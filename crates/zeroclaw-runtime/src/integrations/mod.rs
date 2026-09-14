@@ -46,6 +46,14 @@ pub struct IntegrationEntry {
     pub description: String,
     pub category: IntegrationCategory,
     pub status: IntegrationStatus,
+    /// Canonical config map key for entries backed by a schema config slot —
+    /// the model-provider family key for AI-model entries and the
+    /// `ChannelsConfig` map key for chat entries. This is deliberately
+    /// separate from a runtime channel kind: multiple runtime backends can
+    /// share one config map. Config deep links must route on this key, never
+    /// on a slug of the human-readable `name`. `None` for entries without a
+    /// config section.
+    pub key: Option<String>,
 }
 
 /// Handle the `integrations` CLI command

@@ -159,13 +159,20 @@ pub struct ToolCall {
 
 #[derive(Debug, Clone, Default)]
 pub struct TokenUsage {
-    /// Total prompt size: uncached + cached input tokens.
+    /// Total prompt size: uncached + cached input tokens (including the
+    /// cache-write subset when the provider reports it separately).
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     /// Subset of `input_tokens` that was served from the model_provider's
     /// prompt cache (Anthropic `cache_read_input_tokens`,
     /// OpenAI `prompt_tokens_details.cached_tokens`).
     pub cached_input_tokens: Option<u64>,
+    /// Subset of `input_tokens` that the model_provider wrote into its
+    /// prompt cache on this request (Anthropic
+    /// `cache_creation_input_tokens`, OpenAI-compatible
+    /// `prompt_tokens_details.cache_creation_input_tokens`). Providers
+    /// bill these at a premium over the plain input rate.
+    pub cache_creation_input_tokens: Option<u64>,
 }
 
 /// An LLM response that may contain text, tool calls, or both.

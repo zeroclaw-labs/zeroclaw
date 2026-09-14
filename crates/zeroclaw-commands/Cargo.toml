@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 description = "Shared built-in slash command catalogue for ZeroClaw surfaces."
 repository.workspace = true
+homepage.workspace = true
 publish = true
 
 [dependencies]

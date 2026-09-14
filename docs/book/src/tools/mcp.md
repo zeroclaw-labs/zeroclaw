@@ -50,6 +50,39 @@ A server is reached over one of three transports (the `transport` field):
 
 Add a server through the gateway, zerocode, or `zeroclaw config set` (for example `zeroclaw config set mcp.servers.filesystem.command npx`). A stdio server needs `command` plus optional `args`/`env`; an http/sse server needs `url` plus optional `headers`. The per-field commands are in the field table below.
 
+### Example: Parallel Search
+
+[Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp)
+provides public web search and page extraction without a Parallel account or API
+key. Free access is rate limited. Its Streamable HTTP endpoint uses ZeroClaw's
+`http` transport:
+
+```toml
+[[mcp.servers]]
+name = "parallel"
+transport = "http"
+url = "https://search.parallel.ai/mcp"
+
+[mcp_bundles.web]
+servers = ["parallel"]
+
+[agents.assistant]
+mcp_bundles = ["web"]
+```
+
+Merge these entries into your existing `config.toml`, using the alias of the
+agent you want to grant access. Add `"web"` to that agent's existing
+`mcp_bundles` list rather than replacing its other grants. If the `web` bundle
+already exists, add `"parallel"` to its `servers` list. Keep `mcp.enabled = true`
+and restart the affected session after changing grants.
+
+The agent can then use `parallel__web_search` and `parallel__web_fetch`, subject
+to its normal tool authorization and approval policy. Calls send queries,
+requested URLs, and any supplied objective or context to Parallel. Once granted
+access, the agent may choose these tools during its work. To revoke access,
+remove `"parallel"` from every bundle granted to that agent, or add it to a
+granted bundle's `exclude` list, then restart the session.
+
 ## Editing servers
 
 Three surfaces edit the same `[[mcp.servers]]` table:
@@ -190,13 +223,32 @@ gated by content shape, not by tool name. Materialization does not auto-deliver
 the file to ACP clients; the agent still calls `deliver_file` when outbound
 delivery is needed. See [ACP `session/prompt` blob intake](../channels/acp.md#sessionprompt).
 
+The two other binary MCP content shapes are mapped as follows. A `type: "image"`
+item (base64 `data` + `mimeType`) is materialized the same way and its content
+item is rewritten to a text item carrying the `[IMAGE:<path>]` marker, which the
+multimodal pipeline lifts into a native provider image part; the item's
+`annotations`/`_meta` and other non-binary fields are preserved. Only the raster
+formats the vision pipeline accepts are materialized: PNG, JPEG, WebP, and GIF.
+The on-disk extension is derived from the declared `mimeType` (canonicalized to
+its case-insensitive essence, parameters dropped) when it names one of those
+types, otherwise from sniffing the decoded bytes; the extension must match the
+bytes because the loader prefers a path's extension over its magic. An image
+whose type is neither a supported declared type nor a recognized supported
+signature degrades to `[attachment unavailable: …]` and is not written. A
+`type: "audio"` item is **not** materialized in this path, because no provider
+resolves an audio path into content parts today, so its `data` is stripped to a
+non-materializing `[audio attachment: <mime>]` placeholder. In every case the raw base64 never
+reaches the model, including for a malformed image/audio item whose `data` is
+empty or not a string.
+
 Because the result comes from an untrusted server, two per-call bounds are
-enforced before any blob is decoded, hashed, or written: at most **64** resource
-blobs per `tools/call` result, and an estimated aggregate decoded size of at most
-**10 MiB** across all of them. A result that exceeds either bound has every
-resource blob degraded to an `[attachment unavailable: …]` marker and writes
-nothing to disk, so an array of many empty or tiny blobs cannot force per-item
-work. Each individual blob is still bounded by the same 10 MB per-file limit.
+enforced before any payload is decoded, hashed, or written: at most **64**
+materializable binary items (resource blobs plus valid image items) per
+`tools/call` result, and an estimated aggregate decoded size of at most **10 MiB**
+across all of them. A result that exceeds either bound has every such item
+degraded to an `[attachment unavailable: …]` marker and writes nothing to disk,
+so an array of many empty or tiny items cannot force per-item work. Each
+individual payload is still bounded by the same 10 MB per-file limit.
 
 Separate from these *decoded* budgets, each HTTP/SSE MCP server also has a
 transport-level response-body cap, `max_response_bytes`, enforced on the raw
@@ -214,3 +266,106 @@ treated as **untrusted**: it is provenance-wrapped, secret-scrubbed, and
 length-bounded before entering context. Access to `mcp_resources` / `mcp_prompts`
 and to specific servers is governed by your agent's tool access policy (risk
 profile), and narrows correctly when delegating to subagents.
+
+## Example: Build Remote Agent (`gbr`)
+
+[Build Remote Agent](https://grokbuildremote.com/) is a pairing device: a phone
+app spectates (and can inject into) this ZeroClaw host through free MIT
+`gbr-agent`. Protocol `gbr/1`. Independent product by Linespotting AB. Not
+affiliated with xAI or SpaceX.
+
+Run `gbr-agent` on the **host**. Do not copy it into a sandbox. Attach only
+loopback Bot API `http://127.0.0.1:8788` or stdio `gbr-mcp`. Phone is spectator
+and veto. Never paste mailbox keys as plaintext in `config.toml`. ZeroClaw chat
+channels are not `gbr/1`.
+
+Loopback limits *network* exposure. It is **not** process authentication.
+Another local process can call `:8788` unless you set `GBR_BOT_REQUIRE_KEY=1`
+and give `gbr-mcp` the matching mailbox key through ZeroClaw secret-managed
+MCP `env` (not a plaintext mailbox key in `config.toml`).
+
+`gbr-mcp` logs tool-call arguments to `~/.gbr/logs/gbr-mcp-YYYY-MM-DD.jsonl`
+at info, default retention 7 days. Secret redaction does not strip ordinary
+inject text. For the safe baseline set `GBR_MCP_LOG_BODIES=0` on the `gbr`
+server `env` in ZeroCode Config. Delete or disable those logs if you do not
+want a second persistence surface outside ZeroClaw history.
+
+Omission of `mcp_bundles` is not a grant: define the server **and** grant it.
+
+Need **Node.js 20+** (`mcp/gbr-mcp` `engines.node >=20`). Pin GitHub Release
+**v0.6.2** (checksum the installer, then the binary). Do not paste live
+website `curl | bash`. See
+[PINNED-INSTALL.md](https://github.com/LinespottingOrg/GrokBuildRemote-Agents/blob/v0.6.2/docs/PINNED-INSTALL.md).
+
+Terminal 1 (leave this process running):
+
+```bash
+gbr-agent version    # need v0.6.2
+export GBR_BOT_REQUIRE_KEY=1
+gbr-agent pair
+gbr-agent run
+```
+
+After pairing, obtain the mailbox key from the phone (Settings -> Bot API) or
+from the host pairing file `~/.gbr/device.json` (`mailbox_key`). The pinned
+`gbr-mcp` client reads `GBR_MAILBOX_KEY` from its options or process
+environment; it does not load that pairing file. With `GBR_BOT_REQUIRE_KEY=1`,
+a fresh shell that omits the key makes unauthorized Bot API requests.
+
+Terminal 2 (MCP install and diagnose; `gbr-agent run` must already be up).
+Paste the key into a silent prompt so the value is not stored in shell history:
+
+```bash
+git clone --branch v0.6.2 --depth 1 https://github.com/LinespottingOrg/GrokBuildRemote-Agents.git
+cd GrokBuildRemote-Agents/mcp/gbr-mcp
+node -v    # v20+
+npm install --ignore-scripts
+IFS= read -rs GBR_MAILBOX_KEY   # paste key, Enter; no echo, no history
+export GBR_MAILBOX_KEY
+export GBR_MCP_LOG_BODIES=0
+node bin/gbr-mcp.js --diagnose
+```
+
+The source tag is pinned, but this release has no npm lockfile, so dependency versions are resolved at install time. `--ignore-scripts` prevents dependency lifecycle scripts from running during installation; it does not make the downloaded dependencies trusted or prevent their code from running when the MCP server starts.
+
+The `export` lines above apply only to this diagnostic shell. They do not
+configure the ZeroClaw-spawned `gbr` server. Define the server and grant it:
+
+```toml
+[[mcp.servers]]
+name = "gbr"
+command = "node"
+args = ["/absolute/path/to/GrokBuildRemote-Agents/mcp/gbr-mcp/bin/gbr-mcp.js"]
+
+[mcp_bundles.gbr]
+servers = ["gbr"]
+
+[agents.assistant]
+mcp_bundles = ["gbr"]
+```
+
+Then set both `GBR_MAILBOX_KEY` and `GBR_MCP_LOG_BODIES=0` on that server's
+`env` through ZeroCode Config (`/config` -> `mcp.servers` -> `gbr` -> `env`).
+The mailbox key is a secret field: use the masked prompt (encrypted secrets
+store) or a 1Password `op://vault/item/field` reference. Do not put the raw
+key in `config.toml`. The CLI equivalent is:
+
+```sh
+zeroclaw config set mcp.servers.gbr.env.GBR_MAILBOX_KEY
+zeroclaw config set mcp.servers.gbr.env.GBR_MCP_LOG_BODIES 0
+```
+
+All MCP environment values use ZeroClaw's masked secret prompt, so the
+trailing `0` is not consumed as the value. Enter `0` at that prompt.
+
+Restart the affected session after changing bundles or `env`. HTTP without MCP,
+after `gbr-agent run` with `GBR_BOT_REQUIRE_KEY=1`:
+
+```bash
+IFS= read -rs GBR_MAILBOX_KEY
+export GBR_MAILBOX_KEY
+curl -sS -H "X-GBR-Key: $GBR_MAILBOX_KEY" http://127.0.0.1:8788/health
+curl -sS -H "X-GBR-Key: $GBR_MAILBOX_KEY" http://127.0.0.1:8788/v1/sessions
+```
+
+Docs: [BOT-API.md](https://github.com/LinespottingOrg/GrokBuildRemote-Agents/blob/v0.6.2/docs/BOT-API.md)

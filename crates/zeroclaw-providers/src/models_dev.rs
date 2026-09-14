@@ -37,6 +37,8 @@ struct ModelCost {
     output: Option<f64>,
     #[serde(default)]
     cache_read: Option<f64>,
+    #[serde(default)]
+    cache_write: Option<f64>,
 }
 
 /// models.dev `limit` block: `context` is the model's maximum input window in
@@ -145,6 +147,7 @@ pub(crate) fn pricing_from_catalog(
             input_per_mtok: cost.input.and_then(sane_mtok),
             output_per_mtok: cost.output.and_then(sane_mtok),
             cached_input_per_mtok: cost.cache_read.and_then(sane_mtok),
+            cache_write_per_mtok: cost.cache_write.and_then(sane_mtok),
         };
         if !rates.is_empty() {
             out.insert(model.id.clone(), rates);
@@ -259,7 +262,7 @@ mod tests {
         let raw = r#"{
             "kilo": {
                 "models": {
-                    "a": {"id": "minimax-m2.7", "cost": {"input": 0.3, "output": 1.2, "cache_read": 0.06}},
+                    "a": {"id": "minimax-m2.7", "cost": {"input": 0.3, "output": 1.2, "cache_read": 0.06, "cache_write": 1.25}},
                     "b": {"id": "no-cost-model"}
                 }
             }
@@ -270,6 +273,7 @@ mod tests {
         assert_eq!(m.input_per_mtok, Some(0.3));
         assert_eq!(m.output_per_mtok, Some(1.2));
         assert_eq!(m.cached_input_per_mtok, Some(0.06));
+        assert_eq!(m.cache_write_per_mtok, Some(1.25));
         assert!(!map.contains_key("no-cost-model"));
         // Unknown provider key yields an empty map, not an error.
         assert!(pricing_from_catalog(&catalog, "absent").is_empty());

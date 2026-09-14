@@ -691,6 +691,19 @@ const ESCAPE_EXCEPTIONS: &[(&str, &str)] = &[(
     "../../web/dist",
 )];
 
+fn slash_separated_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+#[test]
+fn repository_relative_paths_use_slash_separators() {
+    let windows_path = PathBuf::from(r"crates\zeroclaw-gateway\src\static_files.rs");
+    assert_eq!(
+        slash_separated_path(&windows_path),
+        "crates/zeroclaw-gateway/src/static_files.rs"
+    );
+}
+
 #[test]
 fn published_crates_never_include_files_outside_their_own_directory() {
     let mut violations = Vec::new();
@@ -733,11 +746,11 @@ fn published_crates_never_include_files_outside_their_own_directory() {
                         .to_path_buf()
                 };
                 let resolved = normalize(&base, &include.path);
-                let rel = source_path
-                    .strip_prefix(repo_root())
-                    .unwrap_or(&source_path)
-                    .to_string_lossy()
-                    .into_owned();
+                let rel = slash_separated_path(
+                    source_path
+                        .strip_prefix(repo_root())
+                        .unwrap_or(&source_path),
+                );
                 let excepted = ESCAPE_EXCEPTIONS
                     .iter()
                     .any(|(f, p)| *f == rel && *p == include.path);

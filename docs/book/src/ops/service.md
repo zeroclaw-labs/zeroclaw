@@ -44,6 +44,8 @@ On Unix the daemon traps `SIGINT` and `SIGTERM`; on Windows it traps Ctrl+C (`ct
 
 `SIGHUP` is ignored (the daemon stays running). A reload requested via the `/admin/reload` endpoint restarts the daemon loop in place rather than exiting.
 
+An in-place reload starts a replacement generation over the same durable sessions, so it waits for the RPC connections the retiring generation accepted to finish, including any agent turn still unwinding after a forced teardown. If that wait runs out of budget, the reload is refused and the daemon shuts down instead; a service manager then restarts it as a fresh process, which cannot overlap the work the old one never retired.
+
 Conversation memory and session state are written to SQLite incrementally during operation, not buffered until shutdown, so a clean stop does not depend on a flush step. Tool receipts are in-band HMAC tokens in the conversation, not a separate on-disk log. A hard `SIGKILL` skips the clean channel teardown but does not corrupt already-committed memory; only an agent turn that was mid-write is lost.
 
 ## Manual start for debugging

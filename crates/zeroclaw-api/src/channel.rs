@@ -59,6 +59,21 @@ impl ChannelSopTopic {
 
 // ── Channel approval types ──────────────────────────────────────
 
+/// Where a tool call sits in the batch the model issued for one turn.
+///
+/// This is the raw batch position, not an approval count. `index` counts every
+/// call the model asked for, including calls that never reach an approval
+/// prompt. An `Approval 2 of 2` counter would only be truthful once the
+/// approval-required set is known, which is after hooks and policy have run —
+/// later than the first card is rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalPosition {
+    /// 1-based position of this call within the batch.
+    pub index: u32,
+    /// Number of calls in the batch.
+    pub total: u32,
+}
+
 /// Compact description of a tool call presented to the user for approval.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelApprovalRequest {
@@ -68,6 +83,23 @@ pub struct ChannelApprovalRequest {
     /// diffs instead of a plain summary string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_arguments: Option<serde_json::Value>,
+    /// Position of this call in the model's tool-call batch, when the caller
+    /// knows it. `None` on paths that approve a single call with no batch to
+    /// count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<ApprovalPosition>,
+}
+
+impl ChannelApprovalRequest {
+    /// Batch position for an approval card, as `(index, total)`.
+    ///
+    /// Reports the position verbatim. Whether a counter is worth showing is
+    /// the renderer's decision, so that a caller handing the renderer a tuple
+    /// directly cannot bypass the rule.
+    #[must_use]
+    pub fn position_counter(&self) -> Option<(u32, u32)> {
+        self.position.map(|p| (p.index, p.total))
+    }
 }
 
 /// The operator's response to a channel-presented approval prompt.

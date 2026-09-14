@@ -783,6 +783,17 @@ impl InputBarState {
         &self.pending_attachments
     }
 
+    /// Copy only durable, user-selected attachments for a reconnect snapshot.
+    /// Clipboard attachments point at temporary files owned by this input bar
+    /// and must never cross a transport rebuild.
+    pub(crate) fn reconnect_file_attachments(&self) -> Vec<PendingAttachment> {
+        self.pending_attachments
+            .iter()
+            .filter(|attachment| attachment.source == crate::attachment::AttachmentSource::File)
+            .cloned()
+            .collect()
+    }
+
     #[cfg(test)]
     pub fn clipboard_temps(&self) -> &[PathBuf] {
         &self.clipboard_temps

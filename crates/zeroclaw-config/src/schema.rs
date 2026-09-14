@@ -489,6 +489,29 @@ pub struct Config {
     #[nested]
     pub risk_profiles: HashMap<String, RiskProfileConfig>,
 
+    /// OIDC trust relationships (`[oidc.<alias>]`). Each entry names one
+    /// issuer whose identities this daemon accepts and how their verified
+    /// claims map to permission profiles. Any standards-compliant IdP
+    /// works; there is no per-vendor configuration.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub oidc: HashMap<String, OidcConfig>,
+
+    /// Local user roster (`[users.<name>]`) for credential-to-principal
+    /// mapping of local auth providers (peer credentials today). OIDC
+    /// identities are NOT listed here; they are keyed by issuer + subject.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub users: HashMap<String, UserConfig>,
+
+    /// Named permission profiles (`[permission_profiles.<alias>]`): the
+    /// single runtime authorization vocabulary. OIDC claim mappings and
+    /// user roster entries resolve here; deny-by-default — anything a
+    /// profile does not grant is refused.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub permission_profiles: HashMap<String, PermissionProfileConfig>,
+
     /// Named runtime/LLM execution profiles (`[runtime_profiles.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -3993,17 +4016,20 @@ impl Config {
     }
 
     /// Return the first concrete `model` string available for use as a
-    /// default. Scans every typed slot's entries (iteration order is
-    /// the macro slot order) for one with `model` set. Returns `None`
-    /// only when no model-provider entry has any model configured at
-    /// all.
+    /// default: the model declared by the first entry that has one. Entries
+    /// are visited in macro slot order, then sorted alias order within each
+    /// slot, as implemented by
+    /// [`ModelProviders::first_entry_with_model`](crate::providers::ModelProviders::first_entry_with_model).
+    /// Returns `None` only when no model-provider entry has any model
+    /// configured at all.
     #[must_use]
     pub fn resolve_default_model(&self) -> Option<String> {
         self.providers
             .models
-            .iter_entries()
-            .filter_map(|(_, _, base)| base.model.as_deref().map(str::trim))
-            .find(|m| !m.is_empty())
+            .first_entry_with_model()
+            .and_then(|(_, _, base)| base.model.as_deref())
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
             .map(ToString::to_string)
     }
 
@@ -6153,6 +6179,12 @@ pub struct PacingConfig {
     /// escalation (Warning). Defaults to 3.
     #[serde(default = "default_loop_detection_max_repeats")]
     pub loop_detection_max_repeats: usize,
+
+    /// Number of same-tool calls with differing arguments but byte-identical
+    /// results before the first no-progress escalation (Warning). This pattern
+    /// caps at Block — it never terminates the turn. Defaults to 5.
+    #[serde(default = "default_loop_detection_no_progress_min_calls")]
+    pub loop_detection_no_progress_min_calls: usize,
 }
 
 fn default_loop_detection_enabled() -> bool {
@@ -6167,6 +6199,10 @@ fn default_loop_detection_max_repeats() -> usize {
     3
 }
 
+fn default_loop_detection_no_progress_min_calls() -> usize {
+    5
+}
+
 impl Default for PacingConfig {
     fn default() -> Self {
         Self {
@@ -6177,6 +6213,7 @@ impl Default for PacingConfig {
             loop_detection_enabled: default_loop_detection_enabled(),
             loop_detection_window_size: default_loop_detection_window_size(),
             loop_detection_max_repeats: default_loop_detection_max_repeats(),
+            loop_detection_no_progress_min_calls: default_loop_detection_no_progress_min_calls(),
         }
     }
 }
@@ -6717,6 +6754,7 @@ pub struct CostConfig {
     /// input_per_mtok = 15.0
     /// output_per_mtok = 75.0
     /// cached_input_per_mtok = 1.5
+    /// cache_write_per_mtok = 18.75
     ///
     /// [cost.rates.providers.tts.openai."tts-1-hd"]
     /// per_mchar = 30.0
@@ -6837,6 +6875,68 @@ impl CostRatesConfig {
     pub fn tool_rates(&self, tool_name: &str) -> Option<&ToolCostRates> {
         self.tools.get(tool_name)
     }
+
+    /// Reject rate-sheet values that cannot represent a real USD price.
+    /// Deliberate zero-cost entries remain valid and distinguish a configured
+    /// free resource from one whose pricing is unavailable.
+    pub fn validate(&self) -> Result<()> {
+        fn validate_rate(path: String, value: Option<f64>) -> Result<()> {
+            if let Some(value) = value
+                && !crate::cost::is_sane_usd_rate(value)
+            {
+                let max = crate::cost::MAX_SANE_USD_RATE;
+                validation_bail!(
+                    InvalidNumericRange,
+                    path.clone(),
+                    "{path} = {value} is invalid; cost rates must be finite and between 0 and {max} USD per configured unit"
+                );
+            }
+            Ok(())
+        }
+
+        let mut model_rates: Vec<_> = self.providers.models.iter_entries().collect();
+        model_rates.sort_unstable_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
+        for (provider, model, rates) in model_rates {
+            let prefix = format!("cost.rates.providers.models.{provider}.{model}");
+            validate_rate(format!("{prefix}.input_per_mtok"), rates.input_per_mtok)?;
+            validate_rate(format!("{prefix}.output_per_mtok"), rates.output_per_mtok)?;
+            validate_rate(
+                format!("{prefix}.cached_input_per_mtok"),
+                rates.cached_input_per_mtok,
+            )?;
+            validate_rate(
+                format!("{prefix}.cache_write_per_mtok"),
+                rates.cache_write_per_mtok,
+            )?;
+        }
+
+        let mut tts_rates: Vec<_> = self.providers.tts.iter_entries().collect();
+        tts_rates.sort_unstable_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
+        for (provider, voice, rates) in tts_rates {
+            validate_rate(
+                format!("cost.rates.providers.tts.{provider}.{voice}.per_mchar"),
+                rates.per_mchar,
+            )?;
+        }
+
+        let mut transcription_rates: Vec<_> = self.providers.transcription.iter_entries().collect();
+        transcription_rates
+            .sort_unstable_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
+        for (provider, model, rates) in transcription_rates {
+            validate_rate(
+                format!("cost.rates.providers.transcription.{provider}.{model}.per_minute"),
+                rates.per_minute,
+            )?;
+        }
+
+        let mut tool_rates: Vec<_> = self.tools.iter().collect();
+        tool_rates.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        for (tool, rates) in tool_rates {
+            validate_rate(format!("cost.rates.tools.{tool}.per_call"), rates.per_call)?;
+        }
+
+        Ok(())
+    }
 }
 
 /// `[cost.rates.providers.*]` — provider-shaped rate sheets. Each field
@@ -6899,6 +6999,12 @@ pub struct ModelCostRates {
     /// providers that don't charge separately for prompt cache hits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_input_per_mtok: Option<f64>,
+    /// Cache-write tokens (USD per 1M). Optional — the premium providers
+    /// charge to write prompt data into their cache (Anthropic bills 1.25x
+    /// the input rate for the 5-minute TTL and 2x for the 1-hour TTL).
+    /// Leave unset to keep pricing cache writes at the plain input rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_per_mtok: Option<f64>,
 }
 
 /// Rates for a TTS model, in USD per 1M characters.
@@ -8649,7 +8755,8 @@ pub struct KnowledgeConfig {
     /// Enable the knowledge graph tool. Default: false.
     #[serde(default)]
     pub enabled: bool,
-    /// Path to the knowledge graph SQLite database.
+    /// Path to the knowledge graph SQLite database. A leading `~` is expanded
+    /// at use time via [`KnowledgeConfig::resolved_db_path`].
     #[serde(default = "default_knowledge_db_path")]
     pub db_path: String,
     /// Maximum number of knowledge nodes. Default: 100000.
@@ -8680,6 +8787,20 @@ impl Default for KnowledgeConfig {
             auto_capture: false,
             suggest_on_query: true,
         }
+    }
+}
+
+impl KnowledgeConfig {
+    /// Resolve `db_path` to a filesystem path, expanding only a leading `~`
+    /// or `~/` as the home directory.
+    ///
+    /// A `~` anywhere else in the path is left intact, so Windows 8.3 short
+    /// names such as `ADMINI~1` survive resolution. This is the single source
+    /// of truth for the knowledge database location. Pure — performs no
+    /// filesystem I/O.
+    #[must_use]
+    pub fn resolved_db_path(&self) -> PathBuf {
+        expand_tilde_path(&self.db_path)
     }
 }
 
@@ -12824,6 +12945,278 @@ fn is_valid_env_var_name(name: &str) -> bool {
     chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
+// ── Inbound authentication & principals (RFC 7141) ──────────────
+
+/// Validates the operator-chosen names used by the auth sections: OIDC
+/// aliases (which become the `oidc.<alias>` provider selection key) and
+/// roster entry names / durable principal ids. Conservative charset so the
+/// composed keys stay unambiguous in logs, TOML paths, and principal ids.
+fn is_valid_auth_section_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphanumeric() => {}
+        _ => return false,
+    }
+    name.len() <= 64 && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
+
+/// One OIDC trust relationship (`[oidc.<alias>]`) — the identity-mapping
+/// half consumed by the shared principal resolver.
+///
+/// The alias is an operator-chosen handle (it appears in logs and audit
+/// attribution as `oidc.<alias>` and selects the provider during the
+/// handshake), never part of principal identity: canonical identity is
+/// keyed by the validated issuer plus token subject, so renaming an alias
+/// cannot re-key principals or link accounts across issuers.
+///
+/// Token-verification settings (validation mode, audience, client secrets,
+/// lifetimes) ship with the OIDC provider slice; this entry carries what
+/// the resolver needs to map verified claims to permission profiles.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "oidc"]
+#[serde(default)]
+pub struct OidcConfig {
+    /// Issuer URL exactly as it appears in validated token `iss` claims
+    /// (e.g. `https://sso.example.com/realms/main`).
+    pub issuer: String,
+    /// Dotted path to the verified claim holding this deployment's
+    /// role/group values (e.g. `realm_access.roles`, `groups`). Must be
+    /// set explicitly: the daemon refuses to guess where grants live in a
+    /// token.
+    pub claim_path: String,
+    /// Maps a claim value found at `claim_path` to a
+    /// `[permission_profiles.<alias>]` name. Claim values with no mapping
+    /// grant nothing; an identity mapping to no profile at all is denied.
+    pub profile_map: HashMap<String, String>,
+    /// Maps a SERVICE client's verified `client_id` to a
+    /// `[permission_profiles.<alias>]` name. Service principals resolve ONLY
+    /// through this map, never `profile_map`, so a machine credential cannot
+    /// inherit a human profile from similarly-named claims. A service
+    /// `client_id` with no entry here is authenticated but entitled to nothing
+    /// (fail closed).
+    #[serde(default)]
+    pub service_profile_map: HashMap<String, String>,
+}
+
+impl OidcConfig {
+    pub fn validate(&self, alias: &str) -> Result<()> {
+        if !is_valid_auth_section_name(alias) {
+            anyhow::bail!(
+                "oidc alias {alias:?} is invalid: expected [A-Za-z0-9][A-Za-z0-9_-]* (max 64 chars)"
+            );
+        }
+        if self.issuer.trim().is_empty() {
+            anyhow::bail!("oidc.{alias}.issuer is required");
+        }
+        // Require TLS for the issuer: the OIDC discovery, JWKS, and
+        // introspection documents fetched from it are trusted to verify
+        // tokens, so a plaintext issuer lets an on-path attacker forge
+        // them (and, for enrollment, capture the client secret). Loopback
+        // is the sole exception, for local IdP development and the test
+        // harness where there is no network to intercept.
+        {
+            // The resolver compares the configured issuer byte-for-byte with
+            // the verified token issuer, so validation must accept exactly the
+            // value that comparison will use: surrounding whitespace would
+            // pass a trimmed URL check here and then never match. OpenID
+            // Connect Discovery §3 also excludes query and fragment components
+            // from an issuer identifier, so a decorated value is rejected
+            // rather than allowed through on its scheme alone.
+            if self.issuer != self.issuer.trim() {
+                anyhow::bail!("oidc.{alias}.issuer must not have surrounding whitespace");
+            }
+            // Parse structurally: a prefix check accepts lookalike hosts like
+            // `http://localhost.attacker.example`. Require https, or http only
+            // when the host is EXACTLY a loopback name (local IdP dev / tests).
+            let issuer = self.issuer.as_str();
+            let url = match url::Url::parse(issuer) {
+                Ok(url) => url,
+                Err(e) => anyhow::bail!("oidc.{alias}.issuer is not a valid URL: {e}"),
+            };
+            if url.query().is_some() || url.fragment().is_some() {
+                anyhow::bail!(
+                    "oidc.{alias}.issuer must not carry a query or fragment: OpenID Connect \
+                     Discovery issuer identifiers exclude them"
+                );
+            }
+            match url.scheme() {
+                "https" => {}
+                "http" => {
+                    let host = url.host_str().unwrap_or_default();
+                    let is_loopback = matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1");
+                    if !is_loopback {
+                        anyhow::bail!(
+                            "oidc.{alias}.issuer must be an https URL (http is allowed only for \
+                             an exact loopback host: localhost, 127.0.0.1, or ::1)"
+                        );
+                    }
+                }
+                other => anyhow::bail!(
+                    "oidc.{alias}.issuer must be an http(s) URL, got scheme '{other}'"
+                ),
+            }
+        }
+        if self.profile_map.is_empty() && self.service_profile_map.is_empty() {
+            anyhow::bail!(
+                "oidc.{alias} requires profile_map or service_profile_map: map at least one \
+                 verified identity value to a permission profile or every identity from this issuer \
+                 will be denied"
+            );
+        }
+        if !self.profile_map.is_empty() && self.claim_path.trim().is_empty() {
+            anyhow::bail!(
+                "oidc.{alias}.claim_path is required: set the dotted path to the \
+                 claim carrying role/group values (e.g. `realm_access.roles` or `groups`)"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// One local roster identity (`[users.<name>]`) for the local auth
+/// providers (peer credentials today; SSH keys and passwords are
+/// separately tracked extensions).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "user"]
+#[serde(default)]
+pub struct UserConfig {
+    /// Durable principal identifier for this entry; defaults to the entry
+    /// name. Ownership of sessions, memory, approvals, and audit trails
+    /// keys on this id, NOT on the entry name — so to rename the entry
+    /// without orphaning its data, set `principal_id` to the original id
+    /// in the same edit. Changing an entry's effective principal id
+    /// creates a new principal that owns nothing.
+    pub principal_id: Option<String>,
+    /// Unix uid accepted for this user over the local socket (peer
+    /// credential). Required today: it is the only roster credential the
+    /// accepted provider set supports.
+    pub uid: Option<u32>,
+    /// The `[permission_profiles.<alias>]` entries granting this user's
+    /// permissions, merged by deterministic union. Required; a user with
+    /// no profile cannot authenticate.
+    pub permission_profiles: Vec<String>,
+}
+
+impl UserConfig {
+    /// The durable principal id this entry resolves to (explicit
+    /// `principal_id`, else the entry name).
+    #[must_use]
+    pub fn effective_principal_id<'a>(&'a self, name: &'a str) -> &'a str {
+        self.principal_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .unwrap_or(name)
+    }
+
+    pub fn validate(&self, name: &str) -> Result<()> {
+        if !is_valid_auth_section_name(name) {
+            anyhow::bail!(
+                "users entry name {name:?} is invalid: expected [A-Za-z0-9][A-Za-z0-9_-]* (max 64 chars)"
+            );
+        }
+        if let Some(id) = self.principal_id.as_deref().map(str::trim)
+            && !id.is_empty()
+            && !is_valid_auth_section_name(id)
+        {
+            anyhow::bail!(
+                "users.{name}.principal_id {id:?} is invalid: expected [A-Za-z0-9][A-Za-z0-9_-]* (max 64 chars)"
+            );
+        }
+        if self.uid.is_none() {
+            anyhow::bail!(
+                "users.{name}.uid is required: the peer-credential provider is the only \
+                 supported roster credential today, and an entry with no credential can \
+                 never authenticate"
+            );
+        }
+        if self.permission_profiles.iter().all(|p| p.trim().is_empty()) {
+            anyhow::bail!(
+                "users.{name}.permission_profiles is required: a user with no permission \
+                 profile holds no grants and cannot authenticate"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// One named grant set (`[permission_profiles.<alias>]`).
+///
+/// Profiles are the single authorization vocabulary: OIDC `profile_map`
+/// values and `[users.<name>].permission_profiles` both resolve here. A
+/// profile grants exactly what it lists; everything else is denied.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "permission_profile"]
+#[serde(default)]
+pub struct PermissionProfileConfig {
+    /// Grant everything. When true all other fields are irrelevant.
+    pub admin: bool,
+    /// Agent aliases holders of this profile may bind or address. Empty
+    /// grants NO agents; grant every agent with the explicit `"*"` entry.
+    pub allowed_agents: Vec<String>,
+    /// Dotted config path prefixes holders may write. A trailing `.*`
+    /// grants the subtree (e.g. `channels.*`); a bare path grants that
+    /// exact prop; `"*"` grants every path. Empty grants NO paths.
+    pub config_write_paths: Vec<String>,
+    /// Tool names holders may cause an agent to run. Empty grants NO
+    /// tools — broad access requires the explicit `"*"` entry. (Note this
+    /// differs from risk-profile `allowed_tools`, where empty means
+    /// unconstrained: permission profiles are deny-by-default. The
+    /// agent's own risk-profile policy still applies on top.)
+    pub allowed_tools: Vec<String>,
+    /// Resource-class grants: for each resource kind, the verbs
+    /// permitted. Resources: `system`, `sessions`, `memory`, `cron`,
+    /// `config`, `agents`, `cost`, `skills`, `personality`, `logs`,
+    /// `tui`, `files`, `locales`, `quickstart`, `channels`, `providers`,
+    /// `models`, `peer_groups`, `plugins`, `tools`, `sops`. Verbs:
+    /// `create`, `read`, `update`, `delete`, `execute`. An unlisted
+    /// resource is denied.
+    pub grants: HashMap<zeroclaw_api::grants::Resource, Vec<zeroclaw_api::grants::Verb>>,
+}
+
+impl PermissionProfileConfig {
+    /// Compile this profile into the runtime grant shape.
+    #[must_use]
+    pub fn resolve(&self) -> zeroclaw_api::grants::ResolvedGrants {
+        use zeroclaw_api::principal::AgentAlias;
+        let mut resolved = zeroclaw_api::grants::ResolvedGrants::none();
+        resolved.admin = self.admin;
+        // Normalize selectors: trim surrounding whitespace and drop empties.
+        // Validation trims when checking existence, but the compiled selector
+        // must match too, so `" main "` cannot validate and then never match.
+        resolved.allowed_agents = self
+            .allowed_agents
+            .iter()
+            .map(|a| a.trim())
+            .filter(|a| !a.is_empty())
+            .map(|a| AgentAlias(a.to_string()))
+            .collect();
+        resolved.config_write_paths = self
+            .config_write_paths
+            .iter()
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect();
+        resolved.allowed_tools = self
+            .allowed_tools
+            .iter()
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect();
+        for (resource, verbs) in &self.grants {
+            resolved
+                .resources
+                .insert(*resource, verbs.iter().copied().collect());
+        }
+        resolved
+    }
+}
+
 // ── Profiles & Bundles ───────────────────────────────────────────
 
 /// Named risk/autonomy profile (`[risk_profiles.<alias>]`).
@@ -14300,216 +14693,252 @@ impl ChannelsConfig {
         vec![
             ChannelInfo {
                 kind: "telegram",
+                config_key: "telegram",
                 name: "Telegram",
                 desc: "connect your bot",
                 configured: !self.telegram.is_empty(),
             },
             ChannelInfo {
                 kind: "discord",
+                config_key: "discord",
                 name: "Discord",
                 desc: "connect your bot",
                 configured: !self.discord.is_empty(),
             },
             ChannelInfo {
                 kind: "slack",
+                config_key: "slack",
                 name: "Slack",
                 desc: "connect your bot",
                 configured: !self.slack.is_empty(),
             },
             ChannelInfo {
                 kind: "mattermost",
+                config_key: "mattermost",
                 name: "Mattermost",
                 desc: "connect to your bot",
                 configured: !self.mattermost.is_empty(),
             },
             ChannelInfo {
                 kind: "imessage",
+                config_key: "imessage",
                 name: "iMessage",
                 desc: "macOS only",
                 configured: !self.imessage.is_empty(),
             },
             ChannelInfo {
                 kind: "matrix",
+                config_key: "matrix",
                 name: "Matrix",
                 desc: "self-hosted chat",
                 configured: !self.matrix.is_empty(),
             },
             ChannelInfo {
                 kind: "signal",
+                config_key: "signal",
                 name: "Signal",
                 desc: "An open-source, encrypted messaging service",
                 configured: !self.signal.is_empty(),
             },
             ChannelInfo {
                 kind: "whatsapp",
+                config_key: "whatsapp",
                 name: "WhatsApp",
                 desc: "Business Cloud API",
                 configured: !self.whatsapp.is_empty(),
             },
             ChannelInfo {
                 kind: "whatsapp-web",
+                config_key: "whatsapp",
                 name: "WhatsApp Web",
                 desc: "native WhatsApp Web (wa-rs)",
                 configured: self.whatsapp.values().any(|c| c.is_web_config()),
             },
             ChannelInfo {
                 kind: "linq",
+                config_key: "linq",
                 name: "Linq",
                 desc: "iMessage/RCS/SMS via Linq API",
                 configured: !self.linq.is_empty(),
             },
             ChannelInfo {
                 kind: "nextcloud",
+                config_key: "nextcloud_talk",
                 name: "NextCloud Talk",
                 desc: "NextCloud Talk platform",
                 configured: !self.nextcloud_talk.is_empty(),
             },
             ChannelInfo {
                 kind: "email",
+                config_key: "email",
                 name: "Email",
                 desc: "Email over IMAP/SMTP",
                 configured: !self.email.is_empty(),
             },
             ChannelInfo {
                 kind: "gmail-push",
+                config_key: "gmail_push",
                 name: "Gmail Push",
                 desc: "Gmail Pub/Sub push notifications",
                 configured: !self.gmail_push.is_empty(),
             },
             ChannelInfo {
                 kind: "twitch",
+                config_key: "twitch",
                 name: "Twitch",
                 desc: "Twitch chat (IRC)",
                 configured: !self.twitch.is_empty(),
             },
             ChannelInfo {
                 kind: "irc",
+                config_key: "irc",
                 name: "IRC",
                 desc: "IRC over TLS",
                 configured: !self.irc.is_empty(),
             },
             ChannelInfo {
                 kind: "lark",
+                config_key: "lark",
                 name: "Lark",
                 desc: "Lark Bot",
                 configured: !self.lark.is_empty(),
             },
             ChannelInfo {
                 kind: "dingtalk",
+                config_key: "dingtalk",
                 name: "DingTalk",
                 desc: "DingTalk Stream Mode",
                 configured: !self.dingtalk.is_empty(),
             },
             ChannelInfo {
                 kind: "wecom",
+                config_key: "wecom",
                 name: "WeCom",
                 desc: "WeCom Bot Webhook",
                 configured: !self.wecom.is_empty(),
             },
             ChannelInfo {
                 kind: "wecom-ws",
+                config_key: "wecom_ws",
                 name: "WeCom WebSocket",
                 desc: "WeCom AI Bot long connection",
                 configured: !self.wecom_ws.is_empty(),
             },
             ChannelInfo {
                 kind: "wechat",
+                config_key: "wechat",
                 name: "WeChat",
                 desc: "WeChat iLink Bot",
                 configured: !self.wechat.is_empty(),
             },
             ChannelInfo {
                 kind: "qq",
+                config_key: "qq",
                 name: "QQ Official",
                 desc: "Tencent QQ Bot",
                 configured: !self.qq.is_empty(),
             },
             ChannelInfo {
                 kind: "nostr",
+                config_key: "nostr",
                 name: "Nostr",
                 desc: "Nostr DMs",
                 configured: !self.nostr.is_empty(),
             },
             ChannelInfo {
                 kind: "clawdtalk",
+                config_key: "clawdtalk",
                 name: "ClawdTalk",
                 desc: "ClawdTalk Channel",
                 configured: !self.clawdtalk.is_empty(),
             },
             ChannelInfo {
                 kind: "reddit",
+                config_key: "reddit",
                 name: "Reddit",
                 desc: "Reddit bot (OAuth2)",
                 configured: !self.reddit.is_empty(),
             },
             ChannelInfo {
                 kind: "bluesky",
+                config_key: "bluesky",
                 name: "Bluesky",
                 desc: "AT Protocol",
                 configured: !self.bluesky.is_empty(),
             },
             ChannelInfo {
                 kind: "git",
+                config_key: "git",
                 name: "Git",
                 desc: "Git forge (GitHub, Gitea, Forgejo): issues, PRs & events",
                 configured: !self.git.is_empty(),
             },
             ChannelInfo {
                 kind: "twitter",
+                config_key: "twitter",
                 name: "X/Twitter",
                 desc: "X/Twitter Bot via API v2",
                 configured: !self.twitter.is_empty(),
             },
             ChannelInfo {
                 kind: "mochat",
+                config_key: "mochat",
                 name: "Mochat",
                 desc: "Mochat Customer Service",
                 configured: !self.mochat.is_empty(),
             },
             ChannelInfo {
                 kind: "line",
+                config_key: "line",
                 name: "LINE",
                 desc: "connect your LINE bot",
                 configured: !self.line.is_empty(),
             },
             ChannelInfo {
                 kind: "voice-call",
+                config_key: "voice_call",
                 name: "Voice Call",
                 desc: "outbound voice call channel",
                 configured: !self.voice_call.is_empty(),
             },
             ChannelInfo {
                 kind: "voice-wake",
+                config_key: "voice_wake",
                 name: "VoiceWake",
                 desc: "voice wake word detection",
                 configured: !self.voice_wake.is_empty(),
             },
             ChannelInfo {
                 kind: "mqtt",
+                config_key: "mqtt",
                 name: "MQTT",
                 desc: "MQTT SOP Listener",
                 configured: !self.mqtt.is_empty(),
             },
             ChannelInfo {
                 kind: "amqp",
+                config_key: "amqp",
                 name: "AMQP",
                 desc: "AMQP topic consumer",
                 configured: !self.amqp.is_empty(),
             },
             ChannelInfo {
                 kind: "filesystem",
+                config_key: "filesystem",
                 name: "Filesystem",
                 desc: "filesystem change SOP listener",
                 configured: !self.filesystem.is_empty(),
             },
             ChannelInfo {
                 kind: "webhook",
+                config_key: "webhook",
                 name: "Webhook",
                 desc: "HTTP endpoint",
                 configured: !self.webhook.is_empty(),
             },
             ChannelInfo {
                 kind: "plugin",
+                config_key: "plugin",
                 name: "Plugin",
                 desc: "installed WASM channel plugin",
                 configured: !self.plugin.is_empty(),
@@ -19295,6 +19724,9 @@ impl Default for Config {
             delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
             risk_profiles: HashMap::new(),
+            oidc: HashMap::new(),
+            users: HashMap::new(),
+            permission_profiles: HashMap::new(),
             runtime_profiles: HashMap::new(),
             skill_bundles: HashMap::new(),
             knowledge_bundles: HashMap::new(),
@@ -21413,6 +21845,7 @@ impl Config {
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
+        self.cost.rates.validate()?;
 
         let websocket_ping_interval_secs = self.gateway.websocket_ping_interval_secs;
         if websocket_ping_interval_secs > GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS {
@@ -21882,6 +22315,109 @@ impl Config {
                     anyhow::bail!(
                         "risk_profiles.{profile_alias}.shell_env_passthrough[{i}] is invalid ({env_name}); expected [A-Za-z_][A-Za-z0-9_]*"
                     );
+                }
+            }
+        }
+
+        // Inbound authentication & principals (RFC 7141): each auth section
+        // must be internally valid, reference only configured entries, and
+        // map credentials and principal ids unambiguously. Keys are sorted
+        // so the first error reported is deterministic.
+        {
+            let mut oidc_aliases: Vec<&String> = self.oidc.keys().collect();
+            oidc_aliases.sort();
+            for alias in oidc_aliases {
+                let oidc = &self.oidc[alias];
+                oidc.validate(alias)?;
+                let mut claim_values: Vec<&String> = oidc.profile_map.keys().collect();
+                claim_values.sort();
+                for claim_value in claim_values {
+                    let profile = &oidc.profile_map[claim_value];
+                    if !self.permission_profiles.contains_key(profile) {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("oidc.{alias}.profile_map"),
+                            "oidc.{alias}.profile_map[{claim_value:?}] names permission profile {profile:?} but [permission_profiles.{profile}] is not configured",
+                        );
+                    }
+                }
+                // Service mappings reference profiles too: a dangling target
+                // must fail here at load time, not surface later as a
+                // Misconfigured denial when the service first resolves.
+                let mut client_ids: Vec<&String> = oidc.service_profile_map.keys().collect();
+                client_ids.sort();
+                for client_id in client_ids {
+                    let profile = &oidc.service_profile_map[client_id];
+                    if !self.permission_profiles.contains_key(profile) {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("oidc.{alias}.service_profile_map"),
+                            "oidc.{alias}.service_profile_map[{client_id:?}] names permission profile {profile:?} but [permission_profiles.{profile}] is not configured",
+                        );
+                    }
+                }
+            }
+
+            let mut user_names: Vec<&String> = self.users.keys().collect();
+            user_names.sort();
+            let mut uid_owners: HashMap<u32, &str> = HashMap::new();
+            let mut principal_owners: HashMap<&str, &str> = HashMap::new();
+            for name in user_names {
+                let user = &self.users[name];
+                user.validate(name)?;
+                for profile in &user.permission_profiles {
+                    let trimmed = profile.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if !self.permission_profiles.contains_key(trimmed) {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("users.{name}.permission_profiles"),
+                            "users.{name}.permission_profiles names {trimmed:?} but [permission_profiles.{trimmed}] is not configured",
+                        );
+                    }
+                }
+                // A uid maps a kernel-reported peer to exactly one
+                // principal; two entries claiming one uid would make
+                // authentication ambiguous.
+                if let Some(uid) = user.uid
+                    && let Some(other) = uid_owners.insert(uid, name.as_str())
+                {
+                    validation_bail!(
+                        ValidationFailed,
+                        format!("users.{name}.uid"),
+                        "users.{name}.uid = {uid} is already mapped by users.{other}; a uid must resolve to exactly one principal",
+                    );
+                }
+                // Two entries resolving to one durable principal id would
+                // silently link accounts and merge their owned data.
+                let principal_id = user.effective_principal_id(name);
+                if let Some(other) = principal_owners.insert(principal_id, name.as_str()) {
+                    validation_bail!(
+                        ValidationFailed,
+                        format!("users.{name}.principal_id"),
+                        "users.{name} resolves to principal id {principal_id:?} which users.{other} already uses; principal ids must be unique",
+                    );
+                }
+            }
+
+            let mut profile_aliases: Vec<&String> = self.permission_profiles.keys().collect();
+            profile_aliases.sort();
+            for alias in profile_aliases {
+                let profile = &self.permission_profiles[alias];
+                for agent in &profile.allowed_agents {
+                    let trimmed = agent.trim();
+                    if trimmed.is_empty() || trimmed == "*" {
+                        continue;
+                    }
+                    if !self.agents.contains_key(trimmed) {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("permission_profiles.{alias}.allowed_agents"),
+                            "permission_profiles.{alias}.allowed_agents names {trimmed:?} but [agents.{trimmed}] is not configured (use \"*\" for every agent)",
+                        );
+                    }
                 }
             }
         }
@@ -25644,6 +26180,390 @@ mod tests {
         assert_eq!(AmqpConfig::default().dispatch, SopDispatch::AgentLoop);
     }
 
+    // ── Inbound auth config sections (RFC 7141 stage 2) ─────────────
+
+    fn auth_operator_profile() -> PermissionProfileConfig {
+        PermissionProfileConfig {
+            allowed_agents: vec!["*".to_string()],
+            allowed_tools: vec!["calculator".to_string()],
+            grants: HashMap::from([(
+                zeroclaw_api::grants::Resource::Sessions,
+                vec![
+                    zeroclaw_api::grants::Verb::Create,
+                    zeroclaw_api::grants::Verb::Read,
+                ],
+            )]),
+            ..PermissionProfileConfig::default()
+        }
+    }
+
+    fn auth_config() -> Config {
+        let mut config = Config::default();
+        config
+            .permission_profiles
+            .insert("operator".to_string(), auth_operator_profile());
+        config.users.insert(
+            "alice".to_string(),
+            UserConfig {
+                uid: Some(1000),
+                permission_profiles: vec!["operator".to_string()],
+                ..UserConfig::default()
+            },
+        );
+        config.oidc.insert(
+            "corp".to_string(),
+            OidcConfig {
+                issuer: "https://sso.example.com/realms/main".to_string(),
+                claim_path: "realm_access.roles".to_string(),
+                profile_map: HashMap::from([(
+                    "zeroclaw-operators".to_string(),
+                    "operator".to_string(),
+                )]),
+                ..OidcConfig::default()
+            },
+        );
+        config
+    }
+
+    #[::core::prelude::v1::test]
+    fn auth_sections_valid_config_passes_validation() {
+        auth_config().validate().expect("valid auth config");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_dangling_profile_map_reference_fails() {
+        let mut config = auth_config();
+        config
+            .oidc
+            .get_mut("corp")
+            .unwrap()
+            .profile_map
+            .insert("admins".to_string(), "missing".to_string());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("oidc.corp.profile_map"), "got: {err}");
+        assert!(err.contains("missing"), "got: {err}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_dangling_service_profile_map_reference_fails() {
+        // A dangling service target must fail at validation, not surface
+        // later as a Misconfigured denial when the service first resolves.
+        let mut config = auth_config();
+        config
+            .oidc
+            .get_mut("corp")
+            .unwrap()
+            .service_profile_map
+            .insert("worker".to_string(), "missing".to_string());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("oidc.corp.service_profile_map"), "got: {err}");
+        assert!(err.contains("missing"), "got: {err}");
+
+        // A service mapping that names a configured profile round-trips.
+        let mut config = auth_config();
+        let existing = config.oidc["corp"]
+            .profile_map
+            .values()
+            .next()
+            .cloned()
+            .expect("auth_config maps at least one claim value");
+        config
+            .oidc
+            .get_mut("corp")
+            .unwrap()
+            .service_profile_map
+            .insert("worker".to_string(), existing);
+        config
+            .validate()
+            .expect("a service map naming a configured profile is valid");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_service_only_profile_map_does_not_require_a_claim_path() {
+        let mut config = auth_config();
+        let oidc = config.oidc.get_mut("corp").unwrap();
+        oidc.claim_path.clear();
+        oidc.profile_map.clear();
+        oidc.service_profile_map
+            .insert("worker".to_string(), "operator".to_string());
+
+        config
+            .validate()
+            .expect("a service-only OIDC map naming a configured profile is valid");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_requires_a_human_or_service_profile_map() {
+        let mut config = auth_config();
+        let oidc = config.oidc.get_mut("corp").unwrap();
+        oidc.profile_map.clear();
+        oidc.service_profile_map.clear();
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("profile_map"), "got: {err}");
+        assert!(err.contains("service_profile_map"), "got: {err}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_requires_issuer_claim_path_and_profile_map() {
+        for strip in ["issuer", "claim_path", "profile_map"] {
+            let mut config = auth_config();
+            let oidc = config.oidc.get_mut("corp").unwrap();
+            match strip {
+                "issuer" => oidc.issuer.clear(),
+                "claim_path" => oidc.claim_path.clear(),
+                _ => oidc.profile_map.clear(),
+            }
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains(strip),
+                "stripping {strip} must fail, got: {err}"
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_issuer_must_be_https_except_loopback() {
+        // Plaintext issuer over the network is rejected: discovery/JWKS/
+        // introspection are the token-verification root of trust.
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().issuer = "http://sso.corp".to_string();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("https"),
+            "http issuer must be refused, got: {err}"
+        );
+
+        // Loopback stays allowed for local IdP dev and the test harness.
+        for loopback in [
+            "http://127.0.0.1:8080/realms/main",
+            "http://localhost:8080",
+            "http://[::1]:8080",
+        ] {
+            let mut ok = auth_config();
+            ok.oidc.get_mut("corp").unwrap().issuer = loopback.to_string();
+            assert!(
+                ok.validate().is_ok(),
+                "loopback issuer {loopback} must be accepted"
+            );
+        }
+
+        // Lookalike hosts must NOT count as loopback: the url::Url parse
+        // (vs a string prefix) rejects these cleartext issuers.
+        for lookalike in [
+            "http://localhost.attacker.example/realms/main",
+            "http://127.0.0.1.attacker.example",
+            "http://not-localhost:8080",
+            "ftp://sso.corp",
+        ] {
+            let mut bad = auth_config();
+            bad.oidc.get_mut("corp").unwrap().issuer = lookalike.to_string();
+            assert!(
+                bad.validate().is_err(),
+                "lookalike/invalid issuer {lookalike} must be rejected"
+            );
+        }
+
+        // The resolver compares the configured issuer byte-for-byte with the
+        // verified token issuer, so validation must accept exactly that value:
+        // surrounding whitespace would pass a trimmed check and then never
+        // match. OpenID Connect Discovery excludes query and fragment from an
+        // issuer identifier, so decorated values are refused too.
+        for decorated in [
+            " https://sso.example.com ",
+            "https://sso.example.com ",
+            "https://sso.example.com?tenant=x",
+            "https://sso.example.com#fragment",
+        ] {
+            let mut bad = auth_config();
+            bad.oidc.get_mut("corp").unwrap().issuer = decorated.to_string();
+            assert!(
+                bad.validate().is_err(),
+                "issuer {decorated:?} with whitespace/query/fragment must be rejected"
+            );
+        }
+        let mut clean = auth_config();
+        clean.oidc.get_mut("corp").unwrap().issuer = "https://sso.example.com".to_string();
+        assert!(
+            clean.validate().is_ok(),
+            "a plain https issuer must still be accepted"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn permission_profile_resolve_normalizes_agent_selectors() {
+        // A whitespace-padded selector must normalize so it actually matches
+        // (`" main "` validated but never matched before); empties are dropped.
+        let profile = PermissionProfileConfig {
+            allowed_agents: vec![" main ".to_string(), "   ".to_string()],
+            ..PermissionProfileConfig::default()
+        };
+        let resolved = profile.resolve();
+        assert!(
+            resolved.may_use_agent("main"),
+            "trimmed selector must match"
+        );
+        assert_eq!(resolved.allowed_agents.len(), 1, "whitespace-only dropped");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_alias_charset_is_enforced() {
+        let mut config = auth_config();
+        let entry = config.oidc.remove("corp").unwrap();
+        config.oidc.insert("bad.alias".to_string(), entry);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("bad.alias"), "got: {err}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn users_dangling_profile_reference_fails() {
+        let mut config = auth_config();
+        config
+            .users
+            .get_mut("alice")
+            .unwrap()
+            .permission_profiles
+            .push("missing".to_string());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("users.alice.permission_profiles"),
+            "got: {err}"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn users_without_uid_fail_closed_at_load() {
+        let mut config = auth_config();
+        config.users.get_mut("alice").unwrap().uid = None;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("users.alice.uid"), "got: {err}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn users_duplicate_uid_is_ambiguous_and_fails() {
+        let mut config = auth_config();
+        config.users.insert(
+            "bob".to_string(),
+            UserConfig {
+                uid: Some(1000),
+                permission_profiles: vec!["operator".to_string()],
+                ..UserConfig::default()
+            },
+        );
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("uid must resolve to exactly one principal")
+                || err.contains("already mapped"),
+            "got: {err}"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn users_duplicate_principal_id_fails() {
+        // An explicit principal_id colliding with another entry's effective
+        // id would silently link two accounts and merge their owned data.
+        let mut config = auth_config();
+        config.users.insert(
+            "bob".to_string(),
+            UserConfig {
+                principal_id: Some("alice".to_string()),
+                uid: Some(2000),
+                permission_profiles: vec!["operator".to_string()],
+            },
+        );
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("principal ids must be unique"), "got: {err}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn users_rename_with_pinned_principal_id_is_stable() {
+        let mut config = auth_config();
+        let mut entry = config.users.remove("alice").unwrap();
+        entry.principal_id = Some("alice".to_string());
+        config.users.insert("alice-renamed".to_string(), entry);
+        config.validate().expect("rename with pinned id is valid");
+        assert_eq!(
+            config.users["alice-renamed"].effective_principal_id("alice-renamed"),
+            "alice",
+            "the durable principal id survives the display rename"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn permission_profile_allowed_agents_must_exist_or_be_wildcard() {
+        let mut config = auth_config();
+        config
+            .permission_profiles
+            .get_mut("operator")
+            .unwrap()
+            .allowed_agents = vec!["ghost".to_string()];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("permission_profiles.operator.allowed_agents"),
+            "got: {err}"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn permission_profile_resolves_to_deny_by_default_grants() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let resolved = auth_operator_profile().resolve();
+        assert!(!resolved.admin);
+        assert!(resolved.permits(Resource::Sessions, Verb::Read));
+        assert!(!resolved.permits(Resource::Sessions, Verb::Delete));
+        assert!(!resolved.permits(Resource::Config, Verb::Update));
+        assert!(resolved.may_use_agent("anything"), "wildcard entry");
+        assert!(resolved.may_use_tool("calculator"));
+        assert!(!resolved.may_use_tool("shell"), "selector is an allowlist");
+        assert!(
+            !resolved.may_write_config("channels.discord"),
+            "empty config paths grant nothing"
+        );
+
+        let empty = PermissionProfileConfig::default().resolve();
+        assert!(
+            !empty.may_use_tool("calculator"),
+            "empty profile grants nothing"
+        );
+        assert!(!empty.permits(Resource::System, Verb::Read));
+    }
+
+    #[::core::prelude::v1::test]
+    fn auth_sections_roundtrip_from_toml() {
+        let toml_src = r#"
+[permission_profiles.operator]
+allowed_agents = ["*"]
+allowed_tools = ["calculator"]
+
+[permission_profiles.operator.grants]
+sessions = ["create", "read"]
+tools = ["execute"]
+
+[users.alice]
+uid = 1000
+permission_profiles = ["operator"]
+
+[oidc.corp]
+issuer = "https://sso.example.com/realms/main"
+claim_path = "realm_access.roles"
+
+[oidc.corp.profile_map]
+zeroclaw-operators = "operator"
+"#;
+        let config: Config = toml::from_str(toml_src).expect("auth sections parse");
+        config.validate().expect("parsed auth config validates");
+        let resolved = config.permission_profiles["operator"].resolve();
+        assert!(resolved.permits(
+            zeroclaw_api::grants::Resource::Tools,
+            zeroclaw_api::grants::Verb::Execute
+        ));
+        assert_eq!(
+            config.oidc["corp"].profile_map["zeroclaw-operators"],
+            "operator"
+        );
+        assert_eq!(config.users["alice"].uid, Some(1000));
+    }
+
     #[test]
     async fn filesystem_validate_requires_path() {
         let cfg = FilesystemConfig {
@@ -25845,6 +26765,46 @@ mod tests {
         if std::env::var("HOME").is_ok() {
             assert!(!resolved.to_string_lossy().starts_with('~'));
             assert!(resolved.ends_with(".zeroclaw/plugins"));
+        }
+    }
+
+    // ── Knowledge db path resolution ──────────────────────────
+
+    #[test]
+    async fn resolved_db_path_passes_absolute_path_through() {
+        let cfg = KnowledgeConfig {
+            db_path: "/srv/zeroclaw/knowledge.db".to_string(),
+            ..KnowledgeConfig::default()
+        };
+        assert_eq!(
+            cfg.resolved_db_path(),
+            PathBuf::from("/srv/zeroclaw/knowledge.db")
+        );
+    }
+
+    #[test]
+    async fn resolved_db_path_preserves_non_prefix_tilde() {
+        // Windows 8.3 short names contain a `~` that is not a home shortcut.
+        let cfg = KnowledgeConfig {
+            db_path: "/tmp/ADMINI~1/knowledge.db".to_string(),
+            ..KnowledgeConfig::default()
+        };
+        assert_eq!(
+            cfg.resolved_db_path(),
+            PathBuf::from("/tmp/ADMINI~1/knowledge.db")
+        );
+    }
+
+    #[test]
+    async fn resolved_db_path_expands_leading_tilde() {
+        let cfg = KnowledgeConfig {
+            db_path: "~/.zeroclaw/knowledge.db".to_string(),
+            ..KnowledgeConfig::default()
+        };
+        let resolved = cfg.resolved_db_path();
+        if std::env::var("HOME").is_ok() {
+            assert!(!resolved.to_string_lossy().starts_with('~'));
+            assert!(resolved.ends_with(".zeroclaw/knowledge.db"));
         }
     }
 
@@ -28209,6 +29169,9 @@ auto_save = true
                 backend: ObservabilityBackend::Log,
                 ..ObservabilityConfig::default()
             },
+            oidc: HashMap::new(),
+            users: HashMap::new(),
+            permission_profiles: HashMap::new(),
             risk_profiles: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -29309,6 +30272,9 @@ default_temperature = 0.7
             delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
             risk_profiles: HashMap::new(),
+            oidc: HashMap::new(),
+            users: HashMap::new(),
+            permission_profiles: HashMap::new(),
             runtime_profiles: HashMap::new(),
             skill_bundles: HashMap::new(),
             knowledge_bundles: HashMap::new(),
@@ -31409,6 +32375,28 @@ model = "primary-model"
         );
         // resolve_default_model returns the first non-empty model across all model_providers.
         assert!(config.resolve_default_model().is_some());
+
+        // Two aliases in one family: the pick is deterministic (slot order,
+        // then alias order), not HashMap iteration order.
+        config.providers.models.openrouter.insert(
+            "beta".to_string(),
+            OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("beta-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.openrouter.insert(
+            "aaa".to_string(),
+            OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("aaa-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        assert_eq!(config.resolve_default_model().as_deref(), Some("aaa-model"),);
     }
 
     #[test]
@@ -33776,6 +34764,133 @@ group_policy = "disabled"
             written.contains("name = \"fs\""),
             "natural-key `name` must survive the incremental save; got:\n{written}"
         );
+    }
+
+    fn validate_config_with_cost_rates(rates: CostRatesConfig) -> Result<()> {
+        let mut config = Config::default();
+        config.cost.rates = rates;
+        config.validate()
+    }
+
+    #[test]
+    async fn cost_rate_validation_rejects_out_of_range_typed_rates() {
+        for (field, value) in [
+            ("input_per_mtok", -0.01),
+            ("output_per_mtok", f64::NAN),
+            ("cached_input_per_mtok", f64::INFINITY),
+            ("input_per_mtok", f64::MAX),
+            ("cache_write_per_mtok", f64::MAX),
+        ] {
+            let mut rates = CostRatesConfig::default();
+            rates.providers.models.openai.insert(
+                "gpt-test".to_string(),
+                ModelCostRates {
+                    input_per_mtok: (field == "input_per_mtok").then_some(value),
+                    output_per_mtok: (field == "output_per_mtok").then_some(value),
+                    cached_input_per_mtok: (field == "cached_input_per_mtok").then_some(value),
+                    cache_write_per_mtok: (field == "cache_write_per_mtok").then_some(value),
+                },
+            );
+            let error = validate_config_with_cost_rates(rates)
+                .expect_err("invalid model rate must fail canonical config validation");
+            let message = format!("{error:#}");
+            assert!(message.contains("invalid_numeric_range"), "{message}");
+            assert!(message.contains(field), "{message}");
+        }
+
+        let mut rates = CostRatesConfig::default();
+        rates.providers.tts.openai.insert(
+            "voice-test".to_string(),
+            TtsCostRates {
+                per_mchar: Some(f64::NEG_INFINITY),
+            },
+        );
+        let message = format!(
+            "{:#}",
+            validate_config_with_cost_rates(rates)
+                .expect_err("non-finite TTS rate must fail canonical config validation")
+        );
+        assert!(message.contains("providers.tts.openai.voice-test.per_mchar"));
+
+        let mut rates = CostRatesConfig::default();
+        rates.providers.transcription.openai.insert(
+            "transcriber-test".to_string(),
+            TranscriptionCostRates {
+                per_minute: Some(-1.0),
+            },
+        );
+        let message = format!(
+            "{:#}",
+            validate_config_with_cost_rates(rates)
+                .expect_err("negative transcription rate must fail canonical config validation")
+        );
+        assert!(message.contains("providers.transcription.openai.transcriber-test.per_minute"));
+
+        let mut rates = CostRatesConfig::default();
+        rates.tools.insert(
+            "web_search".to_string(),
+            ToolCostRates {
+                per_call: Some(f64::NAN),
+            },
+        );
+        let message = format!(
+            "{:#}",
+            validate_config_with_cost_rates(rates)
+                .expect_err("non-finite tool rate must fail canonical config validation")
+        );
+        assert!(message.contains("cost.rates.tools.web_search.per_call"));
+    }
+
+    #[test]
+    async fn cost_rate_validation_preserves_deliberate_zero_cost_entries() {
+        let mut rates = CostRatesConfig::default();
+        rates.providers.models.openai.insert(
+            "free-model".to_string(),
+            ModelCostRates {
+                input_per_mtok: Some(0.0),
+                output_per_mtok: Some(0.0),
+                cached_input_per_mtok: Some(0.0),
+                cache_write_per_mtok: Some(0.0),
+            },
+        );
+        rates.providers.tts.openai.insert(
+            "free-voice".to_string(),
+            TtsCostRates {
+                per_mchar: Some(0.0),
+            },
+        );
+        rates.providers.transcription.openai.insert(
+            "free-transcriber".to_string(),
+            TranscriptionCostRates {
+                per_minute: Some(0.0),
+            },
+        );
+        rates.tools.insert(
+            "free-tool".to_string(),
+            ToolCostRates {
+                per_call: Some(0.0),
+            },
+        );
+
+        validate_config_with_cost_rates(rates)
+            .expect("0.0 is a deliberate free rate, not missing or invalid pricing");
+    }
+
+    #[test]
+    async fn cost_rate_validation_accepts_the_shared_safety_boundary() {
+        let mut rates = CostRatesConfig::default();
+        rates.providers.models.openai.insert(
+            "boundary-model".to_string(),
+            ModelCostRates {
+                input_per_mtok: Some(crate::cost::MAX_SANE_USD_RATE),
+                output_per_mtok: Some(0.0),
+                cached_input_per_mtok: Some(0.0),
+                cache_write_per_mtok: Some(0.0),
+            },
+        );
+
+        validate_config_with_cost_rates(rates)
+            .expect("the canonical maximum cost rate must remain valid");
     }
 
     /// `cost.rates.providers.models.<type>` is a
@@ -36265,11 +37380,16 @@ url = "http://localhost:8080/mcp"
             from_toml.loop_detection_max_repeats,
             manual.loop_detection_max_repeats
         );
+        assert_eq!(
+            from_toml.loop_detection_no_progress_min_calls,
+            manual.loop_detection_no_progress_min_calls
+        );
 
         // Verify concrete values so a silent change to the defaults is caught.
         assert!(from_toml.loop_detection_enabled, "default should be true");
         assert_eq!(from_toml.loop_detection_window_size, 20);
         assert_eq!(from_toml.loop_detection_max_repeats, 3);
+        assert_eq!(from_toml.loop_detection_no_progress_min_calls, 5);
     }
 
     // ── Docker baked config template ────────────────────────────

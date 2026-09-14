@@ -1,11 +1,13 @@
 # Web dashboard (`gateway.web_dist_dir`)
 
+When ZeroClaw is built with the `embedded-web` feature, the compiled-in dashboard assets take precedence over `gateway.web_dist_dir` and the filesystem locations described below. Filesystem resolution and API-only fallback apply when embedded assets are unavailable.
+
 The gateway daemon ships its HTTP API in the binary, but the web dashboard
 HTML/JS/CSS lives on disk in a `web/dist/` directory produced by Vite. The
 `gateway.web_dist_dir` setting (and its {{#env-var-name gateway.web_dist_dir}}
 schema-mirror env-var override) tells the daemon where that directory is.
 When neither the setting nor a known fallback location contains a built
-`index.html`, the gateway boots in **API-only mode** and the dashboard URL
+`index.html` that resolves within its dashboard root, the gateway boots in **API-only mode** and the dashboard URL
 returns a "not available" message.
 
 ## TL;DR
@@ -33,8 +35,10 @@ Web dashboard: not available — no web/dist found. Build with `cargo web build`
 to
 
 ```text
-Web dashboard: serving from /absolute/path/to/zeroclaw/web/dist
+Web dashboard: serving filesystem assets
 ```
+
+The resolved directory is recorded in the structured `path` field of that log event.
 
 ## What the setting does
 
@@ -42,9 +46,9 @@ Web dashboard: serving from /absolute/path/to/zeroclaw/web/dist
 contains a built `index.html`. At gateway start, the daemon:
 
 1. Reads the configured value (or the env-var override).
-2. Verifies the directory exists AND contains `index.html` on this machine.
+2. Verifies the directory exists and its `index.html` resolves inside that dashboard root on this machine.
 3. If yes, serves the dashboard from that path.
-4. If no, logs a WARN ("path doesn't contain `index.html` on this machine;
+4. If no, logs a WARN ("path has no usable `index.html` on this machine;
    falling back to auto-detect") and tries the auto-detect candidates below.
 5. If auto-detect also turns up nothing, the gateway runs in API-only mode
    and `GET /` returns a "not available" message that points back here.
@@ -55,9 +59,9 @@ auto-detect rather than crashing every dashboard request.
 
 ## Default: auto-detect order
 
-When `gateway.web_dist_dir` is unset (or set to a path with no `index.html`),
+When `gateway.web_dist_dir` is unset (or set to a path with no usable `index.html`),
 the daemon probes these locations in order and serves from the first one that
-contains `index.html`:
+contains an `index.html` that resolves within that candidate root:
 
 | # | Candidate | When it matches |
 |---|-----------|-----------------|
@@ -171,12 +175,12 @@ directory (e.g. via systemd), the relative form will look in the wrong place.
 ### "Stale path" WARN at startup
 
 ```text
-WARN gateway.web_dist_dir points at a path that doesn't contain index.html
+WARN gateway.web_dist_dir points at a path without a usable index.html
 on this machine; falling back to auto-detect. Update or remove the setting
 to silence this warning.
 ```
 
-This means the path is syntactically valid but the file isn't there yet.
+This means the path is syntactically valid but its index file is missing or cannot be served from that dashboard root.
 Either run `cargo web build`, fix the path, or remove the setting entirely
 and let auto-detect handle it.
 

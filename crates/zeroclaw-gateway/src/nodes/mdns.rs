@@ -121,6 +121,7 @@ impl MdnsPeer {
 
 /// Authenticated API/status snapshot of a discovered LAN peer.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct MdnsPeerSnapshot {
     pub id: String,
     pub name: String,

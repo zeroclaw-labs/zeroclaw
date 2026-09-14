@@ -459,16 +459,9 @@
       document.documentElement.classList.remove('pc-diagram-modal-open');
 
       if (activeDiagram) {
-        const {
-          svg,
-          placeholder,
-          originalTransform,
-          originalAriaHidden,
-          originalTabIndex,
-        } = activeDiagram;
+        const { svg, placeholder, originalTransform, originalTabIndex } =
+          activeDiagram;
         svg.style.transform = originalTransform;
-        if (originalAriaHidden === null) svg.removeAttribute('aria-hidden');
-        else svg.setAttribute('aria-hidden', originalAriaHidden);
         if (originalTabIndex === null) svg.removeAttribute('tabindex');
         else svg.setAttribute('tabindex', originalTabIndex);
         if (placeholder.isConnected) placeholder.replaceWith(svg);
@@ -503,11 +496,12 @@
         svg: svg,
         placeholder: placeholder,
         originalTransform: svg.style.transform,
-        originalAriaHidden: svg.getAttribute('aria-hidden'),
         originalTabIndex: svg.getAttribute('tabindex'),
       };
       svg.replaceWith(placeholder);
-      svg.setAttribute('aria-hidden', 'true');
+      // The live node must stay exposed to assistive technology inside the
+      // dialog: its Mermaid <title>/<desc> are the accessible name and
+      // description of the diagram while it is zoomed (#10548).
       svg.removeAttribute('tabindex');
       stage.replaceChildren(svg);
       modal.hidden = false;
@@ -551,6 +545,36 @@
     stage.addEventListener('pointercancel', stopDragging);
     document.addEventListener('keydown', function (e) {
       if (!modal.hidden && e.key === 'Escape') closeModal();
+    });
+    // The dialog declares aria-modal="true", so keyboard focus must stay
+    // inside it until it closes. Cycle Tab/Shift+Tab across the dialog's
+    // enabled controls; disabled zoom buttons are skipped (disabled controls
+    // are not focusable, so they must not become a wrap target).
+    function modalFocusables() {
+      return Array.from(
+        modal.querySelectorAll(
+          'button:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter(function (el) {
+        return el.getClientRects().length > 0;
+      });
+    }
+    document.addEventListener('keydown', function (e) {
+      if (modal.hidden || e.key !== 'Tab') return;
+      const focusable = modalFocusables();
+      if (focusable.length === 0) {
+        e.preventDefault();
+        close.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const current = document.activeElement;
+      if (!modal.contains(current) || (e.shiftKey && current === first)
+        || (!e.shiftKey && current === last)) {
+        e.preventDefault();
+        (e.shiftKey ? last : first).focus();
+      }
     });
 
     controls.append(zoomOut, zoomValue, zoomIn, zoomReset);

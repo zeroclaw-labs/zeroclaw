@@ -189,6 +189,20 @@ impl ModelRoutingConfigTool {
         Ok(value.to_string())
     }
 
+    fn reject_unknown_model_provider_family(family: &str, name: &str) -> anyhow::Result<()> {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "model_provider_family": family,
+                    "name": name,
+                })),
+            "model_routing_config: unknown model_provider family"
+        );
+        anyhow::bail!("unknown model_provider type `{family}`. no typed slot in ModelProviders")
+    }
+
     fn parse_optional_string_update(args: &Value, field: &str) -> anyhow::Result<MaybeSet<String>> {
         let Some(raw) = args.get(field) else {
             return Ok(MaybeSet::Unset);
@@ -873,10 +887,37 @@ impl ModelRoutingConfigTool {
     async fn handle_upsert_agent(&self, args: &Value) -> anyhow::Result<ToolResult> {
         let name = Self::parse_non_empty_string(args, "name")?;
         let model_provider = Self::parse_non_empty_string(args, "model_provider")?;
-        let model = Self::parse_non_empty_string(args, "model")?;
-
-        let api_key_update = Self::parse_optional_string_update(args, "api_key")?;
-        let temperature_update = Self::parse_optional_f64_update(args, "temperature")?;
+        let provider_ref_parts = model_provider.split_once('.');
+        let model = if provider_ref_parts.is_some() {
+            if args.get("model").is_some() {
+                anyhow::bail!(
+                    "'model' cannot be supplied when reusing a configured model provider ref"
+                );
+            }
+            None
+        } else {
+            Some(Self::parse_non_empty_string(args, "model")?)
+        };
+        let api_key_update = if provider_ref_parts.is_some() {
+            if args.get("api_key").is_some() {
+                anyhow::bail!(
+                    "'api_key' cannot be supplied when reusing a configured model provider ref"
+                );
+            }
+            MaybeSet::Unset
+        } else {
+            Self::parse_optional_string_update(args, "api_key")?
+        };
+        let temperature_update = if provider_ref_parts.is_some() {
+            if args.get("temperature").is_some() {
+                anyhow::bail!(
+                    "'temperature' cannot be supplied when reusing a configured model provider ref"
+                );
+            }
+            MaybeSet::Unset
+        } else {
+            Self::parse_optional_f64_update(args, "temperature")?
+        };
         let max_depth_update = Self::parse_optional_u32_update(args, "max_depth")?;
         let max_iterations_update = Self::parse_optional_usize_update(args, "max_iterations")?;
         let agentic_update = Self::parse_optional_bool(args, "agentic")?;
@@ -897,43 +938,62 @@ impl ModelRoutingConfigTool {
 
         let mut cfg = self.load_config_without_env()?;
 
-        // synthesize providers.models[model_provider_family][name] from inline brain params.
-        // The arg is the family name (e.g. "openai"); the agent's `model_provider`
-        // reference becomes the dotted form (e.g. "openai.coder").
-        let model_provider_family = model_provider;
-        let agent_model_provider_ref = format!("{model_provider_family}.{name}");
+        // Validate the provider route before mutating any provider, profile, or agent state.
+        let agent_model_provider_ref = if let Some((family, alias)) = provider_ref_parts {
+            if !zeroclaw_config::providers::ModelProviders::slot_names().contains(&family) {
+                Self::reject_unknown_model_provider_family(family, &name)?;
+            }
+            if cfg.providers.models.find(family, alias).is_none() {
+                anyhow::bail!(
+                    "model_provider ref `{model_provider}` is not configured in ModelProviders"
+                );
+            }
+            model_provider.clone()
+        } else {
+            if !zeroclaw_config::providers::ModelProviders::slot_names()
+                .contains(&model_provider.as_str())
+            {
+                Self::reject_unknown_model_provider_family(&model_provider, &name)?;
+            }
+            format!("{model_provider}.{name}")
+        };
+
+        // Validate all bounded updates before mutating the loaded config.
+        if let MaybeSet::Set(value) = temperature_update
+            && !(0.0..=2.0).contains(&value)
         {
-            let provider_entry =
-                cfg.providers.models
-                    .ensure(&model_provider_family, &name)
-                    .ok_or_else(|| {
-                        ::zeroclaw_log::record!(
-                            ERROR,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({
-                                    "model_provider_family": &model_provider_family,
-                                    "name": &name,
-                                })),
-                            "model_routing_config: unknown model_provider family"
-                        );
-                        anyhow::Error::msg(format!(
-                            "unknown model_provider type `{model_provider_family}`. no typed slot in ModelProviders"
-                        ))
-                    })?;
-            provider_entry.model = Some(model.clone());
+            anyhow::bail!("'temperature' must be between 0.0 and 2.0");
+        }
+        if let MaybeSet::Set(iters) = max_iterations_update
+            && iters == 0
+        {
+            anyhow::bail!("'max_iterations' must be greater than 0");
+        }
+        if let MaybeSet::Set(depth) = max_depth_update
+            && depth == 0
+        {
+            anyhow::bail!("'max_depth' must be greater than 0");
+        }
+
+        // Bare families synthesize providers.models[family][agent] from inline params.
+        if let Some(model) = model {
+            let provider_entry = cfg
+                .providers
+                .models
+                .ensure(&model_provider, &name)
+                .ok_or_else(|| {
+                    anyhow::Error::msg(format!(
+                        "unknown model_provider type `{model_provider}`. no typed slot in ModelProviders"
+                    ))
+                })?;
+            provider_entry.model = Some(model);
             match api_key_update {
                 MaybeSet::Set(ref v) => provider_entry.api_key = Some(v.clone()),
                 MaybeSet::Null => provider_entry.api_key = None,
                 MaybeSet::Unset => {}
             }
             match temperature_update {
-                MaybeSet::Set(value) => {
-                    if !(0.0..=2.0).contains(&value) {
-                        anyhow::bail!("'temperature' must be between 0.0 and 2.0");
-                    }
-                    provider_entry.temperature = Some(value);
-                }
+                MaybeSet::Set(value) => provider_entry.temperature = Some(value),
                 MaybeSet::Null => provider_entry.temperature = None,
                 MaybeSet::Unset => {}
             }
@@ -954,17 +1014,11 @@ impl ModelRoutingConfigTool {
                 runtime.agentic = agentic;
             }
             if let MaybeSet::Set(iters) = max_iterations_update {
-                if iters == 0 {
-                    anyhow::bail!("'max_iterations' must be greater than 0");
-                }
                 runtime.max_tool_iterations = iters;
             } else if runtime.max_tool_iterations == 0 {
                 runtime.max_tool_iterations = DEFAULT_AGENT_MAX_ITERATIONS;
             }
             if let MaybeSet::Set(depth) = max_depth_update {
-                if depth == 0 {
-                    anyhow::bail!("'max_depth' must be greater than 0");
-                }
                 runtime.max_delegation_depth = depth;
             } else if runtime.max_delegation_depth == 0 {
                 runtime.max_delegation_depth = DEFAULT_AGENT_MAX_DEPTH;
@@ -1084,7 +1138,7 @@ impl Tool for ModelRoutingConfigTool {
                 },
                 "model": {
                     "type": "string",
-                    "description": "Model for set_default/upsert_scenario/upsert_agent"
+                    "description": "Model for set_default/upsert_scenario or bare-family upsert_agent; omitted when upsert_agent reuses an existing dotted provider ref"
                 },
                 "temperature": {
                     "type": ["number", "null"],
@@ -1383,6 +1437,153 @@ mod tests {
         let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
         let output: Value = serde_json::from_str(&get_result.output).unwrap();
         assert!(output["agents"]["coder"].is_null());
+    }
+
+    #[tokio::test]
+    async fn upsert_agent_reuses_configured_dotted_provider_ref() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+
+        let provision = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "truefoundry",
+                "model_provider": "custom",
+                "model": "provider-model",
+                "temperature": 0.4
+            }))
+            .await
+            .unwrap();
+        assert!(provision.success, "{:?}", provision.error);
+
+        let provider_before = serde_json::to_value(
+            read_saved_provider_entry(&cfg_path, "custom", "truefoundry")
+                .expect("bare family upsert must create custom.truefoundry"),
+        )
+        .unwrap();
+
+        let reuse = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "custom.truefoundry",
+                "allowed_tools": ["file_read"]
+            }))
+            .await
+            .unwrap();
+        assert!(reuse.success, "{:?}", reuse.error);
+
+        let provider_after = serde_json::to_value(
+            read_saved_provider_entry(&cfg_path, "custom", "truefoundry")
+                .expect("reused provider must remain configured"),
+        )
+        .unwrap();
+        assert_eq!(provider_after, provider_before);
+
+        let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
+        let output: Value = serde_json::from_str(&get_result.output).unwrap();
+        assert_eq!(
+            output["agents"]["coder"]["model_provider"],
+            json!("custom.truefoundry")
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_agent_rejects_invalid_provider_requests_without_mutation() {
+        let cases = [
+            ("unknown family", json!("unknown"), true),
+            ("unknown dotted family", json!("unknown.alias"), false),
+            ("missing dotted alias", json!("custom.missing"), false),
+            ("bare family without model", json!("custom"), false),
+        ];
+
+        for (case, model_provider, has_model) in cases {
+            let tmp = TempDir::new().unwrap();
+            let cfg_path = tmp.path().join("config.toml");
+            let tool =
+                ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+            let before = std::fs::read_to_string(&cfg_path).unwrap();
+
+            let mut args = json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": model_provider
+            });
+            if has_model {
+                args["model"] = json!("model");
+            }
+
+            let result = tool.execute(args).await.unwrap();
+            assert!(!result.success, "{case} unexpectedly succeeded");
+            assert_eq!(
+                std::fs::read_to_string(&cfg_path).unwrap(),
+                before,
+                "{case}"
+            );
+
+            let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
+            let output: Value = serde_json::from_str(&get_result.output).unwrap();
+            assert!(output["agents"].as_object().unwrap().is_empty(), "{case}");
+            assert!(
+                read_saved_provider_entry(&cfg_path, "custom", "missing").is_none(),
+                "{case} must not create a provider alias"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upsert_agent_rejects_provider_mutations_on_reused_ref() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+
+        for (name, model_provider) in [("truefoundry", "custom"), ("coder", "openai")] {
+            let result = tool
+                .execute(json!({
+                    "action": "upsert_agent",
+                    "name": name,
+                    "model_provider": model_provider,
+                    "model": "original-model"
+                }))
+                .await
+                .unwrap();
+            assert!(result.success, "{:?}", result.error);
+        }
+
+        let before = std::fs::read_to_string(&cfg_path).unwrap();
+        let provider_before = serde_json::to_value(
+            read_saved_provider_entry(&cfg_path, "custom", "truefoundry")
+                .expect("provider setup must create custom.truefoundry"),
+        )
+        .unwrap();
+
+        for (field, value) in [
+            ("model", json!("replacement-model")),
+            ("api_key", json!("replacement-key")),
+            ("temperature", json!(1.2)),
+        ] {
+            let mut args = json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "custom.truefoundry"
+            });
+            args[field] = value;
+
+            let result = tool.execute(args).await.unwrap();
+            assert!(!result.success, "{field} unexpectedly accepted");
+            assert_eq!(
+                std::fs::read_to_string(&cfg_path).unwrap(),
+                before,
+                "{field}"
+            );
+            let provider_after = serde_json::to_value(
+                read_saved_provider_entry(&cfg_path, "custom", "truefoundry")
+                    .expect("reused provider must remain configured"),
+            )
+            .unwrap();
+            assert_eq!(provider_after, provider_before, "{field}");
+        }
     }
 
     #[tokio::test]

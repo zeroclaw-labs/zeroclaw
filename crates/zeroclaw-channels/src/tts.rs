@@ -440,6 +440,8 @@ pub struct EdgeTtsProvider {
     binary_path: String,
     #[cfg(test)]
     binary_args: Vec<String>,
+    #[cfg(test)]
+    artifact_dir: Option<PathBuf>,
     timeout: std::time::Duration,
 }
 
@@ -693,6 +695,8 @@ impl EdgeTtsProvider {
             binary_path: raw_path,
             #[cfg(test)]
             binary_args: Vec::new(),
+            #[cfg(test)]
+            artifact_dir: None,
             timeout: TTS_HTTP_TIMEOUT,
         })
     }
@@ -708,8 +712,66 @@ impl EdgeTtsProvider {
             alias: alias.to_string(),
             binary_path: binary_path.to_string(),
             binary_args: binary_args.iter().map(|arg| (*arg).to_string()).collect(),
+            artifact_dir: None,
             timeout,
         }
+    }
+
+    #[cfg(all(test, unix))]
+    fn with_artifact_dir(mut self, artifact_dir: PathBuf) -> Self {
+        self.artifact_dir = Some(artifact_dir);
+        self
+    }
+}
+
+impl EdgeTtsProvider {
+    /// Pre-create the media artifact with owner-only permissions (0o600) on Unix.
+    ///
+    /// Left to the edge-tts subprocess, the media file is created with
+    /// umask-affected defaults (typically 0o644), which exposes synthesized
+    /// audio to other users on shared hosts. Creating the file first means the
+    /// child truncates and writes into an existing owner-only file.
+    /// ``create_new`` also makes a UUID collision fail loudly instead of
+    /// clobbering another artifact.
+    fn create_owner_only_artifact(path: &std::path::Path) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+            let artifact = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .context("Failed to create Edge TTS artifact with owner-only permissions")?;
+
+            // `open(2)` applies the process umask to the requested mode. Apply
+            // the final mode through the open handle so a restrictive umask
+            // cannot make the file unusable, and so a path replacement between
+            // creation and permission hardening cannot redirect the chmod.
+            let permission_result = artifact
+                .set_permissions(std::fs::Permissions::from_mode(0o600))
+                .context("Failed to apply owner-only permissions to Edge TTS artifact");
+            drop(artifact);
+
+            if let Err(error) = permission_result {
+                // The file was created by this call, so retain ownership of
+                // cleanup when permission hardening fails. Do not mask the
+                // primary permission error if the best-effort unlink also
+                // fails.
+                if let Err(cleanup_error) = std::fs::remove_file(path) {
+                    return Err(error.context(format!(
+                        "Failed to remove Edge TTS artifact after permission setup failed: {cleanup_error}"
+                    )));
+                }
+                return Err(error);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+        }
+        Ok(())
     }
 }
 
@@ -724,11 +786,25 @@ impl TtsProvider for EdgeTtsProvider {
         "mp3"
     }
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>> {
+        #[cfg(test)]
+        let temp_dir = self.artifact_dir.clone().unwrap_or_else(std::env::temp_dir);
+        #[cfg(not(test))]
         let temp_dir = std::env::temp_dir();
         let output_file = temp_dir.join(format!("zeroclaw_tts_{}.mp3", uuid::Uuid::new_v4()));
         let output_path = output_file
             .to_str()
             .context("Failed to build temp file path for Edge TTS")?;
+        Self::create_owner_only_artifact(&output_file)?;
+
+        // Take ownership of the newly-created artifact before attempting to
+        // start the subprocess. If spawning fails (for example, because the
+        // binary is missing or cannot be executed), dropping this guard removes
+        // the otherwise-empty file instead of leaving one orphan per request.
+        let mut artifact = EdgeTtsTempArtifact {
+            path: output_file.clone(),
+            child: None,
+            stderr_reader: None,
+        };
 
         // Spawn explicitly and move the child into the artifact guard, which
         // owns the child through timeout handling AND cancellation: on any path
@@ -749,11 +825,7 @@ impl TtsProvider for EdgeTtsProvider {
             .kill_on_drop(true)
             .spawn()
             .context("Failed to spawn edge-tts subprocess")?;
-        let mut artifact = EdgeTtsTempArtifact {
-            path: output_file.clone(),
-            child: Some(child),
-            stderr_reader: None,
-        };
+        artifact.child = Some(child);
 
         // Drain stderr concurrently so a verbose child cannot deadlock on a
         // full pipe while we wait for it to exit. Bytes are decoded lossily so
@@ -1060,14 +1132,15 @@ impl TtsManager {
                     }
                 }
                 Err(e) => {
+                    let config_path = format!("[providers.tts.{dotted}]");
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(
-                                ::serde_json::json!({"error": format!("{}", e), "dotted": dotted})
+                                ::serde_json::json!({"error": e.to_string(), "config_path": config_path})
                             ),
-                        "Skipping TTS provider"
+                        "typed TTS provider skipped (config error)"
                     );
                 }
             }
@@ -1299,6 +1372,148 @@ mod tests {
             .status()
             .await
             .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edge_tts_artifact_is_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path =
+            std::env::temp_dir().join(format!("zeroclaw_tts_perm_{}.mp3", uuid::Uuid::new_v4()));
+
+        EdgeTtsProvider::create_owner_only_artifact(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "Edge TTS artifact must be owner-only before the subprocess writes it"
+        );
+
+        // A collision fails loudly instead of clobbering an existing artifact.
+        assert!(EdgeTtsProvider::create_owner_only_artifact(&path).is_err());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edge_tts_artifact_is_owner_only_and_writable_under_restrictive_umask() {
+        const CHILD_ENV: &str = "ZEROCLAW_TTS_UMASK_TEST_CHILD";
+        const TEST_NAME: &str =
+            "tts::tests::edge_tts_artifact_is_owner_only_and_writable_under_restrictive_umask";
+
+        // The umask is process-global. Run the behavioral part in a dedicated
+        // test subprocess so unrelated tests in the parent harness cannot
+        // observe the temporary restrictive umask.
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = std::process::Command::new(
+                std::env::current_exe().expect("test executable must be available"),
+            )
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .status()
+            .expect("spawn restrictive-umask test subprocess");
+            assert!(
+                status.success(),
+                "restrictive-umask test subprocess failed with status {status}"
+            );
+            return;
+        }
+
+        struct UmaskRestore(libc::mode_t);
+
+        impl Drop for UmaskRestore {
+            fn drop(&mut self) {
+                // SAFETY: umask only changes this test subprocess's process
+                // state, and the original value was captured immediately
+                // before the test changed it.
+                unsafe {
+                    libc::umask(self.0);
+                }
+            }
+        }
+
+        // Create the directory before tightening the umask; otherwise the
+        // test fixture itself would be created with mode 000 and be unusable.
+        let artifact_dir = tempfile::tempdir().expect("create isolated artifact directory");
+
+        // SAFETY: umask accepts any mode bits and returns the prior process
+        // value; this subprocess runs only the current test.
+        let previous_umask = unsafe { libc::umask(0o777) };
+        let _umask_restore = UmaskRestore(previous_umask);
+
+        let artifact_path = artifact_dir.path().join("artifact.mp3");
+        let artifact_path = artifact_path
+            .to_str()
+            .expect("artifact path must be valid UTF-8");
+        EdgeTtsProvider::create_owner_only_artifact(std::path::Path::new(artifact_path))
+            .expect("artifact creation must survive a restrictive umask");
+
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(artifact_path)
+            .expect("inspect artifact")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "the artifact must be exactly owner-only before the child writes it"
+        );
+
+        let status = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "printf audio > \"$1\"",
+                "edge-tts-umask-test",
+                artifact_path,
+            ])
+            .status()
+            .expect("spawn child writer");
+        assert!(status.success(), "child writer failed with status {status}");
+        assert_eq!(
+            std::fs::read(artifact_path).expect("read child-written artifact"),
+            b"audio"
+        );
+        std::fs::remove_file(artifact_path).expect("remove test artifact");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edge_tts_removes_temp_output_when_spawn_fails() {
+        let artifact_dir = tempfile::tempdir().expect("create isolated artifact directory");
+        let missing_binary = artifact_dir
+            .path()
+            .join(format!("missing-edge-tts-{}", uuid::Uuid::new_v4()));
+        let provider = EdgeTtsProvider::new_with_command(
+            "test",
+            missing_binary
+                .to_str()
+                .expect("missing binary path must be valid UTF-8"),
+            &[],
+            std::time::Duration::from_secs(5),
+        )
+        .with_artifact_dir(artifact_dir.path().to_path_buf());
+
+        let error = provider
+            .synthesize("hello", "en-US-AriaNeural")
+            .await
+            .expect_err("a missing edge-tts binary must fail to spawn");
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to spawn edge-tts subprocess"),
+            "expected spawn failure, got: {error:#}"
+        );
+
+        let remaining = std::fs::read_dir(artifact_dir.path())
+            .expect("inspect isolated artifact directory")
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("read isolated artifact directory entries");
+        assert!(
+            remaining.is_empty(),
+            "spawn failure must remove the newly-created artifact, found: {remaining:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -1818,6 +2033,53 @@ mod tests {
         let provider = OpenAiTtsProvider::new("test", &cfg).unwrap();
         assert_eq!(provider.base_url, "https://api.openai.com/v1/audio/speech");
         assert_eq!(provider.response_format, "opus");
+    }
+
+    #[test]
+    fn typed_registration_logs_config_path_for_keyless_uri_only_provider() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        // The exact real-world failure mode this diagnostic exists for: a
+        // local, keyless endpoint (e.g. Kokoro) configured via `uri` alone,
+        // with no `api_key`. `OpenAiTtsProvider::new` bails before it ever
+        // reads `uri`, so the provider never registers.
+        let mut cfg = Config::default();
+        cfg.providers.tts.openai.insert(
+            "stoa".to_string(),
+            zeroclaw_config::schema::OpenAITtsProviderConfig {
+                base: TtsProviderConfig {
+                    uri: Some("http://localhost:8880/v1/audio/speech".to_string()),
+                    ..TtsProviderConfig::default()
+                },
+            },
+        );
+
+        let manager = TtsManager::from_config(&cfg).unwrap();
+        assert!(
+            manager.available_providers().is_empty(),
+            "keyless openai provider must not register: {:?}",
+            manager.available_providers()
+        );
+
+        let events: Vec<serde_json::Value> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let event = events
+            .iter()
+            .find(|value| value["attributes"]["config_path"] == "[providers.tts.openai.stoa]")
+            .unwrap_or_else(|| panic!("expected a skip record for openai.stoa: {events:?}"));
+        assert_eq!(
+            event["message"], "typed TTS provider skipped (config error)",
+            "event: {event:?}"
+        );
+        assert!(
+            event["attributes"]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("api_key")),
+            "error should name the missing api_key: {event:?}"
+        );
     }
 
     #[cfg(unix)]
