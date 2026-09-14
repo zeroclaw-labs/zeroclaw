@@ -2600,6 +2600,11 @@ impl RpcDispatcher {
                         .to_string(),
                     ),
                 ),
+                Ok(crate::rpc::turn::TurnOutcome::ContextExhausted { .. }) => (
+                    ::zeroclaw_log::Action::Fail,
+                    ::zeroclaw_log::EventOutcome::Failure,
+                    Some(::serde_json::json!({ "reason": "context_exhausted" }).to_string()),
+                ),
                 Err(e) => (
                     ::zeroclaw_log::Action::Fail,
                     ::zeroclaw_log::EventOutcome::Failure,
@@ -2663,17 +2668,28 @@ impl RpcDispatcher {
             crate::rpc::types::ChatMode::Chat => {
                 if let Some(ref backend) = self.ctx.session_backend {
                     let key = format!("rpc_{sid}");
-                    let _ = backend.append(&key, &ChatMessage::user(&prompt));
                     match &outcome {
+                        Ok(TurnOutcome::ContextExhausted { messages, .. }) => {
+                            // The failed-turn delta is the canonical record:
+                            // enriched user input, any streamed partial, then
+                            // the runtime-authored notice. Persist it directly
+                            // so deriving only the last assistant text cannot
+                            // discard the partial or duplicate the user row.
+                            persist_chat_turn_messages(backend.as_ref(), &key, messages);
+                        }
                         Ok(TurnOutcome::Completed { text, .. }) => {
+                            let _ = backend.append(&key, &ChatMessage::user(&prompt));
                             let _ = backend.append(&key, &ChatMessage::assistant(text));
                         }
                         Ok(TurnOutcome::Cancelled { partial_text, .. })
                             if !partial_text.is_empty() =>
                         {
+                            let _ = backend.append(&key, &ChatMessage::user(&prompt));
                             let _ = backend.append(&key, &ChatMessage::assistant(partial_text));
                         }
-                        _ => {}
+                        Ok(TurnOutcome::Cancelled { .. }) | Err(_) => {
+                            let _ = backend.append(&key, &ChatMessage::user(&prompt));
+                        }
                     }
                 }
             }
@@ -2761,6 +2777,29 @@ impl RpcDispatcher {
                     session_id: req.session_id,
                     stop_reason: "cancelled".to_string(),
                     content: partial_text,
+                })
+            }
+            Ok(TurnOutcome::ContextExhausted { text, .. }) => {
+                // Context exhaustion ends the turn as a failure, so the durable
+                // row has to leave `running` exactly like the generic error arm
+                // below and like the gateway's failed-turn path. Skipping this
+                // write would leave `session/state` and stuck-session detection
+                // reporting a live turn that already returned to the caller.
+                if persist_session_state && let Some(ref backend) = self.ctx.session_backend {
+                    let _ = backend.set_session_state(&session_key, "error", Some(&turn_id));
+                }
+                self.emit_turn_complete(
+                    &req.session_id,
+                    crate::rpc::types::TurnCompletionOutcome::Failed,
+                    text.clone(),
+                    req.client_turn_generation,
+                    message_count,
+                )
+                .await;
+                to_result(SessionPromptResult {
+                    session_id: req.session_id,
+                    stop_reason: "context_exhausted".to_string(),
+                    content: text,
                 })
             }
             Err(e) => {
@@ -5644,6 +5683,25 @@ fn context_usage_max_tokens(cfg: &zeroclaw_config::schema::Config, agent_alias: 
     cfg.effective_max_context_tokens(agent_alias) as u64
 }
 
+/// Persist the Chat-compatible rows from the runtime's canonical turn delta.
+/// Structured tool messages have no representation in SessionBackend; system
+/// rows are prompt scaffolding and must never become transcript messages.
+fn persist_chat_turn_messages(
+    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    session_key: &str,
+    messages: &[zeroclaw_api::model_provider::ConversationMessage],
+) {
+    for message in messages {
+        let zeroclaw_api::model_provider::ConversationMessage::Chat(message) = message else {
+            continue;
+        };
+        if message.role == "system" {
+            continue;
+        }
+        let _ = backend.append(session_key, message);
+    }
+}
+
 /// Persist the exact turn delta captured before structured history trimming.
 /// Empty and failed turns intentionally remain no-ops.
 async fn persist_acp_turn(
@@ -5654,6 +5712,7 @@ async fn persist_acp_turn(
     let messages = match outcome {
         Ok(TurnOutcome::Completed { messages, .. })
         | Ok(TurnOutcome::Cancelled { messages, .. })
+        | Ok(TurnOutcome::ContextExhausted { messages, .. })
             if !messages.is_empty() =>
         {
             messages.clone()
@@ -10139,6 +10198,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acp_persistence_keeps_context_exhaustion_notice_for_resume() {
+        use zeroclaw_api::model_provider::ConversationMessage;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let sid = "context-exhausted";
+        store.create_session(sid, "agent", "/tmp").unwrap();
+        let notice = crate::i18n::get_required_cli_string("turn-context-exhausted");
+        let messages = vec![
+            ConversationMessage::Chat(ChatMessage::user("large request")),
+            ConversationMessage::Chat(ChatMessage::assistant(notice.clone())),
+        ];
+        let outcome = Ok(TurnOutcome::ContextExhausted {
+            text: notice.clone(),
+            messages: messages.clone(),
+        });
+
+        assert_eq!(persist_acp_turn(&store, sid, &outcome).await, None);
+
+        let restored = store.load_session(sid).unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored.messages).unwrap(),
+            serde_json::to_value(&messages).unwrap(),
+            "session resume must retain the terminal explanation"
+        );
+    }
+
+    struct PartialThenContextProvider;
+
+    #[async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for PartialThenContextProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("streaming path required")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: zeroclaw_api::model_provider::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_api::model_provider::StreamResult<zeroclaw_api::model_provider::StreamEvent>,
+        > {
+            use futures_util::StreamExt as _;
+            futures_util::stream::iter(vec![
+                Ok(zeroclaw_api::model_provider::StreamEvent::TextDelta(
+                    zeroclaw_api::model_provider::StreamChunk::delta("partial answer"),
+                )),
+                Err(zeroclaw_api::model_provider::StreamError::ModelProvider(
+                    "maximum context length exceeded".into(),
+                )),
+            ])
+            .boxed()
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for PartialThenContextProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "partial-context"
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_stream_context_error_persists_partial_and_notice_for_reload() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, sessions, chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, tmp.path());
+        let sid = "chat-context-partial";
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(PartialThenContextProvider))
+            .model_provider_name("test.partial-context".into())
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .build()
+            .expect("stream-error test agent should build");
+        sessions
+            .insert(
+                sid.to_string(),
+                crate::rpc::session::RpcSession::new(
+                    agent,
+                    "default",
+                    tmp.path().to_str().unwrap(),
+                    crate::rpc::types::ChatMode::Chat,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let result = dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": sid,
+                "prompt": "large request",
+            }))
+            .await
+            .expect("typed context exhaustion returns a terminal RPC result");
+        assert_eq!(result["stop_reason"], "context_exhausted");
+
+        let restored = chat_backend.load(&format!("rpc_{sid}"));
+        assert_eq!(
+            restored.len(),
+            3,
+            "reload must restore the complete failed turn"
+        );
+        assert!(
+            restored[0].content.ends_with("\n\nlarge request"),
+            "the canonical enriched user row must be persisted once"
+        );
+        assert_eq!(restored[1].role, "assistant");
+        assert_eq!(restored[1].content, "partial answer");
+        assert_eq!(restored[2].role, "assistant");
+        assert_eq!(
+            restored[2].content,
+            crate::i18n::get_required_cli_string("turn-context-exhausted")
+        );
+    }
+
+    #[tokio::test]
     async fn acp_persistence_skips_empty_and_failed_turns() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store =
@@ -14048,6 +14251,140 @@ mod tests {
         assert!(
             after.turn_id.is_some(),
             "the error state must still carry the turn id it failed under"
+        );
+    }
+
+    /// Context exhaustion returns a terminal RPC response, so the durable Chat
+    /// row must leave `running` on that path too. Otherwise `session/state` and
+    /// stuck-session detection keep reporting the finished turn as live.
+    #[tokio::test]
+    async fn session_prompt_leaves_running_state_on_context_exhaustion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+
+        let sid = "rpc-state-context-exhausted";
+        let session_key =
+            install_state_test_session(&sessions, &chat_backend, sid, PartialThenContextProvider)
+                .await;
+
+        let ctx = RpcContext::for_persistence_tests(
+            zeroclaw_config::schema::Config::default(),
+            Arc::clone(&sessions),
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            None,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-context-exhausted:pid=1".into());
+
+        let running = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(running.state, "idle", "the session starts out not running");
+
+        let result = dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": sid,
+                "prompt": "large request",
+            }))
+            .await
+            .expect("typed context exhaustion returns a terminal RPC result");
+        assert_eq!(result["stop_reason"], "context_exhausted");
+
+        let after = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            after.state, "running",
+            "a returned context-exhausted turn must not still report as running"
+        );
+        assert_eq!(
+            after.state, "error",
+            "context exhaustion is a failed turn, so it records the error state"
+        );
+        assert!(
+            after.turn_id.is_some(),
+            "the terminal state must carry the turn id it failed under"
+        );
+
+        let reported = dispatcher
+            .handle_session_state(&json!({ "session_id": sid }))
+            .await
+            .expect("a live session resolves its state from the runtime actor");
+        assert_ne!(
+            reported["state"], "running",
+            "the live view must not keep the finished turn in flight either"
+        );
+    }
+
+    /// The context-exhausted arm is a terminal turn arm like Completed,
+    /// Cancelled, and the generic error, so its `TurnComplete` has to carry the
+    /// same turn identity. A client that filters terminal events by
+    /// `client_turn_generation` drops an unattributed one and stays stuck in
+    /// the working state, and a missing `message_count` leaves the client's
+    /// projected history count behind after the failed turn.
+    #[tokio::test]
+    async fn context_exhausted_turn_complete_carries_turn_identity() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+
+        let sid = "rpc-turn-complete-context-exhausted";
+        install_state_test_session(&sessions, &chat_backend, sid, PartialThenContextProvider).await;
+
+        let ctx = RpcContext::for_persistence_tests(
+            zeroclaw_config::schema::Config::default(),
+            Arc::clone(&sessions),
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            None,
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher =
+            RpcDispatcher::new(ctx, tx, "test-peer-context-exhausted-identity:pid=1".into());
+
+        let result = dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": sid,
+                "prompt": "large request",
+                "client_turn_generation": 77,
+            }))
+            .await
+            .expect("typed context exhaustion returns a terminal RPC result");
+        assert_eq!(result["stop_reason"], "context_exhausted");
+
+        let mut turn_complete = None;
+        while let Ok(raw) = rx.try_recv() {
+            let value: serde_json::Value =
+                serde_json::from_str(&raw).expect("notification must be JSON");
+            if value["params"]["type"] == "turn_complete" {
+                turn_complete = Some(value);
+            }
+        }
+        let turn_complete =
+            turn_complete.expect("context exhaustion must emit a terminal TurnComplete");
+        assert_eq!(turn_complete["params"]["outcome"], "failed");
+        assert_eq!(
+            turn_complete["params"]["client_turn_generation"], 77,
+            "the terminal event must echo the caller's turn generation, or a \
+             generation-filtering client discards it and never leaves the \
+             working state"
+        );
+        assert!(
+            turn_complete["params"]["message_count"].is_number(),
+            "the terminal event must report the projected conversation-entry \
+             count like every other terminal arm"
         );
     }
 
