@@ -286,8 +286,8 @@ fn deferred_summary_line(description: &str) -> String {
 }
 
 /// Build the `<available-deferred-tools>` section for the system prompt.
-/// Lists tool names with a one-line summary each (see
-/// [`deferred_summary_line`]) so the LLM knows what is available without
+/// Lists tool names with a one-line summary each (the first non-empty line
+/// of the description, capped) so the LLM knows what is available without
 /// consuming context window on full schemas or full docstrings. Includes an
 /// instruction block that tells the LLM to call `tool_search` to activate
 /// them.
