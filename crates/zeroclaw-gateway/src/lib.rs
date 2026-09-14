@@ -777,6 +777,8 @@ impl GatewaySupervision {
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)] // supervised-run wiring; params mirror the daemon registry
 pub async fn run_gateway(
     host: &str,
     port: u16,
@@ -793,6 +795,10 @@ pub async fn run_gateway(
     // Shared SOP engine from the daemon. `None` when standalone — sessions build their own.
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    // The daemon's canonical live pairing authority, shared with the RPC
+    // native auth provider. `None` (standalone gateway) constructs a
+    // local guard from config as before.
+    shared_pairing: Option<PairingGuard>,
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
 ) -> Result<()> {
     Box::pin(run_gateway_with_plugin_webhooks(
@@ -805,6 +811,7 @@ pub async fn run_gateway(
         canvas_store,
         sop_engine,
         sop_audit,
+        shared_pairing,
         GatewaySupervision::new(
             readiness,
             Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new()),
@@ -827,6 +834,7 @@ pub async fn run_gateway_with_plugin_webhooks(
     canvas_store: Option<CanvasStore>,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    shared_pairing: Option<PairingGuard>,
     supervision: GatewaySupervision,
 ) -> Result<()> {
     let GatewaySupervision {
@@ -1476,10 +1484,15 @@ pub async fn run_gateway_with_plugin_webhooks(
     };
 
     // ── Pairing guard ──────────────────────────────────────
-    let pairing = Arc::new(PairingGuard::new(
-        config.gateway.require_pairing,
-        &config.gateway.paired_tokens,
-    ));
+    // Supervised runs share the daemon's live authority so pairing and
+    // revocation reach RPC authentication too; standalone constructs its
+    // own from config exactly as before.
+    let pairing = Arc::new(shared_pairing.unwrap_or_else(|| {
+        PairingGuard::new(
+            config.gateway.require_pairing,
+            &config.gateway.paired_tokens,
+        )
+    }));
     let rate_limit_max_keys = normalize_max_keys(
         config.gateway.rate_limit_max_keys,
         RATE_LIMIT_MAX_KEYS_DEFAULT,
@@ -5304,6 +5317,7 @@ path = "{trigger_path}"
                 None,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -5372,6 +5386,7 @@ path = "{trigger_path}"
                 None,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -5418,6 +5433,7 @@ path = "{trigger_path}"
                 "127.0.0.1",
                 0,
                 config,
+                None,
                 None,
                 None,
                 None,
@@ -5489,6 +5505,7 @@ path = "{trigger_path}"
                 None,
                 None,
                 None,
+                None,
                 Some(readiness),
             )
             .await
@@ -5552,6 +5569,7 @@ path = "{trigger_path}"
             "127.0.0.1",
             0,
             config,
+            None,
             None,
             None,
             None,
