@@ -2175,6 +2175,10 @@ impl OpenAiCompatibleModelProvider {
     /// OpenCode affinity header value for the calling conversation, or `None`
     /// when this provider does not target OpenCode.
     ///
+    /// Classifies `chat_completions_url()`, the URL every header-carrying
+    /// request is sent to, rather than `base_url`: an `api_path` is appended to
+    /// the base, so the base alone need not name the destination host.
+    ///
     /// Returns `None` when the operator has already pinned the header through
     /// `extra_headers`: those are baked into the client's default headers, so
     /// adding a second value here would put the header on the wire twice.
@@ -2186,7 +2190,7 @@ impl OpenAiCompatibleModelProvider {
         {
             return None;
         }
-        crate::opencode_session::session_token(&self.base_url)
+        crate::opencode_session::session_token(&self.chat_completions_url())
     }
 
     /// Attach the OpenCode affinity header, for request paths that build in the
@@ -5882,19 +5886,42 @@ mod tests {
     fn opencode_session_header_follows_the_built_request_destination() {
         // Header selection must agree with the parser that addresses the
         // request, not with a textual reading of the configured URI.
-        for (base_url, expected_host) in [
+        for (base_url, api_path, expected_host) in [
             // `\` ends the authority; `@opencode.ai/v1` is only path.
-            ("https://relay.example\\@opencode.ai/v1", "relay.example"),
+            (
+                "https://relay.example\\@opencode.ai/v1",
+                None,
+                "relay.example",
+            ),
             // A percent-encoded host decodes to the relay.
-            ("https://%6fpencode.ai/v1", "opencode.ai"),
+            ("https://%6fpencode.ai/v1", None, "opencode.ai"),
+            // `api_path` is appended to the base, so the base alone need not
+            // name the destination; only the finished endpoint does.
+            (
+                "https:",
+                Some("//opencode.ai/zen/v1/chat/completions"),
+                "opencode.ai",
+            ),
+            (
+                "https:",
+                Some("//relay.example/v1/chat/completions"),
+                "relay.example",
+            ),
         ] {
-            let request = built_opencode_request(&opencode_provider(base_url));
+            let provider = OpenAiCompatibleModelProvider::builder("opencode")
+                .display_name("OpenCode Zen")
+                .base_url(base_url)
+                .api_path(api_path.map(str::to_string))
+                .credential(Some("test-key"))
+                .auth_style(AuthStyle::Bearer)
+                .build();
+            let request = built_opencode_request(&provider);
             let host = request.url().host_str().expect("request must have a host");
-            assert_eq!(host, expected_host, "{base_url}");
+            assert_eq!(host, expected_host, "{base_url} + {api_path:?}");
             assert_eq!(
                 request.headers().contains_key(OPENCODE_SESSION_HEADER),
                 host == "opencode.ai",
-                "{base_url}: header selection must match the request host {host}"
+                "{base_url} + {api_path:?}: header selection must match the request host {host}"
             );
         }
     }
