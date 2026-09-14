@@ -6,6 +6,7 @@ pub mod auth;
 pub mod azure_openai;
 pub mod bedrock;
 pub mod catalog;
+pub mod claude_models;
 pub mod compatible;
 pub mod copilot;
 pub mod dispatch;
@@ -4364,6 +4365,7 @@ mod tests {
                 uri: Some("https://api.default.example/v1/messages".into()),
                 ..ModelProviderConfig::default()
             },
+            thinking_display: None,
         };
         let work_alias = AnthropicModelProviderConfig {
             base: ModelProviderConfig {
@@ -4372,6 +4374,7 @@ mod tests {
                 uri: Some("https://work-proxy.example/v1/v1/anthropic/messages".into()),
                 ..ModelProviderConfig::default()
             },
+            thinking_display: None,
         };
         config
             .providers
@@ -5254,6 +5257,7 @@ mod tests {
                     max_tokens: Some(8_192),
                     ..ModelProviderConfig::default()
                 },
+                thinking_display: None,
             },
         );
 

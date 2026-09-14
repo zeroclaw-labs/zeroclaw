@@ -247,6 +247,7 @@ mod tests {
                     model: Some("claude-haiku-4-5".to_string()),
                     ..Default::default()
                 },
+                thinking_display: None,
             },
         );
         cfg.risk_profiles

@@ -1716,6 +1716,7 @@ data: {\"type\":\"message_stop\"}\n\n",
                     model: Some("claude-test".to_string()),
                     ..Default::default()
                 },
+                thinking_display: None,
             },
         );
         config.risk_profiles.insert(
