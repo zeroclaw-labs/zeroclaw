@@ -4959,6 +4959,29 @@ mod tests {
         App::new(rpc, std::path::Path::new("/tmp"))
     }
 
+    /// Builds a [`Term`] that never queries the real terminal.
+    ///
+    /// `Terminal::new` uses `Viewport::Fullscreen`, which asks the backend for
+    /// its size; over a `Stdout` backend that is a `TIOCGWINSZ` ioctl against
+    /// the process's terminal. Under a test harness stdout is a pipe or
+    /// `/dev/null`, so the query has no terminal to answer it and construction
+    /// is at the mercy of how the runner happens to wire up stdout.
+    ///
+    /// `Viewport::Fixed` takes the area verbatim and skips the size query
+    /// entirely (see `Terminal::with_options`), so the handlers under test get
+    /// a real `Term` with deterministic geometry and no environmental
+    /// dependency. Writes still go to stdout and are swallowed by the harness;
+    /// these tests assert on `App` state, never on rendered bytes.
+    fn headless_term() -> Term {
+        Terminal::with_options(
+            WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 120, 40)),
+            },
+        )
+        .expect("Viewport::Fixed skips the terminal size query, so this cannot fail")
+    }
+
     fn test_manager_with_config_validation(
         valid: bool,
         error: Option<&str>,
@@ -5152,7 +5175,7 @@ mod tests {
             prefix: "agents.worker".into(),
             breadcrumb: vec!["agents".into(), "worker".into()],
         };
-        let mut term = Terminal::new(WideCellCleanupBackend::new(std::io::stdout())).unwrap();
+        let mut term = headless_term();
 
         mgr.handle_field_list(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut term)
             .await
@@ -5182,7 +5205,7 @@ mod tests {
             prefix: "agents.worker".into(),
             breadcrumb: vec!["agents".into(), "worker".into()],
         };
-        let mut term = Terminal::new(WideCellCleanupBackend::new(std::io::stdout())).unwrap();
+        let mut term = headless_term();
 
         mgr.handle_field_list(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut term)
             .await
@@ -5211,7 +5234,7 @@ mod tests {
         };
         mgr.tab_names = vec![ConfigTab::Personality];
         mgr.active_tab = 0;
-        let mut term = Terminal::new(WideCellCleanupBackend::new(std::io::stdout())).unwrap();
+        let mut term = headless_term();
 
         mgr.handle_field_list(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut term)
             .await
@@ -5245,7 +5268,7 @@ mod tests {
         };
         mgr.tab_names = vec![ConfigTab::Skills];
         mgr.active_tab = 0;
-        let mut term = Terminal::new(WideCellCleanupBackend::new(std::io::stdout())).unwrap();
+        let mut term = headless_term();
 
         mgr.handle_field_list(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut term)
             .await
