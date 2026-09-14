@@ -256,6 +256,10 @@ impl PipelineTool {
 
 #[async_trait]
 impl Tool for PipelineTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         Self::NAME
     }
