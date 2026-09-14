@@ -1719,13 +1719,7 @@ pub fn all_tools_with_runtime(
 
     // Knowledge graph tool
     if root_config.knowledge.enabled {
-        let db_path_str = root_config.knowledge.db_path.replace(
-            '~',
-            &directories::UserDirs::new()
-                .map(|u| u.home_dir().to_string_lossy().to_string())
-                .unwrap_or_else(|| ".".to_string()),
-        );
-        let db_path = std::path::PathBuf::from(&db_path_str);
+        let db_path = root_config.knowledge.resolved_db_path();
         match zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
             &db_path,
             root_config.knowledge.max_nodes,
@@ -1735,11 +1729,14 @@ pub fn all_tools_with_runtime(
             }
             Err(e) => {
                 ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "knowledge graph disabled due to init error"
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "error": format!("{}", e),
+                            "db_path": db_path.display().to_string(),
+                        })),
+                    "knowledge: failed to initialize tool"
                 );
             }
         }
@@ -3782,6 +3779,59 @@ permissions = ["http_client"]
         assert!(names.contains(&"model_routing_config"));
         assert!(names.contains(&"pushover"));
         assert!(names.contains(&"proxy_config"));
+    }
+
+    #[test]
+    fn all_tools_registers_knowledge_when_db_path_contains_non_prefix_tilde() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig {
+            enabled: false,
+            ..BrowserConfig::default()
+        };
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+
+        // A `~` that is not a home shortcut, as in a Windows 8.3 short name.
+        let mut cfg = test_config(&tmp);
+        cfg.knowledge.enabled = true;
+        cfg.knowledge.db_path = tmp
+            .path()
+            .join("zc~1probe")
+            .join("knowledge.db")
+            .to_string_lossy()
+            .to_string();
+
+        let tools = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+        )
+        .tools;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"knowledge"));
+        // `KnowledgeGraph::new` runs `create_dir_all` on the parent of the path it
+        // was handed, so this directory exists only if the `~` survived resolution.
+        assert!(tmp.path().join("zc~1probe").is_dir());
     }
 
     #[test]

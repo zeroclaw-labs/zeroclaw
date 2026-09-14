@@ -6433,7 +6433,9 @@ async fn process_channel_message_body(
                 ],
             );
             if let Some(channel) = target_channel.as_ref() {
-                let _ = channel.send(&SendMessage::reply_to(&msg, message)).await;
+                let _ = channel
+                    .send(&SendMessage::reply_to(&msg, message).suppress_voice())
+                    .await;
             }
             reconcile_early_ack(
                 ctx.as_ref(),
@@ -7038,7 +7040,8 @@ async fn process_channel_message_body(
                         let _ = ch
                             .send(
                                 &SendMessage::new(&text, &notify_reply_target)
-                                    .in_thread(thread_ts.clone()),
+                                    .in_thread(thread_ts.clone())
+                                    .suppress_voice(),
                             )
                             .await;
                     }
@@ -7797,7 +7800,8 @@ async fn process_channel_message_body(
                     && let Err(e) = channel
                         .send(
                             &SendMessage::new(block, &delivery_recipient)
-                                .in_thread(msg.thread_ts.clone()),
+                                .in_thread(msg.thread_ts.clone())
+                                .suppress_voice(),
                         )
                         .await
                 {
@@ -17315,6 +17319,44 @@ api_key = "anthropic-key"
         finalized_gate_prompts: tokio::sync::Mutex<Vec<(String, String)>>,
     }
 
+    /// Records every outbound `SendMessage` whole, so a test can assert on
+    /// delivery flags (`suppress_voice`, `force_voice`) and not only on
+    /// recipient and text.
+    #[derive(Default)]
+    struct SendMessageRecordingChannel {
+        sent_messages: tokio::sync::Mutex<Vec<SendMessage>>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for SendMessageRecordingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for SendMessageRecordingChannel {
+        fn name(&self) -> &str {
+            "test-channel"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent_messages.lock().await.push(message.clone());
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     #[cfg(feature = "channel-email")]
     #[derive(Default)]
     struct ThreadingRecordingChannel {
@@ -20997,6 +21039,147 @@ BTC is currently around $65,000 based on latest tool output."#
             receipts_message.contains("mock_price"),
             "receipts block should name the tool that produced the receipt, got {receipts_message}"
         );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_keeps_tool_progress_and_receipts_out_of_voice() {
+        // Tool-progress notices and the receipts block are system content:
+        // both must carry `suppress_voice` so a TTS channel never reads them
+        // aloud, while the conversational reply keeps its default routing.
+        let channel_impl = Arc::new(SendMessageRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let base_ctx = test_runtime_ctx_with_observer_and_tools(
+            channel,
+            Arc::new(ToolCallingModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+            Arc::new(NoopObserver),
+            vec![Box::new(MockPriceTool)],
+        );
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            receipt_generator: Some(
+                zeroclaw_runtime::agent::tool_receipts::ReceiptGenerator::new(),
+            ),
+            show_receipts_in_response: true,
+            ..(*base_ctx).clone()
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-42".to_string(),
+                content: "What is the BTC price now?".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        let is_progress = |m: &SendMessage| m.content.starts_with('\u{1F527}');
+        let is_receipts = |m: &SendMessage| m.content.contains("Tool receipts:");
+
+        let progress: Vec<&SendMessage> = sent_messages.iter().filter(|m| is_progress(m)).collect();
+        assert!(
+            !progress.is_empty(),
+            "expected at least one tool-progress notice; got {sent_messages:?}"
+        );
+        for notice in progress {
+            assert!(
+                notice.suppress_voice,
+                "tool-progress notice must suppress voice synthesis, got {notice:?}"
+            );
+            assert!(!notice.force_voice);
+        }
+
+        let receipts = sent_messages
+            .iter()
+            .find(|m| is_receipts(m))
+            .unwrap_or_else(|| panic!("no `Tool receipts:` send found; got {sent_messages:?}"));
+        assert!(
+            receipts.suppress_voice,
+            "receipts block must suppress voice synthesis, got {receipts:?}"
+        );
+        assert!(!receipts.force_voice);
+
+        let reply = sent_messages
+            .iter()
+            .find(|m| !is_progress(m) && !is_receipts(m))
+            .unwrap_or_else(|| panic!("no conversational reply found; got {sent_messages:?}"));
+        assert!(
+            !reply.suppress_voice,
+            "the conversational reply must keep its default voice routing, got {reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_keeps_provider_init_failure_notice_out_of_voice() {
+        // The notice sent when the routed provider cannot be built is system
+        // content, like the other error notices, and must never be voiced.
+        let channel_impl = Arc::new(SendMessageRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(ToolCallingModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "msg-1".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-42".to_string(),
+            content: "hello".to_string(),
+            channel: "test-channel".into(),
+            channel_alias: None,
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+
+            ..Default::default()
+        };
+        runtime_ctx
+            .route_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                runtime_conversation_history_key(runtime_ctx.as_ref(), &msg),
+                ChannelRouteSelection {
+                    model_provider: "no-such-provider".into(),
+                    model: "route-model".to_string(),
+                    api_key: None,
+                },
+            );
+
+        process_channel_message(runtime_ctx, msg, CancellationToken::new()).await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        let notice = sent_messages
+            .iter()
+            .find(|m| m.content.contains("no-such-provider"))
+            .unwrap_or_else(|| {
+                panic!("no provider-init failure notice found; got {sent_messages:?}")
+            });
+        assert!(
+            notice.suppress_voice,
+            "provider-init failure notice must suppress voice synthesis, got {notice:?}"
+        );
+        assert!(!notice.force_voice);
     }
 
     #[tokio::test]

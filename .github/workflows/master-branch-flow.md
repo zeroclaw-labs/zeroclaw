@@ -72,6 +72,7 @@ tag push.
    - `check-32bit`: `i686-unknown-linux-gnu`, no default features.
    - `bench`: benchmarks compile check.
    - `test`: `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on `ubuntu-latest`.
+   - `memory-postgres-test`: feature-enabled `zeroclaw-memory` tests plus serial database-backed acceptance tests against an ephemeral PostgreSQL 17 service.
    - `windows-test-scope` and `windows-test`: advisory-only Windows measurement. The selector compares base SHA..`HEAD` and chooses baseline `skip`, `scoped`, or `full` plus the orthogonal `needs_plugin_host` flag; the Windows job records both outputs, passes explicit `-p` arguments for `scoped`, uses the full workspace command for `full`, and when the flag is true installs `wasm32-wasip2` and runs the feature-enabled plugin component, library, runtime config, runtime admission, gateway, CLI, and root host tests. Baseline and appended invocations use `--no-fail-fast`, retain separate failure statuses, and report baseline, plugin-host, and total durations.
    - `security`: `cargo deny check`.
    - `CI Required Gate`: composite job; branch protection requires this.
@@ -141,6 +142,7 @@ flowchart TD
   W --> WT["windows-test\nadvisory nextest"]
   B --> L["lint\nfmt · clippy"]
   L --> T["test\ncargo nextest --workspace"]
+  L --> PG["memory-postgres-test\nfeature · database acceptance"]
   P --> PF["fmt"]
   PF --> PT["macOS · Windows\nscheduled nextest"]
   L --> BLD["build\nLinux · macOS · Windows"]
@@ -148,7 +150,7 @@ flowchart TD
   L --> C32["check-32bit\ni686-unknown-linux-gnu"]
   L --> BCH["bench\ncompile check"]
   L --> SEC["security\ncargo deny check"]
-  T & BLD & CHK & C32 & BCH & SEC --> G["CI Required Gate"]
+  T & PG & BLD & CHK & C32 & BCH & SEC --> G["CI Required Gate"]
   WT -. "not required" .-> N["measurement only"]
   G -->|red| D["PR stays open"]
   G -->|green| R["Maintainer merges (squash) → master"]

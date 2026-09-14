@@ -215,7 +215,7 @@ mod allowlist {
 // ─── approval ──────────────────────────────────────────────────────────────
 mod approval {
     use rand::{Rng, RngExt};
-    use zeroclaw_api::channel::ChannelApprovalResponse;
+    use zeroclaw_api::channel::{ChannelApprovalResponse, SendMessage};
 
     pub(super) const TOKEN_LEN: usize = 8;
     const TOKEN_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
@@ -229,6 +229,14 @@ mod approval {
     pub(super) fn generate_token_default() -> String {
         let mut rng = rand::rng();
         generate_token(&mut rng)
+    }
+
+    /// Build the outbound `SendMessage` for an approval prompt: the rendered
+    /// prompt text to the requesting recipient, with voice synthesis
+    /// suppressed. Kept as a small, pure helper so tests can assert its shape
+    /// (recipient, voice suppression) without standing up a live client.
+    pub(super) fn build_prompt_message(prompt: String, recipient: &str) -> SendMessage {
+        SendMessage::new(prompt, recipient).suppress_voice()
     }
 
     /// Try to parse an approval reply. Returns `Some((token, response))` if the
@@ -5302,7 +5310,7 @@ impl Channel for MatrixChannel {
             },
         );
 
-        let send_msg = SendMessage::new(prompt, recipient);
+        let send_msg = approval::build_prompt_message(prompt, recipient);
         if let Err(e) = self.send(&send_msg).await {
             self.pending_approvals.lock().await.remove(&token);
             return Err(e);
@@ -6662,7 +6670,7 @@ mod tests {
 
     mod approval {
         use super::super::approval::{
-            TOKEN_LEN, generate_token, generate_token_default, parse_reply,
+            TOKEN_LEN, build_prompt_message, generate_token, generate_token_default, parse_reply,
         };
         use rand::SeedableRng;
         use rand::rngs::StdRng;
@@ -6834,6 +6842,26 @@ mod tests {
         #[test]
         fn rejects_trailing_garbage() {
             assert!(parse_reply("ABCDEFGH approve please").is_none());
+        }
+
+        #[test]
+        fn approval_prompt_message_suppresses_voice() {
+            let prompt = crate::util::build_approve_deny_approval_prompt(
+                &generate_token_default(),
+                "shell",
+                "ls -la",
+                None,
+            );
+
+            let message = build_prompt_message(prompt.clone(), "!room:example.invalid");
+
+            assert_eq!(message.recipient, "!room:example.invalid");
+            assert_eq!(message.content, prompt);
+            assert!(
+                message.suppress_voice,
+                "the approval prompt must suppress voice synthesis"
+            );
+            assert!(!message.force_voice);
         }
 
         #[test]
