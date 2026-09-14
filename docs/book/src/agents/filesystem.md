@@ -57,6 +57,51 @@ Two things worth calling out:
   touch anything the host filesystem permits. It is off by default and flipping
   it on is auditable.
 
+## Shared resources
+
+`<install>/shared/` holds resources agents draw on in common. An agent reaches
+it only if you opt that agent in:
+
+```toml
+[agents.researcher]
+can_use_shared_workspace = true
+```
+
+The flag is **deny-by-default**. With it off, the only reach an agent has into
+`shared/` is the code-enforced read-only wire to its own skill bundles under
+`shared/skills/<bundle>/`. With it on, `<install>/shared/` is added to the
+agent's read-only allowlist. The environment form follows the usual convention:
+`ZEROCLAW_agents__<alias>__can_use_shared_workspace=true`.
+
+The grant is **read-only by design**, not by omission. Allowlist matching is a
+path-prefix test and explicit allowed roots are consulted before
+`forbidden_paths`, so a writable root over the whole of `shared/` would shadow
+the narrower `shared/skills/` wire and let one agent overwrite skills that other
+agents execute. Write access to `shared/`, if you ever need it, needs a narrower
+surface than this flag.
+
+The location derives from the config file's own directory
+(`config_path.parent()/shared`), not from `data_dir`. An install that points
+`data_dir` elsewhere still shares the directory beside `config.toml`.
+
+Three limits are worth knowing before you turn it on:
+
+- **Reads are exact-path.** The file tools honor the grant, so an agent can read
+  a file under `shared/` when it already knows the path.
+- **Glob discovery stays workspace-only.** Glob-style path search deliberately
+  ignores the read-only tier, so files under `shared/` are readable but are not
+  enumerated by that search. The agent will not discover them by listing; give it
+  the path.
+- **Shell access is bounded separately.** Under an active OS sandbox (Landlock
+  or Seatbelt) shell commands touching `shared/` are denied outright, because the
+  sandbox is built from the workspace directory alone and does not yet receive
+  the allowlist tiers. That is fail-closed, an availability gap rather than a
+  widening. With the sandbox disabled or pass-through, a shell **redirect** into
+  a read-only root is refused: a redirect target must belong to a write tier,
+  never merely a readable one. For a non-redirect argument the static scan cannot
+  tell a read from a write, so the OS sandbox remains the complete write boundary
+  for shell.
+
 ## Memory
 
 Each agent keeps its own memory store under its workspace

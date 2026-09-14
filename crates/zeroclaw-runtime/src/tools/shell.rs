@@ -1353,6 +1353,141 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Production regression for the read-only shell boundary: an agent opted
+    /// into the `<install>/shared/` read grant must not be able to spend that
+    /// READ as a WRITE through a shell redirect.
+    ///
+    /// The sandbox here is explicitly `NoopSandbox`, which is the configuration
+    /// that makes this reachable in production: `sandbox.enabled = false`, the
+    /// `none` backend, and a failed auto-detection all resolve to it, and it
+    /// runs the command unchanged. The denial must therefore come from policy,
+    /// not from the sandbox.
+    ///
+    /// The policy uses wildcard commands with high-risk blocking off so the
+    /// redirect actually reaches the path preflight; under a default policy the
+    /// earlier `is_command_allowed` redirect gate would refuse it first and the
+    /// test would pass for the wrong reason.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_denies_redirect_writes_into_read_only_shared_root() {
+        use crate::security::NoopSandbox;
+
+        let root = std::env::temp_dir().join(format!(
+            "zeroclaw_shell_e2e_shared_readonly_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let workspace = root.join("workspace");
+        let shared = root.join("shared");
+        let skills = shared.join("skills");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(workspace.join("sub")).unwrap();
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::write(shared.join("data.txt"), b"shared-original").unwrap();
+        std::fs::write(skills.join("run.sh"), b"skill-original").unwrap();
+
+        // Exactly the policy shape `can_use_shared_workspace` produces: the
+        // shared dir on the read-only tier, nothing else added.
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.clone(),
+            allowed_roots_read_only: vec![shared.clone()],
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        });
+
+        // A fresh tool per command keeps the shared rate limiter from turning a
+        // later denial into a rate-limit error and masking what is under test.
+        let run = |command: String| {
+            let security = security.clone();
+            async move {
+                let sandbox: Arc<dyn Sandbox> = Arc::new(NoopSandbox);
+                let tool = RateLimitedTool::new(
+                    ShellTool::new_with_sandbox(security.clone(), test_runtime(), sandbox),
+                    security,
+                );
+                tool.execute(json!({"command": command, "approved": true}))
+                    .await
+                    .expect("shell tool must return a result")
+            }
+        };
+
+        // Existing-file overwrite and new-file creation, under both `shared/`
+        // and `shared/skills/`.
+        let denied = [
+            format!("echo pwned > {}/data.txt", shared.display()),
+            format!("echo pwned > {}/new.txt", shared.display()),
+            format!("echo pwned >> {}/data.txt", shared.display()),
+            format!("echo pwned > {}/run.sh", skills.display()),
+            format!("echo pwned > {}/new_skill.sh", skills.display()),
+        ];
+        for command in denied {
+            let result = run(command.clone()).await;
+            assert!(
+                !result.success,
+                "a redirect write into the read-only shared root must be refused: {command}"
+            );
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("Path blocked"),
+                "expected a path-block error for {command}, got: {:?}",
+                result.error
+            );
+        }
+
+        // Nothing was overwritten and nothing was created.
+        assert_eq!(
+            std::fs::read(shared.join("data.txt")).unwrap(),
+            b"shared-original",
+            "an existing shared file must be byte-identical after the refused writes"
+        );
+        assert_eq!(
+            std::fs::read(skills.join("run.sh")).unwrap(),
+            b"skill-original",
+            "an existing shared skill must be byte-identical after the refused writes"
+        );
+        assert!(
+            !shared.join("new.txt").exists(),
+            "no new file may be created under the read-only shared root"
+        );
+        assert!(
+            !skills.join("new_skill.sh").exists(),
+            "no new file may be created under the read-only shared skills dir"
+        );
+
+        // No over-blocking: a write inside the agent's own workspace still runs.
+        let result = run("echo mine > sub/mine.txt".to_string()).await;
+        assert!(
+            result.success,
+            "a write inside the agent's own workspace must still succeed, got: {:?}",
+            result.error
+        );
+        assert!(
+            workspace.join("sub/mine.txt").exists(),
+            "the in-workspace write must actually have happened"
+        );
+
+        // Reads through the shell remain permitted where they already were.
+        let result = run(format!("cat {}/data.txt", shared.display())).await;
+        assert!(
+            result.success,
+            "reading under the shared read-only root must remain allowed, got: {:?}",
+            result.error
+        );
+        let result = run(format!("cat {}/run.sh", skills.display())).await;
+        assert!(
+            result.success,
+            "reading under shared/skills/ must remain allowed, got: {:?}",
+            result.error
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn shell_blocks_option_assignment_path_argument() {
         let tool = wrapped_shell(test_security_with_allowed_commands(
