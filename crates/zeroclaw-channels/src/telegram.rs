@@ -4362,6 +4362,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .get("message_id")
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(0);
+        let (_, sender_id, _) = Self::extract_sender_info(message);
         let thread_id = Self::topic_thread_id(message);
         let reply_target = if let Some(ref tid) = thread_id {
             format!("{chat_id}:{tid}")
@@ -6234,8 +6235,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 // Terminal for inbound processing, same rationale as the
                 // approval branch below: acknowledging the picker callback
                 // must not hold up the offset.
-                if let Some(uid) = uid {
-                    *offset = uid + 1;
+                if uid.is_some() {
+                    *transient_retry = None;
                 }
                 return UpdateOutcome::Advanced;
             }
