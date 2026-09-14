@@ -5996,8 +5996,14 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
-                    let plugin_webhooks = Arc::clone(&plugin_webhooks);
-                    move |host, port, config, tx, reload_controls, tui_registry, ready_tx| {
+                    move |host,
+                          port,
+                          config,
+                          tx,
+                          reload_controls,
+                          tui_registry,
+                          pairing,
+                          ready_tx| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
@@ -6013,6 +6019,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                 Some(canvas_store),
                                 sop_engine,
                                 sop_audit,
+                                pairing,
                                 zeroclaw_gateway::GatewaySupervision::new(
                                     ready_tx,
                                     plugin_webhooks,
@@ -10489,7 +10496,7 @@ async fn run_gateway_if_enabled(
     // manually" message, None for tui_registry (no TUI socket), and None
     // for canvas_store so the gateway falls back to its own default.
     let result = Box::pin(gateway::run_gateway(
-        host, port, config, tx, None, None, None, None, None, None,
+        host, port, config, tx, None, None, None, None, None, None, None,
     ))
     .await;
     // Self-respawn after the listener is released, if an in-app upgrade

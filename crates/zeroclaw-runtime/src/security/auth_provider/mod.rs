@@ -27,6 +27,14 @@
 //! an empty registry rejects everything — wiring it on is a deliberate, later
 //! step.
 
+pub mod native;
+pub mod oidc;
+pub mod peercred;
+
+pub use native::NativeAuthProvider;
+pub use oidc::OidcAuthProvider;
+pub use peercred::{PeercredAuthProvider, UidRoster};
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -126,7 +134,7 @@ pub trait AuthProvider: Send + Sync {
 /// The configured set of providers, selected by name. **Default-deny**: an
 /// empty registry rejects everything, an unknown selection rejects, a
 /// mis-kinded credential rejects, and a selected provider's denial is final.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ProviderRegistry {
     providers: Vec<Arc<dyn AuthProvider>>,
     by_name: HashMap<String, usize>,
@@ -143,21 +151,25 @@ impl ProviderRegistry {
     /// than silently shadowed.
     pub fn register(&mut self, provider: Arc<dyn AuthProvider>) -> anyhow::Result<()> {
         let name = provider.name().to_owned();
-        // An OIDC provider derives its authorization mapping from the `<alias>`
-        // in its `oidc.<alias>` name, so the registry enforces that canonical
-        // shape here rather than trusting each provider to honor the convention.
-        // Without this, an OIDC-method provider registered under a noncanonical
-        // name would slip past the alias-provenance boundary in
-        // `bind_provenance` and borrow an arbitrary issuer's profile mapping.
-        if provider.method() == AuthMethod::Oidc
-            && name.strip_prefix("oidc.").is_none_or(str::is_empty)
-        {
-            anyhow::bail!(
-                "OIDC auth provider must be registered under a canonical `oidc.<alias>` name, got {name:?}"
-            );
-        }
         if self.by_name.contains_key(&name) {
             anyhow::bail!("auth provider name {name:?} is already registered");
+        }
+        // Aliased methods select their authorization mapping by alias, and the
+        // resolver trusts the alias the provider returns. Bind that alias at
+        // registration: an OIDC-method provider MUST register under its
+        // canonical `oidc.<alias>` name with a non-empty alias, so a provider
+        // cannot register under an arbitrary name and later return an alias the
+        // registry never sanctioned (which would let it borrow another issuer's
+        // mapping through `bind_provenance`).
+        if provider.method() == AuthMethod::Oidc
+            && name
+                .strip_prefix("oidc.")
+                .is_none_or(|alias| alias.is_empty())
+        {
+            anyhow::bail!(
+                "an OIDC auth provider must register under a canonical `oidc.<alias>` \
+                 name with a non-empty alias, got {name:?}"
+            );
         }
         self.by_name.insert(name, self.providers.len());
         self.providers.push(provider);
@@ -384,13 +396,14 @@ mod tests {
     /// match its declared provenance (method / subject class / alias). Used to
     /// prove `bind_provenance` rejects such a Verified outcome.
     struct Miswired {
+        name: &'static str,
         bad: AuthenticatedIdentity,
     }
 
     #[async_trait]
     impl AuthProvider for Miswired {
         fn name(&self) -> &str {
-            "oidc.corp"
+            self.name
         }
         fn method(&self) -> AuthMethod {
             AuthMethod::Oidc
@@ -405,7 +418,11 @@ mod tests {
 
     async fn miswired_is_denied(bad: AuthenticatedIdentity) {
         let mut reg = ProviderRegistry::new();
-        reg.register(Arc::new(Miswired { bad })).unwrap();
+        reg.register(Arc::new(Miswired {
+            name: "oidc.corp",
+            bad,
+        }))
+        .unwrap();
         let out = reg.resolve_named("oidc.corp", &bearer("x")).await;
         assert!(
             matches!(
