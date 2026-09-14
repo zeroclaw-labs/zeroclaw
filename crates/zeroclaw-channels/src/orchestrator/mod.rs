@@ -36110,6 +36110,10 @@ Done."#;
             "preamble must carry sender (for disambiguation): {preamble}"
         );
         assert!(
+            preamble.contains("weekday="),
+            "preamble must carry the weekday (pins the fix/channels weekday field): {preamble}"
+        );
+        assert!(
             preamble.contains("message_id=msg-xyz789"),
             "preamble must carry message_id (for the reaction tool): {preamble}"
         );
