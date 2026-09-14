@@ -63,6 +63,17 @@ rpc_type! {
             skip_serializing_if = "Option::is_none"
         )]
         pub client_capabilities: Option<serde_json::Value>,
+        /// Explicit credential for authentication (a native pairing token
+        /// or an OIDC access token). Wins over the transport-intrinsic
+        /// peer credential when present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub auth_token: Option<String>,
+        /// Which configured provider verifies `auth_token` (e.g. `native`,
+        /// `oidc.corp`). Defaults to `native`. Selection is explicit and
+        /// final: the selected provider's denial never falls through to
+        /// another provider.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub auth_provider: Option<String>,
     }
 }
 
@@ -95,6 +106,13 @@ rpc_type! {
         /// Supported RPC method names (e.g. "session/prompt", "memory/list").
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub capabilities: Vec<String>,
+        /// Configured auth provider selection keys (e.g. `native`,
+        /// `peercred`, `oidc.corp`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub auth_methods: Vec<String>,
+        /// Canonical principal id this connection is bound to.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub principal_id: Option<String>,
         /// Shared command catalogue entries available on the TUI surface.
         ///
         /// Always serialized so a new daemon's authoritative empty catalogue
@@ -640,6 +658,24 @@ rpc_type! {
 rpc_type! {
     pub struct ConfigSetResult {
         pub prop: String,
+        pub set: bool,
+    }
+}
+
+rpc_type! {
+    /// An ordered batch of `config/set` entries committed as one unit: every
+    /// entry is staged on a single working copy in order (a later entry for
+    /// the same prop wins), and the result is saved and installed once, or
+    /// not at all. Must contain at least one entry.
+    pub struct ConfigSetManyParams {
+        pub sets: Vec<ConfigSetParams>,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigSetManyResult {
+        /// The props written, in request order.
+        pub props: Vec<String>,
         pub set: bool,
     }
 }
