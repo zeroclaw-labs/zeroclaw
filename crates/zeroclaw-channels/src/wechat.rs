@@ -1982,11 +1982,7 @@ impl WeChatChannel {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("sendMessage failed ({status}): {err}");
-        }
+        let resp = crate::util::ensure_success(resp, "sendMessage").await?;
 
         // The API reports failures as HTTP 200 with a non-zero ret/errcode
         // in the body; a status check alone silently drops the message.

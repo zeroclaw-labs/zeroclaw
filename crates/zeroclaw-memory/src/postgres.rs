@@ -855,6 +855,11 @@ impl ::zeroclaw_api::attribution::Attributable for PostgresMemory {
 mod tests {
     use super::*;
 
+    fn postgres_test_url() -> String {
+        std::env::var("ZEROCLAW_TEST_POSTGRES_URL")
+            .expect("set ZEROCLAW_TEST_POSTGRES_URL to run ignored PostgreSQL tests")
+    }
+
     #[test]
     fn recall_time_filter_qualifies_alias_and_preserves_placeholder_order() {
         let cases = [
@@ -1050,6 +1055,47 @@ mod tests {
             memory.expect("pgvector-enabled construction from a Tokio runtime should succeed");
         drop(memory);
         drop(runtime);
+    }
+
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn postgres_backend_round_trip_uses_isolated_schema() {
+        let database_url = postgres_test_url();
+        let schema = TestSchema::create(&database_url, "round_trip");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let memory = PostgresMemory::new(
+                "ci",
+                &database_url,
+                &schema.name,
+                "memories",
+                Some(5),
+                Some(false),
+                None,
+            )
+            .unwrap();
+
+            memory
+                .store(
+                    "ci_key",
+                    "PostgreSQL CI value",
+                    MemoryCategory::Core,
+                    Some("ci_session"),
+                )
+                .await
+                .unwrap();
+            let stored = memory.get("ci_key").await.unwrap().unwrap();
+            assert_eq!(stored.content, "PostgreSQL CI value");
+            assert_eq!(memory.count().await.unwrap(), 1);
+            assert!(memory.health_check().await);
+            assert!(memory.forget("ci_key").await.unwrap());
+            assert_eq!(memory.count().await.unwrap(), 0);
+        });
     }
 
     #[test]

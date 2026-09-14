@@ -84,6 +84,10 @@ enum Cmd {
     GenRootIndex,
     /// Inject the version-selector script into deployed pages that lack it
     RetrofitSelector,
+    /// Write canonical, hreflang, description and share tags into every
+    /// deployed page, plus robots.txt and sitemap.xml at the root (run in the
+    /// gh-pages clone root, after gen-root-index)
+    GenSeo,
     /// Regenerate pc-themes.css + switcher list from the dashboard theme registry
     Themes,
     /// Regenerate hardware reference snippets from the board registry + catalog
@@ -147,6 +151,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::PruneVersions => cmd::mdbook::versions::prune_versions(),
         Cmd::GenRootIndex => cmd::mdbook::versions::gen_root_index(),
         Cmd::RetrofitSelector => cmd::mdbook::versions::retrofit_selector(),
+        Cmd::GenSeo => cmd::mdbook::seo::run(),
         Cmd::Themes => cmd::mdbook::themes::run(&xtask::util::repo_root()),
         Cmd::Hardware => cmd::mdbook::hardware::run(&xtask::util::repo_root()),
         Cmd::Linkcheck => cmd::mdbook::linkcheck::check_internal_links(

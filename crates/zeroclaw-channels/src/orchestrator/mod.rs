@@ -6433,7 +6433,9 @@ async fn process_channel_message_body(
                 ],
             );
             if let Some(channel) = target_channel.as_ref() {
-                let _ = channel.send(&SendMessage::reply_to(&msg, message)).await;
+                let _ = channel
+                    .send(&SendMessage::reply_to(&msg, message).suppress_voice())
+                    .await;
             }
             reconcile_early_ack(
                 ctx.as_ref(),
@@ -7038,7 +7040,8 @@ async fn process_channel_message_body(
                         let _ = ch
                             .send(
                                 &SendMessage::new(&text, &notify_reply_target)
-                                    .in_thread(thread_ts.clone()),
+                                    .in_thread(thread_ts.clone())
+                                    .suppress_voice(),
                             )
                             .await;
                     }
@@ -7797,7 +7800,8 @@ async fn process_channel_message_body(
                     && let Err(e) = channel
                         .send(
                             &SendMessage::new(block, &delivery_recipient)
-                                .in_thread(msg.thread_ts.clone()),
+                                .in_thread(msg.thread_ts.clone())
+                                .suppress_voice(),
                         )
                         .await
                 {
@@ -10234,7 +10238,8 @@ pub fn register_channels_for_tools(
     feature = "channel-telegram",
     feature = "channel-discord",
     feature = "voice-wake",
-    feature = "channel-matrix"
+    feature = "channel-matrix",
+    feature = "whatsapp-web"
 ))]
 fn resolve_agent_transcription_provider(config: &Config, channel_key: &str) -> String {
     let enabled_agents = enabled_agent_aliases(config);
@@ -10251,6 +10256,40 @@ fn configure_discord_transcription(
     config: &Config,
     channel_key: &str,
 ) -> DiscordChannel {
+    if !config.transcription.enabled {
+        return channel;
+    }
+
+    let provider = resolve_agent_transcription_provider(config, channel_key);
+    match crate::transcription::TranscriptionManager::from_config_with_provider(config, provider) {
+        Ok(manager) => channel.with_transcription_manager(config.transcription.clone(), manager),
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"e": e.to_string()})),
+                "transcription manager init failed, voice transcription disabled"
+            );
+            channel
+        }
+    }
+}
+
+/// Bind the WhatsApp Web channel's transcription manager to the owning
+/// agent's `transcription_provider`.
+///
+/// `WhatsAppWebChannel::with_transcription` registers legacy `[transcription]`
+/// providers only and leaves the agent alias empty, so typed
+/// `[providers.transcription.<type>.<alias>]` entries are never reachable and
+/// `transcribe()` bails before dispatching. Mirrors
+/// `configure_discord_transcription`.
+#[cfg(feature = "whatsapp-web")]
+fn configure_whatsapp_transcription(
+    channel: WhatsAppWebChannel,
+    config: &Config,
+    channel_key: &str,
+) -> WhatsAppWebChannel {
     if !config.transcription.enabled {
         return channel;
     }
@@ -10886,7 +10925,7 @@ fn collect_configured_channels(
                         display_name: "WhatsApp",
                         alias: Some(alias.clone()),
                         channel: crate::paced_channel::PacedChannel::wrap(
-                            Arc::new(
+                            Arc::new(configure_whatsapp_transcription(
                                 WhatsAppWebChannel::new(
                                     wa,
                                     alias.clone(),
@@ -10894,12 +10933,13 @@ fn collect_configured_channels(
                                     allowed_groups_resolver,
                                 )
                                 .with_persistence(config_arc.clone())
-                                .with_transcription(config.transcription.clone())
                                 .with_tts(&config)
                                 .with_workspace_dir(workspace_dir)
                                 .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
                                 .with_group_mention_patterns(wa.group_mention_patterns.clone()),
-                            ),
+                                &config,
+                                &format!("whatsapp.{alias}"),
+                            )),
                             wa,
                         ),
                     });
@@ -12345,7 +12385,6 @@ fn compose_channel_mcp_prompt_sections(
 }
 
 /// Start all configured channels and route messages to the agent
-#[allow(clippy::too_many_lines)]
 pub async fn start_channels(
     config: Config,
     canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
@@ -12353,6 +12392,32 @@ pub async fn start_channels(
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 ) -> Result<()> {
+    Box::pin(start_channels_with_plugin_webhooks(
+        config,
+        canvas_store,
+        cancel,
+        sop_engine,
+        sop_audit,
+        None,
+    ))
+    .await
+}
+
+/// Start supervised channels with the daemon generation's plugin-webhook route
+/// registry. Standalone channel runs use [`start_channels`] because no gateway
+/// shares their lifecycle.
+#[allow(clippy::too_many_lines)]
+pub async fn start_channels_with_plugin_webhooks(
+    config: Config,
+    canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
+    cancel: tokio_util::sync::CancellationToken,
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    plugin_webhooks: Option<Arc<zeroclaw_api::webhook::PluginWebhookRegistry>>,
+) -> Result<()> {
+    let plugin_webhook_registry_lease = plugin_webhooks
+        .as_ref()
+        .map(|registry| registry.start_generation());
     let config_arc = Arc::new(RwLock::new(config));
     let config: Config = config_arc.read().clone();
     let any_agent_provider_resolves = config
@@ -12811,11 +12876,13 @@ pub async fn start_channels(
                      `channel-filesystem`; skipping Filesystem."
                 );
             }
-            let plugin_channels = zeroclaw_runtime::plugin_runtime::configured_plugin_channels(
-                Arc::new(config.clone()),
-                Some(Arc::clone(&config_arc)),
-            )
-            .await;
+            let plugin_channels =
+                zeroclaw_runtime::plugin_runtime::configured_plugin_channels_with_webhooks(
+                    Arc::new(config.clone()),
+                    Some(Arc::clone(&config_arc)),
+                    plugin_webhook_registry_lease.as_ref(),
+                )
+                .await;
             append_configured_plugin_channels(&mut configured_channels, plugin_channels);
             let (channels_by_name, registry_lease) =
                 publish_cron_channel_registry(&configured_channels);
@@ -17254,6 +17321,44 @@ api_key = "anthropic-key"
         finalized_gate_prompts: tokio::sync::Mutex<Vec<(String, String)>>,
     }
 
+    /// Records every outbound `SendMessage` whole, so a test can assert on
+    /// delivery flags (`suppress_voice`, `force_voice`) and not only on
+    /// recipient and text.
+    #[derive(Default)]
+    struct SendMessageRecordingChannel {
+        sent_messages: tokio::sync::Mutex<Vec<SendMessage>>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for SendMessageRecordingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for SendMessageRecordingChannel {
+        fn name(&self) -> &str {
+            "test-channel"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent_messages.lock().await.push(message.clone());
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     #[cfg(feature = "channel-email")]
     #[derive(Default)]
     struct ThreadingRecordingChannel {
@@ -20939,6 +21044,147 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn process_channel_message_keeps_tool_progress_and_receipts_out_of_voice() {
+        // Tool-progress notices and the receipts block are system content:
+        // both must carry `suppress_voice` so a TTS channel never reads them
+        // aloud, while the conversational reply keeps its default routing.
+        let channel_impl = Arc::new(SendMessageRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let base_ctx = test_runtime_ctx_with_observer_and_tools(
+            channel,
+            Arc::new(ToolCallingModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+            Arc::new(NoopObserver),
+            vec![Box::new(MockPriceTool)],
+        );
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            receipt_generator: Some(
+                zeroclaw_runtime::agent::tool_receipts::ReceiptGenerator::new(),
+            ),
+            show_receipts_in_response: true,
+            ..(*base_ctx).clone()
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-42".to_string(),
+                content: "What is the BTC price now?".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        let is_progress = |m: &SendMessage| m.content.starts_with('\u{1F527}');
+        let is_receipts = |m: &SendMessage| m.content.contains("Tool receipts:");
+
+        let progress: Vec<&SendMessage> = sent_messages.iter().filter(|m| is_progress(m)).collect();
+        assert!(
+            !progress.is_empty(),
+            "expected at least one tool-progress notice; got {sent_messages:?}"
+        );
+        for notice in progress {
+            assert!(
+                notice.suppress_voice,
+                "tool-progress notice must suppress voice synthesis, got {notice:?}"
+            );
+            assert!(!notice.force_voice);
+        }
+
+        let receipts = sent_messages
+            .iter()
+            .find(|m| is_receipts(m))
+            .unwrap_or_else(|| panic!("no `Tool receipts:` send found; got {sent_messages:?}"));
+        assert!(
+            receipts.suppress_voice,
+            "receipts block must suppress voice synthesis, got {receipts:?}"
+        );
+        assert!(!receipts.force_voice);
+
+        let reply = sent_messages
+            .iter()
+            .find(|m| !is_progress(m) && !is_receipts(m))
+            .unwrap_or_else(|| panic!("no conversational reply found; got {sent_messages:?}"));
+        assert!(
+            !reply.suppress_voice,
+            "the conversational reply must keep its default voice routing, got {reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_keeps_provider_init_failure_notice_out_of_voice() {
+        // The notice sent when the routed provider cannot be built is system
+        // content, like the other error notices, and must never be voiced.
+        let channel_impl = Arc::new(SendMessageRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(ToolCallingModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "msg-1".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-42".to_string(),
+            content: "hello".to_string(),
+            channel: "test-channel".into(),
+            channel_alias: None,
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+
+            ..Default::default()
+        };
+        runtime_ctx
+            .route_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                runtime_conversation_history_key(runtime_ctx.as_ref(), &msg),
+                ChannelRouteSelection {
+                    model_provider: "no-such-provider".into(),
+                    model: "route-model".to_string(),
+                    api_key: None,
+                },
+            );
+
+        process_channel_message(runtime_ctx, msg, CancellationToken::new()).await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        let notice = sent_messages
+            .iter()
+            .find(|m| m.content.contains("no-such-provider"))
+            .unwrap_or_else(|| {
+                panic!("no provider-init failure notice found; got {sent_messages:?}")
+            });
+        assert!(
+            notice.suppress_voice,
+            "provider-init failure notice must suppress voice synthesis, got {notice:?}"
+        );
+        assert!(!notice.force_voice);
+    }
+
+    #[tokio::test]
     async fn process_channel_message_omits_receipts_block_when_disabled() {
         // Backward-compat: with show_receipts_in_response=false (default), no
         // trailing receipts message is sent — even when a generator is active
@@ -24232,6 +24478,7 @@ BTC is currently around $65,000 based on latest tool output."#
                             tool_name: "shell".to_string(),
                             arguments_summary: "command".to_string(),
                             raw_arguments: None,
+                            position: None,
                         },
                     )
                     .await
@@ -29893,7 +30140,7 @@ This is an example JSON object for profile settings."#;
                 }
                 "plugin" => source_segment_between(
                     async_assembly,
-                    "let plugin_channels = zeroclaw_runtime::plugin_runtime::configured_plugin_channels(",
+                    "zeroclaw_runtime::plugin_runtime::configured_plugin_channels_with_webhooks(",
                     "publish_cron_channel_registry(&configured_channels)",
                 )
                 .is_some_and(|block| {
@@ -30618,6 +30865,16 @@ This is an example JSON object for profile settings."#;
         );
     }
 
+    /// A voice note on a configured Discord channel must reach the STT server
+    /// named by the owning agent's `transcription_provider`.
+    ///
+    /// Two providers are registered so the assertion distinguishes *selection*
+    /// from *presence*: against a lone registered provider, a dispatch that
+    /// ignored the named alias and reached whatever happened to be configured
+    /// would look identical to a correct one. The decoy must receive nothing.
+    ///
+    /// The channel alias, the agent alias and the provider aliases share no
+    /// name, so nothing can route correctly by coincidence.
     #[cfg(feature = "channel-discord")]
     #[tokio::test]
     async fn configured_discord_transcription_dispatches_to_routed_agent_provider() {
@@ -30627,6 +30884,7 @@ This is an example JSON object for profile settings."#;
 
         let media_server = MockServer::start().await;
         let whisper_server = MockServer::start().await;
+        let decoy_server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/voice.ogg"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-audio"))
@@ -30641,6 +30899,15 @@ This is an example JSON object for profile settings."#;
             )
             .expect(1)
             .mount(&whisper_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"text": "decoy transcript"})),
+            )
+            .expect(0)
+            .mount(&decoy_server)
             .await;
 
         let mut config = Config::default();
@@ -30666,6 +30933,13 @@ This is an example JSON object for profile settings."#;
             "routed".to_string(),
             LocalWhisperTranscriptionProviderConfig {
                 uri: format!("{}/v1/transcribe", whisper_server.uri()),
+                ..Default::default()
+            },
+        );
+        config.providers.transcription.local_whisper.insert(
+            "decoy".to_string(),
+            LocalWhisperTranscriptionProviderConfig {
+                uri: format!("{}/v1/transcribe", decoy_server.uri()),
                 ..Default::default()
             },
         );
@@ -30699,8 +30973,19 @@ This is an example JSON object for profile settings."#;
             media.is_empty(),
             "successful direct-channel transcription must not fall back to media"
         );
+        assert!(
+            decoy_server.received_requests().await.unwrap().is_empty(),
+            "the provider the agent did not name must never be called"
+        );
+        let routed = whisper_server.received_requests().await.unwrap();
+        assert_eq!(routed.len(), 1, "exactly one transcription request");
+        assert!(
+            routed[0].body.windows(10).any(|w| w == b"fake-audio"),
+            "the routed request must carry the downloaded audio bytes verbatim"
+        );
         media_server.verify().await;
         whisper_server.verify().await;
+        decoy_server.verify().await;
     }
 
     // Regression: Voice Wake bound its transcription manager to its own
@@ -30735,6 +31020,60 @@ This is an example JSON object for profile settings."#;
         assert_ne!(
             resolved, "frontdoor",
             "must not resolve to the channel alias"
+        );
+    }
+
+    /// Regression: the WhatsApp Web channel built its manager from the legacy
+    /// `[transcription]` section alone, so typed
+    /// `[providers.transcription.*]` entries never registered and the owning
+    /// agent's alias stayed empty — `transcribe()` then bailed with "Agent has
+    /// no transcription_provider configured" for every voice note.
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn whatsapp_transcription_registers_typed_provider_and_binds_the_agent_alias() {
+        let mut config = Config::default();
+        config.transcription.enabled = true;
+        config.channels.whatsapp.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        config.providers.transcription.groq.insert(
+            "fast".to_string(),
+            zeroclaw_config::schema::GroqTranscriptionProviderConfig {
+                base: zeroclaw_config::schema::TranscriptionProviderConfig {
+                    api_key: Some("test-key".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "voice-agent".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["whatsapp.default".into()],
+                transcription_provider: "groq.fast".into(),
+                ..Default::default()
+            },
+        );
+
+        let provider = resolve_agent_transcription_provider(&config, "whatsapp.default");
+        assert_eq!(
+            provider, "groq.fast",
+            "the owning agent's provider must resolve for a whatsapp.<alias> key"
+        );
+
+        let manager = crate::transcription::TranscriptionManager::from_config_with_provider(
+            &config, provider,
+        )
+        .expect("typed provider must build a manager");
+        assert!(
+            manager.available_providers().contains(&"groq.fast"),
+            "typed provider must register, got {:?}",
+            manager.available_providers()
         );
     }
 

@@ -99,6 +99,12 @@ export interface Integration {
   /** Human-readable display label derived by the API from the category enum. */
   category_label: string;
   status: "Available" | "Active";
+  /** Canonical ChannelsConfig map key (or model-provider family key) for
+   *  entries backed by a schema config slot. It can differ from a runtime
+   *  channel kind when multiple backends share one config map. Route config
+   *  deep links on this, never on a slug of `name`; `null` when the entry has
+   *  no config section. */
+  key: string | null;
 }
 
 export interface DiagResult {

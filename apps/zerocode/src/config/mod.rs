@@ -274,6 +274,27 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// The `[sidebar]` section: the shell-level agent sidebar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SidebarSection {
+    /// Whether the agent sidebar is shown. Toggled at runtime and persisted.
+    #[serde(default = "default_sidebar_visible")]
+    pub visible: bool,
+    /// Sidebar width in terminal columns. Clamped to the widget's supported
+    /// range at render time; edited on disk only (no runtime writer).
+    #[serde(default = "default_sidebar_width")]
+    pub width: u16,
+}
+
+impl Default for SidebarSection {
+    fn default() -> Self {
+        Self {
+            visible: default_sidebar_visible(),
+            width: default_sidebar_width(),
+        }
+    }
+}
+
 // ── Todo tracker ──────────────────────────────────────────────────────────────
 
 /// Where the todo tracker renders inside the Code pane.
@@ -311,6 +332,14 @@ impl Default for TodoTrackerSection {
             max_height: default_todotracker_max_height(),
         }
     }
+}
+
+fn default_sidebar_visible() -> bool {
+    true
+}
+
+fn default_sidebar_width() -> u16 {
+    24
 }
 
 impl TodoTrackerSection {
@@ -429,6 +458,8 @@ pub(crate) struct ZerocodeConfig {
     pub theme: ThemeSection,
     #[serde(default, skip_serializing_if = "ConnectionSection::is_empty")]
     pub connection: ConnectionSection,
+    #[serde(default)]
+    pub sidebar: SidebarSection,
     /// Sparse keybinding overrides keyed `"<tag>.<variant>"`. Absent
     /// entries fall back to compile-time defaults.
     #[serde(default)]
@@ -443,6 +474,7 @@ impl Default for ZerocodeConfig {
             locale: default_locale(),
             theme: ThemeSection::default(),
             connection: ConnectionSection::default(),
+            sidebar: SidebarSection::default(),
             keybindings: HashMap::new(),
             todotracker: TodoTrackerSection::default(),
         }
@@ -661,6 +693,15 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
             ),
         }
     }
+    if let Some(v) = doc.get("sidebar") {
+        match v.clone().try_into::<SidebarSection>() {
+            Ok(section) => config.sidebar = section,
+            Err(e) => eprintln!(
+                "zerocode: ignoring [sidebar] in {} ({e}); using default",
+                path.display()
+            ),
+        }
+    }
     if let Some(v) = doc.get("keybindings") {
         let mut migrated_value = v.clone();
         let migrated_legacy = migrate_legacy_ctrl_bindings(&mut migrated_value);
@@ -769,6 +810,14 @@ fn section_mut<'a>(doc: &'a mut toml::Table, key: &str) -> Result<&'a mut toml::
         .or_insert_with(|| toml::Value::Table(toml::Table::new()))
         .as_table_mut()
         .ok_or_else(|| anyhow::Error::msg(format!("'{key}' is not a table")))
+}
+
+/// Persist the sidebar visibility toggle, writing only `[sidebar].visible`.
+pub(crate) fn persist_sidebar_visible(config_dir: &Path, visible: bool) -> Result<()> {
+    let path = config_path(config_dir);
+    let mut doc = load_document(&path)?;
+    section_mut(&mut doc, "sidebar")?.insert("visible".to_string(), toml::Value::Boolean(visible));
+    write_document(&path, &doc)
 }
 
 /// Persist the selected theme name, editing only the `[theme]` section.
@@ -1764,6 +1813,69 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_section_round_trips() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "[sidebar]\nvisible = false\nwidth = 30\n");
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert!(!cfg.sidebar.visible);
+        assert_eq!(cfg.sidebar.width, 30);
+    }
+
+    #[test]
+    fn sidebar_partial_section_fills_field_defaults() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "[sidebar]\nvisible = false\n");
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert!(!cfg.sidebar.visible);
+        assert_eq!(cfg.sidebar.width, 24, "unset width falls back to default");
+    }
+
+    #[test]
+    fn bad_sidebar_does_not_blank_theme() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[theme]\nname = \"dracula\"\n\n[sidebar]\nvisible = \"nope\"\n",
+        );
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert_eq!(cfg.theme.name, "dracula");
+        assert!(cfg.sidebar.visible, "bad [sidebar] drops to default");
+    }
+
+    #[test]
+    fn default_config_serializes_sidebar_for_env_overrides() {
+        let body = toml::to_string_pretty(&ZerocodeConfig::default()).unwrap();
+        assert!(
+            body.contains("[sidebar]") && body.contains("visible = true"),
+            "the default document must materialize [sidebar] so schema-mirror env overrides resolve; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn persist_sidebar_visible_preserves_other_sections() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[theme]\nname = \"nord\"\n\n[future]\nkeep = true\n",
+        );
+        persist_sidebar_visible(dir.path(), false).unwrap();
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["sidebar"]["visible"].as_bool(), Some(false));
+        assert_eq!(doc["theme"]["name"].as_str(), Some("nord"));
+        assert_eq!(doc["future"]["keep"].as_bool(), Some(true));
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert!(!cfg.sidebar.visible);
+        persist_sidebar_visible(dir.path(), true).unwrap();
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert!(cfg.sidebar.visible);
+    }
+
+    #[test]
     fn connection_section_round_trips() {
         let mut c = ZerocodeConfig::default();
         c.connection.wss.uri = Some("wss://host:9781".to_string());
@@ -2191,6 +2303,19 @@ mod tests {
 
         let cfg = ensure_and_load(dir.path()).unwrap();
         assert_eq!(cfg.resolve_todo_tracker().width, 41);
+    }
+
+    #[test]
+    fn canonical_env_spelling_overrides_default_sidebar_field() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _v = EnvVarGuard::set("ZEROCODE_sidebar__visible", "false");
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert!(
+            !cfg.sidebar.visible,
+            "a default config must materialize [sidebar] before schema-mirror overrides apply"
+        );
     }
 
     #[test]

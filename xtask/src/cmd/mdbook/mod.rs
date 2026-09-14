@@ -9,6 +9,7 @@ pub mod placeholders;
 pub mod plugins;
 pub mod protected;
 pub mod refs;
+pub mod seo;
 pub mod serve;
 pub mod stats;
 pub mod sync;

@@ -32,7 +32,7 @@ Explain how the change was checked. Use the evidence that matches the changed su
 
 Fresh required CI is valid evidence when it covers the changed surface. Add extra validation only for a concrete coverage gap, such as platform-specific tests, cross-platform lint, desktop app coverage, release target builds, or stale/unavailable CI.
 
-Visual presentation changes require actual-interface evidence. If this PR changes rendered text, layout, spacing, alignment, wrapping, clipping, color, focus, selection, responsive behavior, or another visible state, exercise the supported interface on an identifiable revision and include or link privacy-safe screenshots at representative terminal or viewport dimensions. String assertions, component-only snapshots, and helper-level renderer tests do not replace this evidence. For interaction or transition changes, also record the action and observed result.
+Visual presentation changes require actual-interface evidence. Include or link privacy-safe screenshots at representative terminal or viewport dimensions with enough surrounding context to judge the result when the result or risk includes layout, spacing, alignment, wrapping, clipping, typography, color, focus, selection, responsive behavior, graphical composition, or another presentation-sensitive state. Record numerical dimensions only when needed to reproduce or assess a concrete presentation concern, such as wrapping, clipping, or responsive layout. A semantic-only rendered-interface change may instead use exact-head automated evidence from the final supported-interface output when it cannot affect layout, styling, clipping, wrapping, focus, selection, or interaction behavior. That evidence must exercise the real interface through its final renderer and observe the output users receive; source inspection, pre-render composition, component-only snapshots, and helper-level assertions do not qualify. A concrete presentation concern restores the screenshot requirement. A noninteractive, unstyled, deterministic plain-text CLI, stdout, stderr, or log change may use exact output from the supported interface when it makes no presentation-sensitive claim and no reviewer has identified a concrete presentation concern. Record relevant output-shaping context such as locale and terminal width. For interaction or transition changes, also record the action and observed result.
 
 ```sh
 # Rust/code examples; choose the checks that match the changed surface:
@@ -47,9 +47,9 @@ Docs-only changes: replace with markdown lint (`scripts/ci/docs_quality_gate.sh`
 - **Known CI coverage gap, if any:** (for example, `None after the docs and links gates`)
 - **Commands run and tail output:**
 - **Beyond CI, what did you manually verify?** (functional scenarios, edge cases, and any security-relevant behavior; also what you did NOT verify)
-- **Visual interface changed?** (`Yes` / `N/A`; if `Yes`, provide the remaining fields; if `N/A`, remove them)
-- **Tested revision, interface, and terminal or viewport dimensions:**
-- **Screenshot evidence:** (attach or link one or more screenshots showing the changed state and enough surrounding layout to judge it)
+- **Visual interface evidence:** (`Screenshot` / `Exact final-interface output` / `Exact plain-text output` / `N/A`; use final-interface output only for a semantic-only rendered-interface change that meets the rule above, exact output only for the narrow noninteractive unstyled-text case, and `N/A` only when no user-visible interface state changed)
+- **Tested revision, interface, and evidence path:** (record numerical dimensions only when needed to reproduce or assess a concrete presentation concern; name the final supported-interface output path for semantic-only rendered evidence; record locale or terminal width when it shapes exact output)
+- **Screenshot or exact-output evidence:** (attach or link screenshots, link the exact-head final-interface check and observed output, or include the exact supported-interface output)
 - **Action or changed state and observed result:**
 - **If any command was intentionally skipped, why:**
 

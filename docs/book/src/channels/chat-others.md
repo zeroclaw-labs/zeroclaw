@@ -93,6 +93,8 @@ Build with `channel-lark` for either Lark or Feishu. The root `channel-feishu` f
 
 Tencent's consumer messenger. Bot API access requires developer registration.
 
+`zeroclaw channel doctor` probes the bot's own identity (`GET /users/@me`) with the channel's credentials, so a healthy verdict means the API accepts the same token the send and listen paths use, not merely that the app secret still mints one. The probe cannot vet a recipient: the platform exposes no lookup for single-chat peer IDs, so an unusable address surfaces only when a send is attempted.
+
 ## IRC
 
 Classic IRC. Supports SASL, NickServ auth, and multiple channels.

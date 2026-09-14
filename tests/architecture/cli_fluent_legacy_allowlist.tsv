@@ -11,7 +11,6 @@ src/main.rs	eprintln	1	"error: `zeroclaw onboard` is deprecated and its flags no
 src/main.rs	println	1	" engaged: {}"
 src/main.rs	println	1	" kill_all: {}"
 src/main.rs	println	1	" network_kill: {}"
-src/main.rs	println	1	" {} v{} — {}"
 src/main.rs	println	1	"Initialized {} section(s) with defaults:"
 src/main.rs	println	1	"Migrated {} to schema version {to}."
 src/main.rs	println	1	"Supported model model_providers ({} total):\n"

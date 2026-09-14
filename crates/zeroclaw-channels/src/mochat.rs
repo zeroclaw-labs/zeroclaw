@@ -115,11 +115,7 @@ impl Channel for MochatChannel {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Mochat send message failed ({status}): {err}");
-        }
+        let resp = crate::util::ensure_success(resp, "Mochat send message").await?;
 
         let result: serde_json::Value = resp.json().await?;
         let code = result.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);

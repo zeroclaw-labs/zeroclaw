@@ -654,6 +654,7 @@ impl ModelProvider for AzureOpenAiModelProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
             cached_input_tokens: None,
+            cache_creation_input_tokens: None,
         });
         let message = native_response
             .choices
@@ -727,6 +728,7 @@ impl ModelProvider for AzureOpenAiModelProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
             cached_input_tokens: None,
+            cache_creation_input_tokens: None,
         });
         let message = native_response
             .choices

@@ -25,9 +25,9 @@ env:
   CARGO_INCREMENTAL: 0
 
 # ── Runner selection: closed Blacksmith toggle (compile-heavy jobs) ─────────
-# The ten Rust-compiling jobs below (lint, build, check, check-plugin-backends,
-# check-32bit, bench, test, msrv, parallel-runtime-test, installer-drift) and the
-# Linux `build` matrix entry pick their runner
+# The eleven Rust-compiling jobs below (lint, build, check, check-plugin-backends,
+# check-32bit, bench, test, memory-postgres-test, msrv, parallel-runtime-test,
+# installer-drift) and the Linux `build` matrix entry pick their runner
 # from a single boolean Actions variable, mapped here to two pinned choices only:
 #   • CI_USE_BLACKSMITH == 'true'        → blacksmith-8vcpu-ubuntu-2404 (pinned in-workflow)
 #   • any other value / unset (default)  → GitHub-hosted ubuntu-latest (today's behavior)
@@ -703,6 +703,14 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      # `channel-qq` is outside `default-channels`, so the workspace run above
+      # does not execute QQ's feature-gated library regressions. This step is
+      # what actually executes the health probe's tests.
+      - name: Run QQ channel lib unit tests
+        run: "cargo nextest run --locked -p zeroclaw-channels --features channel-qq --lib qq::tests::health_check"
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
   windows-test-scope:
     name: Advisory Windows test selection
@@ -984,6 +992,54 @@ jobs:
 
           exit "$overall_status"
 
+  memory-postgres-test:
+    name: Test (PostgreSQL Memory)
+    needs: [fmt]
+    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73 # 17.11-alpine3.24
+        env:
+          POSTGRES_USER: zeroclaw_test
+          POSTGRES_PASSWORD: zeroclaw_test
+          POSTGRES_DB: zeroclaw_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zeroclaw_test -d zeroclaw_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.98.0
+      - uses: ./.github/actions/rust-cache
+        id: rust-cache
+        with:
+          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Ensure web/dist placeholder exists
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - name: Install mold linker
+        run: bash scripts/ci/apt_install.sh mold
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
+      - name: Run memory-postgres feature tests
+        run: cargo nextest run --locked -p zeroclaw-memory --features memory-postgres
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      - name: Run PostgreSQL acceptance tests
+        run: cargo test --locked -p zeroclaw-memory --features memory-postgres -- --ignored --test-threads=1
+        env:
+          ZEROCLAW_TEST_POSTGRES_URL: postgres://zeroclaw_test:zeroclaw_test@127.0.0.1:5432/zeroclaw_test
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+
   parallel-runtime-test-changes:
     name: Detect parallel runtime test changes
     needs: [fmt]
@@ -1190,7 +1246,7 @@ jobs:
 
           # Any change to this workflow re-runs all gated families.
           wf='^\.github/workflows/ci\.yml$'
-          emit docs     "\.mdx?$|^docs/|^\.markdownlint-cli2\.yaml$|^scripts/ci/docs_(quality_gate|links_gate)\.sh$|${wf}"
+          emit docs     "\.mdx?$|^docs/|^\.markdownlint-cli2\.yaml$|^scripts/ci/(check_internal_docs_links(_test)?\.py|docs_(quality_gate|links_gate)\.sh)$|${wf}"
           emit nix      "\.nix$|^flake\.(nix|lock)$|^nix/|${wf}"
           emit nix_hash "(^|/)Cargo\.(toml|lock)$|^nix/hashes\.json$|^scripts/ci/list_git_dep_keys\.py$|${wf}"
           # The generated dashboard contract includes schemas owned by the
@@ -1276,6 +1332,10 @@ jobs:
         env:
           BASE_SHA: ${{ steps.base.outputs.sha }}
         run: bash scripts/ci/docs_links_gate.sh
+      - name: Docs link gate (all internal links)
+        run: python3 scripts/ci/check_internal_docs_links.py
+      - name: Docs link checker unit tests
+        run: python3 scripts/ci/check_internal_docs_links_test.py
 
   zerocode-rpc-boundary:
     name: Zerocode RPC Boundary
@@ -1378,7 +1438,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, msrv, check-32bit, bench, test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
+    needs: [fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, msrv, check-32bit, bench, test, memory-postgres-test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
     runs-on: ubuntu-latest
     steps:
       - name: Check results
