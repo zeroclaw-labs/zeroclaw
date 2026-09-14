@@ -23899,9 +23899,65 @@ impl Config {
             if !Self::is_complementary_required_agent_field(name, &api_error) {
                 return Err(anyhow::Error::new(api_error));
             }
+            // The surfaced error is a still-empty complementary field on the
+            // same agent, so staged repair may proceed. But `validate()` stops
+            // at its first error, and that error says nothing about the value
+            // just written. Re-validate with the complementary field filled in
+            // so any error belonging to *this* write -- a dangling reference,
+            // say -- is not waved through by the exception above.
+            if let Some(probe) = candidate.probe_with_complementary_agent_fields_filled(name)
+                && let Err(error) = probe.validate()
+            {
+                let api_error = crate::api_error::ConfigApiError::from_validation(error);
+                if !Self::is_complementary_required_agent_field(name, &api_error) {
+                    return Err(anyhow::Error::new(api_error));
+                }
+            }
         }
         *self = candidate;
         Ok(())
+    }
+
+    /// Clones `self` with the *other* required fields of `edited_path`'s agent
+    /// filled with placeholders that satisfy their existence checks.
+    ///
+    /// Staged repair means the agent is legitimately incomplete, so
+    /// `validate()` keeps reporting the empty complementary field and never
+    /// reaches the checks that would judge the value just written. Filling the
+    /// complementary fields with references that are known to resolve lets the
+    /// next `validate()` pass move on to those checks. Returns `None` when
+    /// `edited_path` is not an agent required field or no placeholder is
+    /// available, in which case the caller keeps its original decision.
+    fn probe_with_complementary_agent_fields_filled(&self, edited_path: &str) -> Option<Self> {
+        let (agent_alias, edited_field) = Self::agent_required_field(edited_path)?;
+        let agent = self.agents.get(agent_alias)?;
+
+        let mut probe = self.clone();
+        let probe_agent = probe.agents.get_mut(agent_alias)?;
+
+        if edited_field != "model_provider" && agent.model_provider.trim().is_empty() {
+            let (family, alias) = self.any_configured_model_provider()?;
+            probe_agent.model_provider = format!("{family}.{alias}").into();
+        }
+        if edited_field != "risk_profile" && agent.risk_profile.trim().is_empty() {
+            let alias = self.get_map_keys("risk_profiles")?.first()?.clone();
+            probe_agent.risk_profile = alias.into();
+        }
+
+        Some(probe)
+    }
+
+    /// Returns any configured `providers.models.<family>.<alias>` pair.
+    fn any_configured_model_provider(&self) -> Option<(String, String)> {
+        crate::providers::ModelProviders::slot_names()
+            .iter()
+            .find_map(|family| {
+                let alias = self
+                    .get_map_keys(&format!("providers.models.{family}"))?
+                    .first()?
+                    .clone();
+                Some(((*family).to_string(), alias))
+            })
     }
 
     pub fn set_secret_persistent(&mut self, name: &str, value: String) -> Result<()> {
@@ -27778,6 +27834,31 @@ enabled = true
             .set_prop_persistent_validated("agents.worker.model_provider", "openai.primary")
             .unwrap();
         config.validate().unwrap();
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_rejects_dangling_risk_profile_during_agent_repair() {
+        // A freshly staged agent has BOTH required fields empty, so the first
+        // error `validate()` reports is RequiredFieldEmpty on `model_provider`
+        // -- the complementary-field error the staged-repair exception is meant
+        // to tolerate. Writing a `risk_profile` that has no
+        // [risk_profiles.<alias>] entry must still be rejected: the exception
+        // only sees that first error, so a DanglingReference on the field being
+        // written can otherwise ride along and be persisted.
+        let mut config = staged_agent_repair_config();
+
+        let err = config
+            .set_prop_persistent_validated("agents.worker.risk_profile", "does-not-exist")
+            .expect_err("a risk_profile with no [risk_profiles.<alias>] entry must be rejected");
+
+        assert!(
+            err.to_string().contains("does-not-exist"),
+            "error should name the missing risk profile, got: {err}"
+        );
+        assert_eq!(
+            config.agents["worker"].risk_profile, "",
+            "a rejected write must not persist a dangling reference"
+        );
     }
 
     #[test]
