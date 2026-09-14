@@ -458,7 +458,7 @@ jobs:
     name: Check (${{ matrix.name }})
     needs: [fmt]
     runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
-    timeout-minutes: 20
+    timeout-minutes: ${{ matrix.features == 'plugins-wasm-cranelift' && 30 || 20 }}
     strategy:
       fail-fast: false
       matrix:
