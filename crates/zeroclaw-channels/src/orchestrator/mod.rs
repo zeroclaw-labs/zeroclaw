@@ -9238,7 +9238,8 @@ fn build_channel_by_id(
                 )
                 .with_team_ids(mm.team_ids.clone())
                 .with_discover_dms(mm.discover_dms.unwrap_or(true))
-                .with_listen_mode(mm.listen_mode),
+                .with_listen_mode(mm.listen_mode)
+                .with_approval_timeout_secs(mm.approval_timeout_secs),
             ))
         }
         #[cfg(not(feature = "channel-mattermost"))]
@@ -10668,7 +10669,8 @@ fn collect_configured_channels(
                     .with_discover_dms(mm.discover_dms.unwrap_or(true))
                     .with_proxy_url(mm.proxy_url.clone())
                     .with_transcription(config.transcription.clone())
-                    .with_listen_mode(mm.listen_mode),
+                    .with_listen_mode(mm.listen_mode)
+                    .with_approval_timeout_secs(mm.approval_timeout_secs),
                 ),
                 mm,
             ),
@@ -30269,6 +30271,7 @@ This is an example JSON object for profile settings."#;
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
+                approval_timeout_secs: 300,
             },
         );
         // A channel is only collected when an enabled agent references it.
@@ -30318,6 +30321,7 @@ This is an example JSON object for profile settings."#;
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
+                approval_timeout_secs: 300,
             },
         );
         config.agents.clear();
