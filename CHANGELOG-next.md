@@ -99,6 +99,7 @@ ZeroClaw v0.8.5 is a security, connectivity, and operator-experience release spa
 - **The WATI channel was removed.** Move deployments to WhatsApp Cloud or WhatsApp Web; stale WATI configuration remains only long enough to emit migration guidance (#9571).
 - **The Aardvark transport and legacy robot-kit crates were removed from the workspace.** Users that still need the in-tree integration should remain on v0.8.4; independently published library versions are unaffected (#9853).
 - **The root Cargo package is now named `zeroclaw`.** The installed binary name is unchanged, but contributor scripts using `cargo ... -p zeroclawlabs` must switch to `-p zeroclaw` (#9835).
+- **Browser automation is opt-in** (#9824): `[browser] enabled` (still `true` by default) now registers only `browser_open`. The full `browser` automation tool is gated behind the new `[browser] automation_enabled` (default `false`) and is no longer force-merged into the default `auto_approve` list, so automation calls go through the approval gate. Operators who used `[browser] enabled = true` for automation must set `automation_enabled = true`; an existing `auto_approve` entry for `"browser"` (written by the old forced merge) is kept and can be removed to restore prompting. The `Browser` integration row now reports Active when either flag is on.
 
 ## Contributors
 

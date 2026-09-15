@@ -42,14 +42,31 @@ agent-browser install
 
 ### 2. Verify ZeroClaw Config
 
-The browser tool is enabled by default with `allowed_domains = ["*"]`. Restrict domains or disable it via `zeroclaw config set`:
+The `[browser]` section gates two separate tools:
+
+| Config key | Default | Registers |
+|---|---|---|
+| `browser.enabled` | `true` | `browser_open`: hand a URL to the system browser. No scraping, no page interaction |
+| `browser.automation_enabled` | `false` | `browser`: the full Chrome/Chromium automation tool documented on this page (navigate, click, type, read page content) |
+
+Automation drives a browser that may already be logged into your accounts, so it is
+**opt-in**: turn it on explicitly, and only for agents that need it. It is also not on
+the default `auto_approve` list, so each `browser` call goes through the normal approval
+gate unless you add `"browser"` to a risk profile's `auto_approve`.
+
+Both tools share `allowed_domains`, which defaults to `["*"]`. Enable automation, restrict
+domains, or turn `browser_open` off via `zeroclaw config set`:
 
 <div class="os-tabs-src">
 
 #### sh
 
 ```sh
+# Opt into the full `browser` automation tool
+zeroclaw config set browser.automation_enabled true
+# Narrow the shared allowlist from the default ["*"]
 zeroclaw config set browser.allowed_domains '["example.com", "docs.example.com"]'
+# Drop `browser_open` if the agent should not open URLs in the system browser
 zeroclaw config set browser.enabled false
 ```
 
