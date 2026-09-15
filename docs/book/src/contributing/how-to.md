@@ -115,7 +115,7 @@ Body uses the PR template. **The testing section is required**: explain how the 
 
 Risk labels describe the actual change and consequence, not its broad path. Follow the [maintainer label guide](../maintainers/labels.md#risk-labels): `risk:low` is documentation, fixtures, or mechanical metadata with no production, compatibility, build, release, or governance effect; `risk:medium` is ordinary behavioral work; and `risk:high` is a concrete trust, credential, compatibility, governance, or release-authority boundary. `domain:security` is independent from `risk:*` and identifies an effective security boundary.
 
-A PR carrying either `risk:high` or `domain:security` needs deep review, a rollback plan matched to the change, and two independent Core Team approvals before merge. Use `risk:manual` when a maintainer needs to freeze future automatic risk replacement; it cannot lower the review requirement.
+A PR carrying either `risk:high` or `domain:security` needs deep review, a rollback plan matched to the change, and two independent Core Team approvals by default. After an active request for the second Core review remains unanswered for five full business days, a maintainer may evaluate the narrow [expedited second-review lane](../maintainers/pr-workflow.md#expedited-second-review-lane); its canonical page owns every eligibility and accountability condition. Use `risk:manual` when a maintainer needs to freeze future automatic risk replacement; the label does not itself lower the review requirement.
 
 ## After the PR
 
