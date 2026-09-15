@@ -10101,6 +10101,18 @@ mod tests {
     /// inside this bound, so ordinary runner load cannot reach it.
     const LISTEN_HANG_GUARD: Duration = Duration::from_secs(30);
 
+    /// Hang guard for the media-group tests, mirroring [`LISTEN_HANG_GUARD`].
+    ///
+    /// These tests drive a mock Telegram server through album buffering and
+    /// page boundaries, then wait for a dispatch. The waits are hang guards,
+    /// not timing assertions: ordering is proved by the sequence of `recv`
+    /// calls, never by how long a wait is allowed to take. Tight per-wait
+    /// deadlines made the whole family flaky on the repeated parallel runner,
+    /// where a loaded host can stall a settle window past a few seconds
+    /// (#10875). A bound well above any real settle path keeps a genuine hang
+    /// detectable while ordinary runner load cannot reach it.
+    const MEDIA_GROUP_HANG_GUARD: Duration = Duration::from_secs(30);
+
     /// Wait until a main-loop `getUpdates` call carrying `offset` shows up.
     ///
     /// Panics with the offsets actually observed. This replaced a `bool`
@@ -12101,11 +12113,11 @@ mod tests {
         let listener_channel = Arc::clone(&channel);
         let listener = zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
 
-        let album = tokio::time::timeout(Duration::from_secs(4), rx.recv())
+        let album = tokio::time::timeout(MEDIA_GROUP_HANG_GUARD, rx.recv())
             .await
             .expect("album should dispatch")
             .expect("listener should remain connected");
-        let follow_up = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        let follow_up = tokio::time::timeout(MEDIA_GROUP_HANG_GUARD, rx.recv())
             .await
             .expect("follow-up should dispatch")
             .expect("listener should remain connected");
@@ -12316,7 +12328,7 @@ mod tests {
         // 1. Intermediate messages (3..=98) dispatch immediately, while the
         // albums wait for their settlement delays.
         for i in 3..=98 {
-            let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            let msg = tokio::time::timeout(MEDIA_GROUP_HANG_GUARD, rx.recv())
                 .await
                 .expect("intermediate message should dispatch")
                 .expect("listener should remain connected");
@@ -12324,7 +12336,7 @@ mod tests {
         }
 
         // 2. Album A arrives once settled
-        let album_a = tokio::time::timeout(Duration::from_secs(4), rx.recv())
+        let album_a = tokio::time::timeout(MEDIA_GROUP_HANG_GUARD, rx.recv())
             .await
             .expect("album a should dispatch")
             .expect("listener should remain connected");
@@ -12334,7 +12346,7 @@ mod tests {
         // 3. Album B arrives as one single turn containing all 3 photos,
         // because its settlement was held until the saturated page boundary
         // was cleared by the next poll page returning update 101.
-        let album_b = tokio::time::timeout(Duration::from_secs(4), rx.recv())
+        let album_b = tokio::time::timeout(MEDIA_GROUP_HANG_GUARD, rx.recv())
             .await
             .expect("album b should dispatch as a single combined turn")
             .expect("listener should remain connected");
@@ -12581,20 +12593,20 @@ mod tests {
         // 1. The ordinary updates on the page dispatch immediately, including
         // the one at the page boundary, while both albums wait to settle.
         for i in 3..=98 {
-            let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            let msg = tokio::time::timeout(MEDIA_GROUP_HANG_GUARD, rx.recv())
                 .await
                 .expect("intermediate message should dispatch")
                 .expect("listener should remain connected");
             assert_eq!(msg.content, format!("msg {i}"));
         }
-        let boundary = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        let boundary = tokio::time::timeout(MEDIA_GROUP_HANG_GUARD, rx.recv())
             .await
             .expect("page-boundary message should dispatch")
             .expect("listener should remain connected");
         assert_eq!(boundary.content, "boundary");
 
         // 2. Album A settles first and releases the offset.
-        let album_a = tokio::time::timeout(Duration::from_secs(4), rx.recv())
+        let album_a = tokio::time::timeout(MEDIA_GROUP_HANG_GUARD, rx.recv())
             .await
             .expect("album a should dispatch")
             .expect("listener should remain connected");
@@ -12604,7 +12616,7 @@ mod tests {
         // 3. Album B arrives once, with the photo from update 99 and the photo
         // from update 101 in the same turn. Settling it from the replayed page
         // would have delivered only the first photo here.
-        let album_b = tokio::time::timeout(Duration::from_secs(4), rx.recv())
+        let album_b = tokio::time::timeout(MEDIA_GROUP_HANG_GUARD, rx.recv())
             .await
             .expect("album b should dispatch as a single combined turn")
             .expect("listener should remain connected");
@@ -12759,7 +12771,7 @@ mod tests {
         let listener_channel = Arc::clone(&channel);
         let listener = zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
 
-        let first = tokio::time::timeout(Duration::from_secs(4), rx.recv())
+        let first = tokio::time::timeout(MEDIA_GROUP_HANG_GUARD, rx.recv())
             .await
             .expect("the ordinary update should dispatch first")
             .expect("listener should remain connected");
@@ -12768,7 +12780,7 @@ mod tests {
             "the ordinary same-chat update must be delivered before the album settles"
         );
 
-        let album = tokio::time::timeout(Duration::from_secs(4), rx.recv())
+        let album = tokio::time::timeout(MEDIA_GROUP_HANG_GUARD, rx.recv())
             .await
             .expect("the album should dispatch once both photos are in")
             .expect("listener should remain connected");
