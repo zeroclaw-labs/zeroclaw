@@ -152,10 +152,10 @@ pub(crate) async fn prepare_messages_for_iteration(
     }
     let history = sanitized.as_slice();
     if degrade_strip_images {
-        // Text-only fallback: replace every media marker with a
-        // `[media attachment]` placeholder so no filesystem path or data
-        // URI reaches the text-only provider, while surrounding text
-        // (captions, tool metadata) survives.
+        // Text-only fallback: replace every media marker with the prose
+        // placeholder so no filesystem path or data URI reaches the
+        // text-only provider, while surrounding text (captions, tool
+        // metadata) survives.
         let stripped: Vec<ChatMessage> = history
             .iter()
             .map(|m| ChatMessage {
@@ -270,7 +270,7 @@ mod tests {
             !joined.contains("/tmp/clip.wav"),
             "audio path leaked to the provider payload: {joined}"
         );
-        assert!(joined.contains("[media attachment]"));
+        assert!(joined.contains(multimodal::MEDIA_PLACEHOLDER));
     }
 
     #[tokio::test]

@@ -484,6 +484,15 @@ const MEDIA_MARKER_KINDS: &[&str] = &[
 /// document and file delivery.
 const AUDIO_MARKER_KINDS: &[&str] = &["VOICE", "AUDIO"];
 
+/// Text a degraded media marker is replaced with before the history reaches
+/// a model that cannot consume the payload. The model may echo it verbatim
+/// into a reply, so it is plain prose rather than bracket syntax: it must
+/// never parse as an outbound delivery marker (`[KIND:target]`, which the
+/// channel parsers key on `[` and `:`), and it contains no JSON-special
+/// characters so a marker replaced inside a native tool-result blob leaves
+/// the surrounding object valid.
+pub const MEDIA_PLACEHOLDER: &str = "(media attachment omitted)";
+
 pub fn strip_media_markers(text: &str) -> String {
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(&format!(
@@ -492,7 +501,7 @@ pub fn strip_media_markers(text: &str) -> String {
         ))
         .expect("static media-marker regex must compile")
     });
-    RE.replace_all(text, "[media attachment]").into_owned()
+    RE.replace_all(text, MEDIA_PLACEHOLDER).into_owned()
 }
 
 /// Matches the audio-kind markers ([`AUDIO_MARKER_KINDS`]), capturing the
@@ -507,23 +516,23 @@ static AUDIO_MARKER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock:
 
 /// Replace audio markers (`[AUDIO:...]`, `[VOICE:...]`) whose payload is a
 /// *loadable* reference (absolute path, `http(s)://` URL, or `data:` URI) with
-/// the same `[media attachment]` placeholder the degrade path uses, returning
-/// the rewritten text and the number of markers replaced.
+/// the same [`MEDIA_PLACEHOLDER`] the degrade path uses, returning the
+/// rewritten text and the number of markers replaced.
 ///
 /// Non-loadable payloads are left as literal text — placeholders (`[AUDIO:...]`),
 /// prose (`[AUDIO:<clip>]`), and the no-transcription note (`[Audio: attached]`)
 /// are harmless and must survive — mirroring how [`parse_image_markers`]
 /// preserves non-loadable `[IMAGE:...]` markers. Runs over the raw string so it
 /// also cleans a marker embedded in a native tool-result JSON blob
-/// (`{"content":"…[AUDIO:/clip.wav]…"}`): `[media attachment]` contains no
-/// JSON-special characters, so the surrounding object stays valid.
+/// (`{"content":"…[AUDIO:/clip.wav]…"}`); see [`MEDIA_PLACEHOLDER`] for why
+/// the surrounding object stays valid.
 fn strip_unplayable_audio_markers(text: &str) -> (String, usize) {
     let mut stripped = 0usize;
     let out = AUDIO_MARKER_RE.replace_all(text, |caps: &regex::Captures<'_>| {
         let payload = collapse_wrapped_marker(&caps[1]);
         if !payload.is_empty() && is_loadable_image_reference(&payload) {
             stripped += 1;
-            "[media attachment]".to_string()
+            MEDIA_PLACEHOLDER.to_string()
         } else {
             // Preserve placeholder/prose markers verbatim.
             caps[0].to_string()
@@ -1782,13 +1791,19 @@ mod tests {
     #[test]
     fn strip_media_markers_replaces_image_local_path() {
         let input = "Look at [IMAGE:/zeroclaw-data/workspace/telegram_files/photo_1.jpg]";
-        assert_eq!(strip_media_markers(input), "Look at [media attachment]");
+        assert_eq!(
+            strip_media_markers(input),
+            format!("Look at {MEDIA_PLACEHOLDER}")
+        );
     }
 
     #[test]
     fn strip_media_markers_replaces_image_data_uri() {
         let input = "Inline [IMAGE:data:image/png;base64,abcd]";
-        assert_eq!(strip_media_markers(input), "Inline [media attachment]");
+        assert_eq!(
+            strip_media_markers(input),
+            format!("Inline {MEDIA_PLACEHOLDER}")
+        );
     }
 
     #[test]
@@ -1797,7 +1812,7 @@ mod tests {
         // `crates/zeroclaw-channels/src/util.rs`, which is the source of
         // truth for which marker spellings inbound channels can produce.
         let input = "[IMAGE:/a.jpg] [PHOTO:/b.jpg] [DOCUMENT:/c.pdf] [FILE:/d.zip] [VIDEO:/e.mp4] [VOICE:/f.ogg] [AUDIO:/g.wav]";
-        let expected = "[media attachment] [media attachment] [media attachment] [media attachment] [media attachment] [media attachment] [media attachment]";
+        let expected = [MEDIA_PLACEHOLDER; 7].join(" ");
         assert_eq!(strip_media_markers(input), expected);
     }
 
@@ -1808,7 +1823,7 @@ mod tests {
         // but accept lower/mixed case too so we don't depend on that
         // invariant downstream.
         let input = "[image:/a.jpg] [Photo:/b.jpg] [video:/c.mp4]";
-        let expected = "[media attachment] [media attachment] [media attachment]";
+        let expected = [MEDIA_PLACEHOLDER; 3].join(" ");
         assert_eq!(strip_media_markers(input), expected);
     }
 
@@ -1824,8 +1839,25 @@ mod tests {
         let input = "Use [TODO:foo] and [NOTE:bar] but replace [IMAGE:/x.jpg]";
         assert_eq!(
             strip_media_markers(input),
-            "Use [TODO:foo] and [NOTE:bar] but replace [media attachment]"
+            format!("Use [TODO:foo] and [NOTE:bar] but replace {MEDIA_PLACEHOLDER}")
         );
+    }
+
+    #[test]
+    fn media_placeholder_is_prose_not_a_marker() {
+        // A model may copy the placeholder from its input into a reply, so it
+        // must not be anything the marker grammar recognises: no bracket
+        // span, and nothing the strip paths would rewrite again.
+        assert!(!MEDIA_PLACEHOLDER.contains('['));
+        assert!(!MEDIA_PLACEHOLDER.contains(']'));
+        assert!(!MEDIA_PLACEHOLDER.contains(':'));
+        assert!(!MEDIA_PLACEHOLDER.contains(['"', '\\']));
+        assert_eq!(strip_media_markers(MEDIA_PLACEHOLDER), MEDIA_PLACEHOLDER);
+        assert_eq!(
+            strip_unplayable_audio_markers(MEDIA_PLACEHOLDER),
+            (MEDIA_PLACEHOLDER.to_string(), 0)
+        );
+        assert!(parse_image_markers(MEDIA_PLACEHOLDER).1.is_empty());
     }
 
     // ── loadable audio markers degrade; other media kinds keep their paths ──
@@ -1833,7 +1865,7 @@ mod tests {
     #[test]
     fn strip_unplayable_audio_markers_replaces_loadable_audio_path() {
         let (out, n) = strip_unplayable_audio_markers("hear this [AUDIO:/tmp/clip.wav] now");
-        assert_eq!(out, "hear this [media attachment] now");
+        assert_eq!(out, format!("hear this {MEDIA_PLACEHOLDER} now"));
         assert_eq!(n, 1);
     }
 
@@ -1846,7 +1878,10 @@ mod tests {
         let (out, n) = strip_unplayable_audio_markers(input);
         assert_eq!(
             out,
-            "[PHOTO:/a.jpg] [DOCUMENT:/b.pdf] [FILE:/c.zip] [VIDEO:/d.mp4] [media attachment] [media attachment]"
+            format!(
+                "[PHOTO:/a.jpg] [DOCUMENT:/b.pdf] [FILE:/c.zip] [VIDEO:/d.mp4] \
+                 {MEDIA_PLACEHOLDER} {MEDIA_PLACEHOLDER}"
+            )
         );
         assert_eq!(n, 2);
     }
@@ -1866,7 +1901,7 @@ mod tests {
         // `[IMAGE:...]` is handled by `parse_image_markers`; the audio
         // stripper must never touch it (that would drop a resolvable image).
         let (out, n) = strip_unplayable_audio_markers("[IMAGE:/a.png] and [AUDIO:/b.wav]");
-        assert_eq!(out, "[IMAGE:/a.png] and [media attachment]");
+        assert_eq!(out, format!("[IMAGE:/a.png] and {MEDIA_PLACEHOLDER}"));
         assert_eq!(n, 1);
     }
 
@@ -1892,7 +1927,7 @@ mod tests {
     #[test]
     fn strip_unplayable_audio_markers_is_case_insensitive() {
         let (out, n) = strip_unplayable_audio_markers("[Audio:/tmp/clip.wav]");
-        assert_eq!(out, "[media attachment]");
+        assert_eq!(out, MEDIA_PLACEHOLDER);
         assert_eq!(n, 1);
     }
 
@@ -1901,7 +1936,7 @@ mod tests {
         let (out, n) = strip_unplayable_audio_markers(
             "[VOICE:data:audio/ogg;base64,AAAA] and [AUDIO:https://x/y.mp3]",
         );
-        assert_eq!(out, "[media attachment] and [media attachment]");
+        assert_eq!(out, format!("{MEDIA_PLACEHOLDER} and {MEDIA_PLACEHOLDER}"));
         assert_eq!(n, 2);
     }
 
@@ -1926,7 +1961,7 @@ mod tests {
             "raw audio path must not reach the provider: {}",
             tool_msg.content
         );
-        assert!(tool_msg.content.contains("[media attachment]"));
+        assert!(tool_msg.content.contains(MEDIA_PLACEHOLDER));
         assert!(!prepared.contains_images);
     }
 
@@ -1979,7 +2014,7 @@ mod tests {
             !content.contains("/tmp/clip.wav"),
             "audio path must be stripped: {content}"
         );
-        assert!(content.contains("[media attachment]"));
+        assert!(content.contains(MEDIA_PLACEHOLDER));
         // The image marker is still normalized to a data URI alongside it.
         assert!(prepared.contains_images, "image still inlined: {content}");
     }

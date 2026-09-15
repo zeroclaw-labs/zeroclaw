@@ -11,6 +11,7 @@ pub(crate) mod history_append;
 pub(crate) mod history_window;
 pub(crate) mod knobs;
 pub(crate) mod max_iter;
+pub(crate) mod media_degrade;
 pub(crate) mod outcome;
 pub(crate) mod parse_response;
 pub(crate) mod post_exec;
