@@ -14,7 +14,7 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 - `uri`: full endpoint override. Leave unset to use the family's endpoint resolver.
 - `model`: model identifier sent to the provider.
 - `temperature`: optional sampling temperature.
-- `timeout_secs`: HTTP request timeout in seconds.
+- `timeout_secs`: HTTP request timeout in seconds. Setting it above 300 also raises the provider's streaming idle bound (the default 300-second cap on the gap between stream reads) for OpenAI Responses and OpenAI-compatible providers.
 - `max_tokens`: optional response length cap.
 - `extra_headers`: extra HTTP headers for custom gateways or auth bridges.
 - `fallback_models`: alternate model IDs on the same provider alias.

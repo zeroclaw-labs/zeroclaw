@@ -1210,6 +1210,68 @@ pub fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     sanitize_api_error(&formatted)
 }
 
+/// Maximum silence between body reads on provider SSE streams. A provider's
+/// effective bound is derived from this floor by [`stream_idle_timeout`].
+pub(crate) const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The streaming read-idle bound in effect on a provider connection, and
+/// whether a configuration knob can raise it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StreamIdleBound {
+    /// `max(STREAM_IDLE_TIMEOUT, timeout_secs)`: `timeout_secs` governs the
+    /// bound, so idle-timeout errors also name the knob that raises it.
+    Configurable(std::time::Duration),
+    /// A fixed client constant: no configuration knob moves it, so
+    /// idle-timeout errors name the bound without knob advice.
+    Fixed(std::time::Duration),
+}
+
+impl StreamIdleBound {
+    /// The bound's duration, regardless of whether it is configurable.
+    pub(crate) fn duration(self) -> std::time::Duration {
+        match self {
+            StreamIdleBound::Configurable(duration) | StreamIdleBound::Fixed(duration) => duration,
+        }
+    }
+}
+
+/// Effective streaming idle bound for a provider configured with
+/// `timeout_secs`: the 300 s [`STREAM_IDLE_TIMEOUT`] floor, or `timeout_secs`
+/// when set higher, as a [`StreamIdleBound::Configurable`] bound. An unset or
+/// lower `timeout_secs` keeps the 300 s default, so the bound is never
+/// tightened below the floor.
+pub(crate) fn stream_idle_timeout(timeout_secs: u64) -> StreamIdleBound {
+    StreamIdleBound::Configurable(
+        STREAM_IDLE_TIMEOUT.max(std::time::Duration::from_secs(timeout_secs)),
+    )
+}
+
+/// Error text for a failed streaming read. A read/idle timeout names the bound
+/// that fired instead of reqwest's bare "operation timed out"; when
+/// `timeout_secs` governs the bound the message also says that raising it
+/// waits longer. Every other error, including connect failures, keeps the
+/// sanitized reqwest chain unchanged.
+pub(crate) fn stream_idle_error_message(
+    error: &reqwest::Error,
+    idle_timeout: StreamIdleBound,
+) -> String {
+    if error.is_timeout() && !error.is_connect() {
+        let secs = idle_timeout.duration().as_secs();
+        let advice = match idle_timeout {
+            StreamIdleBound::Configurable(_) => {
+                format!("; raise timeout_secs above {secs}s to wait longer")
+            }
+            StreamIdleBound::Fixed(_) => String::new(),
+        };
+        format!(
+            "no data from provider for {secs}s (stream idle timeout{advice}): {}",
+            format_error_chain(error)
+        )
+    } else {
+        format_error_chain(error)
+    }
+}
+
 /// Build a sanitized model_provider error from a failed HTTP response.
 pub async fn api_error(model_provider: &str, response: reqwest::Response) -> anyhow::Error {
     let status = response.status();

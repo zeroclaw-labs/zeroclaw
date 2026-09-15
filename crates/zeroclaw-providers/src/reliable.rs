@@ -529,6 +529,39 @@ fn has_typed_non_retryable_marker(err: &anyhow::Error) -> bool {
         .any(|source| source.is::<crate::traits::NonRetryableProviderError>())
 }
 
+/// First status-shaped HTTP client error code embedded in an error message:
+/// a run of exactly three ASCII digits, not adjacent (either side) to an
+/// ASCII alphanumeric character, whose value is in 400..500. Numbers glued to
+/// units or words ("480s"), longer digit runs ("0409", "4800"), and values
+/// outside the client range are not status codes. This keeps timing and
+/// sizing numbers in provider messages (for example a stream-idle bound of
+/// 480 s) from being misread as a 4xx client error.
+fn embedded_client_status(message: &str) -> Option<u16> {
+    let bytes = message.as_bytes();
+    let mut start = 0;
+    while start < bytes.len() {
+        if !bytes[start].is_ascii_digit() {
+            start += 1;
+            continue;
+        }
+        let mut end = start;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        let status_shaped = end - start == 3
+            && (start == 0 || !bytes[start - 1].is_ascii_alphanumeric())
+            && (end == bytes.len() || !bytes[end].is_ascii_alphanumeric());
+        if status_shaped
+            && let Ok(code) = message[start..end].parse::<u16>()
+            && (400..500).contains(&code)
+        {
+            return Some(code);
+        }
+        start = end;
+    }
+    None
+}
+
 /// Check if an error is non-retryable (client errors that won't resolve with retries).
 pub fn is_non_retryable(err: &anyhow::Error) -> bool {
     // A provider's typed classification is definitive. Check the full chain
@@ -568,13 +601,12 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
     }
     // Fallback: parse status codes from stringified errors (some model_providers
     // embed codes in error messages rather than returning typed HTTP errors).
+    // Only status-shaped numbers count (see `embedded_client_status`), so
+    // elapsed times and other digit noise in a message never look like an
+    // HTTP client error.
     let msg = err.to_string();
-    for word in msg.split(|c: char| !c.is_ascii_digit()) {
-        if let Ok(code) = word.parse::<u16>()
-            && (400..500).contains(&code)
-        {
-            return code != 429 && code != 408;
-        }
+    if let Some(code) = embedded_client_status(&msg) {
+        return code != 429 && code != 408;
     }
 
     // Heuristic: detect auth/model failures by keyword when no HTTP status
@@ -7904,6 +7936,51 @@ mod tests {
             !is_non_retryable(&err),
             "502 must NOT be treated as non-retryable"
         );
+    }
+
+    #[test]
+    fn non_retryable_ignores_stream_idle_timeout_messages() {
+        let err = anyhow::Error::msg(
+            "no data from provider for 480s (stream idle timeout; raise timeout_secs above 480s to wait longer): error sending request for url (http://gateway.example/v1/chat/completions): operation timed out",
+        );
+        assert!(
+            !is_non_retryable(&err),
+            "a stream idle timeout must stay retryable so the user's turn is preserved"
+        );
+        let err = anyhow::Error::msg(
+            "no data from provider for 3600s (stream idle timeout; raise timeout_secs above 3600s to wait longer): error sending request for url (http://gateway.example/v1/chat/completions): operation timed out",
+        );
+        assert!(
+            !is_non_retryable(&err),
+            "an hour-long idle bound is still not a client error"
+        );
+        let err = anyhow::Error::msg(
+            "no data from provider for 480s (stream idle timeout): error sending request for url (http://gateway.example/v1/chat/completions): operation timed out",
+        );
+        assert!(
+            !is_non_retryable(&err),
+            "the fixed-bound idle rendering must also stay retryable"
+        );
+    }
+
+    #[test]
+    fn non_retryable_detects_status_shaped_numbers_only() {
+        assert!(is_non_retryable(&anyhow::Error::msg("HTTP 401")));
+        assert!(is_non_retryable(&anyhow::Error::msg(
+            "upstream rejected the call: \"code\":404, model missing"
+        )));
+        assert!(is_non_retryable(&anyhow::Error::msg(
+            "status=403 forbidden"
+        )));
+        assert!(!is_non_retryable(&anyhow::Error::msg(
+            "waited 480s for first byte"
+        )));
+        assert!(!is_non_retryable(&anyhow::Error::msg(
+            "code 0409 from gateway"
+        )));
+        assert!(!is_non_retryable(&anyhow::Error::msg(
+            "spent 4800 ms connecting"
+        )));
     }
 
     // ── §2.2 Rate limit Retry-After edge cases ───────────────

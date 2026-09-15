@@ -18867,6 +18867,26 @@ api_key = "anthropic-key"
         assert_eq!(persisted[1].content, "ok");
     }
 
+    #[test]
+    fn should_rollback_failed_user_turn_ignores_stream_idle_timeouts() {
+        // A stream idle timeout is a transport stall, not a client error: the
+        // elapsed-seconds bound in the message must never read as an HTTP
+        // status, or a stalled turn would delete the user's prompt.
+        let idle_error = anyhow::Error::msg(
+            "no data from provider for 480s (stream idle timeout; raise timeout_secs above 480s to wait longer): error sending request for url (http://gateway.example/v1/chat/completions): operation timed out",
+        );
+        assert!(
+            !should_rollback_failed_user_turn(&idle_error),
+            "stream idle timeouts must stay retryable so the prompt is preserved"
+        );
+
+        let client_error = anyhow::Error::msg("HTTP 400 Bad Request");
+        assert!(
+            should_rollback_failed_user_turn(&client_error),
+            "genuine 4xx client errors must still roll the failed turn back"
+        );
+    }
+
     pub(crate) struct DummyModelProvider;
 
     #[async_trait::async_trait]
