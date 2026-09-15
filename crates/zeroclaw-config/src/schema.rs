@@ -24170,6 +24170,142 @@ impl Config {
         Ok(())
     }
 
+    /// True when `error` is an empty agent required field that staged repair is
+    /// expected to leave behind, rather than a complaint about the value just
+    /// written to `edited_path`.
+    ///
+    /// Two shapes qualify. The complementary field of the agent being edited:
+    /// an agent completed field-by-field is invalid between writes. And any
+    /// required field of a *different* agent: `validate()` walks agents in
+    /// sorted alias order and stops at its first error, so an unrelated staged
+    /// agent must not block this one from being repaired.
+    ///
+    /// The edited field itself never qualifies -- if the value just written is
+    /// the empty one, that is this write's own error.
+    fn is_complementary_required_agent_field(
+        edited_path: &str,
+        error: &crate::api_error::ConfigApiError,
+    ) -> bool {
+        use crate::api_error::ConfigApiCode;
+
+        if error.code != ConfigApiCode::RequiredFieldEmpty {
+            return false;
+        }
+        let Some(error_path) = error.path.as_deref() else {
+            return false;
+        };
+        let Some((edited_agent, edited_field)) = Self::agent_required_field(edited_path) else {
+            return false;
+        };
+        let Some((error_agent, error_field)) = Self::agent_required_field(error_path) else {
+            return false;
+        };
+
+        if edited_agent != error_agent {
+            return true;
+        }
+        edited_field != error_field
+    }
+
+    fn agent_required_field(path: &str) -> Option<(&str, &str)> {
+        let mut parts = path.split('.');
+        let (Some("agents"), Some(agent), Some(field), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return None;
+        };
+        matches!(field, "model_provider" | "risk_profile").then_some((agent, field))
+    }
+
+    /// Apply and validate a persistent property update atomically.
+    ///
+    /// Validation runs on a working copy so a rejected value cannot mutate the
+    /// live config or leave a dirty path behind.
+    pub fn set_prop_persistent_validated(&mut self, name: &str, value_str: &str) -> Result<()> {
+        let mut candidate = self.clone();
+        candidate.set_prop_persistent(name, value_str)?;
+        if let Err(error) = candidate.validate() {
+            let api_error = crate::api_error::ConfigApiError::from_validation(error);
+            if !Self::is_complementary_required_agent_field(name, &api_error) {
+                return Err(anyhow::Error::new(api_error));
+            }
+            // The surfaced error is a still-empty complementary field on the
+            // same agent, so staged repair may proceed. But `validate()` stops
+            // at its first error, and that error says nothing about the value
+            // just written. Re-validate with the complementary field filled in
+            // so any error belonging to *this* write -- a dangling reference,
+            // say -- is not waved through by the exception above.
+            if let Some(probe) = candidate.probe_with_complementary_agent_fields_filled(name)
+                && let Err(error) = probe.validate()
+            {
+                let api_error = crate::api_error::ConfigApiError::from_validation(error);
+                if !Self::is_complementary_required_agent_field(name, &api_error) {
+                    return Err(anyhow::Error::new(api_error));
+                }
+            }
+        }
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Clones `self` with every empty agent required field filled with a
+    /// placeholder that satisfies its existence check, except the field named by
+    /// `edited_path`.
+    ///
+    /// Staged repair means agents are legitimately incomplete, so `validate()`
+    /// keeps reporting an empty required field and never reaches the checks that
+    /// would judge the value just written. `validate()` also walks agents in
+    /// sorted alias order and stops at its first error, so an unrelated
+    /// incomplete agent can be the one it reports about. Filling every staged
+    /// field except the edited one lets the next `validate()` pass move past all
+    /// of that, leaving only errors that genuinely belong to this write.
+    ///
+    /// The edited field keeps the caller's value so it is the thing under test.
+    /// Returns `None` when `edited_path` is not an agent required field or no
+    /// placeholder is available, in which case the caller keeps its original
+    /// decision.
+    fn probe_with_complementary_agent_fields_filled(&self, edited_path: &str) -> Option<Self> {
+        let (edited_agent, edited_field) = Self::agent_required_field(edited_path)?;
+        self.agents.get(edited_agent)?;
+
+        let mut probe = self.clone();
+        let placeholder_provider = self.any_configured_model_provider();
+        let placeholder_risk_profile = self
+            .get_map_keys("risk_profiles")
+            .and_then(|keys| keys.first().cloned());
+
+        for (alias, agent) in probe.agents.iter_mut() {
+            let editing_this_agent = alias == edited_agent;
+
+            if agent.model_provider.trim().is_empty()
+                && !(editing_this_agent && edited_field == "model_provider")
+            {
+                let (family, provider_alias) = placeholder_provider.clone()?;
+                agent.model_provider = format!("{family}.{provider_alias}").into();
+            }
+            if agent.risk_profile.trim().is_empty()
+                && !(editing_this_agent && edited_field == "risk_profile")
+            {
+                agent.risk_profile = placeholder_risk_profile.clone()?.into();
+            }
+        }
+
+        Some(probe)
+    }
+
+    /// Returns any configured `providers.models.<family>.<alias>` pair.
+    fn any_configured_model_provider(&self) -> Option<(String, String)> {
+        crate::providers::ModelProviders::slot_names()
+            .iter()
+            .find_map(|family| {
+                let alias = self
+                    .get_map_keys(&format!("providers.models.{family}"))?
+                    .first()?
+                    .clone();
+                Some(((*family).to_string(), alias))
+            })
+    }
+
     pub fn set_secret_persistent(&mut self, name: &str, value: String) -> Result<()> {
         self.reject_ambiguous_persistent_map_key_path(name)?;
         self.set_secret(name, value)?;
@@ -28002,6 +28138,207 @@ enabled = true
                 .contains("gateway.websocket_ping_interval_secs"),
             "error must name the offending path; got: {err}"
         );
+    }
+
+    #[test]
+    async fn persistent_set_validation_is_atomic() {
+        let mut config = Config::default();
+        let gateway_before = toml::to_string(&config.gateway).unwrap();
+        let dirty_before = config.dirty_paths.clone();
+        let path = "gateway.websocket_ping_interval_secs";
+
+        let err = config
+            .set_prop_persistent_validated(
+                path,
+                &(GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS + 1).to_string(),
+            )
+            .expect_err("out-of-range persistent update must be rejected");
+
+        assert!(err.to_string().contains(path));
+        assert_eq!(toml::to_string(&config.gateway).unwrap(), gateway_before);
+        assert_eq!(config.dirty_paths, dirty_before);
+    }
+
+    fn staged_agent_repair_config() -> Config {
+        let mut config: Config = toml::from_str(
+            r#"
+                [providers.models.openai.primary]
+                api_key = "test-key"
+                model = "gpt-test"
+
+                [risk_profiles.standard]
+                level = "supervised"
+            "#,
+        )
+        .unwrap();
+        config
+            .agents
+            .insert("worker".to_string(), AliasedAgentConfig::default());
+        config
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_allows_provider_first_agent_repair() {
+        let mut config = staged_agent_repair_config();
+
+        config
+            .set_prop_persistent_validated("agents.worker.model_provider", "openai.primary")
+            .unwrap();
+        assert_eq!(config.agents["worker"].model_provider, "openai.primary");
+        assert!(config.validate().is_err());
+
+        config
+            .set_prop_persistent_validated("agents.worker.risk_profile", "standard")
+            .unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_allows_risk_profile_first_agent_repair() {
+        let mut config = staged_agent_repair_config();
+
+        config
+            .set_prop_persistent_validated("agents.worker.risk_profile", "standard")
+            .unwrap();
+        assert_eq!(config.agents["worker"].risk_profile, "standard");
+        assert!(config.validate().is_err());
+
+        config
+            .set_prop_persistent_validated("agents.worker.model_provider", "openai.primary")
+            .unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_rejects_dangling_risk_profile_during_agent_repair() {
+        // A freshly staged agent has BOTH required fields empty, so the first
+        // error `validate()` reports is RequiredFieldEmpty on `model_provider`
+        // -- the complementary-field error the staged-repair exception is meant
+        // to tolerate. Writing a `risk_profile` that has no
+        // [risk_profiles.<alias>] entry must still be rejected: the exception
+        // only sees that first error, so a DanglingReference on the field being
+        // written can otherwise ride along and be persisted.
+        let mut config = staged_agent_repair_config();
+
+        let err = config
+            .set_prop_persistent_validated("agents.worker.risk_profile", "does-not-exist")
+            .expect_err("a risk_profile with no [risk_profiles.<alias>] entry must be rejected");
+
+        assert!(
+            err.to_string().contains("does-not-exist"),
+            "error should name the missing risk profile, got: {err}"
+        );
+        assert_eq!(
+            config.agents["worker"].risk_profile, "",
+            "a rejected write must not persist a dangling reference"
+        );
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_repairs_agent_despite_other_incomplete_agent() {
+        // Two staged agents, both incomplete. `validate()` walks agents in
+        // sorted alias order and stops at the first error, so "alpha" is the
+        // one it reports about. Repairing "worker" must still be possible: the
+        // staged-repair exception has to recognise that the surfaced error
+        // belongs to a different agent than the one being edited, otherwise an
+        // alphabetically earlier incomplete agent permanently blocks every
+        // later agent from being completed field-by-field.
+        let mut config = staged_agent_repair_config();
+        config
+            .agents
+            .insert("alpha".to_string(), AliasedAgentConfig::default());
+
+        config
+            .set_prop_persistent_validated("agents.worker.model_provider", "openai.primary")
+            .expect("an unrelated incomplete agent must not block repairing this one");
+        assert_eq!(config.agents["worker"].model_provider, "openai.primary");
+
+        config
+            .set_prop_persistent_validated("agents.worker.risk_profile", "standard")
+            .expect("an unrelated incomplete agent must not block repairing this one");
+        assert_eq!(config.agents["worker"].risk_profile, "standard");
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_allows_repairing_empty_agent_model_provider() {
+        let mut config: Config = toml::from_str(
+            r#"
+                [providers.models.openai.primary]
+                api_key = "test-key"
+                model = "gpt-test"
+
+                [risk_profiles.standard]
+                level = "supervised"
+
+                [agents.worker]
+                enabled = true
+                model_provider = ""
+                risk_profile = "standard"
+            "#,
+        )
+        .unwrap();
+
+        config
+            .set_prop_persistent_validated("agents.worker.model_provider", "openai.primary")
+            .unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_rejects_invalid_agent_array_element() {
+        let mut config: Config = toml::from_str(
+            r#"
+                [providers.models.openai.primary]
+                api_key = "test-key"
+                model = "gpt-test"
+
+                [risk_profiles.standard]
+                level = "supervised"
+
+                [agents.worker]
+                enabled = true
+                model_provider = "openai.primary"
+                risk_profile = "standard"
+            "#,
+        )
+        .unwrap();
+        let agents_before = toml::to_string(&config.agents).unwrap();
+        let dirty_before = config.dirty_paths.clone();
+
+        let err = config
+            .set_prop_persistent_validated("agents.worker.channels", r#"["telegram.missing"]"#)
+            .expect_err("an invalid array element at the edited path must be rejected");
+
+        assert!(err.to_string().contains("agents.worker.channels[0]"));
+        assert_eq!(toml::to_string(&config.agents).unwrap(), agents_before);
+        assert_eq!(config.dirty_paths, dirty_before);
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_rejects_non_required_cross_field_error() {
+        let mut config: Config = toml::from_str(
+            r#"
+                [providers.models.openai.primary]
+                api_key = "test-key"
+                model = "gpt-test"
+
+                [agents.worker]
+                enabled = false
+                model_provider = "openai.primary"
+                risk_profile = ""
+            "#,
+        )
+        .unwrap();
+        let agents_before = toml::to_string(&config.agents).unwrap();
+        let dirty_before = config.dirty_paths.clone();
+
+        let err = config
+            .set_prop_persistent_validated("agents.worker.enabled", "true")
+            .expect_err("only the two required agent references may be staged");
+
+        assert!(err.to_string().contains("agents.worker.risk_profile"));
+        assert_eq!(toml::to_string(&config.agents).unwrap(), agents_before);
+        assert_eq!(config.dirty_paths, dirty_before);
     }
 
     #[test]
