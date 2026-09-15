@@ -2681,6 +2681,14 @@ impl AnthropicModelProvider {
 
 #[async_trait]
 impl ModelProvider for AnthropicModelProvider {
+    fn supports_exact_request_replay(
+        &self,
+        request: crate::traits::ChatRequest<'_>,
+        model: &str,
+    ) -> bool {
+        request.thinking.is_some() || self.server_fallbacks_for(model, None).is_none()
+    }
+
     fn default_temperature(&self) -> f64 {
         TEMPERATURE_DEFAULT
     }
@@ -2762,7 +2770,12 @@ impl ModelProvider for AnthropicModelProvider {
         let response = request.send().await?;
 
         if !response.status().is_success() {
-            return Err(super::api_error("Anthropic", response).await);
+            let status = response.status();
+            let error = super::api_error("Anthropic", response).await;
+            return Err(anyhow::Error::new(crate::reliable::ProviderHttpError::new(
+                status,
+                error.to_string(),
+            )));
         }
 
         let chat_response: NativeChatResponse = response.json().await?;
@@ -2886,7 +2899,12 @@ impl ModelProvider for AnthropicModelProvider {
             .send()
             .await?;
         if !response.status().is_success() {
-            return Err(super::api_error("Anthropic", response).await);
+            let status = response.status();
+            let error = super::api_error("Anthropic", response).await;
+            return Err(anyhow::Error::new(crate::reliable::ProviderHttpError::new(
+                status,
+                error.to_string(),
+            )));
         }
 
         let native_response: NativeChatResponse = response.json().await?;
@@ -3119,7 +3137,10 @@ impl ModelProvider for AnthropicModelProvider {
                         .text()
                         .await
                         .unwrap_or_else(|_| format!("HTTP error: {status}"));
-                    return Err(StreamError::ModelProvider(format!("{status}: {body}")));
+                    return Err(StreamError::HttpStatus {
+                        status: status.as_u16(),
+                        message: super::sanitize_api_error(&body),
+                    });
                 }
                 let parsed: NativeChatResponse = response
                     .json()
@@ -3287,9 +3308,10 @@ impl ModelProvider for AnthropicModelProvider {
                     ),
                 };
                 let _ = tx
-                    .send(Err(StreamError::ModelProvider(format!(
-                        "{status}: {error}"
-                    ))))
+                    .send(Err(StreamError::HttpStatus {
+                        status: status.as_u16(),
+                        message: super::sanitize_api_error(&error),
+                    }))
                     .await;
                 return;
             }
@@ -8085,6 +8107,31 @@ data: {\"type\":\"message_stop\"}\n\n";
         })
     }
 
+    #[test]
+    fn exact_request_replay_rejects_effective_server_fallback() {
+        let messages = [crate::traits::ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .server_fallback_models(vec!["claude-opus-4-8".to_string()])
+            .build();
+
+        assert!(!provider.supports_exact_request_replay(request, "claude-fable-5"));
+
+        let thinking_request = ProviderChatRequest {
+            thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
+                budget_tokens: 1_024,
+                display: None,
+            }),
+            ..request
+        };
+        assert!(provider.supports_exact_request_replay(thinking_request, "claude-fable-5"));
+    }
+
     #[tokio::test]
     async fn server_fallback_config_adds_param_and_beta_header() {
         let (addr, captured, server) = spawn_capturing_server().await;
@@ -9636,5 +9683,50 @@ data: {\"type\":\"message_stop\"}\n\n";
             serde_json::from_str(&reasoning).expect("reasoning_content line must be a JSON object");
         assert_eq!(parsed["thinking"], "");
         assert_eq!(parsed["signature"], "sigX");
+    }
+
+    #[tokio::test]
+    async fn message_only_bad_request_preserves_http_status_without_prose_classification() {
+        use axum::{Router, http::StatusCode, routing::post};
+
+        let app = Router::new().route(
+            "/v1/messages",
+            post(|| async { (StatusCode::BAD_REQUEST, "request could not be processed") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Anthropic HTTP test server");
+        let addr = listener.local_addr().expect("Anthropic HTTP test address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Anthropic HTTP test");
+        });
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .base_url(&format!("http://{addr}"))
+            .build();
+        let messages = [crate::traits::ChatMessage::user("hello")];
+
+        let error = provider
+            .chat(
+                crate::traits::ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "claude-test",
+                None,
+            )
+            .await
+            .expect_err("HTTP 400 must remain terminal");
+        server.abort();
+
+        assert_eq!(
+            error
+                .downcast_ref::<crate::reliable::ProviderHttpError>()
+                .map(crate::reliable::ProviderHttpError::status),
+            Some(400)
+        );
     }
 }

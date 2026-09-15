@@ -101,6 +101,7 @@ pub(crate) struct ReliableCallAccounting {
     stream_resume_after: Option<ReliableEntryId>,
     stream_recovery_semantic_empty: bool,
     stream_recovery_semantic_empty_permission: bool,
+    stream_recovery_image_replacement_permission: bool,
     stream_recovery_failure: Option<ProviderErrorDiagnostic>,
 }
 
@@ -209,6 +210,18 @@ pub(crate) fn mark_stream_recovery_semantic_empty() {
         let mut accounting = accounting.lock();
         accounting.stream_recovery_semantic_empty = true;
         accounting.stream_recovery_semantic_empty_permission = true;
+    });
+}
+
+/// Permit one non-streaming call to the exact entry whose image-bearing stream
+/// ended in HTTP 400. Runtime grants this only after constructing a provider-
+/// only request view with the novel image identities removed.
+#[doc(hidden)]
+pub fn permit_exact_image_recovery() {
+    let _ = RELIABLE_CALL_ACCOUNTING.try_with(|accounting| {
+        accounting
+            .lock()
+            .stream_recovery_image_replacement_permission = true;
     });
 }
 
@@ -767,6 +780,29 @@ fn compact_error_detail(err: &anyhow::Error) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Sanitized HTTP failure retained across provider wrappers so runtime policy
+/// can act on the status code without parsing provider prose.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct ProviderHttpError {
+    status: u16,
+    message: String,
+}
+
+impl ProviderHttpError {
+    pub(crate) fn new(status: reqwest::StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status: status.as_u16(),
+            message: message.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn status(&self) -> u16 {
+        self.status
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1879,9 +1915,9 @@ impl ReliableModelProvider {
         self.model_providers.len() > 1 && self.provider_cooldown_active(&entry.cooldown_key)
     }
 
-    /// Admit an entry with its configured retry budget, except for the exact
-    /// semantic-empty stream entry, which receives one atomic non-stream
-    /// recovery attempt when the configured budget permits it.
+    /// Admit an entry with its configured retry budget. The exact failed stream
+    /// entry may receive one atomic non-stream attempt for semantic-empty or
+    /// runtime-authorized image-replacement recovery.
     fn effective_retry_limit(&self, model_slot: usize, entry_index: usize) -> Option<u32> {
         let max_retries = self.max_retries;
         RELIABLE_CALL_ACCOUNTING
@@ -1892,6 +1928,10 @@ impl ReliableModelProvider {
                 });
                 if !exact_failed_entry {
                     return Some(max_retries);
+                }
+                if accounting.stream_recovery_image_replacement_permission {
+                    accounting.stream_recovery_image_replacement_permission = false;
+                    return Some(0);
                 }
                 if max_retries == 0 || !accounting.stream_recovery_semantic_empty_permission {
                     return None;
@@ -2034,6 +2074,25 @@ impl ModelProvider for ReliableModelProvider {
         self.model_providers
             .first()
             .is_some_and(|entry| entry.provider().has_stable_request_identity(model))
+    }
+
+    fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
+        if self.max_retries != 0
+            || !self.api_keys.is_empty()
+            || self.model_providers.len() != 1
+            || self
+                .model_fallbacks
+                .get(model)
+                .is_some_and(|fallbacks| !fallbacks.is_empty())
+        {
+            return false;
+        }
+
+        self.model_providers.first().is_some_and(|entry| {
+            entry
+                .provider()
+                .supports_exact_request_replay(request, entry.served_model(model))
+        })
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {

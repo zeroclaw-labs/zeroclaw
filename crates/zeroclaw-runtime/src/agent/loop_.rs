@@ -2184,6 +2184,8 @@ pub async fn run(
             } else {
                 vec![ChatMessage::system(&system_prompt)]
             };
+            let mut image_cache = zeroclaw_providers::multimodal::LocalImageCache::new();
+            let mut provider_image_state = crate::agent::turn::ProviderImageState::default();
 
             loop {
                 print!("> ");
@@ -2249,6 +2251,8 @@ pub async fn run(
 
                         history.clear();
                         history.push(ChatMessage::system(&system_prompt));
+                        image_cache = zeroclaw_providers::multimodal::LocalImageCache::new();
+                        provider_image_state = crate::agent::turn::ProviderImageState::default();
                         // Clear conversation and daily memory
                         let mut cleared = 0;
                         for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
@@ -2541,7 +2545,10 @@ pub async fn run(
                                     event_tx: None,
                                     steering: None,
                                     new_messages_out: None,
-                                    image_cache: None,
+                                    image_cache: Some(crate::agent::turn::ToolLoopImageState {
+                                        cache: &mut image_cache,
+                                        provider_state: &mut provider_image_state,
+                                    }),
                                     // Origin is threaded from the entry point;
                                     // source/transport/trust stay phase-1
                                     // placeholders until per-transport stamping.
