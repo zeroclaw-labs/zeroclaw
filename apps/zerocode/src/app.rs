@@ -1086,18 +1086,6 @@ pub async fn run(
                         }
                     }
                 }
-                crate::agent_sidebar::SidebarEvent::CloseSession { pane, session_id }
-                    if connected =>
-                {
-                    match pane {
-                        chat::PaneKind::Chat => {
-                            chat_pane.close_session(&session_id).await;
-                        }
-                        chat::PaneKind::Acp => {
-                            acp_pane.close_session(&session_id).await;
-                        }
-                    }
-                }
                 crate::agent_sidebar::SidebarEvent::OpenPicker if connected => {
                     // The picker adds to the pane you're in; other modes
                     // default to Chat.
@@ -1808,6 +1796,21 @@ pub async fn run(
                         help_overlay = Some(HelpOverlayState::default());
                     }
                     _ => {}
+                }
+                // Ctrl+N is the keyboard form of the sidebar `[+]`. Routing it
+                // through the same event keeps the picker, the session cap, the
+                // cancellation/error handling and the remote-Code directory
+                // selection on one path instead of two.
+                let add_session_requested = match mode {
+                    Mode::Acp => acp_pane.take_add_session_request(),
+                    Mode::Chat => chat_pane.take_add_session_request(),
+                    _ => false,
+                };
+                if add_session_requested {
+                    apply_sidebar_event!(
+                        crate::agent_sidebar::SidebarEvent::OpenPicker,
+                        dispatch_state
+                    );
                 }
                 if mode == Mode::Quickstart && quickstart.take_leave_request() {
                     // Return to wherever the sidebar launched the wizard from
