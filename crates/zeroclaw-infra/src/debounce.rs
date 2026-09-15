@@ -122,6 +122,31 @@ impl MessageDebouncer {
             DebounceResult::Pending(rx)
         }
     }
+
+    /// Retire the buffered payload for `sender_key` without dispatching it.
+    ///
+    /// Aborts the pending timer and drops the accumulated messages together
+    /// with the result sender, so the continuation that is waiting on the
+    /// receiver observes a closed channel and exits without processing.
+    ///
+    /// Cancelling tracked work is not enough on its own: text that has already
+    /// been folded into a bucket is not a task, and a later message for the
+    /// same key would inherit it (the bucket is shared by key, its sender is
+    /// replaced, and its messages are concatenated when the timer fires).
+    /// Retiring the bucket is what retracts stopped
+    /// instructions before any later message can reuse them.
+    ///
+    /// Returns `true` when a buffered payload was retired.
+    pub async fn retire_pending(&self, sender_key: &str) -> bool {
+        let mut entries = self.entries.lock().await;
+        match entries.remove(sender_key) {
+            Some(entry) => {
+                entry.timer_handle.abort();
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// Called when the debounce timer fires. Removes the entry, concatenates all
@@ -222,5 +247,82 @@ mod tests {
         };
         let combined = rx.await.unwrap();
         assert_eq!(combined, "fast");
+    }
+
+    #[tokio::test]
+    async fn retire_pending_drops_buffered_payload_and_closes_receiver() {
+        let debouncer = MessageDebouncer::new(Duration::from_millis(5000));
+        let rx = match debouncer.debounce("user1", "stopped instruction").await {
+            DebounceResult::Pending(rx) => rx,
+            DebounceResult::Passthrough(_) => panic!("expected Pending"),
+        };
+
+        assert!(debouncer.retire_pending("user1").await);
+
+        // The continuation observes a cancelled receiver: it can never process
+        // the retired text, even though the window has not expired.
+        assert!(rx.await.is_err());
+        // The bucket is gone, so a later message starts a fresh batch instead of
+        // inheriting the retired one.
+        let rx_next = match debouncer.debounce("user1", "later message").await {
+            DebounceResult::Pending(rx) => rx,
+            DebounceResult::Passthrough(_) => panic!("expected Pending"),
+        };
+        assert!(debouncer.retire_pending("user1").await);
+        assert!(rx_next.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn retire_pending_only_touches_the_named_key() {
+        // The window only has to outlive the retire below, which happens
+        // immediately after both buckets are registered: a long window would
+        // just make this test wait for bob's payload to expire.
+        let debouncer = MessageDebouncer::new(Duration::from_millis(300));
+        let rx_a = match debouncer.debounce("alice", "alice text").await {
+            DebounceResult::Pending(rx) => rx,
+            DebounceResult::Passthrough(_) => panic!("expected Pending"),
+        };
+        let rx_b = match debouncer.debounce("bob", "bob text").await {
+            DebounceResult::Pending(rx) => rx,
+            DebounceResult::Passthrough(_) => panic!("expected Pending"),
+        };
+
+        assert!(debouncer.retire_pending("alice").await);
+
+        assert!(rx_a.await.is_err(), "retired key must not dispatch");
+        assert_eq!(
+            rx_b.await.unwrap(),
+            "bob text",
+            "other senders must keep their pending payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn retire_pending_reports_missing_key() {
+        let debouncer = MessageDebouncer::new(Duration::from_millis(50));
+        assert!(!debouncer.retire_pending("nobody").await);
+
+        let rx = match debouncer.debounce("user1", "hello").await {
+            DebounceResult::Pending(rx) => rx,
+            DebounceResult::Passthrough(_) => panic!("expected Pending"),
+        };
+        assert!(debouncer.retire_pending("user1").await);
+        assert!(rx.await.is_err());
+        // Second retire finds nothing.
+        assert!(!debouncer.retire_pending("user1").await);
+    }
+
+    #[tokio::test]
+    async fn retired_payload_never_fires_after_window_expiry() {
+        let debouncer = MessageDebouncer::new(Duration::from_millis(60));
+        let rx = match debouncer.debounce("user1", "stopped").await {
+            DebounceResult::Pending(rx) => rx,
+            DebounceResult::Passthrough(_) => panic!("expected Pending"),
+        };
+        assert!(debouncer.retire_pending("user1").await);
+
+        // Well past the window: the timer must not resurrect the payload.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(rx.await.is_err());
     }
 }
