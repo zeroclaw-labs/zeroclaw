@@ -36,10 +36,12 @@ impl ClawdTalkChannel {
             from_number: config.from_number,
             allowed_destinations: config.allowed_destinations,
             alias: alias.into(),
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
+            client: zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+                Client::builder().timeout(std::time::Duration::from_secs(30)),
+                "channel.clawdtalk",
+            )
+            .build()
+            .unwrap_or_else(|_| Client::new()),
         }
     }
 

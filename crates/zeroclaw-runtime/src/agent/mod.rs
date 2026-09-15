@@ -26,7 +26,7 @@ pub(crate) mod turn;
 
 pub use turn::context::TurnMeta;
 pub use turn::{
-    is_semantic_empty_terminal_completion,
+    append_safeguard_fallback_notice, is_semantic_empty_terminal_completion,
     redact::{is_credential_key, scrub_credentials_value},
     semantic_empty_terminal_completion_message, terminal_completion_error_message,
 };
