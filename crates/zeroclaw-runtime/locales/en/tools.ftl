@@ -125,7 +125,13 @@ tool-knowledge = Manage a knowledge graph of architecture decisions, solution pa
 
 tool-linkedin = Manage LinkedIn: create posts, list your posts, comment, react, delete posts, view engagement, get profile info, and read the configured content strategy. Requires LINKEDIN_* credentials in .env file.
 
-tool-discord-search = Search Discord message history stored in discord.db. Use to find past messages, summarize channel activity, or look up what users said. Supports keyword search and optional filters: channel_id, since, until.
+tool-discord-search = Search Discord message history from this agent's configured Discord channels. Returns messages matching a keyword query, optionally filtered by channel_id or time range.
+
+tool-sessions-list = List this agent's active conversation sessions with their channel, last activity time, and message count.
+
+tool-sessions-history = Read the message history of a specific session by its session ID. Returns the last N messages. Only sessions this agent owns are readable.
+
+tool-sessions-send = Send a message to a specific session by its session ID. The message is appended to the session's conversation history as a 'user' message. Only sessions this agent owns are writable.
 
 tool-memory-forget = Remove a memory by key. Use to delete outdated facts or sensitive data. Returns whether the memory was found and removed.
 

@@ -85,7 +85,6 @@ tool-image-info = 读取图像文件元数据（格式、尺寸、大小），�
 tool-jira = 与 Jira 交互：读取工单、使用 JQL 搜索、添加评论、列出项目和每个问题的状态转换、推动问题在其工作流中转换状态，以及创建新问题。
 tool-knowledge = 管理架构决策、解决方案模式、经验教训、专家和关系链接的知识图谱。
 tool-linkedin = 管理 LinkedIn：创建帖子、列出你的帖子、评论、点赞、删除帖子、查看互动、获取个人资料信息，以及读取已配置的内容策略。需要 .env 文件中的 LINKEDIN_* 凭据。
-tool-discord-search = 搜索存储在 discord.db 中的 Discord 消息历史。用于查找过往消息、总结频道活动或查看用户说过的话。支持关键词搜索和可选过滤器：channel_id、since、until。
 tool-memory-forget = 按 key 移除一条记忆。用于删除过时的事实或敏感数据。返回该记忆是否被找到并移除。
 tool-memory-recall = 在长期记忆中搜索相关的事实、偏好或上下文。返回按相关性排序的评分结果。省略查询或传入裸 * 以返回近期记忆。
 tool-memory-store = 在长期记忆中存储事实、偏好或备注。使用类别 'core' 表示永久性事实，'daily' 表示会话备注，'conversation' 表示聊天上下文，或自定义类别名称。
