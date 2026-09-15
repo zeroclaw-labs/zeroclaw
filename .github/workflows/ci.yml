@@ -175,6 +175,9 @@ jobs:
       - name: Test release announcement composer
         run: bash scripts/ci/release_post_text.test.sh
 
+      - name: Test docs stable metadata promotion
+        run: python3 scripts/docs/promote_stable_test.py
+
   relay-container-smoke-changes:
     name: Detect Relay Container Smoke changes
     # Ordering note: this detector only runs `git diff` and never compiles, so it
