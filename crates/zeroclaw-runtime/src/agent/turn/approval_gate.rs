@@ -298,6 +298,8 @@ mod tests {
             turn_id: "turn-approval",
             agent_alias: Some("default"),
             parent_agent_alias: None,
+            serving_provider_name: None,
+            serving_model: None,
         };
 
         let arguments = serde_json::json!({"command": "sleep 60"});
