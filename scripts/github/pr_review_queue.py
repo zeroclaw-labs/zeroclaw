@@ -81,6 +81,12 @@ def login(value: Any) -> str | None:
     return None
 
 
+def commit_oid(value: Any) -> str | None:
+    if not isinstance(value, str) or len(value) != 40 or any(character not in "0123456789abcdefABCDEF" for character in value):
+        return None
+    return value.casefold()
+
+
 def labels(pr: dict[str, Any]) -> set[str]:
     values = pr.get("labels", [])
     if not isinstance(values, list):
@@ -184,24 +190,36 @@ def latest_review_by_author(reviews: Iterable[dict[str, Any]]) -> dict[str, dict
 
 
 def second_core_row(pr: dict[str, Any], reviews: list[dict[str, Any]], core: set[str]) -> dict[str, Any] | None:
-    head = pr.get("headRefOid")
-    if not isinstance(head, str) or not head:
+    raw_head = pr.get("headRefOid")
+    if not isinstance(raw_head, str) or not raw_head:
         return base_row(pr, "second-core", "unknown", "current head SHA unavailable")
-    current: list[str] = []
+    head = commit_oid(raw_head)
+    if head is None:
+        return base_row(pr, "second-core", "unknown", "current head SHA malformed")
+    pr_author = (login(pr.get("author")) or "").casefold()
+    current: list[tuple[str, str]] = []
+    older: list[tuple[str, str]] = []
     ambiguous: list[str] = []
     for reviewer, review in latest_review_by_author(reviews).items():
-        if reviewer not in core or str(review.get("state", "")).upper() != "APPROVED":
+        if reviewer not in core or reviewer == pr_author or str(review.get("state", "")).upper() != "APPROVED":
             continue
-        commit = review.get("commit_id") or review.get("commitId")
-        if not isinstance(commit, str) or not commit:
+        commit = commit_oid(review.get("commit_id") or review.get("commitId"))
+        if commit is None:
             ambiguous.append(reviewer)
         elif commit == head:
-            current.append(reviewer)
+            current.append((reviewer, commit))
+        else:
+            older.append((reviewer, commit))
     if ambiguous:
         names = ", ".join("@" + name for name in sorted(ambiguous))
-        return base_row(pr, "second-core", "unknown", f"Core approval missing commit SHA: {names}")
+        return base_row(pr, "second-core", "unknown", f"Core approval commit SHA missing or malformed: {names}")
     if len(current) == 1:
-        return base_row(pr, "second-core", "candidate", f"one current-head Core approval: @{current[0]}")
+        reviewer, revision = current[0]
+        detail = f"one current-head Core approval: @{reviewer} ({revision[:12]})"
+        if older:
+            candidates = ", ".join(f"@{name} ({commit[:12]})" for name, commit in sorted(older))
+            detail += f"; older active independent Core approval requires carry-forward assessment: {candidates}"
+        return base_row(pr, "second-core", "candidate", detail)
     return None
 
 
