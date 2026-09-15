@@ -960,6 +960,9 @@ mod tests {
             slash_options: Vec::new(),
             always: false,
             location: None,
+            provider: None,
+            triggers: vec![],
+            blocked_tools_with_image: vec![],
         }];
 
         let ctx = PromptContext {
@@ -1016,6 +1019,9 @@ mod tests {
             slash_options: Vec::new(),
             always: false,
             location: Some(Path::new("/tmp/workspace/skills/deploy/SKILL.md").to_path_buf()),
+            provider: None,
+            triggers: vec![],
+            blocked_tools_with_image: vec![],
         }];
 
         let ctx = PromptContext {
@@ -1063,6 +1069,9 @@ mod tests {
             slash_options: Vec::new(),
             always: false,
             location: None,
+            provider: None,
+            triggers: Vec::new(),
+            blocked_tools_with_image: Vec::new(),
         }];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
@@ -1114,6 +1123,9 @@ mod tests {
             location: Some(
                 Path::new("/tmp/workspace/skills/security-policy/SKILL.md").to_path_buf(),
             ),
+            provider: None,
+            triggers: Vec::new(),
+            blocked_tools_with_image: Vec::new(),
         }];
 
         let ctx = PromptContext {
@@ -1200,6 +1212,9 @@ mod tests {
             slash_options: Vec::new(),
             always: false,
             location: None,
+            provider: None,
+            triggers: vec![],
+            blocked_tools_with_image: vec![],
         }];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp/workspace"),

@@ -9758,6 +9758,7 @@ path = "{trigger_path}"
             explicitly_addressed: false,
             conversation_scope: Default::default(),
             references: Vec::new(),
+            invoked_skill: None,
         }
     }
 

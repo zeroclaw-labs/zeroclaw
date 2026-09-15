@@ -379,7 +379,47 @@ impl<'a> TurnState<'a> {
     }
 }
 
-pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
+/// Run a tool-calling turn, publishing its exclusions as the capability
+/// ceiling for anything the turn starts.
+///
+/// The scope is established here rather than at each call site so the
+/// invariant holds structurally: every loop, parent or nested, inherits the
+/// ceiling it was started under and can only add to it. See
+/// [`crate::agent::tool_ceiling`].
+pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
+    // The ceiling this loop publishes and the list its own dispatch consults
+    // have to be the same list. An entry point that builds its execution
+    // context from static configuration (`loop_::run` computes only the MCP
+    // exclusions) knows nothing about a ceiling it inherited, so publishing
+    // the union while dispatching against the unmerged slice would leave a
+    // child loop able to call a tool its parent turn removed. Merge once,
+    // here, and hand the merged list to both.
+    let turn_exclusions =
+        crate::agent::tool_ceiling::apply_ceiling_to_excluded(Some(p.exec.excluded_tools));
+    // Boxed to keep the added scope from deepening the loop's already large
+    // future type, which otherwise overflows auto-trait resolution.
+    crate::agent::tool_ceiling::with_tool_ceiling(
+        &turn_exclusions,
+        Box::pin(run_tool_call_loop_with_exclusions(p, &turn_exclusions)),
+    )
+    .await
+}
+
+/// Re-point the execution context at the turn's effective exclusions before the
+/// loop runs.
+///
+/// Split out so the merged list can live in the caller's frame: `ToolLoop`
+/// borrows its exclusions, so the assignment needs a lifetime the local `Vec`
+/// can satisfy.
+async fn run_tool_call_loop_with_exclusions<'a>(
+    mut p: ToolLoop<'a>,
+    excluded_tools: &'a [String],
+) -> Result<String> {
+    p.exec.excluded_tools = excluded_tools;
+    run_tool_call_loop_inner(p).await
+}
+
+async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
     let model_switch_state = p
         .exec
         .model_switch_callback

@@ -2470,6 +2470,7 @@ impl Agent {
     }
 
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
+        let inherited_tool_ceiling = crate::agent::tool_ceiling::current_tool_ceiling();
         if user_message.trim().is_empty() {
             ::zeroclaw_log::record!(
                 WARN,
@@ -2660,7 +2661,10 @@ impl Agent {
                         },
                         crate::agent::loop_::ResolvedRuntimeKnobs {
                             max_tool_iterations: self.config.resolved.max_tool_iterations,
-                            excluded_tools: &[],
+                            // An agent run started from inside a turn inherits that
+                            // turn's capability ceiling. Static agent config alone
+                            // would re-grant a tool the originating turn removed.
+                            excluded_tools: &inherited_tool_ceiling,
                             dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
                             pacing: &pacing,
                             strict_tool_parsing: self.config.resolved.strict_tool_parsing,
@@ -2868,6 +2872,7 @@ impl Agent {
         cancel_token: Option<tokio_util::sync::CancellationToken>,
         mut steering_rx: Option<&mut tokio::sync::mpsc::Receiver<String>>,
     ) -> std::result::Result<StreamedTurnSuccess, StreamedTurnError> {
+        let inherited_tool_ceiling = crate::agent::tool_ceiling::current_tool_ceiling();
         // See `Agent::turn` for the rationale. Same guard: blank input would
         // push a timestamp-only user message into history and the model would
         // narrate the trailing prompt-template sentinel instead of replying.
@@ -3148,7 +3153,12 @@ impl Agent {
                             },
                             crate::agent::loop_::ResolvedRuntimeKnobs {
                                 max_tool_iterations: self.config.resolved.max_tool_iterations,
-                                excluded_tools: &[],
+                                // An agent run started from inside a turn — a
+                                // subagent, say — inherits that turn's
+                                // capability ceiling. Static agent config alone
+                                // would re-grant a tool the originating turn
+                                // removed.
+                                excluded_tools: &inherited_tool_ceiling,
                                 dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
                                 pacing: &pacing,
                                 strict_tool_parsing: self.config.resolved.strict_tool_parsing,
@@ -3522,6 +3532,10 @@ mod parity;
 #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
 #[path = "plugin_live_config.rs"]
 mod plugin_live_config;
+
+#[cfg(test)]
+#[path = "tool_ceiling_nesting.rs"]
+mod tool_ceiling_nesting;
 
 #[cfg(test)]
 mod tests {
@@ -6575,6 +6589,9 @@ mod tests {
                 slash_options: Vec::new(),
                 always: false,
                 location: None,
+                provider: None,
+                triggers: Vec::new(),
+                blocked_tools_with_image: Vec::new(),
             }];
             let mut agent = Agent::builder()
                 .model_provider(provider)
@@ -11697,6 +11714,9 @@ mod tests {
             slash_options: Vec::new(),
             always: false,
             location: None,
+            provider: None,
+            triggers: vec![],
+            blocked_tools_with_image: vec![],
         }
     }
 
@@ -11876,6 +11896,9 @@ mod tests {
             slash_options: Vec::new(),
             always: false,
             location: None,
+            provider: None,
+            triggers: vec![],
+            blocked_tools_with_image: vec![],
         };
         tools::register_skill_tools_with_context(
             &mut tools,
@@ -13126,6 +13149,9 @@ mod tests {
             slash_options: Vec::new(),
             always: false,
             location: None,
+            provider: None,
+            triggers: Vec::new(),
+            blocked_tools_with_image: Vec::new(),
         }];
 
         let mut agent = Agent::builder()

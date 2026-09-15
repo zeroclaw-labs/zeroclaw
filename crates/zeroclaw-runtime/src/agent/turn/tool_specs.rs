@@ -36,7 +36,7 @@ pub(crate) fn build_iteration_tool_specs(
     // Rebuild tool_specs each iteration so newly activated deferred tools appear.
     let mut tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
         .iter()
-        .filter(|tool| !excluded_tools.iter().any(|ex| ex == tool.name()))
+        .filter(|tool| !zeroclaw_api::tool::is_excluded_tool(tool.name(), excluded_tools))
         .map(|tool| tool.spec())
         .collect();
     if let Some(at) = activated_tools {
@@ -54,7 +54,7 @@ pub(crate) fn build_iteration_tool_specs(
             }
         };
         for spec in activated_tools.tool_specs() {
-            if !excluded_tools.iter().any(|ex| ex == &spec.name) {
+            if !zeroclaw_api::tool::is_excluded_tool(&spec.name, excluded_tools) {
                 tool_specs.push(spec);
             }
         }
