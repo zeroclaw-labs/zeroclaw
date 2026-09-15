@@ -307,11 +307,6 @@ impl Tool for CronAddTool {
                     "type": "boolean",
                     "description": "If true (default), recall and inject memory context before agent job runs. Set to false for stateless digest/report jobs that should not accumulate or consume memory entries.",
                     "default": true
-                },
-                "approved": {
-                    "type": "boolean",
-                    "description": "Set true to explicitly approve medium/high-risk shell commands in supervised mode",
-                    "default": false
                 }
             },
             "required": ["schedule"]
@@ -745,7 +740,12 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("not allowed"));
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("high-risk command is disallowed")
+        );
     }
 
     #[tokio::test]
@@ -858,7 +858,7 @@ mod tests {
             denied
                 .error
                 .unwrap_or_default()
-                .contains("explicit approval")
+                .contains("operator approval")
         );
 
         let approved = tool
@@ -1339,6 +1339,28 @@ mod tests {
         );
         assert!(error.contains("at_local="), "{error}");
         assert!(error.contains("delta_seconds="), "{error}");
+    }
+
+    #[test]
+    fn schema_does_not_advertise_self_approval() {
+        // `approved` is runtime plumbing injected by the approval gate,
+        // never a model-facing parameter (RFC 7155).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = Arc::new(Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        });
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            &cfg.data_dir,
+        ));
+        let tool = CronAddTool::new(cfg, security, TEST_AGENT);
+        assert!(
+            tool.parameters_schema()["properties"]
+                .get("approved")
+                .is_none()
+        );
     }
 
     #[test]

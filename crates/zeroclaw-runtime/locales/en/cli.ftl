@@ -1208,10 +1208,16 @@ sop-rpc-policy-unavailable = The parked SOP policy is unavailable: {$reason}.
 tool-runtime-command-build-failed = Failed to build runtime command: {$error}
 tool-runtime-command-docker-workspace-path = Failed to build runtime command: Failed to canonicalize Docker workspace path {$path}: {$cause}
 tool-runtime-command-docker-allowed-root = Failed to build runtime command: Failed to canonicalize Docker workspace root {$path}: {$cause}
+tool-shell-approval-route-unavailable = Tool call not executed: shell policy requires approval and no operator approval route is available.
+tool-shell-execution-context-unverified = Tool call not executed: the shell execution context could not be verified; fresh approval is required.
+tool-shell-execution-context-changed = Shell execution context changed after approval; fresh approval required
+tool-shell-confirmation-validity-unverified = Shell confirmation validity could not be verified; fresh approval required
+tool-shell-confirmation-expired = Shell confirmation expired; fresh approval required
 
 # ── Terminal tool approval ──
 # The ASCII shortcut tokens stay aligned with the Rust-owned response parser.
 cli-approval-request = 🔧 Agent wants to execute: {$tool}
+cli-approval-intent = { "   " }Stated intent (agent-claimed, untrusted): {$intent}
 cli-approval-prompt = { "   " }[Y]es / [N]o / [A]lways for {$tool}:{ " " }
 
 # ── Tool approval (channels, #9409) ──

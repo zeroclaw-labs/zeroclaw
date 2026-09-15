@@ -204,6 +204,9 @@ impl HasPropKind for crate::scattered_types::EmailOAuth2Config {
 impl HasPropKind for Vec<crate::schema::ClassificationRule> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
 }
+impl HasPropKind for Vec<crate::tool_policy::PolicyRuleConfig> {
+    const PROP_KIND: PropKind = PropKind::ObjectArray;
+}
 impl HasPropKind for Vec<crate::schema::EmbeddingRouteConfig> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
 

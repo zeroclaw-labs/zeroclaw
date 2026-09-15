@@ -1367,6 +1367,7 @@ pub async fn run(
             sop_audit,
             None,
         );
+        let shell_execution = all_tools_result.shell_execution.clone();
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         // Route the per-agent tool registry through the one gated seam
         // (peripherals -> built-in filter -> MCP scope+gate -> skills), identical
@@ -1718,7 +1719,14 @@ pub async fn run(
 
         // ── Approval manager (supervised mode) ───────────────────────
         let approval_manager = if interactive {
-            Some(ApprovalManager::from_risk_profile(&risk_profile))
+            let manager = ApprovalManager::from_risk_profile(&risk_profile);
+            // RFC 7155: the gate resolves the actual shell command, which
+            // needs the policy and the runtime's dialect.
+            manager.set_policy_context(Arc::clone(&security), runtime.shell_dialect());
+            if let Some(resolver) = shell_execution.as_ref() {
+                manager.set_shell_execution_context(Arc::clone(resolver));
+            }
+            Some(manager)
         } else {
             None
         };
@@ -2919,6 +2927,10 @@ pub async fn process_message(
             }
         };
         let approval_manager = ApprovalManager::for_non_interactive(&risk_profile);
+        // RFC 7155: the gate resolves the actual shell command, which
+        // needs the policy and the runtime's dialect. (Non-interactive
+        // without a back-channel still fails closed on Ask tiers.)
+        approval_manager.set_policy_context(Arc::clone(&security), runtime.shell_dialect());
         let mem: Arc<dyn Memory> = zeroclaw_memory::create_memory_for_agent(
             &config,
             agent_alias,
@@ -2981,6 +2993,9 @@ pub async fn process_message(
             sop_audit,
             None,
         );
+        if let Some(resolver) = all_tools_result_pm.shell_execution.as_ref() {
+            approval_manager.set_shell_execution_context(Arc::clone(resolver));
+        }
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
             config: &config,
@@ -3982,6 +3997,7 @@ mod tests {
                 activated_tools: None,
                 excluded_tools: &[],
                 model_switch_callback: None,
+                approval: None,
             },
             &meta,
             &observer,
@@ -4028,6 +4044,7 @@ mod tests {
                 activated_tools: Some(&activated),
                 excluded_tools: &[],
                 model_switch_callback: None,
+                approval: None,
             },
             &meta,
             &observer,
@@ -4080,6 +4097,7 @@ mod tests {
                 activated_tools: Some(&activated),
                 excluded_tools: &[],
                 model_switch_callback: None,
+                approval: None,
             },
             &meta,
             &observer,
@@ -4115,6 +4133,7 @@ mod tests {
                 activated_tools: None,
                 excluded_tools: &[],
                 model_switch_callback: None,
+                approval: None,
             },
             &meta,
             &observer,
@@ -4174,6 +4193,7 @@ mod tests {
                 activated_tools: None,
                 excluded_tools: &[],
                 model_switch_callback: None,
+                approval: None,
             },
             &meta,
             &observer,
@@ -13878,6 +13898,7 @@ Let me check the result."#;
         });
         let risk_profile = RiskProfileConfig::default();
         let built = crate::tools::AllToolsResult {
+            shell_execution: None,
             tools: vec![mock_tool("shell")],
             delegate_handle: None,
             ask_user_handle: None,

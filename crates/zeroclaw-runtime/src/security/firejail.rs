@@ -122,7 +122,11 @@ impl FirejailSandbox {
         let current_dir = cmd.get_current_dir().map(std::path::Path::to_path_buf);
 
         // Build firejail wrapper with security flags
-        let mut firejail_cmd = Command::new("firejail");
+        let launcher = which::which("firejail")
+            .ok()
+            .and_then(|path| path.canonicalize().ok())
+            .unwrap_or_else(|| "firejail".into());
+        let mut firejail_cmd = Command::new(launcher);
         firejail_cmd.args([
             "--private=home", // New home directory
             "--private-dev",  // Minimal /dev
@@ -156,6 +160,18 @@ impl Sandbox for FirejailSandbox {
 
     fn is_available(&self) -> bool {
         Self::is_installed()
+    }
+
+    fn execution_fingerprint_material(
+        &self,
+        _launch_program: &std::path::Path,
+    ) -> std::io::Result<Vec<u8>> {
+        let support = Self::hardening_support();
+        Ok(format!(
+            "sandbox-policy-v1:firejail:seccomp={}:caps_drop={}:noroot={}",
+            support.seccomp, support.caps_drop, support.noroot
+        )
+        .into_bytes())
     }
 
     fn name(&self) -> &str {
@@ -213,7 +229,10 @@ mod tests {
 
         // After wrapping, the program should be firejail
         if sandbox.is_available() {
-            assert_eq!(cmd.get_program().to_string_lossy(), "firejail");
+            assert_eq!(
+                std::path::Path::new(cmd.get_program()).file_name(),
+                Some(std::ffi::OsStr::new("firejail"))
+            );
         }
     }
 
@@ -241,8 +260,8 @@ mod tests {
         sandbox.wrap_command(&mut cmd).unwrap();
 
         assert_eq!(
-            cmd.get_program().to_string_lossy(),
-            "firejail",
+            std::path::Path::new(cmd.get_program()).file_name(),
+            Some(std::ffi::OsStr::new("firejail")),
             "wrapped command should use firejail as program"
         );
 

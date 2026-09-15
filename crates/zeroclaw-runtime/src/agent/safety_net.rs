@@ -1790,8 +1790,7 @@ impl zeroclaw_api::channel::Channel for RecordingApprovalChannel {
     }
 }
 
-/// Counts executions and captures the args it was actually invoked with —
-/// the observable for the `approved`-arg trust assertions.
+/// Counts executions and captures the args it was actually invoked with.
 struct CapturingArgTool {
     name: &'static str,
     output: &'static str,
@@ -2024,9 +2023,9 @@ async fn safety_net_loop_shell_marks_args_approved_after_backchannel_approval() 
     assert_eq!(requests.load(Ordering::SeqCst), 1);
     assert_eq!(exec.load(Ordering::SeqCst), 1, "approved shell executes");
     let args = captured.lock().clone().expect("executed args captured");
-    assert_eq!(
-        args["approved"], true,
-        "runtime injects approved=true only after a real back-channel approval"
+    assert!(
+        args.get("approved").is_none(),
+        "the generic executable boundary must not retain shell approval plumbing"
     );
 }
 
@@ -2074,7 +2073,10 @@ async fn safety_net_loop_shell_keeps_runtime_approval_from_always_allowlist() {
     );
     assert_eq!(exec.load(Ordering::SeqCst), 2, "both shell calls execute");
     let args = captured.lock().clone().expect("executed args captured");
-    assert_eq!(args["approved"], true);
+    assert!(
+        args.get("approved").is_none(),
+        "the generic executable boundary must not retain shell approval plumbing"
+    );
 }
 
 #[tokio::test]

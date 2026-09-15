@@ -108,6 +108,12 @@ impl Sandbox for SeatbeltSandbox {
         Self::is_installed() && self.policy_path.exists()
     }
 
+    fn execution_fingerprint_material(&self, _launch_program: &Path) -> std::io::Result<Vec<u8>> {
+        let mut material = b"sandbox-policy-v1:seatbelt:".to_vec();
+        material.extend(std::fs::read(&self.policy_path)?);
+        Ok(material)
+    }
+
     fn name(&self) -> &str {
         "sandbox-exec"
     }

@@ -1,11 +1,55 @@
 //! Sandbox trait for pluggable OS-level isolation.
 
 use async_trait::async_trait;
+use std::ffi::{OsStr, OsString};
+use std::path::Path;
 use std::process::Command;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxShellProgram {
+    Host,
+    Isolated {
+        program: OsString,
+        /// Whether host-controlled files are visible in the isolated
+        /// executable namespace.
+        mutable_mount: bool,
+    },
+}
 
 #[async_trait]
 pub trait Sandbox: Send + Sync {
     fn wrap_command(&self, cmd: &mut Command) -> std::io::Result<()>;
+
+    /// Wrap a shell runtime command while retaining the runtime's original
+    /// program spelling. Namespace-changing sandboxes may need that spelling
+    /// because a host-resolved absolute path has no meaning inside the target
+    /// namespace.
+    fn wrap_shell_command(
+        &self,
+        cmd: &mut Command,
+        _original_program: &OsStr,
+    ) -> std::io::Result<SandboxShellProgram> {
+        self.wrap_command(cmd)?;
+        Ok(SandboxShellProgram::Host)
+    }
+
+    /// Materialize the sandbox policy inputs that are not already visible in
+    /// the wrapped command. The returned bytes are fingerprint input only;
+    /// callers hash them before placing them in action facts.
+    fn execution_fingerprint_material(&self, _launch_program: &Path) -> std::io::Result<Vec<u8>> {
+        Ok(b"sandbox-policy-v1:stateless".to_vec())
+    }
+
+    /// Pin mutable sandbox launch references before the final command is
+    /// fingerprinted and spawned. Container sandboxes resolve image tags to
+    /// content-addressed IDs here; ordinary host sandboxes need no extra step.
+    fn pin_shell_command(
+        &self,
+        _command: &mut Command,
+        _resolved_launcher: &Path,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
 
     fn is_available(&self) -> bool;
 
@@ -41,6 +85,10 @@ impl Sandbox for NoopSandbox {
 
     fn is_available(&self) -> bool {
         true
+    }
+
+    fn execution_fingerprint_material(&self, _launch_program: &Path) -> std::io::Result<Vec<u8>> {
+        Ok(b"sandbox-policy-v1:none".to_vec())
     }
 
     fn name(&self) -> &str {
