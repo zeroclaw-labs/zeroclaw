@@ -11,6 +11,7 @@ use super::outcome::{
 use super::redact::scrub_credentials;
 use super::stream_consume::consume_provider_streaming_response;
 use crate::agent::cost::check_tool_loop_budget;
+use crate::agent::prompt::redact_session_prompt_tool_exchanges_for_export;
 use crate::cost::types::BudgetCheck;
 use crate::observability::ObserverEvent;
 use crate::tools::ToolSpec;
@@ -72,12 +73,11 @@ pub(crate) async fn announce_llm_request(
             && policy.captures_payload()
             && let ::serde_json::Value::Object(map) = &mut attrs
         {
-            let rendered: Vec<::serde_json::Value> = request_messages
-                .iter()
-                .map(|m| {
-                    ::serde_json::json!({"role": m.role.as_str(), "content": m.content.as_str()})
-                })
-                .collect();
+            let rendered: Vec<::serde_json::Value> =
+                redact_session_prompt_tool_exchanges_for_export(request_messages)
+                    .iter()
+                    .map(|m| ::serde_json::json!({"role": m.role.as_str(), "content": m.content}))
+                    .collect();
             let serialized = ::serde_json::to_string(&rendered).unwrap_or_default();
             let scrubbed = scrub_credentials(&serialized);
             if let Some(capture) =
@@ -109,7 +109,8 @@ pub(crate) async fn announce_llm_request(
 
     // Fire void hook before LLM call
     if let Some(hooks) = ctx.hooks {
-        hooks.fire_llm_input(request_messages, active_model).await;
+        let export_messages = redact_session_prompt_tool_exchanges_for_export(request_messages);
+        hooks.fire_llm_input(&export_messages, active_model).await;
     }
 
     llm_started_at
@@ -469,6 +470,7 @@ mod payload_capture_tests {
             model: "stub-model",
             temperature: None,
             approval: None,
+            session_prompt_approval_required: true,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -534,7 +536,7 @@ mod payload_capture_tests {
                         .get("attributes")
                         .and_then(|a| a.get("trace_id"))
                         .and_then(|v| v.as_str())
-                        == Some("trace-req-test");
+                        == Some(PAYLOAD_CAPTURE_TRACE_ID);
                     if ours && value.get("message").and_then(|v| v.as_str()) == Some("llm_request")
                     {
                         return value;
@@ -563,6 +565,8 @@ mod payload_capture_tests {
     // redacts the value, preserving only its first 4 chars. The unique secret
     // tail below must NOT survive into the captured payload.
     const SECRET_TAIL: &str = "ABCDEF1234567890SECRET";
+    const SESSION_PROMPT_MARKER: &str = "session-prompt-private-marker";
+    const PAYLOAD_CAPTURE_TRACE_ID: &str = "trace-payload-capture-test";
 
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
@@ -580,7 +584,9 @@ mod payload_capture_tests {
         let pacing = PacingConfig::default();
         let provider = StubProvider;
         let history = vec![
-            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::system(format!(
+                "You are a helpful assistant.\n\n## Session Prompts\n- id: \"task\"; content: \"{SESSION_PROMPT_MARKER}\"\n"
+            )),
             ChatMessage::user(format!("deploy with api_key: sk-{SECRET_TAIL} please")),
         ];
 
@@ -588,7 +594,10 @@ mod payload_capture_tests {
         install_writer("redacted");
         while rx.try_recv().is_ok() {}
 
-        let ctx = test_ctx(&observer, &pacing);
+        let ctx = TurnCtx {
+            turn_id: PAYLOAD_CAPTURE_TRACE_ID,
+            ..test_ctx(&observer, &pacing)
+        };
         let _ = announce_llm_request(&ctx, &history, &provider, "stub", "stub-model", 0).await;
         let on_record = next_llm_request(&mut rx).await;
 
@@ -602,6 +611,10 @@ mod payload_capture_tests {
         assert!(
             !request_messages.contains(SECRET_TAIL),
             "captured payload must not contain the raw secret; got: {request_messages}"
+        );
+        assert!(
+            !request_messages.contains(SESSION_PROMPT_MARKER),
+            "captured payload must not contain session-prompt content; got: {request_messages}"
         );
         assert_eq!(
             attrs
@@ -627,7 +640,10 @@ mod payload_capture_tests {
         install_writer("off");
         while rx.try_recv().is_ok() {}
 
-        let ctx = test_ctx(&observer, &pacing);
+        let ctx = TurnCtx {
+            turn_id: PAYLOAD_CAPTURE_TRACE_ID,
+            ..test_ctx(&observer, &pacing)
+        };
         let _ = announce_llm_request(&ctx, &history, &provider, "stub", "stub-model", 0).await;
         let off_record = next_llm_request(&mut rx).await;
 
@@ -1160,6 +1176,7 @@ mod streaming_fallback_tests {
             model: "test-model",
             temperature: Some(0.0),
             approval: None,
+            session_prompt_approval_required: true,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: Some(&token),
@@ -1257,6 +1274,7 @@ mod streaming_fallback_tests {
             model: "test-model",
             temperature: Some(0.0),
             approval: None,
+            session_prompt_approval_required: true,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -1319,6 +1337,7 @@ mod streaming_fallback_tests {
             model: "test-model",
             temperature: Some(0.0),
             approval: None,
+            session_prompt_approval_required: true,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -1449,6 +1468,7 @@ mod streaming_fallback_tests {
                 model: "test-model",
                 temperature: Some(0.0),
                 approval: None,
+                session_prompt_approval_required: true,
                 channel_name: "test",
                 channel_reply_target: None,
                 cancellation_token: None,
@@ -1526,6 +1546,7 @@ mod streaming_fallback_tests {
             model: "requested-model",
             temperature: Some(0.0),
             approval: None,
+            session_prompt_approval_required: true,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -1625,6 +1646,7 @@ mod streaming_fallback_tests {
             model: "test-model",
             temperature: Some(0.0),
             approval: None,
+            session_prompt_approval_required: true,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -1690,6 +1712,7 @@ mod streaming_fallback_tests {
             model: "requested-model",
             temperature: Some(0.0),
             approval: None,
+            session_prompt_approval_required: true,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: Some(&cancellation),
@@ -1756,6 +1779,7 @@ mod streaming_fallback_tests {
             model: "requested-model",
             temperature: Some(0.0),
             approval: None,
+            session_prompt_approval_required: true,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,

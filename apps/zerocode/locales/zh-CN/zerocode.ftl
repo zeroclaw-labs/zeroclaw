@@ -466,6 +466,7 @@ zc-chat-approval-action-allow = 允许
 zc-chat-approval-action-always = 总是
 zc-chat-approval-action-reject = 拒绝
 zc-chat-approval-action-edit = 编辑
+zc-chat-approval-scroll-hint = 滚动
 zc-chat-clipboard-you = 你：{ $text }
 zc-chat-clipboard-agent = Agent：{ $text }
 zc-chat-copied-clipboard = 已复制到剪贴板

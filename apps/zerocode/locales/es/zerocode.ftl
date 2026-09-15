@@ -466,6 +466,7 @@ zc-chat-approval-action-allow = Permitir
 zc-chat-approval-action-always = Siempre
 zc-chat-approval-action-reject = Rechazar
 zc-chat-approval-action-edit = Editar
+zc-chat-approval-scroll-hint = desplazar
 zc-chat-clipboard-you = Tú: { $text }
 zc-chat-clipboard-agent = Agente: { $text }
 zc-chat-copied-clipboard = Copiado al portapapeles

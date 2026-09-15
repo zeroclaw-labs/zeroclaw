@@ -2129,6 +2129,7 @@ mod accept_error_tests {
         let gen2_started = Arc::new(Notify::new());
         let overlap_detected = Arc::new(AtomicBool::new(false));
         let gen1_listener_exited = Arc::new(AtomicBool::new(false));
+        let gen1_released = Arc::new(AtomicBool::new(false));
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let port1 = free_port().await;
@@ -2265,6 +2266,7 @@ mod accept_error_tests {
         let client_key_pem = client.key_pem.clone();
         let count1_for_gen2 = Arc::clone(&count1);
         let gen1_listener_exited_for_gen2 = Arc::clone(&gen1_listener_exited);
+        let gen1_released_for_gen2 = Arc::clone(&gen1_released);
 
         let gen2_task = zeroclaw_spawn::spawn!(async move {
             // Gen 2 waits for Gen 1 listener to cleanly shut down
@@ -2390,7 +2392,17 @@ mod accept_error_tests {
                 .await
                 .unwrap();
 
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            // A fixed delay here races a correctly-draining Gen 1 on slower
+            // runners: it can cancel Gen 2 before the predecessor is released
+            // and then incorrectly require Gen 2 to have executed. Wait for
+            // the test's explicit release instead, then prove the provider
+            // entered before shutting down the replacement listener.
+            while !gen1_released_for_gen2.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            tokio::time::timeout(Duration::from_secs(5), gen2_started.notified())
+                .await
+                .expect("Gen 2 prompt should reach its provider after Gen 1 drains");
 
             cancel2.cancel();
             handle2
@@ -2429,6 +2441,7 @@ mod accept_error_tests {
             *finished = true;
             cvar.notify_all();
         }
+        gen1_released.store(true, Ordering::SeqCst);
 
         if let Some((exited, counted)) = forced_observation {
             assert!(
