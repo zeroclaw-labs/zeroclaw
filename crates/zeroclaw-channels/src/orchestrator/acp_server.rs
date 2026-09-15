@@ -1179,6 +1179,11 @@ impl AcpServer {
             .iter()
             .map(|(message, _)| message.clone())
             .collect();
+        // Breadcrumb provenance is the store's canonical record alongside
+        // the transcript, never inferred from message text. Set it BEFORE
+        // seeding: seed-time trim reads the flag to decide whether a leading
+        // synthetic marker counts as a real turn.
+        agent.set_history_has_trim_breadcrumb(data.trim_breadcrumb);
         let restore_trim_event = agent.seed_conversation_history_with_event(seed_messages);
         let dropped_messages = match &restore_trim_event {
             Some(TurnEvent::HistoryTrimmed {
@@ -1190,8 +1195,22 @@ impl AcpServer {
         // boundary back to the original stored index so client replay starts
         // at the same retained turn even though repair may have removed seed
         // rows the stored transcript still contains.
+        //
+        // `dropped_messages` counts only real messages: a leading persisted
+        // synthetic breadcrumb is excluded by the crumb-aware trim but is
+        // still present in `seed_pairs`, so the seed-vector offset is the
+        // dropped count plus the leading crumb row.
+        let seed_crumbs = if data.trim_breadcrumb
+            && seed_pairs.first().is_some_and(|(message, _)| {
+                matches!(message, ConversationMessage::Chat(chat) if chat.role == "user")
+                    && zeroclaw_runtime::agent::history::is_history_trim_breadcrumb_text(&chat.content)
+            }) {
+            1
+        } else {
+            0
+        };
         let replay_from = seed_pairs
-            .get(dropped_messages)
+            .get(dropped_messages + seed_crumbs)
             .map(|(_, original_index)| *original_index)
             .unwrap_or(stored_messages.len());
 
@@ -1439,6 +1458,10 @@ impl AcpServer {
                 "ACP session/resume repaired interrupted tool calls in restored transcript"
             );
         }
+        // Breadcrumb provenance is the store's canonical record alongside
+        // the transcript, never inferred from message text. Set it BEFORE
+        // seeding: seed-time trim reads the flag.
+        agent.set_history_has_trim_breadcrumb(data.trim_breadcrumb);
         let restore_trim_event = agent.seed_conversation_history_with_event(seed_messages);
 
         let acp_channel = Arc::new(AcpChannel::new(
@@ -3218,18 +3241,45 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
             dropped_messages,
             kept_turns,
             reason,
-        } => JsonRpcNotification {
-            jsonrpc: "2.0",
-            // ACP's SessionUpdate union is closed. Custom notifications use
-            // underscore-prefixed methods so clients can safely ignore them.
-            method: "_zeroclaw/history_trimmed",
-            params: serde_json::json!({
+            token_budget,
+            tokens_before,
+            tokens_after,
+            tokens_before_source,
+            tokens_after_source,
+            unsatisfiable_floor,
+        } => {
+            let mut params = serde_json::json!({
                 "sessionId": session_id,
                 "droppedMessages": dropped_messages,
                 "keptTurns": kept_turns,
                 "reason": reason,
-            }),
-        },
+            });
+            if let Some(token_budget) = token_budget {
+                params["tokenBudget"] = (*token_budget).into();
+            }
+            if let Some(tokens_before) = tokens_before {
+                params["tokensBefore"] = (*tokens_before).into();
+            }
+            if let Some(tokens_after) = tokens_after {
+                params["tokensAfter"] = (*tokens_after).into();
+            }
+            if let Some(tokens_before_source) = tokens_before_source {
+                params["tokensBeforeSource"] = tokens_before_source.as_str().into();
+            }
+            if let Some(tokens_after_source) = tokens_after_source {
+                params["tokensAfterSource"] = tokens_after_source.as_str().into();
+            }
+            if let Some(unsatisfiable_floor) = unsatisfiable_floor {
+                params["unsatisfiableFloor"] = (*unsatisfiable_floor).into();
+            }
+            JsonRpcNotification {
+                jsonrpc: "2.0",
+                // ACP's SessionUpdate union is closed. Custom notifications use
+                // underscore-prefixed methods so clients can safely ignore them.
+                method: "_zeroclaw/history_trimmed",
+                params,
+            }
+        }
         TurnEvent::Plan { entries } => JsonRpcNotification {
             jsonrpc: "2.0",
             method: "session/update",
@@ -5390,6 +5440,12 @@ mod tests {
                 dropped_messages: 12,
                 kept_turns: 3,
                 reason: "message limit".to_string(),
+                token_budget: Some(500_000),
+                tokens_before: Some(612_000),
+                tokens_after: Some(117_000),
+                tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Provider),
+                tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+                unsatisfiable_floor: None,
             },
         )
         .expect("history trim must produce an ACP notification");
@@ -5403,6 +5459,11 @@ mod tests {
                 "droppedMessages": 12,
                 "keptTurns": 3,
                 "reason": "message limit",
+                "tokenBudget": 500_000,
+                "tokensBefore": 612_000,
+                "tokensAfter": 117_000,
+                "tokensBeforeSource": "provider",
+                "tokensAfterSource": "calibrated",
             })
         );
         assert!(value["params"].get("update").is_none());
@@ -6316,6 +6377,101 @@ mod tests {
                 text == "old request" || text == "old answer"
             }),
             "trimmed messages must not be replayed to the client"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_load_replays_the_retained_turn_when_a_persisted_crumb_leads_the_seed() {
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+
+        // `dropped_messages` from the crumb-aware restore trim counts only
+        // real messages, but the persisted leading breadcrumb is still a row
+        // of the seed vector. The replay offset must skip that crumb row too:
+        // with [crumb, old turn, new turn] and one old turn dropped, replay
+        // must begin at the new turn, not at the old turn's assistant reply.
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let session_id = "sess-load-crumb-replay";
+        store
+            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .unwrap();
+        let crumb = ConversationMessage::Chat(ChatMessage::user(
+            zeroclaw_runtime::agent::history::HISTORY_TRIM_BREADCRUMB_CANONICAL.to_string(),
+        ));
+        store
+            .append_turn(
+                session_id,
+                std::slice::from_ref(&crumb),
+            )
+            .unwrap();
+        store
+            .append_turn(
+                session_id,
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("old request")),
+                    ConversationMessage::Chat(ChatMessage::assistant("old answer")),
+                ],
+            )
+            .unwrap();
+        store
+            .append_turn(
+                session_id,
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("new request")),
+                    ConversationMessage::Chat(ChatMessage::assistant("new answer")),
+                ],
+            )
+            .unwrap();
+        store.set_trim_breadcrumb(session_id, true).unwrap();
+
+        let mut config = make_test_config(cwd.path());
+        config
+            .runtime_profiles
+            .get_mut("default")
+            .unwrap()
+            .max_history_messages = Some(2);
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let server = Arc::new(AcpServer::new_with_writer_and_store(
+            config,
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        ));
+
+        server
+            .handle_session_load(&serde_json::json!({ "sessionId": session_id }))
+            .await
+            .expect("session/load must succeed");
+
+        let mut notifications = Vec::new();
+        while let Ok(message) = writer_rx.try_recv() {
+            notifications.push(serde_json::from_str::<serde_json::Value>(&message).unwrap());
+        }
+
+        let replayed_texts: Vec<String> = notifications
+            .iter()
+            .filter_map(|notification| {
+                notification["params"]["update"]["content"]["text"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(
+            replayed_texts,
+            vec!["new request".to_string(), "new answer".to_string()],
+            "replay must begin at the first retained real turn, aligned with the provider seed: \
+             {replayed_texts:?}"
+        );
+        assert_eq!(
+            notifications[0]["method"], "_zeroclaw/history_trimmed",
+            "the restore trim event must still be emitted first"
+        );
+        assert!(
+            !replayed_texts
+                .iter()
+                .any(|text| text.contains("old request") || text.contains("old answer")),
+            "rows from the dropped turn must not be replayed"
         );
     }
 

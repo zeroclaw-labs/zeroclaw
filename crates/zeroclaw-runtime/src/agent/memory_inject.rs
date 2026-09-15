@@ -382,6 +382,29 @@ pub async fn render_memory_context(
     context
 }
 
+/// Strip a `render_memory_context` preamble off the front of `content`.
+/// `preamble` is the exact block the injecting call recorded rendering
+/// (`run_tool_call_loop`'s `injected_memory_preamble` out-param) — never a
+/// generic marker pattern, since a genuine user message can legitimately
+/// start with the same marker text. Matching the exact rendered string (the
+/// specific recalled entries, not just the wrapper) is also what makes this
+/// safe to call on a buffer the injection never touched at all: a
+/// pre-injection clone of the message (the ordinary no-trim write-back path
+/// keeps one, separate from the buffer the injector actually mutated) simply
+/// won't start with that exact string, so `strip_prefix` is a no-op there.
+/// `None`, or a preamble that isn't an exact prefix of `content`, is a
+/// no-op: the preamble is provider-only per-turn context that must never be
+/// persisted into durable/canonical history (trim write-back, session
+/// storage), only sent to the provider for the turn that recalled it.
+pub(crate) fn strip_memory_context_preamble<'a>(
+    content: &'a str,
+    preamble: Option<&str>,
+) -> &'a str {
+    preamble
+        .and_then(|p| content.strip_prefix(p))
+        .unwrap_or(content)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1636,6 +1659,55 @@ mod tests {
         memory.candidate_multiplier = 0;
         let cfg = MemoryInjectConfig::from_memory_config(&memory, 5);
         assert_eq!(cfg.candidate_multiplier, 1);
+    }
+
+    #[test]
+    fn strip_memory_context_preamble_recovers_the_original_user_content() {
+        let existing = "what's the weather like";
+        let preamble =
+            format!("{MEMORY_CONTEXT_OPEN}\n- k: some recalled fact\n{MEMORY_CONTEXT_CLOSE}\n\n");
+        let with_preamble = format!("{preamble}{existing}");
+        assert_eq!(
+            strip_memory_context_preamble(&with_preamble, Some(&preamble)),
+            existing,
+            "must recover exactly the pre-injection user content"
+        );
+    }
+
+    #[test]
+    fn strip_memory_context_preamble_is_a_no_op_without_a_recorded_preamble() {
+        let plain = "no memory preamble here";
+        assert_eq!(strip_memory_context_preamble(plain, None), plain);
+
+        // A user message that happens to start with the marker text is left
+        // untouched when the caller never recorded injecting a preamble on
+        // it — provenance comes from the caller's own record, not the text.
+        let looks_like_a_preamble = format!(
+            "{MEMORY_CONTEXT_OPEN}\n- k: a user-authored fact\n{MEMORY_CONTEXT_CLOSE}\n\nplease keep this text"
+        );
+        assert_eq!(
+            strip_memory_context_preamble(&looks_like_a_preamble, None),
+            looks_like_a_preamble
+        );
+    }
+
+    #[test]
+    fn strip_memory_context_preamble_is_a_no_op_when_the_recorded_preamble_is_not_an_exact_prefix()
+    {
+        // A pre-injection clone of the message (the ordinary no-trim
+        // write-back path keeps one, separate from the buffer the injector
+        // actually mutated) never carries the preamble at all, even though a
+        // preamble was recorded for *some* message this turn. The exact
+        // string match, not a generic marker match, is what keeps this a
+        // no-op instead of chewing into unrelated content.
+        let clean = "short reply";
+        let unrelated_preamble = format!(
+            "{MEMORY_CONTEXT_OPEN}\n- k: some other turn's recalled fact\n{MEMORY_CONTEXT_CLOSE}\n\n"
+        );
+        assert_eq!(
+            strip_memory_context_preamble(clean, Some(&unrelated_preamble)),
+            clean
+        );
     }
 
     /// Regression: a high-scoring but render-ineligible entry must not consume
