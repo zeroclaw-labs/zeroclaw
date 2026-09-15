@@ -622,6 +622,9 @@ pub(crate) fn build_system_prompt_for_turn(
     show_tool_calls: bool,
     thinking_prefix: Option<&str>,
     shell_profile: Option<&zeroclaw_api::runtime_traits::ShellProfile>,
+    // Whether this turn is on a messaging channel surface. The caller owns
+    // this per-turn fact; it must not come from process-wide channel config.
+    is_messaging_channel_turn: bool,
 ) -> Result<String> {
     let native_tools = model_provider
         .capabilities_for_model(model_name)
@@ -666,6 +669,7 @@ pub(crate) fn build_system_prompt_for_turn(
             inject_memory,
             show_tool_calls,
             shell_profile,
+            is_messaging_channel_turn,
         );
 
     if expose_text_tool_protocol {
@@ -1714,6 +1718,7 @@ pub async fn run(
             config.channels.show_tool_calls,
             None,
             runtime.shell_profile().as_ref(),
+            false,
         )?;
 
         // ── Approval manager (supervised mode) ───────────────────────
@@ -1809,6 +1814,7 @@ pub async fn run(
                 config.channels.show_tool_calls,
                 thinking_params.system_prompt_prefix.as_deref(),
                 runtime.shell_profile().as_ref(),
+                false,
             )?;
 
             let excluded_tool_names: HashSet<&str> =
@@ -1929,6 +1935,7 @@ pub async fn run(
                         config.channels.show_tool_calls,
                         thinking_params.system_prompt_prefix.as_deref(),
                         runtime.shell_profile().as_ref(),
+                        false,
                     )?;
                 }
                 match zeroclaw_api::NATIVE_THINKING_OVERRIDE
@@ -2485,6 +2492,7 @@ pub async fn run(
                             config.channels.show_tool_calls,
                             thinking_params.system_prompt_prefix.as_deref(),
                             runtime.shell_profile().as_ref(),
+                            false,
                         )?;
                     }
                     match zeroclaw_api::NATIVE_THINKING_OVERRIDE
@@ -3225,6 +3233,7 @@ pub async fn process_message(
                 false,
                 config.channels.show_tool_calls,
                 runtime.shell_profile().as_ref(),
+                false,
             );
         if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
@@ -13734,6 +13743,7 @@ Let me check the result."#;
             false,
             Some("THINKING_PREFIX"),
             None,
+            false,
         )
         .expect("turn prompt");
 
@@ -13790,6 +13800,7 @@ Let me check the result."#;
             false,
             None,
             None,
+            true,
         )
         .expect("startup prompt should build");
         assert!(startup_prompt.contains(NATIVE_TOOLS_TASK_FRAMING));
@@ -13823,6 +13834,7 @@ Let me check the result."#;
             false,
             None,
             None,
+            true,
         )
         .expect("no-tools turn prompt should build");
         assert!(
@@ -13859,6 +13871,7 @@ Let me check the result."#;
             false,
             None,
             None,
+            true,
         )
         .expect("tools turn prompt should build");
         assert!(tools_turn_prompt.contains(NATIVE_TOOLS_TASK_FRAMING));
@@ -13968,6 +13981,7 @@ Let me check the result."#;
             false,
             None,
             None,
+            false,
         )
         .expect("turn prompt should build");
 
@@ -14024,6 +14038,7 @@ Let me check the result."#;
             false,
             None,
             None,
+            false,
         )
         .expect("strict turn prompt should build");
         assert!(!strict_prompt.contains("<callable_tools"));
@@ -14093,6 +14108,7 @@ Let me check the result."#;
             false,
             None,
             None,
+            true,
         )
         .expect("compact-mode text prompt should build");
 
