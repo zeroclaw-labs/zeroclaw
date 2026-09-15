@@ -26,12 +26,27 @@ pub enum ToolProtocolEnvelopeKind {
 
 fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
     let initial = match raw {
-        Some(serde_json::Value::String(s)) => serde_json::from_str::<serde_json::Value>(s)
-            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
+        Some(serde_json::Value::String(s)) => parse_arguments_string(s),
         Some(value) => value.clone(),
         None => serde_json::Value::Object(serde_json::Map::new()),
     };
     unwrap_nested_json_strings(initial)
+}
+
+/// String-encoded arguments can carry the same python-style `\'` escapes as
+/// the envelope around them; the outer repair does not reach this inner
+/// string, so a failed parse gets one repair retry before degrading to empty
+/// arguments (an empty call would "succeed" into a tool error downstream).
+fn parse_arguments_string(s: &str) -> serde_json::Value {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(s) {
+        return value;
+    }
+    if let Some((repaired, _)) = repair_python_escaped_quotes(s)
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&repaired)
+    {
+        return value;
+    }
+    serde_json::Value::Object(serde_json::Map::new())
 }
 
 /// Canonical vocabulary of terminal markers emitted by providers that must be
@@ -511,11 +526,29 @@ pub fn looks_like_tool_protocol_example(text: &str) -> bool {
         }
     }
 
+    // Bare envelopes embedded in prose have no tag or fence marker, so the
+    // checks above never see them; without this arm the embedded salvage pass
+    // would execute an envelope a model quoted while explaining the protocol.
+    if let Some((visible_text, calls)) = extract_embedded_protocol_envelopes(trimmed)
+        && !calls.is_empty()
+        && has_example_context(&visible_text)
+    {
+        return true;
+    }
+
     false
 }
 
 fn has_example_context(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
+    let mut lower = text.to_ascii_lowercase();
+    // RFC 2606 documentation domains are placeholder DATA, not example
+    // narration: models reach for `https://example.com/...` links inside real
+    // leaked commands, and one such URL must not reclassify a genuine leak as
+    // documentation (observed in the field: a leaked `--zoom-link
+    // https://example.com/...` suppressed the whole salvage pass).
+    for domain in ["example.com", "example.org", "example.net"] {
+        lower = lower.replace(domain, "");
+    }
     lower.contains("example")
         || lower.contains("sample")
         || lower.contains("示例")
@@ -2091,6 +2124,270 @@ fn range_hits_rejected_span(rejected: &[std::ops::Range<usize>], start: usize, e
         .any(|span| !span.is_empty() && start < span.end && span.start < end)
 }
 
+/// JSON keys that every bare embedded envelope carries. Checked as a cheap
+/// gate before the brace scan in [`for_each_embedded_json_object`].
+const EMBEDDED_ENVELOPE_KEYS: [&str; 4] = [
+    "\"tool_calls\"",
+    "\"toolcalls\"",
+    "\"function_call\"",
+    "\"tool_code\"",
+];
+
+/// Remove the one malformed-JSON escape leaked envelopes actually carry: a
+/// python-style `\'` inside a JSON string (observed in the field inside a
+/// leaked `arguments` payload, and the very defect that makes the envelope
+/// unparseable everywhere -- provider side included, which is plausibly WHY it
+/// arrived as text). `\'` is never valid JSON, so dropping the backslash
+/// cannot change the meaning of any well-formed payload; a backslash run of
+/// even length before the quote means every backslash is itself escaped and
+/// the run is left alone.
+///
+/// Returns the repaired text plus the repaired byte positions of the affected
+/// quotes, so spans found in the repaired text can be mapped back to original
+/// offsets: each breakpoint strictly before an offset stands for one removed
+/// byte. `None` when there is nothing to repair.
+fn repair_python_escaped_quotes(text: &str) -> Option<(String, Vec<usize>)> {
+    if !text.contains("\\'") {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut breakpoints: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        let run_start = i;
+        while i < bytes.len() && bytes[i] == b'\\' {
+            i += 1;
+        }
+        let run = i - run_start;
+        if i < bytes.len() && bytes[i] == b'\'' && run % 2 == 1 {
+            out.extend(std::iter::repeat_n(b'\\', run - 1));
+            breakpoints.push(out.len());
+            out.push(b'\'');
+            i += 1;
+        } else {
+            out.extend(std::iter::repeat_n(b'\\', run));
+        }
+    }
+    if breakpoints.is_empty() {
+        return None;
+    }
+    let repaired = String::from_utf8(out).expect("only ascii backslashes were removed");
+    Some((repaired, breakpoints))
+}
+
+/// Walk `response` for complete top-level JSON objects embedded in prose and
+/// offer each to `visit` with its byte span IN `response` COORDINATES. Every
+/// value that parses is consumed whole -- members nested inside a non-envelope
+/// value must never be re-offered as top-level candidates, or business JSON
+/// that merely CONTAINS a protocol-shaped member would become executable (the
+/// admitted value must be the executed value).
+///
+/// The scan runs over a `\'`-repaired copy when one is needed: any well-formed
+/// value contains no `\'` and is byte-identical in the repaired text, so
+/// scanning the repaired text is strictly more capable, and the mapped spans
+/// keep callers slicing the ORIGINAL bytes for visible-text reconstruction.
+fn for_each_embedded_json_object(
+    response: &str,
+    visit: &mut dyn FnMut(&serde_json::Value, usize, usize),
+) {
+    if !EMBEDDED_ENVELOPE_KEYS
+        .iter()
+        .any(|key| response.contains(key))
+    {
+        return;
+    }
+
+    if let Some((repaired, breakpoints)) = repair_python_escaped_quotes(response) {
+        scan_embedded_json_objects(&repaired, &mut |value, start, end| {
+            let orig_start = start + breakpoints.partition_point(|&b| b < start);
+            let orig_end = end + breakpoints.partition_point(|&b| b < end);
+            visit(value, orig_start, orig_end);
+        });
+    } else {
+        scan_embedded_json_objects(response, visit);
+    }
+}
+
+fn scan_embedded_json_objects(
+    response: &str,
+    visit: &mut dyn FnMut(&serde_json::Value, usize, usize),
+) {
+    let char_positions: Vec<(usize, char)> = response.char_indices().collect();
+    let mut idx = 0;
+    while idx < char_positions.len() {
+        let (byte_idx, ch) = char_positions[idx];
+        if ch != '{' {
+            idx += 1;
+            continue;
+        }
+        let slice = &response[byte_idx..];
+        let mut stream = serde_json::Deserializer::from_str(slice).into_iter::<serde_json::Value>();
+        if let Some(Ok(value)) = stream.next() {
+            let consumed = stream.byte_offset();
+            if consumed > 0 {
+                let end = byte_idx + consumed;
+                visit(&value, byte_idx, end);
+                while idx < char_positions.len() && char_positions[idx].0 < end {
+                    idx += 1;
+                }
+                continue;
+            }
+        }
+        idx += 1;
+    }
+}
+
+/// Whether an embedded object is a Gemini-style python tool stub:
+/// `{"content":..., "tool_code":"print(shell(...))", "tool_name":"shell"}`.
+/// Its arguments live inside a python expression and cannot be reconstructed
+/// faithfully, so the stub is stripped (keeping any narration) rather than
+/// executed.
+fn is_embedded_python_tool_stub(value: &serde_json::Value) -> bool {
+    has_non_empty_string(value, "tool_name") && has_non_empty_string(value, "tool_code")
+}
+
+fn embedded_python_stub_mentions_known_tool(
+    value: &serde_json::Value,
+    known_tool_names: &HashSet<String>,
+) -> bool {
+    value
+        .get("tool_name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .is_some_and(|name| known_tool_names.contains(&name.to_ascii_lowercase()))
+}
+
+/// One embedded envelope's contribution: narration to keep, calls to run.
+struct EmbeddedEnvelope {
+    content: Option<String>,
+    calls: Vec<ParsedToolCall>,
+}
+
+/// Admit an embedded object only when it is a protocol ENVELOPE -- a shape a
+/// runtime serializes, never one a person types as data. A bare invocation
+/// object (`{"name":..., "arguments":...}`) in prose stays inert, exactly as
+/// the `<tools>` wrapper policy keeps prose-wrapped examples inert.
+fn embedded_protocol_envelope(value: &serde_json::Value) -> Option<EmbeddedEnvelope> {
+    if !value.is_object() {
+        return None;
+    }
+    let content = value
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string);
+
+    if is_embedded_python_tool_stub(value) {
+        return Some(EmbeddedEnvelope {
+            content,
+            calls: Vec::new(),
+        });
+    }
+
+    // Only the canonical `tool_calls` envelope is executable here -- the same
+    // contract as the whole-response JSON pass. Alias and function_call
+    // variants are protocol-detection signals everywhere else in this crate
+    // (rejected and retried, never dispatched), and salvaging them mid-prose
+    // would grant a leak more capability than the same bytes have alone.
+    let calls = match classify_tool_protocol_json_value(value)? {
+        ToolProtocolEnvelopeKind::ToolCalls => parse_tool_calls_from_json_value(value),
+        _ => return None,
+    };
+    if calls.is_empty() {
+        return None;
+    }
+    Some(EmbeddedEnvelope { content, calls })
+}
+
+/// Recover tool calls from provider-envelope JSON glued into prose text.
+///
+/// Some models intermittently serialize a turn's tool calls INTO the visible
+/// reply instead of the structured channel -- observed from `gpt-5.6` via the
+/// codex provider as ZeroClaw's own assistant-history shape
+/// (`{"content":null,"tool_calls":[{"arguments":"...","id":"call_...","name":"..."}]}`),
+/// several envelopes concatenated, with ordinary narration before, between,
+/// and after them. Whole-text parsing cannot see these because the response
+/// does not START with JSON.
+///
+/// Returns the visible text with envelope spans replaced by their `content`
+/// narration, plus the recovered calls. `None` unless at least one executable
+/// call was recovered: text is never altered when nothing will run, so an
+/// unsalvageable leak reaches the parse-issue detector with its bytes intact.
+fn extract_embedded_protocol_envelopes(response: &str) -> Option<(String, Vec<ParsedToolCall>)> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut calls: Vec<ParsedToolCall> = Vec::new();
+    let mut plain_from = 0usize;
+
+    for_each_embedded_json_object(response, &mut |value, start, end| {
+        if let Some(envelope) = embedded_protocol_envelope(value) {
+            let before = response[plain_from..start].trim();
+            if !before.is_empty() {
+                parts.push(before.to_string());
+            }
+            if let Some(content) = envelope.content {
+                parts.push(content);
+            }
+            calls.extend(envelope.calls);
+            plain_from = end;
+        }
+    });
+
+    if calls.is_empty() {
+        return None;
+    }
+    let tail = response[plain_from..].trim();
+    if !tail.is_empty() {
+        parts.push(tail.to_string());
+    }
+    // The observed leak repeats each narration verbatim, once inside the
+    // envelope's `content` and once as the plain text right after it (which
+    // may then continue past the echo); keep the longer copy.
+    let mut deduped: Vec<String> = Vec::with_capacity(parts.len());
+    for i in 0..parts.len() {
+        let echoed_by_next = i + 1 < parts.len() && parts[i + 1].starts_with(parts[i].as_str());
+        if !echoed_by_next {
+            deduped.push(std::mem::take(&mut parts[i]));
+        }
+    }
+    Some((deduped.join("\n"), calls))
+}
+
+/// Whether prose text carries an embedded protocol envelope that names a known
+/// tool. Feeds the parse-issue detector for leaks the salvage pass cannot
+/// execute (e.g. python tool stubs), so they are rejected and retried instead
+/// of rendered to the user.
+pub fn embedded_tool_protocol_envelope_mentions_known_tool(
+    text: &str,
+    known_tool_names: &HashSet<String>,
+) -> bool {
+    if known_tool_names.is_empty() {
+        return false;
+    }
+    let mut found = false;
+    for_each_embedded_json_object(text, &mut |value, _start, _end| {
+        if found {
+            return;
+        }
+        if is_embedded_python_tool_stub(value) {
+            found = embedded_python_stub_mentions_known_tool(value, known_tool_names);
+            return;
+        }
+        if classify_tool_protocol_json_value(value).is_some()
+            || has_malformed_tool_protocol_json_signal(value)
+        {
+            found = json_value_mentions_known_tool(value, known_tool_names);
+        }
+    });
+    found
+}
+
 pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     // Strip `<think>...</think>` blocks before parsing.  Qwen and other
     // reasoning models embed chain-of-thought inline in the response text;
@@ -2562,6 +2859,21 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         }
     }
 
+    // Provider-envelope JSON glued into prose: the whole-response JSON pass
+    // above cannot see an envelope that follows narration text. Scanning
+    // `remaining` (never the original response) keeps refused `<tools>` bytes
+    // out of reach -- the tag loop consumed them.
+    if calls.is_empty()
+        && let Some((envelope_text, envelope_calls)) =
+            extract_embedded_protocol_envelopes(remaining)
+    {
+        if !envelope_text.trim().is_empty() {
+            text_parts.push(envelope_text.trim().to_string());
+        }
+        calls = envelope_calls;
+        remaining = "";
+    }
+
     // Remaining text after last tool call
     if !remaining.trim().is_empty() {
         text_parts.push(remaining.trim().to_string());
@@ -2909,6 +3221,200 @@ mod tools_wrapper_body_boundary_tests {
             1,
             "whitespace padding must not disqualify, got {calls:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod embedded_envelope_salvage_tests {
+    use super::*;
+
+    /// The observed leak, structurally exact: narration, then ZeroClaw's own
+    /// assistant-history envelope shape with string-encoded arguments -- made
+    /// unparseable by a python-style `\'` escape inside the arguments string,
+    /// exactly as seen in the field -- then a Gemini-style python tool stub
+    /// carrying its own narration, then a trailing narration line.
+    fn leaked_response() -> String {
+        concat!(
+            "Okay! I can create that webinar page for you.\n",
+            "{\"content\":null,\"tool_calls\":[{\"arguments\":\"{\\\"command\\\":\\\"python3 scripts/wp.py webinar-create --slug 'tesla-frand' --caption 'We\\'ll delve into it'\\\"}\",\"id\":\"call_U9gW6D9hK7Q1G41gJ9c1v4dF\",\"name\":\"shell\"}]}",
+            "{\"content\":\"I'm preparing the command now to create the webinar.\",\"tool_code\":\"print(json.dumps(shell(\\\"python3 scripts/wp.py webinar-create\\\")))\",\"tool_name\":\"shell\"}",
+            "I am creating the draft now.\n",
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn recovers_call_from_envelope_embedded_after_prose() {
+        let (visible, calls) = parse_tool_calls(&leaked_response());
+
+        assert_eq!(calls.len(), 1, "exactly the tool_calls envelope dispatches");
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments["command"],
+            "python3 scripts/wp.py webinar-create --slug 'tesla-frand' --caption 'We'll delve into it'"
+        );
+        assert_eq!(
+            calls[0].tool_call_id.as_deref(),
+            Some("call_U9gW6D9hK7Q1G41gJ9c1v4dF")
+        );
+
+        assert!(
+            !visible.contains("tool_calls") && !visible.contains("tool_code"),
+            "no envelope bytes may stay visible: {visible}"
+        );
+        assert!(visible.contains("Okay! I can create that webinar page for you."));
+        assert!(
+            visible.contains("I'm preparing the command now"),
+            "stub narration is kept: {visible}"
+        );
+        assert!(visible.contains("I am creating the draft now."));
+    }
+
+    #[test]
+    fn recovers_calls_from_concatenated_envelopes() {
+        let text = "Working on it.\n{\"content\":null,\"tool_calls\":[{\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\",\"id\":\"call_1\",\"name\":\"shell\"}]}{\"content\":null,\"tool_calls\":[{\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\",\"id\":\"call_2\",\"name\":\"file_read\"}]}";
+        let (visible, calls) = parse_tool_calls(text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[1].name, "file_read");
+        assert_eq!(visible, "Working on it.");
+    }
+
+    #[test]
+    fn bare_invocation_object_in_prose_stays_inert() {
+        // Only ENVELOPE shapes are admitted mid-prose. A bare invocation
+        // object is the shape of the prose-wrapped example regression, and the
+        // cheap key gate plus the envelope predicate must both refuse it.
+        let text = "To run it manually, send {\"name\":\"shell\",\"arguments\":{\"command\":\"rm -rf /tmp/x\"}} to the API.";
+        let (visible, calls) = parse_tool_calls(text);
+        assert!(calls.is_empty(), "bare invocation dispatched: {calls:?}");
+        assert_eq!(visible, text);
+    }
+
+    #[test]
+    fn protocol_member_nested_in_business_json_stays_inert() {
+        let text = "Audit summary: {\"report\":\"llm-traffic\",\"sample\":{\"content\":null,\"tool_calls\":[{\"arguments\":\"{\\\"command\\\":\\\"rm -rf /tmp/x\\\"}\",\"id\":\"call_9\",\"name\":\"shell\"}]}} end of report.";
+        let (visible, calls) = parse_tool_calls(text);
+        assert!(
+            calls.is_empty(),
+            "nested member must not dispatch: {calls:?}"
+        );
+        assert_eq!(visible, text);
+    }
+
+    #[test]
+    fn embedded_envelope_with_example_context_is_an_example() {
+        let text = "For example, the internal protocol looks like this: {\"content\":null,\"tool_calls\":[{\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\",\"id\":\"call_1\",\"name\":\"shell\"}]} and the runtime parses it.";
+        assert!(looks_like_tool_protocol_example(text));
+    }
+
+    /// SECOND field payload (2026-08-29, the "continue" turn): prose plan,
+    /// then TWO valid envelopes each echoed by a python stub, where (a) a
+    /// leaked command contains an `https://example.com/...` placeholder link
+    /// -- placeholder DATA must not classify the leak as documentation and
+    /// suppress the salvage -- and (b) the second envelope's string-encoded
+    /// arguments carry a python-style `\'` that only the INNER parse sees,
+    /// which previously degraded that call to empty arguments. A trailing
+    /// stub with a literal newline inside a string (unparseable by design)
+    /// must not stop the two good envelopes from salvaging.
+    #[test]
+    fn prose_led_envelopes_with_placeholder_link_and_inner_escape_salvage() {
+        let plan = "Here's the plan to get this webinar draft created correctly.\n";
+        let env1 = r#"{"content":null,"tool_calls":[{"arguments":"{\"command\":\"python3 docx_to_html.py --extract-images assets\"}","id":"call_1","name":"shell"}]}"#;
+        let stub1 = r#"{"content":"Extracting now.","tool_code":"print(shell(\"python3 docx_to_html.py --extract-images assets\"))","tool_name":"shell"}"#;
+        let env2 = r#"{"content":null,"tool_calls":[{"arguments":"{\"command\":\"wp.py webinar-create --caption 'We\\'ll deliver' --zoom-link 'https://example.com/z'\"}","id":"call_2","name":"shell"}]}"#;
+        let bad_stub = "{\"content\":\"I've created it!\nSee the page.\",\"tool_code\":\"print(1)\",\"tool_name\":\"shell\"}";
+        let payload =
+            format!("{plan}{env1}{stub1}Extracting now.\n{env2}{bad_stub}All done for review.");
+
+        assert!(
+            !looks_like_tool_protocol_example(&payload),
+            "a placeholder example.com link inside a leaked command is data, not documentation"
+        );
+
+        let (visible, calls) = parse_tool_calls(&payload);
+        assert_eq!(calls.len(), 2, "both envelopes salvage: {calls:?}");
+        assert!(calls.iter().all(|c| c.name == "shell"));
+        let second = calls[1].arguments["command"].as_str().unwrap_or_default();
+        assert!(
+            second.contains("webinar-create") && second.contains("We'll deliver"),
+            "inner \\' repair must recover the second command, got: {second}"
+        );
+        assert!(visible.contains("Here's the plan"), "narration is kept");
+    }
+
+    #[test]
+    fn python_stub_only_leak_is_not_salvaged_but_is_detected() {
+        let text = "{\"content\":\"Running it now.\",\"tool_code\":\"print(shell(\\\"ls\\\"))\",\"tool_name\":\"shell\"} Running it now.";
+        let with_prose = format!("Let me check that. {text}");
+
+        let (visible, calls) = parse_tool_calls(&with_prose);
+        assert!(calls.is_empty(), "a stub has no reconstructible arguments");
+        assert_eq!(
+            visible, with_prose,
+            "text is never altered when nothing runs"
+        );
+
+        let known: HashSet<String> = HashSet::from(["shell".to_string()]);
+        assert!(embedded_tool_protocol_envelope_mentions_known_tool(
+            &with_prose,
+            &known
+        ));
+        let other: HashSet<String> = HashSet::from(["web_search".to_string()]);
+        assert!(!embedded_tool_protocol_envelope_mentions_known_tool(
+            &with_prose,
+            &other
+        ));
+    }
+
+    #[test]
+    fn tool_result_echo_stays_inert() {
+        let text = "The provider then answers with {\"tool_call_id\":\"call_1\",\"content\":\"file contents here\"} on the wire.";
+        let (visible, calls) = parse_tool_calls(text);
+        assert!(calls.is_empty());
+        assert_eq!(visible, text);
+    }
+
+    #[test]
+    fn plain_prose_with_braces_is_untouched() {
+        let text = "Use {curly} braces {like this} in the template.";
+        let (visible, calls) = parse_tool_calls(text);
+        assert!(calls.is_empty());
+        assert_eq!(visible, text);
+    }
+
+    #[test]
+    fn escaped_backslash_before_quote_is_not_repaired() {
+        // `\\'` is VALID JSON (escaped backslash, then a literal quote); the
+        // parity rule must leave it alone so the argument keeps its backslash.
+        let text = "Sure.\n{\"content\":null,\"tool_calls\":[{\"arguments\":\"{\\\"command\\\":\\\"echo back\\\\\\\\'slash\\\"}\",\"id\":\"call_1\",\"name\":\"shell\"}]}";
+        let (_visible, calls) = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["command"], "echo back\\'slash");
+    }
+
+    #[test]
+    fn repair_never_alters_visible_prose() {
+        // Prose around the envelope carries its own `\'`; the repaired copy is
+        // scan-only, and visible text must come from the original bytes.
+        let text = "In shell, quote it as \\' when needed.\n{\"content\":null,\"tool_calls\":[{\"arguments\":\"{\\\"command\\\":\\\"echo 'We\\'ll see'\\\"}\",\"id\":\"call_1\",\"name\":\"shell\"}]}\nDone \\' here.";
+        let (visible, calls) = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["command"], "echo 'We'll see'");
+        assert!(visible.contains("In shell, quote it as \\' when needed."));
+        assert!(visible.contains("Done \\' here."));
+        assert!(!visible.contains("tool_calls"));
+    }
+
+    #[test]
+    fn repair_offsets_map_spans_back_to_original_bytes() {
+        // A repaired quote BEFORE the envelope shifts every later offset by
+        // one; mis-mapped spans would leave a stray byte of the envelope in
+        // the visible text or eat a byte of prose.
+        let text = "It\\'s ready.\n{\"content\":null,\"tool_calls\":[{\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\",\"id\":\"call_1\",\"name\":\"shell\"}]}\nNext step follows.";
+        let (visible, calls) = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(visible, "It\\'s ready.\nNext step follows.");
     }
 }
 
