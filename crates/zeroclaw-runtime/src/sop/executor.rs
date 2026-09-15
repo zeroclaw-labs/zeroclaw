@@ -149,6 +149,32 @@ pub(crate) fn drain_live_actions(queue: &LiveActionQueue) -> Vec<QueuedSopAction
     }
 }
 
+/// Tools a SOP step turn must never see. Each would let the step act on the
+/// run it is part of (start, advance, or approve it) on whatever engine the
+/// turn holds, instead of returning a result to the driver that owns the run.
+pub(crate) const SOP_STEP_SELF_DRIVE_TOOLS: [&str; 3] =
+    ["sop_execute", "sop_advance", "sop_approve"];
+
+/// The agent's own security policy with `SOP_STEP_SELF_DRIVE_TOOLS` excluded:
+/// the tool scope for a headless step turn. Mirrors what the live turn path
+/// does for a nested step in `sop_step_excluded_tools`.
+pub(crate) fn step_turn_security(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> Result<zeroclaw_config::policy::SecurityPolicy> {
+    let mut policy = zeroclaw_config::policy::SecurityPolicy::for_agent(config, agent_alias)?;
+    let excluded = policy.excluded_tools.get_or_insert_with(Vec::new);
+    for tool in SOP_STEP_SELF_DRIVE_TOOLS {
+        if !excluded
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(tool))
+        {
+            excluded.push(tool.to_string());
+        }
+    }
+    Ok(policy)
+}
+
 /// Upper bound on steps a single headless drive may execute, so a routing
 /// cycle can never pin a background task forever.
 pub(crate) const MAX_HEADLESS_DRIVE_STEPS: usize = 128;
@@ -234,9 +260,70 @@ pub fn spawn_headless_run_driver(
     audit: Option<Arc<SopAuditLogger>>,
     first_action: SopRunAction,
 ) {
+    let lease = match driven_run_id(&first_action) {
+        Some(run_id) => match HeadlessDriverLease::acquire(&engine, run_id) {
+            Some(lease) => Some(lease),
+            None => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({ "run_id": run_id })),
+                    "SOP headless driver: run already has a driver; refusing a second one"
+                );
+                return;
+            }
+        },
+        None => None,
+    };
     zeroclaw_spawn::spawn!(async move {
+        // Held for the driver's whole life so every exit path (parked,
+        // terminal, advance failure, budget exhausted) releases it.
+        let _lease = lease;
         drive_headless_run(config, engine, audit, first_action).await;
     });
+}
+
+/// The run an action would execute steps for. Parked and terminal actions
+/// drive nothing, so they need no lease.
+fn driven_run_id(action: &SopRunAction) -> Option<&str> {
+    match action {
+        SopRunAction::ExecuteStep { run_id, .. }
+        | SopRunAction::DeterministicStep { run_id, .. } => Some(run_id),
+        _ => None,
+    }
+}
+
+/// Process-local ownership of a run's headless driver. One resumed action can
+/// be scheduled from several surfaces (HTTP approve, WS, channel, RPC); two
+/// drivers over the same run execute the same step twice and hand the engine
+/// two results for it. The lease lives in the engine and is released on drop.
+struct HeadlessDriverLease {
+    engine: Arc<Mutex<SopEngine>>,
+    run_id: String,
+}
+
+impl HeadlessDriverLease {
+    fn acquire(engine: &Arc<Mutex<SopEngine>>, run_id: &str) -> Option<Self> {
+        let mut guard = match engine.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.try_lease_headless_driver(run_id).then(|| Self {
+            engine: Arc::clone(engine),
+            run_id: run_id.to_string(),
+        })
+    }
+}
+
+impl Drop for HeadlessDriverLease {
+    fn drop(&mut self) {
+        let mut guard = match self.engine.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.release_headless_driver(&self.run_id);
+    }
 }
 
 /// Drive a broker-approved run from a headless approval surface.
@@ -312,6 +399,21 @@ async fn drive_headless_run(
                 let started_at = crate::sop::engine::now_iso8601();
                 let session_path =
                     std::path::PathBuf::from(format!("sop-{run_id}-step-{}", step.number));
+                // The step turn returns its result to THIS driver. It must not
+                // be able to advance the run itself through the SOP tools: a
+                // turn that does so acts on a second engine built inside the
+                // turn, executes the successor steps there, and hands this
+                // driver a prose summary that then fails the step's schema.
+                // The live turn path already scopes these tools out; a policy
+                // that cannot be resolved is left to `agent::run`, which fails
+                // the step the same way it would have without the scope.
+                let overrides = match step_turn_security(&config, &agent_alias) {
+                    Ok(policy) => crate::agent::loop_::AgentRunOverrides {
+                        security: Some(Arc::new(policy)),
+                        ..Default::default()
+                    },
+                    Err(_) => crate::agent::loop_::AgentRunOverrides::default(),
+                };
                 let run_result = Box::pin(crate::agent::run(
                     config.clone(),
                     &agent_alias,
@@ -326,7 +428,7 @@ async fn drive_headless_run(
                     Some(session_path),
                     None,
                     zeroclaw_api::ingress::TurnOrigin::Daemon,
-                    crate::agent::loop_::AgentRunOverrides::default(),
+                    overrides,
                 ))
                 .await;
                 let completed_at = crate::sop::engine::now_iso8601();
@@ -602,6 +704,135 @@ mod tests {
             SopRunAction::ExecuteStep { run_id, .. } => run_id.clone(),
             other => panic!("expected ExecuteStep, got {other:?}"),
         }
+    }
+
+    /// Two surfaces scheduling the same resumed action must not both drive it:
+    /// the second driver would execute the same step again and hand the
+    /// engine a second result for it. The lease is held for the driver's life
+    /// and released on drop, whichever way the driver exits.
+    #[test]
+    fn headless_driver_lease_refuses_a_second_driver_until_the_first_ends() {
+        let engine = Arc::new(Mutex::new(SopEngine::new(SopConfig::default())));
+        let first = HeadlessDriverLease::acquire(&engine, "run-1")
+            .expect("the first driver takes the lease");
+        assert!(
+            HeadlessDriverLease::acquire(&engine, "run-1").is_none(),
+            "a second driver for the same run is refused while the first is alive"
+        );
+        assert!(
+            HeadlessDriverLease::acquire(&engine, "run-2").is_some(),
+            "the lease is per run"
+        );
+        drop(first);
+        assert!(
+            HeadlessDriverLease::acquire(&engine, "run-1").is_some(),
+            "the lease is released when the driver ends"
+        );
+    }
+
+    fn config_with_agent(
+        alias: &str,
+        profile: zeroclaw_config::schema::RiskProfileConfig,
+    ) -> zeroclaw_config::schema::Config {
+        let mut cfg = zeroclaw_config::schema::Config {
+            data_dir: std::path::PathBuf::from("/tmp/zeroclaw-step-turn-security-test"),
+            config_path: std::path::PathBuf::from(
+                "/tmp/zeroclaw-step-turn-security-test/config.toml",
+            ),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        cfg.risk_profiles.insert("reviewer".into(), profile);
+        cfg.agents.insert(
+            alias.into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                risk_profile: "reviewer".into(),
+                ..zeroclaw_config::schema::AliasedAgentConfig::default()
+            },
+        );
+        cfg
+    }
+
+    /// A headless step turn must not be able to start, advance, or approve
+    /// the run it belongs to: those tools act on a second engine inside the
+    /// turn and leave the driver holding a prose result for the step. The
+    /// profile's own exclusions are kept and the three names are not
+    /// duplicated when the profile already lists one of them.
+    #[test]
+    fn step_turn_security_excludes_the_self_drive_sop_tools() {
+        let cfg = config_with_agent(
+            "reviewer",
+            zeroclaw_config::schema::RiskProfileConfig {
+                excluded_tools: vec!["browser".into(), "SOP_ADVANCE".into()],
+                ..zeroclaw_config::schema::RiskProfileConfig::default()
+            },
+        );
+        let policy = step_turn_security(&cfg, "reviewer").expect("policy resolves");
+        let excluded = policy.excluded_tools.expect("exclusions present");
+        for tool in SOP_STEP_SELF_DRIVE_TOOLS {
+            assert!(
+                excluded.iter().any(|e| e.eq_ignore_ascii_case(tool)),
+                "{tool} must be excluded from a headless step turn, got {excluded:?}"
+            );
+        }
+        assert!(
+            excluded.iter().any(|e| e == "browser"),
+            "profile exclusions are kept"
+        );
+        assert_eq!(
+            excluded
+                .iter()
+                .filter(|e| e.eq_ignore_ascii_case("sop_advance"))
+                .count(),
+            1,
+            "an exclusion the profile already carries is not duplicated"
+        );
+    }
+
+    #[test]
+    fn step_turn_security_adds_exclusions_to_a_profile_that_has_none() {
+        let cfg = config_with_agent(
+            "reviewer",
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        let policy = step_turn_security(&cfg, "reviewer").expect("policy resolves");
+        let mut excluded = policy.excluded_tools.expect("exclusions present");
+        excluded.sort();
+        let mut expected: Vec<String> = SOP_STEP_SELF_DRIVE_TOOLS
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(excluded, expected);
+    }
+
+    #[test]
+    fn step_turn_security_fails_for_an_unknown_agent() {
+        let cfg = config_with_agent(
+            "reviewer",
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        assert!(step_turn_security(&cfg, "nobody").is_err());
+    }
+
+    #[test]
+    fn only_actions_with_steps_to_execute_need_a_driver_lease() {
+        let step_action = SopRunAction::ExecuteStep {
+            run_id: "run-1".to_string(),
+            step: SopStep::default(),
+            context: String::new(),
+        };
+        assert_eq!(driven_run_id(&step_action), Some("run-1"));
+        let deterministic = SopRunAction::DeterministicStep {
+            run_id: "run-2".to_string(),
+            step: SopStep::default(),
+            input: json!({}),
+        };
+        assert_eq!(driven_run_id(&deterministic), Some("run-2"));
+        let terminal = SopRunAction::Completed {
+            run_id: "run-3".to_string(),
+            sop_name: "sop".to_string(),
+        };
+        assert_eq!(driven_run_id(&terminal), None);
     }
 
     #[tokio::test]
