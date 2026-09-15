@@ -622,6 +622,24 @@ impl PairingGuard {
         tokens.contains(&hashed)
     }
 
+    /// Strict membership check for inbound authentication: whether `token`
+    /// hashes to a currently-paired token, regardless of `require_pairing`.
+    /// The gateway's `is_authenticated` convenience fails OPEN when pairing
+    /// is disabled, which is only correct on surfaces that already treat
+    /// the transport as trusted — an auth provider must use this instead,
+    /// so an empty token set denies everything.
+    pub fn token_is_paired(&self, token: &str) -> bool {
+        let hashed = hash_token(token);
+        self.paired_tokens.lock().contains(&hashed)
+    }
+
+    /// Strict membership check by pre-computed SHA-256 hash (see
+    /// [`Self::token_is_paired`]). Lets an established connection re-check
+    /// liveness of its pairing without retaining the bearer itself.
+    pub fn token_hash_is_paired(&self, token_hash: &str) -> bool {
+        self.paired_tokens.lock().contains(token_hash)
+    }
+
     /// Returns true if the gateway is already paired (has at least one token).
     pub fn is_paired(&self) -> bool {
         let tokens = self.paired_tokens.lock();
@@ -929,6 +947,30 @@ mod tests {
     }
 
     #[test]
+    async fn strict_token_check_ignores_require_pairing() {
+        let guard = PairingGuard::new(false, &["zc_tok".to_string()], PairingCodePolicy::default());
+        assert!(
+            guard.is_authenticated("anything"),
+            "gateway convenience fails open when pairing is disabled"
+        );
+        assert!(guard.token_is_paired("zc_tok"));
+        assert!(!guard.token_is_paired("anything"));
+        let hash = PairingGuard::token_hash("zc_tok");
+        assert!(guard.token_hash_is_paired(&hash));
+
+        assert!(guard.revoke_token("zc_tok"));
+        assert!(!guard.token_is_paired("zc_tok"), "revocation is live");
+        assert!(!guard.token_hash_is_paired(&hash));
+    }
+
+    #[test]
+    async fn empty_guard_strict_check_denies_everything() {
+        let guard = PairingGuard::new(false, &[], PairingCodePolicy::default());
+        assert!(!guard.token_is_paired("anything"));
+        assert!(!guard.token_hash_is_paired(&PairingGuard::token_hash("anything")));
+    }
+
+    #[test]
     async fn tokens_returns_hashes() {
         let guard = new_guard(true, &["zc_a".into(), "zc_b".into()]);
         let tokens = guard.tokens();
@@ -1112,7 +1154,7 @@ mod tests {
     async fn unambiguous_charset_excludes_confusable_glyphs() {
         let alphabet = PairingCodeCharset::Unambiguous.alphabet();
         assert_eq!(alphabet.len(), 32, "Crockford Base32 is 32 symbols");
-        for confusable in [b'I', b'L', b'O', b'U', b'l', b'o'] {
+        for &confusable in b"ILOUlo" {
             assert!(
                 !alphabet.contains(&confusable),
                 "{} must not appear in the unambiguous alphabet",

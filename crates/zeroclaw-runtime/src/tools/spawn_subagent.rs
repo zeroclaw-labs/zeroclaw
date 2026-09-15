@@ -58,6 +58,10 @@ impl SpawnSubagentTool {
 
 #[async_trait]
 impl Tool for SpawnSubagentTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         Self::NAME
     }
