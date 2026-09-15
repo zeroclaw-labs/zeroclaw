@@ -349,6 +349,10 @@ rpc_type! {
         /// "page N of M" / "load older" affordances.
         #[serde(default)]
         pub start: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub next_cursor: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub has_older: Option<bool>,
     }
 }
 
@@ -359,6 +363,10 @@ rpc_type! {
         pub limit: Option<usize>,
         #[serde(default)]
         pub before_index: Option<usize>,
+        /// Presence of this field opts into bounded ACP cursor pagination.
+        /// `null` requests the newest page; a string continues a walk.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub cursor: Option<String>,
     }
 }
 
@@ -1705,6 +1713,18 @@ mod tests {
             let wire = serde_json::to_value(&params).unwrap();
             assert_eq!(wire["keep_siblings"], json!(keep));
         }
+    }
+
+    #[test]
+    fn session_messages_params_omit_absent_cursor() {
+        let params = SessionMessagesParams {
+            session_id: "session".into(),
+            limit: None,
+            before_index: None,
+            cursor: None,
+        };
+        let wire = serde_json::to_value(params).unwrap();
+        assert!(wire.get("cursor").is_none());
     }
 
     #[test]
