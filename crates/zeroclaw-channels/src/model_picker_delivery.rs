@@ -49,10 +49,11 @@
 //!   (`start_channels` teardown), which is the only point where no live
 //!   queued selection can still hold revocation authority.
 //! - The dispatch that dequeued a selection can end before it ever reaches
-//!   the mutation point: an `on_message_received` hook cancels it, a
-//!   self-loop guard drops it, or the dispatch task is aborted. Nothing
-//!   downstream would consume that registration, so the dispatch holds a
-//!   [`DispatchOwnership`] token for the message's lifetime and its drop
+//!   the mutation point: pre-worker routing can reject it, an
+//!   `on_message_received` hook can cancel it, a self-loop guard can drop it,
+//!   or the dispatch task can be aborted. Nothing downstream would consume
+//!   that registration, so the dispatch holds a [`DispatchOwnership`] token
+//!   from queue dequeue for the message's lifetime and its drop
 //!   settles the claim as `Dropped`: a still-waiting callback is woken so
 //!   it restores the picker at once instead of at its timeout, a revoked
 //!   marker is reclaimed, and an applied or unregistered selection is left
@@ -458,11 +459,11 @@ fn settle_dropped(message_id: &str) {
     }
 }
 
-/// Ownership token held by the dispatch that dequeued a message, for the
-/// whole dispatch lifetime of that message. Dropping it settles a
-/// registration that no downstream path will consume any more — the
-/// dispatch returned early (hook cancel, self-loop guard, passive context)
-/// or its task was aborted. A selection that reached [`confirm`],
+/// Ownership token held from the instant the dispatch loop dequeues a message,
+/// for the whole dispatch lifetime of that message. Dropping it settles a
+/// registration that no downstream path will consume any more — pre-worker
+/// routing rejected it, the dispatch returned early (hook cancel, self-loop
+/// guard, passive context), or its task was aborted. A selection that reached [`confirm`],
 /// [`apply_if_not_revoked`] or [`take_revoked`] has already left the
 /// registry, and ordinary traffic never registered, so the drop is inert
 /// on every completed path.

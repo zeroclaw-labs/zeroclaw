@@ -3027,11 +3027,28 @@ fn scrub_native_model_picker_error(error: &anyhow::Error) -> String {
     zeroclaw_runtime::security::scrub(&error.to_string())
 }
 
+#[cfg(test)]
 async fn handle_runtime_command_if_needed(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
     target_channel: Option<&Arc<dyn Channel>>,
 ) -> bool {
+    handle_runtime_command_for_delivery(ctx, msg, target_channel, &msg.id).await
+}
+
+/// Handle a runtime command while keeping picker-delivery bookkeeping bound
+/// to the immutable id assigned at ingress. A modifying hook may replace the
+/// public `ChannelMessage`, including its id, but it must not retarget the
+/// revocation claim that authorized a queued picker selection.
+async fn handle_runtime_command_for_delivery(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    target_channel: Option<&Arc<dyn Channel>>,
+    delivery_message_id: &str,
+) -> bool {
+    #[cfg(not(feature = "channel-telegram"))]
+    let _ = delivery_message_id;
+
     let Some(command) = parse_runtime_command(&msg.channel, &msg.content) else {
         return false;
     };
@@ -3253,7 +3270,7 @@ async fn handle_runtime_command_if_needed(
                 // mutation, no response, no provider turn.
                 #[cfg(feature = "channel-telegram")]
                 let picker_applied =
-                    crate::model_picker_delivery::apply_if_not_revoked(&msg.id, || {
+                    crate::model_picker_delivery::apply_if_not_revoked(delivery_message_id, || {
                         apply_model_ref(&mut current, &ctx.model_routes, &model);
                         set_route_selection(ctx, &sender_key, current.clone(), &defaults_snapshot);
                     });
@@ -5393,6 +5410,7 @@ async fn process_channel_message(
     let agent_alias = Arc::clone(&ctx.agent_alias);
     let sender = msg.sender.clone();
     let message_id = msg.id.clone();
+    let delivery_message_id = message_id.clone();
     let composite_for_body = channel_composite.clone();
     zeroclaw_log::scope!(
         category: "channel",
@@ -5401,7 +5419,14 @@ async fn process_channel_message(
         sender: sender.as_str(),
         message_id: message_id.as_str(),
         => async move {
-            process_channel_message_body(ctx, msg, cancellation_token, composite_for_body).await;
+            process_channel_message_body(
+                ctx,
+                msg,
+                cancellation_token,
+                composite_for_body,
+                delivery_message_id,
+            )
+            .await;
         }
     )
     .await;
@@ -6267,6 +6292,7 @@ async fn process_channel_message_body(
     msg: zeroclaw_api::channel::ChannelMessage,
     cancellation_token: CancellationToken,
     channel_composite: String,
+    delivery_message_id: String,
 ) {
     ::zeroclaw_log::record!(
         INFO,
@@ -6360,7 +6386,7 @@ async fn process_channel_message_body(
     // or being reported as handled. Ordinary traffic never registered a
     // delivery ack, so `take_revoked` is a no-op for it.
     #[cfg(feature = "channel-telegram")]
-    if crate::model_picker_delivery::take_revoked(&msg.id) {
+    if crate::model_picker_delivery::take_revoked(&delivery_message_id) {
         return;
     }
 
@@ -6484,14 +6510,21 @@ async fn process_channel_message_body(
             "Failed to apply runtime config update"
         );
     }
-    if handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
+    if handle_runtime_command_for_delivery(
+        ctx.as_ref(),
+        &msg,
+        target_channel.as_ref(),
+        &delivery_message_id,
+    )
+    .await
+    {
         // Confirm picker-selection delivery only now that the command was
         // actually handled: the Telegram callback waits on this
         // acknowledgement before reporting the selection as queued, so a
         // message dropped anywhere earlier (receiver shutdown, routing
         // miss) never looks applied. No-op for ordinary messages.
         #[cfg(feature = "channel-telegram")]
-        crate::model_picker_delivery::confirm(&msg.id);
+        crate::model_picker_delivery::confirm(&delivery_message_id);
         reconcile_early_ack(
             ctx.as_ref(),
             &msg,
@@ -8132,6 +8165,21 @@ async fn process_channel_message_body(
     }
 }
 
+#[cfg(feature = "channel-telegram")]
+type ModelPickerDispatchOwnership = crate::model_picker_delivery::DispatchOwnership;
+
+/// Keep the dispatch loop feature-neutral. Without Telegram support there is
+/// no picker registry, so ownership is a zero-sized no-op.
+#[cfg(not(feature = "channel-telegram"))]
+struct ModelPickerDispatchOwnership;
+
+#[cfg(not(feature = "channel-telegram"))]
+impl ModelPickerDispatchOwnership {
+    fn hold(_message_id: &str) -> Self {
+        Self
+    }
+}
+
 /// Shared worker body extracted so both the normal path and the debounce path
 /// can reuse the same in-flight tracking / cancellation / process logic.
 async fn dispatch_worker(
@@ -8140,10 +8188,12 @@ async fn dispatch_worker(
     in_flight: Arc<tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>>,
     task_sequence: Arc<AtomicU64>,
     permit: tokio::sync::OwnedSemaphorePermit,
+    _dispatch_ownership: ModelPickerDispatchOwnership,
 ) {
     let _permit = permit;
-    // Dispatch ownership of a picker selection's delivery-ack registration,
-    // held from the moment this worker owns the dequeued message: across
+    // Picker delivery ownership is acquired by the dispatch loop at dequeue
+    // and moved into this worker. It therefore spans pre-worker routing and
+    // queue-control branches as well as
     // the wait for the sender's previous turn (a newer message can cancel
     // this worker there, so `process_channel_message` returns before the
     // body runs), every early exit of the body (hook cancel, self-loop
@@ -8153,8 +8203,6 @@ async fn dispatch_worker(
     // revoked marker behind for the daemon's lifetime. No-op for ordinary
     // traffic and for a selection that was confirmed, applied, or consumed
     // as revoked by the body.
-    #[cfg(feature = "channel-telegram")]
-    let _dispatch_ownership = crate::model_picker_delivery::DispatchOwnership::hold(&msg.id);
     let interrupt_enabled = ctx
         .interrupt_on_new_message
         .enabled_for_channel(msg.channel.as_str());
@@ -8748,6 +8796,11 @@ async fn run_message_dispatch_loop(
     let task_sequence = Arc::new(AtomicU64::new(1));
 
     while let Some(msg) = rx.recv().await {
+        // Acquire picker-delivery ownership at the first definitive queue
+        // consumption boundary. Every `continue`, semaphore shutdown, debounce
+        // cancellation, worker abort, and normal completion below then settles
+        // this exact ingress id. Ordinary messages create an inert guard.
+        let dispatch_ownership = ModelPickerDispatchOwnership::hold(&msg.id);
         // Gate answers (button-click markers / `approve <ref>` text replies)
         // resolve a PARKED run and must never start one, so they are consumed
         // BEFORE agent ownership lookup. A configured approval route may be
@@ -8895,6 +8948,7 @@ async fn run_message_dispatch_loop(
                             debounce_in_flight,
                             debounce_task_seq,
                             permit,
+                            dispatch_ownership,
                         )
                         .await;
                     });
@@ -8919,7 +8973,15 @@ async fn run_message_dispatch_loop(
         let in_flight = Arc::clone(&in_flight_by_sender);
         let task_sequence = Arc::clone(&task_sequence);
         workers.spawn(async move {
-            dispatch_worker(worker_ctx, msg, in_flight, task_sequence, permit).await;
+            dispatch_worker(
+                worker_ctx,
+                msg,
+                in_flight,
+                task_sequence,
+                permit,
+                dispatch_ownership,
+            )
+            .await;
         });
 
         while let Some(result) = workers.try_join_next() {
@@ -27815,13 +27877,41 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
+    /// Test hook mirroring the public modifying-hook contract: callers may
+    /// replace a message, including its public id, after dequeue.
+    #[cfg(feature = "channel-telegram")]
+    struct RewriteInboundMessageIdHook;
+
+    #[cfg(feature = "channel-telegram")]
+    #[async_trait::async_trait]
+    impl zeroclaw_runtime::hooks::HookHandler for RewriteInboundMessageIdHook {
+        fn name(&self) -> &str {
+            "rewrite-inbound-message-id"
+        }
+
+        async fn on_message_received(
+            &self,
+            mut message: zeroclaw_api::channel::ChannelMessage,
+        ) -> zeroclaw_runtime::hooks::HookResult<zeroclaw_api::channel::ChannelMessage> {
+            message.id = "hook-rewritten-picker-selection-id".to_string();
+            zeroclaw_runtime::hooks::HookResult::Continue(message)
+        }
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    enum PickerInboundHook {
+        None,
+        Cancel,
+        RewriteId,
+    }
+
     /// Telegram dispatch context for the picker drop regressions: optionally
     /// an inbound hook that cancels every message before the delivery-ack
     /// gate runs, optionally interrupt-on-new-message for Telegram.
     #[cfg(feature = "channel-telegram")]
     fn picker_dispatch_context(
         zeroclaw_dir: &std::path::Path,
-        cancel_inbound: bool,
+        inbound_hook: PickerInboundHook,
         interrupt_telegram: bool,
     ) -> (
         Arc<ChannelRuntimeContext>,
@@ -27847,9 +27937,17 @@ BTC is currently around $65,000 based on latest tool output."#
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert("telegram.main".to_string(), channel);
         ctx.channels_by_name = Arc::new(channels_by_name);
-        if cancel_inbound {
+        let hook =
+            match inbound_hook {
+                PickerInboundHook::None => None,
+                PickerInboundHook::Cancel => Some(Box::new(CancelInboundMessageHook)
+                    as Box<dyn zeroclaw_runtime::hooks::HookHandler>),
+                PickerInboundHook::RewriteId => Some(Box::new(RewriteInboundMessageIdHook)
+                    as Box<dyn zeroclaw_runtime::hooks::HookHandler>),
+            };
+        if let Some(hook) = hook {
             let mut hook_runner = zeroclaw_runtime::hooks::HookRunner::new();
-            hook_runner.register(Box::new(CancelInboundMessageHook));
+            hook_runner.register(hook);
             ctx.hooks = Some(Arc::new(hook_runner));
         }
         ctx.interrupt_on_new_message = InterruptOnNewMessageConfig {
@@ -27878,6 +27976,42 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
+    /// Regression for a definitive drop before worker creation: ownership
+    /// starts at dequeue, so an unowned picker selection reclaims an already
+    /// revoked registration instead of retaining it until daemon teardown.
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn message_dispatch_unowned_selection_reclaims_revoked_registration() {
+        let _registry_guard = crate::model_picker_delivery::registry_test_lock();
+        let selection = picker_selection_message("telegram_model_picker_selection_unowned_revoked");
+        let delivery_ack = crate::model_picker_delivery::register(&selection.id);
+        assert!(matches!(
+            crate::model_picker_delivery::revoke(&selection.id),
+            crate::model_picker_delivery::RevokeOutcome::Won
+        ));
+        drop(delivery_ack);
+        assert!(crate::model_picker_delivery::is_registered(&selection.id));
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(selection.clone()).await.unwrap();
+        drop(tx);
+        let router = AgentRouter {
+            by_agent: Arc::new(HashMap::new()),
+            owner_by_channel_key: Arc::new(HashMap::new()),
+            single_ctx: None,
+            sop_engine: None,
+            sop_audit: None,
+        };
+        run_message_dispatch_loop(rx, router, 1).await;
+
+        assert!(
+            !crate::model_picker_delivery::is_registered(&selection.id),
+            "pre-worker owner rejection must reclaim the revoked picker claim"
+        );
+        assert!(!crate::model_picker_delivery::take_revoked(&selection.id));
+    }
+
     /// Regression for the pre-gate lifecycle leak: the callback's bounded
     /// ack wait elapsed (revoked marker retained for the late dispatch),
     /// then an `on_message_received` hook cancelled the dequeued selection
@@ -27895,7 +28029,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let _registry_guard = crate::model_picker_delivery::registry_test_lock();
         let tmp = tempfile::TempDir::new().unwrap();
         let (runtime_ctx, provider_impl, channel_impl) =
-            picker_dispatch_context(tmp.path(), true, false);
+            picker_dispatch_context(tmp.path(), PickerInboundHook::Cancel, false);
         let selection =
             picker_selection_message("telegram_model_picker_selection_hook_cancel_revoked");
         // Mirror the timed-out callback: registered before the queue
@@ -27946,7 +28080,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let _registry_guard = crate::model_picker_delivery::registry_test_lock();
         let tmp = tempfile::TempDir::new().unwrap();
         let (runtime_ctx, provider_impl, channel_impl) =
-            picker_dispatch_context(tmp.path(), true, false);
+            picker_dispatch_context(tmp.path(), PickerInboundHook::Cancel, false);
         let selection =
             picker_selection_message("telegram_model_picker_selection_hook_cancel_waiting");
         let mut delivery_ack = crate::model_picker_delivery::register(&selection.id);
@@ -27998,7 +28132,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let _registry_guard = crate::model_picker_delivery::registry_test_lock();
         let tmp = tempfile::TempDir::new().unwrap();
         let (runtime_ctx, provider_impl, channel_impl) =
-            picker_dispatch_context(tmp.path(), false, true);
+            picker_dispatch_context(tmp.path(), PickerInboundHook::None, true);
         let selection =
             picker_selection_message("telegram_model_picker_selection_cancelled_while_waiting");
         let mut delivery_ack = crate::model_picker_delivery::register(&selection.id);
@@ -28025,12 +28159,15 @@ BTC is currently around $65,000 based on latest tool output."#
         let worker_msg = selection.clone();
         let worker_in_flight = Arc::clone(&in_flight);
         let worker_sequence = Arc::clone(&task_sequence);
+        let dispatch_ownership =
+            crate::model_picker_delivery::DispatchOwnership::hold(&selection.id);
         let worker = zeroclaw_spawn::spawn!(dispatch_worker(
             worker_ctx,
             worker_msg,
             worker_in_flight,
             worker_sequence,
             permit,
+            dispatch_ownership,
         ));
 
         // Wait until the worker has registered itself (task id 1) and is
@@ -28076,6 +28213,42 @@ BTC is currently around $65,000 based on latest tool output."#
         }
         assert!(provider_impl.calls.lock().unwrap().is_empty());
         assert!(channel_impl.sent_messages.lock().await.is_empty());
+    }
+
+    /// A modifying hook may rewrite the public message id, but the picker
+    /// claim is bound to the immutable id assigned before queue handoff. A
+    /// timed-out selection must therefore stay revoked across that rewrite.
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn message_dispatch_hook_id_rewrite_preserves_picker_revocation() {
+        let _registry_guard = crate::model_picker_delivery::registry_test_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (runtime_ctx, provider_impl, channel_impl) =
+            picker_dispatch_context(tmp.path(), PickerInboundHook::RewriteId, false);
+        let selection = picker_selection_message("telegram_model_picker_selection_hook_id_rewrite");
+        let delivery_ack = crate::model_picker_delivery::register(&selection.id);
+        assert!(matches!(
+            crate::model_picker_delivery::revoke(&selection.id),
+            crate::model_picker_delivery::RevokeOutcome::Won
+        ));
+        drop(delivery_ack);
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(selection.clone()).await.unwrap();
+        drop(tx);
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx.clone()), 1).await;
+
+        assert!(
+            runtime_ctx.route_overrides.lock().unwrap().is_empty(),
+            "rewriting the public message id must not bypass picker revocation"
+        );
+        assert!(provider_impl.calls.lock().unwrap().is_empty());
+        assert!(channel_impl.sent_messages.lock().await.is_empty());
+        assert!(!crate::model_picker_delivery::is_registered(&selection.id));
+        assert!(!crate::model_picker_delivery::is_registered(
+            "hook-rewritten-picker-selection-id"
+        ));
     }
 
     /// Regression for the late-revocation race *past* the early dispatch
