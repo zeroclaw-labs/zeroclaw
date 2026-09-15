@@ -47,10 +47,12 @@ scopeguard = "1.2"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 
 [target.'cfg(unix)'.dependencies]
+libc = "0.2"
 nix = { version = "0.30", default-features = false, features = ["process", "signal"] }
 
 [target.'cfg(windows)'.dependencies]
 process-wrap = { version = "=9.0.0", default-features = false, features = ["job-object", "kill-on-drop", "tokio1"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [features]
 default = []
