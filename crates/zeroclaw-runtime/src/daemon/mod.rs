@@ -1169,7 +1169,10 @@ async fn await_socket_startup(
         Ok(SocketStartupState::Fatal { kind, message }) => {
             Err(std::io::Error::new(kind, message).into())
         }
-        Ok(SocketStartupState::Pending) => unreachable!("wait_for excludes pending state"),
+        Ok(SocketStartupState::Pending) => Err(std::io::Error::other(
+            "socket startup remained pending after readiness wait",
+        )
+        .into()),
         Err(_) => Ok(()),
     }
 }
