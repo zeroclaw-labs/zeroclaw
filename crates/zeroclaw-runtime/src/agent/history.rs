@@ -11,7 +11,7 @@ use zeroclaw_providers::ChatMessage;
 /// used when callers omit the parameter.
 pub const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
 
-static LOCAL_IMAGE_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
+pub(crate) static LOCAL_IMAGE_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?:[A-Za-z]:[\\/]|\\\\[^\s<>'"`\]\)/\\]+[\\/]|/)[^\s<>'"`\]\)]+?\.(?i:png|jpe?g|webp|gif|bmp)"#,
     )
