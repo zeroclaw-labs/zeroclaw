@@ -315,8 +315,37 @@ impl AcpServer {
         workspace_dir: &std::path::Path,
         enable_mcp: bool,
     ) -> Result<Agent> {
+        let Some(store) = self.store.as_ref() else {
+            return if let ConfigSource::Live(live_config) = &self.config_source {
+                Agent::from_live_config_with_session_cwd_and_mcp_backchannel(
+                    Arc::clone(live_config),
+                    agent_alias,
+                    Some(workspace_dir),
+                    enable_mcp,
+                    true,
+                    true,
+                    self.sop_engine.clone(),
+                    self.sop_audit.clone(),
+                    self.canvas_store.clone(),
+                )
+                .await
+            } else {
+                Agent::from_config_with_session_cwd_and_mcp_backchannel(
+                    config,
+                    agent_alias,
+                    Some(workspace_dir),
+                    enable_mcp,
+                    true,
+                    true,
+                    self.sop_engine.clone(),
+                    self.sop_audit.clone(),
+                    self.canvas_store.clone(),
+                )
+                .await
+            };
+        };
         if let ConfigSource::Live(live_config) = &self.config_source {
-            Agent::from_live_config_with_session_cwd_and_mcp_backchannel(
+            Agent::from_live_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions(
                 Arc::clone(live_config),
                 agent_alias,
                 Some(workspace_dir),
@@ -327,10 +356,11 @@ impl AcpServer {
                 self.sop_engine.clone(),
                 self.sop_audit.clone(),
                 self.canvas_store.clone(),
+                Arc::clone(store),
             )
             .await
         } else {
-            Agent::from_config_with_session_cwd_and_mcp_backchannel(
+            Agent::from_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions(
                 config,
                 agent_alias,
                 Some(workspace_dir),
@@ -341,6 +371,7 @@ impl AcpServer {
                 self.sop_engine.clone(),
                 self.sop_audit.clone(),
                 self.canvas_store.clone(),
+                Arc::clone(store),
             )
             .await
         }

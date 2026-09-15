@@ -8,7 +8,121 @@ use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
+use zeroclaw_infra::acp_session_store::{
+    AcpSessionAccess, AcpSessionData, AcpSessionStore, AcpSessionSummary,
+};
 use zeroclaw_infra::session_backend::SessionBackend;
+
+/// Agent-scoped access to the durable ACP session store.
+///
+/// The handle is only attached to agents built by the ACP server. Each tool
+/// execution still verifies that the task-local session key names a live ACP
+/// session owned by `agent_alias`; construction for an alias alone is not an
+/// ACP invocation grant.
+#[derive(Clone)]
+pub struct AcpSessionReadView {
+    store: Arc<AcpSessionStore>,
+    agent_alias: Arc<str>,
+}
+
+enum AcpTargetAccess {
+    Inactive,
+    Owned,
+    Foreign,
+    Missing,
+}
+
+impl AcpSessionReadView {
+    pub fn new(store: Arc<AcpSessionStore>, agent_alias: impl Into<String>) -> Self {
+        Self {
+            store,
+            agent_alias: Arc::from(agent_alias.into()),
+        }
+    }
+
+    fn is_active(&self) -> anyhow::Result<bool> {
+        let Some(current_key) = current_session_key() else {
+            return Ok(false);
+        };
+        self.store
+            .is_live_session_for_agent(&current_key, &self.agent_alias)
+    }
+
+    fn active_summaries(&self) -> anyhow::Result<Option<Vec<AcpSessionSummary>>> {
+        let Some(current_key) = current_session_key() else {
+            return Ok(None);
+        };
+        let summaries = self.store.list_live_sessions_by_agent(&self.agent_alias)?;
+        if summaries
+            .iter()
+            .any(|summary| summary.session_uuid == current_key)
+        {
+            Ok(Some(summaries))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn classify_target(&self, session_id: &str) -> anyhow::Result<AcpTargetAccess> {
+        if !self.is_active()? {
+            return Ok(AcpTargetAccess::Inactive);
+        }
+        Ok(
+            match self
+                .store
+                .classify_session_for_agent(session_id, &self.agent_alias)?
+            {
+                AcpSessionAccess::Owned => AcpTargetAccess::Owned,
+                AcpSessionAccess::Foreign => AcpTargetAccess::Foreign,
+                AcpSessionAccess::Missing => AcpTargetAccess::Missing,
+            },
+        )
+    }
+
+    fn load_owned(&self, session_id: &str) -> anyhow::Result<Option<AcpSessionData>> {
+        self.store
+            .load_session_for_agent(session_id, &self.agent_alias)
+    }
+
+    fn all_session_ids(&self) -> anyhow::Result<std::collections::BTreeSet<String>> {
+        Ok(self.store.list_session_ids()?.into_iter().collect())
+    }
+}
+
+fn current_session_key() -> Option<String> {
+    zeroclaw_api::TOOL_LOOP_SESSION_KEY
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+}
+
+fn tool_msg_with_args(key: &str, args: &[(&str, &str)]) -> String {
+    crate::i18n::get_required_tool_string_with_args(key, args)
+}
+
+fn session_history_header(session_id: &str, shown: usize, total: usize) -> String {
+    let shown = shown.to_string();
+    let total = total.to_string();
+    tool_msg_with_args(
+        "tool-sessions-history-header",
+        &[
+            ("session_id", session_id),
+            ("shown", &shown),
+            ("total", &total),
+        ],
+    )
+}
+
+fn acp_send_unsupported() -> String {
+    tool_msg_with_args(
+        "tool-sessions-send-error-acp-unsupported",
+        &[
+            ("tool", "sessions_send"),
+            ("channel", "ACP"),
+            ("product", "Code"),
+        ],
+    )
+}
 
 /// Validate that a session ID is non-empty and contains at least one
 /// alphanumeric character (prevents blank keys after sanitization).
@@ -131,11 +245,25 @@ impl SessionOwnershipScope {
 /// Lists active sessions with their channel, last activity time, and message count.
 pub struct SessionsListTool {
     backend: Arc<dyn SessionBackend>,
+    acp_sessions: Option<AcpSessionReadView>,
 }
 
 impl SessionsListTool {
     pub fn new(backend: Arc<dyn SessionBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            acp_sessions: None,
+        }
+    }
+
+    pub fn with_acp_sessions(
+        backend: Arc<dyn SessionBackend>,
+        acp_sessions: AcpSessionReadView,
+    ) -> Self {
+        Self {
+            backend,
+            acp_sessions: Some(acp_sessions),
+        }
     }
 }
 
@@ -168,7 +296,31 @@ impl Tool for SessionsListTool {
             .and_then(serde_json::Value::as_u64)
             .map_or(50, |v| v as usize);
 
-        let metadata = self.backend.list_sessions_with_metadata();
+        let mut metadata: Vec<SessionListEntry> = self
+            .backend
+            .list_sessions_with_metadata()
+            .into_iter()
+            .map(|meta| SessionListEntry {
+                channel: meta.key.split("__").next().unwrap_or(&meta.key).to_string(),
+                key: meta.key,
+                last_activity: meta.last_activity,
+                message_count: meta.message_count,
+            })
+            .collect();
+
+        if let Some(view) = &self.acp_sessions
+            && let Some(acp_sessions) = view.active_summaries()?
+        {
+            let acp_ids = view.all_session_ids()?;
+            metadata.retain(|entry| !acp_ids.contains(&entry.key));
+            metadata.extend(acp_sessions.into_iter().map(|summary| SessionListEntry {
+                key: summary.session_uuid,
+                channel: "acp".to_string(),
+                last_activity: summary.last_activity,
+                message_count: summary.message_count,
+            }));
+            metadata.sort_by_key(|entry| std::cmp::Reverse(entry.last_activity));
+        }
 
         if metadata.is_empty() {
             return Ok(ToolResult {
@@ -181,12 +333,10 @@ impl Tool for SessionsListTool {
         let capped: Vec<_> = metadata.into_iter().take(limit).collect();
         let mut output = format!("Found {} session(s):\n", capped.len());
         for meta in &capped {
-            // Extract channel from key (convention: channel__identifier)
-            let channel = meta.key.split("__").next().unwrap_or(&meta.key);
             let _ = writeln!(
                 output,
                 "- {}: channel={}, messages={}, last_activity={}",
-                meta.key, channel, meta.message_count, meta.last_activity
+                meta.key, meta.channel, meta.message_count, meta.last_activity
             );
         }
 
@@ -198,17 +348,41 @@ impl Tool for SessionsListTool {
     }
 }
 
+struct SessionListEntry {
+    key: String,
+    channel: String,
+    last_activity: chrono::DateTime<chrono::Utc>,
+    message_count: usize,
+}
+
 // ── SessionsHistoryTool ─────────────────────────────────────────────
 
 /// Reads the message history of a specific session by ID.
 pub struct SessionsHistoryTool {
     backend: Arc<dyn SessionBackend>,
     security: Arc<SecurityPolicy>,
+    acp_sessions: Option<AcpSessionReadView>,
 }
 
 impl SessionsHistoryTool {
     pub fn new(backend: Arc<dyn SessionBackend>, security: Arc<SecurityPolicy>) -> Self {
-        Self { backend, security }
+        Self {
+            backend,
+            security,
+            acp_sessions: None,
+        }
+    }
+
+    pub fn with_acp_sessions(
+        backend: Arc<dyn SessionBackend>,
+        security: Arc<SecurityPolicy>,
+        acp_sessions: AcpSessionReadView,
+    ) -> Self {
+        Self {
+            backend,
+            security,
+            acp_sessions: Some(acp_sessions),
+        }
     }
 }
 
@@ -275,7 +449,31 @@ impl Tool for SessionsHistoryTool {
             .and_then(serde_json::Value::as_u64)
             .map_or(20, |v| v as usize);
 
-        let messages = self.backend.load(session_id);
+        let mut require_existing_chat_session = false;
+        if let Some(view) = &self.acp_sessions {
+            match view.classify_target(session_id)? {
+                AcpTargetAccess::Owned => {
+                    let Some(session) = view.load_owned(session_id)? else {
+                        return Ok(session_not_found(session_id));
+                    };
+                    return Ok(render_acp_history(&session, limit));
+                }
+                AcpTargetAccess::Foreign => return Ok(session_not_found(session_id)),
+                AcpTargetAccess::Inactive => {}
+                AcpTargetAccess::Missing => require_existing_chat_session = true,
+            }
+        }
+
+        let resolved_session_id = if require_existing_chat_session {
+            let Some(session_key) = resolve_existing_session_key(self.backend.as_ref(), session_id)
+            else {
+                return Ok(session_not_found(session_id));
+            };
+            session_key
+        } else {
+            session_id.to_string()
+        };
+        let messages = self.backend.load(&resolved_session_id);
 
         if messages.is_empty() {
             return Ok(ToolResult {
@@ -290,10 +488,8 @@ impl Tool for SessionsHistoryTool {
         let tail = &messages[start..];
 
         let mut output = format!(
-            "Session '{}': showing {}/{} messages\n",
-            session_id,
-            tail.len(),
-            messages.len()
+            "{}\n",
+            session_history_header(session_id, tail.len(), messages.len())
         );
         for msg in tail {
             let _ = writeln!(output, "[{}] {}", msg.role, msg.content);
@@ -307,17 +503,82 @@ impl Tool for SessionsHistoryTool {
     }
 }
 
+fn render_acp_history(session: &AcpSessionData, limit: usize) -> ToolResult {
+    let start = session.messages.len().saturating_sub(limit);
+    let tail = &session.messages[start..];
+    let mut output = format!(
+        "{}\n",
+        session_history_header(&session.session_uuid, tail.len(), session.messages.len())
+    );
+    for message in tail {
+        match message {
+            zeroclaw_api::model_provider::ConversationMessage::Chat(chat) => {
+                let _ = writeln!(output, "[{}] {}", chat.role, chat.content);
+            }
+            zeroclaw_api::model_provider::ConversationMessage::AssistantToolCalls {
+                text,
+                tool_calls,
+                ..
+            } => {
+                if let Some(text) = text.as_deref().filter(|text| !text.is_empty()) {
+                    let _ = writeln!(output, "[assistant] {text}");
+                }
+                for call in tool_calls {
+                    let _ = writeln!(output, "[assistant tool_call] {}", call.name);
+                }
+            }
+            zeroclaw_api::model_provider::ConversationMessage::ToolResults(results) => {
+                for result in results {
+                    let _ = writeln!(output, "[tool {}] {}", result.tool_name, result.content);
+                }
+            }
+        }
+    }
+    ToolResult {
+        success: true,
+        output: output.into(),
+        error: None,
+    }
+}
+
+fn session_not_found(session_id: &str) -> ToolResult {
+    ToolResult {
+        success: false,
+        output: ToolOutput::default(),
+        error: Some(format!(
+            "Session '{session_id}' not found. Use sessions_list or sessions_current to choose an existing session. Gateway dashboard sessions are stored as 'gw_<session_id>'."
+        )),
+    }
+}
+
 // ── SessionsSendTool ────────────────────────────────────────────────
 
 /// Sends a message to a specific session, enabling inter-agent communication.
 pub struct SessionsSendTool {
     backend: Arc<dyn SessionBackend>,
     security: Arc<SecurityPolicy>,
+    acp_sessions: Option<AcpSessionReadView>,
 }
 
 impl SessionsSendTool {
     pub fn new(backend: Arc<dyn SessionBackend>, security: Arc<SecurityPolicy>) -> Self {
-        Self { backend, security }
+        Self {
+            backend,
+            security,
+            acp_sessions: None,
+        }
+    }
+
+    pub fn with_acp_sessions(
+        backend: Arc<dyn SessionBackend>,
+        security: Arc<SecurityPolicy>,
+        acp_sessions: AcpSessionReadView,
+    ) -> Self {
+        Self {
+            backend,
+            security,
+            acp_sessions: Some(acp_sessions),
+        }
     }
 }
 
@@ -400,16 +661,24 @@ impl Tool for SessionsSendTool {
             });
         }
 
+        if let Some(view) = &self.acp_sessions {
+            match view.classify_target(session_id)? {
+                AcpTargetAccess::Owned => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(acp_send_unsupported()),
+                    });
+                }
+                AcpTargetAccess::Foreign => return Ok(session_not_found(session_id)),
+                AcpTargetAccess::Inactive | AcpTargetAccess::Missing => {}
+            }
+        }
+
         let Some(target_session_key) =
             resolve_existing_session_key(self.backend.as_ref(), session_id)
         else {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!(
-                    "Session '{session_id}' not found. Use sessions_list or sessions_current to choose an existing session. Gateway dashboard sessions are stored as 'gw_<session_id>'."
-                )),
-            });
+            return Ok(session_not_found(session_id));
         };
 
         let chat_msg = zeroclaw_api::model_provider::ChatMessage::user(message);
@@ -445,11 +714,25 @@ impl Tool for SessionsSendTool {
 /// which is scoped around gateway and channel agent turns.
 pub struct SessionsCurrentTool {
     backend: Arc<dyn SessionBackend>,
+    acp_sessions: Option<AcpSessionReadView>,
 }
 
 impl SessionsCurrentTool {
     pub fn new(backend: Arc<dyn SessionBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            acp_sessions: None,
+        }
+    }
+
+    pub fn with_acp_sessions(
+        backend: Arc<dyn SessionBackend>,
+        acp_sessions: AcpSessionReadView,
+    ) -> Self {
+        Self {
+            backend,
+            acp_sessions: Some(acp_sessions),
+        }
     }
 }
 
@@ -471,10 +754,7 @@ impl Tool for SessionsCurrentTool {
     }
 
     async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let session_key = zeroclaw_api::TOOL_LOOP_SESSION_KEY
-            .try_with(Clone::clone)
-            .ok()
-            .flatten();
+        let session_key = current_session_key();
 
         let Some(key) = session_key else {
             return Ok(ToolResult {
@@ -487,6 +767,18 @@ impl Tool for SessionsCurrentTool {
         };
 
         let mut output = format!("Current session: {key}\n");
+        if let Some(view) = &self.acp_sessions
+            && view.is_active()?
+        {
+            let channel =
+                tool_msg_with_args("tool-sessions-current-channel", &[("channel", "acp")]);
+            let _ = writeln!(output, "{channel}");
+            return Ok(ToolResult {
+                success: true,
+                output: output.into(),
+                error: None,
+            });
+        }
         if let Some(meta) = self.backend.get_session_metadata(&key) {
             if let Some(name) = meta.name.filter(|name| !name.is_empty()) {
                 let _ = writeln!(output, "Name: {name}");
@@ -832,6 +1124,10 @@ mod tests {
 
         fn list_sessions(&self) -> Vec<String> {
             self.inner.list_sessions()
+        }
+
+        fn list_sessions_with_metadata(&self) -> Vec<SessionMetadata> {
+            self.metadata.lock().unwrap().values().cloned().collect()
         }
 
         fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
@@ -1704,5 +2000,282 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("could not be deleted"));
+    }
+
+    fn acp_fixture() -> (
+        TempDir,
+        Arc<AcpSessionStore>,
+        AcpSessionReadView,
+        String,
+        String,
+        String,
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(AcpSessionStore::new(tmp.path()).unwrap());
+        let current = "11111111-1111-4111-8111-111111111111".to_string();
+        let other = "22222222-2222-4222-8222-222222222222".to_string();
+        let foreign = "foreign-acp-session".to_string();
+        store.create_session(&current, "rowan", "/current").unwrap();
+        store
+            .append_turn(
+                &current,
+                &[zeroclaw_api::model_provider::ConversationMessage::Chat(
+                    ChatMessage::user("current prompt"),
+                )],
+            )
+            .unwrap();
+        store.create_session(&other, "rowan", "/other").unwrap();
+        store
+            .append_turn(
+                &other,
+                &[zeroclaw_api::model_provider::ConversationMessage::Chat(
+                    ChatMessage::assistant("other answer"),
+                )],
+            )
+            .unwrap();
+        store.create_session(&foreign, "sable", "/foreign").unwrap();
+        let view = AcpSessionReadView::new(store.clone(), "rowan");
+        (tmp, store, view, current, other, foreign)
+    }
+
+    #[test]
+    fn acp_session_output_fluent_keys_interpolate_protocol_values() {
+        let header = session_history_header("session-alpha", 37, 89);
+        assert!(header.contains("session-alpha"));
+        assert!(header.contains("37"));
+        assert!(header.contains("89"));
+        assert!(!header.contains("{tool-sessions-history-header}"));
+
+        let channel = tool_msg_with_args("tool-sessions-current-channel", &[("channel", "acp")]);
+        assert!(channel.contains("acp"));
+        assert!(!channel.contains("{tool-sessions-current-channel}"));
+
+        let unsupported = acp_send_unsupported();
+        assert!(unsupported.contains("sessions_send"));
+        assert!(unsupported.contains("ACP"));
+        assert!(unsupported.contains("Code"));
+        assert!(!unsupported.contains("{tool-sessions-send-error-acp-unsupported}"));
+    }
+
+    #[tokio::test]
+    async fn acp_current_list_and_history_share_owned_session_view() {
+        let (_acp_tmp, _store, view, current, other, _foreign) = acp_fixture();
+        let (_chat_tmp, backend) = test_backend();
+        let current_tool = SessionsCurrentTool::with_acp_sessions(backend.clone(), view.clone());
+        let list_tool = SessionsListTool::with_acp_sessions(backend.clone(), view.clone());
+        let history_tool = SessionsHistoryTool::with_acp_sessions(backend, test_security(), view);
+
+        zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some(current.clone()), async {
+                let current_result = current_tool.execute(json!({})).await.unwrap();
+                assert!(current_result.success);
+                assert!(current_result.output.contains(&current));
+                let channel =
+                    tool_msg_with_args("tool-sessions-current-channel", &[("channel", "acp")]);
+                assert!(current_result.output.contains(&channel));
+
+                let list_result = list_tool.execute(json!({})).await.unwrap();
+                assert!(list_result.success);
+                assert!(list_result.output.contains(&current));
+                assert!(list_result.output.contains(&other));
+
+                let current_history = history_tool
+                    .execute(json!({"session_id": current}))
+                    .await
+                    .unwrap();
+                assert!(current_history.success);
+                assert!(
+                    current_history
+                        .output
+                        .starts_with(&session_history_header(&current, 1, 1))
+                );
+                assert!(current_history.output.contains("current prompt"));
+
+                let other_history = history_tool
+                    .execute(json!({"session_id": other}))
+                    .await
+                    .unwrap();
+                assert!(other_history.success);
+                assert!(
+                    other_history
+                        .output
+                        .starts_with(&session_history_header(&other, 1, 1))
+                );
+                assert!(other_history.output.contains("other answer"));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn acp_list_unions_before_sorting_and_limit() {
+        let (_acp_tmp, _store, view, current, _other, _foreign) = acp_fixture();
+        let (_chat_tmp, inner) = test_backend();
+        let old_chat = SessionMetadata {
+            key: "telegram__old".into(),
+            name: None,
+            created_at: Utc::now() - chrono::Duration::days(2),
+            last_activity: Utc::now() - chrono::Duration::days(1),
+            message_count: 1,
+            agent_alias: Some("rowan".into()),
+            channel_id: Some("telegram.default".into()),
+            room_id: None,
+            sender_id: None,
+        };
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(MetadataBackend::new(inner, vec![old_chat]));
+        let tool = SessionsListTool::with_acp_sessions(backend, view);
+
+        let result = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some(current.clone()), tool.execute(json!({"limit": 1})))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("channel=acp"));
+        assert!(!result.output.contains("telegram__old"));
+    }
+
+    #[tokio::test]
+    async fn non_acp_invocation_for_same_alias_remains_chat_only() {
+        let (_acp_tmp, _store, view, current, _other, _foreign) = acp_fixture();
+        let (_chat_tmp, backend) = seeded_backend();
+        let tool = SessionsListTool::with_acp_sessions(backend, view);
+
+        let result = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some("telegram__alice".into()), tool.execute(json!({})))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("telegram__alice"));
+        assert!(!result.output.contains(&current));
+    }
+
+    #[tokio::test]
+    async fn foreign_acp_uuid_is_indistinguishable_from_unknown_and_send_is_unsupported() {
+        let (_acp_tmp, store, view, current, _other, foreign) = acp_fixture();
+        let (_chat_tmp, backend) = test_backend();
+        let history =
+            SessionsHistoryTool::with_acp_sessions(backend.clone(), test_security(), view.clone());
+        let send = SessionsSendTool::with_acp_sessions(backend, test_security(), view);
+        let unknown = "missing-acp-session";
+
+        zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some(current.clone()), async {
+                let foreign_result = history
+                    .execute(json!({"session_id": foreign}))
+                    .await
+                    .unwrap();
+                let unknown_result = history
+                    .execute(json!({"session_id": unknown}))
+                    .await
+                    .unwrap();
+                assert!(!foreign_result.success);
+                assert!(!unknown_result.success);
+                assert_eq!(
+                    foreign_result.error.unwrap().replace(&foreign, "<id>"),
+                    unknown_result.error.unwrap().replace(unknown, "<id>")
+                );
+
+                let foreign_send = send
+                    .execute(json!({"session_id": foreign, "message": "hello"}))
+                    .await
+                    .unwrap();
+                let unknown_send = send
+                    .execute(json!({"session_id": unknown, "message": "hello"}))
+                    .await
+                    .unwrap();
+                assert!(!foreign_send.success);
+                assert!(!unknown_send.success);
+                assert_eq!(
+                    foreign_send.error.unwrap().replace(&foreign, "<id>"),
+                    unknown_send.error.unwrap().replace(unknown, "<id>")
+                );
+
+                let send_result = send
+                    .execute(json!({"session_id": current, "message": "hello"}))
+                    .await
+                    .unwrap();
+                assert!(!send_result.success);
+                assert_eq!(send_result.error.unwrap(), acp_send_unsupported());
+            })
+            .await;
+
+        assert_eq!(
+            store
+                .load_session_for_agent(&current, "rowan")
+                .unwrap()
+                .unwrap()
+                .messages
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn uuid_shaped_chat_key_falls_back_only_when_absent_from_acp_store() {
+        let (_acp_tmp, _store, view, current, _other, _foreign) = acp_fixture();
+        let (_chat_tmp, backend) = test_backend();
+        let chat_uuid = "44444444-4444-4444-8444-444444444444";
+        backend
+            .append(chat_uuid, &ChatMessage::user("uuid chat message"))
+            .unwrap();
+        let history = SessionsHistoryTool::with_acp_sessions(backend, test_security(), view);
+
+        let result = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(
+                Some(current),
+                history.execute(json!({"session_id": chat_uuid})),
+            )
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("uuid chat message"));
+    }
+
+    #[tokio::test]
+    async fn same_key_collision_prefers_owned_acp_and_is_listed_once() {
+        let (_acp_tmp, _store, view, current, _other, _foreign) = acp_fixture();
+        let (_chat_tmp, backend) = test_backend();
+        backend
+            .append(&current, &ChatMessage::user("colliding chat message"))
+            .unwrap();
+        let list = SessionsListTool::with_acp_sessions(backend.clone(), view.clone());
+        let history = SessionsHistoryTool::with_acp_sessions(backend, test_security(), view);
+
+        zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some(current.clone()), async {
+                let listed = list.execute(json!({})).await.unwrap();
+                assert_eq!(listed.output.matches(&current).count(), 1);
+
+                let result = history
+                    .execute(json!({"session_id": current}))
+                    .await
+                    .unwrap();
+                assert!(result.success);
+                assert!(result.output.contains("current prompt"));
+                assert!(!result.output.contains("colliding chat message"));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn foreign_acp_collision_hides_chat_session_during_owned_acp_turn() {
+        let (_acp_tmp, _store, view, current, _other, foreign) = acp_fixture();
+        let (_chat_tmp, backend) = test_backend();
+        backend
+            .append(
+                &foreign,
+                &ChatMessage::user("colliding foreign chat message"),
+            )
+            .unwrap();
+        let list = SessionsListTool::with_acp_sessions(backend, view);
+
+        let result = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some(current), list.execute(json!({})))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(!result.output.contains(&foreign));
+        assert!(!result.output.contains("colliding foreign chat message"));
     }
 }
