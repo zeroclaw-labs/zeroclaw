@@ -31,19 +31,22 @@ impl ResolvedModelAccess<'_> {
         // Fail closed before spending a provider call when the enclosing turn's
         // cost budget is already exhausted. No-op when unscoped.
         crate::agent::turn::provider_call::enforce_tool_loop_budget()?;
-        // This one-shot seam does NOT run `prepare_messages_for_provider` (the
-        // main iteration path does that upstream), so a tool-result
-        // `[AUDIO:/path]` in the history — e.g. the max-iteration graceful
-        // summary sends the accumulated history verbatim — would otherwise
-        // reach the provider as a raw filesystem path and be hallucinated
-        // over. Strip loadable audio markers here so every direct
-        // `run_model_query` caller is covered. Borrows untouched when clean.
+        // This one-shot seam does not run the full multimodal preparation
+        // (`prepare_messages_for_provider`): callers that want images in the
+        // request normalize before calling, and the max-iteration graceful
+        // summary does. As a fail-closed backstop for every other caller,
+        // loadable audio markers are replaced with a placeholder here, and so
+        // are image markers whose reference is not an inline `data:` URI, so
+        // no filesystem path or URL marker can reach a provider adapter
+        // through this seam. Both helpers borrow the input untouched when
+        // clean.
         let ChatRequest {
             messages,
             tools,
             thinking,
         } = request;
         let sanitized = multimodal::sanitize_audio_markers(messages);
+        let sanitized = multimodal::sanitize_image_markers(&sanitized);
         let request = ChatRequest {
             messages: &sanitized,
             tools,

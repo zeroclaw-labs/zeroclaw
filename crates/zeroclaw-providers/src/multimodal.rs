@@ -592,6 +592,96 @@ pub fn sanitize_audio_markers(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]
     Cow::Owned(rebuilt)
 }
 
+/// Matches image markers, capturing the payload for the inline-reference
+/// check. Built from [`IMAGE_MARKER_PREFIX`] so this seam helper and
+/// [`parse_image_markers`] agree on exactly which markers are image markers;
+/// the match is case-sensitive for the same reason.
+static IMAGE_MARKER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(&format!(
+        r"{}([^\]]*)\]",
+        regex::escape(IMAGE_MARKER_PREFIX)
+    ))
+    .expect("static image-marker regex must compile")
+});
+
+/// Replace image markers whose payload is a loadable reference other than an
+/// inline `data:` URI (a filesystem path or an `http(s)://` URL) with the same
+/// [`MEDIA_PLACEHOLDER`] the degrade path uses, returning the rewritten text
+/// and the number of markers replaced.
+///
+/// A `data:` URI is inline content: it has either already passed the
+/// normalizer's size and MIME checks or will hit the provider adapter's
+/// structural check, so it stays. Non-loadable payloads are prose and stay
+/// verbatim, mirroring how [`parse_image_markers`] preserves them. Runs over
+/// the raw string so a marker embedded in a native tool-result JSON blob is
+/// cleaned in place; see [`MEDIA_PLACEHOLDER`] for why the surrounding object
+/// stays valid.
+fn strip_undeliverable_image_markers(text: &str) -> (String, usize) {
+    let mut stripped = 0usize;
+    let out = IMAGE_MARKER_RE.replace_all(text, |caps: &regex::Captures<'_>| {
+        let payload = collapse_wrapped_marker(&caps[1]);
+        if !payload.is_empty()
+            && is_loadable_image_reference(&payload)
+            && !payload.starts_with("data:")
+        {
+            stripped += 1;
+            MEDIA_PLACEHOLDER.to_string()
+        } else {
+            // Preserve inline data URIs and non-loadable markers verbatim.
+            caps[0].to_string()
+        }
+    });
+    (out.into_owned(), stripped)
+}
+
+/// Strip image markers that cannot be delivered inline (see
+/// [`strip_undeliverable_image_markers`]) across every message, logging one
+/// degradation warning when any are removed. Returns the input borrowed when
+/// no image marker is present (the common, allocation-free path) or an owned
+/// rebuilt vector otherwise.
+///
+/// This is the fail-closed backstop on one-shot dispatch seams that send
+/// stored history without the full multimodal preparation: a filesystem path
+/// or URL image marker can no longer reach a provider adapter, whichever
+/// route the history took. Inline `data:` URIs and non-loadable prose markers
+/// pass through; callers that want the turn's images delivered run the full
+/// normalizer before they reach this point.
+pub fn sanitize_image_markers(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]> {
+    if !messages
+        .iter()
+        .any(|m| IMAGE_MARKER_RE.is_match(&m.content))
+    {
+        return Cow::Borrowed(messages);
+    }
+
+    let mut stripped = 0usize;
+    let rebuilt: Vec<ChatMessage> = messages
+        .iter()
+        .map(|m| {
+            let (content, n) = strip_undeliverable_image_markers(&m.content);
+            stripped += n;
+            ChatMessage {
+                role: m.role.clone(),
+                content,
+            }
+        })
+        .collect();
+
+    if stripped > 0 {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "markers_stripped": stripped,
+                })),
+            "multimodal: stripped image marker(s) with a path or URL reference on a one-shot dispatch seam; no size or content validation runs there, so the reference was replaced with a placeholder instead of being sent to the model as text"
+        );
+    }
+
+    Cow::Owned(rebuilt)
+}
+
 pub fn extract_ollama_image_payload(image_ref: &str) -> Option<String> {
     if image_ref.starts_with("data:") {
         let comma_idx = image_ref.find(',')?;
@@ -1942,6 +2032,96 @@ mod tests {
         );
         assert_eq!(out, format!("{MEDIA_PLACEHOLDER} and {MEDIA_PLACEHOLDER}"));
         assert_eq!(n, 2);
+    }
+
+    // ── seam-level image sanitize: paths/URLs drop, inline data URIs stay ──
+
+    #[test]
+    fn strip_undeliverable_image_markers_replaces_path_and_url() {
+        let (out, n) = strip_undeliverable_image_markers(
+            "see [IMAGE:/tmp/shot.png] and [IMAGE:https://x/y.png]",
+        );
+        assert_eq!(
+            out,
+            format!("see {MEDIA_PLACEHOLDER} and {MEDIA_PLACEHOLDER}")
+        );
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn strip_undeliverable_image_markers_keeps_inline_data_uri() {
+        let (out, n) =
+            strip_undeliverable_image_markers("see [IMAGE:data:image/png;base64,iVBORw0KGgo=]");
+        assert_eq!(out, "see [IMAGE:data:image/png;base64,iVBORw0KGgo=]");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn strip_undeliverable_image_markers_preserves_non_loadable_payloads() {
+        // Prose and placeholder markers are harmless literal text and must
+        // survive, mirroring `parse_image_markers`.
+        for input in ["[IMAGE:...]", "[IMAGE:<screenshot>]", "[IMAGE:shot.png]"] {
+            let (out, n) = strip_undeliverable_image_markers(input);
+            assert_eq!(out, input, "should preserve non-loadable marker: {input}");
+            assert_eq!(
+                n, 0,
+                "non-loadable marker must not count as stripped: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_undeliverable_image_markers_is_case_sensitive_like_parse() {
+        // `parse_image_markers` matches the prefix literally, so a lowercase
+        // kind is prose everywhere downstream; the seam helper must agree or
+        // it would rewrite text the in-loop path leaves alone.
+        let (out, n) = strip_undeliverable_image_markers("[image:/tmp/shot.png]");
+        assert_eq!(out, "[image:/tmp/shot.png]");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn sanitize_image_markers_borrows_clean_input() {
+        let messages = [ChatMessage::user("no markers here")];
+        assert!(matches!(
+            sanitize_image_markers(&messages),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn sanitize_image_markers_borrows_when_only_inline_data_uris_present() {
+        let messages = [ChatMessage::user(
+            "see [IMAGE:data:image/png;base64,iVBORw0KGgo=]",
+        )];
+        let sanitized = sanitize_image_markers(&messages);
+        // Rebuilt (the regex matched) but byte-identical content.
+        assert_eq!(sanitized[0].content, messages[0].content);
+    }
+
+    #[test]
+    fn sanitize_image_markers_rewrites_path_markers_in_place() {
+        let marker = format!("[{}:{}]", "IMAGE", "/tmp/shot.png");
+        let messages = [
+            ChatMessage::user("look"),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "content": format!("saved {marker}"),
+                    "tool_call_id": "toolu_1",
+                })
+                .to_string(),
+            ),
+        ];
+        let sanitized = sanitize_image_markers(&messages);
+        assert_eq!(sanitized[0].content, "look");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&sanitized[1].content).expect("tool JSON stays valid");
+        assert_eq!(
+            parsed["content"],
+            format!("saved {MEDIA_PLACEHOLDER}"),
+            "the marker inside the native tool-result envelope must be replaced"
+        );
+        assert_eq!(parsed["tool_call_id"], "toolu_1");
     }
 
     #[tokio::test]

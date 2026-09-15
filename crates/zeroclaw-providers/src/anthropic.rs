@@ -5,6 +5,7 @@ use crate::traits::{
 };
 use anyhow::Context;
 use async_trait::async_trait;
+#[cfg(test)]
 use base64::Engine as _;
 use futures_util::stream::{self, StreamExt};
 use reqwest::Client;
@@ -1420,31 +1421,15 @@ impl AnthropicModelProvider {
                                     continue;
                                 }
                             }
-                        } else if std::path::Path::new(img_ref.trim()).exists() {
-                            // Local file path
-                            match std::fs::read(img_ref.trim()) {
-                                Ok(bytes) => {
-                                    let b64 =
-                                        base64::engine::general_purpose::STANDARD.encode(&bytes);
-                                    let ext = std::path::Path::new(img_ref.trim())
-                                        .extension()
-                                        .and_then(|e| e.to_str())
-                                        .unwrap_or("jpg");
-                                    let mime = match ext {
-                                        "png" => "image/png",
-                                        "gif" => "image/gif",
-                                        "webp" => "image/webp",
-                                        _ => "image/jpeg",
-                                    }
-                                    .to_string();
-                                    (mime, b64)
-                                }
-                                Err(_) => {
-                                    omitted += 1;
-                                    continue;
-                                }
-                            }
                         } else {
+                            // Counted exactly like the tool-result arm. The
+                            // multimodal normalizer is the only component that
+                            // may turn a file reference into inline image
+                            // content, and it has already run by the time a
+                            // message reaches this adapter; reading the path
+                            // here (extension-inferred MIME, no size or
+                            // content validation) would reopen the hole the
+                            // normalizer exists to close.
                             omitted += 1;
                             continue;
                         };
@@ -7861,6 +7846,50 @@ data: {\"type\":\"message_stop\"}\n\n";
             .flat_map(|m| &m.content)
             .any(|block| matches!(block, NativeContentOut::Image { .. }));
         assert!(has_image, "user-message images must still be delivered");
+    }
+
+    /// A user-message image marker pointing at a real file on disk must not
+    /// be read: the reference is counted as omitted exactly like the
+    /// tool-result arm, no `Image` block is built, and the omission note says
+    /// so. The file carries a genuine PNG signature, so under the old
+    /// raw-path branch this exact input was read from disk and forwarded with
+    /// an extension-inferred MIME type and no size or content validation; the
+    /// note's count of one is the proof no read happened.
+    #[test]
+    fn user_message_path_image_marker_is_omitted_not_read() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let image_path = temp.path().join("photo.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .expect("write png");
+
+        let messages = vec![ChatMessage::user(format!(
+            "what is this [IMAGE:{}]",
+            image_path.display()
+        ))];
+
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let blocks = last_user_blocks(&native_msgs);
+
+        assert!(
+            !blocks.iter().any(|block| block["type"] == "image"),
+            "a filesystem path must not become an image block: {blocks:?}"
+        );
+        let text = blocks
+            .iter()
+            .find(|block| block["type"] == "text")
+            .and_then(|block| block["text"].as_str())
+            .unwrap_or_else(|| panic!("expected a text block: {blocks:?}"));
+        assert!(
+            text.contains(OMISSION_NOTE_ONE),
+            "the dropped path must be surfaced as an omission note: {text}"
+        );
+        assert!(
+            !text.contains(&image_path.display().to_string()),
+            "the raw path must not reach the wire as text either: {text}"
+        );
     }
 
     /// The wire-shape pin for the two-shape content: an image-free tool result
