@@ -114,6 +114,23 @@ default and never calls the plugin's export. This is how the WIT contract
 stays additive: a new optional method is a new flag plus a new function, never
 a break.
 
+### Checking that a plugin still loads here
+
+`wit/v0` is experimental, so a plugin built against a vendored copy that has
+drifted from this host compiles cleanly and then fails to instantiate.
+`zeroclaw plugin install` refuses such a plugin, but that gate cannot help one
+installed before the gate existed, installed with `--no-verify`, or left in
+place across a host upgrade. `zeroclaw plugin info <name>` always runs the same
+instantiation check the daemon runs at startup and prints the verdict, the full
+wasmtime cause chain, and the rebuild hint; it exits non-zero when the plugin
+does not load, so a script can branch on it. `zeroclaw plugin list --verify`
+runs the check for every installed package and annotates each row with the
+verdict, or with the first line of the cause when it fails. Plain
+`zeroclaw plugin list` is unchanged and still costs only a directory read,
+because verifying compiles and instantiates every component. A skill bundle
+ships no component, so it is reported as not applicable rather than as a
+failure.
+
 ## Execution model
 
 The host (`crates/zeroclaw-plugins/src/component.rs`) owns one async
