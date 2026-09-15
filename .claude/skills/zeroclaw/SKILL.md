@@ -21,7 +21,7 @@ Default to a middle ground — brief explanation of what you're about to do, the
 
 ## Discovery — Before You Act
 
-Before running any ZeroClaw operation, make sure you know where things are:
+Before running any ZeroClaw operation, make sure you know where things are. When inspecting configuration, read only the fields needed for the operation and keep credential values out of tool output.
 
 1. **Find the binary.** Search in this order:
    - `which zeroclaw` (PATH)
@@ -55,7 +55,7 @@ If the user hasn't set up ZeroClaw yet (no `~/.zeroclaw/config.toml` exists), gu
 ```bash
 zeroclaw quickstart                                              # Interactive — picks a provider + agent
 zeroclaw quickstart --model-provider ollama --model qwen2.5:7b   # Non-interactive
-zeroclaw config set channels.<name>.<field>=<value>              # Configure a channel after quickstart
+zeroclaw config set channels.<name>.<field> <value>             # Configure a channel after quickstart
 ```
 
 After quickstart, verify everything works:
@@ -64,7 +64,7 @@ zeroclaw status
 zeroclaw doctor
 ```
 
-If they already have a config but a channel is broken, edit just that channel's fields with `zeroclaw config set channels.<name>.<field>=<value>` rather than re-running quickstart (quickstart leaves an existing config alone).
+If they already have a config but a channel is broken, edit just that channel's fields with `zeroclaw config set channels.<name>.<field> <value>` rather than re-running quickstart (quickstart leaves an existing config alone).
 
 ## Building from Source
 
@@ -157,7 +157,7 @@ To see what's available: `GET /api/tools` (REST) lists all registered tools with
 
 ### Configuration
 
-Edit `~/.zeroclaw/config.toml` directly, use `zeroclaw config set <key>=<value>` for one field at a time, or delete `~/.zeroclaw/` and re-run `zeroclaw quickstart` for a fresh setup.
+Use `zeroclaw config set <path> <value>` to update configuration fields. For secret fields, omit the value and use the masked input prompt. Change only the affected fields, preserving unrelated settings and stored data.
 
 **REST:**
 - `GET /api/config`: compatibility whole-config read (secrets masked as `***MASKED***`)
@@ -204,7 +204,7 @@ Confirm with the user before running any estop command — these are disruptive.
 
 ### Channels
 
-Channel availability depends on the installed build's feature set. Use `zeroclaw channels list` to inspect configured channels and `zeroclaw channels doctor` to check their health. Consult the current channel guide and generated config reference before editing `~/.zeroclaw/config.toml`; do not infer config keys from a fixed channel inventory.
+Channel availability depends on the installed build's feature set. Use `zeroclaw channels list` to inspect configured channels and `zeroclaw channel doctor` to check their health. Consult the current channel guide and generated config reference before configuring a channel; do not infer config keys from a fixed channel inventory.
 
 ### Pairing (Authentication Setup)
 
@@ -224,10 +224,10 @@ Here are multi-step sequences you're likely to need:
 3. If gateway needed: `curl -sf http://127.0.0.1:42617/health`
 
 **"Set up a new channel"**
-1. Read the current config: `cat ~/.zeroclaw/config.toml`
-2. Add the channel config (edit the TOML)
+1. Inspect the relevant channel's configuration fields without printing credentials.
+2. Configure the channel with `zeroclaw config set channels.<name>.<field> <value>`; omit secret values to use the masked input prompt.
 3. Restart: `zeroclaw service restart` (or restart daemon manually)
-4. Verify: `zeroclaw channels doctor`
+4. Verify: `zeroclaw channel doctor`
 
 **"Switch to a different model"**
 1. Check available: `zeroclaw models list`
@@ -266,10 +266,10 @@ Only load these when you need precise details beyond what's in this file — for
 
 **"Too many requests" (429)** — You're hitting ZeroClaw's rate limit. Back off — the response includes `retry_after` with the number of seconds to wait.
 
-**Agent not using tools / acting limited** — Check autonomy settings in config.toml under `[autonomy]`. `level = "read_only"` disables most tools. Try `level = "supervised"` or `level = "full"`.
+**Agent not using tools / acting limited**: Inspect the affected agent's effective tool policy and the failing operation. Check whether a denied permission explains the failure and whether the restriction is intentional. If broader access is needed, explain and confirm the smallest policy change; do not use full autonomy as a generic fix.
 
 **Memory not persisting** — Check `[memory]` config. If `backend = "none"`, nothing is stored. Switch to `"sqlite"` or `"markdown"`. Also verify `auto_save = true`.
 
-**Channel not responding** — Run `zeroclaw channels doctor` for the specific channel. Common issues: expired bot token, wrong allowed_users list, channel not enabled in `[channels]`.
+**Channel not responding**: Run `zeroclaw channel doctor` and inspect the affected channel's result. Common issues: expired bot token, wrong allowed_users list, channel not enabled in `[channels]`.
 
 Report errors to the user with context appropriate to their expertise level. For beginners, explain what went wrong and suggest the fix. For experts, just show the error and the fix.
