@@ -901,6 +901,12 @@ pub struct SopRunDetail {
     pub trigger_topic: Option<String>,
     /// True while the run is live rather than a retained terminal record.
     pub active: bool,
+    /// Why the run failed, scrubbed. This is the run-level cause the engine
+    /// retains, not a step's output: a run can fail before any step result
+    /// exists — an input-schema rejection finishes the run straight from
+    /// validation — and then this is the only explanation the response carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
     pub steps: Vec<SopStepDetail>,
 }
 
@@ -949,6 +955,7 @@ impl SopRunDetail {
             trigger_source: run.trigger_event.source.to_string(),
             trigger_topic: run.trigger_event.topic.as_deref().map(scrub_credentials),
             active,
+            failure_reason: run.failure_reason.as_deref().map(scrub_credentials),
             steps: run
                 .step_results
                 .iter()

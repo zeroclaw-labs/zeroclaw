@@ -5111,14 +5111,15 @@ impl RpcDispatcher {
     /// output, and captured tool calls. `sops/runs` intentionally returns
     /// summaries; this is the drill-down a UI uses for a selected run.
     fn handle_sops_run_detail(&self, params: &Value) -> RpcResult {
-        // Local transports only. This dispatcher serves both owner-scoped local
-        // IPC and remote WSS, and a fresh WSS caller can complete `initialize`
-        // without presenting a client credential and still be marked
-        // authenticated — so on that transport this method would hand step
-        // output, tool arguments and errors to anyone who can reach the socket.
-        // The accepted remote-authentication RFC has no implementation on this
-        // branch, so run detail stays off WSS rather than widening a hole it
-        // does not own. Lift this once that boundary lands.
+        // Local transports only. WSS now requires a client certificate, so the
+        // question is no longer whether the caller authenticated — it is what
+        // that authentication entitles them to read. A certificate proves the
+        // peer, not that the peer may see one particular run's step output,
+        // tool arguments and errors, and this dispatcher has no per-run
+        // authorization to consult. Local IPC is owner-scoped by the socket
+        // itself, which is the entitlement this method relies on. Lift the
+        // refusal once there is a principal to authorize run contents against,
+        // and replace it with that check rather than simply removing it.
         if self.peer_label.starts_with("wss:") {
             return Err(rpc_err(
                 AUTH_REQUIRED,
@@ -6050,6 +6051,184 @@ mod tests {
     /// the raw trigger payload, framing marker, revision bookkeeping, and
     /// structured tool output are excluded outright; and exactly the
     /// documented fields cross the wire.
+    /// A run can fail before any step result exists: an input-schema rejection
+    /// finishes the run straight from validation. Without the run-level reason
+    /// the response is `status: failed`, `steps: []`, and no explanation at all
+    /// — which defeats the point of a detail method for a supported failure path.
+    #[tokio::test]
+    async fn run_detail_explains_a_run_that_failed_before_any_step() {
+        use std::sync::{Arc, Mutex};
+
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        use crate::sop::types::{
+            Sop, SopAdmissionPolicy, SopEvent, SopExecutionMode, SopPriority, SopStep, SopStepKind,
+            SopTriggerSource, StepSchema,
+        };
+
+        let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
+        engine.set_sops_for_test(vec![Sop {
+            name: "schema-gate".into(),
+            description: "fails before the first step runs".into(),
+            version: "0.1.0".into(),
+            execution_mode: SopExecutionMode::Auto,
+            priority: SopPriority::Normal,
+            triggers: vec![],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Step one".into(),
+                body: "Do step one".into(),
+                kind: SopStepKind::default(),
+                schema: Some(StepSchema {
+                    input: Some(serde_json::json!({
+                        "type": "object",
+                        "properties": {"ok": {"type": "string"}},
+                        "required": ["ok"]
+                    })),
+                    output: None,
+                }),
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        }]);
+        let action = engine
+            .start_run(
+                "schema-gate",
+                SopEvent {
+                    source: SopTriggerSource::Manual,
+                    topic: None,
+                    payload: Some("{}".into()),
+                    timestamp: "2026-01-01T00:00:00Z".into(),
+                },
+            )
+            .expect("the start itself succeeds; the run then fails validation");
+        let run_id = match &action {
+            crate::sop::SopRunAction::Failed { run_id, .. } => run_id.clone(),
+            other => panic!("input-schema rejection must fail the run, got {other:?}"),
+        };
+
+        let engine = Arc::new(Mutex::new(engine));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            16,
+            Arc::new(SessionActorQueue::new(4, 10, 60)),
+        ));
+        let ctx = RpcContext::minimal_with_sop_engine(
+            zeroclaw_config::schema::Config::default(),
+            sessions,
+            Arc::clone(&engine),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-rpc:pid=1".to_string());
+
+        let value = dispatcher
+            .handle_sops_run_detail(&serde_json::json!({ "run_id": run_id }))
+            .expect("the retained failed run resolves");
+        let run = value.get("run").and_then(|v| v.as_object()).expect("run");
+
+        assert_eq!(run.get("status").and_then(|v| v.as_str()), Some("failed"));
+        assert_eq!(
+            run.get("steps").and_then(|v| v.as_array()).map(Vec::len),
+            Some(0),
+            "this failure path records no step result, which is the premise"
+        );
+        let reason = run
+            .get("failure_reason")
+            .and_then(|v| v.as_str())
+            .expect("a failed run with no steps must still explain itself");
+        assert!(
+            reason.contains("input schema validation failed"),
+            "the response must carry the retained run-level cause, got {reason:?}"
+        );
+    }
+
+    /// The new field follows the same redaction policy as the rest of the
+    /// projection. Seeded through the store and restored, because that is what a
+    /// retained failed run actually is after a restart — and because the schema
+    /// validator never echoes instance values, so that path cannot produce a
+    /// credential-shaped reason on its own.
+    #[tokio::test]
+    async fn run_detail_scrubs_the_retained_failure_reason() {
+        use std::sync::{Arc, Mutex};
+
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        use crate::sop::store::{InMemoryRunStore, PersistedRun, SopRunStore};
+        use crate::sop::types::{SopEvent, SopRun, SopRunStatus, SopTriggerSource};
+
+        let store = Arc::new(InMemoryRunStore::new());
+        let run_id = "run-retained-failure-0001";
+        let run = SopRun {
+            run_id: run_id.to_string(),
+            sop_name: "retained".into(),
+            trigger_event: SopEvent {
+                source: SopTriggerSource::Manual,
+                topic: None,
+                payload: None,
+                timestamp: "2026-01-01T00:00:00Z".into(),
+            },
+            frame_marker_id: String::new(),
+            status: SopRunStatus::Failed,
+            current_step: 1,
+            total_steps: 1,
+            started_at: "2026-01-01T00:00:00Z".into(),
+            completed_at: Some("2026-01-01T00:00:01Z".into()),
+            failure_reason: Some("upstream rejected the call: token=REASONSECRET4242".into()),
+            step_results: Vec::new(),
+            waiting_since: None,
+            llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
+        };
+        let pr = PersistedRun::new(
+            run.clone(),
+            "2026-01-01T00:00:01Z".into(),
+            run.trigger_event.source,
+        );
+        store
+            .finish_run(run_id, &pr)
+            .expect("seed the terminal run");
+
+        let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default())
+            .with_store(store.clone());
+        engine.restore_runs();
+
+        let engine = Arc::new(Mutex::new(engine));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            16,
+            Arc::new(SessionActorQueue::new(4, 10, 60)),
+        ));
+        let ctx = RpcContext::minimal_with_sop_engine(
+            zeroclaw_config::schema::Config::default(),
+            sessions,
+            Arc::clone(&engine),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-rpc:pid=1".to_string());
+
+        let value = dispatcher
+            .handle_sops_run_detail(&serde_json::json!({ "run_id": run_id }))
+            .expect("the restored failed run resolves");
+        let wire = serde_json::to_string(&value).expect("serializable");
+        assert!(
+            !wire.contains("REASONSECRET4242"),
+            "the failure reason must be scrubbed like every other free-text field: {wire}"
+        );
+        let reason = value
+            .pointer("/run/failure_reason")
+            .and_then(|v| v.as_str())
+            .expect("the reason is still present, just redacted");
+        assert!(
+            reason.contains("[REDACTED]"),
+            "the redaction marker must survive so the cause is still legible, got {reason:?}"
+        );
+    }
+
     #[tokio::test]
     async fn sops_run_detail_serializes_a_scrubbed_projection_of_a_terminal_run() {
         use std::collections::BTreeSet;
