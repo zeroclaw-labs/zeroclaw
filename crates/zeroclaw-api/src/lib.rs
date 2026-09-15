@@ -8,6 +8,7 @@ pub mod grants;
 pub mod hook;
 pub mod ingress;
 pub mod jsonrpc;
+pub mod lifecycle;
 pub mod media;
 pub mod memory_traits;
 pub mod model_provider;

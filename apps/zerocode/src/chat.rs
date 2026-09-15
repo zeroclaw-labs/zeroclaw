@@ -682,6 +682,20 @@ impl Chat {
 
     /// One summary per tracked session, in stable creation order, for the
     /// agent sidebar. Cheap: derives from live state, owns nothing.
+    /// Terminal status candidates for every live session this pane tracks,
+    /// focused or not, paired with the owning agent alias. Background sessions
+    /// keep draining transport events each tick, so their state is current.
+    pub(crate) fn terminal_statuses(&self) -> Vec<(TurnStatus, String)> {
+        let mut out = Vec::with_capacity(self.background.len() + 1);
+        if let ChatPhase::Active(state) = &self.phase {
+            out.push((state.terminal_status(), state.agent_alias.clone()));
+        }
+        for state in &self.background {
+            out.push((state.terminal_status(), state.agent_alias.clone()));
+        }
+        out
+    }
+
     pub(crate) fn session_summaries(&self) -> Vec<SidebarSessionSummary> {
         let active = match &self.phase {
             ChatPhase::Active(state) => Some(state.as_ref()),
@@ -9311,6 +9325,23 @@ impl ChatState {
     /// running (the turn is still winding down); a pending elicitation
     /// counts only when it targets this session (defense against a stale
     /// modal surviving a session switch).
+    /// Terminal-facing turn status. An operator wait outranks whatever the
+    /// turn was doing, so the terminal reads as blocked while a prompt is up
+    /// and returns to the turn's own state once it is answered.
+    pub(crate) fn terminal_status(&self) -> TurnStatus {
+        if self
+            .pending_elicitation
+            .as_ref()
+            .is_some_and(|e| e.session_id == self.session_id)
+        {
+            TurnStatus::WaitingForInput
+        } else if self.pending_approval.is_some() {
+            TurnStatus::WaitingForApproval
+        } else {
+            self.turn_status.clone()
+        }
+    }
+
     pub(crate) fn sidebar_status(&self) -> SidebarStatus {
         if self.last_error.is_some() {
             SidebarStatus::Errored
@@ -10148,6 +10179,10 @@ pub async fn open_editor_for_content(content: &str) -> String {
         .await;
 
     crossterm::terminal::enable_raw_mode().ok();
+    // The editor owned the terminal and may have set its own title, so the
+    // cached view of it is no longer true. Without this the next sync dedupes
+    // against a value the terminal no longer shows and never corrects it.
+    crate::osc_status::invalidate();
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::terminal::EnterAlternateScreen,
