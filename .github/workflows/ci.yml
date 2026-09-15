@@ -25,8 +25,8 @@ env:
   CARGO_INCREMENTAL: 0
 
 # ── Runner selection: single control point in `fmt` (compile-heavy jobs) ────
-# The eleven Rust-compiling jobs below (lint, build, check, check-plugin-backends,
-# check-32bit, bench, test, memory-postgres-test, msrv, parallel-runtime-test,
+# The Rust-compiling jobs below (lint, build, check, check-plugin-backends,
+# check-32bit, bench, test, test-channel-features, memory-postgres-test, msrv, parallel-runtime-test,
 # installer-drift) and the Linux `build` matrix entry read their runner label and
 # cache provider from the `fmt` job's outputs. They all already declare
 # `needs: [fmt]`, so this adds no queue hop. Both values are checked-in constants
@@ -514,10 +514,16 @@ jobs:
         include:
           - name: plugins cranelift backend
             features: plugins-wasm-cranelift
+            suite: components
+          - name: plugins cranelift runtime
+            features: plugins-wasm-cranelift
+            suite: runtime
           - name: plugins pulley backend
             features: plugins-wasm-pulley
+            suite: check
           - name: plugins runtime-only backend
             features: plugins-wasmtime
+            suite: check
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -542,19 +548,21 @@ jobs:
         if: steps.changed.outputs.run == 'true'
         with:
           use-blacksmith: ${{ needs.fmt.outputs.use_blacksmith }}
+          # Keep the new runtime build separate from the existing backend caches.
+          shared-key: ${{ matrix.suite == 'runtime' && 'plugins-cranelift-runtime' || '' }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Check
-        if: steps.changed.outputs.run == 'true'
+        if: steps.changed.outputs.run == 'true' && matrix.suite != 'runtime'
         run: cargo check --locked -p zeroclaw-plugins --no-default-features --features ${{ matrix.features }}
       - name: Run plugin component tests
-        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'components'
         run: cargo test --locked -p zeroclaw-plugins --features plugins-wasm-cranelift --test channel_plugin_e2e --test egress_plugin_e2e --test tool_plugin_timeout_e2e --test reference_plugin --test reference_plugin_e2e --test tool_plugin_e2e
       - name: Run plugins lib unit tests
-        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'components'
         run: cargo test --locked -p zeroclaw-plugins --no-default-features --features plugins-wasm-cranelift --lib
       - name: Run runtime live-config plugin regressions
-        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'runtime'
         # Module filter, not a single test name: agent::plugin_live_config holds
         # every production-constructor live-config regression (direct Agent and
         # independently delegated registries today), and a filter pinned to one
@@ -567,13 +575,13 @@ jobs:
       # pre-construction collision refusal. Filters are passed after `--` because
       # `cargo test` accepts only one positional TESTNAME; the harness ORs them.
       - name: Run runtime plugin admission regressions
-        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'runtime'
         run: 'cargo test --locked -p zeroclaw-runtime --features plugins-wasm-cranelift --lib -- plugin_runtime:: tools::tests::shared_ceiling tools::tests::repeated_loader tools::tests::auto_discover tools::tests::colliding_plugin'
       # Cross-crate activation proof. This lives in the root `zeroclaw` package
       # rather than the line above because it drives `zeroclaw-runtime`, which
       # `zeroclaw-plugins` cannot depend on without inverting the crate graph.
       - name: Run channel plugin activation e2e
-        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'runtime'
         run: cargo test --locked --features plugins-wasm-cranelift --test plugin_channel_runtime_e2e
 
   msrv:
@@ -742,41 +750,46 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
-      # `channel-wechat` is outside `default-channels` and `channels-full`, so
-      # the workspace run above compiles neither the module nor its unit tests.
-      # Adding it to `ci-all` gives Lint and Check compile coverage; this step
-      # is what actually executes the tests.
-      - name: Run WeChat channel lib unit tests
-        run: "cargo nextest run --locked -p zeroclaw-channels --features channel-wechat --lib wechat::"
-        env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
-      # `channel-lark` is outside `default-channels`, so the workspace run above
-      # does not execute Lark's feature-gated library regressions. This step
-      # exercises the URL-verification handler coverage added by PR #9110.
-      - name: Run Lark channel URL-verification tests
-        run: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-lark --lib lark_url_verification"
-        env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
-      # `channel-matrix` is outside `default-channels`, so the workspace run
-      # above does not execute Matrix's feature-gated library regressions. This
-      # step is what actually executes them.
-      - name: Run Matrix channel lib unit tests
-        run: "cargo nextest run --locked -p zeroclaw-channels --features channel-matrix --lib matrix::"
-        env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
-      # `channel-qq` is outside `default-channels`, so the workspace run above
-      # executes neither QQ's feature-gated channel tests nor the disposition
-      # guards over its one-off and announcement arms (the guards skip any
-      # channel the build did not compile, so QQ reads as absent there). This
-      # step runs the health probe's tests and both arms against a build that
-      # has `channel-qq`. The filter names only those tests: the rest of the
-      # `qq::` module reaches the real auth endpoint and spends the four-attempt
-      # backoff, which would put the network in the job.
-      - name: Run QQ channel lib unit tests
-        run: "cargo nextest run --locked -p zeroclaw-channels --features channel-qq --lib qq::tests::health_check one_off_send_resolves_dotted_qq_alias deliver_announcement_routes_qq_to_qq_arm deliver_announcement_rejects_disabled_qq_alias compiled_channel_keys_have_intentional_announcement_delivery_registration compiled_channel_keys_have_intentional_one_shot_builder_support"
+
+  # Feature configurations keep their original defaults and test filters.
+  # In particular, Lark runs without defaults and QQ excludes live-auth tests.
+  test-channel-features:
+    name: Test (channel ${{ matrix.name }})
+    needs: [fmt]
+    runs-on: ${{ needs.fmt.outputs.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: WeChat
+            command: "cargo nextest run --locked -p zeroclaw-channels --features channel-wechat --lib wechat::"
+          - name: Lark
+            command: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-lark --lib lark_url_verification"
+          - name: Matrix
+            command: "cargo nextest run --locked -p zeroclaw-channels --features channel-matrix --lib matrix::"
+          - name: QQ
+            command: "cargo nextest run --locked -p zeroclaw-channels --features channel-qq --lib qq::tests::health_check one_off_send_resolves_dotted_qq_alias deliver_announcement_routes_qq_to_qq_arm deliver_announcement_rejects_disabled_qq_alias compiled_channel_keys_have_intentional_announcement_delivery_registration compiled_channel_keys_have_intentional_one_shot_builder_support"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+      - uses: ./.github/actions/rust-cache
+        with:
+          use-blacksmith: ${{ needs.fmt.outputs.use_blacksmith }}
+          shared-key: channel-feature-${{ matrix.name }}
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Ensure web/dist placeholder exists
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - name: Install test system dependencies
+        run: bash scripts/ci/apt_install.sh mold expect python3
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
+      - name: Run channel feature tests
+        run: ${{ matrix.command }}
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
@@ -1530,7 +1543,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, msrv, check-32bit, bench, test, memory-postgres-test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
+    needs: [fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, msrv, check-32bit, bench, test, test-channel-features, memory-postgres-test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
     runs-on: ubuntu-latest
     steps:
       - name: Check results
