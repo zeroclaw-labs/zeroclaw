@@ -572,19 +572,137 @@ fn random_telegram_ack_reaction() -> &'static str {
     TELEGRAM_ACK_REACTIONS[pick_uniform_index(TELEGRAM_ACK_REACTIONS.len())]
 }
 
-fn build_telegram_ack_reaction_request(
-    chat_id: &str,
+/// The bot's last-applied reaction for one message and whether the
+/// `reaction` tool set it (explicit) versus an automatic acknowledgement.
+#[derive(Clone, Debug)]
+struct ReactionSlot {
+    emoji: String,
+    explicit: bool,
+}
+
+enum ReactionWrite {
+    Clear,
+    Set(String),
+}
+
+/// Shared `setMessageReaction` writer. Holds the reaction-state lock across
+/// the request so concurrent ack and tool writes serialize and the tracked
+/// slot stays consistent with what Telegram last received.
+///
+/// Telegram has no emoji-scoped removal: the `reaction` list we send replaces
+/// the bot's whole reaction, and bots hold a single slot. Removal therefore
+/// only fires when the tracked slot matches the emoji being removed, so a
+/// mismatched or automatic removal cannot clear a different reaction.
+/// Automatic acknowledgement writes skip entirely when the slot holds an
+/// explicit (tool) reaction, so the end-of-turn ack swap cannot erase a
+/// user-requested reaction.
+async fn send_reaction_request(
+    state: &tokio::sync::Mutex<std::collections::HashMap<(String, i64), ReactionSlot>>,
+    client: reqwest::Client,
+    url: String,
+    chat_id: String,
+    thread_id: Option<String>,
     message_id: i64,
     emoji: &str,
-) -> serde_json::Value {
-    serde_json::json!({
+    explicit: bool,
+    remove: bool,
+) -> anyhow::Result<()> {
+    let mut tracked = state.lock().await;
+    let key = (chat_id.clone(), message_id);
+
+    let write = if remove {
+        match tracked.get(&key) {
+            Some(slot) if slot.emoji == emoji => Some(ReactionWrite::Clear),
+            // Removing an emoji the bot is not currently showing (or never
+            // tracked) would clear a different reaction; skip instead.
+            _ => None,
+        }
+    } else if !explicit && tracked.get(&key).is_some_and(|slot| slot.explicit) {
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "chat_id": chat_id,
+                    "message_id": message_id
+                })),
+            "skipping acknowledgement reaction; message holds an explicit reaction"
+        );
+        None
+    } else {
+        Some(ReactionWrite::Set(emoji.to_string()))
+    };
+
+    let Some(write) = write else {
+        return Ok(());
+    };
+
+    let reaction_list = match &write {
+        ReactionWrite::Clear => Vec::new(),
+        ReactionWrite::Set(emoji) => {
+            vec![::serde_json::json!({"type": "emoji", "emoji": emoji})]
+        }
+    };
+    let mut body = ::serde_json::json!({
         "chat_id": chat_id,
         "message_id": message_id,
-        "reaction": [{
-            "type": "emoji",
-            "emoji": emoji
-        }]
-    })
+        "reaction": reaction_list,
+    });
+    if let Some(thread_id) = thread_id {
+        body["message_thread_id"] = ::serde_json::Value::String(thread_id);
+    }
+
+    let response = match client.post(&url).json(&body).send().await {
+        Ok(resp) => resp,
+        Err(err) => {
+            // reqwest embeds the request URL, which carries the bot token,
+            // in transport errors. Strip it and scrub before the text can
+            // reach logs or tool-result history.
+            let safe = zeroclaw_runtime::security::scrub(&err.without_url().to_string());
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "chat_id": chat_id,
+                        "message_id": message_id,
+                        "err": safe
+                    })),
+                "setMessageReaction request failed"
+            );
+            return Err(anyhow::Error::msg(format!(
+                "Telegram API request failed: {safe}"
+            )));
+        }
+    };
+    if !response.status().is_success() {
+        let status = response.status();
+        let err_body =
+            zeroclaw_runtime::security::scrub(&response.text().await.unwrap_or_default());
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "status": status.to_string(),
+                    "body": err_body
+                })),
+            "setMessageReaction failed"
+        );
+        anyhow::bail!("Telegram API error {status}: {err_body}");
+    }
+
+    match write {
+        ReactionWrite::Clear => {
+            tracked.remove(&key);
+        }
+        ReactionWrite::Set(emoji) => {
+            tracked.insert(key, ReactionSlot { emoji, explicit });
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -869,6 +987,12 @@ pub struct TelegramChannel {
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
     ack_reactions: bool,
+    /// Tracks the bot's last-applied reaction per message. Telegram bots hold
+    /// one reaction slot per message and `setMessageReaction` replaces the
+    /// whole list, so every reaction write funnels through one lock-guarded
+    /// state. The `explicit` flag marks agent-driven (tool) reactions, which
+    /// automatic acknowledgement cleanup must never overwrite.
+    reactions: Arc<tokio::sync::Mutex<std::collections::HashMap<(String, i64), ReactionSlot>>>,
     tts_manager: Option<Arc<super::tts::TtsManager>>,
     voice_chats: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Resolves voice peers from canonical config at call-time.
@@ -2475,6 +2599,7 @@ impl TelegramChannel {
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
             ack_reactions: true,
+            reactions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             tts_manager: None,
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             voice_peer_resolver: Arc::new(Vec::new) as Arc<dyn Fn() -> Vec<String> + Send + Sync>,
@@ -2989,25 +3114,18 @@ impl TelegramChannel {
     }
 
     fn try_add_ack_reaction_nonblocking(&self, chat_id: String, message_id: i64) {
+        let state = Arc::clone(&self.reactions);
         let client = self.http_client();
         let url = self.api_url("setMessageReaction");
         let emoji = random_telegram_ack_reaction().to_string();
-        let body = build_telegram_ack_reaction_request(&chat_id, message_id, &emoji);
 
         zeroclaw_spawn::spawn!(async move {
-            let response = match client.post(&url).json(&body).send().await {
-                Ok(resp) => resp,
-                Err(err) => {
-                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"chat_id": chat_id, "message_id": message_id, "err": err.to_string()})), "failed to add ACK reaction to chat_id=, message_id=");
-                    return;
-                }
-            };
-
-            if !response.status().is_success() {
-                let status = response.status();
-                let err_body = response.text().await.unwrap_or_default();
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"chat_id": chat_id, "message_id": message_id, "status": status.to_string(), "err_body": err_body})), "add ACK reaction failed for chat_id=, message_id=: status=, body=");
-            }
+            // Automatic acknowledgement write; send_reaction_request skips it
+            // and logs when the message holds an explicit (tool) reaction.
+            let _ = send_reaction_request(
+                &state, client, url, chat_id, None, message_id, &emoji, false, false,
+            )
+            .await;
         });
     }
 
@@ -3016,6 +3134,44 @@ impl TelegramChannel {
             "channel.telegram",
             self.proxy_url.as_deref(),
         )
+    }
+
+    /// Parse a message id for reaction calls. Accepts either the bare numeric
+    /// Telegram message id or the ZeroClaw-scoped form surfaced to agents,
+    /// e.g. `"telegram_8943231406_893"`.
+    fn parse_reaction_message_id(message_id: &str) -> anyhow::Result<i64> {
+        let raw = message_id.rsplit('_').next().unwrap_or(message_id).trim();
+        raw.parse::<i64>()
+            .map_err(|_| anyhow::Error::msg(format!("invalid Telegram message_id '{message_id}'")))
+    }
+
+    /// Apply one reaction write. `explicit` marks agent-driven (tool) writes,
+    /// `remove` drops the current reaction. See `send_reaction_request` for
+    /// the state and skip semantics.
+    async fn apply_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+        explicit: bool,
+        remove: bool,
+    ) -> anyhow::Result<()> {
+        let message_id = Self::parse_reaction_message_id(message_id)?;
+        let (chat_id, thread_id) = Self::parse_reply_target(channel_id);
+        let client = self.http_client();
+        let url = self.api_url("setMessageReaction");
+        send_reaction_request(
+            &self.reactions,
+            client,
+            url,
+            chat_id,
+            thread_id,
+            message_id,
+            emoji,
+            explicit,
+            remove,
+        )
+        .await
     }
 
     fn normalize_identity(value: &str) -> String {
@@ -6649,6 +6805,37 @@ impl Channel for TelegramChannel {
         })
     }
 
+    async fn add_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        self.apply_reaction(channel_id, message_id, emoji, false, false)
+            .await
+    }
+
+    async fn remove_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        self.apply_reaction(channel_id, message_id, emoji, false, true)
+            .await
+    }
+
+    async fn set_explicit_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+        add: bool,
+    ) -> anyhow::Result<()> {
+        self.apply_reaction(channel_id, message_id, emoji, true, !add)
+            .await
+    }
+
     fn supports_draft_updates(&self) -> bool {
         self.stream_mode != StreamMode::Off
     }
@@ -7783,6 +7970,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_reaction_message_id_accepts_scoped_and_bare_forms() {
+        assert_eq!(
+            TelegramChannel::parse_reaction_message_id("telegram_8943231406_893").unwrap(),
+            893
+        );
+        assert_eq!(
+            TelegramChannel::parse_reaction_message_id("893").unwrap(),
+            893
+        );
+        assert_eq!(
+            TelegramChannel::parse_reaction_message_id(" 893 ").unwrap(),
+            893
+        );
+        assert!(TelegramChannel::parse_reaction_message_id("not-a-number").is_err());
+    }
+
+    #[test]
     fn scrub_masks_poll_error_url() {
         let raw = "error sending request for url (https://api.telegram.org/bot123456:ABC-def_GHI/getUpdates)";
         let redacted = zeroclaw_runtime::security::scrub(raw);
@@ -8015,15 +8219,6 @@ mod tests {
             let emoji = random_telegram_ack_reaction();
             assert!(TELEGRAM_ACK_REACTIONS.contains(&emoji));
         }
-    }
-
-    #[test]
-    fn telegram_ack_reaction_request_shape() {
-        let body = build_telegram_ack_reaction_request("-100200300", 42, "⚡️");
-        assert_eq!(body["chat_id"], "-100200300");
-        assert_eq!(body["message_id"], 42);
-        assert_eq!(body["reaction"][0]["type"], "emoji");
-        assert_eq!(body["reaction"][0]["emoji"], "⚡️");
     }
 
     #[test]
@@ -19940,5 +20135,163 @@ mod tests {
     fn non_approval_callback_data_is_ignored() {
         let cb_data = "some_other_action:data";
         assert!(cb_data.strip_prefix("approval:").is_none());
+    }
+
+    // --- reaction tool integration tests ---
+
+    async fn mount_reaction_ok(server: &wiremock::MockServer) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("POST"))
+            .and(path("/bot123456:ABC-def_GHI/setMessageReaction"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(server)
+            .await;
+    }
+
+    fn reaction_channel(api_base: String) -> TelegramChannel {
+        TelegramChannel::new(
+            "123456:ABC-def_GHI".into(),
+            "default",
+            Arc::new(Vec::new),
+            false,
+        )
+        .with_api_base(api_base)
+    }
+
+    async fn reaction_request_bodies(server: &wiremock::MockServer) -> Vec<serde_json::Value> {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == "/bot123456:ABC-def_GHI/setMessageReaction")
+            .map(|r| serde_json::from_slice(&r.body).expect("valid json body"))
+            .collect()
+    }
+
+    /// Transport failures embed the request URL in the reqwest error text,
+    /// and that URL carries the bot token. Neither the logged attribute nor
+    /// the returned error may contain it.
+    #[tokio::test]
+    async fn reaction_transport_failure_does_not_leak_bot_token() {
+        // Reserve a port, then drop the listener: connection refused, the
+        // cleanest transport failure. reqwest embeds the full request URL
+        // (bot token included) in exactly this error class.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let api_base = format!("http://127.0.0.1:{port}");
+
+        let ch = reaction_channel(api_base);
+        let err = ch
+            .add_reaction("8943231406", "893", "\u{1F44D}")
+            .await
+            .expect_err("transport failure must surface as an error");
+
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains("123456:ABC-def_GHI"),
+            "bot token leaked in error: {rendered}"
+        );
+        assert!(
+            !rendered.contains("127.0.0.1"),
+            "request URL leaked in error: {rendered}"
+        );
+        assert!(
+            rendered.contains("Telegram API request failed"),
+            "rendered: {rendered}"
+        );
+    }
+
+    /// The end-of-turn ack swap (remove 👀, add done-emoji) runs through the
+    /// same trait methods the reaction tool uses. When the tool reacted to
+    /// the current message, the swap must not reach Telegram at all, or it
+    /// would erase the user-requested reaction.
+    #[tokio::test]
+    async fn explicit_reaction_survives_ack_completion_swap() {
+        let server = wiremock::MockServer::start().await;
+        mount_reaction_ok(&server).await;
+        let ch = reaction_channel(server.uri());
+
+        // Orchestrator early ack, then the tool reacts to the same message,
+        // then the end-of-turn ack swap: remove 👀, add ✅.
+        ch.add_reaction("8943231406", "893", "\u{1F440}")
+            .await
+            .unwrap();
+        ch.set_explicit_reaction("8943231406", "telegram_8943231406_893", "\u{1F62E}", true)
+            .await
+            .unwrap();
+        ch.remove_reaction("8943231406", "893", "\u{1F440}")
+            .await
+            .unwrap();
+        ch.add_reaction("8943231406", "893", "\u{2705}")
+            .await
+            .unwrap();
+
+        let bodies = reaction_request_bodies(&server).await;
+        assert_eq!(
+            bodies.len(),
+            2,
+            "automatic ack swap must not reach Telegram: {bodies:?}"
+        );
+        assert_eq!(
+            bodies[0]["reaction"],
+            serde_json::json!([{"type": "emoji", "emoji": "\u{1F440}"}])
+        );
+        assert_eq!(
+            bodies[1]["reaction"],
+            serde_json::json!([{"type": "emoji", "emoji": "\u{1F62E}"}])
+        );
+    }
+
+    /// Without an explicit reaction on the message, the ack swap still works:
+    /// remove clears, done-emoji replaces.
+    #[tokio::test]
+    async fn ack_swap_completes_when_no_explicit_reaction() {
+        let server = wiremock::MockServer::start().await;
+        mount_reaction_ok(&server).await;
+        let ch = reaction_channel(server.uri());
+
+        ch.add_reaction("8943231406", "893", "\u{1F440}")
+            .await
+            .unwrap();
+        ch.remove_reaction("8943231406", "893", "\u{1F440}")
+            .await
+            .unwrap();
+        ch.add_reaction("8943231406", "893", "\u{2705}")
+            .await
+            .unwrap();
+
+        let bodies = reaction_request_bodies(&server).await;
+        assert_eq!(bodies.len(), 3, "{bodies:?}");
+        assert_eq!(bodies[1]["reaction"], serde_json::json!([]));
+        assert_eq!(
+            bodies[2]["reaction"],
+            serde_json::json!([{"type": "emoji", "emoji": "\u{2705}"}])
+        );
+    }
+
+    /// The orchestrator passes composite `chat_id:thread_id` targets
+    /// unchanged; reaction calls must split them into Telegram's
+    /// `chat_id` + `message_thread_id` fields.
+    #[tokio::test]
+    async fn reaction_targets_topic_threads() {
+        let server = wiremock::MockServer::start().await;
+        mount_reaction_ok(&server).await;
+        let ch = reaction_channel(server.uri());
+
+        ch.set_explicit_reaction("-100200300:77", "42", "\u{1F525}", true)
+            .await
+            .unwrap();
+
+        let bodies = reaction_request_bodies(&server).await;
+        assert_eq!(bodies.len(), 1, "{bodies:?}");
+        assert_eq!(bodies[0]["chat_id"], "-100200300");
+        assert_eq!(bodies[0]["message_thread_id"], "77");
+        assert_eq!(bodies[0]["message_id"], 42);
     }
 }
