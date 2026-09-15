@@ -7,6 +7,7 @@ pub enum WebSearchProviderRoute {
     Jina,
     Bocha,
     AnySearch,
+    Keenable,
 }
 
 /// Provider HTTP-failure status surfaced to the agent via the error message's
@@ -46,6 +47,7 @@ const TAVILY_PROVIDER: &str = "tavily";
 const JINA_PROVIDER: &str = "jina";
 const BOCHA_PROVIDER: &str = "bocha";
 const ANYSEARCH_PROVIDER: &str = "anysearch";
+const KEENABLE_PROVIDER: &str = "keenable";
 
 pub fn resolve_web_search_provider(raw_model_provider: &str) -> WebSearchProviderResolution {
     let normalized = raw_model_provider.trim().to_ascii_lowercase();
@@ -87,6 +89,11 @@ pub fn resolve_web_search_provider(raw_model_provider: &str) -> WebSearchProvide
         "anysearch" | "any-search" | "any_search" => WebSearchProviderResolution {
             route: WebSearchProviderRoute::AnySearch,
             canonical_provider: ANYSEARCH_PROVIDER,
+            used_fallback: false,
+        },
+        "keenable" | "keenable-search" | "keenable_search" => WebSearchProviderResolution {
+            route: WebSearchProviderRoute::Keenable,
+            canonical_provider: KEENABLE_PROVIDER,
             used_fallback: false,
         },
         // Warns for unknown model_providers, falls back to default.
@@ -182,6 +189,17 @@ mod tests {
             let resolved = resolve_web_search_provider(alias);
             assert_eq!(resolved.route, WebSearchProviderRoute::AnySearch);
             assert_eq!(resolved.canonical_provider, ANYSEARCH_PROVIDER);
+            assert!(!resolved.used_fallback);
+        }
+    }
+
+    #[test]
+    fn resolve_aliases_to_keenable() {
+        let keenable_aliases = ["keenable", "keenable-search", "keenable_search"];
+        for alias in keenable_aliases {
+            let resolved = resolve_web_search_provider(alias);
+            assert_eq!(resolved.route, WebSearchProviderRoute::Keenable);
+            assert_eq!(resolved.canonical_provider, KEENABLE_PROVIDER);
             assert!(!resolved.used_fallback);
         }
     }
