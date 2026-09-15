@@ -1,5 +1,7 @@
 #[cfg(feature = "agent-runtime")]
 pub mod eval;
 #[cfg(feature = "agent-runtime")]
+pub mod migrate_session_ownership;
+#[cfg(feature = "agent-runtime")]
 pub mod self_test;
 pub mod update;
