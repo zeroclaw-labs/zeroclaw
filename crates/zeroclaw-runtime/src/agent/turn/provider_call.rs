@@ -152,6 +152,7 @@ pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
 pub(crate) async fn call_provider(
     ctx: &TurnCtx<'_>,
     active_model_provider: &dyn ModelProvider,
+    active_model_provider_name: &str,
     active_model: &str,
     prepared_messages: &[ChatMessage],
     request_tools: Option<&[ToolSpec]>,
@@ -270,6 +271,15 @@ pub(crate) async fn call_provider(
                             {
                                 scope.mark_stream_recovery_semantic_empty();
                             }
+                            if request_tools.is_some()
+                                && custom_provider_alias(active_model_provider_name).is_some()
+                                && zeroclaw_providers::rejects_native_tool_calling_message(
+                                    &stream_err.to_string(),
+                                )
+                            {
+                                scope.record_stream_recovery_failure(&stream_err);
+                                (Err(stream_err), false, false, String::new())
+                            } else {
                             scope.record_stream_recovery_failure(&stream_err);
                             ::zeroclaw_log::record!(
                                 WARN,
@@ -327,6 +337,7 @@ pub(crate) async fn call_provider(
                                 recovery.await
                             };
                             (result, false, false, String::new())
+                            }
                         }
                     }
                 }))))
@@ -411,6 +422,13 @@ pub(crate) async fn call_provider(
         streamed_protocol_suppressed,
         streamed_visible_text,
     })
+}
+
+pub(crate) fn custom_provider_alias(model_provider_name: &str) -> Option<&str> {
+    model_provider_name
+        .strip_prefix("custom.")
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty())
 }
 
 #[cfg(test)]
@@ -1184,6 +1202,7 @@ mod streaming_fallback_tests {
                     call_provider(
                         &ctx,
                         &provider,
+                        "test-provider",
                         "test-model",
                         &[ChatMessage::user("go")],
                         None,
@@ -1276,6 +1295,7 @@ mod streaming_fallback_tests {
         let error = call_provider(
             &ctx,
             &provider,
+            "test-provider",
             "test-model",
             &[ChatMessage::user("go")],
             None,
@@ -1338,6 +1358,7 @@ mod streaming_fallback_tests {
         let error = call_provider(
             &ctx,
             &provider,
+            "test-provider",
             "test-model",
             &[ChatMessage::user("go")],
             None,
@@ -1468,6 +1489,7 @@ mod streaming_fallback_tests {
             let error = call_provider(
                 &ctx,
                 &provider,
+                "test-provider",
                 "test-model",
                 &[ChatMessage::user("go")],
                 None,
@@ -1644,6 +1666,7 @@ mod streaming_fallback_tests {
         let error = call_provider(
             &ctx,
             &provider,
+            "test-provider",
             "test-model",
             &[ChatMessage::user("go")],
             None,
@@ -1709,6 +1732,7 @@ mod streaming_fallback_tests {
         let outcome = call_provider(
             &ctx,
             &provider,
+            "test-provider",
             "requested-model",
             &[ChatMessage::user("go")],
             None,
@@ -1775,6 +1799,7 @@ mod streaming_fallback_tests {
         let outcome = call_provider(
             &ctx,
             &provider,
+            "test-provider",
             "requested-model",
             &[ChatMessage::user("go")],
             None,
