@@ -41,7 +41,8 @@ The token budget comes from `ResolvedRuntime::effective_context_budget()`:
 
 Token counts are estimated by `history::estimate_history_tokens`: roughly four
 characters per token plus four framing tokens per message. This is a heuristic,
-not a provider tokenizer.
+not a provider tokenizer. An `[IMAGE:...]` marker is charged a fixed per-image
+cost instead of being priced by its text length.
 
 Token-budget trimming runs before the first provider call of a turn when
 history already exceeds the effective budget and at provider-call boundaries

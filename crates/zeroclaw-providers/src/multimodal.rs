@@ -11,7 +11,7 @@ use zeroclaw_api::media::{
 use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_config::schema::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
 
-const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
+pub const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
 
 /// Per-path cache for resolved local image data URIs. Keyed by absolute
 /// path; stores `(len, mtime)` for freshness checks (`(0, 0)` sentinel

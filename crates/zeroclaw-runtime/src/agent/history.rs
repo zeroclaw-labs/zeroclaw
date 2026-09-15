@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::LazyLock;
 use zeroclaw_providers::ChatMessage;
+use zeroclaw_providers::multimodal::IMAGE_MARKER_PREFIX;
 
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
 /// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
@@ -311,11 +312,25 @@ pub fn truncate_tool_message(msg_content: &str, max_chars: usize) -> String {
     truncate_tool_result(msg_content, max_chars)
 }
 
-/// Estimate the token cost of a single message using the ~4 chars/token
-/// heuristic plus ~4 framing tokens (role, delimiters). Single-sourced so the
-/// history and system-floor estimates stay in lock-step.
+/// Fixed per-image charge for `[IMAGE:...]` markers in the history estimate.
+/// Anthropic bills at most ~1,600 tokens for an image after its 1568px
+/// downscale (w*h/750); OpenAI high-detail and Gemini land below that for the
+/// same input. Qwen-VL can bill more (~4k for an A4 page at 300dpi); that
+/// remains an under-estimate here, bounded and corrected by the
+/// provider-reported usage path after the first response.
+pub const IMAGE_TOKEN_ESTIMATE: usize = 1_600;
+
+/// Estimate the token cost of a single message: the ~4 chars/token heuristic
+/// plus ~4 framing tokens (role, delimiters), with `[IMAGE:...]` markers
+/// charged at [`IMAGE_TOKEN_ESTIMATE`] per image instead of their text
+/// length. Single-sourced so the history and system-floor estimates stay in
+/// lock-step.
 fn estimate_message_tokens(message: &ChatMessage) -> usize {
-    message.content.len().div_ceil(4) + 4
+    if !message.content.contains(IMAGE_MARKER_PREFIX) {
+        return message.content.len().div_ceil(4) + 4;
+    }
+    let (text, refs) = zeroclaw_providers::multimodal::parse_image_markers(&message.content);
+    text.len().div_ceil(4) + refs.len() * IMAGE_TOKEN_ESTIMATE + 4
 }
 
 /// Estimate token count for a message history using ~4 chars/token heuristic.
@@ -541,6 +556,72 @@ mod tests {
         assert_eq!(estimate_system_floor_tokens(&[]), 0);
         let history = vec![ChatMessage::user("hi"), ChatMessage::assistant("yo")];
         assert_eq!(estimate_system_floor_tokens(&history), 0);
+    }
+
+    #[test]
+    fn image_path_marker_is_charged_per_image_not_per_byte() {
+        // The marker is 18 bytes of text: bytes/4 would price it at ~9
+        // tokens against the ~1.5k the provider bills after downscale.
+        let message = ChatMessage::user("[IMAGE:/tmp/a.png]");
+
+        assert_eq!(
+            estimate_history_tokens(&[message]),
+            IMAGE_TOKEN_ESTIMATE + 4
+        );
+    }
+
+    #[test]
+    fn image_data_uri_marker_is_charged_per_image_not_per_byte() {
+        // ~600 KB of base64 would price at ~150k tokens under the text
+        // heuristic, against ~1.5k billed.
+        let payload = format!("data:image/png;base64,{}", "A".repeat(600_000));
+        let message = ChatMessage::user(format!("[IMAGE:{payload}]"));
+
+        assert_eq!(
+            estimate_history_tokens(&[message]),
+            IMAGE_TOKEN_ESTIMATE + 4
+        );
+    }
+
+    #[test]
+    fn path_and_data_uri_forms_estimate_identically() {
+        // Invariant 2: the same image costs the same however it is
+        // referenced, so the raw-history estimate bounds the prepared
+        // payload from above.
+        let via_path = ChatMessage::user("[IMAGE:/tmp/scene.png]");
+        let payload = format!("data:image/png;base64,{}", "B".repeat(600_000));
+        let via_data_uri = ChatMessage::user(format!("[IMAGE:{payload}]"));
+
+        let path_estimate = estimate_history_tokens(&[via_path]);
+        assert_eq!(path_estimate, estimate_history_tokens(&[via_data_uri]));
+        assert_eq!(path_estimate, IMAGE_TOKEN_ESTIMATE + 4);
+    }
+
+    #[test]
+    fn placeholder_marker_stays_text() {
+        // `parse_image_markers` keeps placeholder markers in the text, so
+        // they retain the plain-text pricing.
+        for placeholder in ["[IMAGE:...]", "[IMAGE:<path>]"] {
+            let message = ChatMessage::user(placeholder);
+
+            assert_eq!(
+                estimate_history_tokens(&[message]),
+                placeholder.len().div_ceil(4) + 4
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_text_and_images_sum() {
+        let content = "see [IMAGE:/a.png] and [IMAGE:/b.png] ok";
+        let message = ChatMessage::user(content);
+
+        let (text, refs) = zeroclaw_providers::multimodal::parse_image_markers(content);
+        assert_eq!(refs.len(), 2);
+        assert_eq!(text, "see  and  ok");
+
+        let expected = text.len().div_ceil(4) + 2 * IMAGE_TOKEN_ESTIMATE + 4;
+        assert_eq!(estimate_history_tokens(&[message]), expected);
     }
 
     #[test]
