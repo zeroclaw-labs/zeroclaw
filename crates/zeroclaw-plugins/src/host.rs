@@ -309,6 +309,56 @@ impl PluginHost {
         Ok(installed_name)
     }
 
+    /// Resolve a source's signature-admitted manifest and absolute WASM path
+    /// for a pre-install load-check, without copying or registering anything.
+    ///
+    /// Returns `Ok(None)` for a plugin that ships no WASM component (there is
+    /// nothing to instantiate). The manifest is validated for shape and the
+    /// WASM file's existence, matching what [`Self::install`] checks before it
+    /// commits. Signature policy is checked before returning an executable
+    /// path, so callers cannot compile or instantiate an unadmitted component.
+    pub fn source_component(
+        &self,
+        source: &str,
+    ) -> Result<Option<(PluginManifest, PathBuf)>, PluginError> {
+        let source_path = PathBuf::from(source);
+        let manifest_path = if source_path.is_dir() {
+            source_path.join("manifest.toml")
+        } else {
+            source_path.clone()
+        };
+
+        if !manifest_path.exists() {
+            return Err(PluginError::NotFound(format!(
+                "manifest.toml not found at {}",
+                manifest_path.display()
+            )));
+        }
+
+        let (manifest, manifest_toml) = self.load_manifest(&manifest_path)?;
+        let source_dir = manifest_path
+            .parent()
+            .ok_or_else(|| PluginError::InvalidManifest("no parent directory".into()))?;
+
+        validate_manifest_shape(&manifest, source_dir)?;
+        self.verify_plugin_signature(&manifest.name, &manifest_toml, &manifest)?;
+        validate_manifest_config(&manifest)?;
+
+        match manifest.wasm_path.as_deref() {
+            Some(rel) => {
+                let wasm = source_dir.join(rel);
+                if !wasm.exists() {
+                    return Err(PluginError::NotFound(format!(
+                        "WASM file not found: {}",
+                        wasm.display()
+                    )));
+                }
+                Ok(Some((manifest, wasm)))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Remove a plugin by name.
     pub fn remove(&mut self, name: &str) -> Result<(), PluginError> {
         if self.loaded.remove(name).is_none() {
@@ -1317,6 +1367,49 @@ capabilities = ["tool"]
             host.list_plugins().is_empty(),
             "strict mode must reject an unsigned plugin during discovery"
         );
+    }
+
+    #[test]
+    fn source_component_rejects_unsigned_plugin_before_load_verification() {
+        let source = tempdir().unwrap();
+        std::fs::write(
+            source.path().join("manifest.toml"),
+            "name = \"unsigned-source\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n",
+        )
+        .unwrap();
+        std::fs::write(source.path().join("plugin.wasm"), b"not a component").unwrap();
+
+        let plugins = tempdir().unwrap();
+        let host = PluginHost::from_plugins_dir_with_security(
+            plugins.path(),
+            SignatureMode::Strict,
+            Vec::new(),
+        )
+        .unwrap();
+
+        let err = host
+            .source_component(source.path().to_str().unwrap())
+            .expect_err("strict policy must reject an unsigned source before load verification");
+        assert!(matches!(err, PluginError::UnsignedPlugin(_)));
+    }
+
+    #[test]
+    fn source_component_rejects_invalid_config_before_load_verification() {
+        let source = tempdir().unwrap();
+        std::fs::write(
+            source.path().join("manifest.toml"),
+            "name = \"invalid-config-source\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\npermissions = [\"config_read\"]\n",
+        )
+        .unwrap();
+        std::fs::write(source.path().join("plugin.wasm"), b"not a component").unwrap();
+
+        let plugins = tempdir().unwrap();
+        let host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+
+        let err = host
+            .source_component(source.path().to_str().unwrap())
+            .expect_err("invalid config must be rejected before load verification");
+        assert!(matches!(err, PluginError::InvalidManifest(_)));
     }
 
     #[test]

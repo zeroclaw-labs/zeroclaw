@@ -272,3 +272,29 @@ async fn reference_plugin_end_to_end_from_throwaway_config() {
         "label=masked|uppercase=true|max_len=5|keys=3|text=HELLO"
     );
 }
+
+/// Install-time load verification. The real fixture instantiates against this
+/// host's `tool-plugin` world, and a non-component artifact is refused with the
+/// load diagnostic — this is the check `zeroclaw plugin install` runs so a
+/// wrong-ABI plugin fails at the CLI instead of installing cleanly and then
+/// being silently skipped at daemon startup.
+#[tokio::test]
+async fn verify_component_loads_accepts_the_fixture_and_rejects_a_non_component() {
+    let manifest: PluginManifest = toml::from_str(FIXTURE_MANIFEST).unwrap();
+
+    zeroclaw_plugins::validate::verify_component_loads(&fixture(), &manifest)
+        .await
+        .expect("the in-tree tool fixture must load against this host");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let garbage = tmp.path().join("not-a-component.wasm");
+    fs::write(&garbage, b"not a wasm component").unwrap();
+    let err = zeroclaw_plugins::validate::verify_component_loads(&garbage, &manifest)
+        .await
+        .expect_err("a non-component artifact must be refused, not accepted");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("failed to load WASM component"),
+        "the rejection should name the load failure; got: {msg}"
+    );
+}
