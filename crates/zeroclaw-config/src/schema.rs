@@ -48,6 +48,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "channel.whatsapp",
     "tool.browser",
     "tool.composio",
+    "tool.file_download",
     "tool.http_request",
     "tool.pushover",
     "tool.web_search",
@@ -9735,6 +9736,13 @@ pub struct FileDownloadConfig {
     #[serde(default = "default_file_download_timeout_secs")]
     pub timeout_secs: u64,
 
+    /// Private, loopback, or link-local endpoint hosts that file_download may
+    /// contact. Cloud metadata and credential-delivery addresses remain blocked
+    /// even when their host appears here. Use only for operator-controlled
+    /// internal document services.
+    #[serde(default)]
+    pub allowed_private_hosts: Vec<String>,
+
     /// Static HTTP headers attached to every download request — typically an
     /// `Authorization: Bearer …` token for the upstream endpoint. Same shape as
     /// `[mcp.servers.*.headers]`.
@@ -9759,6 +9767,7 @@ impl Default for FileDownloadConfig {
             max_file_size_bytes: default_file_download_max_size_bytes(),
             timeout_secs: default_file_download_timeout_secs(),
             headers: HashMap::new(),
+            allowed_private_hosts: Vec::new(),
         }
     }
 }
@@ -10303,13 +10312,13 @@ pub enum ProxyScope {
 }
 
 /// Proxy configuration for outbound HTTP/HTTPS/SOCKS5 traffic (`[proxy]` section).
-/// The standard `web_fetch` request and every `http_request` request are direct
-/// so their locally validated DNS answers can be pinned: they bypass environment
-/// proxies and reject a runtime proxy scope that applies to `tool.web_fetch` or
-/// `tool.http_request`, including an enabled `environment` scope. Unmanaged process
-/// proxy variables are warned when ignored. The optional Firecrawl API fallback uses
-/// normal environment proxy discovery. To proxy other traffic, use `services` scope
-/// without those selectors or `tool.*`.
+/// The standard `web_fetch` request, every `http_request` request, and configured
+/// `file_download` requests are direct so their locally validated DNS answers can
+/// be pinned: they bypass environment proxies and reject a runtime proxy scope
+/// that applies to their `tool.*` selectors, including an enabled `environment`
+/// scope. Unmanaged process proxy variables are warned when ignored. The optional
+/// Firecrawl API fallback uses normal environment proxy discovery. To proxy other
+/// traffic, use `services` scope without those selectors or `tool.*`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "proxy"]
@@ -21407,30 +21416,49 @@ impl Config {
             return;
         }
 
-        let (http_request_blocked, web_fetch_blocked) = match self.proxy.scope {
-            ProxyScope::Environment | ProxyScope::Zeroclaw => (true, true),
-            ProxyScope::Services => (
-                self.proxy.should_apply_to_service("tool.http_request"),
-                self.proxy.should_apply_to_service("tool.web_fetch"),
-            ),
-        };
-        if !http_request_blocked && !web_fetch_blocked {
+        let file_download_enabled = self
+            .file_download
+            .url
+            .as_deref()
+            .is_some_and(|url| !url.trim().is_empty());
+        let mut affected = Vec::new();
+        match self.proxy.scope {
+            ProxyScope::Environment | ProxyScope::Zeroclaw => {
+                affected.push("http_request");
+                affected.push("web_fetch");
+                if file_download_enabled {
+                    affected.push("file_download");
+                }
+            }
+            ProxyScope::Services => {
+                if self.proxy.should_apply_to_service("tool.http_request") {
+                    affected.push("http_request");
+                }
+                if self.proxy.should_apply_to_service("tool.web_fetch") {
+                    affected.push("web_fetch");
+                }
+                if file_download_enabled && self.proxy.should_apply_to_service("tool.file_download")
+                {
+                    affected.push("file_download");
+                }
+            }
+        }
+        if affected.is_empty() {
             return;
         }
-
-        let affected = match (http_request_blocked, web_fetch_blocked) {
-            (true, true) => "http_request and web_fetch",
-            (true, false) => "http_request",
-            (false, true) => "web_fetch",
-            (false, false) => return,
+        let affected = match affected.as_slice() {
+            [one] => (*one).to_string(),
+            [first, second] => format!("{first} and {second}"),
+            [first, second, third] => format!("{first}, {second}, and {third}"),
+            _ => affected.join(", "),
         };
         warnings.push(crate::validation_warnings::ValidationWarning::new(
             "proxy_conflicts_with_dns_pinned_tools",
             format!(
                 "The configured proxy scope applies to DNS-pinned tool calls ({affected}), so \
                  those calls will fail instead of using an unpinned proxy connection. Use \
-                 proxy.scope = \"services\" and omit tool.http_request and tool.* from \
-                 proxy.services; tool.* also selects web_fetch."
+                 proxy.scope = \"services\" and omit tool.http_request, tool.web_fetch, \
+                 tool.file_download, and tool.* from proxy.services."
             ),
             if self.proxy.scope == ProxyScope::Services {
                 "proxy.services"
@@ -34585,6 +34613,24 @@ api_token = "tok"
         assert_eq!(http_warning.path, "proxy.services");
         assert!(http_warning.message.contains("tool calls (http_request)"));
         assert!(!http_warning.message.contains("tool calls (web_fetch)"));
+
+        let file_download_warning = Config {
+            file_download: FileDownloadConfig {
+                url: Some("https://files.example.test/download".into()),
+                ..FileDownloadConfig::default()
+            },
+            ..services_config(vec!["tool.file_download"])
+        }
+        .collect_warnings()
+        .into_iter()
+        .find(|warning| warning.code == "proxy_conflicts_with_dns_pinned_tools")
+        .expect("the explicit file_download selector must warn when file_download is enabled");
+        assert_eq!(file_download_warning.path, "proxy.services");
+        assert!(
+            file_download_warning
+                .message
+                .contains("tool calls (file_download)")
+        );
 
         let wildcard_warning = services_config(vec!["tool.*"])
             .collect_warnings()

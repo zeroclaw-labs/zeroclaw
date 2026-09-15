@@ -59,7 +59,7 @@ pub use zeroclaw_tools::discord_search::DiscordSearchTool;
 pub use zeroclaw_tools::email_read::EmailReadTool;
 pub use zeroclaw_tools::email_search::EmailSearchTool;
 pub use zeroclaw_tools::escalate::EscalateToHumanTool;
-pub use zeroclaw_tools::file_download::FileDownloadTool;
+pub use zeroclaw_tools::file_download::{FileDownloadSsrfPolicy, FileDownloadTool};
 pub use zeroclaw_tools::file_edit::FileEditTool;
 pub use zeroclaw_tools::file_upload::FileUploadTool;
 pub use zeroclaw_tools::file_upload_bundle::FileUploadBundleTool;
@@ -1563,11 +1563,30 @@ pub fn all_tools_with_runtime(
         .as_deref()
         .is_some_and(|u| !u.trim().is_empty())
     {
-        tool_arcs.push(Arc::new(FileDownloadTool::new_with_persistence(
-            security.clone(),
-            root_config.file_download.clone(),
-            persistent_writes,
-        )));
+        let policy_resolver: Arc<dyn Fn() -> FileDownloadSsrfPolicy + Send + Sync> =
+            if let Some(live) = live_config.clone() {
+                Arc::new(move || {
+                    let config = live.read();
+                    FileDownloadSsrfPolicy {
+                        allowed_private_hosts: config.file_download.allowed_private_hosts.clone(),
+                        nat64_prefixes: config.security.nat64_prefixes.clone(),
+                    }
+                })
+            } else {
+                let snapshot = FileDownloadSsrfPolicy {
+                    allowed_private_hosts: root_config.file_download.allowed_private_hosts.clone(),
+                    nat64_prefixes: root_config.security.nat64_prefixes.clone(),
+                };
+                Arc::new(move || snapshot.clone())
+            };
+        tool_arcs.push(Arc::new(
+            FileDownloadTool::new_with_persistence_and_resolver(
+                security.clone(),
+                root_config.file_download.clone(),
+                persistent_writes,
+                move || policy_resolver(),
+            ),
+        ));
     }
 
     // Poll tool — always registered; owns its own late-bound channel map.
@@ -2088,8 +2107,8 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use zeroclaw_config::schema::{
-        ApprovalGroupConfig, ApprovalPolicyConfig, BrowserConfig, Config, MemoryConfig,
-        SopApprovalConfig,
+        ApprovalGroupConfig, ApprovalPolicyConfig, BrowserConfig, Config, FileDownloadConfig,
+        MemoryConfig, SopApprovalConfig,
     };
 
     #[tokio::test]
@@ -4617,6 +4636,91 @@ permissions = ["http_client"]
             "llm_task should construct the Codex provider for \
              openai.codex (requires_openai_auth=true), producing an \
              openai-codex credential error; got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_download_factory_seam_reflects_live_config_revocation() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method, matchers::path};
+
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: tmp.path().to_path_buf(),
+            max_actions_per_hour: 100,
+            ..SecurityPolicy::default()
+        });
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ok".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut root_config = test_config(&tmp);
+        root_config.file_download = FileDownloadConfig {
+            url: Some(format!("{}/download", server.uri())),
+            allowed_private_hosts: vec!["127.0.0.1".into()],
+            ..FileDownloadConfig::default()
+        };
+        let live_config = Arc::new(parking_lot::RwLock::new(root_config.clone()));
+
+        let tools = all_tools_with_runtime(
+            Arc::new(root_config.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &BrowserConfig::default(),
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &root_config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some(live_config.clone()),
+        )
+        .tools;
+        let file_download = tools
+            .iter()
+            .find(|tool| tool.name() == "file_download")
+            .expect("file_download must be registered when file_download.url is set");
+        let args = serde_json::json!({ "document_id": "doc-1", "dest_path": "out.bin" });
+
+        let first = file_download.execute(args.clone()).await.unwrap();
+        assert!(first.success, "allowlisted local endpoint should pass");
+
+        live_config
+            .write()
+            .file_download
+            .allowed_private_hosts
+            .clear();
+
+        let second = file_download.execute(args).await.unwrap();
+        assert!(
+            !second.success,
+            "same tool instance must observe live allowlist revocation"
+        );
+        assert!(
+            second
+                .error
+                .unwrap_or_default()
+                .contains("file_download.allowed_private_hosts")
         );
     }
 }
