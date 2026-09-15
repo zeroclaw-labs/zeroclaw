@@ -14091,6 +14091,7 @@ dependencies = [
  "zeroclaw-infra",
  "zeroclaw-log",
  "zeroclaw-macros",
+ "zeroclaw-spawn",
 ]
 
 [[package]]

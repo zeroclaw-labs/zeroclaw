@@ -6,20 +6,20 @@
 //! is the dotted `<channel_type>.<alias>` instance ref — the same
 //! channel-ref contract `Config::channel_external_peers` matches at
 //! message-time (the runtime reader never looks at the map key). This
-//! module is the single writer for that shape: WeChat and WhatsApp Web
-//! both persist through it, so the two channels can never drift into
+//! module is the single writer for that shape: Telegram, LINE, WeChat, and
+//! WhatsApp Web all persist through it, so the channels cannot drift into
 //! different on-disk layouts (and no channel grows a local allowlist
 //! cache).
 //!
-//! Writes go through the shared `Arc<RwLock<Config>>` handle the
-//! orchestrator wires into each channel — mutate canonical in-memory state
-//! under the lock, then persist a snapshot with `Config::save()`. Channels
-//! constructed without the handle (tests, one-shot CLI runs) skip
-//! persistence with a warning: pairing still works for the process
-//! lifetime, it just isn't durable.
+//! Writes go through the shared live-config authority the orchestrator wires
+//! into each channel: acquire its mutation witness, clone and mutate a
+//! snapshot, persist it with `Config::save()`, then publish it in memory.
+//! Channels constructed without the handle (tests, one-shot CLI runs) skip
+//! persistence with a warning: pairing still works for the process lifetime,
+//! it just isn't durable.
 
-use std::sync::Arc;
 use zeroclaw_config::schema::Config;
+use zeroclaw_runtime::LiveConfigAuthority;
 
 /// Merge `identity` into the `external_peers` of the peer group whose
 /// `channel` ref matches `<channel_type>.<alias>`, on the canonical
@@ -142,20 +142,20 @@ pub(crate) fn merge_external_peer(
 
 /// Persist a paired identity as an authorized external peer.
 ///
-/// Mutates the shared canonical config under the write lock via
-/// [`merge_external_peer`], then saves a snapshot to `config.toml`.
+/// Clones the shared canonical config under the write lock, mutates the clone
+/// via [`merge_external_peer`], saves it to `config.toml`, then publishes it.
 /// Idempotent: an already-authorized identity returns without writing, so
 /// callers may invoke this on every connect/reconnect. `persist = None`
 /// (no handle wired) warns and succeeds without persisting.
 pub(crate) async fn persist_external_peer(
-    persist: Option<&Arc<parking_lot::RwLock<Config>>>,
+    persist: Option<&LiveConfigAuthority>,
     channel_type: &str,
     alias: &str,
     identity: &str,
 ) -> anyhow::Result<()> {
     use anyhow::Context;
 
-    let Some(config) = persist else {
+    let Some(authority) = persist else {
         // The raw identity is a durable personal identifier (e.g. a phone
         // number) and must not reach the log sink; channel_type/alias give
         // the operator enough to locate the unwired constructor path.
@@ -171,17 +171,18 @@ pub(crate) async fn persist_external_peer(
         );
         return Ok(());
     };
-    let snapshot = {
-        let mut cfg = config.write();
-        if !merge_external_peer(&mut cfg, channel_type, alias, identity)? {
-            return Ok(());
-        }
-        cfg.clone()
-    };
+    let config_write_lock = authority.config_write_lock();
+    let _config_write_guard = config_write_lock.lock().await;
+    let config = authority.config();
+    let mut snapshot = config.read().clone();
+    if !merge_external_peer(&mut snapshot, channel_type, alias, identity)? {
+        return Ok(());
+    }
     snapshot
         .save()
         .await
         .with_context(|| format!("Failed to persist {channel_type} peer to config.toml"))?;
+    *config.write() = snapshot;
     Ok(())
 }
 
@@ -503,5 +504,28 @@ mod tests {
         persist_external_peer(None, "whatsapp", "admin", "+15551234567")
             .await
             .expect("missing handle is a soft no-op");
+    }
+
+    #[tokio::test]
+    async fn persist_save_failure_does_not_publish_peer_in_memory() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let blocked_parent = temp.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, "file").unwrap();
+        let mut config = config_with_whatsapp("admin");
+        config.config_path = blocked_parent.join("config.toml");
+        config.data_dir = temp.path().join("data");
+        let authority = LiveConfigAuthority::new(config);
+
+        persist_external_peer(Some(&authority), "whatsapp", "admin", "+15551234567")
+            .await
+            .expect_err("save failure must reject paired identity");
+
+        assert!(
+            authority
+                .config()
+                .read()
+                .channel_external_peers("whatsapp", "admin")
+                .is_empty()
+        );
     }
 }
