@@ -1264,6 +1264,7 @@ jobs:
           for path in (
               ".github/workflows/ci.yml",
               ".github/workflows/project-dashboard-plan.yml",
+              ".github/workflows/pr-risk-labeler.yml",
               ".github/workflows/pr-size-labeler.yml",
               ".github/workflows/release-stable-manual.yml",
           ):
