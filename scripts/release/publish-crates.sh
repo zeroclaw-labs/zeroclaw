@@ -101,6 +101,15 @@ fi
 
 META="$(cargo metadata --format-version 1 --no-deps)"
 
+# Resolve the entire graph before registry queries, even during a tokenless dry
+# run or a resume. Versioned dev-dependencies survive Cargo packaging and must
+# already exist when their consumer uploads. Stream metadata: the full workspace
+# exceeds the platform limit for a single argv entry.
+ORDER="$(python3 "$REPO_ROOT/scripts/release/publish_order.py" "$VERSION" <<<"$META")" || {
+  echo "error: could not compute publish order." >&2
+  exit 1
+}
+
 # `publish` is null when unrestricted (publishable) and [] when publish = false.
 # Only packages at the coordinated workspace version belong to this release;
 # independent-version workspace members are reported but never uploaded merely
@@ -138,27 +147,6 @@ echo "  publishable:  ${#PUBLISHABLE[@]} crates"
 echo "  private:      ${#PRIVATE[@]} crates (${PRIVATE[*]})"
 echo "  independent:  ${#INDEPENDENT[@]} crates (${INDEPENDENT[*]})"
 echo
-
-# ── Preflight 1: no release crate depends on a private one ─────────────────
-# cargo only reports this once it reaches the offending crate, which can be
-# after several irreversible uploads have already succeeded.
-leaks="$(jq -r --arg version "$VERSION" \
-  --argjson priv "$(printf '%s\n' "${PRIVATE[@]}" | jq -R . | jq -s .)" '
-  [ .packages[]
-    | select(.publish == null and .version == $version) as $p
-    | $p.dependencies[]
-    | select(.kind == null or .kind == "build")
-    | select(.name as $n | $priv | index($n))
-    | "\($p.name) -> \(.name)"
-  ] | unique | .[]' <<<"$META")"
-if [[ -n "$leaks" ]]; then
-  echo "error: publishable crates depend on unpublishable workspace crates:" >&2
-  while IFS= read -r leak; do
-    echo "       $leak" >&2
-  done <<<"$leaks"
-  echo "       Either publish the dependency or drop the edge." >&2
-  exit 1
-fi
 
 # ── Preflight 2: what is already on crates.io, and what would be created ────
 # Two distinct questions, and the difference decides how fast the loop may run:
@@ -263,49 +251,6 @@ if [[ $EXECUTE -eq 1 && -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
   echo "       subsequent version bumps need 'publish-update'." >&2
   exit 1
 fi
-
-# Topological order over the publishable set, so each crate's dependencies are
-# already on the registry when it uploads. Compute this during the dry run too:
-# the tokenless preflight must exercise every operation needed before the first
-# irreversible upload. Cargo metadata is too large for one argv entry on the
-# full workspace, so pass it on a dedicated file descriptor instead.
-ORDER="$(python3 - "$VERSION" 3<<<"$META" <<'PY'
-import json
-import os
-import sys
-
-with os.fdopen(3) as metadata:
-    meta = json.load(metadata)
-version = sys.argv[1]
-pkgs = {p["name"]: p for p in meta["packages"]}
-pub = {
-    n for n, p in pkgs.items()
-    if p["publish"] is None and p["version"] == version
-}
-deps = {
-    n: sorted({d["name"] for d in p["dependencies"]
-               if d["name"] in pub and d["kind"] in (None, "build")})
-    for n, p in pkgs.items()
-}
-order, state = [], {}
-def visit(n, trail=()):
-    if state.get(n) == "done":
-        return
-    if state.get(n) == "visiting":
-        sys.exit("dependency cycle: " + " -> ".join(trail + (n,)))
-    state[n] = "visiting"
-    for d in deps[n]:
-        visit(d, trail + (n,))
-    state[n] = "done"
-    order.append(n)
-for n in sorted(pub):
-    visit(n)
-print("\n".join(order))
-PY
-)" || {
-  echo "error: could not compute publish order." >&2
-  exit 1
-}
 
 if [[ $EXECUTE -eq 0 ]]; then
   echo "── Dry run: packaging and verifying every crate (no upload) ──"
