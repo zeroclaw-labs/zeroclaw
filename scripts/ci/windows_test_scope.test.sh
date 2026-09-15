@@ -224,6 +224,9 @@ assert_selection "Rust toolchain" full '[]' '' "$paths_file" true
 printf '%s\n' '.github/workflows/ci.yml' > "$paths_file"
 assert_selection "workflow itself exercises plugin host path" full '[]' '' "$paths_file" true
 
+printf '%s\n' '.github/workflows/windows-tests.yml' > "$paths_file"
+assert_selection "label-gated workflow exercises plugin host path" full '[]' '' "$paths_file" true
+
 printf '%s\n' '.github/workflows/pr-size-labeler.yml' > "$paths_file"
 assert_selection "known independent workflow only" skip '[]' 'No covered Rust compilation or test paths changed.' "$paths_file"
 
@@ -335,13 +338,27 @@ import os
 from pathlib import Path
 
 workflow = Path(os.environ["WORKFLOW"]).read_text()
+advisory = Path(os.environ["WORKFLOW"]).with_name("windows-tests.yml").read_text()
+assert "\n  workflow_dispatch:" not in advisory
+assert "\n  pull_request:" in advisory
+assert "types: [opened, synchronize, reopened, labeled]" in advisory
+assert "if: contains(github.event.pull_request.labels.*.name, 'ci:windows') && (github.event.action != 'labeled' || github.event.label.name == 'ci:windows')" in advisory
+assert "github.event.action == 'labeled' && github.event.label.name != 'ci:windows' && github.run_id || 'selected'" in advisory
+assert "\n  pull_request_target:" not in advisory
+assert "\n  push:" not in advisory
+assert "\n  schedule:" not in advisory
+assert "\n  windows-test:" not in workflow
+assert "save-if: false" in advisory
+assert "persist-credentials: false" in advisory
+assert "ref: ${{ github.sha }}" in advisory
+assert "toolchain: 1.98.0\n          components: rustfmt" in advisory
 plugin_backend_job = workflow.split("\n  check-plugin-backends:\n", 1)[1].split(
     "\n  msrv:\n", 1
 )[0]
-scope_job = workflow.split("\n  windows-test-scope:\n", 1)[1].split(
+scope_job = advisory.split("\n  windows-test-scope:\n", 1)[1].split(
     "\n  windows-test:\n", 1
 )[0]
-windows_job = workflow.split("\n  windows-test:\n", 1)[1].split(
+windows_job = advisory.split("\n  windows-test:\n", 1)[1].split(
     "\n  parallel-runtime-test-changes:\n", 1
 )[0]
 normalization = 'archive="$(cygpath -u "$archive")"'
