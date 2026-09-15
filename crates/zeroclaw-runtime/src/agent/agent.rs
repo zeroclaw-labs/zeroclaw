@@ -295,6 +295,34 @@ impl zeroclaw_api::channel::Channel for RoutedApprovalChannel {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TestTurnEntryPause {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl TestTurnEntryPause {
+    pub(crate) fn new() -> (Self, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        (
+            Self {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            },
+            entered,
+            release,
+        )
+    }
+
+    async fn wait(&self) {
+        self.entered.notify_one();
+        self.release.notified().await;
+    }
+}
+
 #[derive(Debug)]
 struct HistoryTrimNotice {
     dropped_messages: usize,
@@ -413,6 +441,8 @@ pub struct Agent {
     channel_name: String,
     #[cfg(test)]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
+    #[cfg(test)]
+    turn_entry_pause: Option<TestTurnEntryPause>,
     /// The `DelegateTool` this Agent's registry registered, in its concrete
     /// type. Test-only: `tools` erases it behind `dyn Tool`, so a regression
     /// otherwise cannot drive the *constructed* delegate's nested-registry
@@ -563,6 +593,8 @@ pub struct AgentBuilder {
     #[cfg(test)]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
     #[cfg(test)]
+    turn_entry_pause: Option<TestTurnEntryPause>,
+    #[cfg(test)]
     delegate_tool: Option<Arc<crate::tools::DelegateTool>>,
 }
 
@@ -616,6 +648,8 @@ impl AgentBuilder {
             provider_switch_config: None,
             #[cfg(test)]
             turn_datetime: None,
+            #[cfg(test)]
+            turn_entry_pause: None,
             #[cfg(test)]
             delegate_tool: None,
         }
@@ -875,6 +909,12 @@ impl AgentBuilder {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_turn_entry_pause(mut self, pause: TestTurnEntryPause) -> Self {
+        self.turn_entry_pause = Some(pause);
+        self
+    }
+
     pub fn exclude_memory(mut self, exclude: bool) -> Self {
         self.exclude_memory = exclude;
         self
@@ -1023,6 +1063,8 @@ impl AgentBuilder {
             #[cfg(test)]
             turn_datetime: self.turn_datetime,
             #[cfg(test)]
+            turn_entry_pause: self.turn_entry_pause,
+            #[cfg(test)]
             delegate_tool: self.delegate_tool,
         })
     }
@@ -1169,6 +1211,76 @@ impl Agent {
             return 0;
         };
         crate::agent::turn::media_degrade::degrade_media_in_messages(&mut self.history[start..])
+    }
+
+    /// Replace one completed turn only after confirming that the live history
+    /// still ends with the exact messages the turn committed. A mismatch is a
+    /// fail-closed signal: callers must discard this Agent rather than mixing
+    /// generations in its provider history.
+    pub fn replace_history_suffix(
+        &mut self,
+        expected_suffix: &[ConversationMessage],
+        replacement: Vec<ConversationMessage>,
+    ) -> bool {
+        if expected_suffix.is_empty() || self.history.len() < expected_suffix.len() {
+            return false;
+        }
+        let start = self.history.len() - expected_suffix.len();
+        if !self.history[start..]
+            .iter()
+            .zip(expected_suffix)
+            .all(|(live, expected)| Self::conversation_messages_equal(live, expected))
+        {
+            return false;
+        }
+        self.history.truncate(start);
+        self.history.extend(replacement);
+        true
+    }
+
+    fn conversation_messages_equal(
+        left: &ConversationMessage,
+        right: &ConversationMessage,
+    ) -> bool {
+        match (left, right) {
+            (ConversationMessage::Chat(left), ConversationMessage::Chat(right)) => {
+                left.role == right.role && left.content == right.content
+            }
+            (
+                ConversationMessage::AssistantToolCalls {
+                    text: left_text,
+                    tool_calls: left_calls,
+                    reasoning_content: left_reasoning,
+                },
+                ConversationMessage::AssistantToolCalls {
+                    text: right_text,
+                    tool_calls: right_calls,
+                    reasoning_content: right_reasoning,
+                },
+            ) => {
+                left_text == right_text
+                    && left_reasoning == right_reasoning
+                    && left_calls.len() == right_calls.len()
+                    && left_calls.iter().zip(right_calls).all(|(left, right)| {
+                        left.id == right.id
+                            && left.name == right.name
+                            && left.arguments == right.arguments
+                            && left.extra_content == right.extra_content
+                    })
+            }
+            (
+                ConversationMessage::ToolResults(left_results),
+                ConversationMessage::ToolResults(right_results),
+            ) => {
+                left_results.len() == right_results.len()
+                    && left_results.iter().zip(right_results).all(|(left, right)| {
+                        left.tool_call_id == right.tool_call_id
+                            && left.content == right.content
+                            && left.tool_name == right.tool_name
+                    })
+            }
+            _ => false,
+        }
     }
 
     pub fn channel_handles(&self) -> &AgentChannelHandles {
@@ -2889,6 +3001,11 @@ impl Agent {
                 committed_response: String::new(),
                 new_messages: Vec::new(),
             });
+        }
+
+        #[cfg(test)]
+        if let Some(pause) = self.turn_entry_pause.clone() {
+            pause.wait().await;
         }
 
         // ── Preamble (identical to turn) ───────────────────────────────
@@ -7385,6 +7502,88 @@ mod tests {
     }
 
     #[test]
+    fn seed_conversation_history_skips_failed_turn_marker_from_provider_replay() {
+        use zeroclaw_api::model_provider::{ToolCall, ToolResultMessage};
+
+        let provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![]),
+        });
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        // The durable shape a failed turn leaves behind: prompt, complete
+        // tool exchange, fixed system marker. The marker must be dropped
+        // from live history (the system prompt is rebuilt fresh) while the
+        // complete pair survives intact for the next provider request.
+        let messages = vec![
+            ConversationMessage::Chat(ChatMessage::user("write the file")),
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "tc-1".into(),
+                    name: "shell".into(),
+                    arguments: r#"{"command":"ls"}"#.into(),
+                    extra_content: None,
+                }],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "tc-1".into(),
+                content: "ok".into(),
+                tool_name: "shell".into(),
+            }]),
+            ConversationMessage::Chat(ChatMessage::system(
+                zeroclaw_infra::acp_session_store::FAILED_TURN_MARKER,
+            )),
+        ];
+
+        agent.seed_conversation_history(messages);
+
+        let non_system: Vec<_> = agent
+            .history()
+            .iter()
+            .filter(|m| !matches!(m, ConversationMessage::Chat(c) if c.role == "system"))
+            .collect();
+
+        assert_eq!(
+            non_system.len(),
+            3,
+            "prompt + tool call + tool result; the marker row must not \
+             become a provider-replay message"
+        );
+        assert!(matches!(
+            non_system[0],
+            ConversationMessage::Chat(c) if c.role == "user"
+        ));
+        assert!(
+            matches!(non_system[1], ConversationMessage::AssistantToolCalls { tool_calls, .. } if tool_calls[0].id == "tc-1")
+        );
+        assert!(
+            matches!(non_system[2], ConversationMessage::ToolResults(r) if r[0].tool_call_id == "tc-1")
+        );
+    }
+
+    #[test]
     fn seed_history_trims_over_cap_restore_and_returns_transport_event() {
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
@@ -8457,6 +8656,35 @@ mod tests {
             .structured_max_history_messages(max_history_messages)
             .build()
             .expect("agent builder should succeed with valid config")
+    }
+
+    #[test]
+    fn replace_history_suffix_is_atomic_on_structural_mismatch() {
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = trim_history_test_agent(32, observer);
+        agent.history = vec![
+            ConversationMessage::Chat(ChatMessage::user("old")),
+            ConversationMessage::Chat(ChatMessage::assistant("finished")),
+        ];
+        let expected = agent.history[1..].to_vec();
+        let replacement = vec![ConversationMessage::Chat(ChatMessage::assistant("safe"))];
+
+        assert!(agent.replace_history_suffix(&expected, replacement.clone()));
+        assert!(matches!(
+            agent.history.last(),
+            Some(ConversationMessage::Chat(message)) if message.content == "safe"
+        ));
+
+        let before = agent.history.clone();
+        assert!(!agent.replace_history_suffix(
+            &[ConversationMessage::Chat(ChatMessage::assistant("wrong"))],
+            vec![ConversationMessage::Chat(ChatMessage::assistant("partial"))],
+        ));
+        assert_eq!(
+            serde_json::to_value(&agent.history).unwrap(),
+            serde_json::to_value(&before).unwrap(),
+            "a mismatch must not partially mutate"
+        );
     }
 
     fn seed_old_trim_test_turn(agent: &mut Agent) {
