@@ -343,7 +343,6 @@ struct GitStatusUpdate {
 /// picker swaps to the populated list (or surfaces an error) on the draw loop.
 struct ModelFetchResult {
     session_id: String,
-    family: String,
     model_provider_ref: String,
     models: Vec<String>,
     current: Option<String>,
@@ -3851,10 +3850,10 @@ impl Chat {
         })
     }
 
-    /// Fetch the model catalog for a model_provider family. Returns an empty vec
+    /// Fetch the model catalog for the full model_provider reference. Returns an empty vec
     /// on failure; the caller surfaces the error on the info bar.
-    async fn fetch_models(rpc: &RpcClient, family: &str) -> Vec<String> {
-        match rpc.catalog_models(family).await {
+    async fn fetch_models(rpc: &RpcClient, model_provider_ref: &str) -> Vec<String> {
+        match rpc.catalog_models(model_provider_ref).await {
             Ok(res) => res.models,
             Err(_) => Vec::new(),
         }
@@ -3878,14 +3877,8 @@ impl Chat {
             state.mark_dirty_full();
             return;
         };
-        let family = model_provider_ref
-            .split('.')
-            .next()
-            .unwrap_or(&model_provider_ref)
-            .to_string();
-
         // Warm cache: open immediately, no fetch, no loading state.
-        if state.input_bar.model_catalog_provider() == Some(family.as_str())
+        if state.input_bar.model_catalog_provider() == Some(model_provider_ref.as_str())
             && !state.input_bar.model_catalog().is_empty()
         {
             let models = state.input_bar.model_catalog().to_vec();
@@ -3914,19 +3907,17 @@ impl Chat {
         let rpc = rpc.clone();
         let tx = model_fetch_tx.clone();
         let session_id = state.session_id.clone();
-        let model_provider_ref_c = model_provider_ref.clone();
         let session_model = state.model.clone();
         tokio::spawn(async move {
-            let models = Self::fetch_models(&rpc, &family).await;
+            let models = Self::fetch_models(&rpc, &model_provider_ref).await;
             let current = match session_model {
                 Some(m) => Some(m),
-                None => Self::configured_model(&rpc, &model_provider_ref_c).await,
+                None => Self::configured_model(&rpc, &model_provider_ref).await,
             };
             let _ = tx
                 .send(ModelFetchResult {
                     session_id,
-                    family,
-                    model_provider_ref: model_provider_ref_c,
+                    model_provider_ref,
                     models,
                     current,
                 })
@@ -3958,12 +3949,11 @@ impl Chat {
         }
         state
             .input_bar
-            .set_model_catalog(res.family, res.models.clone());
+            .set_model_catalog(res.model_provider_ref, res.models.clone());
         state.model_picker = ModelPickerOverlay::Model(crate::widgets::PickerState::new(
             res.models,
             res.current.as_deref(),
         ));
-        let _ = res.model_provider_ref;
         state.info_message = None;
         state.mark_dirty_full();
     }
@@ -12330,6 +12320,52 @@ mod tests {
     fn model_picker_overlay_default_is_closed() {
         let s = state();
         assert!(!s.model_picker.is_open());
+    }
+
+    #[tokio::test]
+    async fn model_picker_catalog_preserves_provider_alias_and_isolates_cache() {
+        let (tx, mut requests) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(rpc.clone()));
+        let mut chat = Chat::new(client.clone(), PaneKind::Chat);
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        let (results_tx, mut results_rx) = mpsc::channel(1);
+
+        for provider in ["custom.first", "custom.second", "anthropic.work"] {
+            let model = format!("{provider}-model");
+            let active = active_state(&mut chat);
+            active.model_provider_ref = Some(provider.to_string());
+            active.model = Some(model.clone());
+            Chat::open_model_picker(&client, &results_tx, active).await;
+            assert!(matches!(active.model_picker, ModelPickerOverlay::Loading));
+
+            let request = next_rpc_request(&mut requests, "catalog request expected").await;
+            assert_eq!(request["method"], "config/catalog-models");
+            assert_eq!(request["params"]["model_provider"], provider);
+            respond_ok(
+                &rpc,
+                &request,
+                serde_json::json!({ "models": [model.clone()] }),
+            );
+            let result = tokio::time::timeout(Duration::from_secs(2), results_rx.recv())
+                .await
+                .expect("catalog response should complete")
+                .expect("catalog result channel should remain open");
+            chat.apply_model_fetch(result);
+
+            let active = active_state(&mut chat);
+            assert_eq!(active.input_bar.model_catalog_provider(), Some(provider));
+            assert_eq!(active.input_bar.model_catalog(), &[model]);
+            assert!(matches!(active.model_picker, ModelPickerOverlay::Model(_)));
+            active.model_picker = ModelPickerOverlay::None;
+            Chat::open_model_picker(&client, &results_tx, active).await;
+            assert!(matches!(active.model_picker, ModelPickerOverlay::Model(_)));
+            assert!(
+                requests.try_recv().is_err(),
+                "same alias should reuse its catalog"
+            );
+            active.model_picker = ModelPickerOverlay::None;
+        }
     }
 
     #[test]
