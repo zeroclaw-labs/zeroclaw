@@ -649,6 +649,24 @@ rpc_type! {
 }
 
 rpc_type! {
+    /// An ordered batch of `config/set` entries committed as one unit: every
+    /// entry is staged on a single working copy in order (a later entry for
+    /// the same prop wins), and the result is saved and installed once, or
+    /// not at all. Must contain at least one entry.
+    pub struct ConfigSetManyParams {
+        pub sets: Vec<ConfigSetParams>,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigSetManyResult {
+        /// The props written, in request order.
+        pub props: Vec<String>,
+        pub set: bool,
+    }
+}
+
+rpc_type! {
     pub struct ConfigValidateResult {
         pub valid: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
