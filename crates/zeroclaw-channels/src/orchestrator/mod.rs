@@ -28709,6 +28709,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     model: Some("claude-sonnet-4-5".into()),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
         picker_config.agents.insert(

@@ -9037,6 +9037,7 @@ mod tests {
                     model: Some("claude-sonnet".to_string()),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
         config.agents.insert(
