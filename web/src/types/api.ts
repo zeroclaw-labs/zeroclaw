@@ -262,9 +262,12 @@ export interface WsMessage {
   reason?: string;
   // Context window info (present on "done" frames). See #7311.
   max_context_tokens?: number;
+  model_context_window?: number;
   input_tokens?: number;
   output_tokens?: number;
-  last_input_tokens?: number;
+  // Emitted as JSON null when the accepted call reports no usage (stale
+  // route protection); consumers must branch on null, not undefined.
+  last_input_tokens?: number | null;
 }
 
 export type ApprovalDecision = "approve" | "deny" | "always";

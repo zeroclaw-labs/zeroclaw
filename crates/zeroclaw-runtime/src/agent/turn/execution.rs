@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use zeroclaw_api::model_provider::{ChatRequest, ChatResponse, SemanticEmptyTerminalCompletion};
 use zeroclaw_config::schema::{MultimodalConfig, PacingConfig};
-use zeroclaw_providers::dispatch::with_exact_dispatch_route;
+use zeroclaw_providers::dispatch::{AccountedAttempt, with_exact_dispatch_route};
 use zeroclaw_providers::{ModelProvider, ProviderDispatch, multimodal};
 
 use super::{LoopKnobs, ModelSwitchCallback};
@@ -26,8 +26,48 @@ pub struct ResolvedModelAccess<'a> {
     pub temperature: Option<f64>,
 }
 
+/// Owned per-attempt usage summary for a finished `run_model_query` call.
+/// The seam settles costs but owns no event sink, so callers that do (the
+/// max-iteration summary path) project these as `TurnEvent::Usage` to keep
+/// the gateway ledger complete.
+#[derive(Debug, Clone)]
+pub struct SettledAttemptSummary {
+    pub provider_ref: String,
+    pub model: String,
+    pub input_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cost_usd: Option<f64>,
+    pub accepted: bool,
+}
+
+/// Append summaries for the billable subset of `attempts` as rejected
+/// (`accepted: false`) leaves. Costs are computed without touching the
+/// accumulators — the caller already settled them.
+fn extend_rejected_summaries(out: &mut Vec<SettledAttemptSummary>, attempts: &[AccountedAttempt]) {
+    for billable in crate::agent::cost::billable_provider_attempts(attempts) {
+        out.push(SettledAttemptSummary {
+            provider_ref: billable.attempt.provider_ref().to_string(),
+            model: billable.attempt.model().to_string(),
+            input_tokens: billable.usage.input_tokens,
+            cached_input_tokens: billable.usage.cached_input_tokens,
+            output_tokens: billable.usage.output_tokens,
+            cost_usd: crate::agent::cost::compute_cost_usd(
+                billable.attempt.provider_ref(),
+                billable.attempt.model(),
+                billable.usage,
+            ),
+            accepted: false,
+        });
+    }
+}
+
 impl ResolvedModelAccess<'_> {
-    pub async fn run_model_query(&self, request: ChatRequest<'_>) -> anyhow::Result<ChatResponse> {
+    pub async fn run_model_query(
+        &self,
+        request: ChatRequest<'_>,
+        settled_out: &mut Vec<SettledAttemptSummary>,
+    ) -> anyhow::Result<ChatResponse> {
         // Fail closed before spending a provider call when the enclosing turn's
         // cost budget is already exhausted. No-op when unscoped.
         crate::agent::turn::provider_call::enforce_tool_loop_budget()?;
@@ -78,6 +118,7 @@ impl ResolvedModelAccess<'_> {
                 // cause to every one-shot caller.
                 if response.is_semantically_empty_terminal() {
                     crate::agent::cost::settle_provider_attempts(attempts, None);
+                    extend_rejected_summaries(settled_out, attempts);
                     return Err(anyhow::Error::new(SemanticEmptyTerminalCompletion));
                 }
                 zeroclaw_providers::dispatch::commit_accepted_provider_route(accepted_route);
@@ -85,19 +126,43 @@ impl ResolvedModelAccess<'_> {
                     &attempts[..attempts.len().saturating_sub(1)],
                     None,
                 );
+                extend_rejected_summaries(
+                    settled_out,
+                    &attempts[..attempts.len().saturating_sub(1)],
+                );
                 // Only a semantically valid result controls accepted context
                 // usage and successful response telemetry.
-                if let Some(usage) = response.usage.as_ref() {
+                let accepted_cost_usd = response.usage.as_ref().and_then(|usage| {
                     crate::agent::cost::record_tool_loop_cost_usage(
                         &served_provider,
                         &served_model,
                         usage,
-                    );
-                }
+                    )
+                    .map(|(_, cost_usd)| cost_usd)
+                });
+                // The accepted leaf is always projected (even usage-less, so
+                // terminal identity stays coherent); the caller emits it with
+                // `accepted: true`.
+                settled_out.push(SettledAttemptSummary {
+                    provider_ref: served_provider,
+                    model: served_model,
+                    input_tokens: response.usage.as_ref().and_then(|usage| usage.input_tokens),
+                    cached_input_tokens: response
+                        .usage
+                        .as_ref()
+                        .and_then(|usage| usage.cached_input_tokens),
+                    output_tokens: response
+                        .usage
+                        .as_ref()
+                        .and_then(|usage| usage.output_tokens),
+                    cost_usd: accepted_cost_usd,
+                    accepted: true,
+                });
                 Ok(response)
             }
             Err(error) => {
                 crate::agent::cost::settle_provider_attempts(attempts, None);
+                extend_rejected_summaries(settled_out, attempts);
                 Err(error)
             }
         }
@@ -391,11 +456,14 @@ mod run_model_query_tests {
         let provider = UsageProvider;
         let messages = [ChatMessage::user("hi")];
         let resp = access(&provider)
-            .run_model_query(ChatRequest {
-                messages: &messages,
-                tools: None,
-                thinking: None,
-            })
+            .run_model_query(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                &mut Vec::new(),
+            )
             .await
             .expect("query ok");
         assert_eq!(resp.text.as_deref(), Some("ok"));
@@ -414,11 +482,14 @@ mod run_model_query_tests {
         let resp = TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(Some(ctx), async {
                 access(&provider)
-                    .run_model_query(ChatRequest {
-                        messages: &messages,
-                        tools: None,
-                        thinking: None,
-                    })
+                    .run_model_query(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        &mut Vec::new(),
+                    )
                     .await
             })
             .await
@@ -449,6 +520,7 @@ mod run_model_query_tests {
         let ctx = ToolLoopCostTrackingContext::usage_only();
         let turn_usage = Arc::clone(&ctx.turn_usage);
 
+        let mut summaries = Vec::new();
         let response = TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(Some(ctx), async {
                 ResolvedModelAccess {
@@ -457,11 +529,14 @@ mod run_model_query_tests {
                     model: "test-model",
                     temperature: None,
                 }
-                .run_model_query(ChatRequest {
-                    messages: &messages,
-                    tools: None,
-                    thinking: None,
-                })
+                .run_model_query(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    &mut summaries,
+                )
                 .await
             })
             .await
@@ -476,6 +551,15 @@ mod run_model_query_tests {
         assert_eq!(recorded.input_tokens, 160);
         assert_eq!(recorded.output_tokens, 12);
         assert_eq!(recorded.last_input_tokens, 80);
+        // The summary projects exactly what the gateway ledger needs: the
+        // rejected first attempt plus the accepted second attempt.
+        assert_eq!(summaries.len(), 2);
+        assert!(!summaries[0].accepted);
+        assert_eq!(summaries[0].input_tokens, Some(80));
+        assert_eq!(summaries[0].output_tokens, Some(5));
+        assert!(summaries[1].accepted);
+        assert_eq!(summaries[1].input_tokens, Some(80));
+        assert_eq!(summaries[1].output_tokens, Some(7));
     }
 
     #[tokio::test]
@@ -496,6 +580,7 @@ mod run_model_query_tests {
         let ctx = ToolLoopCostTrackingContext::usage_only();
         let turn_usage = Arc::clone(&ctx.turn_usage);
 
+        let mut summaries = Vec::new();
         let error = TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(Some(ctx), async {
                 ResolvedModelAccess {
@@ -504,11 +589,14 @@ mod run_model_query_tests {
                     model: "test-model",
                     temperature: None,
                 }
-                .run_model_query(ChatRequest {
-                    messages: &messages,
-                    tools: None,
-                    thinking: None,
-                })
+                .run_model_query(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    &mut summaries,
+                )
                 .await
                 .expect_err("semantic-empty exhaustion must fail")
             })
@@ -523,6 +611,12 @@ mod run_model_query_tests {
         assert_eq!(recorded.input_tokens, 80);
         assert_eq!(recorded.output_tokens, 5);
         assert_eq!(recorded.last_input_tokens, 0);
+        // Exhaustion still yields a projectable rejected summary so terminal
+        // exits keep the ledger complete.
+        assert_eq!(summaries.len(), 1);
+        assert!(!summaries[0].accepted);
+        assert_eq!(summaries[0].input_tokens, Some(80));
+        assert_eq!(summaries[0].output_tokens, Some(5));
     }
 
     #[tokio::test]
@@ -547,11 +641,14 @@ mod run_model_query_tests {
             let error = TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(Some(ctx), async {
                     direct_access(&provider)
-                        .run_model_query(ChatRequest {
-                            messages: &messages,
-                            tools: None,
-                            thinking: None,
-                        })
+                        .run_model_query(
+                            ChatRequest {
+                                messages: &messages,
+                                tools: None,
+                                thinking: None,
+                            },
+                            &mut Vec::new(),
+                        )
                         .await
                         .expect_err("direct semantic-empty response must fail")
                 })
@@ -596,11 +693,14 @@ mod run_model_query_tests {
         let response = TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(Some(ctx), async {
                 direct_access(&provider)
-                    .run_model_query(ChatRequest {
-                        messages: &messages,
-                        tools: None,
-                        thinking: None,
-                    })
+                    .run_model_query(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        &mut Vec::new(),
+                    )
                     .await
             })
             .await

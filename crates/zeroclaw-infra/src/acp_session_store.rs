@@ -749,6 +749,47 @@ impl AcpSessionStore {
         Ok(())
     }
 
+    /// Clear the durable token snapshot back to the schema's unknown
+    /// representation (0). Used when an accepted turn attempt serves a route
+    /// without token usage: the prior snapshot must not survive, mirroring
+    /// the client-side meter which clears on accepted usage-less events.
+    pub fn clear_token_count(&self, session_uuid: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        let rows = conn
+            .execute(
+                "UPDATE acp_sessions SET token_count = 0 WHERE session_uuid = ?1",
+                params![session_uuid],
+            )
+            .context("Failed to clear token_count")?;
+        if rows == 0 {
+            return Err(anyhow::Error::msg(format!(
+                "clear_token_count: no session with uuid {session_uuid}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Apply a `TurnEvent::Usage` to the durable token snapshot. Accepted
+    /// events with usage overwrite it; accepted usage-less events clear it
+    /// back to unknown (0) so a resumed session never replays a stale
+    /// route's count; rejected billing telemetry never touches the store.
+    /// Both durable consumers (ACP server, RPC dispatch) route through here
+    /// so the accepted-gate cannot drift between paths.
+    pub fn persist_usage_snapshot(
+        &self,
+        session_uuid: &str,
+        input_tokens: Option<u64>,
+        accepted: bool,
+    ) -> Result<()> {
+        if !accepted {
+            return Ok(());
+        }
+        match input_tokens {
+            Some(v) => self.set_token_count(session_uuid, v),
+            None => self.clear_token_count(session_uuid),
+        }
+    }
+
     /// Persist the session's latest TodoWrite plan as a JSON array of
     /// `PlanEntry` (whole-list replace). An empty slice stores an empty
     /// array (a cleared plan), distinct from SQL NULL (never had one).
@@ -1474,6 +1515,78 @@ mod tests {
         assert!(
             err.to_string().contains("nonexistent"),
             "error must name the missing session_uuid; got: {err}"
+        );
+    }
+
+    #[test]
+    fn clear_token_count_resets_snapshot_to_unknown() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-clr", "alpha", "/tmp/proj")
+            .unwrap();
+        store.set_token_count("sess-clr", 152_306).unwrap();
+        store.clear_token_count("sess-clr").unwrap();
+        assert_eq!(
+            store.load_session("sess-clr").unwrap().unwrap().token_count,
+            0,
+            "accepted usage-less call must clear the durable snapshot"
+        );
+    }
+
+    #[test]
+    fn clear_token_count_errors_on_unknown_session() {
+        let (_tmp, store) = open_store();
+        let err = store.clear_token_count("nonexistent").unwrap_err();
+        assert!(
+            err.to_string().contains("nonexistent"),
+            "error must name the missing session_uuid; got: {err}"
+        );
+    }
+
+    #[test]
+    fn persist_usage_snapshot_accepted_sequence_clears_on_missing() {
+        // Accepted A with usage, then accepted B without: the durable
+        // snapshot must clear, not retain A's count.
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-seq", "alpha", "/tmp/proj")
+            .unwrap();
+        store
+            .persist_usage_snapshot("sess-seq", Some(1000), true)
+            .unwrap();
+        assert_eq!(
+            store.load_session("sess-seq").unwrap().unwrap().token_count,
+            1000
+        );
+        store
+            .persist_usage_snapshot("sess-seq", None, true)
+            .unwrap();
+        assert_eq!(
+            store.load_session("sess-seq").unwrap().unwrap().token_count,
+            0,
+            "accepted usage-less call must clear the durable snapshot"
+        );
+    }
+
+    #[test]
+    fn persist_usage_snapshot_rejected_never_touches_store() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-rej", "alpha", "/tmp/proj")
+            .unwrap();
+        store
+            .persist_usage_snapshot("sess-rej", Some(1000), true)
+            .unwrap();
+        store
+            .persist_usage_snapshot("sess-rej", Some(5000), false)
+            .unwrap();
+        store
+            .persist_usage_snapshot("sess-rej", None, false)
+            .unwrap();
+        assert_eq!(
+            store.load_session("sess-rej").unwrap().unwrap().token_count,
+            1000,
+            "rejected billing telemetry is billing-only"
         );
     }
 

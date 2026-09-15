@@ -15405,10 +15405,192 @@ Let me check the result."#;
                 _ => {}
             }
         }
-        assert_eq!(usage_events, vec![(Some(80), Some(7))]);
+        // Both the rejected attempt (80 in, 5 out) and the accepted attempt
+        // (80 in, 7 out) now emit Usage events.
+        assert_eq!(usage_events, vec![(Some(80), Some(5)), (Some(80), Some(7))]);
         assert!(
             !history_trimmed,
             "recovered rejected usage must not trim history"
+        );
+    }
+
+    /// A malformed-protocol iteration settles billable attempts and retries
+    /// with a fresh vec: the gateway ledger must still see the rejected
+    /// attempt. Regression for the rejected-projection gap on the
+    /// malformed-retry path (the error-recovery path shares the helper).
+    #[tokio::test]
+    async fn malformed_retry_projects_rejected_usage_before_accepted_response() {
+        use super::{
+            TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoop, ToolLoopCostTrackingContext,
+            run_tool_call_loop,
+        };
+        use zeroclaw_api::agent::TurnEvent;
+        use zeroclaw_providers::reliable::ReliableModelProvider;
+
+        struct ShellProbeTool;
+        zeroclaw_api::tool_attribution!(
+            ShellProbeTool,
+            ::zeroclaw_api::attribution::ToolKind::Plugin
+        );
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for ShellProbeTool {
+            fn name(&self) -> &str {
+                "shell"
+            }
+            fn description(&self) -> &str {
+                "probe tool"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(
+                &self,
+                _args: serde_json::Value,
+            ) -> anyhow::Result<crate::tools::ToolResult> {
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: "ok".into(),
+                    error: None,
+                })
+            }
+        }
+
+        // Body is broken JSON naming an unknown tool: no parser fallback can
+        // produce a valid call from it (so the iteration can never execute),
+        // while the `<tool_call>` envelope shape unconditionally flags a
+        // parse issue regardless of the known-tool set.
+        let malformed = ChatResponse {
+            text: Some(
+                "<tool_call>{\"name\": \"nonexistent_tool_xyz\", BROKEN!!!</tool_call>".to_string(),
+            ),
+            tool_calls: Vec::new(),
+            usage: Some(zeroclaw_providers::traits::TokenUsage {
+                input_tokens: Some(60),
+                output_tokens: Some(4),
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
+            }),
+            reasoning_content: None,
+        };
+        let accepted = ChatResponse {
+            text: Some("accepted response".to_string()),
+            tool_calls: Vec::new(),
+            usage: Some(zeroclaw_providers::traits::TokenUsage {
+                input_tokens: Some(80),
+                output_tokens: Some(7),
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
+            }),
+            reasoning_content: None,
+        };
+        let provider = ReliableModelProvider::new(
+            "reliable-test",
+            vec![(
+                "scripted".to_string(),
+                Box::new(ScriptedModelProvider {
+                    responses: Arc::new(Mutex::new(VecDeque::from([malformed, accepted]))),
+                    capabilities: ProviderCapabilities::default(),
+                }) as Box<dyn ModelProvider>,
+            )],
+            1,
+            1,
+        );
+        let observer = CapturingObserver::default();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let usage_ctx = ToolLoopCostTrackingContext::usage_only();
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("earlier question"),
+            ChatMessage::assistant("earlier answer"),
+            ChatMessage::user("current question"),
+        ];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                ShellProbeTool,
+            )
+                as Box<dyn crate::tools::Tool>]);
+
+        let result = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(usage_ctx.clone()),
+                run_tool_call_loop(ToolLoop {
+                    parent_agent_alias: None,
+                    sop_reassembly: None,
+                    exec: ResolvedAgentExecution {
+                        model_access: ResolvedModelAccess {
+                            model_provider: &provider,
+                            provider_name: "reliable-test",
+                            model: "test-model",
+                            temperature: Some(0.0),
+                        },
+                        tools_registry: &tools_registry,
+                        observer: &observer,
+                        silent: true,
+                        approval: None,
+                        multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                        config: None,
+                        max_tool_iterations: 2,
+                        hooks: None,
+                        excluded_tools: &[],
+                        dedup_exempt_tools: &[],
+                        activated_tools: None,
+                        model_switch_callback: None,
+                        pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                        strict_tool_parsing: false,
+                        parallel_tools: false,
+                        max_tool_result_chars: 0,
+                        context_token_budget: 100,
+                        receipt_generator: None,
+                        knobs: &LoopKnobs::default(),
+                    },
+                    history: &mut history,
+                    channel_name: "test",
+                    channel_reply_target: None,
+                    cancellation_token: None,
+                    on_delta: None,
+                    shared_budget: None,
+                    channel: None,
+                    collected_receipts: None,
+                    event_tx: Some(event_tx),
+                    steering: None,
+                    new_messages_out: None,
+                    image_cache: None,
+                    memory: None,
+                    ingress: IngressContext::sub_turn(),
+                    agent_alias: None,
+                    turn_id: "malformed-usage-test",
+                }),
+            )
+            .await
+            .expect("malformed retry should recover into the accepted response");
+
+        assert_eq!(result, "accepted response");
+        let usage = usage_ctx.snapshot_turn_usage();
+        assert_eq!(usage.input_tokens, 140, "both billed attempts are retained");
+        assert_eq!(usage.output_tokens, 11);
+        assert_eq!(
+            usage.last_input_tokens, 80,
+            "only the accepted response may set the context-window fill"
+        );
+
+        let mut usage_events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let TurnEvent::Usage {
+                input_tokens,
+                output_tokens,
+                accepted,
+                ..
+            } = event
+            {
+                usage_events.push((input_tokens, output_tokens, accepted));
+            }
+        }
+        // The malformed iteration's billable attempt (60 in, 4 out) is
+        // projected as rejected even though its iteration never accepted,
+        // followed by the accepted attempt (80 in, 7 out).
+        assert_eq!(
+            usage_events,
+            vec![(Some(60), Some(4), false), (Some(80), Some(7), true),]
         );
     }
 
