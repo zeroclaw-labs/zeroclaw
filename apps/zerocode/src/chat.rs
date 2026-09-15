@@ -343,10 +343,10 @@ struct GitStatusUpdate {
 /// picker swaps to the populated list (or surfaces an error) on the draw loop.
 struct ModelFetchResult {
     session_id: String,
-    family: String,
     model_provider_ref: String,
     models: Vec<String>,
     current: Option<String>,
+    error: Option<String>,
 }
 
 /// Completion of a background lost-session re-attachment. The message queue
@@ -3851,13 +3851,17 @@ impl Chat {
         })
     }
 
-    /// Fetch the model catalog for a model_provider family. Returns an empty vec
-    /// on failure; the caller surfaces the error on the info bar.
-    async fn fetch_models(rpc: &RpcClient, family: &str) -> Vec<String> {
-        match rpc.catalog_models(family).await {
-            Ok(res) => res.models,
-            Err(_) => Vec::new(),
-        }
+    /// Fetch the model catalog for a configured model_provider reference while
+    /// preserving an actionable RPC diagnostic separately from a successful
+    /// empty catalog.
+    async fn fetch_models(
+        rpc: &RpcClient,
+        model_provider_ref: &str,
+    ) -> Result<Vec<String>, String> {
+        rpc.catalog_models(model_provider_ref)
+            .await
+            .map(|res| res.models)
+            .map_err(|error| error.to_string())
     }
 
     /// Open the single-stage model picker for the active agent's model_provider,
@@ -3878,14 +3882,9 @@ impl Chat {
             state.mark_dirty_full();
             return;
         };
-        let family = model_provider_ref
-            .split('.')
-            .next()
-            .unwrap_or(&model_provider_ref)
-            .to_string();
-
-        // Warm cache: open immediately, no fetch, no loading state.
-        if state.input_bar.model_catalog_provider() == Some(family.as_str())
+        // The full configured reference is the cache identity: two aliases in
+        // one family may have different endpoints, headers, and catalogs.
+        if state.input_bar.model_catalog_provider() == Some(model_provider_ref.as_str())
             && !state.input_bar.model_catalog().is_empty()
         {
             let models = state.input_bar.model_catalog().to_vec();
@@ -3917,18 +3916,26 @@ impl Chat {
         let model_provider_ref_c = model_provider_ref.clone();
         let session_model = state.model.clone();
         tokio::spawn(async move {
-            let models = Self::fetch_models(&rpc, &family).await;
-            let current = match session_model {
-                Some(m) => Some(m),
-                None => Self::configured_model(&rpc, &model_provider_ref_c).await,
+            let catalog = Self::fetch_models(&rpc, &model_provider_ref_c).await;
+            let (models, error) = match catalog {
+                Ok(models) => (models, None),
+                Err(error) => (Vec::new(), Some(error)),
+            };
+            let current = if error.is_none() {
+                match session_model {
+                    Some(m) => Some(m),
+                    None => Self::configured_model(&rpc, &model_provider_ref_c).await,
+                }
+            } else {
+                None
             };
             let _ = tx
                 .send(ModelFetchResult {
                     session_id,
-                    family,
                     model_provider_ref: model_provider_ref_c,
                     models,
                     current,
+                    error,
                 })
                 .await;
         });
@@ -3948,6 +3955,15 @@ impl Chat {
         if !matches!(state.model_picker, ModelPickerOverlay::Loading) {
             return;
         }
+        if let Some(error) = res.error {
+            state.model_picker = ModelPickerOverlay::None;
+            state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t_args(
+                "zc-model-catalog-failed",
+                &[("error", &error)],
+            )));
+            state.mark_dirty_full();
+            return;
+        }
         if res.models.is_empty() {
             state.model_picker = ModelPickerOverlay::None;
             state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t(
@@ -3958,7 +3974,7 @@ impl Chat {
         }
         state
             .input_bar
-            .set_model_catalog(res.family, res.models.clone());
+            .set_model_catalog(res.model_provider_ref.clone(), res.models.clone());
         state.model_picker = ModelPickerOverlay::Model(crate::widgets::PickerState::new(
             res.models,
             res.current.as_deref(),
@@ -11573,18 +11589,6 @@ mod tests {
         );
     }
 
-    /// B1 risk #2, automated: a bounded-range off-by-one can still satisfy the
-    /// line-count assertions the other tests make, and would surface only as
-    /// mis-aimed clicks and wrong copy regions in a real terminal.
-    ///
-    /// This sweeps EVERY scroll offset over a wrapped history (prose plus code
-    /// fences) and pins the coordinate invariants that scrolling, bottom
-    /// anchoring, copy targets and `entry_rects` all read:
-    ///   1. the resolved entry range covers the whole viewport window, so no
-    ///      visible row is projected from outside the range;
-    ///   2. the line-level window covers the viewport and `local_scroll`
-    ///      indexes a real row of the slice;
-    ///   3. the materialized line count is exactly the resolved line window.
     #[test]
     fn visible_range_coordinate_invariants_hold_at_every_scroll_offset() {
         let mut s = state();
@@ -11683,6 +11687,64 @@ mod tests {
             .unwrap_or_else(|_| panic!("{reason}"))
             .expect("session reattach result channel should stay open");
         chat.apply_session_reattach_result(update);
+    }
+
+    #[tokio::test]
+    async fn model_picker_catalog_request_preserves_configured_hailo_alias() {
+        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(16);
+        let outbound = Arc::new(RpcOutbound::new(writer_tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
+        let mut active = state();
+        active.set_model_identity(Some("hailo_ollama.edge"), Some("edge-model"));
+
+        Chat::open_model_picker(&rpc, &fetch_tx, &mut active).await;
+        let request =
+            next_rpc_request(&mut writer_rx, "model picker should request a catalog").await;
+        assert_eq!(
+            request["method"],
+            crate::client::method::CONFIG_CATALOG_MODELS
+        );
+        assert_eq!(request["params"]["model_provider"], "hailo_ollama.edge");
+        respond_ok(
+            &outbound,
+            &request,
+            serde_json::json!({"models": ["edge-model"], "live": true}),
+        );
+        let fetched = fetch_rx.recv().await.expect("catalog result should arrive");
+        assert_eq!(fetched.model_provider_ref, "hailo_ollama.edge");
+        assert_eq!(fetched.models, vec!["edge-model"]);
+        assert!(fetched.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn model_picker_catalog_error_remains_distinct_from_empty_catalog() {
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        {
+            let active = active_state(&mut chat);
+            active.model_picker = ModelPickerOverlay::Loading;
+        }
+
+        chat.apply_model_fetch(ModelFetchResult {
+            session_id: "sess-1".to_string(),
+            model_provider_ref: "hailo_ollama.edge".to_string(),
+            models: Vec::new(),
+            current: None,
+            error: Some("HTTP 401 Unauthorized".to_string()),
+        });
+
+        let active = active_state(&mut chat);
+        assert!(matches!(active.model_picker, ModelPickerOverlay::None));
+        let message = active
+            .info_message
+            .as_ref()
+            .expect("catalog failure should surface an info-bar error");
+        assert!(
+            message.text.contains("401"),
+            "actionable catalog diagnostic was lost: {}",
+            message.text
+        );
+        assert_ne!(message.text, crate::i18n::t("zc-model-catalog-empty"));
     }
 
     #[test]
