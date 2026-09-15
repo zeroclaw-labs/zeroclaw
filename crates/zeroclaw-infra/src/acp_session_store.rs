@@ -139,6 +139,9 @@ impl AcpSessionStore {
         Self::ensure_interaction_surface_column(&conn)
             .context("Failed to migrate ACP session interaction surface")?;
 
+        Self::ensure_projected_message_count_column(&conn)
+            .context("Failed to migrate ACP session projected message count")?;
+
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -248,6 +251,98 @@ impl AcpSessionStore {
             }
             Err(e) => Err(e).context("Failed to add ACP session interaction surface"),
         }
+    }
+
+    /// One-statement backfill for `projected_message_count`, applied exactly
+    /// once when the column is added. Per session it counts the same entries
+    /// the runtime projection produces:
+    ///   - chat rows plus tool-call batch rows whose text is non-empty,
+    ///   - one entry per `event_kind = 'in'` tool-call row,
+    ///   - one orphan entry per `event_kind = 'out'` row that finds no
+    ///     unconsumed `'in'` row for its `tool_call_id` at its position.
+    const BACKFILL_PROJECTED_MESSAGE_COUNT_SQL: &str = "
+        WITH tool_rows AS (
+            SELECT m.session_id  AS sid,
+                   tc.event_kind AS ev,
+                   SUM(CASE WHEN tc.event_kind = 'in' THEN 1 ELSE 0 END)
+                     OVER (PARTITION BY tc.tool_call_id ORDER BY tc.id
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
+                     AS ins_before,
+                   SUM(CASE WHEN tc.event_kind = 'out' THEN 1 ELSE 0 END)
+                     OVER (PARTITION BY tc.tool_call_id ORDER BY tc.id
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
+                     AS outs_before
+            FROM acp_tool_calls tc
+            JOIN acp_messages m ON m.id = tc.message_id
+        )
+        UPDATE acp_sessions
+           SET projected_message_count =
+                 (SELECT COUNT(*)
+                    FROM acp_messages m
+                   WHERE m.session_id = acp_sessions.id
+                     AND NOT (m.content = ''
+                              AND EXISTS (SELECT 1
+                                            FROM acp_tool_calls tc
+                                           WHERE tc.message_id = m.id
+                                             AND tc.event_kind = 'in')))
+               + (SELECT COUNT(*)
+                    FROM acp_tool_calls tc
+                    JOIN acp_messages m ON m.id = tc.message_id
+                   WHERE m.session_id = acp_sessions.id
+                     AND tc.event_kind = 'in')
+               + (SELECT COUNT(*)
+                    FROM tool_rows tr
+                   WHERE tr.sid = acp_sessions.id
+                     AND tr.ev = 'out'
+                     AND COALESCE(tr.ins_before, 0) <= COALESCE(tr.outs_before, 0))";
+
+    /// Idempotent migration adding the persisted projected conversation-entry
+    /// count the session picker reports. `session/list-acp` must show the same
+    /// number `turn_end` reports for the same session, and deriving that
+    /// number from the message rows at read time is too expensive to run
+    /// under the store's connection mutex, so the count is stored on
+    /// `acp_sessions` and maintained by `append_turn`. Existing databases are
+    /// backfilled from the message rows exactly once, when the column is
+    /// added.
+    fn ensure_projected_message_count_column(conn: &Connection) -> Result<()> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(acp_sessions)")
+            .context("Failed to inspect ACP session schema")?;
+        let mut rows = stmt
+            .query([])
+            .context("Failed to read ACP session schema")?;
+        while let Some(row) = rows
+            .next()
+            .context("Failed to read ACP session schema row")?
+        {
+            let column: String = row
+                .get(1)
+                .context("Failed to read ACP session column name")?;
+            if column == "projected_message_count" {
+                return Ok(());
+            }
+        }
+        drop(rows);
+        drop(stmt);
+
+        match conn.execute(
+            "ALTER TABLE acp_sessions ADD COLUMN projected_message_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                if msg.contains("duplicate column name") =>
+            {
+                return Ok(());
+            }
+            Err(e) => return Err(e).context("Failed to add ACP session projected message count"),
+        }
+
+        // Only reached when the column was just added; re-opening an already
+        // migrated database must not rewrite live counters.
+        conn.execute(Self::BACKFILL_PROJECTED_MESSAGE_COUNT_SQL, [])
+            .context("Failed to backfill ACP session projected message count")?;
+        Ok(())
     }
 
     /// Record a new session. Returns the integer `id` assigned by SQLite.
@@ -436,7 +531,7 @@ impl AcpSessionStore {
                         s.token_count,
                         s.created_at,
                         s.last_activity,
-                        (SELECT COUNT(*) FROM acp_messages m WHERE m.session_id = s.id) AS message_count
+                        s.projected_message_count AS message_count
                  FROM acp_sessions s
                  WHERE s.killed_at IS NULL
                  ORDER BY s.last_activity DESC",
@@ -619,6 +714,10 @@ impl AcpSessionStore {
         // Track the most recent assistant message_id so a following
         // ToolResults variant can attach its 'out' rows back to it.
         let mut last_assistant_msg_id: Option<i64> = None;
+        // Persisted counter mirroring the runtime's projected conversation
+        // length: one entry per chat message, non-empty assistant text plus
+        // one per tool call, results folding into the call awaiting them.
+        let mut projected_increment: i64 = 0;
 
         for msg in messages {
             match msg {
@@ -630,6 +729,7 @@ impl AcpSessionStore {
                         params![session_id, chat.role, chat.content, now],
                     )
                     .context("Failed to insert chat message")?;
+                    projected_increment += 1;
                     if chat.role == "assistant" {
                         last_assistant_msg_id = Some(tx.last_insert_rowid());
                     }
@@ -639,6 +739,10 @@ impl AcpSessionStore {
                     tool_calls,
                     reasoning_content,
                 } => {
+                    if text.as_deref().is_some_and(|text| !text.is_empty()) {
+                        projected_increment += 1;
+                    }
+                    projected_increment += tool_calls.len() as i64;
                     tx.execute(
                         "INSERT INTO acp_messages
                            (session_id, role, content, reasoning_content, created_at)
@@ -703,6 +807,26 @@ impl AcpSessionStore {
                                 |row| row.get(0),
                             )
                             .unwrap_or_else(|_| String::from("unknown"));
+                        // A result folds into its call (no entry) while an
+                        // 'in' row for this tool_call_id is still unconsumed;
+                        // beyond that it is an orphan entry. The transaction
+                        // sees this turn's earlier 'out' rows, so duplicates
+                        // within and across turns fold correctly.
+                        let (in_rows, out_rows): (i64, i64) = tx
+                            .query_row(
+                                "SELECT
+                                    COALESCE(SUM(CASE WHEN tc.event_kind = 'in' THEN 1 ELSE 0 END), 0),
+                                    COALESCE(SUM(CASE WHEN tc.event_kind = 'out' THEN 1 ELSE 0 END), 0)
+                                 FROM acp_tool_calls tc
+                                 JOIN acp_messages m ON m.id = tc.message_id
+                                 WHERE m.session_id = ?1 AND tc.tool_call_id = ?2",
+                                params![session_id, result.tool_call_id],
+                                |row| Ok((row.get(0)?, row.get(1)?)),
+                            )
+                            .context("Failed to look up tool call availability")?;
+                        if in_rows <= out_rows {
+                            projected_increment += 1;
+                        }
                         tx.execute(
                             "INSERT INTO acp_tool_calls
                                (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
@@ -724,8 +848,11 @@ impl AcpSessionStore {
         }
 
         tx.execute(
-            "UPDATE acp_sessions SET last_activity = ?1 WHERE id = ?2",
-            params![now, session_id],
+            "UPDATE acp_sessions
+                SET last_activity = ?1,
+                    projected_message_count = projected_message_count + ?2
+              WHERE id = ?3",
+            params![now, projected_increment, session_id],
         )
         .context("Failed to update last_activity")?;
 
@@ -861,7 +988,7 @@ impl AcpSessionStore {
                         s.token_count,
                         s.created_at,
                         s.last_activity,
-                        (SELECT COUNT(*) FROM acp_messages m WHERE m.session_id = s.id) AS message_count
+                        s.projected_message_count AS message_count
                  FROM acp_sessions s
                  WHERE s.agent_alias = ?1
                  ORDER BY s.last_activity DESC",
@@ -904,6 +1031,24 @@ impl AcpSessionStore {
             });
         }
         Ok(out)
+    }
+
+    /// Persisted projected conversation-entry count for the session, the
+    /// same number the session picker lists and `turn_end` reports. Reading
+    /// it avoids hydrating the full message history that `load_session`
+    /// performs just to re-derive the count. `None` when the session UUID is
+    /// unknown.
+    pub fn projected_message_count(&self, session_uuid: &str) -> Result<Option<usize>> {
+        let conn = self.conn.lock();
+        let count: Option<i64> = conn
+            .query_row(
+                "SELECT projected_message_count FROM acp_sessions WHERE session_uuid = ?1",
+                params![session_uuid],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to query projected_message_count")?;
+        Ok(count.map(|n| n.max(0) as usize))
     }
 
     /// Delete every ACP session (live or killed) for `agent_alias`, returning the
@@ -1004,7 +1149,9 @@ fn parse_ts(s: &str, field: &'static str, session_uuid: &str) -> DateTime<Utc> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use zeroclaw_api::model_provider::{ChatMessage, ToolCall, ToolResultMessage};
+    use zeroclaw_api::model_provider::{
+        ChatMessage, ToolCall, ToolResultMessage, projected_entry_count,
+    };
 
     fn open_store() -> (TempDir, AcpSessionStore) {
         let tmp = TempDir::new().unwrap();
@@ -1553,6 +1700,288 @@ mod tests {
         let list = store.list_sessions().unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].session_uuid, "sess-live");
+    }
+
+    fn tool_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+            extra_content: None,
+        }
+    }
+
+    fn tool_result(id: &str) -> ToolResultMessage {
+        ToolResultMessage {
+            tool_call_id: id.to_string(),
+            content: "out".into(),
+            tool_name: "shell".into(),
+        }
+    }
+
+    fn assert_list_matches_projection(
+        store: &AcpSessionStore,
+        session_uuid: &str,
+        expected: usize,
+    ) {
+        let summary = &store
+            .list_sessions()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.session_uuid == session_uuid)
+            .unwrap_or_else(|| panic!("session {session_uuid} should be listed"));
+        let data = store.load_session(session_uuid).unwrap().unwrap();
+        assert_eq!(summary.message_count, expected, "session {session_uuid}");
+        assert_eq!(
+            summary.message_count,
+            projected_entry_count(&data.messages),
+            "session {session_uuid} persisted count must match the projection"
+        );
+    }
+
+    #[test]
+    fn list_sessions_message_count_matches_projection_after_mixed_writes() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-mixed", "alpha", "/tmp/mixed")
+            .unwrap();
+
+        // Chat only.
+        store
+            .append_turn(
+                "sess-mixed",
+                &[ConversationMessage::Chat(ChatMessage::user("hi"))],
+            )
+            .unwrap();
+        assert_list_matches_projection(&store, "sess-mixed", 1);
+
+        // One batch of 3 calls with text: text + 3 calls = +4. Results come
+        // in a later turn so the cross-turn fold is exercised there.
+        store
+            .append_turn(
+                "sess-mixed",
+                &[ConversationMessage::AssistantToolCalls {
+                    text: Some("inspecting".into()),
+                    tool_calls: vec![tool_call("a"), tool_call("b"), tool_call("c")],
+                    reasoning_content: None,
+                }],
+            )
+            .unwrap();
+        assert_list_matches_projection(&store, "sess-mixed", 5);
+
+        // One batch of 2 calls with empty text: calls only = +2.
+        store
+            .append_turn(
+                "sess-mixed",
+                &[ConversationMessage::AssistantToolCalls {
+                    text: Some(String::new()),
+                    tool_calls: vec![tool_call("d"), tool_call("e")],
+                    reasoning_content: None,
+                }],
+            )
+            .unwrap();
+        assert_list_matches_projection(&store, "sess-mixed", 7);
+
+        // Results folding into the same-turn call ("f") and into calls
+        // written in PREVIOUS append_turns ("a", "b", "c"): only the new
+        // call adds an entry.
+        store
+            .append_turn(
+                "sess-mixed",
+                &[
+                    ConversationMessage::AssistantToolCalls {
+                        text: None,
+                        tool_calls: vec![tool_call("f")],
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::ToolResults(vec![
+                        tool_result("f"),
+                        tool_result("a"),
+                        tool_result("b"),
+                        tool_result("c"),
+                    ]),
+                ],
+            )
+            .unwrap();
+        assert_list_matches_projection(&store, "sess-mixed", 8);
+
+        // An orphan result (no call was ever written for it) counts as its
+        // own entry on top of the same-turn call; the unconsumed previous
+        // turn's call ("d") still folds.
+        store
+            .append_turn(
+                "sess-mixed",
+                &[
+                    ConversationMessage::AssistantToolCalls {
+                        text: None,
+                        tool_calls: vec![tool_call("g")],
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::ToolResults(vec![
+                        tool_result("g"),
+                        tool_result("d"),
+                        tool_result("orphan"),
+                    ]),
+                ],
+            )
+            .unwrap();
+        assert_list_matches_projection(&store, "sess-mixed", 10);
+    }
+
+    #[test]
+    fn migration_backfills_projected_message_count_from_existing_rows() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("sessions").join("acp-sessions.db");
+        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+
+        // A pre-migration database: current tables, no projected counter.
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE acp_sessions (
+                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_uuid  TEXT NOT NULL UNIQUE,
+                 agent_alias   TEXT NOT NULL,
+                 workspace_dir TEXT NOT NULL,
+                 interaction_surface TEXT,
+                 token_count   INTEGER NOT NULL DEFAULT 0,
+                 killed_at     TEXT,
+                 created_at    TEXT NOT NULL,
+                 last_activity TEXT NOT NULL
+             );
+             CREATE TABLE acp_messages (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id  INTEGER NOT NULL REFERENCES acp_sessions(id) ON DELETE CASCADE,
+                 role        TEXT NOT NULL,
+                 content     TEXT NOT NULL,
+                 reasoning_content TEXT,
+                 created_at  TEXT NOT NULL
+             );
+             CREATE TABLE acp_tool_calls (
+                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                 message_id   INTEGER NOT NULL REFERENCES acp_messages(id) ON DELETE CASCADE,
+                 tool_call_id TEXT NOT NULL,
+                 tool_name    TEXT NOT NULL,
+                 event_kind   TEXT NOT NULL,
+                 payload      TEXT NOT NULL,
+                 outcome      TEXT,
+                 created_at   TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+
+        // Session 1: chat (1), batch with text + 2 calls (3), results fold.
+        conn.execute(
+            "INSERT INTO acp_sessions
+               (session_uuid, agent_alias, workspace_dir, token_count, created_at, last_activity)
+             VALUES ('old-full', 'alpha', '/tmp/a', 0, 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (1, 'user', 'hi', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (1, 'assistant', 'working', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, created_at)
+             VALUES (2, 'x', 'shell', 'in', '{}', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, created_at)
+             VALUES (2, 'y', 'read', 'in', '{}', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (2, 'x', 'shell', 'out', '/tmp', 'unknown', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (2, 'y', 'read', 'out', 'data', 'unknown', 't')",
+            [],
+        )
+        .unwrap();
+
+        // Session 2: empty-text batch (0 text entries), one call whose
+        // result folds, and one orphan 'out' row for a call never issued.
+        conn.execute(
+            "INSERT INTO acp_sessions
+               (session_uuid, agent_alias, workspace_dir, token_count, created_at, last_activity)
+             VALUES ('old-orphan', 'alpha', '/tmp/b', 0, 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (2, 'assistant', '', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, created_at)
+             VALUES (3, 'z', 'shell', 'in', '{}', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (3, 'z', 'shell', 'out', 'ok', 'unknown', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (3, 'ghost', 'shell', 'out', 'lost', 'unknown', 't')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Opening the store migrates and backfills once.
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        assert_list_matches_projection(&store, "old-full", 4);
+        assert_list_matches_projection(&store, "old-orphan", 2);
+
+        // A post-migration append keeps incrementing from the backfilled base.
+        store
+            .append_turn(
+                "old-full",
+                &[ConversationMessage::Chat(ChatMessage::user("again"))],
+            )
+            .unwrap();
+        assert_list_matches_projection(&store, "old-full", 5);
+        drop(store);
+
+        // Reopening an already-migrated database must not re-run the
+        // backfill: plant a sentinel and expect it to survive.
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        {
+            let conn = store.conn.lock();
+            conn.execute(
+                "UPDATE acp_sessions SET projected_message_count = 99 WHERE session_uuid = 'old-full'",
+                [],
+            )
+            .unwrap();
+        }
+        drop(store);
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        let count = store
+            .projected_message_count("old-full")
+            .unwrap()
+            .unwrap_or_else(|| panic!("old-full should report a count"));
+        assert_eq!(count, 99, "backfill must run only when the column is added");
     }
 
     #[test]
