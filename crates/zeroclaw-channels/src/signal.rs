@@ -582,6 +582,24 @@ impl Channel for SignalChannel {
         "signal"
     }
 
+    /// A Signal 1:1 DM carries the bare sender (E.164 / UUID) as its
+    /// `reply_target`, whereas a group message carries `group:<id>`
+    /// (`GROUP_TARGET_PREFIX`). Reusing `parse_recipient_target` — the same
+    /// classifier `send`/`reply_target` rely on — a `Direct` target is a DM.
+    ///
+    /// Without this override Signal fell back to the trait default (`false`),
+    /// so every DM was treated as non-direct and ran through the reply-intent
+    /// precheck; plain 1:1 messages (e.g. a greeting) could be classified
+    /// `NO_REPLY` and silently dropped. Reporting DMs as direct lets the
+    /// orchestrator skip the classifier and always answer them, while group
+    /// traffic still goes through the precheck.
+    fn is_direct_message(&self, msg: &ChannelMessage) -> bool {
+        matches!(
+            Self::parse_recipient_target(&msg.reply_target),
+            RecipientTarget::Direct(_)
+        )
+    }
+
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let params = match Self::parse_recipient_target(&message.recipient) {
             RecipientTarget::Direct(number) => serde_json::json!({
@@ -1301,6 +1319,35 @@ mod tests {
             poll_vote: None,
         };
         assert_eq!(ch.reply_target(&group, "+1111111111"), "group:group123");
+    }
+
+    #[test]
+    fn is_direct_message_true_for_dm_target_false_for_group() {
+        let ch = SignalChannel::new(
+            "http://127.0.0.1:8686".to_string(),
+            "+1234567890".to_string(),
+            Vec::new(),
+            false,
+            "signal_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+            false,
+        );
+        let e164_dm = ChannelMessage {
+            reply_target: "+1111111111".to_string(),
+            ..Default::default()
+        };
+        let uuid_dm = ChannelMessage {
+            reply_target: "a1b2c3d4-e5f6-7890-abcd-ef1234567890".to_string(),
+            ..Default::default()
+        };
+        let group = ChannelMessage {
+            reply_target: "group:group123".to_string(),
+            ..Default::default()
+        };
+        assert!(ch.is_direct_message(&e164_dm));
+        assert!(ch.is_direct_message(&uuid_dm));
+        assert!(!ch.is_direct_message(&group));
     }
 
     #[test]

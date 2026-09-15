@@ -48,6 +48,8 @@ zc-app-reload-confirm-row = { $confirm_chord } = reload   { $cancel_chord } = ca
 zc-error-daemon-version-mismatch = Version mismatch: zerocode is { $client_version } but the daemon is { $server_version }. Rebuild and restart the daemon from the same checkout as zerocode.
 zc-error-daemon-initialize-timeout = zerocode connected to the daemon, but initialization did not finish within { $seconds }s. Restart the daemon and try again.
 zc-error-spawned-daemon-startup = zerocode started an ephemeral daemon, but it failed to become ready: { $details }
+zc-daemon-wait-notice = zerocode: waiting for daemon at { $path } (up to { $seconds }s)…
+zc-error-daemon-not-ready-timeout = daemon did not become ready within { $seconds }s (socket: { $path }); if the socket path is long, set ZEROCLAW_SOCKET to a shorter path or use a shorter --config-dir
 
 zc-zerocode-tab-theme = Theme
 zc-zerocode-tab-agent-theme = Agent Themes
@@ -524,6 +526,10 @@ zc-chat-context-menu-copy = Copy
 zc-chat-context-menu-send-now = Send now
 zc-chat-context-menu-edit = Edit
 zc-chat-context-menu-delete = Delete
+zc-chat-tool-show-all = [Show all · { $count } more lines]
+zc-chat-tool-show-less = [Show less]
+zc-chat-tool-display-limited = [Display limited; copy for full content]
+zc-chat-tool-encoded-size = { $count } encoded characters
 
 zc-config-breadcrumb-root = Config
 zc-config-section-detail-hint = { $open } or { $into } to open this section

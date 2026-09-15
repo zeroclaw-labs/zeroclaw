@@ -105,7 +105,7 @@ impl VoiceCallChannel {
             config,
             alias: alias.into(),
             active_calls: Arc::new(Mutex::new(HashMap::new())),
-            client: reqwest::Client::new(),
+            client: zeroclaw_config::schema::build_runtime_proxy_client("channel.voice_call"),
         }
     }
 

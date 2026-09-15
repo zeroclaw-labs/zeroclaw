@@ -1723,15 +1723,17 @@ mod client {
             .as_deref()
             .context("matrix: whoami requires access_token")?;
         let url = matrix_client_api_url(homeserver, WHOAMI_ENDPOINT);
-        let response = reqwest::Client::builder()
-            .timeout(WHOAMI_TIMEOUT)
-            .build()
-            .context("matrix: build whoami HTTP client")?
-            .get(url)
-            .bearer_auth(access_token)
-            .send()
-            .await
-            .context("matrix: whoami request failed")?;
+        let response = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            reqwest::Client::builder().timeout(WHOAMI_TIMEOUT),
+            "channel.matrix",
+        )
+        .build()
+        .context("matrix: build whoami HTTP client")?
+        .get(url)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .context("matrix: whoami request failed")?;
         let status = response.status();
 
         if !status.is_success() {
@@ -2925,21 +2927,7 @@ pub(crate) fn build_transcription_manager(
     config: &zeroclaw_config::schema::Config,
     agent_provider: &str,
 ) -> anyhow::Result<crate::transcription::TranscriptionManager> {
-    let manager = crate::transcription::TranscriptionManager::from_config_with_provider(
-        config,
-        agent_provider.to_string(),
-    )?;
-    if !agent_provider.is_empty() {
-        return Ok(manager);
-    }
-    let sole_provider = match manager.available_providers().as_slice() {
-        [only] => Some((*only).to_string()),
-        _ => None,
-    };
-    Ok(match sole_provider {
-        Some(alias) => manager.with_agent_transcription_provider(alias),
-        None => manager,
-    })
+    crate::transcription::build_channel_transcription_manager(config, agent_provider)
 }
 
 /// Resolves transcription state from live config at message time. `None` means
@@ -3396,12 +3384,15 @@ mod outbound {
                 }
                 attempt.follow()
             });
-            reqwest::Client::builder()
-                .timeout(MARKER_HTTP_TIMEOUT)
-                .redirect(redirect_policy)
-                .user_agent("zeroclaw-matrix/1.0")
-                .build()
-                .expect("default reqwest client config never fails to build")
+            zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+                reqwest::Client::builder()
+                    .timeout(MARKER_HTTP_TIMEOUT)
+                    .redirect(redirect_policy)
+                    .user_agent("zeroclaw-matrix/1.0"),
+                "channel.matrix",
+            )
+            .build()
+            .expect("default reqwest client config never fails to build")
         })
     }
 

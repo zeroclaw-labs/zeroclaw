@@ -3,7 +3,9 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use zeroclaw_config::config::CredentialSurfaceClass;
 use zeroclaw_config::policy::SecurityPolicy;
-use zeroclaw_config::schema::{RiskProfileConfig, SandboxBackend, SandboxConfig};
+use zeroclaw_config::schema::{
+    DEFAULT_SANDBOX_IMAGE, RiskProfileConfig, SandboxBackend, SandboxConfig,
+};
 
 use crate::config::Config;
 
@@ -405,6 +407,13 @@ fn sandbox_config_from_policy(policy: &SecurityPolicy) -> SandboxConfig {
             .map(parse_sandbox_backend)
             .unwrap_or_default(),
         firejail_args: policy.firejail_args.clone(),
+        image: policy
+            .sandbox_image
+            .as_deref()
+            .map(str::trim)
+            .filter(|image| !image.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| DEFAULT_SANDBOX_IMAGE.to_string()),
     }
 }
 

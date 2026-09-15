@@ -2634,7 +2634,11 @@ mod tests {
                 ),
             ),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(
+                false,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(crate::auth_rate_limit::AuthRateLimiter::new()),
@@ -2894,6 +2898,56 @@ mod tests {
                 .openai
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn patch_allow_from_deny_all_persists_and_reloads_tool_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.risk_profiles.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig {
+                deny_all_tools: true,
+                ..Default::default()
+            },
+        );
+        config.save().await.unwrap();
+
+        let state = test_state(config);
+        let (status, json) = response_json(
+            handle_patch(
+                State(state),
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([
+                    {
+                        "op": "replace",
+                        "path": "/risk_profiles/default/allowed_tools",
+                        "value": ["shell"]
+                    },
+                    {
+                        "op": "replace",
+                        "path": "/risk_profiles/default/deny_all_tools",
+                        "value": false
+                    }
+                ])),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["saved"], true);
+
+        let written = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        let reloaded = zeroclaw_config::migration::migrate_to_current(&written).unwrap();
+        let profile = reloaded.risk_profiles.get("default").unwrap();
+        assert_eq!(profile.allowed_tools, vec!["shell"]);
+        assert!(!profile.deny_all_tools);
+
+        let policy =
+            zeroclaw_config::policy::SecurityPolicy::from_profiles(profile, None, tmp.path());
+        assert!(policy.is_tool_allowed("shell"));
+        assert!(!policy.is_tool_allowed("memory_recall"));
     }
 
     #[tokio::test]
@@ -4217,7 +4271,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let config = config_with_telegram_alias(&tmp, "alerts");
         let mut state = test_state(config);
-        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
 
         let (status, _json) = response_json(
             handle_api_channel_bind(

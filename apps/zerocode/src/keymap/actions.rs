@@ -359,6 +359,7 @@ keyactions! {
         OpenFileBrowser    [Chord::primary('a')] => "browse files",
         Backspace          [Chord::key(KeyCode::Backspace)] => "backspace",
         DeletePreviousWord [Chord::primary('w'), Chord::with(KeyCode::Backspace, KeyModifiers::ALT)] => "delete previous word",
+        DeleteForward      [Chord::key(KeyCode::Delete)] => "delete next character",
         ClearInput         [Chord::primary('u')] => "clear input",
         SelectAll          [] => "select all",
         Paste              [Chord::primary('v')] => "paste",

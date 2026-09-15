@@ -75,7 +75,7 @@ and backs off; a plugin whose poll keeps trapping reports unhealthy through
 `poll-message` is therefore visible, not fatal, but it makes your channel
 useless. Keep it simple: drain the queue, translate, return.
 
-## Capability flags: the 22 optional methods
+## Capability flags: the {{#include ../_snippets/plugin-channel-flag-count.md}} optional methods
 
 Everything else in the interface is gated by `channel-capabilities` flags.
 The pattern (identical to the memory world):
@@ -98,6 +98,7 @@ flags declaration, which is the source of truth. In summary, the groups:
 | Multi-message streaming | `supports-multi-message-streaming`, `multi-message-delay-ms` | Paragraph-by-paragraph delivery with a minimum inter-message delay (default 800ms, cached at load). |
 | Moderation | `add-reaction`, `remove-reaction`, `pin-message`, `unpin-message`, `redact-message` | Emoji reactions, pinning, message deletion. |
 | Interaction | `request-approval`, `request-choice`, `supports-free-form-ask` | Tool-call approval prompts and multiple-choice questions presented natively on the platform. |
+| Webhook ingress | `webhook-ingress` | Serve inbound webhooks: the gateway mounts your `webhook-path` segment under `/plugin/<segment>` and passes each request to `parse-webhook`, which verifies platform authenticity and returns messages or a challenge reply. Implement both exports together. |
 
 Start with the required {{#include ../_snippets/plugin-channel-required-count.md}} plus `health-check`, and add groups as the
 platform supports them. Advertising a flag you have not implemented is worse

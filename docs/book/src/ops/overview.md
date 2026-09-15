@@ -58,7 +58,7 @@ If it's dying repeatedly, check [Troubleshooting → Daemon keeps restarting](./
 
 ### 2. Channel and component health
 
-The gateway exposes a component health snapshot at `/health` (public, no secrets) and `/api/health` (authenticated). Channels, providers, and other long-running components register themselves in the `components` map as they start, report OK, or error.
+The gateway exposes a public component liveness snapshot at `/health`; detailed component errors remain available through the authenticated diagnostic routes `/api/health` and `/api/status`. Channels, providers, and other long-running components register themselves in the `components` map as they start, report OK, or error.
 
 <div class="os-tabs-src">
 
@@ -80,14 +80,14 @@ curl -s http://localhost:42617/health | jq
     "updated_at": "2026-06-08T09:00:00+00:00",
     "uptime_seconds": 3600,
     "components": {
-      "channel:telegram": {"status": "ok", "updated_at": "…", "last_ok": "…", "last_error": null, "restart_count": 0},
-      "channel:matrix":   {"status": "error", "updated_at": "…", "last_ok": "…", "last_error": "401 Unauthorized", "restart_count": 3}
+      "channel:telegram": {"status": "ok", "updated_at": "…", "last_ok": "…", "restart_count": 0},
+      "channel:matrix":   {"status": "error", "updated_at": "…", "last_ok": "…", "restart_count": 3}
     }
   }
 }
 ```
 
-Each component carries `status` (`starting` / `ok` / `error`), `last_ok`, `last_error`, and `restart_count`. Watch for `status: "error"` and climbing `restart_count`.
+Each component in the public `/health` response carries `status` (`starting` / `ok` / `error`), `updated_at`, `last_ok`, and `restart_count`. Watch for `status: "error"` and climbing `restart_count`. The public response omits `last_error`; use `/api/health` or `/api/status` with the configured API authentication to inspect detailed component errors.
 
 A channel reads `starting` with a null `last_ok` until it confirms it can actually reach its service, not merely until its listener starts. Some channels report what they observed while talking to the service, so a listener that is running but has never completed an exchange stays `starting` rather than `ok`, and one whose calls are failing reads `error`. A channel restarting under an alias that previously reported `ok` returns to `starting` until it produces its own successful exchange. Channels that offer no such signal are marked `ok` for as long as their listener runs.
 

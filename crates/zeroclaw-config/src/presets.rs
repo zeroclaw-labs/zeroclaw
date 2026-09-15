@@ -84,9 +84,11 @@ fn locked_down_risk() -> RiskProfileConfig {
         delegation_policy: DelegationPolicy::default(),
         approval_route: None,
         allowed_tools: vec![],
+        deny_all_tools: false,
         excluded_tools: vec![],
         sandbox_enabled: Some(true),
         sandbox_backend: None,
+        sandbox_image: None,
         firejail_args: vec![],
     }
 }
@@ -108,9 +110,11 @@ fn balanced_risk() -> RiskProfileConfig {
         },
         approval_route: None,
         allowed_tools: vec![],
+        deny_all_tools: false,
         excluded_tools: vec![],
         sandbox_enabled: Some(true),
         sandbox_backend: None,
+        sandbox_image: None,
         firejail_args: vec![],
     }
 }
@@ -132,9 +136,11 @@ fn yolo_risk() -> RiskProfileConfig {
         },
         approval_route: None,
         allowed_tools: vec![],
+        deny_all_tools: false,
         excluded_tools: vec![],
         sandbox_enabled: Some(false),
         sandbox_backend: None,
+        sandbox_image: None,
         firejail_args: vec![],
     }
 }

@@ -519,6 +519,12 @@ pub struct SopRunsRequest {
     pub sop: Option<String>,
 }
 
+/// Parameters for `sops/run-detail`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopRunDetailRequest {
+    pub run_id: String,
+}
+
 /// Request payload for `sops/save` and `sops/create`. The `sop` field is the
 /// wire form of the runtime `Sop`; the daemon deserializes and validates it.
 /// `sops/validate` also accepts this form to validate an unsaved draft.

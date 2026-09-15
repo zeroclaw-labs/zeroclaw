@@ -255,6 +255,13 @@ export function AgentChatInner({
         }
         return true;
 
+      case 'upload':
+        // Same picker as the attach button — the input click is allowed here
+        // because runCommand fires from the user's Enter keypress, keeping
+        // the browser's user-activation requirement satisfied.
+        fileInputRef.current?.click();
+        return true;
+
       case 'model': {
         const name = args.trim();
         if (!name) {
