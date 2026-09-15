@@ -1164,15 +1164,12 @@ impl OpenAiResponsesModelProvider {
     ///
     /// `responses_url` is the full endpoint rather than a base URL; the target
     /// test parses its host, so it matches either shape. Returns `None` when
-    /// the operator already pinned the header through `extra_headers`, which
-    /// `build_default_headers` puts on every request — a second value here
-    /// would send the header twice.
+    /// the operator already pinned a valid header value through
+    /// `extra_headers`, which `build_default_headers` puts on every request; a
+    /// second value here would send the header twice. A pinned value
+    /// `build_default_headers` skips as invalid does not count.
     fn opencode_session_value(&self) -> Option<String> {
-        if self
-            .extra_headers
-            .keys()
-            .any(|key| key.eq_ignore_ascii_case(OPENCODE_SESSION_HEADER))
-        {
+        if crate::opencode_session::operator_pinned_session(&self.extra_headers) {
             return None;
         }
         crate::opencode_session::session_token(&self.responses_url)
@@ -1198,6 +1195,7 @@ impl OpenAiResponsesModelProvider {
         if !default_headers.is_empty() {
             builder = builder.default_headers(default_headers);
         }
+        let builder = crate::opencode_session::restrict_redirects(builder, &self.responses_url);
         let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
             builder,
             "model_provider.openai",
@@ -1213,6 +1211,7 @@ impl OpenAiResponsesModelProvider {
         if !default_headers.is_empty() {
             builder = builder.default_headers(default_headers);
         }
+        let builder = crate::opencode_session::restrict_redirects(builder, &self.responses_url);
         let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
             builder,
             "model_provider.openai",
@@ -1744,6 +1743,53 @@ mod tests {
                 "{api_url}: header selection must match the request host {host}"
             );
         }
+    }
+
+    #[test]
+    fn opencode_session_pin_counts_only_when_the_value_is_valid() {
+        let provider_with = |value: &str| {
+            OpenAiResponsesModelProvider::builder("opencode")
+                .api_url("https://opencode.ai/zen/v1")
+                .credential(Some("test-key"))
+                .extra_headers(std::collections::HashMap::from([(
+                    "x-opencode-session".to_string(),
+                    value.to_string(),
+                )]))
+                .build()
+        };
+        assert!(
+            provider_with("pinned-by-operator")
+                .opencode_session_value()
+                .is_none(),
+            "a valid operator pin must win over the derived value"
+        );
+        assert!(
+            provider_with("bad\nvalue")
+                .opencode_session_value()
+                .is_some(),
+            "an invalid pinned value must not suppress the derived token"
+        );
+    }
+
+    #[test]
+    fn opencode_responses_clients_carry_the_cross_host_redirect_policy() {
+        // reqwest's `Debug` names the redirect policy only when it is not the
+        // default, so this checks both clients the Responses provider builds.
+        let has_policy = |client: Client| format!("{client:?}").contains("redirect_policy");
+        let provider = |api_url: &str| {
+            OpenAiResponsesModelProvider::builder("opencode")
+                .api_url(api_url)
+                .credential(Some("test-key"))
+                .build()
+        };
+
+        let opencode = provider("https://opencode.ai/zen/v1");
+        assert!(has_policy(opencode.http_client()));
+        assert!(has_policy(opencode.streaming_client()));
+
+        let other = provider("https://api.openai.com/v1");
+        assert!(!has_policy(other.http_client()));
+        assert!(!has_policy(other.streaming_client()));
     }
 
     #[test]
