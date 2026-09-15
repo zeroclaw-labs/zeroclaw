@@ -27,7 +27,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, OnceLock};
 use std::thread;
@@ -40,6 +40,7 @@ use crate::config::{LlmRequestPayloadPolicy, LogConfig, ResolvedPolicy, StorageP
 use crate::event::LogEvent;
 use crate::migrate;
 use crate::observer_bridge;
+use crate::reader::{ArchiveOrder, SEQ_WIDTH, list_archives, split_base_ext};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
@@ -109,6 +110,19 @@ type WorkerDead = Arc<AtomicBool>;
 struct WorkerState {
     policy: ResolvedPolicy,
     worker_dead: WorkerDead,
+    /// Non-empty JSONL lines written to the *current* active segment since
+    /// the last rotation. Reset to `0` whenever `rotate_active` runs
+    /// (date, size, or entry-count trigger). Seeded at worker startup by
+    /// counting the existing active file so a restart resumes the correct
+    /// count instead of rotating prematurely (or too late) after reload.
+    line_count: AtomicU64,
+    /// Sequence number for the next archive this writer creates.
+    ///
+    /// Stamped into the archive name so segment order is fixed at write time
+    /// rather than inferred by a reader from mtimes. Seeded at startup from
+    /// the highest number already on disk, so the series keeps increasing
+    /// across restarts and reloads even though nothing persists it directly.
+    next_archive_seq: AtomicU64,
 }
 
 /// Producer-facing state. The `tx` sender is NOT shared with the worker
@@ -185,9 +199,16 @@ fn init_from_config_with_migration_and_shutdown_warning<F>(
     let worker_dead: WorkerDead = Arc::new(AtomicBool::new(false));
 
     if policy.storage.is_enabled() {
+        let initial_line_count = if policy.max_entries_per_segment > 0 {
+            seed_line_count(&policy.path)
+        } else {
+            0
+        };
         let worker_state = Arc::new(WorkerState {
             policy: policy.clone(),
             worker_dead: Arc::clone(&worker_dead),
+            line_count: AtomicU64::new(initial_line_count),
+            next_archive_seq: AtomicU64::new(seed_archive_seq(&policy.path)),
         });
         spawn_worker(rx, worker_state);
     } else {
@@ -376,7 +397,19 @@ fn write_one(state: &Arc<WorkerState>, value: &Value) -> Result<()> {
     // first event lands in a fresh file. Idempotent when no rotation
     // is needed.
     if state.policy.storage == StoragePolicy::Rotating {
-        maybe_rotate_for_date(state)?;
+        if maybe_rotate_for_date(state)? {
+            state.line_count.store(0, Ordering::Relaxed);
+        }
+        // The counter is seeded from the existing active file at startup, so
+        // a file that already sits at (or above) the cap — an operator
+        // enabling this mode on an existing log, or a reload from another
+        // policy — must rotate *before* this append. Rotating only after the
+        // append would leave `cap + 1` entries in the archive and break the
+        // "maximum N entries per segment" contract. A freshly rotated file
+        // has count 0, so this is a no-op on the steady-state path.
+        if maybe_rotate_for_entry_count(state)? {
+            state.line_count.store(0, Ordering::Relaxed);
+        }
     }
     let mut file = open_active_file(state)?;
     {
@@ -386,7 +419,15 @@ fn write_one(state: &Arc<WorkerState>, value: &Value) -> Result<()> {
     }
     match state.policy.storage {
         StoragePolicy::Rolling => trim_to_last_entries(state)?,
-        StoragePolicy::Rotating => maybe_rotate_for_size(state)?,
+        StoragePolicy::Rotating => {
+            state.line_count.fetch_add(1, Ordering::Relaxed);
+            // Triggers are mutually exclusive per write: the first one that
+            // fires rotates the file and resets the count, so a later
+            // trigger in the same call never fires against a stale file.
+            if maybe_rotate_for_size(state)? || maybe_rotate_for_entry_count(state)? {
+                state.line_count.store(0, Ordering::Relaxed);
+            }
+        }
         StoragePolicy::None | StoragePolicy::Full => {}
     }
     Ok(())
@@ -444,6 +485,21 @@ pub fn active_log_path() -> Option<PathBuf> {
     current_state()
         .filter(|s| s.policy.storage.is_enabled())
         .map(|s| s.policy.path.clone())
+}
+
+/// The active log path paired with whether the installed storage policy owns
+/// timestamped archives. `None` when persistence is disabled at the writer
+/// layer, matching [`active_log_path`].
+///
+/// Query entry points need both halves: the path says *where* to read, and the
+/// flag says whether archives next to it are part of this policy's logical
+/// stream. Reading the flag from the same writer state that produced the path
+/// keeps the two consistent; deriving it from a separate config snapshot could
+/// disagree with the writer actually running.
+pub fn active_log_query_scope() -> Option<(PathBuf, bool)> {
+    current_state()
+        .filter(|s| s.policy.storage.is_enabled())
+        .map(|s| (s.policy.path.clone(), s.policy.storage.reads_archives()))
 }
 
 pub fn flush_for_test() -> Result<()> {
@@ -725,17 +781,45 @@ fn count_nonempty_lines(path: &Path) -> Result<usize> {
     Ok(n)
 }
 
+/// Seed the in-memory line counter at worker startup. A missing active file
+/// is the normal state for a fresh workspace and returns `0` silently.
+/// Any other I/O error is logged at `warn` level and also returns `0` so the
+/// worker can start rather than panicking; it will self-correct once enough
+/// events are written to trigger an entry-count rotation.
+fn seed_line_count(path: &Path) -> u64 {
+    match count_nonempty_lines(path) {
+        Ok(n) => n as u64,
+        Err(ref err)
+            if err
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .map(|e| e.kind() == std::io::ErrorKind::NotFound)
+                .unwrap_or(false) =>
+        {
+            0
+        }
+        Err(err) => {
+            tracing::warn!(
+                target: "zeroclaw_log",
+                error = ?err,
+                "log: could not seed entry-count from active file; starting from 0"
+            );
+            0
+        }
+    }
+}
+
 /// Rotate the active file to an archive when it has crossed a UTC day boundary
 /// since its last write. No-op when daily rotation is off, the file is absent,
-/// or it was last written today.
-fn maybe_rotate_for_date(state: &Arc<WorkerState>) -> Result<()> {
+/// or it was last written today. Returns `true` when a rotation occurred.
+fn maybe_rotate_for_date(state: &Arc<WorkerState>) -> Result<bool> {
     if !state.policy.rotate_daily {
-        return Ok(());
+        return Ok(false);
     }
     let path = &state.policy.path;
     let meta = match fs::metadata(path) {
         Ok(m) => m,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(err) => {
             return Err(err)
                 .with_context(|| format!("stat log for date rotation: {}", path.display()));
@@ -743,27 +827,28 @@ fn maybe_rotate_for_date(state: &Arc<WorkerState>) -> Result<()> {
     };
     // An empty active file has nothing worth archiving.
     if meta.len() == 0 {
-        return Ok(());
+        return Ok(false);
     }
     let modified: DateTime<Utc> = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH).into();
     if modified.date_naive() < Utc::now().date_naive() {
         rotate_active(state, modified)?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Rotate the active file when a just-completed append left it at or above the
 /// configured byte budget. No-op when size rotation is disabled (`max_bytes`
-/// `== 0`) or the file is under budget.
-fn maybe_rotate_for_size(state: &Arc<WorkerState>) -> Result<()> {
+/// `== 0`) or the file is under budget. Returns `true` when a rotation occurred.
+fn maybe_rotate_for_size(state: &Arc<WorkerState>) -> Result<bool> {
     let max = state.policy.max_bytes;
     if max == 0 {
-        return Ok(());
+        return Ok(false);
     }
     let path = &state.policy.path;
     let meta = match fs::metadata(path) {
         Ok(m) => m,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(err) => {
             return Err(err)
                 .with_context(|| format!("stat log for size rotation: {}", path.display()));
@@ -774,15 +859,51 @@ fn maybe_rotate_for_size(state: &Arc<WorkerState>) -> Result<()> {
         // matching date rotation, so the archive name reflects its contents.
         let when: DateTime<Utc> = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH).into();
         rotate_active(state, when)?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
+}
+
+/// Rotate the active file when the in-memory line counter says the segment has
+/// reached the configured entry cap. Returns `true` when a rotation occurred.
+fn maybe_rotate_for_entry_count(state: &Arc<WorkerState>) -> Result<bool> {
+    let cap = state.policy.max_entries_per_segment;
+    if cap == 0 {
+        return Ok(false);
+    }
+    let count = state.line_count.load(Ordering::Relaxed);
+    if count < cap as u64 {
+        return Ok(false);
+    }
+    let path = &state.policy.path;
+    let meta = match fs::metadata(path) {
+        Ok(m) => m,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("stat log for entry-count rotation: {}", path.display()));
+        }
+    };
+    if meta.len() == 0 {
+        return Ok(false);
+    }
+    let when: DateTime<Utc> = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH).into();
+    rotate_active(state, when)?;
+    Ok(true)
 }
 
 fn rotate_active(state: &Arc<WorkerState>, when: DateTime<Utc>) -> Result<()> {
     let path = &state.policy.path;
-    let archive = archive_path(path, when)?;
+    // Claim the next number before renaming so the archive name records where
+    // this segment falls in the series.
+    let seq = state.next_archive_seq.fetch_add(1, Ordering::Relaxed);
+    let archive = archive_path(path, when, seq)?;
     fs::rename(path, &archive)
         .with_context(|| format!("rotating log {} → {}", path.display(), archive.display()))?;
+
+    // Record the number before retention runs: retention may delete this very
+    // archive, and the series must not fall back to it on the next restart.
+    record_seq_watermark(path, seq);
 
     #[cfg(unix)]
     {
@@ -794,9 +915,92 @@ fn rotate_active(state: &Arc<WorkerState>, when: DateTime<Utc>) -> Result<()> {
     Ok(())
 }
 
+/// Path of the sidecar that records the highest archive sequence ever issued.
+///
+/// Sits next to the active log as `<basename>.seq`, which does not match the
+/// archive-name shape, so `list_archives` never mistakes it for a segment.
+fn seq_watermark_path(active: &Path) -> PathBuf {
+    let dir = active.parent().unwrap_or_else(|| Path::new("."));
+    let name = active
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("runtime-trace");
+    dir.join(format!("{name}.seq"))
+}
+
+/// Record `seq` as the highest number ever issued, if it beats what is stored.
+///
+/// Best-effort: a failure here costs monotonicity across a wipe-and-restart,
+/// which the reader already handles as an unresolvable cursor, so it must never
+/// fail the append that triggered the rotation.
+fn record_seq_watermark(active: &Path, seq: u64) {
+    let path = seq_watermark_path(active);
+    let stored = read_seq_watermark(active);
+    if stored >= seq {
+        return;
+    }
+    if let Err(err) = fs::write(&path, seq.to_string()) {
+        tracing::warn!(
+            target: "zeroclaw_log_internal",
+            error = ?err,
+            path = %path.display(),
+            "log: could not record the rotation sequence high-water mark; a later \
+             restart may reuse a number if retention removes every archive",
+        );
+    }
+}
+
+/// Highest sequence recorded by a previous run, or `0` when there is none.
+fn read_seq_watermark(active: &Path) -> u64 {
+    fs::read_to_string(seq_watermark_path(active))
+        .ok()
+        .and_then(|raw| raw.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// The next archive sequence number to issue.
+///
+/// Taken from two sources, whichever is higher: the numbered archives still on
+/// disk, and a small sidecar recording the highest number ever issued. The
+/// archives alone are not enough. Age-based retention can delete every numbered
+/// archive, and a restart would then begin again at 1 while a client still
+/// holds a cursor naming sequence 1. That cursor is supposed to be
+/// unresolvable, but it would instead bind to an unrelated future archive and
+/// show the client history it never asked for. The sidecar keeps the series
+/// monotonic across that wipe.
+///
+/// Legacy archives written before numbering existed contribute nothing here.
+/// They sort before every numbered archive, so starting a fresh series at 1
+/// alongside them is correct.
+fn seed_archive_seq(active: &Path) -> u64 {
+    let on_disk = match list_archives(active) {
+        Ok(archives) => archives
+            .iter()
+            .filter_map(|(_, order)| match order {
+                ArchiveOrder::Seq(n) => Some(*n),
+                ArchiveOrder::Legacy(_) => None,
+            })
+            .max()
+            .unwrap_or(0),
+        Err(err) => {
+            // A directory that cannot be listed is reported by the query path
+            // as well. The watermark below still bounds the series, so this
+            // only loses the archives-on-disk half of the comparison.
+            tracing::warn!(
+                target: "zeroclaw_log",
+                error = ?err,
+                path = %active.display(),
+                "log: could not read existing archives to seed the rotation sequence",
+            );
+            0
+        }
+    };
+    on_disk.max(read_seq_watermark(active)).saturating_add(1)
+}
+
 /// Build the archive path for `path`, stamping the timestamp before the
 /// extension and disambiguating same-second rotations with a numeric suffix.
-fn archive_path(path: &Path, when: DateTime<Utc>) -> Result<PathBuf> {
+fn archive_path(path: &Path, when: DateTime<Utc>, seq: u64) -> Result<PathBuf> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
@@ -805,14 +1009,22 @@ fn archive_path(path: &Path, when: DateTime<Utc>) -> Result<PathBuf> {
     let (base, ext) = split_base_ext(file_name);
     let stamp = when.format("%Y%m%d-%H%M%S").to_string();
 
-    // The existence check and subsequent `fs::rename` are called from
-    // the single-threaded worker, so the check-then-rename has no
-    // in-process race.
-    let mut candidate = dir.join(format!("{base}.{stamp}{ext}"));
-    let mut n = 1u32;
+    // The sequence number leads so the name itself carries segment order: a
+    // reader sorts by it and never has to infer order from mtimes, which are
+    // an observation made at enumeration time and can misorder segments when
+    // several rotations land during one read. The stamp stays for operators
+    // reading the directory.
+    //
+    // The existence check and the subsequent `fs::rename` both run on the
+    // single-threaded worker, so this check-then-rename has no in-process
+    // race. A collision here means the seeded series overlapped something on
+    // disk; bumping the sequence keeps names unique and order intact.
+    let mut seq = seq;
+    let width = SEQ_WIDTH;
+    let mut candidate = dir.join(format!("{base}.{seq:0width$}-{stamp}{ext}"));
     while candidate.exists() {
-        candidate = dir.join(format!("{base}.{stamp}.{n}{ext}"));
-        n += 1;
+        seq = seq.saturating_add(1);
+        candidate = dir.join(format!("{base}.{seq:0width$}-{stamp}{ext}"));
     }
     Ok(candidate)
 }
@@ -821,82 +1033,6 @@ fn archive_path(path: &Path, when: DateTime<Utc>) -> Result<PathBuf> {
 /// dot (or is empty). The split is on the *last* dot so multi-dot names keep
 /// only their final extension: `runtime-trace.jsonl` → `("runtime-trace",
 /// ".jsonl")`; `a.b.jsonl` → `("a.b", ".jsonl")`; `trace` → `("trace", "")`.
-fn split_base_ext(file_name: &str) -> (&str, &str) {
-    match file_name.rfind('.') {
-        Some(i) if i > 0 => (&file_name[..i], &file_name[i..]),
-        _ => (file_name, ""),
-    }
-}
-
-/// True when `s` is exactly a `YYYYMMDD-HHMMSS` stamp: 8 digits, `-`, 6 digits.
-fn is_stamp(s: &str) -> bool {
-    let b = s.as_bytes();
-    b.len() == 15
-        && b[..8].iter().all(u8::is_ascii_digit)
-        && b[8] == b'-'
-        && b[9..].iter().all(u8::is_ascii_digit)
-}
-
-fn is_archive_core(core: &str) -> bool {
-    match core.split_once('.') {
-        // `<stamp>.<counter>` — counter must be a non-empty run of digits.
-        Some((stamp, counter)) => {
-            !counter.is_empty() && counter.bytes().all(|b| b.is_ascii_digit()) && is_stamp(stamp)
-        }
-        // `<stamp>`
-        None => is_stamp(core),
-    }
-}
-
-fn list_archives(active: &Path) -> Result<Vec<(PathBuf, SystemTime)>> {
-    let dir = active.parent().unwrap_or_else(|| Path::new("."));
-    let active_name = active
-        .file_name()
-        .and_then(|s| s.to_str())
-        .context("log path has no file name")?;
-    let (base, ext) = split_base_ext(active_name);
-    let prefix = format!("{base}.");
-
-    let mut out = Vec::new();
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-        Err(err) => {
-            return Err(err).with_context(|| format!("reading log dir {}", dir.display()));
-        }
-    };
-    for entry in entries {
-        let entry = entry.with_context(|| format!("reading entry in {}", dir.display()))?;
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        if name == active_name {
-            continue;
-        }
-        let Some(suffix) = name.strip_prefix(&prefix) else {
-            continue;
-        };
-        let core = if ext.is_empty() {
-            suffix
-        } else {
-            let Some(core) = suffix.strip_suffix(ext) else {
-                continue;
-            };
-            core
-        };
-        if !is_archive_core(core) {
-            continue;
-        }
-        let Ok(meta) = entry.metadata() else { continue };
-        if !meta.is_file() {
-            continue;
-        }
-        let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        out.push((entry.path(), mtime));
-    }
-    Ok(out)
-}
-
 /// Prune rotated archives by age then by count. Best-effort: a removal failure
 /// is logged but never fails the enclosing append, since retention is
 /// housekeeping rather than part of the durability contract.
@@ -918,16 +1054,24 @@ fn run_retention(policy: &ResolvedPolicy) {
             return;
         }
     };
-    // Newest first, so a later count cap keeps the most recent archives.
-    archives.sort_by_key(|(_, mtime)| std::cmp::Reverse(*mtime));
+    // Newest first, so a later count cap keeps the most recent archives. The
+    // ordering key comes from the archive name where available, so it stays
+    // correct even if a file's mtime was touched after it was written.
+    archives.sort_by_key(|(_, order)| std::cmp::Reverse(*order));
 
-    // Age-based cleanup.
+    // Age-based cleanup. This one genuinely needs wall-clock age, so it reads
+    // mtime from the filesystem rather than the name-derived ordering key. An
+    // archive whose mtime cannot be read is kept: deleting a file we failed to
+    // measure would be the more destructive choice.
     if max_age_days > 0
         && let Some(cutoff) =
             SystemTime::now().checked_sub(Duration::from_secs(max_age_days.saturating_mul(86_400)))
     {
-        archives.retain(|(p, mtime)| {
-            if *mtime < cutoff {
+        archives.retain(|(p, _)| {
+            let Ok(mtime) = fs::metadata(p).and_then(|m| m.modified()) else {
+                return true;
+            };
+            if mtime < cutoff {
                 remove_archive(p);
                 false
             } else {
@@ -961,6 +1105,10 @@ pub(crate) static WRITER_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex:
 mod tests {
     use super::*;
     use crate::event::{EventCategory, Severity};
+    // Archive-name predicates live in `reader`; only the tests below exercise
+    // them directly, so importing them at module scope would be unused in a
+    // non-test build.
+    use crate::reader::{is_archive_core, is_stamp};
 
     fn install_writer(dir: &Path, max_entries: usize) {
         let cfg = LogConfig {
@@ -1105,12 +1253,12 @@ mod tests {
 
         flush_for_test().unwrap();
         let path = runtime_trace_path().unwrap();
-        let contents = fs::read_to_string(&path).unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
         assert_eq!(lines.len(), 3);
         // Last three should be 7, 8, 9 (oldest to newest order preserved).
         for (idx, &line) in lines.iter().enumerate() {
-            let v: Value = serde_json::from_str(line).unwrap();
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
             assert_eq!(v["message"].as_str().unwrap(), format!("event-{}", idx + 7));
         }
     }
@@ -1731,23 +1879,111 @@ mod tests {
     }
 
     #[test]
-    fn archive_path_places_stamp_before_extension_and_dedupes() {
+    fn archive_path_leads_with_the_sequence_and_dedupes_on_collision() {
         use chrono::TimeZone;
         let tmp = tempfile::tempdir().unwrap();
         let active = tmp.path().join("runtime-trace.jsonl");
         let when = Utc.with_ymd_and_hms(2026, 6, 24, 3, 15, 0).unwrap();
 
-        let a1 = archive_path(&active, when).unwrap();
+        // The sequence leads the name so readers can order segments by name
+        // alone; the stamp stays for operators reading the directory.
+        let a1 = archive_path(&active, when, 1).unwrap();
         assert_eq!(
             a1.file_name().unwrap().to_str().unwrap(),
-            "runtime-trace.20260624-031500.jsonl"
+            "runtime-trace.0000000001-20260624-031500.jsonl"
         );
-        // A same-second collision is disambiguated with a numeric suffix.
+
+        // A number already taken on disk is skipped rather than reused, so two
+        // archives never share an ordering key.
         fs::write(&a1, "x").unwrap();
-        let a2 = archive_path(&active, when).unwrap();
+        let a2 = archive_path(&active, when, 1).unwrap();
         assert_eq!(
             a2.file_name().unwrap().to_str().unwrap(),
-            "runtime-trace.20260624-031500.1.jsonl"
+            "runtime-trace.0000000002-20260624-031500.jsonl"
+        );
+    }
+
+    #[test]
+    fn archive_sequence_never_reuses_a_number_after_retention_wipes_every_archive() {
+        // The cursor contract says an archive sequence is never reused, so a
+        // cursor naming a pruned segment stays unresolvable and the reader can
+        // honestly report the end of history. Deriving the next number only
+        // from the archives still on disk breaks that at one boundary: age
+        // retention can delete every numbered archive, and a restart would then
+        // begin again at 1. A client still holding `1:<off>` would have it bind
+        // to an unrelated future archive and be shown history it never asked
+        // for. A sidecar records the highest number ever issued so the series
+        // survives that wipe.
+        let tmp = tempfile::tempdir().unwrap();
+        let active = tmp.path().join("runtime-trace.jsonl");
+        fs::write(&active, "").unwrap();
+
+        // Rotations reached sequence 5, then retention removed every archive.
+        record_seq_watermark(&active, 5);
+        assert!(
+            list_archives(&active)
+                .unwrap()
+                .iter()
+                .all(|(_, order)| !matches!(order, ArchiveOrder::Seq(_))),
+            "test setup: no numbered archive may remain on disk"
+        );
+
+        assert_eq!(
+            seed_archive_seq(&active),
+            6,
+            "the series must resume past every number it has already issued, \
+             even with no archive left to read it from"
+        );
+    }
+
+    #[test]
+    fn archive_sequence_prefers_whichever_source_is_higher() {
+        // Both sources bound the series: the archives still on disk and the
+        // recorded high-water mark. Whichever is higher wins, so neither a
+        // stale sidecar nor a wiped directory can pull the series backwards.
+        let tmp = tempfile::tempdir().unwrap();
+        let active = tmp.path().join("runtime-trace.jsonl");
+        fs::write(&active, "").unwrap();
+        fs::write(
+            tmp.path()
+                .join("runtime-trace.0000000012-20260624-031500.jsonl"),
+            "x\n",
+        )
+        .unwrap();
+
+        // Sidecar behind the archives: the archive on disk decides.
+        record_seq_watermark(&active, 4);
+        assert_eq!(seed_archive_seq(&active), 13);
+
+        // Sidecar ahead of them: the watermark decides.
+        record_seq_watermark(&active, 30);
+        assert_eq!(seed_archive_seq(&active), 31);
+    }
+
+    #[test]
+    fn archive_sequence_resumes_above_existing_archives() {
+        // A restart recovers the counter from the names on disk. Reusing a
+        // number would leave two archives ordered by an ambiguous key.
+        let tmp = tempfile::tempdir().unwrap();
+        let active = tmp.path().join("runtime-trace.jsonl");
+        fs::write(&active, "").unwrap();
+        fs::write(
+            tmp.path()
+                .join("runtime-trace.0000000007-20260624-031500.jsonl"),
+            "x\n",
+        )
+        .unwrap();
+        // A legacy archive contributes no number and must not disturb seeding.
+        fs::write(
+            tmp.path().join("runtime-trace.20260101-000000.jsonl"),
+            "y\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            seed_archive_seq(&active),
+            8,
+            "the series must resume above the highest number already on disk"
         );
     }
 
@@ -1938,5 +2174,172 @@ mod tests {
         );
         // Real archives are still pruned to the cap.
         assert_eq!(archives.len(), 1, "real archives are still capped");
+    }
+
+    #[test]
+    fn rotating_entry_count_rotation_trigger() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = LogConfig {
+            log_persistence: "rotating".into(),
+            log_persistence_max_bytes: 0,
+            log_persistence_rotate_daily: false,
+            log_persistence_retention_max_files: 0,
+            log_persistence_max_entries_per_segment: 2,
+            ..LogConfig::default()
+        };
+        init_from_config(&cfg, tmp.path());
+        let path = runtime_trace_path().unwrap();
+
+        emit("event-1");
+        emit("event-2");
+        // The cap is 2; the active file now holds exactly cap entries, so the
+        // next write triggers rotation (count >= cap after the append).
+        let archives_before = list_archives(&path).unwrap();
+        assert_eq!(
+            archives_before.len(),
+            1,
+            "rotation must fire when segment reaches cap (>= cap trigger)"
+        );
+        emit("event-3");
+        let archives = list_archives(&path).unwrap();
+        assert_eq!(
+            archives.len(),
+            1,
+            "entry-count cap must rotate the active file after cap+1 writes"
+        );
+        assert_eq!(
+            total_events(&path),
+            3,
+            "all events preserved across active + archive"
+        );
+    }
+
+    #[test]
+    fn entry_count_seeded_at_cap_rotates_before_the_next_append() {
+        // An operator enabling entry-count rotation on an existing log (or
+        // reloading from another policy) can start with an active file that
+        // already holds exactly `cap` rows. The counter is seeded from that
+        // file, so the next append must rotate *first*: appending before
+        // rotating would archive `cap + 1` rows and break the documented
+        // "maximum N entries per segment" contract.
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        const CAP: usize = 3;
+
+        // Seed an active file with exactly CAP non-empty JSONL rows before
+        // any writer is installed.
+        let state_dir = tmp.path().join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let seeded = state_dir.join("runtime-trace.jsonl");
+        let mut seed = String::new();
+        for i in 0..CAP {
+            let ev = LogEvent::new(Severity::Info, "test", EventCategory::Agent);
+            let mut v = serde_json::to_value(&ev).unwrap();
+            v["message"] = serde_json::Value::String(format!("seeded-{i}"));
+            seed.push_str(&serde_json::to_string(&v).unwrap());
+            seed.push('\n');
+        }
+        fs::write(&seeded, &seed).unwrap();
+        assert_eq!(count_nonempty_lines(&seeded).unwrap(), CAP);
+
+        let cfg = LogConfig {
+            log_persistence: "rotating".into(),
+            log_persistence_max_bytes: 0,
+            log_persistence_rotate_daily: false,
+            log_persistence_retention_max_files: 0,
+            log_persistence_max_entries_per_segment: CAP,
+            ..LogConfig::default()
+        };
+        init_from_config(&cfg, tmp.path());
+        let path = runtime_trace_path().unwrap();
+        assert_eq!(path, seeded, "writer must adopt the seeded active file");
+
+        emit("post-seed");
+
+        // No archive may exceed the cap.
+        for (archive, _) in list_archives(&path).unwrap() {
+            let n = count_nonempty_lines(&archive).unwrap();
+            assert!(
+                n <= CAP,
+                "archive {} holds {n} entries, exceeding the cap of {CAP}",
+                archive.display()
+            );
+        }
+        // Nothing is lost: the seeded rows plus the new one are all on disk.
+        assert_eq!(
+            total_events(&path),
+            CAP + 1,
+            "seeded rows and the new append must all survive the rotation"
+        );
+    }
+
+    #[test]
+    fn entry_count_seeded_over_cap_archives_the_existing_file_whole() {
+        // Transition case: enabling entry-count rotation on a log that is
+        // already larger than the cap, or reloading after the cap was lowered.
+        // Splitting that file into cap-sized pieces would mean a full rewrite,
+        // which is the O(file size) cost this trigger exists to avoid, so the
+        // existing file is archived whole, once. Every archive after it holds
+        // exactly `cap` entries.
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        const CAP: usize = 2;
+        const SEEDED: usize = 5; // deliberately over the cap
+
+        let state_dir = tmp.path().join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let seeded = state_dir.join("runtime-trace.jsonl");
+        let mut seed = String::new();
+        for i in 0..SEEDED {
+            let ev = LogEvent::new(Severity::Info, "test", EventCategory::Agent);
+            let mut v = serde_json::to_value(&ev).unwrap();
+            v["message"] = serde_json::Value::String(format!("seeded-{i}"));
+            seed.push_str(&serde_json::to_string(&v).unwrap());
+            seed.push('\n');
+        }
+        fs::write(&seeded, &seed).unwrap();
+
+        let cfg = LogConfig {
+            log_persistence: "rotating".into(),
+            log_persistence_max_bytes: 0,
+            log_persistence_rotate_daily: false,
+            log_persistence_retention_max_files: 0,
+            log_persistence_max_entries_per_segment: CAP,
+            ..LogConfig::default()
+        };
+        init_from_config(&cfg, tmp.path());
+        let path = runtime_trace_path().unwrap();
+
+        emit("post-seed");
+
+        // The transition archive holds the whole over-cap file, not `cap` rows.
+        let archives = list_archives(&path).unwrap();
+        assert_eq!(archives.len(), 1, "the seeded file is archived once");
+        assert_eq!(
+            count_nonempty_lines(&archives[0].0).unwrap(),
+            SEEDED,
+            "the pre-existing file is archived whole rather than split"
+        );
+
+        // Steady state resumes: the next `cap` appends produce a cap-sized archive.
+        for i in 0..CAP {
+            emit(&format!("steady-{i}"));
+        }
+        let archives = list_archives(&path).unwrap();
+        assert_eq!(archives.len(), 2, "a second rotation fired at the cap");
+        let mut sizes: Vec<usize> = archives
+            .iter()
+            .map(|(p, _)| count_nonempty_lines(p).unwrap())
+            .collect();
+        sizes.sort_unstable();
+        assert_eq!(
+            sizes,
+            vec![CAP, SEEDED],
+            "after the one-time transition archive, archives are cap-sized"
+        );
+
+        // Nothing is lost across the transition.
+        assert_eq!(total_events(&path), SEEDED + 1 + CAP);
     }
 }
