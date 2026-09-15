@@ -33871,7 +33871,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![zeroclaw_api::media::MediaAttachment {
                     file_name: "sticker.png".to_string(),
-                    data: vec![1, 2, 3, 4],
+                    data: tiny_png(),
                     mime_type: Some("image/png".to_string()),
                     marker: None,
                 }],
@@ -33909,7 +33909,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(turns[0].content.contains("[Image: sticker.png attached"));
         assert!(turns[0].content.contains("please inspect this"));
         assert!(turns[0].content.contains("[IMAGE:data:"));
-        assert!(turns[0].content.contains("AQIDBA"));
+        assert!(turns[0].content.contains("iVBORw0K"));
     }
 
     #[tokio::test]
@@ -36980,6 +36980,20 @@ This is an example JSON object for profile settings."#;
         assert!(cleaned.contains("look at") && cleaned.contains("please"));
     }
 
+    /// A structurally complete 1x1 PNG. Multimodal preparation validates the
+    /// decoded bytes of data-URI image markers, so an attachment that must
+    /// reach a provider as an image has to frame a real image rather than
+    /// arbitrary bytes.
+    fn tiny_png() -> Vec<u8> {
+        vec![
+            0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 0x00, 0x00, 0x00, 0x0d, b'I', b'H',
+            b'D', b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, b'I', b'D', b'A', b'T', 0x78,
+            0xda, 0x63, 0x64, 0x60, 0xf8, 0x5f, 0x0f, 0x00, 0x02, 0x87, 0x01, 0x80, 0xeb, 0x47,
+            0xba, 0x92, 0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82,
+        ]
+    }
+
     #[tokio::test]
     async fn media_pipeline_preserves_image_bytes_when_vision_route_configured() {
         use wiremock::matchers::{body_string_contains, method, path};
@@ -36993,9 +37007,13 @@ This is an example JSON object for profile settings."#;
 
         let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
         let vision_server = MockServer::start().await;
+        let png_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, tiny_png());
         let _vision_mock = Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .and(body_string_contains("data:image/png;base64,AQIDBA=="))
+            .and(body_string_contains(
+                format!("data:image/png;base64,{png_b64}").as_str(),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "choices": [
                     {
@@ -37049,7 +37067,7 @@ This is an example JSON object for profile settings."#;
                 interruption_scope_id: None,
                 attachments: vec![zeroclaw_api::media::MediaAttachment {
                     file_name: "route.png".to_string(),
-                    data: vec![1, 2, 3, 4],
+                    data: tiny_png(),
                     mime_type: Some("image/png".to_string()),
                     marker: None,
                 }],
@@ -37097,7 +37115,7 @@ This is an example JSON object for profile settings."#;
         assert!(
             vision_body
                 .to_string()
-                .contains("data:image/png;base64,AQIDBA=="),
+                .contains(format!("data:image/png;base64,{png_b64}").as_str()),
             "vision provider request must contain the preserved attachment bytes: {vision_body}"
         );
     }

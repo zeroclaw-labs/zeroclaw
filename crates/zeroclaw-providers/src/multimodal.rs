@@ -1323,7 +1323,130 @@ fn normalize_data_uri(source: &str, max_bytes: usize) -> anyhow::Result<String> 
 
     validate_size(source, decoded.len(), max_bytes)?;
 
+    match complete_image_mime_from_magic(&decoded) {
+        None => {
+            return Err(MultimodalError::InvalidMarker {
+                input: source.to_string(),
+                reason: format!("decoded payload is not a recognized image (declared {mime})"),
+            }
+            .into());
+        }
+        Some(sniffed) if sniffed != mime.as_str() => {
+            return Err(MultimodalError::InvalidMarker {
+                input: source.to_string(),
+                reason: format!(
+                    "decoded image signature is {sniffed}, but the marker declared {mime}"
+                ),
+            }
+            .into());
+        }
+        Some(_) => {}
+    }
+
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(decoded)))
+}
+
+/// Sniff decoded data-URI bytes and require the payload to frame a complete
+/// image of the sniffed type.
+///
+/// [`image_mime_from_magic`] matches leading signature bytes only, so a
+/// truncated fragment — a JPEG SOI plus the APP0 header of a segment it does
+/// not carry, a bare PNG signature — still sniffs as the declared type.
+/// Promoting marker-shaped text out of a tool result needs more than a
+/// prefix: the bytes must frame an image the provider can decode, otherwise
+/// the marker keeps flowing as text.
+fn complete_image_mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
+    let mime = image_mime_from_magic(bytes)?;
+    let framed = match mime {
+        "image/png" => is_framed_png(bytes),
+        "image/jpeg" => is_framed_jpeg(bytes),
+        "image/gif" => is_framed_gif(bytes),
+        "image/webp" => is_framed_webp(bytes),
+        // BMP is recognized but never accepted by `PROVIDER_IMAGE_MIME_TYPES`,
+        // so callers reject it as a declared-type mismatch before framing
+        // could matter.
+        _ => true,
+    };
+    framed.then_some(mime)
+}
+
+/// A PNG frames when the signature is followed by chunk-framed data: the
+/// first chunk is `IHDR` and the walk ends exactly at `IEND`.
+fn is_framed_png(bytes: &[u8]) -> bool {
+    // The caller reached this through the PNG sniff, so the 8-byte signature
+    // is present.
+    let mut offset = 8usize;
+    let mut first_chunk = true;
+    while offset < bytes.len() {
+        if bytes.len() - offset < 8 {
+            return false;
+        }
+        let data_len = u32::from_be_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]) as usize;
+        let chunk_type = &bytes[offset + 4..offset + 8];
+        if first_chunk {
+            if chunk_type != b"IHDR" || data_len != 13 {
+                return false;
+            }
+            first_chunk = false;
+        }
+        let Some(chunk_end) = (offset + 8)
+            .checked_add(data_len)
+            .and_then(|end| end.checked_add(4))
+        else {
+            return false;
+        };
+        if chunk_end > bytes.len() {
+            return false;
+        }
+        if chunk_type == b"IEND" {
+            return data_len == 0 && chunk_end == bytes.len();
+        }
+        offset = chunk_end;
+    }
+    false
+}
+
+/// A JPEG frames when SOI is followed by a marker segment whose declared
+/// length fits and the file ends with an EOI marker. Complete JPEGs satisfy
+/// both; a truncated header loses the EOI, and a header-only stub announces a
+/// segment it does not carry.
+fn is_framed_jpeg(bytes: &[u8]) -> bool {
+    // The caller reached this through the JPEG sniff, so FF D8 FF is present.
+    if bytes.len() < 6 || !bytes.ends_with(&[0xFF, 0xD9]) {
+        return false;
+    }
+    let marker = bytes[3];
+    if matches!(marker, 0x01 | 0xD8 | 0xD9 | 0xD0..=0xD7) {
+        return false; // standalone marker: no length-prefixed segment to frame
+    }
+    let segment_len = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+    if segment_len < 2 {
+        return false; // the segment length counts itself; smaller is malformed
+    }
+    4 + segment_len <= bytes.len() - 2
+}
+
+/// A GIF frames when the logical screen descriptor is present and the stream
+/// ends with the 0x3B trailer byte.
+fn is_framed_gif(bytes: &[u8]) -> bool {
+    // The caller reached this through the GIF sniff, so the 6-byte header is
+    // present; the descriptor (7) plus the trailer (1) are the minimum
+    // remaining structure.
+    bytes.len() >= 14 && matches!(bytes.last(), Some(&0x3B))
+}
+
+/// A WebP frames when the RIFF size field accounts for every remaining byte:
+/// the container declares its own extent.
+fn is_framed_webp(bytes: &[u8]) -> bool {
+    // The caller reached this through the WebP sniff, so RIFF + size + WEBP
+    // (12 bytes) is present.
+    bytes.len() >= 12
+        && u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize == bytes.len() - 8
 }
 
 async fn normalize_remote_image(
@@ -1789,6 +1912,147 @@ mod tests {
         assert_eq!(
             ImageDataUriRejection::MalformedBase64.to_string(),
             "malformed base64 payload"
+        );
+    }
+
+    /// A structurally complete 1x1 PNG — IHDR, IDAT and an exact IEND
+    /// termination: the smallest payload that frames as a PNG through the
+    /// decoded-byte check.
+    const MINIMAL_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+    #[test]
+    fn normalize_data_uri_rejects_truncated_jpeg_fragment() {
+        // The regression payload: canonical base64 that decodes to six bytes —
+        // a JPEG SOI plus the APP0 header of a segment it does not carry.
+        // Prefix sniffing alone would accept it; framing must not.
+        let source = format!("data:image/jpeg;base64,{}", "/9j/4AAQ");
+        let error = normalize_data_uri(&source, TEN_MB).unwrap_err();
+        let reason = match error.downcast_ref::<MultimodalError>() {
+            Some(MultimodalError::InvalidMarker { reason, .. }) => reason.clone(),
+            _ => panic!("truncated JPEG fragment must fail as InvalidMarker"),
+        };
+        assert!(
+            reason.contains("not a recognized image"),
+            "reason should name the failure: {reason}"
+        );
+        assert!(
+            !reason.contains("data:") && !reason.contains("/9j"),
+            "reason must not echo the payload: {reason}"
+        );
+    }
+
+    #[test]
+    fn normalize_data_uri_accepts_framed_jpeg_header() {
+        // SOI plus a complete 16-byte APP0 JFIF segment plus EOI: the
+        // smallest payload that frames as a JPEG, and it round-trips
+        // unchanged.
+        let jpeg: &[u8] = &[
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x00,
+            0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
+        ];
+        let source = format!("data:image/jpeg;base64,{}", STANDARD.encode(jpeg));
+        let normalized = normalize_data_uri(&source, TEN_MB)
+            .unwrap_or_else(|error| panic!("framed JPEG must pass: {error}"));
+        assert_eq!(normalized, source);
+    }
+
+    #[test]
+    fn normalize_data_uri_rejects_signature_that_disagrees_with_declaration() {
+        // A framed PNG declared as JPEG is rejected, not re-labelled: a marker
+        // lifted out of arbitrary tool text has no provenance, so the bytes
+        // and the declaration must agree.
+        let source = format!("data:image/jpeg;base64,{MINIMAL_PNG_B64}");
+        let error = normalize_data_uri(&source, TEN_MB).unwrap_err();
+        let reason = match error.downcast_ref::<MultimodalError>() {
+            Some(MultimodalError::InvalidMarker { reason, .. }) => reason.clone(),
+            _ => panic!("sniffed/declared mismatch must fail as InvalidMarker"),
+        };
+        assert!(
+            reason.contains("image/png") && reason.contains("image/jpeg"),
+            "reason should name both types: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_keeps_truncated_tool_result_marker_as_text() {
+        // The reported scenario: a text-returning tool printed marker-shaped
+        // text whose payload decodes but does not frame an image. The tool
+        // result must stay textual — the skipped-image note replaces the
+        // marker — so nothing image-shaped reaches the provider.
+        let marker = format!("[{}:{}]", "IMAGE", "data:image/jpeg;base64,/9j/4AAQ");
+        let native_tool_content = serde_json::json!({
+            "tool_call_id": "call_shell",
+            "content": format!("rg done\n{marker}"),
+        })
+        .to_string();
+
+        let prepared = prepare_messages_for_provider(
+            &[ChatMessage::tool(native_tool_content)],
+            &MultimodalConfig::default(),
+        )
+        .await
+        .expect("marker-shaped text must not fail preparation");
+
+        assert!(!prepared.contains_images);
+        let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
+            .expect("native tool result must remain valid JSON");
+        assert_eq!(
+            value.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("call_shell")
+        );
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content should remain a JSON string");
+        assert!(inner.contains("rg done"));
+        assert!(
+            inner.contains("1 attached image(s) could not be loaded"),
+            "the skipped-image note is the safe textual representation: {inner}"
+        );
+        assert!(
+            !inner.contains(IMAGE_MARKER_PREFIX),
+            "no marker may survive: {inner}"
+        );
+        assert!(
+            !inner.contains("data:image"),
+            "no image payload may survive: {inner}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_promotes_framed_tool_result_image_marker() {
+        // The other side of the boundary: a tool result whose marker decodes
+        // to a framed image of the declared type still rides as an image
+        // marker for the provider to lift.
+        let marker = format!("[{}:data:image/png;base64,{}]", "IMAGE", MINIMAL_PNG_B64);
+        let native_tool_content = serde_json::json!({
+            "tool_call_id": "call_snapshot",
+            "content": format!("snapshot captured\n{marker}"),
+        })
+        .to_string();
+
+        let prepared = prepare_messages_for_provider(
+            &[ChatMessage::tool(native_tool_content)],
+            &MultimodalConfig::default(),
+        )
+        .await
+        .expect("a framed tool-result image must prepare");
+
+        assert!(prepared.contains_images);
+        let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
+            .expect("native tool result must remain valid JSON");
+        assert_eq!(
+            value.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("call_snapshot")
+        );
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content should remain a JSON string");
+        assert!(inner.contains("snapshot captured"));
+        assert!(
+            inner.contains("data:image/png;base64,"),
+            "the promoted marker rides inside the tool content: {inner}"
         );
     }
 
