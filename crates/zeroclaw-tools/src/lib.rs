@@ -43,6 +43,7 @@ pub mod google_workspace;
 pub mod hardware_board_info;
 pub mod hardware_memory_map;
 pub mod hardware_memory_read;
+mod http_decode;
 pub mod http_request;
 pub mod image_gen;
 pub mod image_info;
@@ -99,6 +100,45 @@ pub const MEMORY_TOOL_NAMES: &[&str] = &[
     "memory_export",
     "memory_purge",
 ];
+
+/// Shared test-only isolation for the process-global runtime proxy state that
+/// production `Tool::execute` paths read (`http_request`, `web_fetch`) and
+/// `proxy_config` tests mutate through the real setters.
+///
+/// One binary-wide async mutex serializes those tests, and the guard restores
+/// the value observed on entry when it drops, so a writer test can neither leak
+/// its configured proxy into later tests nor race a concurrent reader mid-test.
+/// A reset alone would still race; production proxy state is untouched.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use tokio::sync::{Mutex, MutexGuard};
+    use zeroclaw_config::schema::{ProxyConfig, runtime_proxy_config, set_runtime_proxy_config};
+
+    static RUNTIME_PROXY_STATE_LOCK: Mutex<()> = Mutex::const_new(());
+
+    pub(crate) struct RuntimeProxyStateGuard {
+        _lock: MutexGuard<'static, ()>,
+        snapshot: ProxyConfig,
+    }
+
+    impl RuntimeProxyStateGuard {
+        /// Hold while the test reads or mutates the runtime proxy state.
+        pub(crate) async fn acquire() -> Self {
+            let lock = RUNTIME_PROXY_STATE_LOCK.lock().await;
+            let snapshot = runtime_proxy_config();
+            Self {
+                _lock: lock,
+                snapshot,
+            }
+        }
+    }
+
+    impl Drop for RuntimeProxyStateGuard {
+        fn drop(&mut self) {
+            set_runtime_proxy_config(self.snapshot.clone());
+        }
+    }
+}
 
 #[cfg(test)]
 mod memory_tool_names_guard {
