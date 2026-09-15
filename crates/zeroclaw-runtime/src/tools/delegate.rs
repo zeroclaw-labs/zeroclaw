@@ -3968,7 +3968,9 @@ mod tests {
     use crate::control_plane::{
         ControlPlaneHandle, SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
     };
-    use crate::platform::{NativeRuntime, RuntimeAdapter};
+    #[cfg(unix)]
+    use crate::platform::NativeRuntime;
+    use crate::platform::RuntimeAdapter;
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use crate::tools::{MemoryRecallTool, MemoryStoreTool};
     use std::path::{Path, PathBuf};
@@ -5309,17 +5311,20 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[derive(Default)]
     struct IndependentRiskPolicyModelProvider {
         tool_messages: std::sync::Mutex<Vec<String>>,
     }
 
+    #[cfg(unix)]
     impl IndependentRiskPolicyModelProvider {
         fn tool_messages(&self) -> Vec<String> {
             self.tool_messages.lock().unwrap().clone()
         }
     }
 
+    #[cfg(unix)]
     #[async_trait]
     impl ModelProvider for IndependentRiskPolicyModelProvider {
         async fn chat_with_system(
@@ -5378,6 +5383,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl ::zeroclaw_api::attribution::Attributable for IndependentRiskPolicyModelProvider {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Provider(
