@@ -522,6 +522,43 @@ mod tests {
     /// the bridge forwards each one as a record rather than dropping it.
     const BRIDGED_RECORD_COUNT: usize = 8;
 
+    /// The reviewed `log.target` roots the body below emits under: the
+    /// hand-written literal crosses whole, the module-path targets reduce to
+    /// their crate. This is the per-test marker `own_records` selects on.
+    const OWN_TARGETS: &[&str] = &["Client/PairCode", "whatsapp_rust"];
+
+    /// A native `tracing::*!` event's message. Native events are not bridged,
+    /// so their text is not redacted; that is what makes this one findable
+    /// in both sinks, proving the pollution below is real and not vacuous.
+    const FOREIGN_MESSAGE: &str = "simulated concurrent native tracing event";
+
+    /// Only the records this test emitted, out of everything the shared sinks
+    /// hold.
+    ///
+    /// `writer::record_event` fans every event into one process-global
+    /// broadcast hook and one runtime-trace file, and `LogCaptureLayer` is
+    /// installed as the process-global subscriber by the first test that asks
+    /// for it. From then on a native `tracing::*!` event fired by any test
+    /// running in parallel — the migration tests fire several — lands in the
+    /// same sinks these tests read. Counting the sinks unfiltered is what made
+    /// these assertions flake under `cargo test`'s in-process parallel runner;
+    /// `HOOK_TEST_LOCK` guards hook install/clear, not emission, so it cannot
+    /// help. `log.target` is set by `tracing_log` on every record the `log`
+    /// bridge forwards and on nothing else, and the bridge reduces it to a
+    /// reviewed root, so a per-test root set selects exactly this test's
+    /// records and excludes every native event whatever its text or target.
+    fn own_records(values: &[serde_json::Value], roots: &[&str]) -> Vec<serde_json::Value> {
+        values
+            .iter()
+            .filter(|value| {
+                value["attributes"]["log.target"]
+                    .as_str()
+                    .is_some_and(|target| roots.contains(&target))
+            })
+            .cloned()
+            .collect()
+    }
+
     /// The credential boundary, exercised through the real sinks rather than
     /// the fmt probe: the global `LogCaptureLayer`, `writer::record_event`'s
     /// rolling JSONL persistence, and the broadcast hook, wired exactly as
@@ -596,21 +633,33 @@ mod tests {
                 target: "whatsapp_rust::socket",
                 "{TRANSPORT_FAILURE}"
             );
+            // A native `tracing::*!` event on the same subscriber: the shape a
+            // parallel migration test fires into these process-global sinks.
+            // It must land in both sinks and be excluded from every count
+            // below; see `own_records`.
+            tracing::warn!(
+                target: "zeroclaw_log::migrate",
+                "{FOREIGN_MESSAGE}"
+            );
         });
 
         let mut broadcast = Vec::new();
         while let Ok(value) = rx.try_recv() {
-            broadcast.push(value.to_string());
+            broadcast.push(value);
         }
         crate::broadcast::clear_broadcast_hook();
+        let broadcast_text: String = broadcast.iter().map(ToString::to_string).collect();
 
         crate::writer::flush_for_test().unwrap();
         let persisted =
             std::fs::read_to_string(crate::writer::runtime_trace_path().unwrap()).unwrap();
 
+        // The negative checks read the whole of each sink, unfiltered: nothing
+        // this test never emitted can contain its private fixture strings, and
+        // the wider the body searched, the stronger the guarantee.
         for (sink, body) in [
             ("persisted runtime-trace.jsonl", persisted.as_str()),
-            ("live broadcast", broadcast.concat().as_str()),
+            ("live broadcast", broadcast_text.as_str()),
         ] {
             for (what, marker) in [
                 ("phone number", PAIR_PHONE),
@@ -638,12 +687,14 @@ mod tests {
         }
 
         // Every emission still arrives as a record: the text is withheld, the
-        // event is not suppressed.
-        let bridged: Vec<serde_json::Value> = persisted
+        // event is not suppressed. Counted over this test's own records only;
+        // the sinks are shared with whatever else the runner has in flight.
+        let persisted_records: Vec<serde_json::Value> = persisted
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .filter(|value| value["attributes"]["log.target"].is_string())
             .collect();
+        let bridged = own_records(&persisted_records, OWN_TARGETS);
+        let own_broadcast = own_records(&broadcast, OWN_TARGETS);
         assert_eq!(
             bridged.len(),
             BRIDGED_RECORD_COUNT,
@@ -658,10 +709,23 @@ mod tests {
             );
         }
         assert_eq!(
-            broadcast.len(),
+            own_broadcast.len(),
             BRIDGED_RECORD_COUNT,
             "every third-party record must also reach the live broadcast: {broadcast:?}"
         );
+
+        // The stand-in for a concurrent test's native event did reach both
+        // sinks, so the counts above held against real pollution, not against
+        // an empty channel.
+        for (sink, records) in [
+            ("live broadcast", &broadcast),
+            ("persisted runtime-trace.jsonl", &persisted_records),
+        ] {
+            assert!(
+                records.iter().any(|v| v["message"] == FOREIGN_MESSAGE),
+                "the foreign native event must reach the {sink}: {records:?}"
+            );
+        }
 
         // What the bridge is still worth: severity and provenance. The
         // transport failure is findable by its crate's reviewed name — a
@@ -970,7 +1034,7 @@ mod tests {
 
         let mut broadcast = Vec::new();
         while let Ok(value) = rx.try_recv() {
-            broadcast.push(value.to_string());
+            broadcast.push(value);
         }
         crate::broadcast::clear_broadcast_hook();
 
@@ -978,18 +1042,27 @@ mod tests {
         let persisted =
             std::fs::read_to_string(crate::writer::runtime_trace_path().unwrap()).unwrap();
 
-        let bridged: Vec<serde_json::Value> = persisted
+        // This test's own records only — see `own_records`. Selecting by the
+        // reviewed roots also makes the positional `zip` below exact: the five
+        // records were emitted in order on one thread, and nothing a parallel
+        // test emits can interleave with them once filtered.
+        let roots: Vec<&str> = ACTIVATED_CRATE_SITES
+            .iter()
+            .map(|(_, root)| *root)
+            .collect();
+        let persisted_records: Vec<serde_json::Value> = persisted
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .filter(|value| value["attributes"]["log.target"].is_string())
             .collect();
+        let bridged = own_records(&persisted_records, &roots);
+        let own_broadcast = own_records(&broadcast, &roots);
         assert_eq!(
             bridged.len(),
             ACTIVATED_CRATE_SITES.len(),
             "every activated crate's record must be persisted: {persisted}"
         );
         assert_eq!(
-            broadcast.len(),
+            own_broadcast.len(),
             ACTIVATED_CRATE_SITES.len(),
             "every activated crate's record must also be broadcast: {broadcast:?}"
         );

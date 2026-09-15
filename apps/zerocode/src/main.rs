@@ -1470,10 +1470,14 @@ async fn await_spawned_daemon_ready(
     socket: &std::path::Path,
     daemon: &mut SpawnedDaemon,
 ) -> anyhow::Result<client::RpcClient> {
+    let socket_path = socket.display().to_string();
+    let readiness_seconds = SPAWNED_DAEMON_CONNECT_TIMEOUT.as_secs().to_string();
     eprintln!(
-        "zerocode: waiting for daemon at {} (up to {}s)…",
-        socket.display(),
-        SPAWNED_DAEMON_CONNECT_TIMEOUT.as_secs(),
+        "{}",
+        crate::i18n::t_args(
+            "zc-daemon-wait-notice",
+            &[("path", &socket_path), ("seconds", &readiness_seconds)],
+        )
     );
     let deadline = tokio::time::Instant::now() + SPAWNED_DAEMON_CONNECT_TIMEOUT;
     loop {
@@ -1482,10 +1486,11 @@ async fn await_spawned_daemon_ready(
         }
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!(
-                "daemon did not become ready within {}s (socket: {}); if the socket path is \
-                 long, set ZEROCLAW_SOCKET to a shorter path or use a shorter --config-dir",
-                SPAWNED_DAEMON_CONNECT_TIMEOUT.as_secs(),
-                socket.display(),
+                "{}",
+                crate::i18n::t_args(
+                    "zc-error-daemon-not-ready-timeout",
+                    &[("path", &socket_path), ("seconds", &readiness_seconds)],
+                )
             );
         }
         match client::RpcClient::connect(socket, None, None).await {

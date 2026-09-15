@@ -731,7 +731,15 @@ impl WeChatChannel {
         let pairing = if has_peers {
             None
         } else {
-            let guard = PairingGuard::new(true, &[]);
+            // Chat-channel bind codes are retyped by hand into a Telegram/
+            // LINE/WeChat message, so they deliberately keep the six-digit
+            // numeric shape. The shared-policy change re-scoped the *gateway* pairing code, not
+            // this one; changing it here would be an unreviewed UX change.
+            let guard = PairingGuard::new(
+                true,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::numeric_compat(),
+            );
             if let Some(code) = guard.pairing_code() {
                 // Mirror Telegram: a backgrounded daemon discards stdout, so
                 // also record the one-time bind code through the structured
@@ -774,7 +782,7 @@ impl WeChatChannel {
             peer_resolver,
             persist: None,
             pairing,
-            client: reqwest::Client::new(),
+            client: zeroclaw_config::schema::build_runtime_proxy_client("channel.wechat"),
             context_tokens: Mutex::new(HashMap::new()),
             typing_tickets: Mutex::new(HashMap::new()),
             cursor: Mutex::new(String::new()),

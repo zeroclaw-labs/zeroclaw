@@ -44,7 +44,13 @@ On Unix the daemon traps `SIGINT` and `SIGTERM`; on Windows it traps Ctrl+C (`ct
 
 `SIGHUP` is ignored (the daemon stays running). A reload requested via the `/admin/reload` endpoint restarts the daemon loop in place rather than exiting.
 
-An in-place reload starts a replacement generation over the same durable sessions, so it waits for the RPC connections the retiring generation accepted to finish, including any agent turn still unwinding after a forced teardown. If that wait runs out of budget, the reload is refused and the daemon shuts down instead; a service manager then restarts it as a fresh process, which cannot overlap the work the old one never retired.
+An in-place reload starts a replacement generation over the same durable sessions, so it waits for the RPC connections the retiring generation accepted to finish, including any agent turn still unwinding after a forced teardown. If that wait runs out of budget, the reload is refused and the daemon shuts down instead. The refusal is deliberate: exiting is what keeps a replacement generation from overlapping work that the old one never retired.
+
+How the daemon comes back after a refusal depends on what was running it:
+
+- Under the installed systemd unit (`Restart=always`) or launchd LaunchAgent (`KeepAlive`), the service manager starts a fresh daemon process, as described under Restart behaviour.
+- Under the Windows `ONLOGON` task, which has no restart-on-failure policy, the daemon stays down until you restart it manually or the next logon.
+- When ZeroCode started the daemon itself, which it does by spawning an ephemeral daemon whenever it finds no local endpoint, ZeroCode owns that child and replaces it itself instead of waiting on a service manager. It makes a single automatic respawn attempt per disconnect, and flags the daemon as needing attention if that attempt does not come back.
 
 Conversation memory and session state are written to SQLite incrementally during operation, not buffered until shutdown, so a clean stop does not depend on a flush step. Tool receipts are in-band HMAC tokens in the conversation, not a separate on-disk log. A hard `SIGKILL` skips the clean channel teardown but does not corrupt already-committed memory; only an agent turn that was mid-write is lost.
 

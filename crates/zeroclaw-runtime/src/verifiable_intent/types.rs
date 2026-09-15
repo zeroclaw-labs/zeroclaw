@@ -14,6 +14,15 @@ pub struct Jwk {
     pub x: String,
     /// Base64url-encoded y coordinate.
     pub y: String,
+    /// Key identifier, carried inside the JWK.
+    ///
+    /// `credential-format.md` §4.6 requires an Autonomous mandate's `cnf.jwk` to
+    /// "include a `kid` member as its key identifier", and §11.2's worked
+    /// mandates show it nested there. An L3 header's `kid` is resolved against
+    /// this value (§5.7 rule 1), so a `kid` sitting beside `jwk` rather than
+    /// inside it is not the claim a verifier looks up.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kid: Option<String>,
     /// Base64url-encoded private key (only present for signing keys, never serialized to verifiers).
     #[serde(skip_serializing)]
     pub d: Option<String>,
@@ -27,17 +36,21 @@ impl fmt::Debug for Jwk {
             .field("crv", &self.crv)
             .field("x", &self.x)
             .field("y", &self.y)
+            .field("kid", &self.kid)
             .field("d", &private_scalar)
             .finish()
     }
 }
 
 /// Confirmation claim (`cnf`) binding a credential to a public key.
+///
+/// Carries the JWK alone. The key identifier lives inside it, so a mandate pair
+/// comparing `cnf` values compares the embedded `kid` too, which is what §4.6
+/// requires of a pair: identical `cnf.jwk` values "including the embedded
+/// `kid`".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Cnf {
     pub jwk: Jwk,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kid: Option<String>,
 }
 
 // ── Execution mode ───────────────────────────────────────────────────
@@ -204,8 +217,14 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for DisclosableEntry<T> {
 #[serde(tag = "type")]
 pub enum KnownConstraint {
     /// Merchant allowlist for checkout mandates.
-    #[serde(rename = "mandate.checkout.allowed_merchant")]
+    ///
+    /// The wire field is `allowed` for both allowlists (`constraints.md` §4.1
+    /// and §4.3). The Rust name stays specific because two variants would
+    /// otherwise both carry a field called `allowed`, and the same
+    /// rename-on-the-wire idiom already appears on `PaymentInstrument::type`.
+    #[serde(rename = "mandate.checkout.allowed_merchants")]
     AllowedMerchant {
+        #[serde(rename = "allowed")]
         allowed_merchants: Vec<DisclosableEntry<Entity>>,
     },
 
@@ -216,13 +235,14 @@ pub enum KnownConstraint {
     },
 
     /// Payee allowlist for payment mandates.
-    #[serde(rename = "payment.allowed_payee")]
+    #[serde(rename = "mandate.payment.allowed_payees")]
     AllowedPayee {
+        #[serde(rename = "allowed")]
         allowed_payees: Vec<DisclosableEntry<Entity>>,
     },
 
     /// Per-transaction amount range.
-    #[serde(rename = "payment.amount")]
+    #[serde(rename = "mandate.payment.amount_range")]
     PaymentAmount {
         currency: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -232,11 +252,21 @@ pub enum KnownConstraint {
     },
 
     /// Cumulative budget cap.
-    #[serde(rename = "payment.budget")]
-    PaymentBudget { currency: String, max: i64 },
+    ///
+    /// `min` is a per-transaction floor, distinct from `max`'s cumulative
+    /// ceiling (`constraints.md` §4.5). The specification requires it to be
+    /// positive when present; enforcing that belongs to the checker stage, and
+    /// carrying the field is what lets that stage see it at all.
+    #[serde(rename = "mandate.payment.budget")]
+    PaymentBudget {
+        currency: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        min: Option<i64>,
+        max: i64,
+    },
 
     /// Merchant-managed recurring payment.
-    #[serde(rename = "payment.recurrence")]
+    #[serde(rename = "mandate.payment.recurrence")]
     PaymentRecurrence {
         frequency: String,
         start_date: String,
@@ -247,18 +277,23 @@ pub enum KnownConstraint {
     },
 
     /// Agent-managed recurring purchase.
-    #[serde(rename = "payment.agent_recurrence")]
+    ///
+    /// `end_date` is REQUIRED here and RECOMMENDED on `PaymentRecurrence`
+    /// (`constraints.md` §4.7 against §4.6). §7.4 gives the reason: a required
+    /// end date is what stops an open-ended agent-managed authorization, so an
+    /// agent-recurrence constraint without one is malformed and must not parse
+    /// into this variant.
+    #[serde(rename = "mandate.payment.agent_recurrence")]
     AgentRecurrence {
         frequency: String,
         start_date: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        end_date: Option<String>,
+        end_date: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         max_occurrences: Option<u32>,
     },
 
     /// Cross-reference between checkout and payment mandates.
-    #[serde(rename = "payment.reference")]
+    #[serde(rename = "mandate.payment.reference")]
     PaymentReference { conditional_transaction_id: String },
 }
 
@@ -271,14 +306,14 @@ pub enum KnownConstraint {
 /// malformed input is silently ignored. `known_constraint_tags_are_complete`
 /// pins the list to the enum.
 const KNOWN_CONSTRAINT_TYPES: &[&str] = &[
-    "mandate.checkout.allowed_merchant",
+    "mandate.checkout.allowed_merchants",
     "mandate.checkout.line_items",
-    "payment.allowed_payee",
-    "payment.amount",
-    "payment.budget",
-    "payment.recurrence",
-    "payment.agent_recurrence",
-    "payment.reference",
+    "mandate.payment.allowed_payees",
+    "mandate.payment.amount_range",
+    "mandate.payment.budget",
+    "mandate.payment.recurrence",
+    "mandate.payment.agent_recurrence",
+    "mandate.payment.reference",
 ];
 
 /// A constraint carried by an L2 open mandate.
@@ -717,7 +752,11 @@ mod tests {
         }
         .into();
         let json = serde_json::to_string(&c).unwrap();
-        assert!(json.contains("payment.amount"));
+        // Compared whole. A substring test passes for any tag that merely
+        // contains this one, so it would survive a rename while proving
+        // nothing about the tag actually emitted.
+        let emitted: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(emitted["type"], "mandate.payment.amount_range");
         let back: Constraint = serde_json::from_str(&json).unwrap();
         assert_eq!(c, back);
     }
@@ -733,7 +772,8 @@ mod tests {
         }
         .into();
         let json = serde_json::to_string(&c).unwrap();
-        assert!(json.contains("mandate.checkout.allowed_merchant"));
+        let emitted: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(emitted["type"], "mandate.checkout.allowed_merchants");
         let back: Constraint = serde_json::from_str(&json).unwrap();
         assert_eq!(c, back);
     }
@@ -745,8 +785,8 @@ mod tests {
     #[test]
     fn constraint_entries_keep_disclosed_and_withheld_forms() {
         let json = r#"{
-            "type": "mandate.checkout.allowed_merchant",
-            "allowed_merchants": [
+            "type": "mandate.checkout.allowed_merchants",
+            "allowed": [
                 {"id": "m-1", "name": "Audioshop", "website": "https://audioshop.example"},
                 {"...": "hrPPJ7L3t5KDOjA04PIL08z0_6UyW8finU53nPf-sCU"}
             ]
@@ -786,8 +826,8 @@ mod tests {
     #[test]
     fn a_reference_entry_must_carry_nothing_but_the_hash() {
         let hybrid = r#"{
-            "type": "mandate.checkout.allowed_merchant",
-            "allowed_merchants": [{"...": "abc", "id": "m-1"}]
+            "type": "mandate.checkout.allowed_merchants",
+            "allowed": [{"...": "abc", "id": "m-1"}]
         }"#;
         assert!(
             serde_json::from_str::<Constraint>(hybrid).is_err(),
@@ -795,8 +835,8 @@ mod tests {
         );
 
         let non_string_hash = r#"{
-            "type": "mandate.checkout.allowed_merchant",
-            "allowed_merchants": [{"...": 7}]
+            "type": "mandate.checkout.allowed_merchants",
+            "allowed": [{"...": 7}]
         }"#;
         assert!(
             serde_json::from_str::<Constraint>(non_string_hash).is_err(),
@@ -812,8 +852,8 @@ mod tests {
     #[test]
     fn a_complete_hybrid_entry_is_rejected_rather_than_silently_disclosed() {
         let merchant = r#"{
-            "type": "mandate.checkout.allowed_merchant",
-            "allowed_merchants": [
+            "type": "mandate.checkout.allowed_merchants",
+            "allowed": [
                 {"...": "HASH", "name": "Store X", "website": "https://store-x.example"}
             ]
         }"#;
@@ -840,8 +880,17 @@ mod tests {
     /// field erases data no later stage can recover.
     #[test]
     fn known_constraint_preserves_unrecognized_fields() {
-        let json = r#"{"type":"payment.amount","currency":"USD","max":40000,"acme_tier":"gold"}"#;
+        let json = r#"{"type":"mandate.payment.amount_range","currency":"USD","max":40000,"acme_tier":"gold"}"#;
         let parsed: Constraint = serde_json::from_str(json).unwrap();
+
+        // Pinned to the recognized arm. An unrecognized constraint round-trips
+        // just as faithfully, so the equality below would still hold if this
+        // tag ever stopped being recognized, and the case this test exists for
+        // would go unexercised.
+        let Constraint::Known { known, .. } = &parsed else {
+            panic!("`payment.amount` must parse as a recognized constraint, got {parsed:?}");
+        };
+        assert!(matches!(known, KnownConstraint::PaymentAmount { .. }));
 
         let before: serde_json::Value = serde_json::from_str(json).unwrap();
         let after: serde_json::Value =
@@ -891,7 +940,7 @@ mod tests {
     /// that it arrives through `extra` rather than through the variant.
     #[test]
     fn an_explicit_null_for_an_optional_field_is_preserved() {
-        let json = r#"{"type":"payment.amount","currency":"USD","min":null}"#;
+        let json = r#"{"type":"mandate.payment.amount_range","currency":"USD","min":null}"#;
         let parsed: Constraint = serde_json::from_str(json).unwrap();
 
         let Constraint::Known {
@@ -1080,16 +1129,32 @@ mod tests {
     /// checker says no and the signed mandate says yes.
     #[test]
     fn a_hand_built_unknown_may_not_become_a_recognized_constraint() {
-        let mut fields = serde_json::Map::new();
-        fields.insert("currency".to_owned(), serde_json::json!("USD"));
-        let disguised = Constraint::Unknown {
-            constraint_type: "payment.amount".to_owned(),
-            fields,
-        };
-        assert!(
-            signed_form_matches_the_evaluated_value(&disguised),
-            "an unrecognized constraint must not be signed as a recognized one"
-        );
+        // The disguise needs a tag this build recognizes and the fields that
+        // make it parse back as that variant. Both are taken from the enum, so
+        // renaming a tag cannot turn the disguise into a genuinely
+        // unrecognized constraint and leave this case silently unexercised.
+        // Walking every variant also covers the seven the hand-written case
+        // never reached.
+        for variant in every_known_variant() {
+            let serde_json::Value::Object(mut object) = serde_json::to_value(&variant).unwrap()
+            else {
+                panic!("a recognized constraint must serialize to an object");
+            };
+            let constraint_type = object
+                .remove("type")
+                .and_then(|tag| tag.as_str().map(str::to_owned))
+                .expect("a recognized constraint must carry a string `type`");
+
+            let disguised = Constraint::Unknown {
+                constraint_type: constraint_type.clone(),
+                fields: object,
+            };
+            assert!(
+                signed_form_matches_the_evaluated_value(&disguised),
+                "an unrecognized constraint carrying the recognized tag \
+                 `{constraint_type}` must not be signed as a recognized one"
+            );
+        }
 
         // Control: a genuinely unrecognized tag round-trips as itself.
         let mut fields = serde_json::Map::new();
@@ -1129,7 +1194,7 @@ mod tests {
         };
 
         let serialized = serde_json::to_value(&hand_built).unwrap();
-        assert_eq!(serialized["type"], "payment.amount");
+        assert_eq!(serialized["type"], "mandate.payment.amount_range");
 
         let reparsed: Constraint = serde_json::from_value(serialized).unwrap();
         let Constraint::Known { known, extra } = &reparsed else {
@@ -1180,6 +1245,97 @@ mod tests {
             emitted, declared,
             "KNOWN_CONSTRAINT_TYPES has drifted from the KnownConstraint variants"
         );
+    }
+
+    /// `end_date` is REQUIRED on an agent-managed recurrence and RECOMMENDED on
+    /// a merchant-managed one (`constraints.md` §4.7 against §4.6). §7.4 gives
+    /// the reason: the required end date is the thing that stops an open-ended
+    /// agent-managed authorization.
+    ///
+    /// The consequence is a parse outcome, not a checker outcome. An
+    /// agent-recurrence constraint with no `end_date` must not become the
+    /// recognized variant, and because its tag is registered it must surface as
+    /// an error and not degrade into `Unknown`, where a permissive policy would
+    /// skip it.
+    #[test]
+    fn an_agent_recurrence_without_an_end_date_is_refused() {
+        let missing = r#"{
+            "type": "mandate.payment.agent_recurrence",
+            "frequency": "ON_DEMAND",
+            "start_date": "2026-03-01"
+        }"#;
+        let err = serde_json::from_str::<Constraint>(missing).unwrap_err();
+        assert!(
+            err.to_string().contains("end_date"),
+            "expected a missing-field error naming end_date, got: {err}"
+        );
+
+        // Control: the same constraint parses once the required field is there,
+        // so the refusal above is attributable to `end_date` and not to the tag.
+        let complete = r#"{
+            "type": "mandate.payment.agent_recurrence",
+            "frequency": "ON_DEMAND",
+            "start_date": "2026-03-01",
+            "end_date": "2026-03-31",
+            "max_occurrences": 10
+        }"#;
+        let parsed: Constraint = serde_json::from_str(complete).expect("the complete form parses");
+        let Constraint::Known {
+            known: KnownConstraint::AgentRecurrence { end_date, .. },
+            ..
+        } = &parsed
+        else {
+            panic!("expected an agent recurrence, got {parsed:?}");
+        };
+        assert_eq!(end_date, "2026-03-31");
+
+        // The sibling type keeps `end_date` optional, so the two must not have
+        // been changed together.
+        let merchant_managed = r#"{
+            "type": "mandate.payment.recurrence",
+            "frequency": "MNTH",
+            "start_date": "2026-03-01"
+        }"#;
+        assert!(
+            serde_json::from_str::<Constraint>(merchant_managed).is_ok(),
+            "a merchant-managed recurrence may omit end_date"
+        );
+    }
+
+    /// `mandate.payment.budget` carries a per-transaction floor beside its
+    /// cumulative ceiling (`constraints.md` §4.5). Nothing evaluates it yet, so
+    /// what matters at this stage is that it survives a round trip rather than
+    /// being dropped into `extra` or discarded.
+    #[test]
+    fn a_budget_minimum_round_trips_as_a_recognized_field() {
+        let json = r#"{"type":"mandate.payment.budget","currency":"USD","min":1000,"max":50000}"#;
+        let parsed: Constraint = serde_json::from_str(json).unwrap();
+
+        let Constraint::Known {
+            known: KnownConstraint::PaymentBudget { min, max, .. },
+            extra,
+        } = &parsed
+        else {
+            panic!("expected a payment budget, got {parsed:?}");
+        };
+        assert_eq!(*min, Some(1000));
+        assert_eq!(*max, 50000);
+        assert!(
+            extra.is_empty(),
+            "`min` must be a recognized field, not preserved as an extra: {extra:?}"
+        );
+
+        let before: serde_json::Value = serde_json::from_str(json).unwrap();
+        let after: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(before, after);
+
+        // Absent stays absent: the field is skipped when unset, so a budget
+        // without a floor does not gain a null one.
+        let without = r#"{"type":"mandate.payment.budget","currency":"USD","max":50000}"#;
+        let parsed: Constraint = serde_json::from_str(without).unwrap();
+        let emitted = serde_json::to_value(&parsed).unwrap();
+        assert!(emitted.get("min").is_none(), "emitted: {emitted}");
     }
 
     #[test]
@@ -1241,8 +1397,9 @@ mod tests {
     /// malformed recognized constraint would pass unreported.
     #[test]
     fn malformed_known_constraint_errors_rather_than_becoming_unknown() {
-        // `payment.amount` requires `currency`.
-        let err = serde_json::from_str::<Constraint>(r#"{"type":"payment.amount"}"#).unwrap_err();
+        // `mandate.payment.amount_range` requires `currency`.
+        let err = serde_json::from_str::<Constraint>(r#"{"type":"mandate.payment.amount_range"}"#)
+            .unwrap_err();
         assert!(
             err.to_string().contains("currency"),
             "expected a missing-field error, got: {err}"
@@ -1260,7 +1417,8 @@ mod tests {
     /// Recognized types are unaffected by the open representation.
     #[test]
     fn known_constraint_still_parses_into_its_variant() {
-        let json = r#"{"type":"payment.amount","currency":"USD","min":10000,"max":40000}"#;
+        let json =
+            r#"{"type":"mandate.payment.amount_range","currency":"USD","min":10000,"max":40000}"#;
         let parsed: Constraint = serde_json::from_str(json).unwrap();
         assert!(matches!(
             parsed,
@@ -1275,7 +1433,7 @@ mod tests {
     #[test]
     fn mixed_constraint_list_parses_both_arms() {
         let json = r#"[
-            {"type":"payment.amount","currency":"USD","max":40000},
+            {"type":"mandate.payment.amount_range","currency":"USD","max":40000},
             {"type":"urn:example:experimental","scope":"wide"}
         ]"#;
         let parsed: Vec<Constraint> = serde_json::from_str(json).unwrap();

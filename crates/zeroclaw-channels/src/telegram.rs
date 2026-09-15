@@ -729,7 +729,6 @@ pub struct TelegramChannel {
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     persist: Option<Arc<RwLock<Config>>>,
     pairing: Option<PairingGuard>,
-    client: reqwest::Client,
     typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     stream_mode: StreamMode,
     draft_update_interval_ms: u64,
@@ -1046,7 +1045,15 @@ impl TelegramChannel {
         let pairing = if has_peers {
             None
         } else {
-            let guard = PairingGuard::new(true, &[]);
+            // Chat-channel bind codes are retyped by hand into a Telegram/
+            // LINE/WeChat message, so they deliberately keep the six-digit
+            // numeric shape. The shared-policy change re-scoped the *gateway* pairing code, not
+            // this one; changing it here would be an unreviewed UX change.
+            let guard = PairingGuard::new(
+                true,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::numeric_compat(),
+            );
             if let Some(code) = guard.pairing_code() {
                 // Surface the one-time bind code through the structured log,
                 // not just stdout. A backgrounded daemon (launchd/systemd/
@@ -1078,7 +1085,6 @@ impl TelegramChannel {
             peer_resolver,
             persist: None,
             pairing,
-            client: reqwest::Client::new(),
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: TELEGRAM_DRAFT_UPDATE_INTERVAL_MS,
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
@@ -1182,86 +1188,30 @@ impl TelegramChannel {
         self
     }
 
-    /// Configure voice transcription.
-    pub fn with_transcription(
+    /// Configure voice transcription from a `[transcription]` snapshot.
+    ///
+    /// Compatibility and test path. The daemon routes every channel through
+    /// `with_transcription_manager` with a manager built from live
+    /// config and the owning agent's resolved provider; this path can only see
+    /// the legacy section, so it binds a lone registered provider and
+    /// otherwise leaves the choice unbound (see
+    /// `transcription::manager_from_snapshot`).
+    pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
+        let manager = super::transcription::manager_from_snapshot(&config);
+        self.with_transcription_manager(config, manager)
+    }
+
+    /// Store an already-built transcription manager, or nothing. The config is
+    /// recorded only alongside a manager, so a channel never advertises
+    /// transcription it cannot perform.
+    pub(crate) fn with_transcription_manager(
         mut self,
         config: zeroclaw_config::schema::TranscriptionConfig,
+        manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
     ) -> Self {
-        if !config.enabled {
-            return self;
-        }
-        match super::transcription::TranscriptionManager::new(&config) {
-            Ok(m) => {
-                let names = m.available_providers();
-                let m = if names.len() == 1 {
-                    let only = names[0].to_string();
-                    m.with_agent_transcription_provider(only)
-                } else {
-                    m
-                };
-                self.transcription_manager = Some(std::sync::Arc::new(m));
-                self.transcription = Some(config);
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"e": e.to_string()})),
-                    "transcription manager init failed, voice transcription disabled"
-                );
-            }
-        }
-        self
-    }
-
-    pub fn with_typed_transcription_providers(
-        mut self,
-        typed: &zeroclaw_config::providers::TranscriptionProviders,
-        agent_alias: &str,
-    ) -> Self {
-        if agent_alias.is_empty() || typed.is_empty() {
-            return self;
-        }
-        let base = match self.transcription_manager.take() {
-            Some(arc) => match std::sync::Arc::try_unwrap(arc) {
-                Ok(m) => m,
-                Err(arc) => {
-                    self.transcription_manager = Some(arc);
-                    return self;
-                }
-            },
-            None => super::transcription::TranscriptionManager::empty(),
-        };
-        let updated = base
-            .with_typed_providers(typed)
-            .with_agent_transcription_provider(agent_alias.to_string());
-        self.transcription_manager = Some(std::sync::Arc::new(updated));
-        self
-    }
-
-    /// Set the agent transcription provider alias on the internal TranscriptionManager.
-    /// Must be called after `with_transcription`. No-op if transcription was not configured.
-    /// The alias should be the provider type key ("groq", "openai", etc.) registered in
-    /// the TranscriptionManager, or the full "type.alias" form (the type prefix is extracted).
-    pub fn with_agent_transcription_provider(mut self, alias: impl Into<String>) -> Self {
-        let alias = alias.into();
-        if alias.is_empty() {
-            return self;
-        }
-        // Resolve "groq.default" → "groq" (TranscriptionManager keys by type, not full alias)
-        let key = alias.split('.').next().unwrap_or(&alias).to_string();
-        if let Some(manager) = self.transcription_manager.take() {
-            match std::sync::Arc::try_unwrap(manager) {
-                Ok(m) => {
-                    self.transcription_manager = Some(std::sync::Arc::new(
-                        m.with_agent_transcription_provider(key),
-                    ));
-                }
-                Err(arc) => {
-                    self.transcription_manager = Some(arc);
-                }
-            }
+        if let Some(manager) = manager {
+            self.transcription_manager = Some(manager);
+            self.transcription = Some(config);
         }
         self
     }
@@ -1965,6 +1915,7 @@ impl TelegramChannel {
             // Finalize path: text is already the final answer — no debounce.
             let text = content.to_string();
             let recipient = recipient.to_string();
+            let proxy_url = self.proxy_url.clone();
             zeroclaw_spawn::spawn!(async move {
                 let is_config_voice_peer = voice_peer_resolver().contains(&recipient);
                 if !is_config_voice_peer && let Ok(mut vc) = voice_chats.lock() {
@@ -1973,6 +1924,7 @@ impl TelegramChannel {
                 match Self::synthesize_and_send_voice(
                     &api_base,
                     &bot_token,
+                    proxy_url.as_deref(),
                     &chat_id,
                     thread_id.as_deref(),
                     &text,
@@ -2017,6 +1969,7 @@ impl TelegramChannel {
 
         let pending = self.pending_voice.clone();
         let recipient = recipient.to_string();
+        let proxy_url = self.proxy_url.clone();
         zeroclaw_spawn::spawn!(async move {
             // Wait 10 seconds — long enough for the agent to finish its
             // full tool chain and send the final answer.
@@ -2040,6 +1993,7 @@ impl TelegramChannel {
                 match Self::synthesize_and_send_voice(
                     &api_base,
                     &bot_token,
+                    proxy_url.as_deref(),
                     &chat_id,
                     thread_id.as_deref(),
                     &text,
@@ -2078,6 +2032,7 @@ impl TelegramChannel {
     async fn synthesize_and_send_voice(
         api_base: &str,
         bot_token: &str,
+        proxy_url: Option<&str>,
         chat_id: &str,
         thread_id: Option<&str>,
         text: &str,
@@ -2100,7 +2055,10 @@ impl TelegramChannel {
         let (method, field, filename, mime) = telegram_audio_send_spec("opus")?;
 
         let url = format!("{api_base}/bot{bot_token}/{method}");
-        let client = zeroclaw_config::schema::build_runtime_proxy_client("channel.telegram");
+        // The same per-channel proxy every other Telegram request uses; the
+        // global proxy alone dropped a configured `proxy_url` for voice uploads.
+        let client =
+            zeroclaw_config::schema::build_channel_proxy_client("channel.telegram", proxy_url);
 
         let mut form = reqwest::multipart::Form::new()
             .text("chat_id", chat_id.to_string())
@@ -5294,7 +5252,7 @@ impl Channel for TelegramChannel {
         }
 
         let resp = self
-            .client
+            .http_client()
             .post(self.api_url("sendMessage"))
             .json(&body)
             .send()
@@ -5376,7 +5334,7 @@ impl Channel for TelegramChannel {
         });
 
         let resp = self
-            .client
+            .http_client()
             .post(self.api_url("editMessageText"))
             .json(&body)
             .send()
@@ -5432,7 +5390,7 @@ impl Channel for TelegramChannel {
         if !suppress_voice && self.is_voice_peer(recipient) {
             if let Ok(id) = message_id.parse::<i64>() {
                 let _ = self
-                    .client
+                    .http_client()
                     .post(self.api_url("deleteMessage"))
                     .json(&serde_json::json!({
                         "chat_id": chat_id,
@@ -5470,7 +5428,7 @@ impl Channel for TelegramChannel {
             // Delete the draft message
             if let Some(id) = msg_id {
                 let _ = self
-                    .client
+                    .http_client()
                     .post(self.api_url("deleteMessage"))
                     .json(&serde_json::json!({
                         "chat_id": chat_id,
@@ -5499,7 +5457,7 @@ impl Channel for TelegramChannel {
         if text.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
             if let Some(id) = msg_id {
                 let _ = self
-                    .client
+                    .http_client()
                     .post(self.api_url("deleteMessage"))
                     .json(&serde_json::json!({
                         "chat_id": chat_id,
@@ -5530,7 +5488,7 @@ impl Channel for TelegramChannel {
         });
 
         let resp = self
-            .client
+            .http_client()
             .post(self.api_url("editMessageText"))
             .json(&body)
             .send()
@@ -5556,7 +5514,7 @@ impl Channel for TelegramChannel {
         });
 
         let resp = self
-            .client
+            .http_client()
             .post(self.api_url("editMessageText"))
             .json(&plain_body)
             .send()
@@ -5576,7 +5534,7 @@ impl Channel for TelegramChannel {
         }
 
         let delete_resp = self
-            .client
+            .http_client()
             .post(self.api_url("deleteMessage"))
             .json(&serde_json::json!({
                 "chat_id": chat_id,
@@ -5633,7 +5591,7 @@ impl Channel for TelegramChannel {
         };
 
         let response = self
-            .client
+            .http_client()
             .post(self.api_url("deleteMessage"))
             .json(&serde_json::json!({
                 "chat_id": chat_id,

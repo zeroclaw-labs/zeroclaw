@@ -9116,7 +9116,10 @@ fn build_channel_by_id(
                 .with_api_base(tg.api_base_url.clone())
                 .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
-                .with_transcription(config.transcription.clone())
+                .with_transcription_manager(
+                    config.transcription.clone(),
+                    resolved_transcription_manager(&config, &format!("telegram.{alias}")),
+                )
                 .with_tts(&config)
                 .with_workspace_dir(workspace_dir)
                 .with_approval_timeout_secs(tg.approval_timeout_secs),
@@ -9144,7 +9147,7 @@ fn build_channel_by_id(
                 DiscordChannel::new(
                     dc.bot_token.clone(),
                     dc.guild_ids.clone(),
-                    alias,
+                    alias.clone(),
                     peer_resolver,
                     dc.listen_to_bots,
                     dc.mention_only,
@@ -9156,7 +9159,10 @@ fn build_channel_by_id(
                     dc.draft_update_interval_ms,
                     dc.multi_message_delay_ms,
                 )
-                .with_transcription(config.transcription.clone())
+                .with_transcription_manager(
+                    config.transcription.clone(),
+                    resolved_transcription_manager(&config, &format!("discord.{alias}")),
+                )
                 .with_stall_timeout(dc.stall_timeout_secs)
                 .with_approval_timeout_secs(dc.approval_timeout_secs)
                 .with_intents_mask(dc.intents_mask)
@@ -9195,13 +9201,16 @@ fn build_channel_by_id(
                     bot_token,
                     sl.resolved_app_token(),
                     sl.channel_ids.clone(),
-                    alias,
+                    alias.clone(),
                     peer_resolver,
                 )
                 .with_thread_context_max_messages_resolver(thread_context_max_messages_resolver)
                 .with_workspace_dir(workspace_dir)
                 .with_markdown_blocks(sl.use_markdown_blocks)
-                .with_transcription(config.transcription.clone())
+                .with_transcription_manager(
+                    config.transcription.clone(),
+                    resolved_transcription_manager(&config, &format!("slack.{alias}")),
+                )
                 .with_streaming(sl.stream_drafts, sl.draft_update_interval_ms)
                 .with_cancel_reaction(sl.cancel_reaction.clone())
                 .with_approval_timeout_secs(sl.approval_timeout_secs),
@@ -10236,6 +10245,12 @@ pub fn register_channels_for_tools(
 #[cfg(any(
     feature = "channel-telegram",
     feature = "channel-discord",
+    feature = "channel-slack",
+    feature = "channel-mattermost",
+    feature = "whatsapp-web",
+    feature = "channel-lark",
+    feature = "channel-line",
+    feature = "channel-qq",
     feature = "voice-wake",
     feature = "channel-matrix",
     feature = "whatsapp-web"
@@ -10249,64 +10264,58 @@ fn resolve_agent_transcription_provider(config: &Config, channel_key: &str) -> S
         .unwrap_or_default()
 }
 
+/// The transcription manager a configured channel instance stores, or `None`.
+///
+/// One path for every transcribing channel: gate on `[transcription].enabled`,
+/// resolve the owning agent's provider for `channel_key`, build the manager
+/// from live config through `transcription::build_channel_transcription_manager`
+/// (typed providers, legacy-key compatibility, sole-provider fallback), and
+/// on failure log once and leave the channel up without transcription.
+#[cfg(any(
+    feature = "channel-telegram",
+    feature = "channel-discord",
+    feature = "channel-slack",
+    feature = "channel-mattermost",
+    feature = "whatsapp-web",
+    feature = "channel-lark",
+    feature = "channel-line",
+    feature = "channel-qq"
+))]
+fn resolved_transcription_manager(
+    config: &Config,
+    channel_key: &str,
+) -> Option<Arc<crate::transcription::TranscriptionManager>> {
+    if !config.transcription.enabled {
+        return None;
+    }
+    let provider = resolve_agent_transcription_provider(config, channel_key);
+    match crate::transcription::build_channel_transcription_manager(config, &provider) {
+        Ok(manager) => Some(Arc::new(manager)),
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(
+                        ::serde_json::json!({"channel_key": channel_key, "e": e.to_string()})
+                    ),
+                "transcription manager init failed, voice transcription disabled"
+            );
+            None
+        }
+    }
+}
+
 #[cfg(feature = "channel-discord")]
 fn configure_discord_transcription(
     channel: DiscordChannel,
     config: &Config,
     channel_key: &str,
 ) -> DiscordChannel {
-    if !config.transcription.enabled {
-        return channel;
-    }
-
-    let provider = resolve_agent_transcription_provider(config, channel_key);
-    match crate::transcription::TranscriptionManager::from_config_with_provider(config, provider) {
-        Ok(manager) => channel.with_transcription_manager(config.transcription.clone(), manager),
-        Err(e) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"e": e.to_string()})),
-                "transcription manager init failed, voice transcription disabled"
-            );
-            channel
-        }
-    }
-}
-
-/// Bind the WhatsApp Web channel's transcription manager to the owning
-/// agent's `transcription_provider`.
-///
-/// `WhatsAppWebChannel::with_transcription` registers legacy `[transcription]`
-/// providers only and leaves the agent alias empty, so typed
-/// `[providers.transcription.<type>.<alias>]` entries are never reachable and
-/// `transcribe()` bails before dispatching. Mirrors
-/// `configure_discord_transcription`.
-#[cfg(feature = "whatsapp-web")]
-fn configure_whatsapp_transcription(
-    channel: WhatsAppWebChannel,
-    config: &Config,
-    channel_key: &str,
-) -> WhatsAppWebChannel {
-    if !config.transcription.enabled {
-        return channel;
-    }
-
-    let provider = resolve_agent_transcription_provider(config, channel_key);
-    match crate::transcription::TranscriptionManager::from_config_with_provider(config, provider) {
-        Ok(manager) => channel.with_transcription_manager(config.transcription.clone(), manager),
-        Err(e) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"e": e.to_string()})),
-                "transcription manager init failed, voice transcription disabled"
-            );
-            channel
-        }
-    }
+    channel.with_transcription_manager(
+        config.transcription.clone(),
+        resolved_transcription_manager(config, channel_key),
+    )
 }
 
 #[cfg(feature = "channel-discord")]
@@ -10458,9 +10467,6 @@ fn collect_configured_channels(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_voice_peers("telegram", &alias))
         };
-        let channel_key = format!("telegram.{alias}");
-        let agent_transcription_provider =
-            resolve_agent_transcription_provider(&config, &channel_key);
         channels.push(ConfiguredChannel {
             display_name: "Telegram",
             alias: Some(alias.clone()),
@@ -10477,11 +10483,9 @@ fn collect_configured_channels(
                     .with_api_base(tg.api_base_url.clone())
                     .with_ack_reactions(ack)
                     .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
-                    .with_transcription(config.transcription.clone())
-                    .with_agent_transcription_provider(agent_transcription_provider.clone())
-                    .with_typed_transcription_providers(
-                        &config.providers.transcription,
-                        &agent_transcription_provider,
+                    .with_transcription_manager(
+                        config.transcription.clone(),
+                        resolved_transcription_manager(&config, &format!("telegram.{alias}")),
                     )
                     .with_tts(&config)
                     .with_workspace_dir(config.channel_workspace_dir(&format!("telegram.{alias}")))
@@ -10614,7 +10618,10 @@ fn collect_configured_channels(
                     .with_workspace_dir(config.channel_workspace_dir(&format!("slack.{alias}")))
                     .with_markdown_blocks(sl.use_markdown_blocks)
                     .with_proxy_url(sl.proxy_url.clone())
-                    .with_transcription(config.transcription.clone())
+                    .with_transcription_manager(
+                        config.transcription.clone(),
+                        resolved_transcription_manager(&config, &format!("slack.{alias}")),
+                    )
                     .with_streaming(sl.stream_drafts, sl.draft_update_interval_ms)
                     .with_cancel_reaction(sl.cancel_reaction.clone())
                     .with_approval_timeout_secs(sl.approval_timeout_secs),
@@ -10667,7 +10674,10 @@ fn collect_configured_channels(
                     .with_team_ids(mm.team_ids.clone())
                     .with_discover_dms(mm.discover_dms.unwrap_or(true))
                     .with_proxy_url(mm.proxy_url.clone())
-                    .with_transcription(config.transcription.clone())
+                    .with_transcription_manager(
+                        config.transcription.clone(),
+                        resolved_transcription_manager(&config, &format!("mattermost.{alias}")),
+                    )
                     .with_listen_mode(mm.listen_mode),
                 ),
                 mm,
@@ -10923,7 +10933,7 @@ fn collect_configured_channels(
                         display_name: "WhatsApp",
                         alias: Some(alias.clone()),
                         channel: crate::paced_channel::PacedChannel::wrap(
-                            Arc::new(configure_whatsapp_transcription(
+                            Arc::new(
                                 WhatsAppWebChannel::new(
                                     wa,
                                     alias.clone(),
@@ -10931,13 +10941,18 @@ fn collect_configured_channels(
                                     allowed_groups_resolver,
                                 )
                                 .with_persistence(config_arc.clone())
+                                .with_transcription_manager(
+                                    config.transcription.clone(),
+                                    resolved_transcription_manager(
+                                        &config,
+                                        &format!("whatsapp.{alias}"),
+                                    ),
+                                )
                                 .with_tts(&config)
                                 .with_workspace_dir(workspace_dir)
                                 .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
                                 .with_group_mention_patterns(wa.group_mention_patterns.clone()),
-                                &config,
-                                &format!("whatsapp.{alias}"),
-                            )),
+                            ),
                             wa,
                         ),
                     });
@@ -11294,7 +11309,10 @@ fn collect_configured_channels(
                     .with_per_user_session(lk.per_user_session)
                     .with_ack_reactions(lk.ack_reactions.unwrap_or(config.channels.ack_reactions))
                     .with_streaming(lk.stream_mode, lk.draft_update_interval_ms)
-                    .with_transcription(config.transcription.clone()),
+                    .with_transcription_manager(
+                        config.transcription.clone(),
+                        resolved_transcription_manager(&config, &format!("lark.{alias}")),
+                    ),
             ),
         });
     }
@@ -11341,7 +11359,10 @@ fn collect_configured_channels(
             channel: Arc::new(
                 LineChannel::from_config(ln, alias.clone(), peer_resolver, sender_name_resolver)
                     .with_persistence(config_arc.clone())
-                    .with_transcription(config.transcription.clone()),
+                    .with_transcription_manager(
+                        config.transcription.clone(),
+                        resolved_transcription_manager(&config, &format!("line.{alias}")),
+                    ),
             ),
         });
     }
@@ -11420,7 +11441,10 @@ fn collect_configured_channels(
                 )
                 .with_workspace_dir(config.channel_workspace_dir(&format!("qq.{alias}")))
                 .with_proxy_url(qq.proxy_url.clone())
-                .with_transcription(config.transcription.clone()),
+                .with_transcription_manager(
+                    config.transcription.clone(),
+                    resolved_transcription_manager(&config, &format!("qq.{alias}")),
+                ),
             ),
         });
     }
@@ -11858,8 +11882,8 @@ fn collect_configured_channels(
                             &config,
                             &transcription_channel_key,
                         );
-                        crate::transcription::TranscriptionManager::from_config_with_provider(
-                            &config, provider,
+                        crate::transcription::build_channel_transcription_manager(
+                            &config, &provider,
                         )
                     }),
             ),
@@ -13366,6 +13390,40 @@ pub async fn deliver_announcement(
         #[cfg(not(feature = "channel-wechat"))]
         "wechat" => {
             anyhow::bail!("WeChat channel requires the `channel-wechat` feature");
+        }
+        #[cfg(feature = "channel-qq")]
+        "qq" => {
+            let qq = config.channels.qq.get(alias).ok_or_else(not_configured)?;
+            // The listener collector skips a disabled alias, but cron and
+            // one-off delivery reach this arm without a live instance, so the
+            // off switch has to be honored here before the transport is built.
+            if !qq.enabled {
+                let message =
+                    format!("[channels.qq.{alias}] is disabled; set enabled = true to deliver");
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"channel": format!("qq.{alias}")})),
+                    &message
+                );
+                anyhow::bail!("{message}");
+            }
+            let peers = config.channel_external_peers("qq", alias);
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+                Arc::new(move || peers.clone());
+            let ch = QQChannel::new(
+                qq.app_id.clone(),
+                qq.app_secret.clone(),
+                alias,
+                peer_resolver,
+            )
+            .with_proxy_url(qq.proxy_url.clone());
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+        }
+        #[cfg(not(feature = "channel-qq"))]
+        "qq" => {
+            anyhow::bail!("QQ channel requires the `channel-qq` feature");
         }
         #[cfg(feature = "channel-lark")]
         "lark" | "feishu" => {
@@ -31062,15 +31120,66 @@ This is an example JSON object for profile settings."#;
             "the owning agent's provider must resolve for a whatsapp.<alias> key"
         );
 
-        let manager = crate::transcription::TranscriptionManager::from_config_with_provider(
-            &config, provider,
-        )
-        .expect("typed provider must build a manager");
+        let manager = resolved_transcription_manager(&config, "whatsapp.default")
+            .expect("the shared path must build a manager for the typed provider");
         assert!(
             manager.available_providers().contains(&"groq.fast"),
             "typed provider must register, got {:?}",
             manager.available_providers()
         );
+        assert_eq!(
+            manager.bound_provider(),
+            "groq.fast",
+            "the owning agent's typed provider must be bound, not just registered"
+        );
+    }
+
+    #[cfg(feature = "channel-slack")]
+    #[test]
+    fn resolved_transcription_manager_binds_the_owning_agents_provider() {
+        let mut config = Config {
+            transcription: zeroclaw_config::schema::TranscriptionConfig {
+                enabled: true,
+                api_key: Some("k".to_string()),
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        config.agents.insert(
+            "ops".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["slack.support".into()],
+                transcription_provider: "groq.default".into(),
+                ..Default::default()
+            },
+        );
+        let manager = resolved_transcription_manager(&config, "slack.support")
+            .expect("an enabled legacy groq section builds a manager");
+        // The agent's typed-alias preference resolves to the legacy type key
+        // that is actually registered, instead of failing at transcribe time.
+        assert_eq!(manager.available_providers(), vec!["groq"]);
+        let mut disabled = config.clone();
+        disabled.transcription.enabled = false;
+        assert!(resolved_transcription_manager(&disabled, "slack.support").is_none());
+    }
+
+    #[cfg(feature = "channel-slack")]
+    #[test]
+    fn resolved_transcription_manager_falls_back_to_the_sole_provider_without_a_preference() {
+        let config = Config {
+            transcription: zeroclaw_config::schema::TranscriptionConfig {
+                enabled: true,
+                api_key: Some("k".to_string()),
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        // No owning agent declares a preference: the lone provider is bound so
+        // a single-provider deployment keeps working.
+        let manager = resolved_transcription_manager(&config, "slack.support")
+            .expect("an enabled legacy groq section builds a manager");
+        assert_eq!(manager.available_providers(), vec!["groq"]);
     }
 
     #[cfg(feature = "voice-wake")]
@@ -36225,6 +36334,29 @@ Done."#;
     }
 
     #[tokio::test]
+    #[cfg(feature = "channel-qq")]
+    async fn one_off_send_resolves_dotted_qq_alias() {
+        // The QQ instance alias is the channel type in practice
+        // (`[channels.qq.qq]`), and a bare id only ever resolves a
+        // `default` alias, so the dotted form is the one operators use.
+        // It must reach the QQ arm rather than the dispatcher's reject path.
+        let config = zeroclaw_config::schema::Config::default();
+
+        let err = send_channel_message(&config, "qq.qq", "user:OPENID", "test message")
+            .await
+            .expect_err("unconfigured alias should fail after dotted ref resolution");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("[channels.qq.qq] not configured"),
+            "dotted qq id should reach named channel resolution; got: {message}"
+        );
+        assert!(
+            !message.contains("unsupported delivery channel"),
+            "dotted qq id must not be reported as an unsupported delivery channel; got: {message}"
+        );
+    }
+
+    #[tokio::test]
     #[cfg(feature = "channel-linq")]
     async fn one_off_send_keeps_dotted_linq_alias_on_builder() {
         // `linq.<alias>` predates the announcement delegation and is resolved by
@@ -36276,7 +36408,6 @@ Done."#;
             "wecom",
             "wecom_ws",
             "wecom-ws",
-            "qq",
             "nostr",
             "clawdtalk",
             "reddit",
@@ -36400,6 +36531,59 @@ Done."#;
         assert!(
             msg.contains("[channels.email.default] not configured"),
             "email.default must report the real config table; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-qq")]
+    async fn deliver_announcement_routes_qq_to_qq_arm() {
+        let config = zeroclaw_config::schema::Config::default();
+
+        let err = deliver_announcement(&config, "qq.qq", "user:OPENID", None, "hi")
+            .await
+            .expect_err("expected qq.qq to bail because channel is not configured");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("unsupported delivery channel"),
+            "qq.qq must route to the QQ arm, not fall through; got: {msg}"
+        );
+        assert!(
+            msg.contains("[channels.qq.qq] not configured"),
+            "qq.qq must report the real config table; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-qq")]
+    async fn deliver_announcement_rejects_disabled_qq_alias() {
+        // Disabling an alias keeps its credentials, and the cron scheduler
+        // reaches this arm without consulting the listener collector, so the
+        // refusal has to come from the dispatcher itself.
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.qq.insert(
+            "work".to_string(),
+            zeroclaw_config::schema::QQConfig {
+                enabled: false,
+                app_id: "test-app-id".to_string(),
+                app_secret: "test-app-secret".to_string(),
+                // If the guard regresses, the send attempt lands on a refused
+                // loopback port instead of Tencent's API.
+                proxy_url: Some("http://127.0.0.1:1".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let err = deliver_announcement(&config, "qq.work", "user:OPENID", None, "hi")
+            .await
+            .expect_err("a disabled qq alias must not be delivered to");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("[channels.qq.work] is disabled"),
+            "disabled alias must report the off switch; got: {msg}"
+        );
+        assert!(
+            !msg.contains("unsupported delivery channel"),
+            "disabled alias must reach the QQ arm; got: {msg}"
         );
     }
 

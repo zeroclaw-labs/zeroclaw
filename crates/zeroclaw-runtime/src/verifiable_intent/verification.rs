@@ -289,22 +289,31 @@ fn check_single_constraint(
         KnownConstraint::PaymentAmount { currency, min, max } => {
             check_payment_amount(currency, *min, *max, fulfillment)
         }
-        KnownConstraint::PaymentBudget { currency, max } => {
-            check_payment_budget(currency, *max, fulfillment)
+        // `min` is bound and deliberately unevaluated. It is a per-transaction
+        // floor the specification requires to be positive when present, and
+        // enforcing it is the checker-parity stage's work. Naming it rather than
+        // eliding it with `..` keeps that omission visible here.
+        KnownConstraint::PaymentBudget {
+            currency,
+            min: _,
+            max,
+        } => check_payment_budget(currency, *max, fulfillment),
+        KnownConstraint::PaymentReference { .. } => {
+            // Reference binding is verified structurally, not against
+            // fulfillment. The reported type is the registered tag alone: a
+            // caller matches this value against the constraint it sent, and
+            // embedding a transaction identifier in it made that impossible.
+            ConstraintCheckResult::ok("mandate.payment.reference")
         }
-        KnownConstraint::PaymentReference {
-            conditional_transaction_id,
-        } => {
-            // Reference binding is verified structurally, not against fulfillment.
-            ConstraintCheckResult::ok(&format!(
-                "payment.reference({})",
-                &conditional_transaction_id[..8.min(conditional_transaction_id.len())]
-            ))
+        // Recurrence constraints are informational for the payment network to
+        // enforce statefulness. Pass-through at the agent level. The two are
+        // reported separately because they are separate registered types, and a
+        // shared label left a caller unable to tell which one it sent.
+        KnownConstraint::PaymentRecurrence { .. } => {
+            ConstraintCheckResult::ok("mandate.payment.recurrence")
         }
-        KnownConstraint::PaymentRecurrence { .. } | KnownConstraint::AgentRecurrence { .. } => {
-            // Recurrence constraints are informational for the payment network
-            // to enforce statefulness. Pass-through at the agent level.
-            ConstraintCheckResult::ok("recurrence")
+        KnownConstraint::AgentRecurrence { .. } => {
+            ConstraintCheckResult::ok("mandate.payment.agent_recurrence")
         }
     }
 }
@@ -341,7 +350,7 @@ fn check_allowed_merchant(
     allowed_merchants: &[DisclosableEntry<Entity>],
     fulfillment: &Fulfillment,
 ) -> ConstraintCheckResult {
-    let ct = "mandate.checkout.allowed_merchant";
+    let ct = "mandate.checkout.allowed_merchants";
     if allowed_merchants.is_empty() {
         return ConstraintCheckResult::violation(
             ct,
@@ -401,7 +410,7 @@ fn check_allowed_payee(
     allowed_payees: &[DisclosableEntry<Entity>],
     fulfillment: &Fulfillment,
 ) -> ConstraintCheckResult {
-    let ct = "payment.allowed_payee";
+    let ct = "mandate.payment.allowed_payees";
     if allowed_payees.is_empty() {
         return ConstraintCheckResult::violation(
             ct,
@@ -457,7 +466,7 @@ fn check_payment_amount(
     max: Option<i64>,
     fulfillment: &Fulfillment,
 ) -> ConstraintCheckResult {
-    let ct = "payment.amount";
+    let ct = "mandate.payment.amount_range";
     let Some(actual_amount) = fulfillment.amount else {
         return ConstraintCheckResult::violation(
             ct,
@@ -500,7 +509,7 @@ fn check_payment_budget(
     max: i64,
     fulfillment: &Fulfillment,
 ) -> ConstraintCheckResult {
-    let ct = "payment.budget";
+    let ct = "mandate.payment.budget";
     let Some(actual_amount) = fulfillment.amount else {
         return ConstraintCheckResult::violation(
             ct,
@@ -1151,6 +1160,7 @@ mod tests {
                 .into(),
                 KnownConstraint::PaymentBudget {
                     currency: expected.into(),
+                    min: None,
                     max: 50000,
                 }
                 .into(),
@@ -1168,8 +1178,8 @@ mod tests {
             );
 
             assert_eq!(results.len(), 2);
-            assert_eq!(results[0].constraint_type, "payment.amount");
-            assert_eq!(results[1].constraint_type, "payment.budget");
+            assert_eq!(results[0].constraint_type, "mandate.payment.amount_range");
+            assert_eq!(results[1].constraint_type, "mandate.payment.budget");
             for result in results {
                 assert!(!result.satisfied);
                 assert_eq!(result.violations.len(), 1);
@@ -1282,7 +1292,7 @@ mod tests {
     fn unknown_constraint_does_not_prevent_evaluating_the_rest() {
         let constraints: Vec<Constraint> = serde_json::from_str(
             r#"[
-                {"type":"payment.amount","currency":"USD","max":40000},
+                {"type":"mandate.payment.amount_range","currency":"USD","max":40000},
                 {"type":"urn:example:experimental","scope":"wide"}
             ]"#,
         )
@@ -1302,11 +1312,52 @@ mod tests {
 
         assert_eq!(results.len(), 2);
         assert!(results[0].satisfied);
-        assert_eq!(results[0].constraint_type, "payment.amount");
+        assert_eq!(results[0].constraint_type, "mandate.payment.amount_range");
         assert!(!results[1].satisfied);
         assert_eq!(
             results[1].violations[0].kind,
             ViErrorKind::UnknownConstraintType
         );
+    }
+
+    /// The tag a checker reports and the tag that variant serializes must be the
+    /// same string.
+    ///
+    /// `constraint_type` is built from literals inside each checker, entirely
+    /// separately from the `#[serde(rename)]` that decides the wire tag. Nothing
+    /// ties the two together, so a rename applied to one and not the other
+    /// compiles, passes every existing test, and produces a checker that
+    /// evaluates one constraint while reporting another. That reported value is
+    /// not internal: `constraint_result_json` publishes it to the caller of the
+    /// `vi_verify` tool.
+    ///
+    /// Deriving the walk from the enum rather than from a list is what stops a
+    /// ninth variant being added without a tag to match.
+    #[test]
+    fn every_checker_reports_the_tag_its_variant_serializes() {
+        use strum::IntoEnumIterator as _;
+
+        for variant in KnownConstraint::iter() {
+            let serialized = serde_json::to_value(&variant).expect("a variant must serialize");
+            let expected = serialized["type"]
+                .as_str()
+                .expect("a recognized constraint must carry a string `type`");
+
+            // Default-constructed fields, so most of these are violations. The
+            // reported type is set on every result whatever the outcome, which
+            // is the only field under test here.
+            let results = check_constraints(
+                std::slice::from_ref(&Constraint::from(variant.clone())),
+                &Fulfillment::default(),
+                StrictnessMode::Strict,
+                MandateMode::Autonomous,
+            );
+
+            assert_eq!(
+                results[0].constraint_type, expected,
+                "the checker for {variant:?} reports `{}` while the wire tag is `{expected}`",
+                results[0].constraint_type
+            );
+        }
     }
 }

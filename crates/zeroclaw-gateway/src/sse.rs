@@ -902,7 +902,9 @@ mod tests {
     ) -> Arc<zeroclaw_runtime::security::pairing::PairingGuard> {
         let owned: Vec<String> = tokens.iter().map(|t| (*t).to_string()).collect();
         Arc::new(zeroclaw_runtime::security::pairing::PairingGuard::new(
-            require, &owned,
+            require,
+            &owned,
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
         ))
     }
 

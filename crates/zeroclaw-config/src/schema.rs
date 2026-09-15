@@ -7,6 +7,7 @@ pub mod v2;
 use crate::autonomy::AutonomyLevel;
 use crate::autonomy::DelegationPolicy;
 use crate::domain_matcher::DomainMatcher;
+use crate::pairing::{PAIRING_CODE_MAX_LENGTH, PAIRING_CODE_MIN_LENGTH, PairingCodePolicy};
 use crate::traits::{ChannelConfig, HasPropKind, PropKind};
 use crate::validation_bail;
 use anyhow::{Context, Result};
@@ -6565,6 +6566,18 @@ pub struct MultimodalConfig {
     #[serde(default = "default_multimodal_max_images")]
     pub max_images: usize,
     /// Maximum image payload size in MiB before base64 encoding.
+    ///
+    /// Measured on decoded bytes, so the encoded request payload is about a
+    /// third larger. Applies to every image entering the pipeline: channel
+    /// attachments, tool outputs that surface local image paths, and the web
+    /// dashboard upload. Defaults to the 20 MiB ceiling that
+    /// [`MultimodalConfig::effective_limits`] clamps to, so an ordinary photo
+    /// is accepted without configuration; lower it to bound per-turn upload
+    /// cost or gateway buffering.
+    ///
+    /// Providers apply their own limits on top of this one. Anthropic refuses a
+    /// single image over 10 MB base64-encoded (about 7.5 MiB decoded), enforced
+    /// by its provider client independently of this setting.
     #[serde(default = "default_multimodal_max_image_size_mb")]
     pub max_image_size_mb: usize,
     /// Maximum age of images in conversation turns.
@@ -6599,11 +6612,18 @@ fn default_multimodal_max_images() -> usize {
 }
 
 fn default_multimodal_max_image_size_mb() -> usize {
-    5
+    20
 }
 
 impl MultimodalConfig {
     /// Clamp configured values to safe runtime bounds.
+    ///
+    /// The 20 MiB image ceiling is the lowest common per-image or per-request
+    /// bound across the supported vision APIs (OpenAI accepts about 20 MB per
+    /// image, Gemini 20 MB for an inline request, Anthropic 32 MB per request
+    /// with a tighter per-image limit its own client enforces). Images are
+    /// buffered whole and grow by about a third under base64, so the ceiling
+    /// also bounds gateway memory per upload.
     pub fn effective_limits(&self) -> (usize, usize) {
         let max_images = self.max_images.clamp(1, 16);
         let max_image_size_mb = self.max_image_size_mb.clamp(1, 20);
@@ -7216,6 +7236,13 @@ pub struct GatewayConfig {
     #[serde(default = "default_gateway_websocket_ping_interval_secs")]
     pub websocket_ping_interval_secs: u64,
 
+    /// Pairing-code generation policy (`[gateway.pairing_code]`). The one
+    /// source of truth for the length and character family of every code
+    /// the gateway issues.
+    #[serde(default)]
+    #[nested]
+    pub pairing_code: PairingCodePolicy,
+
     /// Pairing dashboard configuration
     #[serde(default)]
     #[nested]
@@ -7335,6 +7362,7 @@ impl Default for GatewayConfig {
             session_persistence: true,
             session_ttl_hours: 0,
             websocket_ping_interval_secs: default_gateway_websocket_ping_interval_secs(),
+            pairing_code: PairingCodePolicy::default(),
             pairing_dashboard: PairingDashboardConfig::default(),
             web_dist_dir: None,
             tls: None,
@@ -7347,13 +7375,17 @@ impl Default for GatewayConfig {
 }
 
 /// Pairing dashboard configuration (`[gateway.pairing_dashboard]`).
+///
+/// Code length and character family are **not** configured here. The
+/// dashboard pairing flow issues its codes through the same
+/// [`PairingGuard`](crate::pairing::PairingGuard) as startup pairing and
+/// `zeroclaw gateway get-paircode`, so it consumes
+/// [`gateway.pairing_code`](crate::pairing::PairingCodePolicy) rather than
+/// carrying a second, dashboard-only setting.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "gateway.pairing_dashboard"]
 pub struct PairingDashboardConfig {
-    /// Length of pairing codes (default: 8)
-    #[serde(default = "default_pairing_code_length")]
-    pub code_length: usize,
     /// Time-to-live for pending pairing codes in seconds (default: 3600)
     #[serde(default = "default_pairing_ttl")]
     pub code_ttl_secs: u64,
@@ -7368,9 +7400,6 @@ pub struct PairingDashboardConfig {
     pub lockout_secs: u64,
 }
 
-fn default_pairing_code_length() -> usize {
-    8
-}
 fn default_pairing_ttl() -> u64 {
     3600
 }
@@ -7387,7 +7416,6 @@ fn default_pairing_lockout_secs() -> u64 {
 impl Default for PairingDashboardConfig {
     fn default() -> Self {
         Self {
-            code_length: default_pairing_code_length(),
             code_ttl_secs: default_pairing_ttl(),
             max_pending_codes: default_max_pending_codes(),
             max_failed_attempts: default_max_failed_attempts(),
@@ -8341,7 +8369,7 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), "searxng" (self-hosted), "jina" (requires API key), or "bocha" (Bocha AI, requires API key — Chinese-friendly, <https://open.bochaai.com>)
+    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), "searxng" (self-hosted), "jina" (requires API key), "bocha" (requires API key), or "anysearch" (optional API key; anonymous requests use a lower quota)
     #[serde(default = "default_web_search_provider")]
     pub search_provider: String,
     /// Brave Search API key (required if search_provider is "brave")
@@ -8368,6 +8396,12 @@ pub struct WebSearchConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub bocha_api_key: Option<String>,
+    /// AnySearch API key (optional if search_provider is `"anysearch"`). Without a key, requests use AnySearch's rate-limited anonymous quota. Obtain at <https://www.anysearch.com/console/api-keys>.
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub anysearch_api_key: Option<String>,
     /// SearXNG instance URL (required if search_provider is `"searxng"`), e.g. `"https://searx.example.com"`.
     #[serde(default)]
     pub searxng_instance_url: Option<String>,
@@ -8400,6 +8434,7 @@ impl Default for WebSearchConfig {
             tavily_api_key: None,
             jina_api_key: None,
             bocha_api_key: None,
+            anysearch_api_key: None,
             searxng_instance_url: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
@@ -12919,6 +12954,13 @@ impl RiskProfileConfig {
             enabled: self.sandbox_enabled,
             backend,
             firejail_args: self.firejail_args.clone(),
+            image: self
+                .sandbox_image
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(default_sandbox_image),
         }
     }
 }
@@ -13315,6 +13357,11 @@ pub struct RiskProfileConfig {
     pub sandbox_backend: Option<String>,
     /// Extra arguments forwarded to firejail when sandbox_backend = "firejail".
     pub firejail_args: Vec<String>,
+    /// Container image the docker sandbox runs commands in when
+    /// `sandbox_backend = "docker"`. `None` inherits the built-in default.
+    /// Set this to pin a digest or a specific tag so the sandbox stops
+    /// tracking whatever the default tag moves to.
+    pub sandbox_image: Option<String>,
 }
 
 impl Default for RiskProfileConfig {
@@ -13337,6 +13384,7 @@ impl Default for RiskProfileConfig {
             sandbox_enabled: None,
             sandbox_backend: None,
             firejail_args: Vec::new(),
+            sandbox_image: None,
         }
     }
 }
@@ -18391,6 +18439,23 @@ pub struct SandboxConfig {
     /// Custom Firejail arguments (when backend = firejail)
     #[serde(default)]
     pub firejail_args: Vec<String>,
+
+    /// Container image the Docker sandbox runs commands in (when backend =
+    /// docker). Pin a digest or a specific tag if you need the sandbox to stop
+    /// tracking upstream changes to the default tag.
+    #[serde(default = "default_sandbox_image")]
+    pub image: String,
+}
+
+/// Default container image for the Docker sandbox backend.
+///
+/// The single source for this value: the serde default below and
+/// `DockerSandbox`'s own default both read it, so a change here cannot leave
+/// one path on a stale image.
+pub const DEFAULT_SANDBOX_IMAGE: &str = "alpine:latest";
+
+fn default_sandbox_image() -> String {
+    DEFAULT_SANDBOX_IMAGE.to_string()
 }
 
 impl Default for SandboxConfig {
@@ -18399,6 +18464,7 @@ impl Default for SandboxConfig {
             enabled: None, // Auto-detect
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
+            image: default_sandbox_image(),
         }
     }
 }
@@ -21854,6 +21920,20 @@ impl Config {
                 InvalidNumericRange,
                 path,
                 "{path} = {websocket_ping_interval_secs} is out of range; must be 0..={GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS}"
+            );
+        }
+
+        // Pairing-code policy. Rejected at load rather than clamped
+        // at generation, so an operator who asks for a weak pairing code is
+        // told, not silently given a different one.
+        let pairing_code_length = self.gateway.pairing_code.length;
+        if self.gateway.pairing_code.validate().is_err() {
+            let path = "gateway.pairing_code.length";
+            validation_bail!(
+                InvalidNumericRange,
+                path,
+                "{path} = {pairing_code_length} is out of range; must be \
+                 {PAIRING_CODE_MIN_LENGTH}..={PAIRING_CODE_MAX_LENGTH}"
             );
         }
 
@@ -27235,6 +27315,33 @@ untrusted_outbound_redact = false
     }
 
     #[test]
+    async fn multimodal_defaults_sit_at_the_effective_ceiling() {
+        // The default is deliberately the clamp ceiling: an operator who never
+        // configures `[multimodal]` should be able to send an ordinary photo.
+        // If either number moves, move it here too rather than incidentally.
+        let cfg = MultimodalConfig::default();
+        assert_eq!(cfg.max_image_size_mb, 20);
+        assert_eq!(cfg.effective_limits(), (4, 20));
+    }
+
+    #[test]
+    async fn multimodal_effective_limits_clamp_out_of_range_values() {
+        let cfg = MultimodalConfig {
+            max_images: 99,
+            max_image_size_mb: 512,
+            ..MultimodalConfig::default()
+        };
+        assert_eq!(cfg.effective_limits(), (16, 20));
+
+        let cfg = MultimodalConfig {
+            max_images: 0,
+            max_image_size_mb: 0,
+            ..MultimodalConfig::default()
+        };
+        assert_eq!(cfg.effective_limits(), (1, 1));
+    }
+
+    #[test]
     async fn http_request_config_default_has_correct_values() {
         let cfg = HttpRequestConfig::default();
         assert_eq!(cfg.timeout_secs, 30);
@@ -27670,6 +27777,177 @@ enabled = true
         config
             .validate()
             .expect("WebSocket ping interval upper bound must validate");
+    }
+
+    // ── Pairing-code policy ──────────────────────────
+
+    /// The shipped default is the strong policy, not the six-digit code.
+    #[test]
+    async fn gateway_default_pairing_code_policy_is_the_strong_default() {
+        let config = Config::default();
+        assert_eq!(config.gateway.pairing_code, PairingCodePolicy::default());
+        assert_eq!(config.gateway.pairing_code.length, 32);
+        assert_eq!(
+            config.gateway.pairing_code.charset,
+            crate::pairing::PairingCodeCharset::Alphanumeric
+        );
+    }
+
+    #[test]
+    async fn gateway_pairing_code_section_parses_from_toml() {
+        let config: Config =
+            toml::from_str("[gateway.pairing_code]\nlength = 24\ncharset = \"unambiguous\"\n")
+                .expect("pairing-code section parses");
+        assert_eq!(config.gateway.pairing_code.length, 24);
+        assert_eq!(
+            config.gateway.pairing_code.charset,
+            crate::pairing::PairingCodeCharset::Unambiguous
+        );
+        config.validate().expect("24 unambiguous chars is valid");
+    }
+
+    #[test]
+    async fn validate_rejects_pairing_code_length_below_minimum() {
+        let mut config = Config::default();
+        config.gateway.pairing_code.length = PAIRING_CODE_MIN_LENGTH - 1;
+
+        let err = config
+            .validate()
+            .expect_err("a pairing code weaker than the old default must be rejected");
+
+        assert!(
+            err.to_string().contains("gateway.pairing_code.length"),
+            "error must name the offending path; got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_pairing_code_length_above_maximum() {
+        let mut config = Config::default();
+        config.gateway.pairing_code.length = PAIRING_CODE_MAX_LENGTH + 1;
+
+        let err = config
+            .validate()
+            .expect_err("an over-long pairing code must be rejected");
+
+        assert!(
+            err.to_string().contains("gateway.pairing_code.length"),
+            "error must name the offending path; got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_pairing_code_length_bounds() {
+        for length in [PAIRING_CODE_MIN_LENGTH, PAIRING_CODE_MAX_LENGTH] {
+            let mut config = Config::default();
+            config.gateway.pairing_code.length = length;
+            config
+                .validate()
+                .unwrap_or_else(|e| panic!("documented bound {length} must validate: {e}"));
+        }
+    }
+
+    /// The dashboard consumes the shared policy instead of carrying
+    /// its own length knob. A config that still names the retired
+    /// `gateway.pairing_dashboard.code_length` must load, must not resurrect
+    /// a parallel setting, and must leave `[gateway.pairing_code]` in charge.
+    #[test]
+    async fn retired_dashboard_code_length_is_not_a_parallel_setting() {
+        let config: Config = toml::from_str(
+            "[gateway.pairing_dashboard]\n\
+             code_length = 8\n\
+             code_ttl_secs = 3600\n\
+             \n\
+             [gateway.pairing_code]\n\
+             length = 20\n\
+             charset = \"unambiguous\"\n",
+        )
+        .expect("a config carrying the retired key must still load");
+
+        // The shared policy is the only thing that decides code shape.
+        assert_eq!(config.gateway.pairing_code.length, 20);
+        assert_eq!(
+            config.gateway.pairing_code.charset,
+            crate::pairing::PairingCodeCharset::Unambiguous
+        );
+        // The dashboard section survives with its remaining fields.
+        assert_eq!(config.gateway.pairing_dashboard.code_ttl_secs, 3600);
+
+        // No settable property anywhere still offers a second code length.
+        let code_length_props: Vec<String> = config
+            .prop_fields()
+            .into_iter()
+            .map(|f| f.name)
+            .filter(|name| name.starts_with("gateway.") && name.ends_with("code_length"))
+            .collect();
+        assert!(
+            code_length_props.is_empty(),
+            "a parallel pairing-code length setting reappeared: {code_length_props:?}"
+        );
+
+        // And exactly one pairing-code length property exists overall.
+        let length_props: Vec<String> = config
+            .prop_fields()
+            .into_iter()
+            .map(|f| f.name)
+            .filter(|name| name.starts_with("gateway.pairing"))
+            .filter(|name| name.contains("length"))
+            .collect();
+        assert_eq!(
+            length_props,
+            vec!["gateway.pairing_code.length".to_string()],
+            "there must be exactly one pairing-code length setting"
+        );
+    }
+
+    /// The dashboard/API pairing flow and startup pairing must agree,
+    /// because both resolve the same `[gateway.pairing_code]` value.
+    #[test]
+    async fn dashboard_and_startup_pairing_share_one_policy() {
+        let config: Config =
+            toml::from_str("[gateway.pairing_code]\nlength = 12\ncharset = \"numeric\"\n")
+                .expect("parses");
+        let guard = crate::pairing::PairingGuard::new(true, &[], config.gateway.pairing_code);
+
+        // Startup code (what the banner prints).
+        let startup = guard.pairing_code().expect("startup code");
+        // Dashboard code (`POST /api/pairing/initiate`) — the gateway
+        // re-reads live config for this argument on every mint.
+        let dashboard = guard
+            .generate_new_pairing_code(config.gateway.pairing_code)
+            .expect("dashboard code");
+
+        for code in [&startup, &dashboard] {
+            assert_eq!(code.len(), 12, "code {code} must follow the config");
+            assert!(code.chars().all(|c| c.is_ascii_digit()));
+        }
+    }
+
+    /// Review MAJOR-1, config half: strengthening `[gateway.pairing_code]`
+    /// changes what the *same* guard mints, with no reconstruction. Mirrors
+    /// how the gateway swaps the whole `Config` on a config write.
+    #[test]
+    async fn a_strengthened_policy_applies_without_rebuilding_the_guard() {
+        let weak: Config =
+            toml::from_str("[gateway.pairing_code]\nlength = 6\ncharset = \"numeric\"\n")
+                .expect("parses");
+        let guard = crate::pairing::PairingGuard::new(true, &[], weak.gateway.pairing_code);
+        assert_eq!(guard.pairing_code().expect("startup code").len(), 6);
+
+        // Operator edits config; the gateway replaces the whole Config.
+        let strong: Config =
+            toml::from_str("[gateway.pairing_code]\nlength = 28\ncharset = \"unambiguous\"\n")
+                .expect("parses");
+        let minted = guard
+            .generate_new_pairing_code(strong.gateway.pairing_code)
+            .expect("mint under the new policy");
+
+        assert_eq!(minted.len(), 28, "next code must follow the new policy");
+        let alphabet = strong.gateway.pairing_code.charset.alphabet();
+        assert!(
+            minted.bytes().all(|b| alphabet.contains(&b)),
+            "code {minted} must use the new charset"
+        );
     }
 
     fn plugin_entry_with_egress(hosts: &[&str], private: &[&str]) -> super::PluginEntryConfig {
@@ -29752,6 +30030,58 @@ reasoning_effort = "HIGH"
     }
 
     #[test]
+    async fn sandbox_image_defaults_to_the_shared_constant() {
+        // The default has to come from one place; a second literal anywhere is
+        // how the docs and the sandbox drifted apart before.
+        assert_eq!(SandboxConfig::default().image, DEFAULT_SANDBOX_IMAGE);
+        assert_eq!(DEFAULT_SANDBOX_IMAGE, "alpine:latest");
+    }
+
+    #[test]
+    async fn sandbox_image_is_configurable() {
+        // The sandbox is configured per risk profile, not under a
+        // `[security.sandbox]` table: `SandboxConfig` is a runtime view that
+        // `sandbox_config()` assembles from these flat keys.
+        let raw = r#"
+[risk_profiles.custom]
+sandbox_backend = "docker"
+sandbox_image = "alpine:3.20"
+"#;
+        let cfg = toml::from_str::<Config>(raw).expect("config with a sandbox image should parse");
+        let profile = cfg
+            .risk_profiles
+            .get("custom")
+            .expect("the custom profile should deserialize");
+        assert_eq!(profile.sandbox_image.as_deref(), Some("alpine:3.20"));
+        assert_eq!(profile.sandbox_config().image, "alpine:3.20");
+    }
+
+    #[test]
+    async fn sandbox_image_absent_falls_back_to_the_default() {
+        let raw = r#"
+[risk_profiles.custom]
+sandbox_backend = "docker"
+"#;
+        let cfg = toml::from_str::<Config>(raw).expect("config without an image should parse");
+        let profile = cfg.risk_profiles.get("custom").expect("profile");
+        assert_eq!(profile.sandbox_image, None);
+        assert_eq!(profile.sandbox_config().image, DEFAULT_SANDBOX_IMAGE);
+    }
+
+    #[test]
+    async fn sandbox_image_blank_is_treated_as_unset() {
+        // An empty or whitespace value must not hand Docker an empty image
+        // name; it falls back the same way an absent key does.
+        let raw = r#"
+[risk_profiles.custom]
+sandbox_image = "   "
+"#;
+        let cfg = toml::from_str::<Config>(raw).expect("config should parse");
+        let profile = cfg.risk_profiles.get("custom").expect("profile");
+        assert_eq!(profile.sandbox_config().image, DEFAULT_SANDBOX_IMAGE);
+    }
+
+    #[tokio::test]
     async fn runtime_reasoning_effort_rejects_invalid_values() {
         let raw = r#"
 default_temperature = 0.7
@@ -30373,6 +30703,7 @@ default_temperature = 0.7
         config.browser.computer_use.api_key = Some("browser-credential".into());
         config.web_search.brave_api_key = Some("brave-credential".into());
         config.web_search.tavily_api_key = Some("tavily-credential".into());
+        config.web_search.anysearch_api_key = Some("anysearch-credential".into());
         config.storage.postgres.insert(
             "default".to_string(),
             PostgresStorageConfig {
@@ -30486,6 +30817,7 @@ default_temperature = 0.7
             "browser-credential",
             "brave-credential",
             "tavily-credential",
+            "anysearch-credential",
             "postgres://user:pw@host/db",
             "qdrant-credential",
             "rotation-credential-a",
@@ -30559,6 +30891,15 @@ default_temperature = 0.7
         assert_eq!(
             store.decrypt(tavily_encrypted).unwrap(),
             "tavily-credential"
+        );
+
+        let anysearch_encrypted = stored.web_search.anysearch_api_key.as_deref().unwrap();
+        assert!(crate::secrets::SecretStore::is_encrypted(
+            anysearch_encrypted
+        ));
+        assert_eq!(
+            store.decrypt(anysearch_encrypted).unwrap(),
+            "anysearch-credential"
         );
 
         let worker_provider = stored
@@ -31833,6 +32174,7 @@ allowed_numbers = ["+1", "+2"]
             session_persistence: true,
             session_ttl_hours: 0,
             websocket_ping_interval_secs: 30,
+            pairing_code: PairingCodePolicy::default(),
             pairing_dashboard: PairingDashboardConfig::default(),
             web_dist_dir: None,
             tls: None,
