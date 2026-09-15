@@ -23,8 +23,6 @@ struct LoadedPlugin {
     plugin_dir: PathBuf,
     /// Resolved path to the WASM file. `None` for skill-only plugins.
     wasm_path: Option<PathBuf>,
-    #[allow(dead_code)]
-    verification: VerificationResult,
 }
 
 impl PluginHost {
@@ -135,7 +133,7 @@ impl PluginHost {
 
                     // Verify plugin signature
                     match self.verify_plugin_signature(&manifest.name, &manifest_toml, &manifest) {
-                        Ok(verification) => {
+                        Ok(_) => {
                             if let Err(e) = validate_manifest_config(&manifest) {
                                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"plugin": path.display().to_string(), "error": format!("{}", e)})), "skipping plugin due to invalid config schema");
                                 continue;
@@ -168,7 +166,6 @@ impl PluginHost {
                                     manifest,
                                     plugin_dir: path.clone(),
                                     wasm_path,
-                                    verification,
                                 },
                             );
                         }
@@ -262,8 +259,7 @@ impl PluginHost {
         }
 
         // Verify plugin signature before installing
-        let verification =
-            self.verify_plugin_signature(&manifest.name, &manifest_toml, &manifest)?;
+        self.verify_plugin_signature(&manifest.name, &manifest_toml, &manifest)?;
         validate_manifest_config(&manifest)?;
 
         // Copy plugin to plugins directory
@@ -302,7 +298,6 @@ impl PluginHost {
                 manifest,
                 plugin_dir: dest_dir,
                 wasm_path: wasm_dest,
-                verification,
             },
         );
 

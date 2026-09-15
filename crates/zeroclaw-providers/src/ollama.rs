@@ -435,7 +435,7 @@ impl OllamaModelProvider {
             .to_string()
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn build_chat_request(
         &self,
         messages: Vec<Message>,

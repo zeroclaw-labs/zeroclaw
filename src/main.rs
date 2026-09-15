@@ -30,7 +30,6 @@
     clippy::unnecessary_literal_bound,
     clippy::unnecessary_map_or,
     clippy::unnecessary_wraps,
-    dead_code,
     unused_variables,
     unused_imports
 )]
@@ -50,6 +49,7 @@ use crossterm::{
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 
+#[cfg(any(not(feature = "agent-runtime"), windows))]
 const STDIN_LINE_CAP: usize = 1024 * 1024;
 
 /// Result of [`read_capped_line`].
@@ -88,6 +88,7 @@ fn read_capped_line<R: std::io::BufRead>(reader: R, cap: usize) -> std::io::Resu
 /// UTF-8 char boundary. `String::truncate` panics when the byte index lands
 /// inside a multi-byte character, so a raw `line.truncate(cap)` on piped input
 /// is a latent panic. No-op when the string already fits.
+#[cfg(any(windows, test))]
 fn cap_line_utf8_safe(line: &mut String, cap: usize) {
     if line.len() > cap {
         line.truncate(line.floor_char_boundary(cap));
@@ -117,6 +118,7 @@ fn discard_until_newline<R: std::io::BufRead>(reader: &mut R) -> std::io::Result
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(feature = "agent-runtime")]
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 
 /// Resolve a `cli-*` Fluent key for CLI output. Routes through the runtime
@@ -214,7 +216,7 @@ fn quickstart_selector_terminal_size<T: QuickstartSelectorTerminal>(
 }
 
 /// Whether a sampled terminal size is usable for fitting the checklist.
-#[cfg(feature = "agent-runtime")]
+#[cfg(all(feature = "agent-runtime", test))]
 fn quickstart_selector_size_is_usable(size: Option<(u16, u16)>) -> bool {
     size.is_some()
 }
@@ -702,6 +704,7 @@ fn quickstart_step_label(step: zeroclaw_runtime::quickstart::QuickstartStep) -> 
 /// line, preserving any non-comment whitespace. Mirrors the gateway's
 /// `apply_comments`. Best-effort — silently bails on parse errors so a
 /// successful set isn't downgraded to a failure for a metadata problem.
+#[cfg(feature = "agent-runtime")]
 async fn apply_comment_inline(
     config_path: &std::path::Path,
     path: &str,
@@ -715,6 +718,7 @@ async fn apply_comment_inline(
     .context("failed to write comment annotation")
 }
 
+#[cfg(feature = "agent-runtime")]
 fn config_patch_prop_kind(config: &Config, path: &str) -> Option<crate::config::PropKind> {
     config
         .prop_fields()
@@ -723,6 +727,7 @@ fn config_patch_prop_kind(config: &Config, path: &str) -> Option<crate::config::
         .map(|f| f.kind)
 }
 
+#[cfg(feature = "agent-runtime")]
 fn json_value_to_setprop_string(
     value: &serde_json::Value,
     config: &Config,
@@ -748,6 +753,7 @@ fn json_value_to_setprop_string(
     }
 }
 
+#[cfg(feature = "agent-runtime")]
 fn config_patch_map_prop_error(err: anyhow::Error, path: &str, op_index: usize) -> ConfigApiError {
     let msg = err.to_string();
     if msg.starts_with("Unknown property") {
@@ -759,11 +765,13 @@ fn config_patch_map_prop_error(err: anyhow::Error, path: &str, op_index: usize) 
     }
 }
 
+#[cfg(feature = "agent-runtime")]
 fn config_patch_json_error(err: &ConfigApiError) -> Result<()> {
     eprintln!("{}", serde_json::to_string_pretty(err)?);
     std::process::exit(1);
 }
 
+#[cfg(feature = "agent-runtime")]
 fn config_patch_json_value_type_error(
     message: impl Into<String>,
     path: Option<String>,
@@ -779,6 +787,7 @@ fn config_patch_json_value_type_error(
     err
 }
 
+#[cfg(feature = "agent-runtime")]
 fn config_patch_fail_json_or_human<T>(
     json: bool,
     err: ConfigApiError,
@@ -862,6 +871,7 @@ fn pause_after_no_command_help() {
 
 #[cfg(feature = "agent-runtime")]
 mod agent;
+#[cfg(feature = "agent-runtime")]
 mod alias_cli;
 #[cfg(feature = "agent-runtime")]
 mod approval;
@@ -903,6 +913,7 @@ mod i18n;
 mod identity;
 #[cfg(feature = "agent-runtime")]
 mod integrations;
+#[cfg(feature = "agent-runtime")]
 mod memory;
 #[cfg(feature = "agent-runtime")]
 mod migration;
@@ -1695,62 +1706,6 @@ enum DeprecatedPropsCommands {
 }
 
 #[cfg(feature = "agent-runtime")]
-fn runtime_dir_env_is_explicit(name: &str, value: &str) -> bool {
-    match name {
-        "ZEROCLAW_CONFIG_DIR" | "ZEROCLAW_DATA_DIR" => !value.trim().is_empty(),
-        "ZEROCLAW_WORKSPACE" => !value.is_empty(),
-        _ => false,
-    }
-}
-
-#[cfg(feature = "agent-runtime")]
-fn resolve_homebrew_onboard_config_dir(
-    exe: &Path,
-    env_lookup: impl Fn(&str) -> Option<String>,
-) -> Option<PathBuf> {
-    let explicit_runtime_dir = [
-        "ZEROCLAW_CONFIG_DIR",
-        "ZEROCLAW_DATA_DIR",
-        "ZEROCLAW_WORKSPACE",
-    ]
-    .iter()
-    .any(|name| env_lookup(name).is_some_and(|value| runtime_dir_env_is_explicit(name, &value)));
-
-    if explicit_runtime_dir {
-        return None;
-    }
-
-    zeroclaw_runtime::service::homebrew_var_dir_from_exe(exe)
-}
-
-#[cfg(feature = "agent-runtime")]
-fn apply_homebrew_onboard_config_dir_with(
-    exe: &Path,
-    env_lookup: impl Fn(&str) -> Option<String>,
-    mut set_env: impl FnMut(&'static str, &Path),
-) -> Option<PathBuf> {
-    let config_dir = resolve_homebrew_onboard_config_dir(exe, env_lookup)?;
-    set_env("ZEROCLAW_CONFIG_DIR", &config_dir);
-    Some(config_dir)
-}
-
-#[cfg(feature = "agent-runtime")]
-fn apply_homebrew_onboard_config_dir() {
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
-
-    apply_homebrew_onboard_config_dir_with(
-        &exe,
-        |name| std::env::var(name).ok(),
-        |name, value| {
-            // SAFETY: called early in the onboard command path before new threads are spawned.
-            unsafe { std::env::set_var(name, value) };
-        },
-    );
-}
-
-#[cfg(feature = "agent-runtime")]
 fn quickstart_runtime_profile_for_provider(
     provider_type: &str,
     providers: &[zeroclaw_runtime::quickstart::QuickstartTypeOption],
@@ -1860,7 +1815,6 @@ async fn run_quickstart_cli(
     enum ChannelChoice {
         Fresh {
             kind: String,
-            display_name: String,
             alias: String,
             extras: std::collections::BTreeMap<String, String>,
         },
@@ -2556,7 +2510,6 @@ async fn run_quickstart_cli(
                         }
                         form.channels.push(ChannelChoice::Fresh {
                             kind: chosen.kind.clone(),
-                            display_name: chosen.display_name.clone(),
                             alias,
                             extras,
                         });
@@ -3047,6 +3000,7 @@ fn model_path_provider_type(path: &str) -> Option<&'static str> {
         .map(|p| p.name)
 }
 
+#[cfg(feature = "agent-runtime")]
 fn map_key_for_prop_path<'a>(section_path: &str, prop_path: &'a str) -> Option<&'a str> {
     let tail = prop_path.strip_prefix(section_path)?.strip_prefix('.')?;
     let mut parts = tail.split('.');
@@ -3057,6 +3011,7 @@ fn map_key_for_prop_path<'a>(section_path: &str, prop_path: &'a str) -> Option<&
 
 /// Split `section_arg` into the map key under `section_path` with NOTHING after
 /// it, the `config init <section>.<alias>` shape.
+#[cfg(feature = "agent-runtime")]
 fn map_key_for_section_arg<'a>(section_path: &str, section_arg: &'a str) -> Option<&'a str> {
     let tail = section_arg.strip_prefix(section_path)?.strip_prefix('.')?;
     (!tail.is_empty() && !tail.contains('.')).then_some(tail)
@@ -3066,6 +3021,7 @@ fn map_key_for_section_arg<'a>(section_path: &str, section_arg: &'a str) -> Opti
 /// alias `split` extracts. `#[resource_key]` sections are excluded: their keys
 /// are values from another domain (model id, voice, tool name) and may
 /// themselves contain dots, so a dot split would yield a bogus alias.
+#[cfg(feature = "agent-runtime")]
 fn alias_target_for_path<'a>(
     path: &'a str,
     split: impl Fn(&str, &'a str) -> Option<&'a str>,
@@ -3084,6 +3040,7 @@ fn alias_target_for_path<'a>(
 /// exists, the section is resource-keyed or a natural-key list, or the argument
 /// is a plain nested prefix that `init_defaults` already handles). A reserved
 /// alias is an error, not a silent no-op.
+#[cfg(feature = "agent-runtime")]
 fn init_map_alias(config: &mut Config, section_arg: &str) -> Result<Option<String>> {
     let Some((section_path, alias)) = alias_target_for_path(section_arg, map_key_for_section_arg)
     else {
@@ -3098,6 +3055,7 @@ fn init_map_alias(config: &mut Config, section_arg: &str) -> Result<Option<Strin
 
 /// Dirty every generated leaf under a newly created map alias so required
 /// default-valued fields survive the incremental writer's empty-leaf pruning.
+#[cfg(feature = "agent-runtime")]
 fn mark_new_map_alias_dirty(config: &mut Config, alias_path: &str) {
     let prefix = format!("{alias_path}.");
     let leaf_paths: Vec<String> = config
@@ -3115,6 +3073,7 @@ fn mark_new_map_alias_dirty(config: &mut Config, alias_path: &str) {
     }
 }
 
+#[cfg(feature = "agent-runtime")]
 fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<bool> {
     let Some((section_path, key)) = alias_target_for_path(prop_path, map_key_for_prop_path) else {
         return Ok(false);
@@ -5468,6 +5427,14 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
             }
             Commands::Completions { .. } | Commands::MarkdownHelp | Commands::MarkdownSchema => {
                 anyhow::bail!("documentation command was not handled before runtime dispatch")
+            }
+            Commands::Props { props_command } => {
+                let DeprecatedPropsCommands::Any(args) = props_command;
+                drop(args);
+                anyhow::bail!(
+                    "`zeroclaw props` has been renamed to `zeroclaw config`. \
+                     Replace `props` with `config` in your command and try again."
+                );
             }
             _ => {
                 anyhow::bail!(
@@ -8569,7 +8536,9 @@ Add pricing to the active provider profile or supply a catalog entry."
             }
         },
 
-        Commands::Props { .. } => {
+        Commands::Props { props_command } => {
+            let DeprecatedPropsCommands::Any(args) = props_command;
+            drop(args);
             anyhow::bail!(
                 "`zeroclaw props` has been renamed to `zeroclaw config`. \
                  Replace `props` with `config` in your command and try again."
@@ -9089,6 +9058,7 @@ fi"#
 // ─── Gateway helper functions ───────────────────────────────────────────────
 
 /// Resolve gateway host and port from CLI args or config.
+#[cfg(feature = "agent-runtime")]
 fn resolve_gateway_addr(config: &Config, port: Option<u16>, host: Option<String>) -> (u16, String) {
     let port = port.unwrap_or(config.gateway.port);
     let host = host.unwrap_or_else(|| config.gateway.host.clone());
@@ -9096,6 +9066,7 @@ fn resolve_gateway_addr(config: &Config, port: Option<u16>, host: Option<String>
 }
 
 /// Log gateway startup message.
+#[cfg(feature = "agent-runtime")]
 fn log_gateway_start(host: &str, port: u16) {
     if port == 0 {
         ::zeroclaw_log::record!(
@@ -9158,18 +9129,9 @@ async fn shutdown_gateway(host: &str, port: u16, path_prefix: Option<&str>) -> R
 /// Dispatch the gateway-backed SOP verbs. Requires the `agent-runtime` build (the
 /// gateway HTTP client + `gateway_admin_url` live behind it, like `shutdown_gateway`);
 /// without it these verbs cannot reach the daemon, so they error clearly.
+#[cfg(feature = "agent-runtime")]
 async fn sop_admin_dispatch(cmd: SopCommands, config: &crate::config::Config) -> Result<()> {
-    #[cfg(feature = "agent-runtime")]
-    {
-        sop_admin_request(cmd, config).await
-    }
-    #[cfg(not(feature = "agent-runtime"))]
-    {
-        let _ = (cmd, config);
-        anyhow::bail!(
-            "`zeroclaw sop approve/deny/pending` requires the agent-runtime build (the gateway client)"
-        )
-    }
+    sop_admin_request(cmd, config).await
 }
 
 /// CLI -> daemon dispatch for the out-of-band SOP approval verbs (EPIC C, C8).
@@ -10138,6 +10100,7 @@ fn running_executable_for_remediation() -> Option<std::path::PathBuf> {
     }
 }
 
+#[cfg(feature = "agent-runtime")]
 fn gate_security_posture(
     config: &zeroclaw::config::Config,
     allow_degraded: bool,
@@ -10525,7 +10488,7 @@ async fn run_gateway_if_enabled(
     }
 }
 
-#[cfg(not(feature = "gateway"))]
+#[cfg(all(feature = "agent-runtime", not(feature = "gateway")))]
 #[allow(clippy::unused_async)]
 async fn run_gateway_if_enabled(
     _host: &str,
@@ -10536,6 +10499,7 @@ async fn run_gateway_if_enabled(
     anyhow::bail!("Gateway feature is not enabled. Rebuild with --features gateway")
 }
 
+#[cfg(feature = "agent-runtime")]
 fn is_addr_in_use_error(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause
@@ -10544,10 +10508,12 @@ fn is_addr_in_use_error(err: &anyhow::Error) -> bool {
     })
 }
 
+#[cfg(feature = "agent-runtime")]
 fn is_default_gateway_addr(host: &str, port: u16, default_host: &str, default_port: u16) -> bool {
     host == default_host && port == default_port
 }
 
+#[cfg(feature = "agent-runtime")]
 fn gateway_browser_host(host: &str) -> &str {
     match host {
         "0.0.0.0" => "127.0.0.1",
@@ -10556,6 +10522,7 @@ fn gateway_browser_host(host: &str) -> &str {
     }
 }
 
+#[cfg(feature = "agent-runtime")]
 fn gateway_addr_in_use_message(
     host: &str,
     port: u16,
@@ -10599,6 +10566,7 @@ fn gateway_addr_in_use_message(
     lines.join("\n")
 }
 
+#[cfg(feature = "agent-runtime")]
 fn gateway_restart_recovery_command(host: &str, port: u16, default_host: &str) -> String {
     let mut command = format!("    zeroclaw gateway start --port {port}");
     if host != default_host {
@@ -10607,6 +10575,7 @@ fn gateway_restart_recovery_command(host: &str, port: u16, default_host: &str) -
     command
 }
 
+#[cfg(feature = "agent-runtime")]
 fn gateway_paircode_recovery_command(
     host: &str,
     port: u16,
@@ -10624,6 +10593,7 @@ fn gateway_paircode_recovery_command(
     command
 }
 
+#[cfg(feature = "agent-runtime")]
 fn available_gateway_restart_hint_port(host: &str, port: u16) -> Option<u16> {
     const SCAN_LIMIT: u16 = 20;
 
@@ -13350,110 +13320,6 @@ mod tests {
                 other => panic!("expected onboard command, got {other:?}"),
             }
         }
-    }
-
-    #[test]
-    #[cfg(feature = "agent-runtime")]
-    fn homebrew_onboard_config_dir_detects_cellar_paths() {
-        assert_eq!(
-            resolve_homebrew_onboard_config_dir(
-                Path::new("/opt/homebrew/Cellar/zeroclaw/0.8.0/bin/zeroclaw"),
-                |_| None,
-            ),
-            Some(PathBuf::from("/opt/homebrew/var/zeroclaw")),
-        );
-        assert_eq!(
-            resolve_homebrew_onboard_config_dir(
-                Path::new("/usr/local/Cellar/zeroclaw/0.8.0/bin/zeroclaw"),
-                |_| None,
-            ),
-            Some(PathBuf::from("/usr/local/var/zeroclaw")),
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "agent-runtime")]
-    fn homebrew_onboard_config_dir_detects_brew_bin_symlink_layout() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let prefix = temp.path().join("homebrew");
-        std::fs::create_dir_all(prefix.join("Cellar")).expect("create Cellar marker");
-        let exe = prefix.join("bin/zeroclaw");
-
-        assert_eq!(
-            resolve_homebrew_onboard_config_dir(&exe, |_| None),
-            Some(prefix.join("var/zeroclaw")),
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "agent-runtime")]
-    fn homebrew_onboard_config_dir_preserves_explicit_runtime_paths() {
-        let exe = Path::new("/opt/homebrew/Cellar/zeroclaw/0.8.0/bin/zeroclaw");
-
-        for var in [
-            "ZEROCLAW_CONFIG_DIR",
-            "ZEROCLAW_DATA_DIR",
-            "ZEROCLAW_WORKSPACE",
-        ] {
-            assert_eq!(
-                resolve_homebrew_onboard_config_dir(exe, |name| {
-                    (name == var).then(|| "/tmp/zeroclaw-explicit".to_string())
-                }),
-                None,
-                "{var} should take precedence over Homebrew detection",
-            );
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "agent-runtime")]
-    fn homebrew_onboard_config_dir_treats_workspace_whitespace_as_explicit() {
-        let exe = Path::new("/opt/homebrew/Cellar/zeroclaw/0.8.0/bin/zeroclaw");
-
-        assert_eq!(
-            resolve_homebrew_onboard_config_dir(exe, |name| {
-                (name == "ZEROCLAW_WORKSPACE").then(|| "   ".to_string())
-            }),
-            None,
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "agent-runtime")]
-    fn apply_homebrew_onboard_config_dir_sets_detected_config_dir() {
-        let exe = Path::new("/opt/homebrew/Cellar/zeroclaw/0.8.0/bin/zeroclaw");
-        let mut applied = None;
-
-        let detected = apply_homebrew_onboard_config_dir_with(
-            exe,
-            |_| None,
-            |name, value| applied = Some((name, value.to_path_buf())),
-        );
-
-        assert_eq!(detected, Some(PathBuf::from("/opt/homebrew/var/zeroclaw")));
-        assert_eq!(
-            applied,
-            Some((
-                "ZEROCLAW_CONFIG_DIR",
-                PathBuf::from("/opt/homebrew/var/zeroclaw"),
-            )),
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "agent-runtime")]
-    fn apply_homebrew_onboard_config_dir_skips_explicit_config_dir() {
-        let exe = Path::new("/opt/homebrew/Cellar/zeroclaw/0.8.0/bin/zeroclaw");
-        let mut applied = None;
-
-        let detected = apply_homebrew_onboard_config_dir_with(
-            exe,
-            |name| (name == "ZEROCLAW_CONFIG_DIR").then(|| "/tmp/zeroclaw".to_string()),
-            |name, value| applied = Some((name, value.to_path_buf())),
-        );
-
-        assert_eq!(detected, None);
-        assert_eq!(applied, None);
     }
 
     #[test]
