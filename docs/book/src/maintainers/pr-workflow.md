@@ -19,7 +19,30 @@ The control loop that delivers this is layered on purpose:
 - **Risk-based review depth**: high-risk consequences and security boundaries get deep review, while low-risk work stays fast.
 - **Rollback-first merge contract**: every merge path includes a concrete recovery story.
 
-Automation handles path/scope labels, manual issue-dashboard planning reports, and CI gating. Risk, size, type, and contributor-tier labels are maintainer intake decisions unless a maintained workflow explicitly owns them. Final merge accountability stays with human maintainers and PR authors. A PR carrying either `risk:high` or `domain:security` requires deep review and two independent Core Team approvals; automated review does not count as a Core Team approval.
+Automation handles path/scope labels, manual issue-dashboard planning reports, and CI gating. Risk, size, type, and contributor-tier labels are maintainer intake decisions unless a maintained workflow explicitly owns them. Final merge accountability stays with human maintainers and PR authors. A PR carrying either `risk:high` or `domain:security` requires deep review and defaults to two independent Core Team approvals; automated review does not count as a Core Team approval. The only standing exception is the [expedited second-review lane](#expedited-second-review-lane).
+
+## Expedited second-review lane
+
+The two-Core rule remains the default for every PR carrying `risk:high` or `domain:security`. A human maintainer may instead evaluate the expedited lane when an active durable request to a second Core reviewer, distinct from the author and approving reviewer, has remained unanswered for five full business days. This is an optional accountable merge path, not an automatic timeout or permission to clear an objection.
+
+Start the clock at the later of the qualifying non-author Core approval and the active durable public request for that distinct second Core reviewer. Use UTC and count only Monday-through-Friday transitions, without a holiday calendar. The start day is not a full business day: the deadline is the same UTC time of day after five eligible weekday transitions. Record both source timestamps and the computed deadline in the final merge packet.
+
+The request must remain active and unanswered on the effective head. A formal review from the requested reviewer, removal or cancellation of the request, or a recorded decline ends that clock. If a second human review is still required, a new active durable request starts a new clock under the rule above.
+
+Any head change requires a non-author Core approval and accepted advisory evidence applicable to the new effective head. A verified mechanical base integration may preserve only elapsed clock time when it selects no behavior and the new head obtains fresh required CI; every other head change restarts the clock.
+
+The lane is eligible only when every condition below holds on the effective head:
+
+- The PR is non-draft, mergeable, and fully passing every required check.
+- One Core Team member other than the PR author has approved the effective head.
+- `zeroclaw-reviewer[bot]` or an explicitly accepted equivalent advisory artifact has completed clean applicable exact-head review without tool failure, and a human has reconciled every finding. An equivalent artifact must identify its producer and link the durable public record that accepted it for this purpose.
+- Five full business days have elapsed since the clock began.
+- No `do-not-merge`, `needs-author-action`, stale-candidate, release hold, unresolved changes-requested review, review thread, human or automated finding, or other blocking condition remains.
+- The body, labels, linked work, validation, rollback account, compatibility disposition, and follow-ups are current.
+
+An objection or hold is not silence and never expires through this lane. Broad governance, security-floor, release, migration, and irreversible architecture changes continue to default to two human approvals. If a maintainer proposes the lane for one of those categories, the final packet must explain why the exact change is bounded and why one human approval plus the named evidence is sufficient.
+
+The final merge packet names the approving Core maintainer; the distinct requested reviewer and active request; the source timestamps, clock calculation, and UTC deadline; the advisory producer, acceptance record when applicable, result, and reviewed head; current required CI; all reconciled holds and findings; and the consequence, likelihood, impact, and uncertainty of proceeding without the second human review. The merger remains responsible for that exact-head decision, and the ordinary exact merge approval is still required.
 
 ## Project board contract
 
@@ -103,7 +126,7 @@ PR lanes are routing expectations, not another required label family. Use them t
 | A: maintenance fast lane | Docs-only corrections, small tests that leave behavior unchanged, metadata/template fixes, narrow examples, CI/tooling fixes that preserve permissions and release behavior | Lightest review; fast merge once CI, template, labels, and privacy checks are clean. Usually `risk:low` and `size:XS` or `size:S`. |
 | B: narrow bug/fix lane | Small bug fixes with clear failing behavior, targeted provider/channel/tool fixes with focused validation, compatibility fixes that preserve behavior outside the reported path | Normal review by one subsystem-aware reviewer unless risk or ownership says otherwise. Merge when the linked issue is actually satisfied, validation is credible, and CI is green. |
 | C: feature slice lane | Additive feature work, new provider/channel/tool support, new config surface, scoped user-visible behavior changes | Normal review plus boundary-specific validation. Milestone fit matters, and the PR should say whether it implements, depends on, or is related to a tracker. |
-| D: architecture, migration, and elevated-review lane | Concrete trust, credential, compatibility, governance, release-authority, migration, lifecycle, persistence, permission, or toolchain-floor boundary; any PR carrying `risk:high` or `domain:security` | Deep review, evidence matched to the changed risk, and rollback and compatibility analysis. A PR carrying `risk:high` or `domain:security` also requires two independent Core Team approvals. |
+| D: architecture, migration, and elevated-review lane | Concrete trust, credential, compatibility, governance, release-authority, migration, lifecycle, persistence, permission, or toolchain-floor boundary; any PR carrying `risk:high` or `domain:security` | Deep review, evidence matched to the changed risk, and rollback and compatibility analysis. A PR carrying `risk:high` or `domain:security` defaults to two independent Core Team approvals; only the [expedited second-review lane](#expedited-second-review-lane) provides a standing exception. |
 | E: supersede, replacement, and overlap lane | Multiple PRs solving the same issue, newer PRs replacing older ones, contributor work carried forward from another PR, old PR made obsolete by current `master` | Coordinate before deep review. Choose one canonical path when possible, use `Supersedes #N` only when accurate, and preserve attribution when work is materially carried forward. |
 
 Do not build a separate manual PR board for these lanes unless native GitHub state and CODEOWNERS stop answering the routing question. Check native GitHub merge state before normal lane review: `DIRTY` means resolve conflicts first; `BEHIND` alone is mergeability housekeeping, not an author-facing blocker.
@@ -137,7 +160,7 @@ Before requesting review, the PR has all of these:
 Before merge:
 
 - `CI Required Gate` is green.
-- Required reviewers approved (including any CODEOWNERS paths); a PR carrying `risk:high` or `domain:security` has two independent Core Team approvals.
+- Required reviewers approved, including any CODEOWNERS paths; a PR carrying `risk:high` or `domain:security` satisfies the two-Core default or every condition of the [expedited second-review lane](#expedited-second-review-lane).
 - Risk labels match the actual diff and consequence rather than broad component location. See [Labels](./labels.md).
 - Migration / compatibility impact is documented.
 - Rollback path is concrete and fast.
@@ -150,7 +173,7 @@ Every merge:
 - CI gate is green.
 - Docs-quality checks are green when docs changed.
 - Security and privacy fields are complete; evidence is redacted / anonymized.
-- A PR carrying `risk:high` or `domain:security` has two independent Core Team approvals; automated review does not count.
+- A PR carrying `risk:high` or `domain:security` satisfies the two-Core default or every condition of the [expedited second-review lane](#expedited-second-review-lane); automated review never counts as a Core Team approval.
 - Agent-workflow notes are sufficient for reproducibility (if AI-assisted).
 - Rollback plan is explicit.
 - Commit title follows Conventional Commits.
@@ -211,7 +234,7 @@ Path location alone does not select `risk:high`. Classify the actual diff and co
 
 Filesystem access boundaries and network or authentication behavior inside these crates deserve particular attention even when the diff is small.
 
-**Minimum for `risk:high` or `domain:security` PRs:** threat or risk statement, mitigation notes, rollback steps, and two independent Core Team approvals.
+**Minimum for `risk:high` or `domain:security` PRs:** threat or risk statement, mitigation notes, rollback steps, and either two independent Core Team approvals or every condition of the [expedited second-review lane](#expedited-second-review-lane).
 
 **Recommended for `risk:high` or `domain:security` PRs:** a focused test proving boundary behavior, plus one explicit failure-mode scenario with expected degradation.
 

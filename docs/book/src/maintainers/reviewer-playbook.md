@@ -24,9 +24,9 @@ Use [PR lanes](./pr-workflow.md#pr-lanes) for routing expectations; use this pla
 |---|---|---|---|
 | `risk:low` | Documentation, localization, fixtures, generated references, or mechanical metadata with no production, compatibility, build, release, or governance effect | 1 reviewer + CI gate | Coherent validation evidence, no behavior ambiguity |
 | `risk:medium` | Ordinary behavioral runtime, gateway, provider, channel, tool, config, application, and CI work | 1 subsystem-aware reviewer + behavior verification | Focused scenario proof, explicit side effects |
-| `risk:high` or `domain:security` | A concrete trust, credential, compatibility, governance, release-authority, or cross-cutting security boundary | Fast triage + deep review + rollback readiness + two independent Core Team approvals | Security and failure-mode checks, rollback clarity |
+| `risk:high` or `domain:security` | A concrete trust, credential, compatibility, governance, release-authority, or cross-cutting security boundary | Fast triage + deep review + rollback readiness + two independent Core Team approvals by default | Security and failure-mode checks, rollback clarity; only the [expedited second-review lane](./pr-workflow.md#expedited-second-review-lane) provides a standing exception |
 
-`domain:security` remains independent from `risk:*`: use it for an effective security or trust boundary, not simply because the changed component is security-shaped. Either label triggers the same deep-review and two-independent-Core-approval path. Automated review does not count as a Core Team approval.
+`domain:security` remains independent from `risk:*`: use it for an effective security or trust boundary, not simply because the changed component is security-shaped. Either label triggers deep review and defaults to two independent Core Team approvals; only the [expedited second-review lane](./pr-workflow.md#expedited-second-review-lane) provides a standing exception. Automated review does not count as a Core Team approval.
 
 When uncertain, classify upward and ask a maintainer to resolve the boundary before merge.
 
@@ -222,6 +222,8 @@ When passing review to another maintainer or agent mid-flight, include:
 5. **Suggested next action.**
 
 This keeps context loss low and avoids the next reviewer redoing the same fetches you already did.
+
+Core reviewers aim to review pull requests in their area within five business days, as defined by [FND-003](../foundations/fnd-003-governance.md). If a requested second Core review remains unanswered after that window, evaluate the [expedited second-review lane](./pr-workflow.md#expedited-second-review-lane). Elapsed time is not approval and never clears an objection, hold, changes-requested review, security concern, or other finding. If the PR is not eligible, keep the required human review routed and use the handoff above when another qualified reviewer takes it.
 
 ## Weekly queue hygiene
 
