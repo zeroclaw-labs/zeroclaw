@@ -703,6 +703,7 @@ mod tests {
         SopRun {
             run_id: run_id.into(),
             sop_name: sop_name.into(),
+            initiating_agent: None,
             trigger_event: make_event(),
             frame_marker_id: format!("marker-{run_id}"),
             status,
@@ -1278,6 +1279,7 @@ mod tests {
         let run = SopRun {
             run_id: "r1".into(),
             sop_name: "test-sop".into(),
+            initiating_agent: None,
             trigger_event: make_event(),
             frame_marker_id: "marker-r1".into(),
             status: SopRunStatus::Running,
@@ -1393,6 +1395,7 @@ mod tests {
         let running_run = SopRun {
             run_id: "r1".into(),
             sop_name: "test-sop".into(),
+            initiating_agent: None,
             trigger_event: make_event(),
             frame_marker_id: "marker-r1".into(),
             status: SopRunStatus::Running,

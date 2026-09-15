@@ -11,6 +11,10 @@ use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 pub struct SopExecuteTool {
     engine: Arc<Mutex<SopEngine>>,
     audit: Option<Arc<SopAuditLogger>>,
+    /// The agent this tool instance belongs to. Recorded on runs it starts, so a
+    /// procedure that parks at an approval can still resume as the agent that
+    /// started it once the turn is gone.
+    initiator: Option<String>,
 }
 
 impl SopExecuteTool {
@@ -18,7 +22,16 @@ impl SopExecuteTool {
         Self {
             engine,
             audit: None,
+            initiator: None,
         }
+    }
+
+    /// Record `alias` as the initiating agent on runs this tool starts.
+    #[must_use]
+    pub fn with_initiator(mut self, alias: impl Into<String>) -> Self {
+        let alias = alias.into();
+        self.initiator = (!alias.trim().is_empty()).then_some(alias);
+        self
     }
 
     pub fn with_audit(mut self, audit: Arc<SopAuditLogger>) -> Self {
@@ -93,7 +106,7 @@ impl Tool for SopExecuteTool {
                 anyhow::Error::msg(format!("Engine lock poisoned: {e}"))
             })?;
 
-            match engine.start_run(sop_name, event) {
+            match engine.start_run_owned(sop_name, event, self.initiator.as_deref()) {
                 Ok(action) => {
                     let run_id = action_run_id(&action);
                     let snapshot = run_id.and_then(|id| engine.get_run(id).cloned());
