@@ -952,12 +952,12 @@ mod tests {
     async fn shell_blocks_disallowed_command() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
         let result = tool
-            .execute(json!({"command": "rm -rf /"}))
+            .execute(json!({"command": "zeroclaw_disallowed_test_command"}))
             .await
             .expect("disallowed command execution should return a result");
         assert!(!result.success);
         let error = result.error.as_deref().unwrap_or("");
-        assert!(error.contains("not allowed") || error.contains("high-risk"));
+        assert!(error.contains("not allowed"), "unexpected error: {error}");
     }
 
     #[tokio::test]
