@@ -5,6 +5,7 @@ use crate::tools::shell_env::SAFE_SHELL_ENV_VARS;
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::platform::is_android;
@@ -300,10 +301,16 @@ impl Tool for ShellTool {
         // Execute with timeout to prevent hanging commands.
         // Clear the environment to prevent leaking API keys and other secrets
         // (CWE-200), then re-add only safe, functional variables.
-        let mut cmd = match self
-            .runtime
-            .build_shell_command(command, &self.security.workspace_dir)
-        {
+        let effective_path = self
+            .tui_env
+            .as_ref()
+            .and_then(|env| env.get("PATH"))
+            .map(OsStr::new);
+        let mut cmd = match self.runtime.build_shell_command_with_effective_path(
+            command,
+            &self.security.workspace_dir,
+            effective_path,
+        ) {
             Ok(cmd) => cmd,
             Err(e) => {
                 return Ok(ToolResult {
@@ -319,16 +326,18 @@ impl Tool for ShellTool {
         // Apply sandbox wrapping before execution.
         // The Sandbox trait operates on std::process::Command, so use as_std_mut
         // to get a mutable reference to the underlying command.
-        self.sandbox.wrap_command(cmd.as_std_mut()).map_err(|e| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                "shell tool: sandbox wrap_command failed"
-            );
-            anyhow::Error::msg(format!("Sandbox error: {e}"))
-        })?;
+        self.sandbox
+            .wrap_shell_command(cmd.as_std_mut(), self.runtime.shell_program())
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "shell tool: sandbox wrap_command failed"
+                );
+                anyhow::Error::msg(format!("Sandbox error: {e}"))
+            })?;
 
         cmd.env_clear();
 
@@ -952,12 +961,12 @@ mod tests {
     async fn shell_blocks_disallowed_command() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
         let result = tool
-            .execute(json!({"command": "rm -rf /"}))
+            .execute(json!({"command": "zeroclaw_disallowed_test_command"}))
             .await
             .expect("disallowed command execution should return a result");
         assert!(!result.success);
         let error = result.error.as_deref().unwrap_or("");
-        assert!(error.contains("not allowed") || error.contains("high-risk"));
+        assert!(error.contains("not allowed"), "unexpected error: {error}");
     }
 
     #[tokio::test]
@@ -1955,6 +1964,78 @@ mod tests {
             env_output_contains_assignment(&result.output, "ZC_TUI_TEST_VAR", "tui_injected"),
             "tui_env var should appear in subprocess env, got:\n{}",
             result.output
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn effective_path_resolves_independent_native_runtime_launcher() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let launcher_dir = tempfile::tempdir().expect("launcher tempdir should be created");
+        let launcher = launcher_dir.path().join("tui-only-shell");
+        std::fs::write(
+            &launcher,
+            "#!/bin/sh\necho TUI_PATH_SHIM_RAN\nfor arg in \"$@\"; do echo \"arg:$arg\"; done\n",
+        )
+        .expect("recording shell should be written");
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))
+            .expect("recording shell should be executable");
+        let split_path = std::env::join_paths([
+            std::path::PathBuf::new(),
+            std::path::PathBuf::from("relative-decoy"),
+            launcher_dir.path().to_path_buf(),
+        ])
+        .expect("test PATH should be joined")
+        .into_string()
+        .expect("test PATH should be UTF-8");
+
+        let tool = ShellTool::new(
+            unrestricted_shell_test_security(),
+            Arc::new(NativeRuntime::with_shell("tui-only-shell".into())),
+        )
+        .with_tui_env(Some(HashMap::from([("PATH".into(), split_path)])));
+        let result = tool
+            .execute(json!({"command": "echo direct_tui_path"}))
+            .await
+            .expect("shell tool should return a result");
+
+        assert!(
+            result.success && result.output.contains("TUI_PATH_SHIM_RAN"),
+            "TUI-only launcher should execute, got output={:?} error={:?}",
+            result.output,
+            result.error
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn effective_path_with_no_absolute_entries_fails_closed() {
+        let unusable_path = std::env::join_paths([
+            std::path::PathBuf::new(),
+            std::path::PathBuf::from("relative-only"),
+        ])
+        .expect("test PATH should be joined")
+        .into_string()
+        .expect("test PATH should be UTF-8");
+        let tool = ShellTool::new(
+            unrestricted_shell_test_security(),
+            Arc::new(NativeRuntime::with_shell("tui-only-shell".into())),
+        )
+        .with_tui_env(Some(HashMap::from([("PATH".into(), unusable_path)])));
+        let result = tool
+            .execute(json!({"command": "echo must_not_run"}))
+            .await
+            .expect("shell tool should return a failed result");
+
+        assert!(!result.success, "unusable TUI PATH must fail closed");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("effective child PATH")),
+            "unexpected error: {:?}",
+            result.error
         );
     }
 

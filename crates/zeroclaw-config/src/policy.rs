@@ -7740,15 +7740,17 @@ mod tests {
     #[test]
     fn forbidden_path_argument_blocks_path_after_quoted_heredoc_like_text() {
         let p = unix_forbidden_path_policy();
+        let posix_path =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
 
         assert_eq!(
-            p.forbidden_path_argument("printf \"<<EOF\nbody\nEOF\" /etc/shadow"),
+            posix_path("printf \"<<EOF\nbody\nEOF\" /etc/shadow"),
             Some("/etc/shadow".into())
         );
 
         // Single-quoted variant of the same shape.
         assert_eq!(
-            p.forbidden_path_argument("printf '<<EOF\nbody\nEOF' /etc/passwd"),
+            posix_path("printf '<<EOF\nbody\nEOF' /etc/passwd"),
             Some("/etc/passwd".into())
         );
     }
@@ -7779,66 +7781,67 @@ mod tests {
     #[test]
     fn forbidden_path_argument_allows_safe_device_redirect_targets() {
         let p = unix_forbidden_path_policy();
-        assert_eq!(p.forbidden_path_argument("ls missing 2>/dev/null"), None);
-        assert_eq!(p.forbidden_path_argument("ls missing 2> /dev/null"), None);
-        assert_eq!(p.forbidden_path_argument("echo hi >/dev/stdout"), None);
-        assert_eq!(p.forbidden_path_argument("echo hi > /dev/stdout"), None);
-        assert_eq!(p.forbidden_path_argument("echo err 1>/dev/stderr"), None);
-        assert_eq!(p.forbidden_path_argument("echo err 1> /dev/stderr"), None);
-        assert_eq!(p.forbidden_path_argument("cat </dev/zero"), None);
-        assert_eq!(p.forbidden_path_argument("cat < /dev/zero"), None);
+        let posix_path =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
+        assert_eq!(posix_path("ls missing 2>/dev/null"), None);
+        assert_eq!(posix_path("ls missing 2> /dev/null"), None);
+        assert_eq!(posix_path("echo hi >/dev/stdout"), None);
+        assert_eq!(posix_path("echo hi > /dev/stdout"), None);
+        assert_eq!(posix_path("echo err 1>/dev/stderr"), None);
+        assert_eq!(posix_path("echo err 1> /dev/stderr"), None);
+        assert_eq!(posix_path("cat </dev/zero"), None);
+        assert_eq!(posix_path("cat < /dev/zero"), None);
         #[cfg(not(target_os = "windows"))]
-        assert_eq!(p.forbidden_path_argument("cat /dev/null"), None);
-        assert_eq!(p.forbidden_path_argument("cat ./safe.txt>/dev/null"), None);
-        assert_eq!(p.forbidden_path_argument("cat> /dev/null"), None);
-        assert_eq!(p.forbidden_path_argument("cat ./safe.txt>&2"), None);
+        assert_eq!(posix_path("cat /dev/null"), None);
+        assert_eq!(posix_path("cat ./safe.txt>/dev/null"), None);
+        assert_eq!(posix_path("cat> /dev/null"), None);
+        assert_eq!(posix_path("cat ./safe.txt>&2"), None);
     }
 
     #[test]
     fn forbidden_path_argument_blocks_unsafe_redirect_targets() {
         let p = unix_forbidden_path_policy();
+        let posix_path =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
         assert_eq!(
-            p.forbidden_path_argument("echo hi >/etc/passwd"),
+            posix_path("echo hi >/etc/passwd"),
             Some("/etc/passwd".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("echo hi > /etc/passwd"),
+            posix_path("echo hi > /etc/passwd"),
             Some("/etc/passwd".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("echo hi >/dev/stderr.log"),
+            posix_path("echo hi >/dev/stderr.log"),
             Some("/dev/stderr.log".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("echo hi > /dev/stderr.log"),
+            posix_path("echo hi > /dev/stderr.log"),
             Some("/dev/stderr.log".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("cat </dev/zero/etc/passwd"),
+            posix_path("cat </dev/zero/etc/passwd"),
             Some("/dev/zero/etc/passwd".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("echo hi >/dev/null/../../etc/passwd"),
+            posix_path("echo hi >/dev/null/../../etc/passwd"),
             Some("/dev/null/../../etc/passwd".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("cat</dev/null /etc/passwd"),
+            posix_path("cat</dev/null /etc/passwd"),
             Some("/etc/passwd".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("cat /etc/passwd>/dev/null"),
+            posix_path("cat /etc/passwd>/dev/null"),
             Some("/etc/passwd".into())
         );
         assert_eq!(
-            p.forbidden_path_argument("cat /etc/passwd> /dev/null"),
+            posix_path("cat /etc/passwd> /dev/null"),
             Some("/etc/passwd".into())
         );
+        assert_eq!(posix_path("cat /etc/passwd>&2"), Some("/etc/passwd".into()));
         assert_eq!(
-            p.forbidden_path_argument("cat /etc/passwd>&2"),
-            Some("/etc/passwd".into())
-        );
-        assert_eq!(
-            p.forbidden_path_argument("grep --file=/etc/passwd>/dev/null root"),
+            posix_path("grep --file=/etc/passwd>/dev/null root"),
             Some("/etc/passwd".into())
         );
     }
