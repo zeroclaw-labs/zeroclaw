@@ -14,7 +14,7 @@ The coarse-grained knob. Three settings:
 
 - **ReadOnly**: the agent can observe (read files, query memory, fetch URLs it's allowed to fetch) but cannot write or execute commands.
 - **Supervised** (default): low-risk ops run; medium-risk ask the operator; high-risk block.
-- **Full**: no approval gates; `workspace_only` is implicitly disabled. `forbidden_paths`, `forbidden_commands`, and the OS sandbox still enforce.
+- **Full**: uncovered tools skip approval gates; `always_ask` still prompts or fails closed. `workspace_only` is implicitly disabled. `forbidden_paths`, `forbidden_commands`, and the OS sandbox still enforce.
 
 Docs: [Autonomy levels](./autonomy.md).
 

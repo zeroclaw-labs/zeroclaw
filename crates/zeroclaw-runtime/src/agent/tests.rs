@@ -4,13 +4,15 @@ use crate::agent::agent::Agent;
 use crate::agent::dispatcher::{
     NativeToolDispatcher, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
+use crate::approval::ApprovalManager;
 use crate::observability::{NoopObserver, Observer};
+use crate::security::AutonomyLevel;
 use crate::tools::{Tool, ToolOutput, ToolResult};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 use zeroclaw_api::agent::TurnEvent;
-use zeroclaw_config::schema::{AliasedAgentConfig, MemoryConfig};
+use zeroclaw_config::schema::{AliasedAgentConfig, MemoryConfig, RiskProfileConfig};
 use zeroclaw_memory::{self, Memory};
 
 zeroclaw_api::mock_tool_attribution!(CountingTool, EchoTool, FailingTool, PanickingTool);
@@ -1106,6 +1108,187 @@ async fn system_prompt_not_duplicated_on_second_turn() {
         .filter(|msg| matches!(msg, ConversationMessage::Chat(c) if c.role == "system"))
         .count();
     assert_eq!(system_count, 1, "System prompt should appear exactly once");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 14b. Construction boundary: prompt text and enforcement share one manager
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A tool named `shell` that records whether it actually executed.
+struct RecordingShellTool {
+    executions: Arc<Mutex<usize>>,
+}
+
+impl RecordingShellTool {
+    fn new() -> (Self, Arc<Mutex<usize>>) {
+        let executions = Arc::new(Mutex::new(0));
+        (
+            Self {
+                executions: executions.clone(),
+            },
+            executions,
+        )
+    }
+}
+
+#[async_trait]
+impl Tool for RecordingShellTool {
+    fn name(&self) -> &str {
+        "shell"
+    }
+
+    fn description(&self) -> &str {
+        "Records execution attempts"
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+
+    async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
+        *self.executions.lock().unwrap() += 1;
+        Ok(ToolResult {
+            success: true,
+            output: ToolOutput::text("ran"),
+            error: None,
+        })
+    }
+}
+
+zeroclaw_api::mock_tool_attribution!(RecordingShellTool);
+
+/// Extract the system prompt the agent actually injected into history.
+fn system_prompt_of(agent: &Agent) -> String {
+    agent
+        .history()
+        .first()
+        .and_then(|msg| match msg {
+            ConversationMessage::Chat(c) if c.role == "system" => Some(c.content.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn construction_boundary_full_always_ask_prompt_matches_enforcement() {
+    // The real construction boundary: one ApprovalManager feeds both the
+    // rendered prompt and the execution gate, so the model-facing text and
+    // the runtime behavior cannot diverge.
+    let profile = RiskProfileConfig {
+        level: AutonomyLevel::Full,
+        always_ask: vec![" shell ".into()],
+        ..RiskProfileConfig::default()
+    };
+    let (shell_tool, shell_executions) = RecordingShellTool::new();
+    let (counting_tool, count) = CountingTool::new();
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![
+        tool_response(vec![
+            ToolCall {
+                id: "tc1".into(),
+                name: "shell".into(),
+                arguments: serde_json::json!({"command": "ls"}).to_string(),
+                extra_content: None,
+            },
+            ToolCall {
+                id: "tc2".into(),
+                name: "counter".into(),
+                arguments: serde_json::json!({}).to_string(),
+                extra_content: None,
+            },
+        ]),
+        text_response("done"),
+    ]));
+    let mut agent = Agent::builder()
+        .model_provider(model_provider)
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            vec![Box::new(shell_tool), Box::new(counting_tool)],
+        ))
+        .memory(make_memory())
+        .observer(make_observer())
+        .tool_dispatcher(Box::new(NativeToolDispatcher))
+        .workspace_dir(std::env::temp_dir())
+        .approval_manager(Some(Arc::new(ApprovalManager::for_non_interactive(
+            &profile,
+        ))))
+        .build()
+        .unwrap();
+
+    let _ = agent.turn("run ls and count").await.unwrap();
+
+    // Prompt side: the rendered system prompt must describe the same
+    // Full+always_ask policy the manager enforces.
+    let prompt = system_prompt_of(&agent);
+    assert!(
+        prompt.contains("Full autonomy auto-approves tools that are not listed in `always_ask`"),
+        "prompt must state the Full-autonomy contract, got: {prompt}"
+    );
+    assert!(
+        prompt.contains("fail closed when no approver is present: shell"),
+        "prompt must name the exact always_ask tool, got: {prompt}"
+    );
+    assert!(
+        !prompt.contains("No tools are listed in `always_ask`"),
+        "prompt must not claim the always_ask list is empty"
+    );
+    assert!(
+        !prompt.contains("You have full access to all configured tools"),
+        "prompt must not claim unconditional Full access while shell is gated"
+    );
+
+    // Enforcement side: the same manager fails the listed tool closed (no
+    // approver on this surface) while the uncovered tool still executes.
+    assert_eq!(
+        *shell_executions.lock().unwrap(),
+        0,
+        "always_ask tool must not execute without an approver"
+    );
+    assert_eq!(
+        *count.lock().unwrap(),
+        1,
+        "uncovered Full tool must execute"
+    );
+    assert!(
+        agent.history().iter().any(|msg| match msg {
+            ConversationMessage::ToolResults(results) => results
+                .iter()
+                .any(|r| r.content.contains("requires approval")),
+            _ => false,
+        }),
+        "the gated tool's denial must reach the model as a tool result"
+    );
+}
+
+#[tokio::test]
+async fn build_system_prompt_without_manager_stays_generic() {
+    // A builder without an approval manager cannot see a real policy, so its
+    // prompt must stay generic: no Full-autonomy promises, no invented
+    // always_ask exceptions.
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![text_response("ok")]));
+    let mut agent = build_agent_with(
+        model_provider,
+        vec![Box::new(EchoTool)],
+        Box::new(NativeToolDispatcher),
+    );
+
+    let _ = agent.turn("hi").await.unwrap();
+
+    let prompt = system_prompt_of(&agent);
+    assert!(
+        prompt.contains("Ask for approval when the runtime policy requires it"),
+        "managerless prompt must render generic safety guidance, got: {prompt}"
+    );
+    assert!(
+        !prompt.contains("no extra approval needed"),
+        "managerless prompt must not promise unconditioned execution"
+    );
+    assert!(
+        !prompt.contains("You have full access to all configured tools"),
+        "managerless prompt must not claim Full autonomy"
+    );
+    assert!(
+        !prompt.contains("always_ask"),
+        "managerless prompt must not invent always_ask facts, got: {prompt}"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -205,7 +205,7 @@ them as Fluent keys.
 9. Unknown target agent: error is `Unknown agent '<target>'. Available agents: <comma-separated list>`.
 10. Depth exceeded (controlled by the parent's `runtime_profile.max_delegation_depth`, default 3): error is `Delegation depth limit reached (<depth>/<max>).`
 11. Unknown action: error is `Unknown action '<value>'. Use delegate/check_result/list_results/cancel_task/await_sessions.`
-12. Independent target whose risk profile has `always_ask` entries: error is `delegate target "<target>" cannot run in independent mode from "<caller>": risk profile "<profile>" has always_ask entries (<list>). See ZeroClaw docs, "Delegation & SubAgents" > "What's not supported".`
+12. Target whose risk profile has `always_ask` entries: an independent target returns `delegate target "<target>" cannot run in independent mode from "<caller>": risk profile "<profile>" has always_ask entries (<list>). See ZeroClaw docs, "Delegation & SubAgents" > "What's not supported".` A bounded agentic target returns the same error with `cannot run in bounded agentic mode`.
 13. Agentic target with a missing target risk profile: error is `Agent '<target>' is agentic but risk_profile '<target_profile>' is not configured`.
 14. Agentic target with zero executable child tools: no error is emitted for the empty tool set itself; the target receives a normal model turn without tools.
 
@@ -240,4 +240,4 @@ them as Fluent keys.
 3. **Per-spawn time budget.** There is no `timeout_secs` argument. The parent blocks for the full duration of the child run; cancellation has to flow through the broader interruption scope.
 4. **Streaming progress back to the parent.** The parent sees the child's final response as a single string after completion.
 5. **A `[agents.<alias>].subagent_*` config block.** The validator and override type ship today; the operator-facing config surface that plumbs caller-defined narrowing is not in this release. Both spawn sites pass `SubAgentOverrides::default()` until that surface lands.
-6. **Independent `delegate` targets with `always_ask`.** Independent delegation is blocked when the target agent's risk profile has non-empty `always_ask` entries. The runtime refuses before starting the target, including background and parallel delegation. This blocker remains until approval forwarding for independent child agents is supported by a future ZeroClaw version.
+6. **`delegate` targets with `always_ask`.** Independent delegation and bounded agentic delegation are blocked when the target agent's risk profile has non-empty `always_ask` entries. The runtime refuses before starting the target, including background and parallel delegation. Non-agentic bounded delegation remains available because it cannot execute child tools. This blocker remains until approval forwarding for child agent loops is supported by a future ZeroClaw version.

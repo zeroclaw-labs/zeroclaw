@@ -117,9 +117,10 @@ pub struct PromptContext<'a> {
     /// (allowed commands, forbidden paths, autonomy level) so it can plan
     /// tool calls without trial-and-error.  See
     pub security_summary: Option<String>,
-    /// Autonomy level from config. Controls whether the safety section
-    /// includes "ask before acting" instructions. Full autonomy omits them
-    /// so the model executes tools directly without simulating approval.
+    /// Autonomy level the prompt describes. Full autonomy omits "ask before
+    /// acting" instructions so the model executes tools directly without
+    /// simulating approval. Policy-aware builders separately supply any
+    /// `always_ask` exceptions without expanding this public context struct.
     pub autonomy_level: AutonomyLevel,
     /// False for isolated / ACP sessions created with `exclude_memory: true`.
     /// Mirrors `system_prompt::build_system_prompt_with_mode_and_autonomy`'s
@@ -134,9 +135,52 @@ pub struct PromptContext<'a> {
     pub shell_profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
 }
 
+/// Model-facing Full-autonomy approval contract used by [`SafetySection`].
+/// ReadOnly is not prompted. Uncovered Full tools are auto-approved.
+/// `always_ask` still prompts, or fails closed when no approver is present.
+fn full_autonomy_safety_lines(always_ask: &[String]) -> String {
+    let mut lines = String::from(
+        "- Full autonomy auto-approves tools that are not listed in `always_ask`.\n\
+         - Read-only mode is not prompted; execution is blocked elsewhere.\n",
+    );
+    if always_ask.iter().any(|tool| tool == "*") {
+        lines.push_str(
+            "- `always_ask` is set to `*`, so every tool still requires operator approval, or fails closed when no approver is present. Do not assume a tool can run without approval.\n",
+        );
+    } else if always_ask.is_empty() {
+        lines.push_str(
+            "- No tools are listed in `always_ask`.\n\
+             - Execute tools and actions directly — no extra approval needed.\n\
+             - You have full access to all configured tools. Use them confidently to accomplish tasks.\n",
+        );
+    } else {
+        lines.push_str(
+            "- These tools still require operator approval, or fail closed when no approver is present: ",
+        );
+        lines.push_str(&always_ask.join(", "));
+        lines.push_str(
+            ".\n- Execute uncovered tools directly — no extra approval needed for those.\n",
+        );
+    }
+    lines.push_str(
+        "- Only refuse an action if the runtime explicitly rejects it — do not preemptively decline.",
+    );
+    lines
+}
+
 pub trait PromptSection: Send + Sync {
     fn name(&self) -> &str;
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String>;
+
+    /// Build with canonical approval-policy details when the caller has them.
+    /// The default preserves compatibility for third-party prompt sections.
+    fn build_with_approval_policy(
+        &self,
+        ctx: &PromptContext<'_>,
+        _always_ask: &[String],
+    ) -> Result<String> {
+        self.build(ctx)
+    }
 }
 
 #[derive(Default)]
@@ -169,9 +213,20 @@ impl SystemPromptBuilder {
     }
 
     pub fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        self.build_with_approval_policy(ctx, &[])
+    }
+
+    /// Render built-in policy-aware sections from the same `always_ask`
+    /// values that execution enforces, while leaving custom sections source
+    /// compatible through `PromptSection`'s default method.
+    pub fn build_with_approval_policy(
+        &self,
+        ctx: &PromptContext<'_>,
+        always_ask: &[String],
+    ) -> Result<String> {
         let mut output = String::new();
         for section in &self.sections {
-            let part = section.build(ctx)?;
+            let part = section.build_with_approval_policy(ctx, always_ask)?;
             if part.trim().is_empty() {
                 continue;
             }
@@ -347,10 +402,19 @@ impl PromptSection for SafetySection {
     }
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        self.build_with_approval_policy(ctx, &[])
+    }
+
+    fn build_with_approval_policy(
+        &self,
+        ctx: &PromptContext<'_>,
+        always_ask: &[String],
+    ) -> Result<String> {
         let mut out = String::from("## Safety\n\n- Do not exfiltrate private data.\n");
 
-        // Omit "ask before acting" instructions when autonomy is Full —
-        // mirrors build_system_prompt_with_mode_and_autonomy.
+        // Omit generic "ask before acting" instructions when autonomy is Full —
+        // mirrors build_system_prompt_with_mode_and_autonomy. `always_ask`
+        // exceptions are spelled out in the Full branch below.
         if ctx.autonomy_level != AutonomyLevel::Full {
             out.push_str(
                 "- Do not run destructive commands without asking.\n\
@@ -365,22 +429,22 @@ impl PromptSection for SafetySection {
             zeroclaw_api::runtime_traits::POSIX_DELETION_GUIDANCE,
             zeroclaw_api::runtime_traits::ShellProfile::safe_deletion_guidance,
         ));
-        out.push_str(match ctx.autonomy_level {
-            AutonomyLevel::Full => {
-                "- Execute tools and actions directly — no extra approval needed.\n\
-                 - You have full access to all configured tools. Use them confidently to accomplish tasks.\n\
-                 - Only refuse an action if the runtime explicitly rejects it — do not preemptively decline."
-            }
+        match ctx.autonomy_level {
+            AutonomyLevel::Full => out.push_str(&full_autonomy_safety_lines(always_ask)),
             AutonomyLevel::ReadOnly => {
-                "- This runtime is read-only. Write operations will be rejected by the runtime if attempted.\n\
-                 - Use read-only tools freely and confidently."
+                out.push_str(
+                    "- This runtime is read-only. Write operations will be rejected by the runtime if attempted.\n\
+                     - Use read-only tools freely and confidently.",
+                );
             }
             AutonomyLevel::Supervised => {
-                "- Ask for approval when the runtime policy requires it for the specific action.\n\
-                 - Do not preemptively refuse actions — attempt them and let the runtime enforce restrictions.\n\
-                 - Use available tools confidently; the security policy will enforce boundaries."
+                out.push_str(
+                    "- Ask for approval when the runtime policy requires it for the specific action.\n\
+                     - Do not preemptively refuse actions — attempt them and let the runtime enforce restrictions.\n\
+                     - Use available tools confidently; the security policy will enforce boundaries.",
+                );
             }
-        });
+        }
 
         // Append concrete security policy constraints when available.
         // This tells the LLM exactly what commands are allowed, which paths
@@ -1346,6 +1410,87 @@ mod tests {
         assert!(
             output.contains("Do not exfiltrate"),
             "full autonomy should still include data exfiltration guard"
+        );
+        assert!(
+            output.contains("always_ask"),
+            "full autonomy contract must mention always_ask even when none are configured"
+        );
+        assert!(
+            !output.contains("no extra approval needed.")
+                || output.contains("No tools are listed in `always_ask`"),
+            "empty always_ask must not claim unconditional extra-approval exemption"
+        );
+    }
+
+    #[test]
+    fn safety_section_full_autonomy_names_exact_always_ask() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let always_ask = ["shell".to_string()];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            agent_workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            interaction: None,
+            dispatcher_instructions: "",
+            sends_native_tool_specs: false,
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Full,
+            inject_memory: true,
+            shell_profile: None,
+        };
+
+        let output = SafetySection
+            .build_with_approval_policy(&ctx, &always_ask)
+            .unwrap();
+        assert!(
+            output.contains("shell"),
+            "exact always_ask tool must be named in the Full safety contract"
+        );
+        assert!(
+            output.contains("still require operator approval"),
+            "must say always_ask tools still prompt"
+        );
+        assert!(
+            !output.contains("No tools are listed in `always_ask`"),
+            "must not claim the always_ask list is empty"
+        );
+    }
+
+    #[test]
+    fn safety_section_full_autonomy_names_wildcard_always_ask() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let always_ask = ["*".to_string()];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            agent_workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            interaction: None,
+            dispatcher_instructions: "",
+            sends_native_tool_specs: false,
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Full,
+            inject_memory: true,
+            shell_profile: None,
+        };
+
+        let output = SafetySection
+            .build_with_approval_policy(&ctx, &always_ask)
+            .unwrap();
+        assert!(
+            output.contains("`always_ask` is set to `*`"),
+            "wildcard always_ask must cover every tool"
+        );
+        assert!(
+            output.contains("every tool still requires operator approval"),
+            "wildcard must not leave an uncovered auto-approve path"
         );
     }
 

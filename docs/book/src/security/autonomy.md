@@ -36,13 +36,13 @@ Risk classification:
 
 ### `full`
 
-No approval gates; all tool calls flagged low/medium/high run without asking. `workspace_only` is implicitly disabled (the agent can access paths outside the workspace); `forbidden_paths` still blocks; the OS-level sandbox (`sandbox_enabled` + `sandbox_backend`) still applies.
+Uncovered tool calls flagged low/medium/high run without asking. `always_ask` still prompts even under Full: an exact name or `"*"` returns an approval prompt on the CLI, routes a request through a channel back-channel, or fails closed on a non-interactive surface with no approver. `workspace_only` is implicitly disabled (the agent can access paths outside the workspace); `forbidden_paths` still blocks; the OS-level sandbox (`sandbox_enabled` + `sandbox_backend`) still applies.
 
-This is appropriate for trusted local dev, CI, or SOPs that need to run end-to-end without a human in the loop. If you need `full` + no workspace constraints + no sandboxing, see [YOLO mode](../getting-started/yolo.md).
+This is appropriate for trusted local dev, CI, or SOPs that need to run end-to-end without a human in the loop. Keep sensitive tools in `always_ask` if you need Full for everything else but still want a prompt (or a fail-closed deny) for those tools. If you need `full` + no workspace constraints + no sandboxing, see [YOLO mode](../getting-started/yolo.md).
 
 ## Per-tool overrides
 
-`auto_approve`, `always_ask`, and `excluded_tools` live as flat lists of tool names on the risk profile (not nested tables). `excluded_tools` is also available per-channel (`channels.<type>.<alias>.excluded_tools`) to hide tools from specific surfaces without changing the profile.
+`auto_approve`, `always_ask`, and `excluded_tools` live as flat lists of tool names on the risk profile (not nested tables). `always_ask` outranks Full autonomy, `auto_approve`, and a session-level "Always" grant: a listed tool (or `"*"`) still prompts. `excluded_tools` is also available per-channel (`channels.<type>.<alias>.excluded_tools`) to hide tools from specific surfaces without changing the profile.
 
 ## Cross-channel approval routing
 
