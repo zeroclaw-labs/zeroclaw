@@ -201,13 +201,14 @@ impl Tool for SendMessageToPeerTool {
                 .as_ref()
                 .map(|_| Arc::new(Mutex::new(TurnUsage::default())));
             zeroclaw_spawn::spawn!(async move {
-                let turn = crate::agent::loop_::process_message(
+                // Keep the large turn future out of the nested cost-scope wrappers.
+                let turn = Box::pin(crate::agent::loop_::process_message(
                     cfg,
                     &recipient_alias,
                     &body,
                     None,
                     zeroclaw_api::ingress::TurnOrigin::AgentDirect,
-                );
+                ));
                 if let Err(e) = deliver_peer_turn_with_cost_scope(cost_ctx, turn_usage, turn).await
                 {
                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"sender": sender, "recipient": recipient_alias, "error": format!("{}", e)})), "peer-message in-process delivery failed");
