@@ -55,6 +55,7 @@
     - [ADR-014: Plugin egress authority](./architecture/decisions/ADR-014-plugin-egress-authority.md)
     - [ADR-015: Unified capability catalog](./architecture/decisions/ADR-015-unified-capability-catalog.md)
     - [ADR-016: Holding-crate exceptions](./architecture/decisions/ADR-016-holding-crate-exceptions.md)
+    - [ADR-017: Inbound authentication and principals](./architecture/decisions/ADR-017-inbound-authentication-and-principals.md)
   - [Logging](./architecture/logging.md)
   - [Runtime state and persistence](./architecture/runtime-state-and-persistence.md)
   - [Memory and payload lifecycle](./architecture/memory-payload-lifecycle.md)
