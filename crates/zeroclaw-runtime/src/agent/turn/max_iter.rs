@@ -574,7 +574,7 @@ mod graceful_summary_metering_tests {
             "raw audio path reached the provider on the max-iteration path: {captured}"
         );
         assert!(
-            captured.contains("[media attachment]"),
+            captured.contains(zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER),
             "audio marker should be replaced with a placeholder: {captured}"
         );
     }

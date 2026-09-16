@@ -76,14 +76,17 @@ pub fn catalog_source_for(family: &str) -> Option<(Option<&'static str>, Option<
         "opencode" => (Some("opencode"), None),
         "atomic_chat" => (Some("atomic-chat"), None),
         "telnyx" => (None, None),
+        "crusoe" => (None, None),
         // Families with no public catalog: local-only servers (no public
         // /models index without a running server) or credential-required
         // APIs with no published catalog. Operator pastes a credential and
         // the provider's `/models` endpoint serves the list directly.
         "sambanova" | "hyperbolic" | "anyscale" | "nscale" | "lepton" | "yi" | "baichuan"
         | "avian" | "deepmyst" | "astrai" | "sglang" | "vllm" | "osaurus" | "litellm"
-        | "llamacpp" | "ollama" | "manifest" | "morph" | "github_models" | "upstage"
-        | "featherless" | "arcee" | "lambda_ai" | "inception" | "custom" => (None, None),
+        | "llamacpp" | "ollama" | "hailo_ollama" | "manifest" | "morph" | "github_models"
+        | "upstage" | "featherless" | "arcee" | "lambda_ai" | "inception" | "custom" => {
+            (None, None)
+        }
         _ => return None,
     };
     Some(pair)

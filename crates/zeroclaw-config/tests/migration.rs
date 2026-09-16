@@ -2196,6 +2196,114 @@ fn generate_current_emits_at_current_schema_version() {
     );
 }
 
+// ── Pairing-code policy ──────────────────────────────
+
+/// Review MAJOR-3: `zeroclaw config generate 3` must not hand the operator
+/// a config that names the retired `pairing_dashboard.code_length`, and must
+/// surface the `[gateway.pairing_code]` policy that actually decides pairing
+/// strength. The generator migrates the frozen V1 fixture, which still
+/// carries the retired key — so this pins the migration step, not the
+/// fixture.
+#[test]
+fn generate_current_retires_dashboard_code_length_and_surfaces_pairing_code() {
+    let raw = generate(CURRENT_SCHEMA_VERSION, &GenerateOptions::default())
+        .expect("generate current succeeds");
+    let parsed: toml::Value = toml::from_str(&raw).expect("generated output parses as TOML");
+    let gateway = parsed
+        .get("gateway")
+        .and_then(toml::Value::as_table)
+        .expect("generated config has a [gateway] section");
+
+    // The V1 fixture still carries the retired key; the migration drops it.
+    assert!(
+        V1_FIXTURE.contains("code_length"),
+        "precondition: the frozen V1 fixture still carries the retired key"
+    );
+    let dashboard = gateway
+        .get("pairing_dashboard")
+        .and_then(toml::Value::as_table)
+        .expect("[gateway.pairing_dashboard] survives with its other fields");
+    assert!(
+        !dashboard.contains_key("code_length"),
+        "retired key must not reach a current-schema config: {dashboard:?}"
+    );
+    assert!(
+        dashboard.contains_key("code_ttl_secs"),
+        "the rest of the dashboard section must be preserved"
+    );
+
+    // The shared policy is surfaced, at the shipped default.
+    let policy = gateway
+        .get("pairing_code")
+        .and_then(toml::Value::as_table)
+        .expect("[gateway.pairing_code] must be surfaced");
+    let default = zeroclaw_config::pairing::PairingCodePolicy::default();
+    assert_eq!(
+        policy.get("length").and_then(toml::Value::as_integer),
+        Some(default.length as i64),
+    );
+    assert_eq!(
+        policy.get("charset").and_then(toml::Value::as_str),
+        Some(default.charset.config_name()),
+    );
+
+    // And the whole thing still deserializes as the current schema.
+    let config: Config = toml::from_str(&raw).expect("generated config parses as Config");
+    assert_eq!(config.gateway.pairing_code, default);
+    config
+        .validate()
+        .expect("a generated config must be valid out of the box");
+}
+
+/// An operator who already hand-wrote `[gateway.pairing_code]` keeps it —
+/// the migration fills the section in, it does not overwrite a choice.
+#[test]
+fn migration_preserves_an_operator_authored_pairing_code_policy() {
+    let input = "schema_version = 2\n\
+                 [gateway]\n\
+                 port = 42617\n\
+                 [gateway.pairing_code]\n\
+                 length = 24\n\
+                 charset = \"unambiguous\"\n\
+                 [gateway.pairing_dashboard]\n\
+                 code_length = 8\n";
+    let migrated = migrate_v2(input);
+    let gateway = migrated
+        .get("gateway")
+        .and_then(toml::Value::as_table)
+        .expect("gateway section present");
+    let policy = gateway
+        .get("pairing_code")
+        .and_then(toml::Value::as_table)
+        .expect("operator-authored policy survives");
+    assert_eq!(
+        policy.get("length").and_then(toml::Value::as_integer),
+        Some(24),
+        "the operator's length must not be overwritten by the default"
+    );
+    assert_eq!(
+        policy.get("charset").and_then(toml::Value::as_str),
+        Some("unambiguous"),
+    );
+    // The retired key is still dropped.
+    let dashboard = gateway
+        .get("pairing_dashboard")
+        .and_then(toml::Value::as_table)
+        .expect("dashboard section present");
+    assert!(!dashboard.contains_key("code_length"));
+}
+
+/// A V2 config with no `[gateway]` at all must migrate cleanly — the
+/// normalizer must not synthesize a gateway section out of nothing.
+#[test]
+fn migration_leaves_a_gatewayless_config_alone() {
+    let migrated = migrate_v2("schema_version = 2\n");
+    assert!(
+        migrated.get("gateway").is_none(),
+        "no [gateway] in, no [gateway] out"
+    );
+}
+
 #[test]
 fn generate_v1_is_v1_shape() {
     let raw = generate(1, &GenerateOptions::default()).expect("generate v1 succeeds");
@@ -2821,4 +2929,67 @@ api_key = "sk-openai-lead"
             agent.model_provider
         );
     }
+}
+
+#[test]
+fn v3_explicit_empty_allowed_tools_stays_unrestricted() {
+    // No schema migration touches `allowed_tools`: V3 files with an explicit
+    // `allowed_tools = []` keep the legacy unrestricted meaning.
+    let raw = r#"
+schema_version = 3
+
+[risk_profiles.default]
+allowed_tools = []
+"#;
+    let cfg = migrate_to_current(raw).expect("V3 empty allowed_tools loads");
+    assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
+    let profile = cfg
+        .risk_profiles
+        .get("default")
+        .expect("default profile survives");
+    assert!(
+        profile.allowed_tools.is_empty(),
+        "legacy V3 allowed_tools = [] must stay the unrestricted state, got {:?}",
+        profile.allowed_tools
+    );
+    assert!(!profile.deny_all_tools);
+    let policy = zeroclaw_config::policy::SecurityPolicy::from_risk_profile(
+        profile,
+        std::path::Path::new("/ws"),
+    );
+    assert!(
+        policy.is_tool_allowed("shell"),
+        "legacy empty array must remain unrestricted"
+    );
+}
+
+#[test]
+fn v3_deny_all_tools_flag_loads_without_migration() {
+    // `deny_all_tools` is a plain additive V3 field: no migration step, it
+    // deserializes directly and maps to deny-all at the policy boundary.
+    let raw = r#"
+schema_version = 3
+
+[risk_profiles.default]
+deny_all_tools = true
+"#;
+    let cfg = migrate_to_current(raw).expect("V3 deny_all_tools loads");
+    assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
+    let profile = cfg
+        .risk_profiles
+        .get("default")
+        .expect("default profile present");
+    assert!(profile.deny_all_tools);
+    let policy = zeroclaw_config::policy::SecurityPolicy::from_risk_profile(
+        profile,
+        std::path::Path::new("/ws"),
+    );
+    assert!(
+        !policy.is_tool_allowed("shell"),
+        "deny_all_tools = true must deny built-ins"
+    );
+    assert!(
+        !policy.is_tool_allowed("filesystem__write_file"),
+        "deny_all_tools = true must deny MCP-shaped names; the __ auto-admit is nonempty-allowlist only"
+    );
 }

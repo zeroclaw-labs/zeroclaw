@@ -9,11 +9,6 @@
 //! bytes. The TUI uses it both for client-issued requests
 //! (`session/turn`, `quickstart/apply`, …) and for routing
 //! daemon-originated notifications.
-//!
-//! Constants in `error_codes` cover the full set the daemon may emit
-//! — some are only consumed by error-routing branches that may not
-//! exercise every code today.
-#![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -29,9 +24,7 @@ pub const OUTBOUND_ID_PREFIX: &str = "zc-out-";
 // ── Wire field name constants ────────────────────────────────────
 
 pub mod field {
-    pub const JSONRPC: &str = "jsonrpc";
     pub const METHOD: &str = "method";
-    pub const PARAMS: &str = "params";
     pub const ID: &str = "id";
     pub const RESULT: &str = "result";
     pub const ERROR: &str = "error";
@@ -69,23 +62,6 @@ pub struct JsonRpcResponse {
     pub id: Value,
 }
 
-#[derive(Debug, Serialize)]
-pub struct JsonRpcNotification {
-    pub jsonrpc: &'static str,
-    pub method: &'static str,
-    pub params: Value,
-}
-
-impl JsonRpcNotification {
-    pub fn new(method: &'static str, params: Value) -> Self {
-        Self {
-            jsonrpc: JSONRPC_VERSION,
-            method,
-            params,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcError {
     pub code: i32,
@@ -97,25 +73,12 @@ pub struct JsonRpcError {
 // ── Error codes ──────────────────────────────────────────────────
 
 pub mod error_codes {
-    pub const PARSE_ERROR: i32 = -32700;
-    pub const INVALID_REQUEST: i32 = -32600;
     pub const METHOD_NOT_FOUND: i32 = -32601;
-    pub const INVALID_PARAMS: i32 = -32602;
     pub const INTERNAL_ERROR: i32 = -32603;
 
     pub const SESSION_NOT_FOUND: i32 = -32000;
-    pub const SESSION_LIMIT_REACHED: i32 = -32001;
+    #[cfg(test)]
     pub const SESSION_BUSY: i32 = -32002;
-    pub const AUTH_REQUIRED: i32 = -32010;
-    pub const VERSION_MISMATCH: i32 = -32011;
-
-    pub const FS_NOT_FOUND: i32 = 4001;
-    pub const FS_PERMISSION_DENIED: i32 = 4002;
-    pub const FS_INVALID_PATH: i32 = 4003;
-
-    pub const FS_NOT_FOUND_STR: &str = "fs.not_found";
-    pub const FS_PERMISSION_DENIED_STR: &str = "fs.permission_denied";
-    pub const FS_INVALID_PATH_STR: &str = "fs.invalid_path";
 }
 
 pub const ACP_PROTOCOL_VERSION: u64 = 1;
@@ -132,6 +95,7 @@ pub(crate) enum OutboundMessage {
 
 #[derive(Debug)]
 enum OutboundSender {
+    #[cfg(test)]
     Raw(mpsc::Sender<String>),
     Transport(mpsc::Sender<OutboundMessage>),
 }
@@ -168,6 +132,7 @@ impl Drop for PendingRequestGuard<'_> {
 }
 
 impl RpcOutbound {
+    #[cfg(test)]
     pub fn new(writer_tx: mpsc::Sender<String>) -> Self {
         Self {
             writer_tx: OutboundSender::Raw(writer_tx),
@@ -186,6 +151,7 @@ impl RpcOutbound {
 
     async fn send_frame(&self, frame: String) -> bool {
         match &self.writer_tx {
+            #[cfg(test)]
             OutboundSender::Raw(writer_tx) => writer_tx.send(frame).await.is_ok(),
             OutboundSender::Transport(writer_tx) => {
                 writer_tx.send(OutboundMessage::Frame(frame)).await.is_ok()
@@ -193,14 +159,20 @@ impl RpcOutbound {
         }
     }
 
+    #[cfg(test)]
     pub async fn send_raw(&self, json: String) -> bool {
         self.send_frame(json).await
     }
 
     pub async fn flush_outbound(&self) -> bool {
+        // `Raw` exists only in test builds, so the pattern is refutable there
+        // and irrefutable in production; both forms keep clippy clean.
+        #[cfg(test)]
         let OutboundSender::Transport(writer_tx) = &self.writer_tx else {
             return true;
         };
+        #[cfg(not(test))]
+        let OutboundSender::Transport(writer_tx) = &self.writer_tx;
         let (ack_tx, ack_rx) = oneshot::channel();
         if writer_tx
             .send(OutboundMessage::Flush(ack_tx))
@@ -230,13 +202,6 @@ impl RpcOutbound {
         match serde_json::to_string(&resp) {
             Ok(s) => self.send_frame(s).await,
             Err(_) => false,
-        }
-    }
-
-    pub async fn notify(&self, method: &'static str, params: Value) {
-        let n = JsonRpcNotification::new(method, params);
-        if let Ok(s) = serde_json::to_string(&n) {
-            let _ = self.send_frame(s).await;
         }
     }
 
@@ -328,6 +293,7 @@ impl RpcOutbound {
         }
     }
 
+    #[cfg(test)]
     pub fn pending_count(&self) -> usize {
         self.state
             .lock()

@@ -1,6 +1,7 @@
 //! Status of the current agent turn, surfaced in the input-bar title.
 
 use std::time::Instant;
+use zeroclaw_api::lifecycle::{LifecycleActivity, LifecycleState};
 
 /// Public so tests and the input bar can pattern-match.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -17,29 +18,56 @@ pub enum TurnStatus {
     CallingTool(String),
     /// Approval request is blocking the turn.
     WaitingForApproval,
+    /// A structured user question is blocking the turn.
+    WaitingForInput,
     /// Cancel request fired; awaiting `TurnComplete` so input stays gated
     /// until the daemon actually winds the turn down.
     Cancelling,
 }
 
 impl TurnStatus {
+    /// Classify detailed TUI state through the shared content-free contract.
+    pub(crate) const fn lifecycle_activity(&self) -> LifecycleActivity {
+        match self {
+            Self::Idle => LifecycleActivity::Idle,
+            Self::CallingTool(_) => LifecycleActivity::Tool,
+            Self::WaitingForApproval | Self::WaitingForInput => LifecycleActivity::Approval,
+            Self::Working | Self::Thinking | Self::Responding | Self::Cancelling => {
+                LifecycleActivity::Turn
+            }
+        }
+    }
+
+    /// Canonical state consumed by terminal and future lifecycle projections.
+    pub(crate) const fn lifecycle_state(&self) -> LifecycleState {
+        self.lifecycle_activity().state()
+    }
+
     /// Verb (no parens, no dots) — `None` for states that render without dots.
-    fn verb(&self) -> Option<String> {
+    pub(crate) fn verb(&self) -> Option<String> {
         match self {
             TurnStatus::Idle => None,
-            TurnStatus::Working => Some("working".into()),
-            TurnStatus::Thinking => Some("thinking".into()),
-            TurnStatus::Responding => Some("responding".into()),
-            TurnStatus::CallingTool(name) => Some(format!("calling tool {name}")),
-            TurnStatus::WaitingForApproval => None,
-            TurnStatus::Cancelling => Some("cancelling".into()),
+            TurnStatus::Working => Some(crate::i18n::t("zc-chat-status-working")),
+            TurnStatus::Thinking => Some(crate::i18n::t("zc-chat-status-thinking")),
+            TurnStatus::Responding => Some(crate::i18n::t("zc-chat-status-responding")),
+            TurnStatus::CallingTool(name) => Some(crate::i18n::t_args(
+                "zc-chat-status-calling-tool",
+                &[("tool", name)],
+            )),
+            TurnStatus::WaitingForApproval | TurnStatus::WaitingForInput => None,
+            TurnStatus::Cancelling => Some(crate::i18n::t("zc-chat-status-cancelling")),
         }
     }
 
     pub fn label(&self, animation_origin: Instant) -> String {
         match self {
             TurnStatus::Idle => " > ".to_string(),
-            TurnStatus::WaitingForApproval => " (awaiting approval) ".to_string(),
+            TurnStatus::WaitingForApproval => {
+                format!(" ({}) ", crate::i18n::t("zc-chat-status-awaiting-approval"))
+            }
+            TurnStatus::WaitingForInput => {
+                format!(" ({}) ", crate::i18n::t("zc-chat-status-awaiting-input"))
+            }
             _ => {
                 let verb = self.verb().unwrap_or_default();
                 let dots = dots_for(animation_origin);
@@ -76,20 +104,36 @@ mod tests {
         let past = Instant::now() - Duration::from_secs(5);
         assert_eq!(
             TurnStatus::WaitingForApproval.label(past),
-            " (awaiting approval) "
+            format!(" ({}) ", crate::i18n::t("zc-chat-status-awaiting-approval"))
+        );
+    }
+
+    #[test]
+    fn input_label_has_no_dots() {
+        let past = Instant::now() - Duration::from_secs(5);
+        assert_eq!(
+            TurnStatus::WaitingForInput.label(past),
+            format!(" ({}) ", crate::i18n::t("zc-chat-status-awaiting-input"))
+        );
+        assert_eq!(
+            TurnStatus::WaitingForInput.lifecycle_state(),
+            LifecycleState::Blocked
         );
     }
 
     #[test]
     fn working_label_has_dots_animation() {
         // origin = now → 0 ms elapsed → phase 0 → no dots.
-        assert_eq!(TurnStatus::Working.label(Instant::now()), " (working) ");
+        assert_eq!(
+            TurnStatus::Working.label(Instant::now()),
+            format!(" ({}) ", crate::i18n::t("zc-chat-status-working"))
+        );
     }
 
     #[test]
     fn calling_tool_includes_name() {
         let s = TurnStatus::CallingTool("git_diff".into()).label(Instant::now());
-        assert!(s.starts_with(" (calling tool git_diff"), "got: {s}");
+        assert!(s.contains("git_diff"), "got: {s}");
     }
 
     #[test]
@@ -101,5 +145,32 @@ mod tests {
         assert_eq!(dots_for(mk(800)), "..");
         assert_eq!(dots_for(mk(1200)), "...");
         assert_eq!(dots_for(mk(1600)), ""); // wraps
+    }
+
+    #[test]
+    fn every_detailed_status_uses_the_shared_lifecycle_mapping() {
+        for status in [
+            TurnStatus::Working,
+            TurnStatus::Thinking,
+            TurnStatus::Responding,
+            TurnStatus::Cancelling,
+        ] {
+            assert_eq!(status.lifecycle_activity(), LifecycleActivity::Turn);
+            assert_eq!(status.lifecycle_state(), LifecycleState::Working);
+        }
+
+        assert_eq!(
+            TurnStatus::CallingTool("git".into()).lifecycle_activity(),
+            LifecycleActivity::Tool
+        );
+        for status in [TurnStatus::WaitingForApproval, TurnStatus::WaitingForInput] {
+            assert_eq!(status.lifecycle_activity(), LifecycleActivity::Approval);
+            assert_eq!(status.lifecycle_state(), LifecycleState::Blocked);
+        }
+        assert_eq!(
+            TurnStatus::Idle.lifecycle_activity(),
+            LifecycleActivity::Idle
+        );
+        assert_eq!(TurnStatus::Idle.lifecycle_state(), LifecycleState::Idle);
     }
 }

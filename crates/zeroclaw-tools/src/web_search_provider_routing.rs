@@ -7,6 +7,7 @@ pub enum WebSearchProviderRoute {
     Jina,
     Bocha,
     AnySearch,
+    Serply,
 }
 
 /// Provider HTTP-failure status surfaced to the agent via the error message's
@@ -46,6 +47,7 @@ const TAVILY_PROVIDER: &str = "tavily";
 const JINA_PROVIDER: &str = "jina";
 const BOCHA_PROVIDER: &str = "bocha";
 const ANYSEARCH_PROVIDER: &str = "anysearch";
+const SERPLY_PROVIDER: &str = "serply";
 
 pub fn resolve_web_search_provider(raw_model_provider: &str) -> WebSearchProviderResolution {
     let normalized = raw_model_provider.trim().to_ascii_lowercase();
@@ -89,6 +91,13 @@ pub fn resolve_web_search_provider(raw_model_provider: &str) -> WebSearchProvide
             canonical_provider: ANYSEARCH_PROVIDER,
             used_fallback: false,
         },
+        "serply" | "serply-search" | "serply_search" | "serply-io" | "serply_io" => {
+            WebSearchProviderResolution {
+                route: WebSearchProviderRoute::Serply,
+                canonical_provider: SERPLY_PROVIDER,
+                used_fallback: false,
+            }
+        }
         // Warns for unknown model_providers, falls back to default.
         // Known non-default model_providers are matched above.
         _ => WebSearchProviderResolution {
@@ -182,6 +191,23 @@ mod tests {
             let resolved = resolve_web_search_provider(alias);
             assert_eq!(resolved.route, WebSearchProviderRoute::AnySearch);
             assert_eq!(resolved.canonical_provider, ANYSEARCH_PROVIDER);
+            assert!(!resolved.used_fallback);
+        }
+    }
+
+    #[test]
+    fn resolve_aliases_to_serply() {
+        let serply_aliases = [
+            "serply",
+            "serply-search",
+            "serply_search",
+            "serply-io",
+            "serply_io",
+        ];
+        for alias in serply_aliases {
+            let resolved = resolve_web_search_provider(alias);
+            assert_eq!(resolved.route, WebSearchProviderRoute::Serply);
+            assert_eq!(resolved.canonical_provider, SERPLY_PROVIDER);
             assert!(!resolved.used_fallback);
         }
     }

@@ -352,7 +352,7 @@ pub fn create_sandbox(
 
     match backend {
         SandboxBackend::Auto | SandboxBackend::None => {
-            detect_best_sandbox(runtime_kind, workspace_dir, extra_roots)
+            detect_best_sandbox(runtime_kind, workspace_dir, extra_roots, &sandbox.image)
         }
         requested => {
             let selected =
@@ -367,8 +367,10 @@ pub fn create_sandbox(
                 }
                 return Arc::new(super::traits::NoopSandbox);
             }
-            if let Some(sandbox) = create_selected_sandbox(selected, workspace_dir, extra_roots) {
-                return sandbox;
+            if let Some(built) =
+                create_selected_sandbox(selected, workspace_dir, extra_roots, &sandbox.image)
+            {
+                return built;
             }
             log_requested_backend_unavailable(selected_backend_label(requested));
             Arc::new(super::traits::NoopSandbox)
@@ -380,13 +382,14 @@ fn detect_best_sandbox(
     runtime_kind: RuntimeKind,
     workspace_dir: Option<&Path>,
     extra_roots: &SandboxExtraRoots,
+    image: &str,
 ) -> Arc<dyn Sandbox> {
     let selected = detect_best_backend(runtime_kind, workspace_dir, extra_roots);
     if matches!(selected, SelectedSandboxBackend::DockerRuntime) {
         log_auto_backend_selection(selected, runtime_kind);
         return Arc::new(super::traits::NoopSandbox);
     }
-    if let Some(sandbox) = create_selected_sandbox(selected, workspace_dir, extra_roots) {
+    if let Some(sandbox) = create_selected_sandbox(selected, workspace_dir, extra_roots, image) {
         log_auto_backend_selection(selected, runtime_kind);
         return sandbox;
     }
@@ -399,6 +402,7 @@ fn create_selected_sandbox(
     selected: SelectedSandboxBackend,
     workspace_dir: Option<&Path>,
     extra_roots: &SandboxExtraRoots,
+    image: &str,
 ) -> Option<Arc<dyn Sandbox>> {
     match selected {
         SelectedSandboxBackend::None => None,
@@ -458,12 +462,9 @@ fn create_selected_sandbox(
         }
         SelectedSandboxBackend::Docker => {
             let result = if let Some(ws) = workspace_dir {
-                super::docker::DockerSandbox::with_workspace(
-                    super::docker::DockerSandbox::default_image(),
-                    ws.to_path_buf(),
-                )
+                super::docker::DockerSandbox::with_workspace(image.to_string(), ws.to_path_buf())
             } else {
-                super::docker::DockerSandbox::new()
+                super::docker::DockerSandbox::with_image(image.to_string())
             };
             result
                 .map(|sandbox| Arc::new(sandbox) as Arc<dyn Sandbox>)
@@ -633,11 +634,16 @@ pub fn linux_memcg_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroclaw_config::schema::DEFAULT_SANDBOX_IMAGE;
 
     #[test]
     fn detect_best_sandbox_returns_something() {
-        let sandbox =
-            detect_best_sandbox(RuntimeKind::Cloudflare, None, &SandboxExtraRoots::default());
+        let sandbox = detect_best_sandbox(
+            RuntimeKind::Cloudflare,
+            None,
+            &SandboxExtraRoots::default(),
+            DEFAULT_SANDBOX_IMAGE,
+        );
         // Should always return at least NoopSandbox
         assert!(sandbox.is_available());
     }
@@ -648,6 +654,7 @@ mod tests {
             enabled: Some(false),
             backend: SandboxBackend::None,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         };
         let sandbox = create_sandbox(
             &sandbox_cfg,
@@ -664,6 +671,7 @@ mod tests {
             enabled: Some(false),
             backend: SandboxBackend::None,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         };
         let posture = sandbox_posture(
             &sandbox_cfg,
@@ -682,6 +690,7 @@ mod tests {
             enabled: None, // Auto-detect
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         };
         let sandbox = create_sandbox(
             &sandbox_cfg,
@@ -698,7 +707,12 @@ mod tests {
         // When runtime.kind = "native", Docker must be skipped in auto-detection
         // even when Docker is installed on the host. The sandbox must be
         // NoopSandbox or something OS-native (Landlock, Firejail, Seatbelt).
-        let sandbox = detect_best_sandbox(RuntimeKind::Native, None, &SandboxExtraRoots::default());
+        let sandbox = detect_best_sandbox(
+            RuntimeKind::Native,
+            None,
+            &SandboxExtraRoots::default(),
+            DEFAULT_SANDBOX_IMAGE,
+        );
         assert_ne!(sandbox.name(), "docker");
     }
 
@@ -708,6 +722,7 @@ mod tests {
             enabled: None,
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         };
         let posture = sandbox_posture(
             &sandbox_cfg,
@@ -724,6 +739,7 @@ mod tests {
             enabled: None,
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         };
         let sandbox = create_sandbox(
             &sandbox_cfg,
@@ -749,6 +765,7 @@ mod tests {
             enabled: None,
             backend: SandboxBackend::Docker,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         };
         let sandbox = create_sandbox(
             &sandbox_cfg,
@@ -807,6 +824,7 @@ mod tests {
             enabled: None,
             backend: SandboxBackend::Docker,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         };
 
         let sandbox = create_sandbox(
@@ -825,6 +843,7 @@ mod tests {
             enabled: None,
             backend: SandboxBackend::Docker,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         };
 
         let posture = sandbox_posture(
@@ -854,6 +873,7 @@ mod tests {
             enabled: Some(false),
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         };
 
         let posture = sandbox_posture(
@@ -874,6 +894,7 @@ mod tests {
             enabled: None,
             backend: SandboxBackend::None,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         };
 
         let posture = sandbox_posture(
@@ -909,6 +930,7 @@ mod tests {
             enabled: None,
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         };
 
         let posture = sandbox_posture(

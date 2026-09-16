@@ -973,6 +973,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_attachment_markers_delivers_echoed_media_placeholder_as_prose() {
+        // A text-only model sees the degradation placeholder in its history
+        // and may repeat it; the reply must reach the user as readable text,
+        // not as a marker or a stray bracket span.
+        let reply = format!(
+            "I can't view that, it shows as {}.",
+            zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER
+        );
+        let (cleaned, attachments) = parse_attachment_markers(&reply);
+        assert_eq!(cleaned, reply);
+        assert!(attachments.is_empty());
+        assert!(!cleaned.contains('['));
+    }
+
+    #[test]
     fn parse_attachment_markers_preserves_empty_target() {
         let (cleaned, attachments) = parse_attachment_markers("See [IMAGE:] here");
         assert_eq!(cleaned, "See [IMAGE:] here");

@@ -144,7 +144,10 @@ Derive macros for config schema, tool registration, and channel registration. Sa
 
 ### `zerocode`
 
-Terminal UI, built as a separate app under `apps/zerocode/`. It is its own workspace member with no `zeroclaw-*` crate dependency (see [Docs & Translations → zerocode strings](../maintainers/docs-and-translations.md) for its independent i18n catalogue).
+Terminal UI, built as a separate app under `apps/zerocode/`. It depends only on
+the shared contracts in `zeroclaw-api`, not runtime, config, channel, provider,
+or tool implementations. Its i18n catalogue remains independent; see
+[Docs & Translations → zerocode strings](../maintainers/docs-and-translations.md).
 
 ## Feature flags
 

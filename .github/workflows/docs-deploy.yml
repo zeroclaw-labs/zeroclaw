@@ -353,6 +353,15 @@ jobs:
             $MDBOOK_XTASK gen-versions > versions.json
             $MDBOOK_XTASK retrofit-selector
             $MDBOOK_XTASK gen-root-index > index.html
+
+            # Root llms.txt / llms-full.txt mirror the English pair of the
+            # version / redirects to (the stable pointer target, else master)
+            # so agents have one fixed URL per file. The pair is one unit: when
+            # that version was built before the llms backend existed, both root
+            # files are removed rather than left serving an older release, and
+            # the root pair publishes on the first deploy whose stable target
+            # carries both. Versioned copies stay at <tag>/en/llms*.txt.
+            $MDBOOK_XTASK sync-root-llms
             # Canonical/hreflang/description/share tags on every page, plus
             # robots.txt and sitemap.xml at the root. Reads CNAME (written
             # above) for the site host and stable-version.txt for the copy

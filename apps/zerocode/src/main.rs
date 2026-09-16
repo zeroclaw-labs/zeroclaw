@@ -41,6 +41,7 @@ mod jsonrpc;
 mod keymap;
 mod logs;
 mod mouse;
+mod osc_status;
 mod quickstart_pane;
 mod relay_proto;
 mod sop_pane;
@@ -68,14 +69,19 @@ static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
 struct ShutdownSignals {
     interrupt: tokio::signal::unix::Signal,
     terminate: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
+    quit: tokio::signal::unix::Signal,
 }
 
 #[cfg(unix)]
 impl ShutdownSignals {
     fn new() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
         Ok(Self {
-            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
-            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+            hangup: signal(SignalKind::hangup())?,
+            quit: signal(SignalKind::quit())?,
         })
     }
 
@@ -83,6 +89,8 @@ impl ShutdownSignals {
         tokio::select! {
             _ = self.interrupt.recv() => {}
             _ = self.terminate.recv() => {}
+            _ = self.hangup.recv() => {}
+            _ = self.quit.recv() => {}
         }
     }
 }
@@ -584,6 +592,9 @@ fn install_panic_hook() {
 /// Best-effort terminal restoration used by the panic hook and Unix shutdown
 /// handlers. Errors are intentionally ignored — we're already crashing.
 fn force_restore_terminal() {
+    // Terminal status outlives the process, so it has to be handed back
+    // here too — otherwise a crash leaves the tab reading as busy.
+    crate::osc_status::release();
     if TERMINAL_ACTIVE.load(Ordering::Relaxed) {
         let _ = crossterm::terminal::disable_raw_mode();
         let _ = crossterm::execute!(
@@ -1059,7 +1070,7 @@ async fn run() -> anyhow::Result<()> {
 }
 
 /// Runs the TUI under Unix shutdown handlers so the terminal is restored on
-/// SIGINT or SIGTERM instead of dying mid-draw. `app::run` owns the full session
+/// SIGINT, SIGTERM, SIGHUP, or SIGQUIT instead of dying mid-draw. `app::run` owns the full session
 /// lifecycle — including in-loop reconnection and recovery — and returns
 /// only when the user quits.
 async fn run_until_exit(
@@ -1470,10 +1481,14 @@ async fn await_spawned_daemon_ready(
     socket: &std::path::Path,
     daemon: &mut SpawnedDaemon,
 ) -> anyhow::Result<client::RpcClient> {
+    let socket_path = socket.display().to_string();
+    let readiness_seconds = SPAWNED_DAEMON_CONNECT_TIMEOUT.as_secs().to_string();
     eprintln!(
-        "zerocode: waiting for daemon at {} (up to {}s)…",
-        socket.display(),
-        SPAWNED_DAEMON_CONNECT_TIMEOUT.as_secs(),
+        "{}",
+        crate::i18n::t_args(
+            "zc-daemon-wait-notice",
+            &[("path", &socket_path), ("seconds", &readiness_seconds)],
+        )
     );
     let deadline = tokio::time::Instant::now() + SPAWNED_DAEMON_CONNECT_TIMEOUT;
     loop {
@@ -1482,10 +1497,11 @@ async fn await_spawned_daemon_ready(
         }
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!(
-                "daemon did not become ready within {}s (socket: {}); if the socket path is \
-                 long, set ZEROCLAW_SOCKET to a shorter path or use a shorter --config-dir",
-                SPAWNED_DAEMON_CONNECT_TIMEOUT.as_secs(),
-                socket.display(),
+                "{}",
+                crate::i18n::t_args(
+                    "zc-error-daemon-not-ready-timeout",
+                    &[("path", &socket_path), ("seconds", &readiness_seconds)],
+                )
             );
         }
         match client::RpcClient::connect(socket, None, None).await {
@@ -1687,7 +1703,10 @@ mod connection_tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let daemon_pid = loop {
             if let Ok(pid) = std::fs::read_to_string(&pid_path) {
-                break pid.trim().parse::<u32>().expect("parse daemon pid");
+                let pid = pid.trim();
+                if !pid.is_empty() {
+                    break pid.parse::<u32>().expect("parse daemon pid");
+                }
             }
             assert!(
                 owner.try_wait().expect("poll signal owner").is_none(),
@@ -1723,14 +1742,10 @@ mod connection_tests {
 
     #[cfg(unix)]
     #[test]
-    fn spawned_daemon_parent_only_sigterm_cleans_up_child() {
-        assert_parent_signal_cleans_up_child(libc::SIGTERM);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn spawned_daemon_parent_only_sigint_cleans_up_child() {
-        assert_parent_signal_cleans_up_child(libc::SIGINT);
+    fn spawned_daemon_parent_termination_signals_clean_up_child() {
+        for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
+            assert_parent_signal_cleans_up_child(signal);
+        }
     }
 
     #[cfg(unix)]

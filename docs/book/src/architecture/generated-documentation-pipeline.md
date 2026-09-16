@@ -35,12 +35,13 @@ This matrix describes the current high-value surfaces, not every helper file pro
 2. Build workspace rustdoc.
 3. Materialize theme, keymap, hardware, feature-matrix, and plugin snippets.
 4. Run mdBook once for every locale in `locales.toml`, with preprocessors configured by `docs/book/book.toml`.
-5. Check links in the rendered primary locale.
-6. Assemble the version directory, locale redirect, rustdoc tree, and shared theme assets under `docs/book/book/`.
+5. Run mdBook once more for the primary locale with only the in-tree `llms` backend, writing `llms.txt` (a page index with one-line descriptions) and `llms-full.txt` (every page as one Markdown stream) beside that locale's HTML. The preprocessors that support the `llms` renderer (gettext, peer-groups, placeholders) run for this pass; `mdbook-mermaid` serves only the HTML renderer, so the text keeps fenced Mermaid source instead of rendered diagrams. Page entries carry the deployed `https://docs.zeroclaw.com/<tag>/<locale>/` URL, while page bodies keep their authored `.md` links unrewritten. Only `cargo mdbook build` produces the pair: `cargo mdbook serve` skips this pass, and an HTML watch rebuild of the locale directory discards any pair already there.
+6. Check links in the rendered primary locale.
+7. Assemble the version directory, locale redirect, rustdoc tree, and shared theme assets under `docs/book/book/`.
 
 The peer-group preprocessor expands its directives while mdBook processes each chapter. Other standard mdBook preprocessors handle links, Mermaid blocks, and gettext localization. Generated references therefore need to exist before chapter preprocessing, while directive expansion and translation happen during the locale build.
 
-The docs deployment workflow initializes the translation submodule, installs the required mdBook tools, runs `cargo mdbook build`, and merges the assembled version into the `gh-pages` branch. It does not call a translation provider or repair catalogs during deployment.
+The docs deployment workflow initializes the translation submodule, installs the required mdBook tools, runs `cargo mdbook build`, and merges the assembled version into the `gh-pages` branch. Each deployed `<tag>/en/` directory keeps its own `llms.txt` and `llms-full.txt`. The root pair at `https://docs.zeroclaw.com/llms.txt` and `llms-full.txt` mirrors the version the site root redirects to (the stable pointer target, or `master` when no pointer resolves), and only when that version's build carries both files. A stable release built before the `llms` backend existed has no pair, so the deploy removes any root copies rather than leaving them serving an older release; the root pair appears with the first stable release built after this backend landed. It does not call a translation provider or repair catalogs during deployment.
 
 ## Tracked and build-only outputs
 
