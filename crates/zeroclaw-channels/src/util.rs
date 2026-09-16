@@ -579,6 +579,7 @@ pub(crate) fn build_yesno_approval_prompt(
 /// catalogue key and the phrasing cannot drift per channel.
 #[cfg(any(
     feature = "channel-discord",
+    feature = "channel-mattermost",
     feature = "channel-signal",
     feature = "channel-slack",
     feature = "channel-whatsapp-cloud",

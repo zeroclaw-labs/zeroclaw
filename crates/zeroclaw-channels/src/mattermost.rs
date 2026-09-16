@@ -1207,6 +1207,7 @@ impl Channel for MattermostChannel {
             &token,
             &request.tool_name,
             &request.arguments_summary,
+            request.position_counter(),
         );
         // Armed from here on: every exit below — including a dropped future —
         // retires this registration and any post bound to it. Cleanup is keyed
@@ -4721,6 +4722,7 @@ mod approval_tests {
             tool_name: "shell".into(),
             arguments_summary: "rm -rf /".into(),
             raw_arguments: None,
+            position: None,
         }
     }
 
@@ -4924,6 +4926,7 @@ mod approval_tests {
             tool_name: "shell".into(),
             arguments_summary: "rm -rf /".into(),
             raw_arguments: None,
+            position: None,
         };
 
         // `send` fails against the unreachable test host, which surfaces as an
