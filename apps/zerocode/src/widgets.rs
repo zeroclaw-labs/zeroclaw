@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 #[derive(Debug, Clone, Default)]
 pub struct HelpEntry {
     /// Keys that trigger this action, e.g. ["↑", "k"]. Rendered labels,
@@ -72,6 +70,7 @@ impl HelpNode {
         }
     }
 
+    #[cfg(test)]
     pub fn titled(title: impl Into<String>, entries: Vec<HelpEntry>) -> Self {
         Self {
             title: Some(title.into()),
@@ -114,11 +113,6 @@ impl CtxBar {
             input_tokens,
             max_tokens,
         }
-    }
-
-    /// `true` when there is something worth rendering.
-    pub fn has_content(&self) -> bool {
-        self.input_tokens.is_some() || self.max_tokens.is_some()
     }
 
     /// Build a `Paragraph` widget, or `None` if there is nothing to show.
@@ -244,6 +238,7 @@ impl<'a> InfoBar<'a> {
         Self { message }
     }
 
+    #[cfg(test)]
     pub fn has_content(&self) -> bool {
         self.message.is_some()
     }
@@ -267,20 +262,28 @@ impl<'a> InfoBar<'a> {
 }
 
 /// Truncate `s` to at most `width` display columns, appending an ellipsis when
-/// it overflows. Approximates width by `char` count — adequate for the
-/// single-line status text the info bar carries.
-fn truncate_to_width(s: &str, width: usize) -> String {
+/// it overflows. Grapheme boundaries and terminal display width stay aligned
+/// with the renderer and hit geometry.
+pub(crate) fn truncate_to_width(s: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    if s.chars().count() <= width {
+    if crate::display_width::display_width(s) <= width {
         return s.to_string();
     }
     if width == 1 {
         return "\u{2026}".to_string();
     }
     let keep = width - 1;
-    let mut out: String = s.chars().take(keep).collect();
+    let mut used = 0usize;
+    let mut out = String::new();
+    for (_, grapheme, grapheme_width) in crate::display_width::grapheme_widths(s) {
+        if used + grapheme_width > keep {
+            break;
+        }
+        out.push_str(grapheme);
+        used += grapheme_width;
+    }
     out.push('\u{2026}');
     out
 }
@@ -392,6 +395,7 @@ impl PickerState {
         Self { items, cursor }
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
@@ -439,6 +443,13 @@ mod info_bar_tests {
     #[test]
     fn truncate_width_one_is_ellipsis() {
         assert_eq!(truncate_to_width("anything", 1), "\u{2026}");
+    }
+
+    #[test]
+    fn truncate_respects_wide_grapheme_columns() {
+        let truncated = truncate_to_width("agent界界", 7);
+        assert_eq!(truncated, "agent\u{2026}");
+        assert_eq!(crate::display_width::display_width(&truncated), 6);
     }
 
     #[test]

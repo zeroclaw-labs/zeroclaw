@@ -21,6 +21,8 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 - `fallback`: ordered list of other dotted provider aliases to try after this alias fails.
 - `wire_api`, `native_tools`, `provider_extra`, `think`, and `chat_template_kwargs`: advanced protocol and request-body overrides.
 - `vision`: override the provider's image-input (vision) capability. Leave unset to use the family's built-in default. Set `false` for a text-only model served by a vision-capable family (for example, a text model behind llama.cpp) so image messages route to a configured `[multimodal] vision_model_provider` instead of erroring; set `true` to force it on.
+- `tool_result_image_policy`: handling for image markers in native `role = "tool"` results sent to compatible chat-completions providers. Defaults to `"image_url"`; set to `"omit"` to remove image URI/base64 payloads and append a fixed notice. This does not change direct user images or OpenAI Responses providers.
+- `cache_passthrough`: opt into Anthropic prompt caching on chat-completions gateways that translate to the Anthropic Messages API. Adds at most two `cache_control` breakpoints per request and surfaces gateway-reported cache reads in token usage. Default `false`, requests unchanged. Requires route qualification before production use; see [Prompt cache passthrough](#prompt-cache-passthrough-chat-completions-gateways).
 - `tls_ca_cert_path`: absolute path to a PEM-encoded CA certificate for TLS connections to this provider (a per-provider trust override, distinct from the gateway TLS `ca_cert_path`). Shell expansion such as `~` is not performed; leave unset to use the system trust store.
 
 Family-specific entries add their own typed fields on top of these shared fields.
@@ -107,6 +109,144 @@ When `[multimodal] vision_model_provider` names a dotted provider alias, its
 precedence over the alias model; if neither is set, the primary turn model is
 used for backward compatibility.
 
+## Native thinking display (Anthropic)
+
+`agent.thinking.display` controls how Anthropic extended thinking is
+delivered when native thinking is enabled (`agent.thinking.native_thinking
+= true`). Accepted values:
+
+- `off` (default): no `display` field is sent; requests are byte-identical
+  to earlier ZeroClaw versions and thinking requests use the non-streaming
+  fallback.
+- `omitted`: Anthropic omits thinking text from the response; blocks arrive
+  signature-only (empty `thinking`, required signature), keeping replay
+  intact while minimizing visible reasoning.
+- `updates`: the request carries the
+  `thinking-display-updates-2026-08-18` beta and uses the streaming
+  response path. Readable thinking progress is surfaced live while the
+  model works; the signed reasoning payload is retained separately for
+  history replay and never shown.
+- `summarized`: same streaming behavior, requesting summarized thinking.
+
+```toml
+[agent.thinking]
+native_thinking = true
+display = "updates"
+```
+
+The setting requires an Anthropic account enrolled in the
+`thinking-display-updates` beta; without enrollment the API rejects the
+request. Set `display = "off"` (or remove the field) to return to the
+previous wire behavior.
+
+## Prompt cache passthrough (chat-completions gateways)
+
+`cache_passthrough = true` on a chat-completions provider alias opts its
+requests into Anthropic prompt caching. Use it on gateways that translate
+Chat Completions into the Anthropic Messages API (LiteLLM, TrueFoundry,
+and similar); the native Anthropic family already caches by default and
+ignores this field.
+
+Before reaching for this flag, check whether the gateway also exposes an
+Anthropic Messages endpoint. If it does, point a
+`[providers.models.anthropic.<alias>]` entry at it with `uri` and skip the
+passthrough entirely; the native provider places its own breakpoints.
+`cache_passthrough` is for gateways that offer only the Chat Completions
+surface.
+
+With the flag on, requests gain at most two `cache_control` breakpoints:
+one on the system prompt, and one rolling breakpoint on the last message
+once the conversation has more than one non-system message, the same gate
+the native Anthropic provider applies. On a message that ends with an
+image, the rolling breakpoint sits on the message's last text block; the
+image is covered by the following turn. With
+`merge_system_into_user` the system role never reaches the wire, so the
+merged first user message (or the synthetic user carrying the system text)
+carries the system-equivalent breakpoint instead. Only breakpoint-carrying
+messages change serialization.
+
+The flag also scopes to the structured request paths: agent turns, tool
+calls, and structured streaming. The text-only helpers (`chat_with_system`,
+`chat_with_history`, the legacy chunk-stream APIs) deliberately emit no
+breakpoints even with the flag on, because their responses drop token usage
+entirely; a premium cache write they triggered could never show up in
+accounting. On those helpers the flag is inert, which also means fallback
+re-entries that route through them send unmarked requests. With the flag
+off (the default), request bodies are byte-identical to previous versions.
+
+```toml
+[providers.models.custom.claude-via-gateway]
+uri = "https://<gateway-host>/v1"
+model = "<anthropic-routed model>"
+api_key = "op://platform/gateway/api-key"
+cache_passthrough = true
+```
+
+Requirements and caveats:
+
+- **Gateway support is required.** The breakpoint reaches Anthropic only
+  when the gateway forwards block-form content with `cache_control` into
+  the native Messages API. Routes that proxy the OpenAI API proper ignore
+  the field. A non-Anthropic-routed model behind the same gateway does not
+  fail loudly: the field is accepted and dropped, and the gateway may still
+  meter cache-write tokens on that route in its own usage accounting. Give
+  Anthropic-routed models a dedicated alias instead of enabling the flag on
+  a mixed entry.
+- **Size and TTL.** Anthropic caches only prefixes of at least 1024 tokens
+  (2048 on some smaller models), and entries expire after roughly five
+  minutes, refreshed on each read. Short or infrequent conversations see
+  no benefit.
+- **Writes bill at a premium.** Tokens written to the cache are billed at
+  a premium (1.25x on the observed route) and reads come back at a large
+  discount. A route that writes the cache on every request without ever
+  reading it costs more than no caching at all.
+- **Qualify the exact route first.** A gateway exposes many model aliases
+  to the same upstream account, and an alias that accepts and bills cache
+  writes can still never serve cache reads. Before relying on the flag in
+  production, send one flagged request and check the usage reports
+  `cache_creation_input_tokens > 0`; then immediately repeat the
+  byte-identical request and check for `cache_read_input_tokens > 0`.
+  Cache creation alone is not evidence that caching works. Re-run the pair
+  after any model-alias or gateway-route change.
+- **Usage reporting.** When the gateway forwards the Anthropic-shaped
+  usage counters, `cache_read_input_tokens` fills the cached-input figure
+  in token usage and cost reporting, and `cache_creation_input_tokens` is
+  written to the debug log with counts only. A response that reports zero
+  cache reads keeps the cached figure at zero rather than substituting the
+  OpenAI-shaped counter. This accounting covers the structured paths only,
+  which is exactly why the helpers without usage capture stay inert above.
+- **Tool definitions are not separately marked.** The native Anthropic
+  provider additionally marks the last tool definition, which covers
+  tool-schema tokens when no system prompt exists. This flag does not mark
+  tool definitions; requests with tools but no system prompt cache only the
+  rolling message breakpoint. The live gateway qualification showed that
+  with a system prompt present, tool-schema tokens sit inside the cached
+  prefix anyway.
+
+## Image input limits
+
+`[multimodal]` bounds every image that enters the request pipeline, whatever its
+source: channel attachments, tool outputs that surface a local image path, and
+the web dashboard upload.
+
+```toml
+[multimodal]
+max_image_size_mb = 20   # per image, decoded bytes (default: 20, clamped to 1-20)
+max_images        = 4    # images kept per request (default: 4, clamped to 1-16)
+```
+
+`max_image_size_mb` is measured before base64 encoding, so the encoded payload
+reaching the provider is about a third larger. The 20 MiB ceiling is the lowest
+common per-image or per-request bound across the supported vision APIs, and
+images are buffered whole, so it also bounds gateway memory per upload. Lower
+the value to cap per-turn upload cost.
+
+Providers apply their own limits on top of this setting. Anthropic refuses a
+single image over 10 MB base64-encoded, about 7.5 MiB decoded, and its client
+enforces that regardless of what `max_image_size_mb` allows. Model context cost
+does not track bytes: providers rasterize images and bill by pixel dimensions,
+so a large file and a small one at the same resolution cost roughly the same.
+
 ## Per-family knobs: worked examples
 
 ### Ollama
@@ -127,6 +267,78 @@ uri = "http://host.docker.internal:11434"
 ```
 
 Ollama-specific optional fields are `num_ctx`, `num_predict`, and `temperature_override`.
+
+### Hailo-Ollama
+
+Hailo-Ollama uses a separate `hailo_ollama` slot because its native API needs
+stricter request shaping than ordinary Ollama. A local instance defaults to
+`http://localhost:8000`; model discovery reads its live `/api/tags` response.
+
+```toml
+[providers.models.hailo_ollama.edge]
+model = "qwen3:1.7b"
+context_window = 2048
+max_tokens = 256
+timeout_secs = 90
+queue_timeout_secs = 30
+```
+
+Set `uri` to the Hailo-Ollama base URL when it runs on another host. The URL
+must use `http` or `https` and must not contain credentials, a query, or a
+fragment. An alias `api_key` is sent as a Bearer `Authorization` header, and
+`extra_headers` are forwarded to both native chat and catalog requests. Do not
+configure both `api_key` and an explicit `Authorization` extra header: ZeroClaw
+rejects that ambiguous credential combination. It serializes generation to one
+active request per normalized endpoint, even when multiple aliases target that
+endpoint, and rejects queued work after `queue_timeout_secs`.
+
+For a non-loopback endpoint, plain `http` sends prompts and responses without
+transport encryption or authentication; use `https` when the network is not a
+trusted isolated link. The provider accepts plain HTTP for local and explicitly
+trusted LAN deployments because Hailo-Ollama's native endpoint has no
+authentication contract.
+
+Hailo-Ollama rejects transport options it cannot honor rather than silently
+ignoring them. In particular, `tls_ca_cert_path`, `think=true`, `vision=true`,
+call-level native `thinking`, `provider_extra`, `api_path`, `wire_api`, and
+`chat_template_kwargs` are not supported. Set `native_tools = false` (or leave
+it unset).
+
+If an accepted request reaches its HTTP timeout or ends with another post-connect
+transport failure, ZeroClaw quarantines that endpoint for the rest of the process
+because Hailo may still be generating after the client disconnects. Confirm the
+backend is idle (restart it if necessary), then restart ZeroClaw to clear the
+quarantine. A connection-establishment failure does not quarantine the endpoint.
+
+For native-backend compatibility, ZeroClaw omits unsupported `think` and
+`num_ctx` wire fields rather than claiming to control them. The native service
+parses each decoded message as structured-prompt JSON a second time, so ZeroClaw
+escapes both literal backslashes and CR/LF/tab controls in the API value to
+preserve their original meaning through that parse. `context_window`
+controls ZeroClaw's best-effort local history budgeting; it is deliberately not
+sent to Hailo-Ollama. Call-level native thinking requests are rejected before
+any backend request. Responses must be a completed non-streaming response
+(`done=true`), and an empty completed response is treated as an error. A low
+`context_window` drops complete older user-anchored turns; the 12-message cap
+uses the same boundary. System instructions are folded into the first retained
+user message before the aggregate context check. If the newest complete turn
+alone then exceeds either budget, the request fails locally before transport
+instead of dropping that turn or substituting a synthetic prompt. Each
+normalized message is bounded to 2,000 Unicode characters.
+
+If the native response has no visible content but does contain non-empty
+internal reasoning, the provider uses that field as a last-resort ordinary-text
+fallback for compatibility with models that put their only output there. It
+does not expose a separate reasoning channel, and callers should not treat this
+fallback as evidence that extended thinking is supported.
+
+Native tool calling, streaming, and vision are not advertised. Because the
+Hailo-Ollama 0.5.1 chat DTO has no image field, `vision=true` is rejected rather
+than overriding that text-only capability; configure a separate vision-capable
+provider instead.
+Prompt-guided tool calls and results remain available as plain text history when
+the complete injected tool protocol fits in the bounded first message; ZeroClaw
+rejects an oversized protocol instead of sending truncated tool instructions.
 
 ### Azure OpenAI
 
@@ -243,6 +455,39 @@ A `fallback_models` entry that is blank or duplicates the alias's primary `model
 is likewise skipped at runtime and surfaced (`empty_fallback_model` /
 `fallback_model_duplicates_primary`). A bad fallback link degrades gracefully, it
 never prevents the agent from running.
+
+### Anthropic refusals and fallback
+
+Native Anthropic requests can come back as a *refusal*: an HTTP 200 whose
+`stop_reason` is `"refusal"`, emitted by Fable's safety classifiers rather than
+a normal completion. ZeroClaw treats a refusal as a typed error so fallback can
+recover it two ways:
+
+- **Client-side** (`fallback_models`, above): the refusal surfaces as an error,
+  and ZeroClaw advances to the next model or alias just as it does for any other
+  provider failure, so the reply comes from a different model.
+- **Server-side** (`server_fallback_models` on
+  `[providers.models.anthropic.<alias>]`): Anthropic retries the refused request
+  against a listed model on its side, in a single non-streaming call. Entries
+  must name permitted fallback targets, for example mapping `claude-fable-5` to
+  `claude-opus-4-8`.
+
+Either way the delivered reply carries a short footer naming the requested and
+served models, so the switch is visible to the user. In the web dashboard chat
+the same switch surfaces as an inline notice just before the answer, showing
+only the requested and served model names. When an ordinary provider failure
+already moved the request to a client-side fallback before Anthropic switched
+models on its side, the reply keeps the ordinary fallback notice as well, so
+the originally requested model stays visible and the two causes are not
+conflated.
+
+Streaming has a limit: a refusal that arrives after streamed output has begun
+keeps the existing interrupted-reply behavior; fallback applies only to refusals
+detected before output starts.
+
+OpenAI-compatible and Responses wires cannot carry Anthropic's native
+refusal/fallback metadata; route Anthropic models through
+`[providers.models.anthropic.<alias>]` to get this behavior.
 
 ## See also
 

@@ -12,7 +12,7 @@ use zeroclaw_api::model_provider::{
     StreamResult,
 };
 
-mod accounting;
+pub(crate) mod accounting;
 
 /// Why a provider supplied usage observation cannot be billed as complete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -631,6 +631,22 @@ impl ProviderDispatch {
         })
     }
 
+    /// Recover a pre-output streamed refusal without replaying the candidate
+    /// that already refused and reported usage.
+    pub async fn chat_after_stream_refusal(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        refusal: crate::AnthropicRefusalError,
+    ) -> anyhow::Result<ChatResponse> {
+        crate::reliable::scope_stream_refusal_recovery(
+            refusal,
+            self.chat(request, model, temperature),
+        )
+        .await
+    }
+
     pub fn stream_chat(
         &self,
         request: ChatRequest<'_>,
@@ -940,6 +956,22 @@ impl<'a> ProviderDispatchRef<'a> {
             }),
             accounting,
         }
+    }
+
+    /// Recover a pre-output streamed refusal without replaying the candidate
+    /// that already refused and reported usage.
+    pub async fn chat_after_stream_refusal(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        refusal: crate::AnthropicRefusalError,
+    ) -> anyhow::Result<ChatResponse> {
+        crate::reliable::scope_stream_refusal_recovery(
+            refusal,
+            self.chat(request, model, temperature),
+        )
+        .await
     }
 
     pub fn stream_chat(
@@ -1394,6 +1426,7 @@ mod tests {
                     input_tokens: Some(3),
                     output_tokens: Some(2),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 "complete",
             ),
@@ -1402,6 +1435,7 @@ mod tests {
                     input_tokens: Some(0),
                     output_tokens: Some(0),
                     cached_input_tokens: Some(0),
+                    cache_creation_input_tokens: None,
                 }),
                 "zero",
             ),
@@ -1410,6 +1444,7 @@ mod tests {
                     input_tokens: None,
                     output_tokens: Some(2),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 "invalid",
             ),

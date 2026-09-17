@@ -13,6 +13,7 @@ use crate::traits::{
 use zeroclaw_api::model_provider::ModelProvider;
 use zeroclaw_config::schema::MemoryConfig;
 use zeroclaw_providers::ProviderDispatch;
+use zeroclaw_providers::multimodal::strip_media_markers;
 
 /// Output of consolidation extraction.
 #[derive(Debug, serde::Deserialize)]
@@ -55,15 +56,6 @@ Respond ONLY with valid JSON: {"history_entry": "...", "memory_update": "..." or
 Do not include any text outside the JSON object."#;
 
 const MAX_TYPED_FACTS_PER_TURN: usize = 5;
-
-fn strip_media_markers(text: &str) -> String {
-    // Matches [IMAGE:...], [DOCUMENT:...], [FILE:...], [VIDEO:...], [VOICE:...], [AUDIO:...]
-    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"\[(?:IMAGE|DOCUMENT|FILE|VIDEO|VOICE|AUDIO):[^\]]*\]")
-            .expect("media-tag regex must compile")
-    });
-    RE.replace_all(text, "[media attachment]").into_owned()
-}
 
 pub async fn consolidate_turn(
     model_provider: &dyn ModelProvider,
@@ -1268,24 +1260,6 @@ mod tests {
         );
         assert!(result.history_entry.ends_with('…'));
     }
-
-    #[test]
-    fn strip_media_markers_replaces_all_marker_kinds() {
-        let text = "see [IMAGE:/a.png] [DOCUMENT:/b.pdf] [FILE:/c.txt] \
-                    [VIDEO:/d.mp4] [VOICE:/e.ogg] [AUDIO:/f.mp3] done";
-        let stripped = strip_media_markers(text);
-        assert_eq!(
-            stripped,
-            "see [media attachment] [media attachment] [media attachment] \
-             [media attachment] [media attachment] [media attachment] done"
-        );
-    }
-
-    #[test]
-    fn strip_media_markers_leaves_other_text_unchanged() {
-        let text = "plain sentence with [NOTE:keep me] and no media tags";
-        assert_eq!(strip_media_markers(text), text);
-    }
 }
 
 #[cfg(test)]
@@ -1478,7 +1452,7 @@ mod consolidate_turn_tests {
         .unwrap();
 
         let prompt = provider.last_prompt().expect("model must be called");
-        assert!(prompt.contains("[media attachment]"));
+        assert!(prompt.contains(zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER));
         assert!(
             !prompt.contains("/home/user/private/cat.png"),
             "local paths must not reach the model"

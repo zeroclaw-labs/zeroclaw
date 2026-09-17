@@ -739,10 +739,37 @@ async fn dispatch_sop_event_filtered(
                             reason,
                         });
                     }
-                    // `has_retryable_defer` was false, so no `Defer` remains here.
-                    SopAdmission::Defer { .. } => unreachable!(
-                        "a retryable Defer would have returned via the has_retryable_defer branch"
-                    ),
+                    // Unreachable today: `has_retryable_defer` was computed from
+                    // this same vector and returned above when any sibling was
+                    // deferred. If a refactor ever lets a `Defer` reach here, a
+                    // mixed Started+Deferred batch would be the 2b hazard described
+                    // below, so defer the WHOLE delivery and start nothing.
+                    SopAdmission::Defer { reason } => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "sop_name": sop_name, "reason": reason
+                            })),
+                            &format!(
+                                "SOP dispatch: late Defer for '{sop_name}', deferring the whole delivery: {reason}"
+                            )
+                        );
+                        for admitted in admit_names.drain(..) {
+                            results.push(DispatchResult::Deferred {
+                                sop_name: admitted,
+                                reason: "AMQP delivery deferred because another matched SOP is backpressured".to_string(),
+                            });
+                        }
+                        results.push(DispatchResult::Deferred {
+                            sop_name: sop_name.clone(),
+                            reason,
+                        });
+                        return results;
+                    }
                 }
             }
 

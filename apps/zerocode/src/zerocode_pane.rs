@@ -1807,10 +1807,7 @@ impl ZerocodePane {
             self.capture = None;
             return;
         }
-        let chord = Chord {
-            code: key.code, // keyguard: capture widget records the pressed chord verbatim
-            modifiers: key.modifiers,
-        };
+        let chord = Chord::with(key.code, key.modifiers); // keyguard: capture widget records the pressed chord verbatim
         if let Some(reason) = reserved_reason(&chord) {
             if let Some(cap) = &mut self.capture {
                 cap.error = Some(format!("'{}' is {reason}", chord.display()));
@@ -2270,18 +2267,18 @@ mod tests {
         crate::keymap::overrides::reset();
     }
 
-    /// The editor half of the darwin normalization case. `ctrl+a` and `super+a`
+    /// The editor half of the darwin primary case. `primary+a` and `super+a`
     /// are one chord at dispatch there, so capturing `super+a` for an action
-    /// while another explicit row owns `ctrl+a` would install two rows that
+    /// while another explicit row owns `primary+a` would install two rows that
     /// only the dispatcher can tell apart.
     #[cfg(target_os = "macos")]
     #[test]
-    fn binding_editor_refuses_a_normalized_collision_on_darwin() {
+    fn binding_editor_refuses_a_primary_collision_on_darwin() {
         let _g = crate::keymap::overrides::TEST_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         crate::keymap::overrides::reset();
-        given_explicit_row("input_bar.clear_input", vec![Chord::ctrl('a')]);
+        given_explicit_row("input_bar.clear_input", vec![Chord::primary('a')]);
 
         let dir = tempfile::tempdir().unwrap();
         let mut pane = ZerocodePane::new(dir.path());

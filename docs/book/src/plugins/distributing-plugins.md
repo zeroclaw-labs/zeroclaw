@@ -97,7 +97,11 @@ The install path is the local plugin directory; a registry is only a JSON
 index consulted at command time (`zeroclaw plugin search` / `install`).
 Both commands exist only in binaries with the plugin host compiled in (see
 [build features](../developing/plugin-protocol.md#build-features)); the
-prebuilt release binaries ship without it. The
+prebuilt release binaries ship without it. Fetching an index through either
+command caches it locally. `zeroclaw plugin list` then combines installed
+packages with the cache without making a network request; it keeps installed
+and registry versions separate rather than guessing whether an arbitrary
+version string is newer. The
 default index is the `zeroclaw-labs/zeroclaw-plugins` repository's
 `registry.json`; private registries are a URL away
 (`--registry <url>` per command, or the `ZEROCLAW_PLUGIN_REGISTRY_URL`

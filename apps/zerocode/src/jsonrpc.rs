@@ -9,11 +9,6 @@
 //! bytes. The TUI uses it both for client-issued requests
 //! (`session/turn`, `quickstart/apply`, …) and for routing
 //! daemon-originated notifications.
-//!
-//! Constants in `error_codes` cover the full set the daemon may emit
-//! — some are only consumed by error-routing branches that may not
-//! exercise every code today.
-#![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -29,9 +24,7 @@ pub const OUTBOUND_ID_PREFIX: &str = "zc-out-";
 // ── Wire field name constants ────────────────────────────────────
 
 pub mod field {
-    pub const JSONRPC: &str = "jsonrpc";
     pub const METHOD: &str = "method";
-    pub const PARAMS: &str = "params";
     pub const ID: &str = "id";
     pub const RESULT: &str = "result";
     pub const ERROR: &str = "error";
@@ -69,23 +62,6 @@ pub struct JsonRpcResponse {
     pub id: Value,
 }
 
-#[derive(Debug, Serialize)]
-pub struct JsonRpcNotification {
-    pub jsonrpc: &'static str,
-    pub method: &'static str,
-    pub params: Value,
-}
-
-impl JsonRpcNotification {
-    pub fn new(method: &'static str, params: Value) -> Self {
-        Self {
-            jsonrpc: JSONRPC_VERSION,
-            method,
-            params,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcError {
     pub code: i32,
@@ -97,25 +73,12 @@ pub struct JsonRpcError {
 // ── Error codes ──────────────────────────────────────────────────
 
 pub mod error_codes {
-    pub const PARSE_ERROR: i32 = -32700;
-    pub const INVALID_REQUEST: i32 = -32600;
     pub const METHOD_NOT_FOUND: i32 = -32601;
-    pub const INVALID_PARAMS: i32 = -32602;
     pub const INTERNAL_ERROR: i32 = -32603;
 
     pub const SESSION_NOT_FOUND: i32 = -32000;
-    pub const SESSION_LIMIT_REACHED: i32 = -32001;
+    #[cfg(test)]
     pub const SESSION_BUSY: i32 = -32002;
-    pub const AUTH_REQUIRED: i32 = -32010;
-    pub const VERSION_MISMATCH: i32 = -32011;
-
-    pub const FS_NOT_FOUND: i32 = 4001;
-    pub const FS_PERMISSION_DENIED: i32 = 4002;
-    pub const FS_INVALID_PATH: i32 = 4003;
-
-    pub const FS_NOT_FOUND_STR: &str = "fs.not_found";
-    pub const FS_PERMISSION_DENIED_STR: &str = "fs.permission_denied";
-    pub const FS_INVALID_PATH_STR: &str = "fs.invalid_path";
 }
 
 pub const ACP_PROTOCOL_VERSION: u64 = 1;
@@ -124,41 +87,101 @@ pub const ACP_PROTOCOL_VERSION: u64 = 1;
 
 type PendingResponder = oneshot::Sender<std::result::Result<Value, JsonRpcError>>;
 
+#[derive(Debug)]
+pub(crate) enum OutboundMessage {
+    Frame(String),
+    Flush(oneshot::Sender<()>),
+}
+
+#[derive(Debug)]
+enum OutboundSender {
+    #[cfg(test)]
+    Raw(mpsc::Sender<String>),
+    Transport(mpsc::Sender<OutboundMessage>),
+}
+
+#[derive(Debug, Default)]
+struct OutboundState {
+    pending: HashMap<String, PendingResponder>,
+    closed_error: Option<JsonRpcError>,
+}
+
 /// Writer + outbound-call tracker shared between the read loop and
 /// the calling tasks. All writes go through `writer_tx` so concurrent
 /// notifications and outbound requests cannot interleave bytes.
 #[derive(Debug)]
 pub struct RpcOutbound {
-    writer_tx: mpsc::Sender<String>,
-    pending: std::sync::Mutex<HashMap<String, PendingResponder>>,
+    writer_tx: OutboundSender,
+    state: std::sync::Mutex<OutboundState>,
     next_id: AtomicU64,
 }
 
 struct PendingRequestGuard<'a> {
-    pending: &'a std::sync::Mutex<HashMap<String, PendingResponder>>,
+    state: &'a std::sync::Mutex<OutboundState>,
     id: String,
 }
 
 impl Drop for PendingRequestGuard<'_> {
     fn drop(&mut self) {
-        self.pending
+        self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .pending
             .remove(&self.id);
     }
 }
 
 impl RpcOutbound {
+    #[cfg(test)]
     pub fn new(writer_tx: mpsc::Sender<String>) -> Self {
         Self {
-            writer_tx,
-            pending: std::sync::Mutex::new(HashMap::new()),
+            writer_tx: OutboundSender::Raw(writer_tx),
+            state: std::sync::Mutex::new(OutboundState::default()),
             next_id: AtomicU64::new(0),
         }
     }
 
+    pub(crate) fn new_transport(writer_tx: mpsc::Sender<OutboundMessage>) -> Self {
+        Self {
+            writer_tx: OutboundSender::Transport(writer_tx),
+            state: std::sync::Mutex::new(OutboundState::default()),
+            next_id: AtomicU64::new(0),
+        }
+    }
+
+    async fn send_frame(&self, frame: String) -> bool {
+        match &self.writer_tx {
+            #[cfg(test)]
+            OutboundSender::Raw(writer_tx) => writer_tx.send(frame).await.is_ok(),
+            OutboundSender::Transport(writer_tx) => {
+                writer_tx.send(OutboundMessage::Frame(frame)).await.is_ok()
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub async fn send_raw(&self, json: String) -> bool {
-        self.writer_tx.send(json).await.is_ok()
+        self.send_frame(json).await
+    }
+
+    pub async fn flush_outbound(&self) -> bool {
+        // `Raw` exists only in test builds, so the pattern is refutable there
+        // and irrefutable in production; both forms keep clippy clean.
+        #[cfg(test)]
+        let OutboundSender::Transport(writer_tx) = &self.writer_tx else {
+            return true;
+        };
+        #[cfg(not(test))]
+        let OutboundSender::Transport(writer_tx) = &self.writer_tx;
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if writer_tx
+            .send(OutboundMessage::Flush(ack_tx))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        ack_rx.await.is_ok()
     }
 
     /// Write a JSON-RPC response (success or error) keyed to a
@@ -177,15 +200,8 @@ impl RpcOutbound {
             id,
         };
         match serde_json::to_string(&resp) {
-            Ok(s) => self.writer_tx.send(s).await.is_ok(),
+            Ok(s) => self.send_frame(s).await,
             Err(_) => false,
-        }
-    }
-
-    pub async fn notify(&self, method: &'static str, params: Value) {
-        let n = JsonRpcNotification::new(method, params);
-        if let Ok(s) = serde_json::to_string(&n) {
-            let _ = self.writer_tx.send(s).await;
         }
     }
 
@@ -198,11 +214,14 @@ impl RpcOutbound {
         let id = format!("{OUTBOUND_ID_PREFIX}{n}");
         let (tx, rx) = oneshot::channel();
         {
-            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-            pending.insert(id.clone(), tx);
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(error) = &state.closed_error {
+                return Err(error.clone());
+            }
+            state.pending.insert(id.clone(), tx);
         }
         let _pending_guard = PendingRequestGuard {
-            pending: &self.pending,
+            state: &self.state,
             id: id.clone(),
         };
         let req = JsonRpcRequest::new(method, params, Value::String(id));
@@ -216,7 +235,7 @@ impl RpcOutbound {
                 });
             }
         };
-        if self.writer_tx.send(body).await.is_err() {
+        if !self.send_frame(body).await {
             return Err(JsonRpcError {
                 code: error_codes::INTERNAL_ERROR,
                 message: "Writer task closed".to_string(),
@@ -239,9 +258,10 @@ impl RpcOutbound {
         error: Option<JsonRpcError>,
     ) {
         let responder = self
-            .pending
+            .state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .pending
             .remove(id_str);
         if let Some(tx) = responder {
             let payload = if let Some(err) = error {
@@ -253,7 +273,32 @@ impl RpcOutbound {
         }
     }
 
+    /// Close request admission and fail every request still awaiting a response
+    /// when the owning transport terminates. Responders are woken after release.
+    pub fn fail_pending(&self, message: &str) {
+        let (responders, error) = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let error = state
+                .closed_error
+                .get_or_insert_with(|| JsonRpcError {
+                    code: error_codes::INTERNAL_ERROR,
+                    message: message.to_string(),
+                    data: None,
+                })
+                .clone();
+            (std::mem::take(&mut state.pending), error)
+        };
+        for (_, responder) in responders {
+            let _ = responder.send(Err(error.clone()));
+        }
+    }
+
+    #[cfg(test)]
     pub fn pending_count(&self) -> usize {
-        self.pending.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending
+            .len()
     }
 }

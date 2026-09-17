@@ -59,6 +59,21 @@ impl ChannelSopTopic {
 
 // ── Channel approval types ──────────────────────────────────────
 
+/// Where a tool call sits in the batch the model issued for one turn.
+///
+/// This is the raw batch position, not an approval count. `index` counts every
+/// call the model asked for, including calls that never reach an approval
+/// prompt. An `Approval 2 of 2` counter would only be truthful once the
+/// approval-required set is known, which is after hooks and policy have run —
+/// later than the first card is rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalPosition {
+    /// 1-based position of this call within the batch.
+    pub index: u32,
+    /// Number of calls in the batch.
+    pub total: u32,
+}
+
 /// Compact description of a tool call presented to the user for approval.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelApprovalRequest {
@@ -68,6 +83,23 @@ pub struct ChannelApprovalRequest {
     /// diffs instead of a plain summary string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_arguments: Option<serde_json::Value>,
+    /// Position of this call in the model's tool-call batch, when the caller
+    /// knows it. `None` on paths that approve a single call with no batch to
+    /// count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<ApprovalPosition>,
+}
+
+impl ChannelApprovalRequest {
+    /// Batch position for an approval card, as `(index, total)`.
+    ///
+    /// Reports the position verbatim. Whether a counter is worth showing is
+    /// the renderer's decision, so that a caller handing the renderer a tuple
+    /// directly cannot bypass the rule.
+    #[must_use]
+    pub fn position_counter(&self) -> Option<(u32, u32)> {
+        self.position.map(|p| (p.index, p.total))
+    }
 }
 
 /// The operator's response to a channel-presented approval prompt.
@@ -331,6 +363,10 @@ pub enum ChannelConversationScope {
 pub struct ChannelMessage {
     pub id: String,
     pub sender: String,
+    /// Immutable sender identifier assigned by the channel platform, when
+    /// available. Display names and usernames remain in `sender` so existing
+    /// session semantics are unchanged.
+    pub platform_sender_id: Option<String>,
     pub reply_target: String,
     pub content: String,
     pub channel: String,
@@ -419,6 +455,46 @@ pub enum ProgressEvent {
     RunningTool,
     CompactingContext,
     FinalizingResponse,
+}
+
+/// Origin of a rendered draft-progress entry.
+///
+/// Channels may display both variants identically, but must retain this value
+/// while coalescing updates so provider reasoning cannot be mistaken for
+/// generated status chrome when their rendered text happens to match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftProgressKind {
+    /// Generated lifecycle or tool-status chrome.
+    Status,
+    /// Raw provider reasoning explicitly enabled for the channel.
+    Reasoning,
+}
+
+/// Rendered draft-progress text paired with its semantic origin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftProgress {
+    /// Semantic source retained independently from the display string.
+    pub kind: DraftProgressKind,
+    /// Channel-ready display text after redaction.
+    pub text: String,
+}
+
+impl DraftProgress {
+    /// Create a generated status or tool-progress entry.
+    pub fn status(text: impl Into<String>) -> Self {
+        Self {
+            kind: DraftProgressKind::Status,
+            text: text.into(),
+        }
+    }
+
+    /// Create a provider-reasoning entry.
+    pub fn reasoning(text: impl Into<String>) -> Self {
+        Self {
+            kind: DraftProgressKind::Reasoning,
+            text: text.into(),
+        }
+    }
 }
 
 impl RoomVisibility {
@@ -610,6 +686,84 @@ pub struct ForgeApiResponse {
     pub body: serde_json::Value,
 }
 
+/// Runtime-owned state needed by a channel to present its native model picker.
+///
+/// The picker is presentation only: a selected option must re-enter the
+/// channel runtime through the existing `/model <ref>` command path so model
+/// resolution and session scoping keep a single owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelModelPickerRequest {
+    /// Human-readable display name of the user who sent `/model`, for
+    /// rendering only. Never use this for authorization; that is
+    /// `requesting_user_id`'s role.
+    pub requesting_user: String,
+    /// Immutable platform identity of the requesting user, used to authorize
+    /// picker interactions (only this user may drive the picker) and to bind
+    /// the selection back to the sender. Channels may decline to present a
+    /// picker (return `Ok(false)`) when this is empty.
+    pub requesting_user_id: String,
+    /// Reply scope inherited from the triggering message. The picker must be
+    /// delivered to this target so it lands in the same chat the command was
+    /// issued in.
+    pub reply_target: String,
+    /// Thread/topic scope inherited from the triggering message. When `Some`,
+    /// the picker and any follow-up selection must stay in the same thread or
+    /// topic; when `None`, the channel's default scope applies.
+    pub thread_ts: Option<String>,
+    /// Alias of the channel instance that received the command. A channel
+    /// must decline requests whose alias is not its own (return `Ok(false)`).
+    pub channel_alias: String,
+    /// Alias of the agent that owns this runtime. Implementations that render
+    /// agent-owned picker state must decline (return `Ok(false)`) on mismatch.
+    pub owner_agent_alias: String,
+    /// Provider ref of the currently selected route, shown as the picker's
+    /// starting state.
+    pub current_model_provider: String,
+    /// Model of the currently selected route, shown as the picker's starting
+    /// state.
+    pub current_model: String,
+    /// Restart-scoped route snapshot used by the channel runtime to resolve
+    /// `/model <ref>`. This is an in-memory view of the routes loaded at
+    /// startup, not durable configuration; native pickers must not offer
+    /// routes outside this set.
+    pub model_routes: Vec<ChannelModelPickerRoute>,
+}
+
+/// Provider/model route identity exposed to a channel-native model picker.
+///
+/// API keys stay runtime-owned and are deliberately excluded; route entries
+/// carry only display and resolution identity, never credentials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelModelPickerRoute {
+    /// Short, user-facing alias accepted by `/model <ref>` (e.g. `fast`).
+    pub hint: String,
+    /// Provider ref this route resolves to.
+    pub model_provider: String,
+    /// Model identifier this route resolves to.
+    pub model: String,
+}
+
+/// What a channel can say about its own listener without performing any I/O.
+///
+/// See [`Channel::listener_health`]. The three states exist because a listener
+/// that has not connected yet and a listener that is working are different
+/// claims, and a caller that stamps "healthy" for both reports a channel as
+/// `ok` before it has ever reached the service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenerHealth {
+    /// No exchange has completed yet, so the channel has nothing to report.
+    /// Not a failure — a listener that has only just started is not yet
+    /// broken — but not evidence of health either.
+    Pending,
+    /// The most recent exchange succeeded, recently enough that it is still
+    /// evidence the channel works.
+    Healthy,
+    /// Either the most recent exchange failed, or the last success is old
+    /// enough that the channel will no longer vouch for it. Both mean a live
+    /// `listen()` is not proof the channel is working.
+    Unhealthy,
+}
+
 /// Core channel trait — implement for any messaging platform.
 ///
 /// Every `Channel` is `Attributable`: the orchestrator's spawn site opens
@@ -639,6 +793,57 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Check if channel is healthy
     async fn health_check(&self) -> bool {
         true
+    }
+
+    /// Present a channel-native model picker for a bare `/model` command.
+    ///
+    /// The picker is presentation only: a confirmed selection must re-enter
+    /// the runtime through the existing `/model <ref>` command path so model
+    /// resolution and session scoping keep a single owner. `request` carries
+    /// the reply scope (`reply_target`/`thread_ts`) the picker must preserve
+    /// and a restart-scoped route snapshot it must not exceed; see
+    /// [`ChannelModelPickerRequest`] for the per-field contract.
+    ///
+    /// Returns `Ok(true)` when the channel presented a picker and took over
+    /// the interaction, `Ok(false)` when it did not (e.g. a channel without a
+    /// native picker, an alias or owner mismatch, or an empty
+    /// `requesting_user_id`) — the caller then falls back to the ordinary
+    /// text response. Returning `Err` reports a presentation failure; the
+    /// caller logs it and falls back to the text response as well. The
+    /// default implementation returns `Ok(false)` for every channel, keeping
+    /// the existing text behavior.
+    async fn present_model_picker(
+        &self,
+        _request: &ChannelModelPickerRequest,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// Listener health as the channel itself last observed it.
+    ///
+    /// `health_check` is an *active* probe: implementations reach the remote
+    /// service to answer it, and some of them send a real message or open a
+    /// broker connection to do so. That makes it safe to call on demand — from
+    /// `channel doctor` — and unsafe to call on a timer, so a recurring caller
+    /// must not use it.
+    ///
+    /// This is the recurring-safe counterpart. It is synchronous and returns
+    /// state the channel recorded while it was already talking to the service,
+    /// so reading it performs no I/O and cannot block, send, or connect.
+    ///
+    /// `None` — the default — means the channel offers no signal at all, and
+    /// the caller should fall back to whatever it knew before asking. A channel
+    /// that *does* implement this reports a [`ListenerHealth`], which is a
+    /// three-state answer rather than a boolean: "I have nothing to say yet" is
+    /// not the same claim as "I am working", and a caller that collapses them
+    /// reports a listener as healthy before it has ever connected.
+    ///
+    /// An implementation owns its own freshness rule, because only the channel
+    /// knows how often a working listener completes an exchange. A success from
+    /// long enough ago that it is no longer evidence must be reported as
+    /// [`ListenerHealth::Unhealthy`], not as `Healthy` forever.
+    fn listener_health(&self) -> Option<ListenerHealth> {
+        None
     }
 
     /// Send a discrete-choice prompt with options.
@@ -829,6 +1034,25 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Show a batch of progress updates without discarding their source kind.
+    ///
+    /// The default preserves compatibility for channels that only need text;
+    /// channels that coalesce semantically different progress should override
+    /// this method and keep the kind through their local draft buffer.
+    async fn update_typed_draft_progress_batch(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        progress: &[DraftProgress],
+    ) -> anyhow::Result<()> {
+        let texts = progress
+            .iter()
+            .map(|entry| entry.text.clone())
+            .collect::<Vec<_>>();
+        self.update_draft_progress_batch(recipient, message_id, &texts)
+            .await
     }
 
     /// Show localized lifecycle progress produced from a typed runtime event.

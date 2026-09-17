@@ -20,6 +20,12 @@ pub struct WasmTool {
     scope: PluginInstanceScope,
     services: PluginHostServices,
     limits: PluginLimits,
+    /// Host-owned egress authority for this instance. `None` is
+    /// deny-by-default: the store still links `wasi:http` when the scope grants
+    /// `HttpClient`, but every outbound request is refused. Held as the shared
+    /// service rather than a resolved allowlist so an operator's config edit
+    /// applies on the next request without rebuilding the tool.
+    egress: Option<crate::egress::EgressHostService>,
 }
 
 impl Attributable for WasmTool {
@@ -61,7 +67,18 @@ impl WasmTool {
             scope,
             services,
             limits,
+            egress: None,
         })
+    }
+
+    /// Attach the host's egress authority for this instance.
+    ///
+    /// Omitting this is safe by construction — the tool then has no network
+    /// reach — which is why it is a builder rather than a required argument.
+    #[must_use]
+    pub fn with_egress_policy(mut self, egress: Option<crate::egress::EgressHostService>) -> Self {
+        self.egress = egress;
+        self
     }
 
     /// Create a `WasmTool` by loading its required metadata exports.
@@ -74,6 +91,7 @@ impl WasmTool {
         scope: PluginInstanceScope,
         services: PluginHostServices,
         limits: PluginLimits,
+        egress: Option<crate::egress::EgressHostService>,
     ) -> anyhow::Result<Self> {
         scope.require_capability(PluginCapability::Tool)?;
         services.resolve_config(&scope)?;
@@ -81,9 +99,15 @@ impl WasmTool {
             let wasm_path = wasm_path.clone();
             let scope = scope.clone();
             let services = services.clone();
+            // The metadata probe instantiates the guest, so it runs under the
+            // same authority the tool will execute under — a component cannot
+            // use its `name()` export as an unpoliced egress window.
+            let egress = egress.clone();
             block_probe(async move {
-                let mut plugin =
-                    runtime::create_plugin(&wasm_path, &scope, &services, limits).await?;
+                let mut plugin = runtime::create_plugin_with_egress(
+                    &wasm_path, &scope, &services, limits, egress,
+                )
+                .await?;
                 runtime::call_tool_metadata(&mut plugin).await
             })
         };
@@ -97,6 +121,7 @@ impl WasmTool {
             scope,
             services,
             limits,
+            egress,
         })
     }
 }
@@ -139,9 +164,16 @@ impl Tool for WasmTool {
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
         let args_json = serde_json::to_vec(&args)?;
         self.services.resolve_config(&self.scope)?;
-        let mut plugin =
-            runtime::create_plugin(&self.wasm_path, &self.scope, &self.services, self.limits)
-                .await?;
+        // The authority handle travels to the fresh store; the *decision* is not
+        // read here. It is read inside the hooks, per request.
+        let mut plugin = runtime::create_plugin_with_egress(
+            &self.wasm_path,
+            &self.scope,
+            &self.services,
+            self.limits,
+            self.egress.clone(),
+        )
+        .await?;
         runtime::call_execute(&mut plugin, &args_json).await
     }
 }
@@ -226,6 +258,7 @@ mod tests {
             tool_scope(),
             crate::services::test_host_services(),
             crate::component::test_limits(0),
+            None,
         );
 
         assert!(result.is_err());
@@ -243,6 +276,7 @@ mod tests {
             tool_scope(),
             services,
             crate::component::test_limits(0),
+            None,
         )
         .err()
         .expect("invalid config must reject registration");

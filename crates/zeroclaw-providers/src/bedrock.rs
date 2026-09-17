@@ -660,9 +660,6 @@ struct ConverseResponse {
     #[serde(default)]
     output: Option<ConverseOutput>,
     #[serde(default)]
-    #[allow(dead_code)]
-    stop_reason: Option<String>,
-    #[serde(default)]
     usage: Option<BedrockUsage>,
 }
 
@@ -683,8 +680,6 @@ struct ConverseOutput {
 
 #[derive(Debug, Deserialize)]
 struct ConverseOutputMessage {
-    #[allow(dead_code)]
-    role: String,
     content: Vec<ResponseContentBlock>,
 }
 
@@ -694,7 +689,7 @@ enum ResponseContentBlock {
     ToolUse(ResponseToolUseWrapper),
     ReasoningContent(ReasoningContentWrapper),
     Text(TextBlock),
-    Other(#[allow(dead_code)] serde_json::Value),
+    Other(serde_json::Value),
 }
 
 #[derive(Debug, Deserialize)]
@@ -1368,6 +1363,7 @@ impl BedrockModelProvider {
             input_tokens: u.input_tokens,
             output_tokens: u.output_tokens,
             cached_input_tokens: None,
+            cache_creation_input_tokens: None,
         });
 
         if let Some(output) = response.output
@@ -1401,7 +1397,7 @@ impl BedrockModelProvider {
                             });
                         }
                     }
-                    ResponseContentBlock::Other(_) => {}
+                    ResponseContentBlock::Other(value) => drop(value),
                 }
             }
         }

@@ -315,7 +315,7 @@ impl LogDetail {
         self.raw.get("attributes").unwrap_or(&NULL)
     }
 
-    fn detail_lines(&self) -> Vec<Line<'static>> {
+    fn detail_lines(&self, active_log_path: Option<&str>) -> Vec<Line<'static>> {
         let label_style = theme::dim_style();
         let val_style = theme::body_style();
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -443,6 +443,12 @@ impl LogDetail {
                 crate::i18n::t("zc-logs-preview-only"),
                 theme::dim_style(),
             )));
+            if let Some(path) = active_log_path {
+                lines.push(Line::from(Span::styled(
+                    crate::i18n::t_args("zc-logs-persisted-path", &[("path", path)]),
+                    theme::dim_style(),
+                )));
+            }
         }
 
         lines
@@ -549,6 +555,7 @@ pub(crate) struct Logs {
     next_cursor_legacy: Option<(String, String)>,
     at_end: bool,
     loading: bool,
+    active_log_path: Option<String>,
     // Viewport
     list_height: u16,
     last_list_area: Rect,
@@ -586,6 +593,7 @@ impl Logs {
             next_cursor_legacy: None,
             at_end: false,
             loading: false,
+            active_log_path: None,
             list_height: 0,
             last_list_area: Rect::default(),
             last_detail_area: None,
@@ -636,6 +644,7 @@ impl Logs {
         let has_cursor = cursor_offset.is_some() || cursor_legacy.is_some();
         match self.rpc.logs_query(params).await {
             Ok(result) => {
+                self.active_log_path = result.log_path;
                 // Events come newest-first from the daemon; reverse to chronological
                 let new_entries: Vec<LogEntry> = result
                     .events
@@ -960,7 +969,7 @@ impl Logs {
                 theme::dim_style(),
             ))]
         } else if let Some(detail) = self.current_resolved_detail() {
-            detail.detail_lines()
+            detail.detail_lines(self.active_log_path.as_deref())
         } else {
             vec![Line::from(Span::styled(
                 crate::i18n::t("zc-logs-loading"),
@@ -1943,7 +1952,7 @@ mod tests {
     #[test]
     fn preview_fallback_is_not_empty_and_notes_partial_payload() {
         let detail = LogDetail::from_preview(&sample_entry());
-        let lines = detail.detail_lines();
+        let lines = detail.detail_lines(None);
         assert!(!lines.is_empty());
         // The fallback must visibly signal the payload is partial so
         // the pane never silently masquerades as a full detail view.
@@ -1958,6 +1967,22 @@ mod tests {
     }
 
     #[test]
+    fn preview_fallback_render_shows_active_persisted_path() {
+        let entry = sample_entry();
+        let detail = LogDetail::from_preview(&entry);
+        let rendered: String = detail
+            .detail_lines(Some("/var/lib/zeroclaw/runtime-trace.jsonl"))
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(rendered.contains(&crate::i18n::t_args(
+            "zc-logs-persisted-path",
+            &[("path", "/var/lib/zeroclaw/runtime-trace.jsonl")],
+        )));
+    }
+
+    #[test]
     fn full_payload_is_not_marked_preview_only() {
         let raw = serde_json::json!({
             "@timestamp": "2026-05-29T11:31:43.543Z",
@@ -1968,12 +1993,13 @@ mod tests {
         let detail = LogDetail::new(raw);
         assert!(!detail.is_preview_only());
         let text: String = detail
-            .detail_lines()
+            .detail_lines(Some("/tmp/runtime-trace.jsonl"))
             .iter()
             .flat_map(|l| l.spans.iter())
             .map(|s| s.content.as_ref())
             .collect();
         assert!(!text.contains(&crate::i18n::t("zc-logs-preview-only")));
+        assert!(!text.contains("runtime-trace.jsonl"));
     }
 
     #[test]
@@ -1994,7 +2020,7 @@ mod tests {
         assert_eq!(detail.attributes()["model"], "switched-model");
 
         let text: String = detail
-            .detail_lines()
+            .detail_lines(None)
             .iter()
             .flat_map(|l| l.spans.iter())
             .map(|s| s.content.as_ref())

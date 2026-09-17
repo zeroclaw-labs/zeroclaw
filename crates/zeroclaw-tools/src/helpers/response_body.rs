@@ -38,21 +38,31 @@ pub(crate) async fn read_bounded(
     Ok(BoundedBody { bytes, overflowed })
 }
 
-pub(crate) async fn read_text(
+/// Read a response body up to `limit` bytes and return UTF-8-safe text.
+///
+/// The boolean is true when the response exceeded the limit. The reader
+/// retains at most one byte beyond the limit to detect overflow.
+pub async fn read_text(
     response: reqwest::Response,
     limit: Option<usize>,
 ) -> anyhow::Result<(String, bool)> {
-    let mut body = read_bounded(response, limit).await?;
+    Ok(into_text(read_bounded(response, limit).await?))
+}
+
+/// Finish a bounded body as text. A byte cap can land mid code point, so a
+/// truncated body drops its incomplete final one rather than ending in U+FFFD.
+/// Shared with `http_decode`, which fills the same body from a decompressor.
+pub(crate) fn into_text(mut body: BoundedBody) -> (String, bool) {
     if body.overflowed
         && let Err(error) = std::str::from_utf8(&body.bytes)
         && error.error_len().is_none()
     {
         body.bytes.truncate(error.valid_up_to());
     }
-    Ok((
+    (
         String::from_utf8_lossy(&body.bytes).into_owned(),
         body.overflowed,
-    ))
+    )
 }
 
 #[cfg(test)]

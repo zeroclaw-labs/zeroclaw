@@ -1,6 +1,10 @@
 //! Release invariants for published container variants and scheduled scans.
 
-use std::{collections::HashSet, fs, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::Path,
+};
 
 fn workflow(name: &str) -> String {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -119,6 +123,70 @@ fn cargo_cache_mounts(containerfile: &str) -> Vec<(&str, Option<&str>)> {
             })
         })
         .collect()
+}
+
+/// Digest shape, mirroring `xtask::generate::container_base::valid_digest`.
+fn has_pinned_digest(image_ref: &str) -> bool {
+    image_ref
+        .split_once("@sha256:")
+        .is_some_and(|(_, hex)| hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// The image a `FROM` names, skipping flags such as `--platform=$BUILDPLATFORM`.
+/// The image is the first non-flag token, so the trailing `AS <stage>` is past it.
+fn from_image_ref(line: &str) -> Option<&str> {
+    let mut tokens = line.split_whitespace();
+    if !tokens.next()?.eq_ignore_ascii_case("FROM") {
+        return None;
+    }
+    tokens.find(|token| !token.starts_with("--"))
+}
+
+/// The stage a `FROM ... AS <stage>` declares.
+fn from_stage_name(line: &str) -> Option<&str> {
+    let mut after_as = line
+        .split_whitespace()
+        .skip_while(|token| !token.eq_ignore_ascii_case("AS"));
+    after_as.next()?;
+    after_as.next()
+}
+
+/// `FROM` references that are neither an earlier build stage nor pinned to a
+/// digest — directly, or through an `ARG` declared in the same file.
+fn unpinned_base_images(dockerfile: &str) -> Vec<&str> {
+    let args: HashMap<&str, &str> = dockerfile
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("ARG "))
+        .filter_map(|declaration| declaration.split_once('='))
+        .map(|(name, value)| (name.trim(), value.trim()))
+        .collect();
+
+    let mut stages: HashSet<&str> = HashSet::new();
+    let mut unpinned = Vec::new();
+
+    for line in dockerfile.lines() {
+        let Some(image_ref) = from_image_ref(line) else {
+            continue;
+        };
+
+        // An undeclared `${ARG}` resolves to nothing, which is not pinned.
+        let resolved = image_ref
+            .strip_prefix("${")
+            .and_then(|name| name.strip_suffix('}'))
+            .map_or(image_ref, |name| {
+                args.get(name).copied().unwrap_or_default()
+            });
+
+        if !stages.contains(image_ref) && !has_pinned_digest(resolved) {
+            unpinned.push(image_ref);
+        }
+
+        if let Some(stage) = from_stage_name(line) {
+            stages.insert(stage);
+        }
+    }
+
+    unpinned
 }
 
 #[test]
@@ -496,5 +564,48 @@ fn cargo_cache_guard_parses_option_order_and_exact_values() {
         mounts[2].1,
         Some("locked"),
         "dst alias and reordered locked mount must be found"
+    );
+}
+
+#[test]
+fn published_relay_image_pins_its_base_images_by_digest() {
+    let dockerfile = repository_file("apps/zerorelay/Dockerfile");
+
+    let unpinned = unpinned_base_images(&dockerfile);
+    assert!(
+        unpinned.is_empty(),
+        "apps/zerorelay/Dockerfile ships as a signed release image, so a mutable \
+         base tag would let the published image drift from the pinned source ref; \
+         unpinned: {unpinned:?}"
+    );
+
+    // Pinning by hand would freeze a digest nothing keeps current. The generated
+    // zones are what put these pins under `cargo generate installers` and the
+    // `installer-drift` gate.
+    for zone in ["base-arg-rust-slim", "base-arg-distroless"] {
+        assert!(
+            dockerfile.contains(&format!("# >>> generated:{zone} from")),
+            "the relay's base pins must stay generator-maintained: \
+             missing generated:{zone} zone"
+        );
+    }
+}
+
+#[test]
+fn base_image_pin_guard_reads_args_flags_and_stage_references() {
+    let unpinned = unpinned_base_images(
+        "ARG PINNED=rust:1.98-slim@sha256:17d1ba895198f9934c6314ec5346a0d5115372f3243390c3d731e242f35c2f27\n\
+         ARG LOOSE=rust:1.98-slim\n\
+         FROM --platform=$BUILDPLATFORM ${PINNED} AS builder\n\
+         FROM ${LOOSE} AS loose\n\
+         FROM ${UNDECLARED} AS undeclared\n\
+         FROM debian:bookworm-slim AS bare\n\
+         FROM builder AS derived",
+    );
+
+    assert_eq!(
+        unpinned,
+        vec!["${LOOSE}", "${UNDECLARED}", "debian:bookworm-slim"],
+        "only digest-backed ARGs and earlier stages may pass the guard"
     );
 }

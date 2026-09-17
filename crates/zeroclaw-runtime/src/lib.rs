@@ -28,7 +28,6 @@ pub mod heartbeat;
 pub mod hooks;
 pub mod i18n;
 pub mod integrations;
-pub mod nodes;
 pub mod observability;
 pub mod peers;
 pub mod platform;

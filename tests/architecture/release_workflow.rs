@@ -387,6 +387,94 @@ fn package_publishers_use_canonical_sources_and_scoped_credentials() {
 }
 
 #[test]
+fn crates_io_publisher_is_preflighted_gated_and_resumable() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let release = workflow("release-stable-manual.yml");
+    let publisher = workflow("pub-crates.yml");
+    let script_path = root.join("scripts/release/publish-crates.sh");
+    let script = fs::read_to_string(&script_path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", script_path.display()));
+
+    for required in [
+        "uses: ./.github/workflows/pub-crates.yml",
+        "release_tag: ${{ needs.validate.outputs.tag }}",
+        "release_sha: ${{ github.sha }}",
+    ] {
+        assert!(
+            release.contains(required),
+            "stable release is missing crates.io wiring: {required}"
+        );
+    }
+    let crates_call = yaml_block(&release, "  crates:\n");
+    assert!(
+        crates_call
+            .contains("secrets:\n      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}"),
+        "the reusable crates.io workflow must receive the existing repository secret explicitly"
+    );
+    assert!(
+        !crates_call.contains("secrets: inherit"),
+        "the crates.io caller must pass only the named registry secret"
+    );
+
+    let workflow_call = yaml_block(&publisher, "  workflow_call:\n");
+    assert!(
+        workflow_call.contains(
+            "secrets:\n      CARGO_REGISTRY_TOKEN:\n        description: \"Repository-scoped crates.io token; referenced only by the protected publish job\"\n        required: true"
+        ),
+        "the reusable publisher must declare the explicitly mapped registry secret"
+    );
+
+    let preflight = yaml_block(&publisher, "  preflight:\n");
+    let publish = yaml_block(&publisher, "  publish:\n");
+    for required in [
+        "ref: ${{ inputs.release_tag }}",
+        "release_sha",
+        "cargo test --locked --test architecture publish_contract",
+        "CARGO_TARGET_DIR: ${{ runner.temp }}/crates-io-package-target",
+        "./scripts/release/publish-crates.sh",
+    ] {
+        assert!(
+            preflight.contains(required),
+            "crates.io preflight is missing invariant: {required}"
+        );
+    }
+    assert!(
+        !preflight.contains("CARGO_REGISTRY_TOKEN"),
+        "the reversible preflight must never reference the registry token"
+    );
+    for required in [
+        "environment:\n      name: crates-io",
+        "ref: ${{ needs.preflight.outputs.sha }}",
+        "CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}",
+        "./scripts/release/publish-crates.sh --execute",
+    ] {
+        assert!(
+            publish.contains(required),
+            "crates.io publish job is missing invariant: {required}"
+        );
+    }
+
+    for required in [
+        "EXECUTE=0",
+        "--execute) EXECUTE=1",
+        "cargo metadata --format-version 1 --no-deps",
+        "git diff --quiet",
+        "git ls-files --others --exclude-standard",
+        "web/dist/index.html",
+        "cargo publish --dry-run --locked --allow-dirty",
+        "--locked --no-verify --allow-dirty",
+        "Topological order over the publishable set",
+        "wait_for_registry_version",
+        "will skip what already landed",
+    ] {
+        assert!(
+            script.contains(required),
+            "publish-crates.sh is missing safety contract: {required}"
+        );
+    }
+}
+
+#[test]
 fn aur_publisher_rejects_stale_release_downgrades() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let guard_script = root.join("scripts/release/aur_version_guard.sh");

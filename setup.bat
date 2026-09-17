@@ -7,8 +7,8 @@ setlocal enabledelayedexpansion
 :: Usage: setup.bat [--prebuilt | --minimal | --dist | --default | --all | --dry-run | --help]
 :: ============================================================================
 
-set "VERSION=0.8.4"
-set "RUST_MIN_VERSION=1.87"
+set "VERSION=0.8.5"
+set "RUST_MIN_VERSION=1.96.0"
 set "TARGET=x86_64-pc-windows-msvc"
 set "REPO=https://github.com/zeroclaw-labs/zeroclaw"
 
@@ -417,7 +417,7 @@ echo Without arguments, runs in interactive mode.
 echo.
 echo Prerequisites:
 echo   - Git (required)
-echo   - Rust 1.87+ (auto-installed if missing)
+echo   - Rust 1.96.0+ (auto-installed if missing)
 echo   - Visual Studio Build Tools with C++ workload (for source builds)
 echo   - Node.js (optional, for web dashboard)
 echo.

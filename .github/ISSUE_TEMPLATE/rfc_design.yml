@@ -1,5 +1,5 @@
 name: RFC / Design Proposal
-description: Propose a significant architecture, governance, or user-facing direction change
+description: Propose a durable project-level decision that must be settled before implementation
 title: "RFC: "
 labels:
   - "type:rfc"
@@ -7,9 +7,41 @@ body:
   - type: markdown
     attributes:
       value: |
-        Use this for significant changes to architecture, public interfaces, defaults, governance,
-        release process, contribution model, or project direction.
-        Smaller feature requests should use the feature template. Security vulnerabilities must be reported privately.
+        **Most work does not need an RFC.** Use this form only when the proposal requires a durable
+        project-level decision before implementation, meaning it is at least one of:
+
+        - a new security layer, or a material change to the project's security model;
+        - a governance, contribution-process, or project-authority change;
+        - a cross-cutting architectural refactor that changes ownership or contracts across established boundaries;
+        - a new subsystem, or another project-wide capability boundary.
+
+        **Do not use this form** for an ordinary feature addition, a schema or data migration, a
+        configuration field or default change, or a bounded implementation refactor. A new channel,
+        provider, or tool is ordinary work however large the diff, unless its substantive effect
+        also crosses one of the triggers above. Those requests proceed through the ordinary issue
+        or PR path. Use the [Feature Request](?template=feature_request.yml) form when requesting a
+        new capability.
+
+        The test is substantive project effect, not the size of the change. If you are unsure, file a
+        feature request and say why it might cross a trigger; a maintainer can promote it. Maintainers
+        may reclassify an RFC that does not meet the trigger, which routes the work rather than
+        rejecting it.
+
+        Scope and ratification rules: [#9496](https://github.com/zeroclaw-labs/zeroclaw/issues/9496)
+        (FND-003 Rev. 15). Security vulnerabilities must be reported privately, never as a public RFC.
+
+  - type: dropdown
+    id: trigger
+    attributes:
+      label: Which RFC trigger does this meet?
+      description: Pick the one this proposal actually crosses. If none apply, use the Feature Request form instead.
+      options:
+        - "Security: a new security layer or material change to the security model"
+        - "Governance: a governance, contribution-process, or project-authority change"
+        - "Architecture: a cross-cutting refactor changing ownership or contracts across established boundaries"
+        - "Capability boundary: a new subsystem or project-wide capability boundary"
+    validations:
+      required: true
 
   - type: textarea
     id: problem

@@ -24,6 +24,7 @@ pub mod otp;
 pub mod pairing;
 pub mod playbook;
 pub mod policy;
+pub mod principal_resolver;
 pub mod prompt_guard;
 #[cfg(target_os = "macos")]
 pub mod seatbelt;
@@ -113,7 +114,7 @@ mod tests {
         let policy = SecurityPolicy::default();
         assert_eq!(policy.autonomy, AutonomyLevel::Supervised);
 
-        let guard = PairingGuard::new(false, &[]);
+        let guard = PairingGuard::new(false, &[], pairing::PairingCodePolicy::default());
         assert!(!guard.require_pairing());
     }
 

@@ -50,19 +50,22 @@ pub(crate) fn build_native_assistant_history(
         serde_json::Value::String(text.trim().to_string())
     };
 
-    let mut obj = serde_json::json!({
-        "content": content,
-        "tool_calls": calls_json,
-    });
+    let mut obj = serde_json::Map::from_iter([
+        ("content".to_string(), content),
+        (
+            "tool_calls".to_string(),
+            serde_json::Value::Array(calls_json),
+        ),
+    ]);
 
     if let Some(rc) = reasoning_content {
-        obj.as_object_mut().unwrap().insert(
+        obj.insert(
             "reasoning_content".to_string(),
             serde_json::Value::String(rc.to_string()),
         );
     }
 
-    obj.to_string()
+    serde_json::Value::Object(obj).to_string()
 }
 
 pub(crate) fn resolve_display_text(
@@ -511,6 +514,7 @@ mod cost_usd_regression_tests {
                 input_tokens: Some(input_tokens),
                 output_tokens: Some(output_tokens),
                 cached_input_tokens: Some(0),
+                cache_creation_input_tokens: None,
             }),
             reasoning_content: None,
         };
@@ -650,6 +654,7 @@ mod cost_usd_regression_tests {
             input_tokens: Some(10),
             output_tokens: Some(5),
             cached_input_tokens: None,
+            cache_creation_input_tokens: None,
         };
         let interpreted = interpret_chat_response(
             &ctx,

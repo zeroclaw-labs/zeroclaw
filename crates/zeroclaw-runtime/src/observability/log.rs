@@ -222,38 +222,6 @@ impl Observer for LogObserver {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": model_provider, "model": model, "duration_ms": ms, "success": success, "error": error_message, "input_tokens": input_tokens, "output_tokens": output_tokens})), "llm.response");
             }
-            ObserverEvent::DeploymentStarted { deploy_id } => {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"deploy_id": deploy_id})),
-                    "deployment.started"
-                );
-            }
-            ObserverEvent::DeploymentCompleted {
-                deploy_id,
-                commit_sha,
-            } => {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(
-                            ::serde_json::json!({"deploy_id": deploy_id, "commit_sha": commit_sha})
-                        ),
-                    "deployment.completed"
-                );
-            }
-            ObserverEvent::DeploymentFailed { deploy_id, reason } => {
-                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"deploy_id": deploy_id, "reason": reason.to_string()})), "deployment.failed");
-            }
-            ObserverEvent::RecoveryCompleted { deploy_id } => {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"deploy_id": deploy_id})),
-                    "recovery.completed"
-                );
-            }
             // `ObserverEvent` is `#[non_exhaustive]` — silently ignore any
             // future variant added by upstream `zeroclaw-api`.
             _ => {}
@@ -293,24 +261,6 @@ impl Observer for LogObserver {
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_attrs(::serde_json::json!({"depth": d})),
                     "metric.queue_depth"
-                );
-            }
-            ObserverMetric::DeploymentLeadTime(d) => {
-                let ms = u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"lead_time_ms": ms})),
-                    "metric.deployment_lead_time"
-                );
-            }
-            ObserverMetric::RecoveryTime(d) => {
-                let ms = u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"recovery_time_ms": ms})),
-                    "metric.recovery_time"
                 );
             }
         }

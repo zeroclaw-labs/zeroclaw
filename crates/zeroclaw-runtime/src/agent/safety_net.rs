@@ -78,6 +78,7 @@ fn token_usage(input: u64, output: u64) -> TokenUsage {
     TokenUsage {
         input_tokens: Some(input),
         cached_input_tokens: None,
+        cache_creation_input_tokens: None,
         output_tokens: Some(output),
     }
 }
@@ -334,12 +335,20 @@ async fn safety_net_streaming_event_sequence_for_tool_turn() {
         pos_tool_call < pos_tool_result,
         "ToolCall must precede its ToolResult"
     );
-    let (call_id, result_id) = match (&events[pos_tool_call], &events[pos_tool_result]) {
-        (TurnEvent::ToolCall { id: c, .. }, TurnEvent::ToolResult { id: r, .. }) => {
-            (c.clone(), r.clone())
-        }
-        _ => unreachable!(),
-    };
+    let call_id = events
+        .iter()
+        .find_map(|event| match event {
+            TurnEvent::ToolCall { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .expect("a ToolCall event must carry an id");
+    let result_id = events
+        .iter()
+        .find_map(|event| match event {
+            TurnEvent::ToolResult { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .expect("a ToolResult event must carry an id");
     assert_eq!(call_id, "tc-1");
     assert_eq!(
         call_id, result_id,
@@ -2113,5 +2122,110 @@ async fn safety_net_loop_cron_add_does_not_trust_model_supplied_approved_arg() {
     assert_eq!(
         args["approved"], false,
         "model-supplied approved=true must be stripped even with no approval gate"
+    );
+}
+
+// ── model_switch through a poisoned callback ────────────────────────────
+
+/// Regression: `ModelSwitchTool::handle_set` writes the pending switch through
+/// a poisoned guard, so the loop's per-iteration check must read through one
+/// too. Under the old `let Ok(guard) = callback.lock()` chain a poisoned
+/// callback short-circuited the check and the requested switch was dropped
+/// silently after the tool had already reported success.
+#[tokio::test]
+async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
+    use crate::agent::loop_::{
+        LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
+        ToolLoop, is_model_switch_requested, run_tool_call_loop,
+    };
+
+    let callback: Arc<std::sync::Mutex<Option<(String, String)>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    // Poison the mutex the only way it can happen in production: a panic while
+    // the guard is held, after the pending switch has been written.
+    let poisoner = Arc::clone(&callback);
+    let poisoning_thread = std::thread::spawn(move || {
+        let mut guard = poisoner
+            .lock()
+            .expect("a fresh lock cannot be poisoned yet");
+        *guard = Some((
+            "switched-provider".to_string(),
+            "switched-model".to_string(),
+        ));
+        panic!("poison the model-switch callback on purpose");
+    })
+    .join();
+    assert!(poisoning_thread.is_err(), "the poisoning thread must panic");
+    assert!(
+        callback.is_poisoned(),
+        "the callback mutex must be poisoned"
+    );
+
+    let provider = ScriptedProvider::new(vec![text_response("never reached")]);
+    let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+    let mut history = vec![ChatMessage::user("hi")];
+    let (dtx, _drx) = mpsc::channel(256);
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    let result = run_tool_call_loop(ToolLoop {
+        parent_agent_alias: None,
+        sop_reassembly: None,
+        exec: ResolvedAgentExecution::resolve(
+            ResolvedModelAccess {
+                model_provider: &provider,
+                provider_name: "mock",
+                model: "mock-model",
+                temperature: None,
+            },
+            ResolvedIo {
+                tools_registry: &tools_registry,
+                observer: &observability::NoopObserver {},
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                hooks: None,
+                activated_tools: None,
+                model_switch_callback: Some(Arc::clone(&callback)),
+                receipt_generator: None,
+            },
+            ResolvedRuntimeKnobs {
+                max_tool_iterations: 5,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 30_000,
+                context_token_budget: 100_000,
+                knobs: &LoopKnobs::default(),
+            },
+        ),
+        history: &mut history,
+        channel_name: "cli",
+        channel_reply_target: None,
+        cancellation_token: None,
+        on_delta: Some(dtx),
+        shared_budget: None,
+        channel: None,
+        collected_receipts: None,
+        event_tx: None,
+        steering: None,
+        new_messages_out: None,
+        image_cache: None,
+        ingress: IngressContext::sub_turn(),
+        memory: None,
+        agent_alias: None,
+        turn_id: &turn_id,
+    })
+    .await;
+
+    let err = result.expect_err("a pending switch must surface as ModelSwitchRequested");
+    assert_eq!(
+        is_model_switch_requested(&err),
+        Some((
+            "switched-provider".to_string(),
+            "switched-model".to_string()
+        )),
+        "a switch written through the poisoned guard must be observed by the loop"
     );
 }

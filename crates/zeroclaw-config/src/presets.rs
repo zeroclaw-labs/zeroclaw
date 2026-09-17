@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::autonomy::AutonomyLevel;
 use crate::autonomy::{DelegationMode, DelegationPolicy};
 use crate::policy::{default_allowed_commands, default_forbidden_paths};
-use crate::schema::{RiskProfileConfig, RuntimeProfileConfig};
+use crate::schema::{RiskProfileConfig, RuntimeProfileConfig, SkillsPromptInjectionMode};
 
 // ─────────────────────────────────────────────────────────────────────
 // Risk presets
@@ -84,9 +84,11 @@ fn locked_down_risk() -> RiskProfileConfig {
         delegation_policy: DelegationPolicy::default(),
         approval_route: None,
         allowed_tools: vec![],
+        deny_all_tools: false,
         excluded_tools: vec![],
         sandbox_enabled: Some(true),
         sandbox_backend: None,
+        sandbox_image: None,
         firejail_args: vec![],
     }
 }
@@ -108,9 +110,11 @@ fn balanced_risk() -> RiskProfileConfig {
         },
         approval_route: None,
         allowed_tools: vec![],
+        deny_all_tools: false,
         excluded_tools: vec![],
         sandbox_enabled: Some(true),
         sandbox_backend: None,
+        sandbox_image: None,
         firejail_args: vec![],
     }
 }
@@ -132,9 +136,11 @@ fn yolo_risk() -> RiskProfileConfig {
         },
         approval_route: None,
         allowed_tools: vec![],
+        deny_all_tools: false,
         excluded_tools: vec![],
         sandbox_enabled: Some(false),
         sandbox_backend: None,
+        sandbox_image: None,
         firejail_args: vec![],
     }
 }
@@ -262,10 +268,11 @@ fn local_small_runtime() -> RuntimeProfileConfig {
         parallel_tools: Some(false),
         tool_dispatcher: None,
         tool_call_dedup_exempt: vec![],
-        max_system_prompt_chars: Some(4_000),
+        max_system_prompt_chars: Some(8_000),
         max_tool_result_chars: Some(4_000),
         keep_tool_context_turns: Some(1),
         memory_recall_limit: Some(3),
+        prompt_injection_mode: Some(SkillsPromptInjectionMode::Compact),
         strict_tool_parsing: true,
         ..RuntimeProfileConfig::default()
     }
@@ -614,10 +621,14 @@ mod tests {
         assert_eq!(values.max_context_tokens, Some(8_000));
         assert_eq!(values.compact_context, Some(true));
         assert_eq!(values.parallel_tools, Some(false));
-        assert_eq!(values.max_system_prompt_chars, Some(4_000));
+        assert_eq!(values.max_system_prompt_chars, Some(8_000));
         assert_eq!(values.max_tool_result_chars, Some(4_000));
         assert_eq!(values.keep_tool_context_turns, Some(1));
         assert_eq!(values.memory_recall_limit, Some(3));
+        assert_eq!(
+            values.prompt_injection_mode,
+            Some(SkillsPromptInjectionMode::Compact)
+        );
         assert!(values.strict_tool_parsing);
     }
 
@@ -661,9 +672,13 @@ mod tests {
         assert_eq!(resolved.resolved.max_context_tokens, 8_000);
         assert!(resolved.resolved.compact_context);
         assert!(!resolved.resolved.parallel_tools);
-        assert_eq!(resolved.resolved.max_system_prompt_chars, 4_000);
+        assert_eq!(resolved.resolved.max_system_prompt_chars, 8_000);
         assert_eq!(resolved.resolved.max_tool_result_chars, 4_000);
         assert_eq!(resolved.resolved.keep_tool_context_turns, 1);
+        assert_eq!(
+            resolved.resolved.prompt_injection_mode,
+            SkillsPromptInjectionMode::Compact
+        );
         assert_eq!(config.effective_memory_recall_limit("local_agent"), 3);
     }
 

@@ -723,7 +723,15 @@ impl LineChannel {
         let alias = alias.into();
         let configured_peers = peer_resolver();
         let pairing = if dm_policy == LineDmPolicy::Pairing && configured_peers.is_empty() {
-            let guard = PairingGuard::new(true, &[]);
+            // Chat-channel bind codes are retyped by hand into a Telegram/
+            // LINE/WeChat message, so they deliberately keep the six-digit
+            // numeric shape. The shared-policy change re-scoped the *gateway* pairing code, not
+            // this one; changing it here would be an unreviewed UX change.
+            let guard = PairingGuard::new(
+                true,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::numeric_compat(),
+            );
             if let Some(code) = guard.pairing_code() {
                 // Mirror Telegram/WeChat: a backgrounded daemon discards
                 // stdout, so surface the one-time bind code through the
@@ -816,42 +824,29 @@ impl LineChannel {
         self
     }
 
-    /// Enable voice/audio transcription for incoming LINE audio messages.
-    /// When enabled, `type = "audio"` webhook events are downloaded from the
-    /// LINE Content API and transcribed before being forwarded to the agent.
-    pub fn with_transcription(
+    /// Configure voice transcription from a `[transcription]` snapshot.
+    ///
+    /// Compatibility and test path. The daemon routes every channel through
+    /// `with_transcription_manager` with a manager built from live
+    /// config and the owning agent's resolved provider; this path can only see
+    /// the legacy section, so it binds a lone registered provider and
+    /// otherwise leaves the choice unbound (see
+    /// `transcription::manager_from_snapshot`).
+    pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
+        let manager = super::transcription::manager_from_snapshot(&config);
+        self.with_transcription_manager(config, manager)
+    }
+
+    /// Store an already-built transcription manager, or nothing. The config is
+    /// recorded only alongside a manager, so a channel never advertises
+    /// transcription it cannot perform.
+    pub(crate) fn with_transcription_manager(
         mut self,
-        config: zeroclaw_config::schema::TranscriptionConfig,
+        _config: zeroclaw_config::schema::TranscriptionConfig,
+        manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
     ) -> Self {
-        if !config.enabled {
-            return self;
-        }
-        match super::transcription::TranscriptionManager::new(&config) {
-            Ok(m) => {
-                let m = if config.local_whisper.is_some() {
-                    m.with_agent_transcription_provider("local_whisper")
-                } else if config.openai.is_some() {
-                    m.with_agent_transcription_provider("openai")
-                } else if config.deepgram.is_some() {
-                    m.with_agent_transcription_provider("deepgram")
-                } else if config.assemblyai.is_some() {
-                    m.with_agent_transcription_provider("assemblyai")
-                } else if config.google.is_some() {
-                    m.with_agent_transcription_provider("google")
-                } else {
-                    m.with_agent_transcription_provider("groq")
-                };
-                self.transcription_manager = Some(Arc::new(m));
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"e": e.to_string()})),
-                    "transcription manager init failed, audio transcription disabled"
-                );
-            }
+        if let Some(manager) = manager {
+            self.transcription_manager = Some(manager);
         }
         self
     }
@@ -1038,11 +1033,7 @@ impl LineChannel {
                 .send()
                 .await?;
 
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let err = resp.text().await.unwrap_or_default();
-                anyhow::bail!("Reply API failed ({status}): {err}");
-            }
+            crate::util::ensure_success(resp, "Reply API").await?;
         }
         Ok(())
     }
@@ -1078,11 +1069,7 @@ impl LineChannel {
                 .send()
                 .await?;
 
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let err = resp.text().await.unwrap_or_default();
-                anyhow::bail!("Push API failed ({status}): {err}");
-            }
+            crate::util::ensure_success(resp, "Push API").await?;
         }
         Ok(())
     }

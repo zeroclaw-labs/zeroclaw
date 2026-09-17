@@ -26,6 +26,18 @@ OpenAI Codex subscription auth lives on the `openai` slot. Set `wire_api = "resp
 
 Local inference via Ollama's native `/api/chat`. Schema-based structured output via `format`. No API key.
 
+### Hailo-Ollama: slot `hailo_ollama`
+
+Local Hailo-accelerated inference through Hailo-Ollama's native `/api/chat` and
+`/api/tags` endpoints. The explicit compatibility mode normalizes and bounds
+history, disables streaming and thinking, and serializes access through a shared
+per-endpoint hardware gate. Ambiguous post-connect transport failures, including
+request timeouts, quarantine that endpoint until ZeroClaw restarts. The native
+Hailo-Ollama service has no authentication contract; an alias may nevertheless
+attach a Bearer `api_key` or `extra_headers` when the operator places a trusted
+authenticating proxy or bridge in front of it. Native tool calling and vision
+remain unsupported.
+
 ### Bedrock: slot `bedrock`
 
 ### Gemini: slot `gemini`
@@ -423,14 +435,21 @@ The `/models` endpoint is public (`PUBLIC_MODEL_LISTING`), so model listing work
 [providers.models.zerorouter.gateway]
 model   = "anthropic/claude-sonnet-5"
 api_key = "..."   # a ZeroRouter key (prefix `zcr_`); or inject from the env
-# uri = "https://zerorouter.ai/v1"  # a hosted or remote router; omit for the localhost default
+# uri = "http://localhost:8080/v1"  # a self-hosted or local router; omit for the hosted default
 ```
 
-Self-hosted, OpenAI-compatible LLM gateway; Bearer-token auth. ZeroRouter is a
-family of independently operated routers, so there is no canonical hosted
-default: the slot points at a locally running router at `http://localhost:8080/v1`.
-To reach the public deployment at `https://zerorouter.ai`, or any other remote
-router, set `uri` explicitly.
+OpenAI-compatible LLM gateway; Bearer-token auth. ZeroRouter is currently in
+beta. The slot defaults to the public hosted deployment at
+`https://zerorouter.ai/v1`, so model discovery works with no configuration at
+all. ZeroRouter is also self-hostable (AGPL); to reach your own router,
+locally at `http://localhost:8080/v1` or anywhere else, set `uri` explicitly.
+A key minted on one router does not authenticate on another, so `api_key`
+must come from the deployment `uri` points at.
+
+Beyond the chat-completions wire this slot speaks, ZeroRouter also serves the
+OpenAI Responses API inbound (`POST /v1/responses`), so Responses-wire
+clients, such as a Codex CLI `model_provider` with `wire_api = "responses"`,
+can point at the same deployment and key directly.
 
 The `/v1/models` endpoint is public (`PUBLIC_MODEL_LISTING`), so model listing
 and its prompt/completion pricing come live from the router itself without a
@@ -524,6 +543,16 @@ The `nearai` slot uses `https://cloud-api.near.ai/v1` by default and sends
 `Authorization: Bearer <api_key>`. To bridge an existing `NEARAI_API_KEY`
 shell variable into ZeroClaw's schema-mirror env surface, set
 `ZEROCLAW_providers__models__nearai__tee__api_key="$NEARAI_API_KEY"`.
+
+Crusoe Managed Inference example:
+
+```toml
+[providers.models.crusoe.default]
+model   = "deepseek-ai/DeepSeek-V4-Flash"   # bare Crusoe catalog ID; see /v1/models with a key set
+api_key = "..."
+```
+
+The `crusoe` slot uses `https://api.inference.crusoecloud.com/v1` by default and sends `Authorization: Bearer <api_key>`. Model IDs are the vendor-prefixed catalog IDs returned by Crusoe's authenticated `/v1/models` endpoint; use that live result to select an available model. The `crusoe/` prefix some tools use is not sent; ZeroClaw passes the `model` field verbatim. The slot has no public model index, so the model picker stays empty until you paste a credential; once a key is set, ZeroClaw lists models from Crusoe's live `/v1/models` endpoint. Credentials come only from config (`api_key`); there is no per-provider `CRUSOE_API_KEY` environment variable. To bridge an existing `CRUSOE_API_KEY` shell variable into ZeroClaw's schema-mirror env surface, set `ZEROCLAW_providers__models__crusoe__default__api_key="$CRUSOE_API_KEY"`.
 
 ---
 

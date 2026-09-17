@@ -58,20 +58,14 @@ pub(crate) mod doctor;
 #[cfg(feature = "gateway")]
 pub mod gateway;
 #[cfg(feature = "agent-runtime")]
-pub(crate) mod hardware;
-#[cfg(feature = "agent-runtime")]
 pub(crate) mod health;
 #[cfg(feature = "agent-runtime")]
 pub(crate) mod heartbeat;
 #[cfg(feature = "agent-runtime")]
 pub mod hooks;
-#[cfg(feature = "agent-runtime")]
-pub(crate) mod integrations;
 pub mod memory;
 #[cfg(feature = "agent-runtime")]
 pub(crate) mod multimodal;
-#[cfg(feature = "agent-runtime")]
-pub mod nodes;
 #[cfg(feature = "agent-runtime")]
 pub mod observability;
 #[cfg(feature = "agent-runtime")]
@@ -85,10 +79,6 @@ pub mod rag;
 pub mod routines;
 #[cfg(feature = "agent-runtime")]
 pub(crate) mod security;
-#[cfg(feature = "agent-runtime")]
-pub(crate) mod service;
-#[cfg(feature = "agent-runtime")]
-pub(crate) mod skills;
 #[cfg(feature = "agent-runtime")]
 pub mod sop;
 #[cfg(feature = "agent-runtime")]
@@ -224,6 +214,12 @@ pub enum ServiceCommands {
     /// Internal launchd runner that owns bounded daemon output capture
     #[command(hide = true)]
     RunLaunchdDaemon,
+    /// Internal desktop runner that owns bounded combined daemon output capture
+    #[command(hide = true)]
+    RunDesktopDaemon {
+        #[arg(long, hide = true)]
+        port: u16,
+    },
     /// Internal OpenRC logger that drains one daemon stream into bounded storage
     #[command(hide = true)]
     RunOpenrcLogWriter {
