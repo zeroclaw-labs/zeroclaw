@@ -73,11 +73,18 @@ pub struct ResolverPolicy {
 }
 
 impl ResolverPolicy {
-    /// Compile the auth sections of a validated [`Config`]. Dangling
-    /// references were rejected at config load; the resolver still fails
-    /// closed if it meets one at resolve time.
-    #[must_use]
-    pub fn from_config(config: &Config) -> Self {
+    /// Compile the auth sections of a [`Config`], validating them first.
+    ///
+    /// This is where the "validated config" precondition is actually
+    /// enforced: `load_or_init` deliberately tolerates a semantically
+    /// invalid config so an operator can boot to repair it, so the resolver
+    /// cannot assume its input was checked. Running the auth-specific
+    /// validation here means duplicate uids or effective principal ids,
+    /// invalid issuers, and dangling profile references are rejected before
+    /// anything is compiled — nothing invalid can become a serving policy.
+    /// The resolver still fails closed if it meets a gap at resolve time.
+    pub fn from_config(config: &Config) -> anyhow::Result<Self> {
+        config.validate_auth()?;
         let profiles = config
             .permission_profiles
             .iter()
@@ -118,20 +125,24 @@ impl ResolverPolicy {
             }
         }
         if roster_conflict {
+            // Unreachable after `validate_auth`, kept as defense in depth for
+            // the roster build itself: never install an ambiguous roster.
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                "Two [users] entries share an effective principal_id; rejecting the whole roster (fail closed) rather than authorizing one arbitrarily. Repair the duplicate principal_id/entry name."
+                "Two [users] entries share an effective principal_id; refusing to compile the roster (fail closed) rather than authorizing one arbitrarily. Repair the duplicate principal_id/entry name."
             );
-            roster.clear();
+            anyhow::bail!(
+                "two [users] entries share an effective principal_id; refusing to compile an ambiguous roster"
+            );
         }
-        Self {
+        Ok(Self {
             profiles,
             oidc,
             roster,
             roster_conflict,
-        }
+        })
     }
 }
 
@@ -175,15 +186,23 @@ impl PrincipalResolver {
     /// stamped generation, so an uninitialized consumer can't look fresh).
     #[must_use]
     pub fn new(policy: ResolverPolicy) -> Self {
+        Self::with_generation(policy, 1)
+    }
+
+    /// Install an initial policy at an already-established authorization
+    /// generation. The inbound RPC state uses this while atomically replacing
+    /// its whole compiled authentication snapshot.
+    #[must_use]
+    pub fn with_generation(policy: ResolverPolicy, generation: u64) -> Self {
         Self {
-            state: RwLock::new((Arc::new(policy), 1)),
+            state: RwLock::new((Arc::new(policy), generation.max(1))),
         }
     }
 
-    /// Convenience: compile and install from a validated config.
-    #[must_use]
-    pub fn from_config(config: &Config) -> Self {
-        Self::new(ResolverPolicy::from_config(config))
+    /// Compile and install from config. Fails — installing nothing — if the
+    /// auth sections are invalid; see [`ResolverPolicy::from_config`].
+    pub fn from_config(config: &Config) -> anyhow::Result<Self> {
+        Ok(Self::new(ResolverPolicy::from_config(config)?))
     }
 
     /// The current authorization-policy generation. Consumers compare
@@ -204,41 +223,30 @@ impl PrincipalResolver {
     }
 
     /// Re-compile from config and install (see [`Self::replace_policy`]) —
-    /// UNLESS the new policy is invalid (a duplicate effective principal id).
-    /// An invalid replacement is rejected: the current policy stays installed
-    /// and the generation does NOT advance, so established connections keep
-    /// resolving against the last valid policy until the config is repaired.
-    pub fn replace_from_config(&self, config: &Config) -> u64 {
-        // Fail closed on a semantically-invalid config. The reload gate upstream
-        // only rejects STRUCTURAL config degradation (a salvage marker), so a
-        // config that parses and survives salvage but fails auth-section
-        // validation — e.g. an OIDC issuer that can never match a token's `iss`,
-        // or a profile referencing a missing grant — must not become live
-        // policy. Keep the previous policy and hold the generation, exactly as
-        // for a duplicate-principal conflict, so live connections keep resolving
-        // against the last valid policy until the config is repaired. This does
-        // not trust the caller to have validated: installation is the boundary.
-        if let Err(e) = config.validate() {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({ "error": format!("{e}") })),
-                "Refusing to install an authorization policy from a config that failed validation; keeping the previous policy. Repair the config and reload."
-            );
-            return self.generation();
-        }
-        let policy = ResolverPolicy::from_config(config);
-        if policy.roster_conflict {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                "Refusing to install an authorization policy with a duplicate effective principal_id; keeping the previous policy. Repair the [users] roster and reload."
-            );
-            return self.generation();
-        }
-        self.replace_policy(policy)
+    /// UNLESS the auth sections are invalid. An invalid replacement is
+    /// rejected with the validation error: the current policy stays
+    /// installed and the generation does NOT advance, so established
+    /// connections keep resolving against the last valid policy until the
+    /// config is repaired and reloaded. Installation is the boundary: this
+    /// does not trust the caller to have validated (the boot path
+    /// deliberately tolerates a semantically invalid config so it can be
+    /// repaired), and the check is auth-specific so unrelated config errors
+    /// cannot block an authorization reload.
+    pub fn replace_from_config(&self, config: &Config) -> anyhow::Result<u64> {
+        let policy = match ResolverPolicy::from_config(config) {
+            Ok(policy) => policy,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({ "error": format!("{error}") })),
+                    "Refusing to install an invalid authorization policy; keeping the previous policy and generation. Repair the auth config and reload."
+                );
+                return Err(error);
+            }
+        };
+        Ok(self.replace_policy(policy))
     }
 
     /// Map a provider-verified identity to its canonical principal and the
@@ -674,27 +682,30 @@ mod tests {
 
     #[test]
     fn duplicate_effective_principal_id_rejects_the_roster() {
-        use zeroclaw_config::schema::UserConfig;
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
         let mut config = Config::default();
-        for (name, uid, profile) in [("alice", 1u32, "reader"), ("bob", 2u32, "ops")] {
+        // A real profile for both entries, so the duplicate principal id is
+        // the ONLY invalidity (an entry with no profile is rejected earlier).
+        config
+            .permission_profiles
+            .insert("reader".to_string(), PermissionProfileConfig::default());
+        for (name, uid) in [("alice", 1u32), ("bob", 2u32)] {
             config.users.insert(
                 name.to_string(),
                 UserConfig {
                     principal_id: Some("shared".to_string()),
                     uid: Some(uid),
-                    permission_profiles: vec![profile.to_string()],
+                    permission_profiles: vec!["reader".to_string()],
                 },
             );
         }
-        let policy = ResolverPolicy::from_config(&config);
-        assert!(
-            policy.roster_conflict,
-            "duplicate effective id flags conflict"
-        );
-        assert!(
-            policy.roster.is_empty(),
-            "a conflicting roster is emptied (fail closed), never overwritten by iteration order"
-        );
+        // Two entries resolving to one durable principal id would silently
+        // link accounts: policy compilation must refuse outright rather than
+        // install a roster whose winner depends on iteration order.
+        let err = ResolverPolicy::from_config(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("principal id"), "got: {err}");
     }
 
     #[test]
@@ -713,16 +724,22 @@ mod tests {
                 },
             );
         }
-        let after = resolver.replace_from_config(&bad);
+        assert!(
+            resolver.replace_from_config(&bad).is_err(),
+            "an invalid replacement must be rejected"
+        );
         assert_eq!(
-            after, before,
+            resolver.generation(),
+            before,
             "an invalid replacement must not install or advance the generation"
         );
     }
 
-    /// A known-valid auth config (mirrors `policy_compiles_from_config_sections`).
+    /// A known-valid auth config: one profile, one roster principal (alice,
+    /// uid 1000) granted it, and one OIDC alias mapping a claim value to it
+    /// (mirrors `policy_compiles_from_config_sections`).
     fn valid_auth_config() -> Config {
-        use zeroclaw_config::schema::{OidcConfig, PermissionProfileConfig};
+        use zeroclaw_config::schema::{OidcConfig, PermissionProfileConfig, UserConfig};
         let mut config = Config::default();
         config.permission_profiles.insert(
             "operator".to_string(),
@@ -732,15 +749,27 @@ mod tests {
                 ..PermissionProfileConfig::default()
             },
         );
+        config.users.insert(
+            "display-name".to_string(),
+            UserConfig {
+                principal_id: Some("alice".to_string()),
+                uid: Some(1000),
+                permission_profiles: vec!["operator".to_string()],
+            },
+        );
         config.oidc.insert(
             "corp".to_string(),
             OidcConfig {
                 issuer: "https://sso.example.com".to_string(),
+                audience: "zeroclaw".to_string(),
                 claim_path: "groups".to_string(),
                 profile_map: HashMap::from([("ops".to_string(), "operator".to_string())]),
                 ..OidcConfig::default()
             },
         );
+        config
+            .validate_auth()
+            .expect("the base auth config is valid");
         config
     }
 
@@ -750,7 +779,9 @@ mod tests {
         let before = resolver.generation();
         let good = valid_auth_config();
         assert!(good.validate().is_ok(), "fixture must be valid");
-        let after = resolver.replace_from_config(&good);
+        let after = resolver
+            .replace_from_config(&good)
+            .expect("a valid replacement installs");
         assert_eq!(
             after,
             before + 1,
@@ -764,18 +795,154 @@ mod tests {
         let before = resolver.generation();
         // Structurally fine, but the OIDC issuer carries a `#fragment` that can
         // never match a token's `iss` (rejected by OidcConfig::validate). The
-        // structural reload gate would not catch this; the activation gate must.
+        // structural reload gate would not catch this; the activation gate must,
+        // and it must say why rather than silently keep the old policy.
         let mut bad = valid_auth_config();
         bad.oidc.get_mut("corp").unwrap().issuer = "https://sso.example.com#fragment".to_string();
         assert!(
             bad.validate().is_err(),
             "fixture must be semantically invalid"
         );
-        let after = resolver.replace_from_config(&bad);
+        assert!(
+            resolver.replace_from_config(&bad).is_err(),
+            "a semantically-invalid replacement must be refused"
+        );
         assert_eq!(
-            after, before,
+            resolver.generation(),
+            before,
             "a semantically-invalid replacement must not install or advance the generation"
         );
+    }
+
+    #[test]
+    fn invalid_auth_replacements_are_rejected_without_changing_policy() {
+        use zeroclaw_config::schema::UserConfig;
+        let alice = AuthenticatedIdentity::new(
+            IdentitySubject::Roster {
+                principal_id: "alice".into(),
+            },
+            AuthMethod::Peercred,
+        );
+        // Every way the auth sections can be invalid at startup or
+        // replacement time. Each case is invalid for ONLY its labeled reason
+        // (the extra entries carry a real profile, since an entry with none is
+        // rejected earlier), and the error text is checked so each case proves
+        // its own check fired. Each must be refused, leave the generation
+        // untouched, and leave previously resolved grants exactly as they
+        // were: an invalid policy is never installed.
+        // (label, error text the rejection must carry, corruption to apply)
+        type Case = (&'static str, &'static str, Box<dyn Fn(&mut Config)>);
+        let cases: Vec<Case> = vec![
+            (
+                "duplicate uid",
+                "uid",
+                Box::new(|c| {
+                    c.users.insert(
+                        "bob".into(),
+                        UserConfig {
+                            principal_id: Some("bob".into()),
+                            uid: Some(1000),
+                            permission_profiles: vec!["operator".into()],
+                        },
+                    );
+                }),
+            ),
+            (
+                "duplicate effective principal id",
+                "principal id",
+                Box::new(|c| {
+                    c.users.insert(
+                        "bob".into(),
+                        UserConfig {
+                            principal_id: Some("alice".into()),
+                            uid: Some(2000),
+                            permission_profiles: vec!["operator".into()],
+                        },
+                    );
+                }),
+            ),
+            (
+                "invalid issuer",
+                "issuer",
+                Box::new(|c| {
+                    c.oidc.get_mut("corp").unwrap().issuer = "http://sso.example.com".into();
+                }),
+            ),
+            (
+                "dangling human profile_map target",
+                "profile_map",
+                Box::new(|c| {
+                    c.oidc
+                        .get_mut("corp")
+                        .unwrap()
+                        .profile_map
+                        .insert("x".into(), "missing".into());
+                }),
+            ),
+            (
+                "dangling service_profile_map target",
+                "service_profile_map",
+                Box::new(|c| {
+                    c.oidc
+                        .get_mut("corp")
+                        .unwrap()
+                        .service_profile_map
+                        .insert("svc".into(), "missing".into());
+                }),
+            ),
+            (
+                "dangling users.permission_profiles target",
+                "permission_profiles",
+                Box::new(|c| {
+                    c.users.get_mut("display-name").unwrap().permission_profiles =
+                        vec!["missing".into()];
+                }),
+            ),
+        ];
+        for (label, expected, corrupt) in cases {
+            let resolver =
+                PrincipalResolver::from_config(&valid_auth_config()).expect("valid base");
+            let generation = resolver.generation();
+            let before = resolver
+                .resolve(&alice)
+                .expect("alice resolves on the valid policy");
+            assert!(
+                before.grants.permits(Resource::Sessions, Verb::Read),
+                "{label}: base grants"
+            );
+
+            let mut bad = valid_auth_config();
+            corrupt(&mut bad);
+            // `.err()` rather than `.unwrap_err()`: the Ok side is a resolver,
+            // which has no Debug impl (and needs none).
+            let startup = PrincipalResolver::from_config(&bad)
+                .err()
+                .expect("startup must refuse to compile an invalid auth config")
+                .to_string();
+            assert!(
+                startup.contains(expected),
+                "{label}: startup must refuse for that reason, got: {startup}"
+            );
+            let replaced = resolver.replace_from_config(&bad).unwrap_err().to_string();
+            assert!(
+                replaced.contains(expected),
+                "{label}: replacement must be refused for that reason, got: {replaced}"
+            );
+            assert_eq!(
+                resolver.generation(),
+                generation,
+                "{label}: a rejected replacement must not advance the generation"
+            );
+            let after = resolver.resolve(&alice).expect("alice still resolves");
+            assert_eq!(
+                after.generation, before.generation,
+                "{label}: previously resolved grants must be unchanged"
+            );
+            assert!(
+                after.grants.permits(Resource::Sessions, Verb::Read),
+                "{label}: prior grants remain in effect"
+            );
+        }
     }
 
     #[test]
@@ -856,6 +1023,7 @@ mod tests {
             "corp".to_string(),
             OidcConfig {
                 issuer: "https://sso.example.com".to_string(),
+                audience: "zeroclaw".to_string(),
                 claim_path: "groups".to_string(),
                 profile_map: HashMap::from([("ops".to_string(), "operator".to_string())]),
                 ..OidcConfig::default()
@@ -863,7 +1031,8 @@ mod tests {
         );
         config.validate().expect("valid");
 
-        let resolver = PrincipalResolver::from_config(&config);
+        let resolver =
+            PrincipalResolver::from_config(&config).expect("a valid auth config compiles");
         // The roster keys on the durable principal id, not the entry name.
         let identity = AuthenticatedIdentity::new(
             IdentitySubject::Roster {
