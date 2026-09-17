@@ -10188,6 +10188,11 @@ fn gate_security_posture(
 /// `Handle::current()` so the sync, under-the-engine-lock adapter calls can bridge
 /// to the async channel/provider calls.
 #[cfg(feature = "agent-runtime")]
+fn qualified_provider_identity(provider_type: impl std::fmt::Display, alias: &str) -> String {
+    format!("{provider_type}.{alias}")
+}
+
+#[cfg(feature = "agent-runtime")]
 fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapters {
     // `llm.generate` runs on the DEFAULT agent's resolved model provider — the
     // daemon-level model of record. No resolvable provider = fail-closed.
@@ -10229,8 +10234,9 @@ fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapte
                 };
                 let model = entry.model.clone().unwrap_or_else(|| "default".to_string());
                 Some(std::sync::Arc::new(
-                    zeroclaw_runtime::sop::capability::ProviderLlmAdapter::new(
+                    zeroclaw_runtime::sop::capability::ProviderLlmAdapter::with_provider_name(
                         std::sync::Arc::from(provider),
+                        qualified_provider_identity(provider_type, alias),
                         model,
                     ),
                 ) as _)
@@ -10704,22 +10710,26 @@ mod tests {
     use clap::{CommandFactory, Parser};
     use std::net::TcpListener;
 
+    /// Deterministic terminal double for the selector's interaction contract.
+    ///
+    /// The terminal-delivery PR must not discard the selector regression
+    /// coverage that guards geometry, cleanup, and selection identity.
     #[cfg(feature = "agent-runtime")]
-    struct SelectorTestTerminal {
-        size: Option<(u16, u16)>,
+    struct QuickstartSelectorTestTerminal {
+        sizes: std::collections::VecDeque<Option<(u16, u16)>>,
         keys: std::collections::VecDeque<std::io::Result<QuickstartSelectorKey>>,
         actions: Vec<&'static str>,
         fail_action: Option<&'static str>,
     }
 
     #[cfg(feature = "agent-runtime")]
-    impl SelectorTestTerminal {
+    impl QuickstartSelectorTestTerminal {
         fn new(
-            size: Option<(u16, u16)>,
+            sizes: impl IntoIterator<Item = Option<(u16, u16)>>,
             keys: impl IntoIterator<Item = std::io::Result<QuickstartSelectorKey>>,
         ) -> Self {
             Self {
-                size,
+                sizes: sizes.into_iter().collect(),
                 keys: keys.into_iter().collect(),
                 actions: Vec::new(),
                 fail_action: None,
@@ -10736,9 +10746,9 @@ mod tests {
     }
 
     #[cfg(feature = "agent-runtime")]
-    impl QuickstartSelectorTerminal for SelectorTestTerminal {
+    impl QuickstartSelectorTerminal for QuickstartSelectorTestTerminal {
         fn size_checked(&mut self) -> Option<(u16, u16)> {
-            self.size
+            self.sizes.pop_front().flatten()
         }
 
         fn enter_alternate_screen(&mut self) -> std::io::Result<()> {
@@ -10784,707 +10794,38 @@ mod tests {
         }
     }
 
-    /// One step of a deterministic PTY interaction: a key press, or a resize
-    /// of the output terminal applied between key presses the way a terminal
-    /// emulator changes a window while the selector waits for input.
-    #[cfg(all(feature = "agent-runtime", unix))]
-    enum PtyStep {
-        Key(QuickstartSelectorKey),
-        ResizeOutput { rows: u16, columns: u16 },
-    }
-
-    /// Injected input for the production Crossterm adapter.
-    ///
-    /// Keys are queued rather than read from the process-global event source
-    /// so the regression runs under a test harness without racing a
-    /// controlling terminal. Resizes are applied to the PTY master exactly as
-    /// a terminal emulator would, so the adapter's own geometry query must
-    /// observe them.
-    #[cfg(all(feature = "agent-runtime", unix))]
-    struct PtyQuickstartInput {
-        master: std::fs::File,
-        steps: std::collections::VecDeque<PtyStep>,
-    }
-
-    #[cfg(all(feature = "agent-runtime", unix))]
-    impl QuickstartSelectorInput for PtyQuickstartInput {
-        fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey> {
-            loop {
-                match self.steps.pop_front() {
-                    Some(PtyStep::Key(key)) => return Ok(key),
-                    Some(PtyStep::ResizeOutput { rows, columns }) => {
-                        set_pty_size(&self.master, rows, columns);
-                    }
-                    None => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            "no injected selector key",
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    /// Open a PTY pair sized `rows` by `columns`, returned as `(master, slave)`.
-    #[cfg(all(feature = "agent-runtime", unix))]
-    fn open_pty(rows: u16, columns: u16) -> (std::fs::File, std::fs::File) {
-        use std::os::fd::FromRawFd;
-
-        let mut master_fd = -1;
-        let mut slave_fd = -1;
-        let mut dimensions = libc::winsize {
-            ws_row: rows,
-            ws_col: columns,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        // SAFETY: both descriptor pointers refer to live `c_int` storage. The
-        // optional name and termios inputs are null, and `dimensions` remains
-        // live for the duration of the call.
-        let openpty_result = unsafe {
-            libc::openpty(
-                &raw mut master_fd,
-                &raw mut slave_fd,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &raw mut dimensions,
-            )
-        };
-        assert_eq!(openpty_result, 0, "openpty failed");
-
-        // SAFETY: `openpty` returned two distinct, live descriptors. Each is
-        // transferred to exactly one `File`, which closes it exactly once.
-        unsafe {
-            (
-                std::fs::File::from_raw_fd(master_fd),
-                std::fs::File::from_raw_fd(slave_fd),
-            )
-        }
-    }
-
-    #[cfg(all(feature = "agent-runtime", unix))]
-    fn set_pty_size(pty: &std::fs::File, rows: u16, columns: u16) {
-        use std::os::fd::AsRawFd;
-
-        let dimensions = libc::winsize {
-            ws_row: rows,
-            ws_col: columns,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        // SAFETY: `pty` owns a live PTY descriptor and `dimensions` is a fully
-        // initialized `winsize` that outlives the call.
-        let result =
-            unsafe { libc::ioctl(pty.as_raw_fd(), libc::TIOCSWINSZ, &raw const dimensions) };
-        assert_eq!(result, 0, "TIOCSWINSZ failed");
-    }
-
-    /// Build the production Crossterm adapter over a PTY slave with injected
-    /// input, so the exact production escape sequences and geometry query run.
-    #[cfg(all(feature = "agent-runtime", unix))]
-    fn pty_quickstart_terminal(
-        master: &std::fs::File,
-        slave: std::fs::File,
-        steps: impl IntoIterator<Item = PtyStep>,
-    ) -> CrosstermQuickstartTerminal<std::fs::File, PtyQuickstartInput> {
-        CrosstermQuickstartTerminal {
-            output: slave,
-            input: PtyQuickstartInput {
-                master: master.try_clone().expect("PTY master should be clonable"),
-                steps: steps.into_iter().collect(),
-            },
-        }
-    }
-
-    /// Read everything written to the PTY, returning once the output is idle.
-    #[cfg(all(feature = "agent-runtime", unix))]
-    fn drain_pty_output(master: &mut std::fs::File) -> String {
-        use std::os::fd::AsRawFd;
-
-        // SAFETY: the PTY master descriptor is live; preserving its current
-        // flags and adding O_NONBLOCK prevents a spurious poll wakeup from
-        // hanging the test.
-        let master_flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
-        assert!(master_flags >= 0, "reading PTY master flags failed");
-        assert_eq!(
-            unsafe {
-                libc::fcntl(
-                    master.as_raw_fd(),
-                    libc::F_SETFL,
-                    master_flags | libc::O_NONBLOCK,
-                )
-            },
-            0,
-            "setting PTY master nonblocking mode failed"
-        );
-
-        let mut output = Vec::new();
-        let mut buffer = [0u8; 4096];
-        loop {
-            let mut poll_fd = libc::pollfd {
-                fd: master.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: `poll_fd` points to one initialized poll descriptor.
-            let ready = unsafe { libc::poll(&raw mut poll_fd, 1, 100) };
-            assert!(ready >= 0, "polling PTY output failed");
-            if ready == 0 || poll_fd.revents & libc::POLLIN == 0 {
-                break;
-            }
-            match master.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(read) => output.extend_from_slice(&buffer[..read]),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) => panic!("failed to read PTY output: {error}"),
-            }
-        }
-        String::from_utf8(output).expect("selector output should be UTF-8")
-    }
-
-    #[cfg(all(feature = "agent-runtime", unix))]
-    const PTY_CLEAR_AND_HOME: &str = "\u{1b}[2J\u{1b}[1;1H";
-
-    #[cfg(all(feature = "agent-runtime", unix))]
-    const PTY_SHOW_CURSOR_AND_LEAVE_SCREEN: &str = "\u{1b}[?25h\u{1b}[?1049l";
-
-    #[cfg(all(feature = "agent-runtime", unix))]
+    #[cfg(feature = "agent-runtime")]
     #[test]
-    fn quickstart_selector_repeated_navigation_redraws_at_pty_origin() {
-        let (mut master, slave) = open_pty(20, 80);
-        let mut term = pty_quickstart_terminal(
-            &master,
-            slave,
-            [
-                PtyStep::Key(QuickstartSelectorKey::Down),
-                PtyStep::Key(QuickstartSelectorKey::Down),
-                PtyStep::Key(QuickstartSelectorKey::Up),
-                PtyStep::Key(QuickstartSelectorKey::Cancel),
-            ],
+    fn quickstart_selector_resize_fails_closed_and_restores_screen() {
+        let mut term = QuickstartSelectorTestTerminal::new(
+            [Some((20, 80)), Some((20, 40))],
+            [Ok(QuickstartSelectorKey::Down)],
         );
-
-        let outcome = interact_quickstart_selector(
-            &mut term,
-            &["first".to_string(), "second".to_string()],
-            "Choose",
-            (20, 80),
-        )
-        .expect("repeated PTY navigation should succeed");
-        assert_eq!(outcome, QuickstartSelectorOutcome::Pick(None));
-
-        let output = drain_pty_output(&mut master);
-        drop(term);
-
-        assert_eq!(
-            output.matches(PTY_CLEAR_AND_HOME).count(),
-            4,
-            "the initial frame and all three navigation redraws must begin at the PTY origin; \
-             output: {output:?}"
-        );
-    }
-
-    /// Quickstart accepts distinct input and output terminals. The frame must
-    /// be fitted to the terminal that receives it: a process-global query can
-    /// describe the controlling terminal while stderr is a narrower one.
-    #[cfg(all(feature = "agent-runtime", unix))]
-    #[test]
-    fn quickstart_selector_measures_the_terminal_that_receives_the_frame() {
-        let (controlling_master, controlling_slave) = open_pty(20, 80);
-        let (mut output_master, output_slave) = open_pty(20, 40);
-
-        let mut controlling = pty_quickstart_terminal(&controlling_master, controlling_slave, []);
-        assert_eq!(
-            controlling.size_checked(),
-            Some((20, 80)),
-            "the adapter over the controlling PTY reports that PTY's geometry"
-        );
-
-        let mut term = pty_quickstart_terminal(
-            &output_master,
-            output_slave,
-            [
-                PtyStep::Key(QuickstartSelectorKey::Down),
-                PtyStep::Key(QuickstartSelectorKey::Cancel),
-            ],
-        );
-        let output_size = quickstart_selector_terminal_size(&mut term)
-            .expect("the output PTY reports its geometry");
-        assert_eq!(
-            output_size,
-            (20, 40),
-            "the adapter over the output PTY must report the output PTY, not the controlling one"
-        );
-
-        // Fit exactly as the Quickstart caller does, from the sampled output
-        // geometry, with content that only fits the wider terminal unfitted.
-        let row_budget = quickstart_selector_row_budget(usize::from(output_size.1))
-            .expect("40 columns is a supported width");
-        let prompt = "Open a selector (Enter), or pick Create. Esc to quit.";
-        let fitted_prompt = fit_quickstart_selector_row(prompt, row_budget);
-        assert_ne!(
-            fitted_prompt, prompt,
-            "the prompt needs fitting at 40 columns"
-        );
-        let label = "[ ] Model provider — not yet chosen (pick one to continue)";
-        let fitted_label = fit_quickstart_selector_row(label, row_budget);
-        assert_ne!(fitted_label, label, "the row needs fitting at 40 columns");
-
-        let outcome = interact_quickstart_selector(
-            &mut term,
-            std::slice::from_ref(&fitted_label),
-            &fitted_prompt,
-            output_size,
-        )
-        .expect("navigation on the output PTY should succeed");
-        assert_eq!(outcome, QuickstartSelectorOutcome::Pick(None));
-
-        let output = drain_pty_output(&mut output_master);
-        drop(term);
-        drop(controlling);
-
-        assert!(
-            output.contains(&format!("? {fitted_prompt}")) && output.contains(&fitted_label),
-            "the fitted prompt and row must reach the output terminal; output: {output:?}"
-        );
-        assert!(
-            !output.contains(prompt) && !output.contains(label),
-            "unfitted text must never reach the 40-column output terminal; output: {output:?}"
-        );
-        for line in output.split("\r\n") {
-            assert!(
-                console::measure_text_width(line) <= 40,
-                "{line:?} exceeds the 40-column output terminal"
-            );
-        }
-    }
-
-    /// A resize of the output terminal alone raises no Crossterm resize event,
-    /// so the recheck on the next key must read the output terminal itself.
-    #[cfg(all(feature = "agent-runtime", unix))]
-    #[test]
-    fn quickstart_selector_fails_closed_when_only_the_output_terminal_resizes() {
-        let (mut master, slave) = open_pty(20, 40);
-        let mut term = pty_quickstart_terminal(
-            &master,
-            slave,
-            [
-                PtyStep::Key(QuickstartSelectorKey::Down),
-                PtyStep::ResizeOutput {
-                    rows: 20,
-                    columns: 30,
-                },
-                PtyStep::Key(QuickstartSelectorKey::Down),
-                PtyStep::Key(QuickstartSelectorKey::Cancel),
-            ],
-        );
-        let initial_size = quickstart_selector_terminal_size(&mut term)
-            .expect("the output PTY reports its geometry");
-        assert_eq!(initial_size, (20, 40));
-
         let error = interact_quickstart_selector(
             &mut term,
             &["first".to_string(), "second".to_string()],
             "Choose",
-            initial_size,
-        )
-        .expect_err("an output-only resize must stop the selector");
-        assert_eq!(
-            error.to_string(),
-            quickstart_selector_resize_error((20, 40), (20, 30)).to_string(),
-            "the recheck must report the output terminal's new geometry"
-        );
-
-        let output = drain_pty_output(&mut master);
-        drop(term);
-
-        assert_eq!(
-            output.matches(PTY_CLEAR_AND_HOME).count(),
-            2,
-            "only the initial frame and the pre-resize redraw may be drawn; output: {output:?}"
-        );
-        assert!(
-            output.ends_with(PTY_SHOW_CURSOR_AND_LEAVE_SCREEN),
-            "the cursor and main screen must be restored after the resize; output: {output:?}"
-        );
-    }
-
-    #[cfg(all(feature = "agent-runtime", unix))]
-    #[test]
-    fn quickstart_output_terminal_size_is_unknown_without_reported_geometry() {
-        let not_a_terminal = tempfile::tempfile().expect("temporary file");
-        assert_eq!(quickstart_output_terminal_size(&not_a_terminal), None);
-
-        let (_unset_master, unset_slave) = open_pty(0, 0);
-        assert_eq!(quickstart_output_terminal_size(&unset_slave), None);
-
-        let (_master, slave) = open_pty(9, 20);
-        assert_eq!(quickstart_output_terminal_size(&slave), Some((9, 20)));
-    }
-
-    #[cfg(feature = "agent-runtime")]
-    #[test]
-    fn fit_quickstart_selector_row_respects_byte_and_display_budgets() {
-        let short = "[ ] Memory — not yet chosen";
-        assert_eq!(fit_quickstart_selector_row(short, 80), short);
-
-        let rows = [
-            "[✓] Model provider — Anthropic (alias: main, model: claude-sonnet-4-5)",
-            "[✓] モデルプロバイダー — Anthropic（モデル：長い名前）",
-            "[✓] 模型提供方 — 提供商与模型摘要",
-            "emoji 👩‍💻 and combining e\u{301} text",
-            "line one\nline two\twith controls",
-        ];
-        for row in rows {
-            for budget in 0..=64 {
-                let fitted = fit_quickstart_selector_row(row, budget);
-                assert!(
-                    fitted.len() <= budget,
-                    "{fitted:?} uses {} bytes with budget {budget}",
-                    fitted.len()
-                );
-                assert!(
-                    console::measure_text_width(&fitted) <= budget,
-                    "{fitted:?} uses {} columns with budget {budget}",
-                    console::measure_text_width(&fitted)
-                );
-                assert!(
-                    fitted.chars().all(|ch| !ch.is_control()),
-                    "{fitted:?} contains a terminal control character"
-                );
-            }
-        }
-
-        let long = rows[0];
-        assert_eq!(fit_quickstart_selector_row(long, 0), "");
-        assert_eq!(fit_quickstart_selector_row(long, 1), ".");
-        assert_eq!(fit_quickstart_selector_row(long, 2), "[.");
-        assert!(fit_quickstart_selector_row(long, 40).ends_with('…'));
-    }
-
-    #[cfg(feature = "agent-runtime")]
-    #[test]
-    fn quickstart_selector_budget_rejects_unsafe_terminal_widths() {
-        assert!(
-            (0..QUICKSTART_SELECTOR_MIN_WIDTH)
-                .all(|width| quickstart_selector_row_budget(width).is_none())
-        );
-        assert_eq!(quickstart_selector_row_budget(20), Some(17));
-        assert_eq!(quickstart_selector_row_budget(21), Some(18));
-    }
-
-    #[cfg(feature = "agent-runtime")]
-    #[test]
-    fn quickstart_selector_minimum_width_keeps_actions_identifiable() {
-        let budget = quickstart_selector_row_budget(QUICKSTART_SELECTOR_MIN_WIDTH).unwrap();
-        let rows = [
-            ("[ ] Model provider — not yet chosen", "[ ] Model"),
-            ("[ ] Risk profile — not yet chosen", "[ ] Risk"),
-            ("[ ] Memory — not yet chosen", "[ ] Memory"),
-            ("[ ] Channels (0) — not yet chosen", "[ ] Channels"),
-            ("[ ] Peer groups — not yet chosen", "[ ] Peer"),
-            ("[ ] Agent identity — not yet chosen", "[ ] Agent"),
-            ("── Create agent", "── Create"),
-        ];
-
-        for (row, identifiable_prefix) in rows {
-            let fitted = fit_quickstart_selector_row(row, budget);
-            assert!(
-                fitted.starts_with(identifiable_prefix),
-                "{fitted:?} does not identify {row:?}"
-            );
-        }
-    }
-
-    /// The checklist rows exactly as a committed locale ships them.
-    ///
-    /// The identifiability guarantee is about the strings users actually see,
-    /// so these are read from the committed catalogues rather than retyped:
-    /// a hand-written approximation can stay distinguishable at a width where
-    /// the real, longer, column-padded row has already collapsed.
-    #[cfg(feature = "agent-runtime")]
-    fn quickstart_checklist_rows_for_locale(cli_ftl: &str) -> Vec<String> {
-        const ROW_KEYS: [&str; 6] = [
-            "cli-quickstart-row-model-provider",
-            "cli-quickstart-row-risk-profile",
-            "cli-quickstart-row-memory",
-            "cli-quickstart-row-channels",
-            "cli-quickstart-row-peer-groups",
-            "cli-quickstart-row-agent-identity",
-        ];
-
-        let value_for = |key: &str| -> String {
-            cli_ftl
-                .lines()
-                .find_map(|line| line.strip_prefix(&format!("{key} = ")))
-                .unwrap_or_else(|| panic!("{key} should be defined in the catalogue"))
-                .to_string()
-        };
-
-        let mut rows: Vec<String> = ROW_KEYS
-            .iter()
-            .map(|key| {
-                value_for(key)
-                    .replace("{$glyph}", "[ ]")
-                    .replace("{$summary}", "not yet chosen")
-            })
-            .collect();
-        rows.push(value_for("cli-quickstart-create-agent"));
-        rows
-    }
-
-    #[cfg(feature = "agent-runtime")]
-    #[test]
-    fn quickstart_selector_accepted_widths_keep_every_action_distinguishable() {
-        // The blocker this guards: a width floor chosen only for arithmetic
-        // safety left widths 3 and 4 "supported" while every fitted row
-        // collapsed to "" or ".", producing an interactive menu in which the
-        // user could not tell Provider from Risk from Create — and could
-        // commit real config chosen blind. Accepting a width must therefore
-        // mean the rows stay individually readable, in every locale we ship,
-        // not merely that the budget subtraction did not underflow.
-        let locales: [(&str, &str); 5] = [
-            (
-                "en",
-                include_str!("../crates/zeroclaw-runtime/locales/en/cli.ftl"),
-            ),
-            (
-                "es",
-                include_str!("../crates/zeroclaw-runtime/locales/es/cli.ftl"),
-            ),
-            (
-                "fr",
-                include_str!("../crates/zeroclaw-runtime/locales/fr/cli.ftl"),
-            ),
-            (
-                "ja",
-                include_str!("../crates/zeroclaw-runtime/locales/ja/cli.ftl"),
-            ),
-            (
-                "zh-CN",
-                include_str!("../crates/zeroclaw-runtime/locales/zh-CN/cli.ftl"),
-            ),
-        ];
-
-        for (locale, cli_ftl) in locales {
-            let rows = quickstart_checklist_rows_for_locale(cli_ftl);
-            assert_eq!(rows.len(), 7, "{locale}: expected seven checklist rows");
-
-            for width in 0..=120usize {
-                let Some(budget) = quickstart_selector_row_budget(width) else {
-                    continue;
-                };
-
-                let fitted: Vec<String> = rows
-                    .iter()
-                    .map(|row| fit_quickstart_selector_row(row, budget))
-                    .collect();
-
-                for (row, label) in rows.iter().zip(&fitted) {
-                    assert!(
-                        !label.is_empty(),
-                        "{locale}: width {width} accepted but {row:?} fits to an empty label"
-                    );
-                    assert!(
-                        label.chars().any(|ch| ch.is_alphanumeric()),
-                        "{locale}: width {width} accepted but {row:?} fits to {label:?}, \
-                         which carries no readable text"
-                    );
-                }
-
-                let distinct: std::collections::HashSet<&str> =
-                    fitted.iter().map(String::as_str).collect();
-                assert_eq!(
-                    distinct.len(),
-                    fitted.len(),
-                    "{locale}: width {width} accepted but the fitted rows are not all \
-                     distinguishable: {fitted:?}"
-                );
-            }
-        }
-    }
-
-    #[cfg(feature = "agent-runtime")]
-    #[test]
-    fn quickstart_selector_rejects_widths_that_erase_action_labels() {
-        // The specific widths the previous floor blessed. At width 3 the row
-        // budget was 0 and every label fitted to ""; at width 4 the budget was
-        // 1 and every label fitted to ".". Both must now be rejected before
-        // any interaction can start.
-        let rows = quickstart_checklist_rows_for_locale(include_str!(
-            "../crates/zeroclaw-runtime/locales/en/cli.ftl"
-        ));
-
-        for width in [0usize, 1, 2, 3, 4, 5, 10, 19] {
-            assert_eq!(
-                quickstart_selector_row_budget(width),
-                None,
-                "width {width} must be rejected, not fitted"
-            );
-        }
-
-        // Demonstrate what acceptance at those widths would have meant, so the
-        // rejection above is anchored to the user-visible failure rather than
-        // to an arbitrary constant.
-        for (collapsed_budget, expected) in [(0usize, ""), (1, ".")] {
-            let fitted: std::collections::HashSet<String> = rows
-                .iter()
-                .map(|row| fit_quickstart_selector_row(row, collapsed_budget))
-                .collect();
-            assert_eq!(
-                fitted,
-                std::collections::HashSet::from([expected.to_string()]),
-                "budget {collapsed_budget} collapses every action to {expected:?}"
-            );
-        }
-
-        assert!(
-            quickstart_selector_row_budget(QUICKSTART_SELECTOR_MIN_WIDTH).is_some(),
-            "the floor itself must remain usable"
-        );
-    }
-
-    #[cfg(feature = "agent-runtime")]
-    #[test]
-    fn quickstart_selector_height_prevents_paging_suffixes() {
-        let item_count = 7;
-        let min_height = quickstart_selector_min_height(item_count);
-
-        assert_eq!(min_height, 9);
-        assert!((0..min_height).all(|height| !quickstart_selector_fits_height(height, item_count)));
-        assert!(quickstart_selector_fits_height(min_height, item_count));
-        assert!(quickstart_selector_fits_height(min_height + 1, item_count));
-        assert_eq!(
-            quickstart_selector_min_height(usize::MAX),
-            usize::MAX,
-            "the terminal guard must not wrap on an unexpected item count"
-        );
-    }
-
-    #[cfg(feature = "agent-runtime")]
-    #[test]
-    fn quickstart_selector_prompt_stays_within_final_terminal_budget() {
-        let prompts = [
-            "Open a selector (Enter), or pick Create. Esc to quit.",
-            "選択肢を開くには Enter、終了するには Esc を押してください。",
-            "Open a selector\nwithout adding a physical terminal row.",
-        ];
-
-        for terminal_width in [20, 40, 80] {
-            let budget = quickstart_selector_row_budget(terminal_width).unwrap();
-            for prompt in prompts {
-                let fitted = fit_quickstart_selector_row(prompt, budget);
-                assert!(
-                    fitted.len() <= budget,
-                    "{fitted:?} uses {} bytes with budget {budget}",
-                    fitted.len()
-                );
-                assert!(
-                    console::measure_text_width(&fitted) <= budget,
-                    "{fitted:?} uses {} columns with budget {budget}",
-                    console::measure_text_width(&fitted)
-                );
-                assert!(
-                    fitted.chars().all(|ch| !ch.is_control()),
-                    "{fitted:?} contains a terminal control character"
-                );
-            }
-        }
-    }
-
-    #[cfg(feature = "agent-runtime")]
-    #[test]
-    fn quickstart_selector_unknown_terminal_size_fails_closed() {
-        // A narrow terminal with an unavailable size must not get rows fitted
-        // against a guessed geometry.
-        assert!(
-            !quickstart_selector_size_is_usable(None),
-            "an unknown terminal size must not be accepted for fitting"
-        );
-        assert!(
-            quickstart_selector_size_is_usable(Some((24, 80))),
-            "a reported size must still be accepted"
-        );
-
-        let mut term = SelectorTestTerminal::new(None, []);
-        assert_eq!(
-            quickstart_selector_terminal_size(&mut term),
-            None,
-            "the selector must preserve a failed terminal size query"
-        );
-    }
-
-    #[cfg(feature = "agent-runtime")]
-    #[test]
-    fn quickstart_selector_recheck_rejects_resize_and_unknown_size() {
-        let initial = (24u16, 80u16);
-
-        assert!(
-            quickstart_selector_recheck_size(initial, Some(initial)).is_ok(),
-            "an unchanged size must allow the interaction to continue"
-        );
-
-        let resized = quickstart_selector_recheck_size(initial, Some((24, 40)))
-            .expect_err("a changed size must abort the interaction");
-        assert!(
-            resized.to_string().contains("40"),
-            "the resize error should name the new width; got {resized}"
-        );
-
-        // The important half: unknown is not evidence the geometry still
-        // matches. Without the checked query this branch would compare the
-        // fabricated (24, 80) against the initial sample, find them equal, and
-        // keep redrawing rows fitted for a terminal it can no longer see.
-        let unknown = quickstart_selector_recheck_size(initial, None)
-            .expect_err("an unavailable size must abort the interaction");
-        assert_eq!(
-            unknown.to_string(),
-            qta("cli-quickstart-terminal-size-unknown", &[]),
-            "unknown size must surface the localized size-unknown error"
-        );
-    }
-
-    #[cfg(feature = "agent-runtime")]
-    #[test]
-    fn quickstart_selector_ctrl_c_restores_screen_even_when_cursor_restore_fails() {
-        let mut term =
-            SelectorTestTerminal::new(Some((20, 80)), [Ok(QuickstartSelectorKey::Interrupt)]);
-        term.fail_action = Some("show_cursor");
-
-        let outcome = interact_quickstart_selector(
-            &mut term,
-            &["first".to_string(), "second".to_string()],
-            "Choose",
             (20, 80),
         )
-        .expect("cleanup failure must not replace Ctrl+C interrupt semantics");
+        .expect_err("a changed output geometry must abort the selector");
 
-        assert_eq!(outcome, QuickstartSelectorOutcome::Interrupt);
-        let show = term
-            .actions
-            .iter()
-            .position(|action| *action == "show_cursor")
-            .expect("cursor restoration must be attempted");
-        let leave = term
-            .actions
-            .iter()
-            .position(|action| *action == "leave_alternate_screen")
-            .expect("alternate-screen restoration must be attempted");
-        assert!(
-            show < leave,
-            "cleanup attempts should retain their safe order"
-        );
+        assert!(error.to_string().contains("40"));
+        assert!(term.actions.contains(&"show_cursor"));
+        assert!(term.actions.contains(&"leave_alternate_screen"));
         assert_eq!(term.actions.last(), Some(&"flush"));
     }
 
     #[cfg(feature = "agent-runtime")]
     #[test]
-    fn quickstart_selector_partial_entry_failure_still_restores_screen() {
-        let mut term = SelectorTestTerminal::new(Some((20, 80)), []);
+    fn quickstart_selector_partial_entry_failure_restores_screen() {
+        let mut term = QuickstartSelectorTestTerminal::new(
+            [Some((20, 80))],
+            std::iter::empty::<std::io::Result<QuickstartSelectorKey>>(),
+        );
         term.fail_action = Some("clear_screen");
 
         let error = match QuickstartSelectorScreen::enter(&mut term) {
-            Ok(_) => panic!("injected clear failure should abort entry"),
+            Ok(_) => panic!("injected entry failure must be returned"),
             Err(error) => error,
         };
         assert!(error.to_string().contains("clear_screen"));
@@ -11502,54 +10843,167 @@ mod tests {
 
     #[cfg(feature = "agent-runtime")]
     #[test]
-    fn quickstart_selector_read_error_still_restores_screen() {
-        let mut term = SelectorTestTerminal::new(
-            Some((20, 80)),
-            [Err(std::io::Error::other("injected read failure"))],
-        );
-
-        let error =
-            interact_quickstart_selector(&mut term, &["first".to_string()], "Choose", (20, 80))
-                .expect_err("injected read failure should surface");
-        assert!(error.to_string().contains("injected read failure"));
-        assert!(term.actions.contains(&"show_cursor"));
-        assert!(term.actions.contains(&"leave_alternate_screen"));
-        assert_eq!(term.actions.last(), Some(&"flush"));
-    }
-
-    #[cfg(feature = "agent-runtime")]
-    #[test]
-    fn quickstart_selection_maps_by_index_when_fitted_labels_are_identical() {
-        let actions = [
-            QuickstartChecklistAction::Provider,
-            QuickstartChecklistAction::Risk,
-            QuickstartChecklistAction::Memory,
-            QuickstartChecklistAction::Channels,
-            QuickstartChecklistAction::PeerGroups,
-            QuickstartChecklistAction::Agent,
-            QuickstartChecklistAction::Create,
+    fn quickstart_selection_uses_index_when_fitted_labels_match() {
+        let choices = [
+            (QuickstartChecklistAction::Provider, String::new()),
+            (QuickstartChecklistAction::Risk, String::new()),
+            (QuickstartChecklistAction::Create, String::new()),
         ];
-        let choices: Vec<(QuickstartChecklistAction, String)> = actions
-            .iter()
-            .copied()
-            .map(|action| (action, "same row".to_string()))
-            .collect();
-        let fitted: Vec<String> = choices
-            .iter()
-            .map(|(_, label)| fit_quickstart_selector_row(label, 0))
-            .collect();
-        assert!(fitted.windows(2).all(|pair| pair[0] == pair[1]));
-
-        for (index, expected) in actions.into_iter().enumerate() {
-            assert_eq!(quickstart_action_for_pick(&choices, Some(index)), expected);
-        }
         assert_eq!(
-            quickstart_action_for_pick(&choices, None),
-            QuickstartChecklistAction::Quit
+            quickstart_action_for_pick(&choices, Some(1)),
+            QuickstartChecklistAction::Risk
         );
         assert_eq!(
             quickstart_action_for_pick(&choices, Some(choices.len())),
             QuickstartChecklistAction::Quit
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_rejects_unknown_or_unsafe_geometry() {
+        assert!(!quickstart_selector_size_is_usable(None));
+        assert!(quickstart_selector_size_is_usable(Some((20, 80))));
+        assert!(quickstart_selector_row_budget(QUICKSTART_SELECTOR_MIN_WIDTH).is_some());
+        assert!(quickstart_selector_row_budget(QUICKSTART_SELECTOR_MIN_WIDTH - 1).is_none());
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_navigation_redraws_and_preserves_selected_identity() {
+        let mut term = QuickstartSelectorTestTerminal::new(
+            [
+                Some((20, 80)),
+                Some((20, 80)),
+                Some((20, 80)),
+                Some((20, 80)),
+            ],
+            [
+                Ok(QuickstartSelectorKey::Down),
+                Ok(QuickstartSelectorKey::Up),
+                Ok(QuickstartSelectorKey::Select),
+            ],
+        );
+        let outcome = interact_quickstart_selector(
+            &mut term,
+            &["first".to_string(), "second".to_string()],
+            "Choose",
+            (20, 80),
+        )
+        .expect("navigation should complete");
+
+        assert_eq!(outcome, QuickstartSelectorOutcome::Pick(Some(0)));
+        assert_eq!(
+            term.actions
+                .iter()
+                .filter(|action| **action == "clear_screen")
+                .count(),
+            3,
+            "initial frame plus both navigation redraws must clear the old frame"
+        );
+        assert_eq!(
+            term.actions
+                .iter()
+                .filter(|action| **action == "move_cursor_to_origin")
+                .count(),
+            3,
+            "every redraw must begin from the terminal origin"
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_unknown_size_during_interaction_restores_screen() {
+        let mut term = QuickstartSelectorTestTerminal::new(
+            [Some((20, 80)), None],
+            [Ok(QuickstartSelectorKey::Other)],
+        );
+        let error =
+            interact_quickstart_selector(&mut term, &["first".to_string()], "Choose", (20, 80))
+                .expect_err("loss of output geometry must abort the selector");
+
+        assert!(error.to_string().contains("terminal"));
+        assert!(term.actions.contains(&"show_cursor"));
+        assert!(term.actions.contains(&"leave_alternate_screen"));
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_interrupt_and_read_failure_restore_screen() {
+        let mut interrupt = QuickstartSelectorTestTerminal::new(
+            [Some((20, 80)), Some((20, 80))],
+            [Ok(QuickstartSelectorKey::Interrupt)],
+        );
+        interrupt.fail_action = Some("show_cursor");
+        assert_eq!(
+            interact_quickstart_selector(
+                &mut interrupt,
+                &["first".to_string()],
+                "Choose",
+                (20, 80),
+            )
+            .expect("cleanup failure must not replace interrupt semantics"),
+            QuickstartSelectorOutcome::Interrupt
+        );
+        assert!(interrupt.actions.contains(&"leave_alternate_screen"));
+
+        let mut read_failure = QuickstartSelectorTestTerminal::new(
+            [Some((20, 80)), Some((20, 80))],
+            [Err(std::io::Error::other("injected read failure"))],
+        );
+        let error = interact_quickstart_selector(
+            &mut read_failure,
+            &["first".to_string()],
+            "Choose",
+            (20, 80),
+        )
+        .expect_err("read failure must surface");
+        assert!(error.to_string().contains("injected read failure"));
+        assert!(read_failure.actions.contains(&"show_cursor"));
+        assert!(read_failure.actions.contains(&"leave_alternate_screen"));
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_fits_rows_without_erasing_action_labels() {
+        let rows = [
+            "[ ] Model provider — not yet chosen",
+            "[ ] Risk profile — not yet chosen",
+            "[ ] Memory — not yet chosen",
+            "── Create agent",
+        ];
+        let budget = quickstart_selector_row_budget(QUICKSTART_SELECTOR_MIN_WIDTH)
+            .expect("the minimum accepted width has a usable row budget");
+        let fitted: Vec<String> = rows
+            .iter()
+            .map(|row| fit_quickstart_selector_row(row, budget))
+            .collect();
+        assert!(
+            fitted
+                .iter()
+                .all(|row| row.chars().any(char::is_alphanumeric))
+        );
+        assert_eq!(
+            fitted
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            fitted.len(),
+            "accepted-width labels must remain distinguishable"
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn sop_provider_identity_keeps_same_family_aliases_distinct() {
+        let fast = qualified_provider_identity("openai", "fast");
+        let smart = qualified_provider_identity("openai", "smart");
+
+        assert_eq!(fast, "openai.fast");
+        assert_eq!(smart, "openai.smart");
+        assert_ne!(
+            fast, smart,
+            "pricing requires the configured alias identity"
         );
     }
 

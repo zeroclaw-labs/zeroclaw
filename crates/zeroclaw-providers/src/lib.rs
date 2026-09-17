@@ -32,6 +32,7 @@ pub mod router;
 pub mod safeguard_notice;
 pub(crate) mod stream_guard;
 pub mod telnyx;
+mod terminal;
 pub mod traits;
 pub mod vision_override;
 
@@ -45,25 +46,50 @@ pub use safeguard_notice::{
     SafeguardFallbackKind, SafeguardFallbackNotice, commit_safeguard_fallback,
     scope_safeguard_fallback, take_last_safeguard_fallback, visible_provider_fallback,
 };
+pub use terminal::{
+    TerminalCompletionContext, TerminalCompletionPolicy, TerminalRecoveryDisposition,
+    TerminalUsageChargeability, billable_terminal_usage, default_terminal_policy,
+    terminal_completion_context,
+};
+
+fn model_refusal_from_source<'a>(
+    cause: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a AnthropicRefusalError> {
+    cause.downcast_ref::<AnthropicRefusalError>().or_else(|| {
+        match cause.downcast_ref::<zeroclaw_api::model_provider::StreamError>() {
+            Some(zeroclaw_api::model_provider::StreamError::ModelRefusal(refusal)) => {
+                Some(refusal.as_ref())
+            }
+            _ => None,
+        }
+    })
+}
 
 /// Return the typed refusal that terminated a provider result, if any.
 ///
 /// Reliable keeps the final cause underneath its rejected-usage and terminal
 /// failure envelopes, and a streamed refusal arrives inside `StreamError`, so
 /// the leaf type is found by walking the chain rather than by an outer
-/// downcast. A later non-refusal failure replaces the refusal as the final
-/// cause and therefore yields `None`.
+/// downcast. A canonical terminal context stores direct-provider provenance
+/// beside its public terminal-failure chain. A later non-refusal failure
+/// replaces the refusal as the final cause and therefore yields `None`.
 pub fn model_refusal_from_error(error: &anyhow::Error) -> Option<&AnthropicRefusalError> {
-    error.chain().find_map(|cause| {
-        cause.downcast_ref::<AnthropicRefusalError>().or_else(|| {
-            match cause.downcast_ref::<zeroclaw_api::model_provider::StreamError>() {
-                Some(zeroclaw_api::model_provider::StreamError::ModelRefusal(refusal)) => {
-                    Some(refusal.as_ref())
-                }
-                _ => None,
-            }
+    // A typed refusal marker may coexist with malformed native framing. The
+    // canonical terminal reason owns delivery, recovery, and accounting; do
+    // not promote retained refusal provenance when it is more permissive or
+    // less truthful than that terminal result.
+    if terminal_completion_context(error).is_some_and(|context| {
+        context.failure().reason != zeroclaw_api::model_provider::TerminalCompletionError::Refusal
+    }) {
+        return None;
+    }
+    error
+        .chain()
+        .find_map(model_refusal_from_source)
+        .or_else(|| {
+            crate::terminal::terminal_completion_typed_source(error)
+                .and_then(|source| model_refusal_from_source(source))
         })
-    })
 }
 
 /// Return billed usage carried by a rejected provider result.

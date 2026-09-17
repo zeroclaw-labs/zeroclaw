@@ -3709,6 +3709,7 @@ mod tests {
                 requested_model: model.into(),
                 category: Some("private-category".into()),
                 usage: self.usage.clone().map(Box::new),
+                provider_executed_tool_activity: false,
                 attempted_candidate: None,
                 attempted_candidate_index: None,
             })

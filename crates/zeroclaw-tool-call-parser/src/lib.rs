@@ -2,7 +2,10 @@
 
 use regex::Regex;
 use std::{collections::HashSet, sync::LazyLock};
-pub use zeroclaw_api::model_provider::strip_think_tags;
+pub use zeroclaw_api::model_provider::{
+    TERMINAL_MARKERS, normalize_terminal_display_text, strip_think_tags,
+    strip_trailing_terminal_markers,
+};
 
 /// A single parsed tool call extracted from LLM output.
 #[derive(Debug, Clone)]
@@ -32,64 +35,6 @@ fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
         None => serde_json::Value::Object(serde_json::Map::new()),
     };
     unwrap_nested_json_strings(initial)
-}
-
-/// Canonical vocabulary of terminal markers emitted by providers that must be
-/// stripped from final response text. This is the single source of truth for
-/// the marker vocabulary, shared by the non-streaming
-/// [`strip_trailing_terminal_markers`] helper and the streaming state machine
-/// (`zeroclaw-runtime`'s `StreamTerminalMarkerStripper`) so a vocabulary or
-/// matching-rule change cannot drift one path.
-///
-/// Order matters: longer spellings must precede shorter ones so a suffix check
-/// matches the most specific marker first.
-pub const TERMINAL_MARKERS: [&str; 2] = ["<|eom|>", "<eom>"];
-
-/// Strip trailing terminal markers (`<eom>`, `<|eom|>`) from a response string.
-/// Handles stacked markers with arbitrary whitespace between them.
-///
-/// Terminal markers are protocol metadata that should not appear in user-visible text.
-/// This function iteratively removes trailing markers and whitespace until none remain.
-///
-/// # Examples
-///
-/// ```
-/// use zeroclaw_tool_call_parser::strip_trailing_terminal_markers;
-///
-/// assert_eq!(strip_trailing_terminal_markers("Summary<eom>"), "Summary");
-/// assert_eq!(strip_trailing_terminal_markers("Summary<|eom|>"), "Summary");
-/// assert_eq!(strip_trailing_terminal_markers("Summary<eom><|eom|>"), "Summary");
-/// assert_eq!(strip_trailing_terminal_markers("Summary<eom>  \n"), "Summary");
-/// assert_eq!(strip_trailing_terminal_markers("Summary<eom>           <|eom|>"), "Summary");
-/// assert_eq!(strip_trailing_terminal_markers("Text with <eom> inline"), "Text with <eom> inline");
-/// ```
-pub fn strip_trailing_terminal_markers(text: &str) -> String {
-    let mut result = text.to_string();
-
-    loop {
-        // Look for a recognized marker at the end of the trailing-whitespace-
-        // trimmed tail. When the trimmed tail ends in a marker, remove the
-        // marker AND the whitespace that followed it (the marker suffix).
-        // Whitespace BEFORE the marker belongs to the response text and is
-        // preserved — this matches the streaming stripper, which keeps e.g.
-        // `"Answer\n<eom>"` as `"Answer\n"`. If no marker is found, unmarked
-        // trailing whitespace (e.g. `"Answer\n"`) is ordinary text and is
-        // preserved too, so the two paths share one policy.
-        let trimmed = result.trim_end();
-        let mut stripped = false;
-        for marker in TERMINAL_MARKERS {
-            if let Some(prefix) = trimmed.strip_suffix(marker) {
-                result = prefix.to_string();
-                stripped = true;
-                break;
-            }
-        }
-        if !stripped {
-            break;
-        }
-    }
-
-    result
 }
 
 /// Recursively unwrap stringified JSON objects/arrays nested inside tool arguments.
@@ -5482,5 +5427,17 @@ Let me check the result."#;
         assert_eq!(strip_trailing_terminal_markers("<eom>\n"), "");
         assert_eq!(strip_trailing_terminal_markers("<|eom|>  "), "");
         assert_eq!(strip_trailing_terminal_markers("<eom>\n<|eom|>"), "");
+    }
+
+    #[test]
+    fn normalize_terminal_display_text_removes_thinking_and_terminal_markers() {
+        assert_eq!(
+            normalize_terminal_display_text("<think>internal</think><eom><|eom|>"),
+            ""
+        );
+        assert_eq!(
+            normalize_terminal_display_text("Answer<think>internal</think><|eom|>"),
+            "Answer"
+        );
     }
 }
