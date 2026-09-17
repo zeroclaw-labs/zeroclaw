@@ -244,8 +244,16 @@ config or credential cache.
 For a channel: `capabilities` containing `channel`, and almost certainly both
 `config_read` (no platform works without credentials) and `http_client`. The
 channel adapter implements outbound `wasi:http`, but links it only after that
-grant is validated; without both pieces, `send` has no network path to the
-platform.
+grant is validated, and the grant alone still reaches nothing: the host owns
+the egress policy, which is deny-by-default. The operator must list the
+platform's API hosts under `plugins.entries.<key>.egress_hosts` for that
+channel instance before `send` has a network path; any destination outside
+that list is refused before a packet leaves, and a granted host that resolves
+to a loopback, private, or link-local address is refused too unless it is also
+listed under `egress_allow_private`. Install-time seeding of that grant for channel instances is
+still manual (the grant ceremony is
+[#9584](https://github.com/zeroclaw-labs/zeroclaw/pull/9584)), so document the
+hosts your plugin needs in its README.
 
 Pair `config_read` with the schema consumed by `ChannelConfig`:
 
