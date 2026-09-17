@@ -175,13 +175,27 @@ impl TuiRegistry {
             .collect()
     }
 
-    /// Return a clone of the environment captured from the TUI identified by
-    /// `tui_id`, or `None` if the TUI is not currently connected.
-    pub fn get_env(&self, tui_id: &str) -> Option<HashMap<String, String>> {
+    /// Return a clone of the environment captured by ONE registration of a
+    /// TUI: the entry for `tui_id`, and only while `epoch` is still the live
+    /// registration for that id.
+    ///
+    /// The captured environment carries the user's real shell, credential
+    /// sockets included, so it is readable only by the connection that
+    /// captured it. Quoting the epoch is what makes that true across a
+    /// reconnect: a superseded connection holds the same id as its successor,
+    /// and without the epoch it would read the successor's environment. This
+    /// mirrors [`Self::unregister`], which quotes the epoch for the same
+    /// reason in the other direction.
+    pub fn env_for_registration(
+        &self,
+        tui_id: &str,
+        epoch: TuiEpoch,
+    ) -> Option<HashMap<String, String>> {
         self.connected
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(tui_id)
+            .filter(|(live, _)| *live == epoch)
             .map(|(_, entry)| entry.env.clone())
     }
 }
@@ -312,7 +326,7 @@ mod tests {
             "the surviving entry must be the successor, not the displaced one"
         );
         assert!(
-            registry.get_env(id).is_some(),
+            registry.env_for_registration(id, epoch_b).is_some(),
             "the live TUI must still resolve its captured environment"
         );
 
@@ -472,13 +486,13 @@ mod tests {
     }
 
     #[test]
-    fn get_env_returns_env_for_connected_tui() {
+    fn env_for_registration_returns_env_for_connected_tui() {
         let registry = TuiRegistry::new_unsigned();
         let mut env = HashMap::new();
         env.insert("PATH".to_string(), "/usr/bin:/usr/local/bin".to_string());
         env.insert("SSH_AUTH_SOCK".to_string(), "/tmp/ssh.sock".to_string());
 
-        registry.register(TuiEntry {
+        let epoch = registry.register(TuiEntry {
             tui_id: "tui_getenv01".to_string(),
             connected_at: Utc::now(),
             peer_label: "test".to_string(),
@@ -486,7 +500,9 @@ mod tests {
             env,
         });
 
-        let got = registry.get_env("tui_getenv01").expect("should find env");
+        let got = registry
+            .env_for_registration("tui_getenv01", epoch)
+            .expect("should find env");
         assert_eq!(
             got.get("PATH").map(|s| s.as_str()),
             Some("/usr/bin:/usr/local/bin")
@@ -498,13 +514,13 @@ mod tests {
     }
 
     #[test]
-    fn get_env_returns_none_for_unknown_tui() {
+    fn env_for_registration_returns_none_for_unknown_tui() {
         let registry = TuiRegistry::new_unsigned();
-        assert!(registry.get_env("tui_nothere").is_none());
+        assert!(registry.env_for_registration("tui_nothere", 0).is_none());
     }
 
     #[test]
-    fn get_env_returns_none_after_unregister() {
+    fn env_for_registration_returns_none_after_unregister() {
         let registry = TuiRegistry::new_unsigned();
         let mut env = HashMap::new();
         env.insert("SOME_VAR".to_string(), "val".to_string());
@@ -515,8 +531,49 @@ mod tests {
             transport: "unix".to_string(),
             env,
         });
-        assert!(registry.get_env("tui_gone0001").is_some());
+        assert!(
+            registry
+                .env_for_registration("tui_gone0001", epoch)
+                .is_some()
+        );
         registry.unregister("tui_gone0001", epoch);
-        assert!(registry.get_env("tui_gone0001").is_none());
+        assert!(
+            registry
+                .env_for_registration("tui_gone0001", epoch)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn env_for_registration_requires_a_matching_epoch() {
+        let registry = TuiRegistry::new_unsigned();
+        let id = "tui_epoch001";
+        let epoch_first = registry.register(TuiEntry {
+            tui_id: id.to_string(),
+            connected_at: Utc::now(),
+            peer_label: "first".to_string(),
+            transport: "unix".to_string(),
+            env: HashMap::from([("SENTINEL_SOCK".to_string(), "/tmp/first.sock".to_string())]),
+        });
+        let epoch_second = registry.register(TuiEntry {
+            tui_id: id.to_string(),
+            connected_at: Utc::now(),
+            peer_label: "second".to_string(),
+            transport: "unix".to_string(),
+            env: HashMap::from([("OTHER_SOCK".to_string(), "/tmp/second.sock".to_string())]),
+        });
+
+        assert!(
+            registry.env_for_registration(id, epoch_first).is_none(),
+            "a superseded registration must not read its successor's environment"
+        );
+        let live = registry
+            .env_for_registration(id, epoch_second)
+            .expect("the live registration resolves its own environment");
+        assert_eq!(
+            live.get("OTHER_SOCK").map(String::as_str),
+            Some("/tmp/second.sock")
+        );
+        assert!(!live.contains_key("SENTINEL_SOCK"));
     }
 }
