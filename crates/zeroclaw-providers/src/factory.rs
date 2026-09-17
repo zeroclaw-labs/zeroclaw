@@ -255,6 +255,9 @@ pub fn apply_compat_options(
     if opts.replay_assistant_reasoning == Some(false) {
         b = b.without_assistant_reasoning_replay();
     }
+    if opts.thinking_passthrough {
+        b = b.with_thinking_passthrough();
+    }
     if opts.cache_passthrough {
         b = b.with_cache_passthrough();
     }

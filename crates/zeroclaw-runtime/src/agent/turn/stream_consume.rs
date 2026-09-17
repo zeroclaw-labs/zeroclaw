@@ -178,6 +178,8 @@ pub(crate) async fn consume_provider_streaming_response(
                 return Err(StreamErrorWithUsage {
                     message,
                     usage: outcome.usage,
+                    // Keep the typed error so the provider-call step can
+                    // recognize terminal stream failures (no fallback).
                     source: err,
                 }
                 .into());
