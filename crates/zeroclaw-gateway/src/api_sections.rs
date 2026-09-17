@@ -4,7 +4,6 @@
 
 use axum::{
     extract::{Query, State},
-    http::HeaderMap,
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
@@ -15,15 +14,11 @@ use zeroclaw_runtime::rpc::types::{
 };
 
 use super::AppState;
-use super::api::require_auth;
 
 /// `GET /api/config/catalog` — list every model provider the CLI wizard knows
 /// about. The dashboard shows these in the "+ Add model provider" picker so
 /// CLI / web stay in sync.
-pub async fn handle_catalog(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
+pub async fn handle_catalog(State(state): State<AppState>) -> Response {
     let _ = state;
 
     let model_providers: Vec<CatalogModelProvider> = zeroclaw_providers::list_model_providers()
@@ -49,12 +44,8 @@ pub struct ModelsQuery {
 
 pub async fn handle_catalog_models(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Query(q): Query<ModelsQuery>,
 ) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
     let local = zeroclaw_runtime::quickstart::model_provider_is_local(&q.model_provider);
     // Snapshot config so the catalog resolves the alias credential and can reach
     // the native /models endpoint (surfacing new native-only models that the
@@ -188,10 +179,7 @@ fn quickstart_agent_missing_requirements(
     missing
 }
 
-pub async fn handle_section_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
+pub async fn handle_section_status(State(state): State<AppState>) -> Response {
     let cfg = state.config.read().clone();
     axum::Json(derive_section_status(&cfg)).into_response()
 }
@@ -243,18 +231,12 @@ pub fn build_agent_options(cfg: &zeroclaw_config::schema::Config) -> AgentOption
 /// `GET /api/config/agent-options` — every alias-reference list the
 /// agent form needs, derived from the live config. Mirrors the lists the
 /// TUI computes locally for its alias pickers.
-pub async fn handle_agent_options(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
+pub async fn handle_agent_options(State(state): State<AppState>) -> Response {
     let cfg = state.config.read().clone();
     axum::Json(build_agent_options(&cfg)).into_response()
 }
 
-pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
+pub async fn handle_sections(State(state): State<AppState>) -> Response {
     let cfg = state.config.read().clone();
     let completed: std::collections::HashSet<String> = cfg
         .onboard_state
@@ -413,12 +395,8 @@ pub struct SectionPath {
 
 pub async fn handle_section_picker(
     State(state): State<AppState>,
-    headers: HeaderMap,
     axum::extract::Path(SectionPath { section }): axum::extract::Path<SectionPath>,
 ) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
     let cfg = state.config.read().clone();
 
     use zeroclaw_config::sections::Section;
@@ -841,14 +819,10 @@ pub struct SectionSelectBody {
 
 pub async fn handle_section_select(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    principal: crate::principal_gate::RequestPrincipal,
     axum::extract::Path(SectionItemPath { section, key }): axum::extract::Path<SectionItemPath>,
     body: Option<axum::extract::Json<SectionSelectBody>>,
 ) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let alias = body
         .and_then(|b| b.0.alias)
         .map(|s| s.trim().to_string())
@@ -1067,12 +1041,32 @@ pub async fn handle_section_select(
         working.mark_dirty(&fields_prefix);
     }
 
+    // Selecting an existing item writes nothing; creating one writes the
+    // new item's fields. Authorized before the save either way.
+    let before = state.config.read().clone();
+    let mut writes = crate::principal_gate::ConfigWriteSet::by_effect(
+        &before,
+        &working,
+        working.dirty_paths.iter().map(String::as_str),
+    );
+    if created {
+        writes = writes.with(fields_prefix.clone(), zeroclaw_api::grants::Verb::Create);
+    }
+    let authorization = match crate::principal_gate::authorize_config_write(&principal, writes) {
+        Ok(authorization) => authorization,
+        Err(denied) => return denied.into_response(),
+    };
+    if let Err(denied) = authorization.covers_all(working.dirty_paths.iter().map(String::as_str)) {
+        return denied.into_response();
+    }
+
     if let Err(e) = working.save_dirty().await {
         return error_response(ConfigApiError::new(
             ConfigApiCode::ReloadFailed,
             format!("save after select failed: {e}"),
         ));
     }
+    authorization.publish_persisted(&working);
     *state.config.write() = working;
 
     axum::Json(SelectItemResponse {
@@ -1498,11 +1492,7 @@ mod tests {
     async fn handle_sections_emits_stable_group_key_with_english_fallback() {
         use http_body_util::BodyExt;
 
-        let response = handle_sections(
-            State(section_test_state(empty_cfg())),
-            axum::http::HeaderMap::new(),
-        )
-        .await;
+        let response = handle_sections(State(section_test_state(empty_cfg()))).await;
         assert_eq!(response.status(), axum::http::StatusCode::OK);
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
@@ -1763,7 +1753,7 @@ mod tests {
 
         let response = handle_section_select(
             State(state.clone()),
-            axum::http::HeaderMap::new(),
+            None,
             axum::extract::Path(SectionItemPath {
                 section: "tunnel".to_string(),
                 key: "cloudflare".to_string(),

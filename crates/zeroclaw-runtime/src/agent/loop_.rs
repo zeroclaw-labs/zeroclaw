@@ -6334,6 +6334,7 @@ mod tests {
             _until: Option<&str>,
         ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
             Ok(vec![zeroclaw_memory::MemoryEntry {
+                principal_id: None,
                 id: "1".into(),
                 key: "remembered".into(),
                 content: "the server is prod-3".into(),
