@@ -19,6 +19,7 @@ SAFE_PACKAGE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]*$")
 DOC_SUFFIXES = {".md", ".mdx", ".markdown", ".rst"}
 FULL_PATHS = {
     ".github/workflows/ci.yml",
+    ".github/workflows/windows-tests.yml",
     "scripts/ci/windows_test_scope.py",
     "scripts/ci/windows_test_scope.test.sh",
     "Cargo.toml",
@@ -35,6 +36,7 @@ PLUGIN_HOST_PATH_PREFIXES = (
 )
 PLUGIN_HOST_EXACT_PATHS = {
     ".github/workflows/ci.yml",
+    ".github/workflows/windows-tests.yml",
     "Cargo.lock",
     "Cargo.toml",
     "scripts/ci/windows_test_scope.py",
