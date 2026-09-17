@@ -416,6 +416,7 @@ mod tests {
             session_id: None,
             score: Some(1.0),
             namespace: namespace.into(),
+            principal_id: None,
             importance: None,
             superseded_by: None,
             kind: None,
