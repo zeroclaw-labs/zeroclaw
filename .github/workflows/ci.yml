@@ -575,6 +575,14 @@ jobs:
       - name: Run channel plugin activation e2e
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
         run: cargo test --locked --features plugins-wasm-cranelift --test plugin_channel_runtime_e2e
+      # Channel egress boundary proof (ADR-014 G2). A root target for the same
+      # crate-graph reason: it drives the production configured-channel path
+      # and asserts on real loopback socket hits, so this is the step that
+      # proves a granted destination is reached and an ungranted or wrong-host
+      # destination never sees a packet.
+      - name: Run channel egress boundary e2e
+        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
+        run: cargo test --locked --features plugins-wasm-cranelift --test channel_egress_e2e
 
   msrv:
     name: MSRV (declared floor)
@@ -1001,7 +1009,8 @@ jobs:
             plugin_cli_status=${PIPESTATUS[0]}
             cargo nextest run --locked --no-fail-fast \
               --features plugins-wasm-cranelift \
-              --test plugin_channel_runtime_e2e 2>&1 | tee "$plugin_root_log"
+              --test plugin_channel_runtime_e2e \
+              --test channel_egress_e2e 2>&1 | tee "$plugin_root_log"
             plugin_root_status=${PIPESTATUS[0]}
             set -e
             plugin_host_duration=$((SECONDS - plugin_started_at))
