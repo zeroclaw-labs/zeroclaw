@@ -62,6 +62,7 @@ key. Free access is rate limited. Its Streamable HTTP endpoint uses ZeroClaw's
 name = "parallel"
 transport = "http"
 url = "https://search.parallel.ai/mcp"
+headers = { "User-Agent" = "ZeroClaw" }
 
 [mcp_bundles.web]
 servers = ["parallel"]
@@ -69,6 +70,12 @@ servers = ["parallel"]
 [agents.assistant]
 mcp_bundles = ["web"]
 ```
+
+The `User-Agent` identifies ZeroClaw project-wide so Parallel can measure
+aggregate integration usage to understand adoption and support it. Keep this
+header on HTTP requests if the transport changes. Preserve existing headers;
+if you already set a `User-Agent`, append `ZeroClaw` to its existing project and
+HTTP client tokens instead of replacing them.
 
 Merge these entries into your existing `config.toml`, using the alias of the
 agent you want to grant access. Add `"web"` to that agent's existing
