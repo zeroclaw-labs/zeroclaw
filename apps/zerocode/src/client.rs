@@ -2323,9 +2323,12 @@ impl RpcClient {
         Ok(())
     }
 
-    pub async fn config_validate(&self) -> Result<ConfigValidateResult> {
-        self.call(method::CONFIG_VALIDATE, serde_json::json!({}))
-            .await
+    pub async fn config_validate(&self, agent: Option<&str>) -> Result<ConfigValidateResult> {
+        self.call(
+            method::CONFIG_VALIDATE,
+            serde_json::json!({ "agent": agent }),
+        )
+        .await
     }
 
     pub async fn config_delete(&self, prop: &str) -> Result<()> {

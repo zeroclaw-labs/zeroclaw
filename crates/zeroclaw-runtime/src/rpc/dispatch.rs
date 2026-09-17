@@ -3468,6 +3468,12 @@ impl RpcDispatcher {
 
             // Config
             Method::ConfigGet => self.handle_config_get(params),
+            // Heap-pinned like `SessionNew` below: this handler's future is
+            // one of the largest in this match (see the stack-regression
+            // test in `tests`), and an exhaustive `match` sizes its state
+            // machine to the largest inline branch regardless of which arm
+            // actually runs. Boxing keeps that branch off this function's
+            // own stack frame.
             Method::ConfigSet => Box::pin(self.handle_config_set(params)).await,
             Method::ConfigSetMany => Box::pin(self.handle_config_set_many(params)).await,
             Method::ConfigValidate => self.handle_config_validate(),
@@ -8973,9 +8979,14 @@ impl RpcDispatcher {
         Ok(())
     }
 
-    fn handle_config_validate(&self) -> RpcResult {
+    fn handle_config_validate(&self, params: &Value) -> RpcResult {
         let config = self.ctx.config.read().clone();
-        match config.validate() {
+        let validation = match params.get("agent") {
+            None | Some(Value::Null) => config.validate(),
+            Some(Value::String(alias)) => config.validate_agent(alias),
+            Some(_) => return Err(rpc_err(INVALID_PARAMS, "agent must be a string")),
+        };
+        match validation {
             Ok(()) => to_result(ConfigValidateResult {
                 valid: true,
                 error: None,
@@ -33601,6 +33612,35 @@ mod tests {
     // isolation of its own, and a successful `config/set` falls through to
     // `flush_config()` -> `save_dirty()`. Always hand it a TempDir-rooted config
     // (`make_secret_test_config`), never a bare `Config::default()`.
+
+    #[test]
+    fn config_validate_scopes_to_requested_agent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_secret_test_config(&tmp);
+        config.create_map_key("risk_profiles", "standard").unwrap();
+        config.agents.insert(
+            "alpha".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        config.agents.insert(
+            "worker".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "anthropic.default".into(),
+                risk_profile: "standard".into(),
+                ..Default::default()
+            },
+        );
+        let dispatcher = make_config_set_test_dispatcher(config);
+
+        let scoped = dispatcher
+            .handle_config_validate(&json!({ "agent": "worker" }))
+            .unwrap();
+        assert_eq!(scoped["valid"], true);
+
+        let whole = dispatcher.handle_config_validate(&json!({})).unwrap();
+        assert_eq!(whole["valid"], false);
+        assert!(whole["error"].as_str().unwrap().contains("agents.alpha"));
+    }
 
     #[tokio::test]
     async fn config_delete_refuses_agent_alias_under_destructive_lease_without_live_or_disk_mutation()

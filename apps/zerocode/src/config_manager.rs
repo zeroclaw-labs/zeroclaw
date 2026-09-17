@@ -2402,12 +2402,15 @@ impl App {
     // ── Field list ───────────────────────────────────────────────
 
     async fn complete_field_list(&mut self) -> Result<()> {
-        let is_agent_editor = matches!(
-            &self.screen,
-            Screen::FieldList { prefix, .. } if prefix.starts_with("agents.")
-        );
-        if is_agent_editor {
-            let result = self.rpc.config_validate().await?;
+        let agent_alias = match &self.screen {
+            Screen::FieldList { prefix, .. } => prefix
+                .strip_prefix("agents.")
+                .filter(|alias| !alias.is_empty())
+                .map(str::to_owned),
+            _ => None,
+        };
+        if let Some(agent_alias) = agent_alias {
+            let result = self.rpc.config_validate(Some(&agent_alias)).await?;
             if !result.valid {
                 self.status_msg = Some(crate::i18n::t_args(
                     "zc-config-status-validation-failed",
@@ -5148,18 +5151,30 @@ mod tests {
     fn test_manager_with_config_validation(
         valid: bool,
         error: Option<&str>,
-    ) -> (App, tokio::task::JoinHandle<()>) {
+    ) -> (
+        App,
+        tokio::task::JoinHandle<()>,
+        Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
         use crate::jsonrpc::RpcOutbound;
         use tokio::sync::mpsc;
 
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let outbound = Arc::new(RpcOutbound::new(tx));
         let responder = Arc::clone(&outbound);
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded_requests = Arc::clone(&requests);
         let error = error.map(str::to_string);
         let task = tokio::spawn(async move {
             while let Some(raw) = rx.recv().await {
                 let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
                 let id = request["id"].as_str().unwrap();
+                if request["method"] == "config/validate" {
+                    recorded_requests
+                        .lock()
+                        .unwrap()
+                        .push(request["params"].clone());
+                }
                 let result = match request["method"].as_str().unwrap() {
                     "config/validate" if valid => serde_json::json!({ "valid": true }),
                     "config/validate" => serde_json::json!({
@@ -5178,6 +5193,7 @@ mod tests {
                 std::path::Path::new("/tmp"),
             ),
             task,
+            requests,
         )
     }
 
@@ -5397,7 +5413,7 @@ mod tests {
     async fn agent_field_back_validates_and_stays_when_invalid() {
         let validation_error =
             "agents.worker.risk_profile must reference a configured risk profile";
-        let (mut mgr, responder) =
+        let (mut mgr, responder, requests) =
             test_manager_with_config_validation(false, Some(validation_error));
         mgr.sections = vec![entry_with_cost("agents", "")];
         mgr.screen = Screen::FieldList {
@@ -5423,12 +5439,16 @@ mod tests {
                 .as_deref()
                 .is_some_and(|message| message.contains(validation_error))
         );
+        assert_eq!(
+            requests.lock().unwrap().as_slice(),
+            &[serde_json::json!({ "agent": "worker" })]
+        );
         responder.abort();
     }
 
     #[tokio::test]
     async fn agent_field_back_validates_and_returns_to_alias_list_when_valid() {
-        let (mut mgr, responder) = test_manager_with_config_validation(true, None);
+        let (mut mgr, responder, requests) = test_manager_with_config_validation(true, None);
         mgr.sections = vec![entry_with_cost("agents", "")];
         mgr.screen = Screen::FieldList {
             section_idx: 0,
@@ -5448,13 +5468,17 @@ mod tests {
                 ..
             } if map_path == "agents"
         ));
+        assert_eq!(
+            requests.lock().unwrap().as_slice(),
+            &[serde_json::json!({ "agent": "worker" })]
+        );
         responder.abort();
     }
 
     #[tokio::test]
     async fn personality_tab_cannot_bypass_invalid_agent_completion() {
         let validation_error = "agents.worker.risk_profile is required";
-        let (mut mgr, responder) =
+        let (mut mgr, responder, _requests) =
             test_manager_with_config_validation(false, Some(validation_error));
         mgr.sections = vec![entry_with_cost("agents", "")];
         mgr.screen = Screen::FieldList {
@@ -5488,7 +5512,7 @@ mod tests {
     #[tokio::test]
     async fn skills_tab_cannot_bypass_invalid_agent_completion() {
         let validation_error = "agents.worker.model_provider is required";
-        let (mut mgr, responder) =
+        let (mut mgr, responder, _requests) =
             test_manager_with_config_validation(false, Some(validation_error));
         mgr.sections = vec![entry_with_cost("agents", "")];
         mgr.screen = Screen::FieldList {

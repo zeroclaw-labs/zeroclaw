@@ -23789,6 +23789,333 @@ impl Config {
         }
     }
 
+    /// Validate one configured agent without requiring unrelated agents to be complete.
+    pub fn validate_agent(&self, alias: &str) -> Result<()> {
+        let Some(agent) = self.agents.get(alias) else {
+            validation_bail!(
+                DanglingReference,
+                format!("agents.{alias}"),
+                "agents.{alias} is not configured",
+            );
+        };
+
+        // model_provider: mandatory, dotted `<type>.<inner>` ref into
+        // model_providers.<type>.<inner>.
+        let mp = agent.model_provider.trim();
+        if mp.is_empty() {
+            validation_bail!(
+                RequiredFieldEmpty,
+                format!("agents.{alias}.model_provider"),
+                "agents.{alias}.model_provider must reference a configured model model_provider (e.g. \"anthropic.default\")",
+            );
+        }
+        match mp.split_once('.') {
+            Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+                if !crate::providers::ModelProviders::slot_names().contains(&ty) {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("agents.{alias}.model_provider"),
+                        "agents.{alias}.model_provider = {mp:?} but {ty:?} is not a known provider family; check [providers.models.<family>.<alias>] in config.toml (valid families: `zeroclaw providers`)",
+                    );
+                }
+                let exists = self
+                    .get_map_keys(&format!("providers.models.{ty}"))
+                    .is_some_and(|keys| keys.iter().any(|k| k == inner));
+                if !exists {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("agents.{alias}.model_provider"),
+                        "agents.{alias}.model_provider = {mp:?} but [providers.models.{ty}.{inner}] is not configured",
+                    );
+                }
+            }
+            _ => validation_bail!(
+                InvalidFormat,
+                format!("agents.{alias}.model_provider"),
+                "agents.{alias}.model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
+            ),
+        }
+
+        // channels: each entry is a dotted `<type>.<inner>` ref into
+        // channels.<type>.<inner>. Empty list is valid (delegate-only agent).
+        // Uses the schema-derived `get_map_keys` so new channel types
+        // surface here automatically — no per-type match arm.
+        for (i, ch) in agent.channels.iter().enumerate() {
+            let trimmed = ch.trim();
+            match trimmed.split_once('.') {
+                Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+                    // `get_map_keys` stores section names using the raw
+                    // field ident (snake), the same dotted form the
+                    // operator sees in TOML (`gmail_push`, `voice_call`,
+                    // `nextcloud_talk`). Look up verbatim.
+                    let exists = self
+                        .get_map_keys(&format!("channels.{ty}"))
+                        .is_some_and(|keys| keys.iter().any(|k| k == inner));
+                    if !exists {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("agents.{alias}.channels[{i}]"),
+                            "agents.{alias}.channels[{i}] = {trimmed:?} but channels.{ty}.{inner} is not configured",
+                        );
+                    }
+                }
+                _ => validation_bail!(
+                    InvalidFormat,
+                    format!("agents.{alias}.channels[{i}]"),
+                    "agents.{alias}.channels[{i}] must be dotted form `<type>.<alias>` (got {trimmed:?})",
+                ),
+            }
+        }
+
+        // Per-agent provider refs that resolve into the typed provider
+        // sections. Empty = no preference for that category (no TTS / no
+        // STT for this agent), which is valid. Non-empty values must
+        // match a configured `[providers.<category>.<type>.<alias>]`
+        // entry, fail loud with the dangling ref otherwise.
+        // there is no global default-X-provider concept — every consumer
+        // either picks a configured alias or opts out entirely.
+        let typed_provider_refs: &[(&str, &str, &str)] = &[
+            ("providers.tts", "tts_provider", agent.tts_provider.trim()),
+            (
+                "providers.transcription",
+                "transcription_provider",
+                agent.transcription_provider.trim(),
+            ),
+            // New field:
+            (
+                "providers.models",
+                "classifier_provider",
+                agent.classifier_provider.trim(),
+            ),
+            // Agent-level context-compression summarizer override.
+            (
+                "providers.models",
+                "summary_provider",
+                agent.summary_provider.trim(),
+            ),
+        ];
+        for (section_prefix, field, value) in typed_provider_refs {
+            if value.is_empty() {
+                continue;
+            }
+            match value.split_once('.') {
+                Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+                    let exists = self
+                        .get_map_keys(&format!("{section_prefix}.{ty}"))
+                        .is_some_and(|keys| keys.iter().any(|k| k == inner));
+                    if !exists {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("agents.{alias}.{field}"),
+                            "agents.{alias}.{field} = {value:?} but {section_prefix}.{ty}.{inner} is not configured",
+                        );
+                    }
+                }
+                _ => validation_bail!(
+                    InvalidFormat,
+                    format!("agents.{alias}.{field}"),
+                    "agents.{alias}.{field} must be dotted form `<type>.<alias>` (got {value:?})",
+                ),
+            }
+        }
+
+        // Bare-alias bundle refs. Tuple is (kebab section path, kebab
+        // agent field name, value list). Both names use the schema's
+        // kebab form: section name matches what `get_map_keys` expects
+        // (macro converts snake→kebab via `snake_to_kebab` per
+        // crates/zeroclaw-macros/src/lib.rs:1056); field name matches
+        // what `prop_fields()` emits, so DanglingReference paths bind
+        // directly to the right inline error in the dashboard form.
+        let bare_multi: &[(&str, &str, &[String])] = &[
+            ("skill_bundles", "skill_bundles", &agent.skill_bundles),
+            (
+                "knowledge_bundles",
+                "knowledge_bundles",
+                &agent.knowledge_bundles,
+            ),
+            ("mcp_bundles", "mcp_bundles", &agent.mcp_bundles),
+        ];
+        for (section, field, values) in bare_multi {
+            for (i, key) in values.iter().enumerate() {
+                let trimmed = key.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let exists = self
+                    .get_map_keys(section)
+                    .is_some_and(|keys| keys.iter().any(|k| k == trimmed));
+                if !exists {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("agents.{alias}.{field}[{i}]"),
+                        "agents.{alias}.{field}[{i}] = {trimmed:?} but {section}.{trimmed} is not configured",
+                    );
+                }
+            }
+        }
+        let bare_single: &[(&str, &str, &str)] = &[
+            ("risk_profiles", "risk_profile", agent.risk_profile.as_str()),
+            (
+                "runtime_profiles",
+                "runtime_profile",
+                agent.runtime_profile.as_str(),
+            ),
+        ];
+        for (section, field, raw) in bare_single {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let exists = self
+                .get_map_keys(section)
+                .is_some_and(|keys| keys.iter().any(|k| k == trimmed));
+            if !exists {
+                validation_bail!(
+                    DanglingReference,
+                    format!("agents.{alias}.{field}"),
+                    "agents.{alias}.{field} = {trimmed:?} but {section}.{trimmed} is not configured",
+                );
+            }
+        }
+
+        // risk_profile is mandatory for enabled agents — there is no
+        // global fallback, so an enabled agent with no profile can't
+        // gate its actions. Run this check last so the more specific
+        // dangling/format errors above surface first.
+        if agent.enabled && agent.risk_profile.trim().is_empty() {
+            validation_bail!(
+                RequiredFieldEmpty,
+                format!("agents.{alias}.risk_profile"),
+                "agents.{alias}.risk_profile must reference a configured [risk_profiles.<alias>] entry",
+            );
+        }
+
+        // delegates: explicit roster entries must point at OTHER
+        // configured agents, never self. Cross-profile targets are
+        // permitted (they run under the target's own policy), so no
+        // profile match is required here.
+        let mut seen_delegates: std::collections::BTreeSet<&str> =
+            std::collections::BTreeSet::new();
+        for (i, target) in agent.delegates.iter().enumerate() {
+            let target_str = target.agent().trim();
+            if target_str.is_empty() {
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    format!("agents.{alias}.delegates[{i}].agent"),
+                    "agents.{alias}.delegates[{i}].agent is empty; remove it or name a configured agent",
+                );
+            }
+            if target_str == alias {
+                validation_bail!(
+                    InvalidFormat,
+                    format!("agents.{alias}.delegates[{i}].agent"),
+                    "agents.{alias}.delegates[{i}].agent = {target_str:?} names this agent itself; an agent cannot delegate to itself",
+                );
+            }
+            if !self.agents.contains_key(target_str) {
+                validation_bail!(
+                    DanglingReference,
+                    format!("agents.{alias}.delegates[{i}].agent"),
+                    "agents.{alias}.delegates[{i}].agent = {target_str:?} but agents.{target_str} is not configured",
+                );
+            }
+            if !seen_delegates.insert(target_str) {
+                validation_bail!(
+                    InvalidFormat,
+                    format!("agents.{alias}.delegates[{i}].agent"),
+                    "agents.{alias}.delegates[{i}].agent = {target_str:?} duplicates an earlier delegate target",
+                );
+            }
+        }
+
+        // workspace.access: keys must point at OTHER agents, never
+        // self, and every target must be a configured agent.
+        for (target, mode) in &agent.workspace.access {
+            let target_str = target.as_str();
+            if target_str == alias {
+                validation_bail!(
+                    InvalidFormat,
+                    format!("agents.{alias}.workspace.access.{target_str}"),
+                    "agents.{alias}.workspace.access.{target_str} = {mode:?} but {target_str} is this agent itself; an agent always has full access to its own workspace, so self-references in the cross-agent allowlist are not permitted",
+                );
+            }
+            if !self.agents.contains_key(target_str) {
+                validation_bail!(
+                    DanglingReference,
+                    format!("agents.{alias}.workspace.access.{target_str}"),
+                    "agents.{alias}.workspace.access.{target_str} = {mode:?} but agents.{target_str} is not configured",
+                );
+            }
+        }
+
+        // workspace.read_memory_from: every grant must name a configured
+        // agent, use the same MemoryBackendKind as the declaring agent,
+        // and appear at most once. Legacy string grants are unrestricted;
+        // structured grants may carry an exact category allowlist. An
+        // explicitly empty category list is invalid rather than silently
+        // becoming unrestricted. Mismatched backends fail at config load
+        // rather than producing a runtime error when the per-agent memory
+        // plumbing consumes the allowlist.
+        let agent_backend = agent.memory.backend;
+        let mut seen_memory_grants: std::collections::BTreeSet<&str> =
+            std::collections::BTreeSet::new();
+        for (i, target) in agent.workspace.read_memory_from.iter().enumerate() {
+            let target_str = target.as_str();
+            if target
+                .categories()
+                .is_some_and(|categories| categories.is_empty())
+            {
+                validation_bail!(
+                    InvalidFormat,
+                    format!("agents.{alias}.workspace.read_memory_from[{i}].categories"),
+                    "agents.{alias}.workspace.read_memory_from[{i}].categories must contain at least one category when present",
+                );
+            }
+            if !seen_memory_grants.insert(target_str) {
+                validation_bail!(
+                    InvalidFormat,
+                    format!("agents.{alias}.workspace.read_memory_from[{i}].agent"),
+                    "agents.{alias}.workspace.read_memory_from[{i}].agent = {target_str:?} duplicates an earlier memory grant; combine categories into one grant",
+                );
+            }
+            if target_str == alias {
+                validation_bail!(
+                    InvalidFormat,
+                    format!("agents.{alias}.workspace.read_memory_from[{i}]"),
+                    "agents.{alias}.workspace.read_memory_from[{i}] = {target_str:?} but {target_str} is this agent itself; an agent always sees its own memory rows, so self-references in the cross-agent allowlist are not permitted",
+                );
+            }
+            let Some(target_agent) = self.agents.get(target_str) else {
+                validation_bail!(
+                    DanglingReference,
+                    format!("agents.{alias}.workspace.read_memory_from[{i}]"),
+                    "agents.{alias}.workspace.read_memory_from[{i}] = {target_str:?} but agents.{target_str} is not configured",
+                );
+            };
+            if target.categories().is_some()
+                && matches!(
+                    agent_backend,
+                    crate::multi_agent::MemoryBackendKind::Markdown
+                )
+            {
+                validation_bail!(
+                    InvalidFormat,
+                    format!("agents.{alias}.workspace.read_memory_from[{i}].categories"),
+                    "agents.{alias}.workspace.read_memory_from[{i}] uses a category-scoped grant, but Markdown memory does not preserve per-row categories; use an unrestricted grant or a backend with category attribution",
+                );
+            }
+            if target_agent.memory.backend != agent_backend {
+                let target_backend = target_agent.memory.backend;
+                validation_bail!(
+                    InvalidFormat,
+                    format!("agents.{alias}.workspace.read_memory_from[{i}]"),
+                    "agents.{alias}.workspace.read_memory_from[{i}] points at agents.{target_str} which uses memory backend {target_backend:?}, but agents.{alias} uses {agent_backend:?}; the allowlist must point at same-backend siblings only",
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Validate configuration values that would cause runtime failures.
     ///
     /// Called after TOML deserialization and env-override application to catch
@@ -25135,329 +25462,12 @@ impl Config {
             }
         }
 
-        // Per-agent validation. Mandatory + alias-existence checks live
-        // here so the gateway PATCH path returns structured per-field
-        // errors and the frontend never owns this rule. Sorted iteration
-        // keeps error ordering stable across runs.
+        // Per-agent validation. Sorted iteration keeps whole-config error
+        // ordering stable, while `validate_agent` also supports scoped editors.
         let mut agent_aliases: Vec<&String> = self.agents.keys().collect();
         agent_aliases.sort();
         for alias in agent_aliases {
-            let agent = &self.agents[alias];
-
-            // model_provider: mandatory, dotted `<type>.<inner>` ref into
-            // model_providers.<type>.<inner>.
-            let mp = agent.model_provider.trim();
-            if mp.is_empty() {
-                validation_bail!(
-                    RequiredFieldEmpty,
-                    format!("agents.{alias}.model_provider"),
-                    "agents.{alias}.model_provider must reference a configured model model_provider (e.g. \"anthropic.default\")",
-                );
-            }
-            match mp.split_once('.') {
-                Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
-                    if !crate::providers::ModelProviders::slot_names().contains(&ty) {
-                        validation_bail!(
-                            DanglingReference,
-                            format!("agents.{alias}.model_provider"),
-                            "agents.{alias}.model_provider = {mp:?} but {ty:?} is not a known provider family; check [providers.models.<family>.<alias>] in config.toml (valid families: `zeroclaw providers`)",
-                        );
-                    }
-                    let exists = self
-                        .get_map_keys(&format!("providers.models.{ty}"))
-                        .is_some_and(|keys| keys.iter().any(|k| k == inner));
-                    if !exists {
-                        validation_bail!(
-                            DanglingReference,
-                            format!("agents.{alias}.model_provider"),
-                            "agents.{alias}.model_provider = {mp:?} but [providers.models.{ty}.{inner}] is not configured",
-                        );
-                    }
-                }
-                _ => validation_bail!(
-                    InvalidFormat,
-                    format!("agents.{alias}.model_provider"),
-                    "agents.{alias}.model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
-                ),
-            }
-
-            // channels: each entry is a dotted `<type>.<inner>` ref into
-            // channels.<type>.<inner>. Empty list is valid (delegate-only agent).
-            // Uses the schema-derived `get_map_keys` so new channel types
-            // surface here automatically — no per-type match arm.
-            for (i, ch) in agent.channels.iter().enumerate() {
-                let trimmed = ch.trim();
-                match trimmed.split_once('.') {
-                    Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
-                        // `get_map_keys` stores section names using the raw
-                        // field ident (snake), the same dotted form the
-                        // operator sees in TOML (`gmail_push`, `voice_call`,
-                        // `nextcloud_talk`). Look up verbatim.
-                        let exists = self
-                            .get_map_keys(&format!("channels.{ty}"))
-                            .is_some_and(|keys| keys.iter().any(|k| k == inner));
-                        if !exists {
-                            validation_bail!(
-                                DanglingReference,
-                                format!("agents.{alias}.channels[{i}]"),
-                                "agents.{alias}.channels[{i}] = {trimmed:?} but channels.{ty}.{inner} is not configured",
-                            );
-                        }
-                    }
-                    _ => validation_bail!(
-                        InvalidFormat,
-                        format!("agents.{alias}.channels[{i}]"),
-                        "agents.{alias}.channels[{i}] must be dotted form `<type>.<alias>` (got {trimmed:?})",
-                    ),
-                }
-            }
-
-            // Per-agent provider refs that resolve into the typed provider
-            // sections. Empty = no preference for that category (no TTS / no
-            // STT for this agent), which is valid. Non-empty values must
-            // match a configured `[providers.<category>.<type>.<alias>]`
-            // entry, fail loud with the dangling ref otherwise.
-            // there is no global default-X-provider concept — every consumer
-            // either picks a configured alias or opts out entirely.
-            let typed_provider_refs: &[(&str, &str, &str)] = &[
-                ("providers.tts", "tts_provider", agent.tts_provider.trim()),
-                (
-                    "providers.transcription",
-                    "transcription_provider",
-                    agent.transcription_provider.trim(),
-                ),
-                // New field:
-                (
-                    "providers.models",
-                    "classifier_provider",
-                    agent.classifier_provider.trim(),
-                ),
-                // Agent-level context-compression summarizer override.
-                (
-                    "providers.models",
-                    "summary_provider",
-                    agent.summary_provider.trim(),
-                ),
-            ];
-            for (section_prefix, field, value) in typed_provider_refs {
-                if value.is_empty() {
-                    continue;
-                }
-                match value.split_once('.') {
-                    Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
-                        let exists = self
-                            .get_map_keys(&format!("{section_prefix}.{ty}"))
-                            .is_some_and(|keys| keys.iter().any(|k| k == inner));
-                        if !exists {
-                            validation_bail!(
-                                DanglingReference,
-                                format!("agents.{alias}.{field}"),
-                                "agents.{alias}.{field} = {value:?} but {section_prefix}.{ty}.{inner} is not configured",
-                            );
-                        }
-                    }
-                    _ => validation_bail!(
-                        InvalidFormat,
-                        format!("agents.{alias}.{field}"),
-                        "agents.{alias}.{field} must be dotted form `<type>.<alias>` (got {value:?})",
-                    ),
-                }
-            }
-
-            // Bare-alias bundle refs. Tuple is (kebab section path, kebab
-            // agent field name, value list). Both names use the schema's
-            // kebab form: section name matches what `get_map_keys` expects
-            // (macro converts snake→kebab via `snake_to_kebab` per
-            // crates/zeroclaw-macros/src/lib.rs:1056); field name matches
-            // what `prop_fields()` emits, so DanglingReference paths bind
-            // directly to the right inline error in the dashboard form.
-            let bare_multi: &[(&str, &str, &[String])] = &[
-                ("skill_bundles", "skill_bundles", &agent.skill_bundles),
-                (
-                    "knowledge_bundles",
-                    "knowledge_bundles",
-                    &agent.knowledge_bundles,
-                ),
-                ("mcp_bundles", "mcp_bundles", &agent.mcp_bundles),
-            ];
-            for (section, field, values) in bare_multi {
-                for (i, key) in values.iter().enumerate() {
-                    let trimmed = key.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    let exists = self
-                        .get_map_keys(section)
-                        .is_some_and(|keys| keys.iter().any(|k| k == trimmed));
-                    if !exists {
-                        validation_bail!(
-                            DanglingReference,
-                            format!("agents.{alias}.{field}[{i}]"),
-                            "agents.{alias}.{field}[{i}] = {trimmed:?} but {section}.{trimmed} is not configured",
-                        );
-                    }
-                }
-            }
-            let bare_single: &[(&str, &str, &str)] = &[
-                ("risk_profiles", "risk_profile", agent.risk_profile.as_str()),
-                (
-                    "runtime_profiles",
-                    "runtime_profile",
-                    agent.runtime_profile.as_str(),
-                ),
-            ];
-            for (section, field, raw) in bare_single {
-                let trimmed = raw.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let exists = self
-                    .get_map_keys(section)
-                    .is_some_and(|keys| keys.iter().any(|k| k == trimmed));
-                if !exists {
-                    validation_bail!(
-                        DanglingReference,
-                        format!("agents.{alias}.{field}"),
-                        "agents.{alias}.{field} = {trimmed:?} but {section}.{trimmed} is not configured",
-                    );
-                }
-            }
-
-            // risk_profile is mandatory for enabled agents — there is no
-            // global fallback, so an enabled agent with no profile can't
-            // gate its actions. Run this check last so the more specific
-            // dangling/format errors above surface first.
-            if agent.enabled && agent.risk_profile.trim().is_empty() {
-                validation_bail!(
-                    RequiredFieldEmpty,
-                    format!("agents.{alias}.risk_profile"),
-                    "agents.{alias}.risk_profile must reference a configured [risk_profiles.<alias>] entry",
-                );
-            }
-
-            // delegates: explicit roster entries must point at OTHER
-            // configured agents, never self. Cross-profile targets are
-            // permitted (they run under the target's own policy), so no
-            // profile match is required here.
-            let mut seen_delegates: std::collections::BTreeSet<&str> =
-                std::collections::BTreeSet::new();
-            for (i, target) in agent.delegates.iter().enumerate() {
-                let target_str = target.agent().trim();
-                if target_str.is_empty() {
-                    validation_bail!(
-                        RequiredFieldEmpty,
-                        format!("agents.{alias}.delegates[{i}].agent"),
-                        "agents.{alias}.delegates[{i}].agent is empty; remove it or name a configured agent",
-                    );
-                }
-                if target_str == alias.as_str() {
-                    validation_bail!(
-                        InvalidFormat,
-                        format!("agents.{alias}.delegates[{i}].agent"),
-                        "agents.{alias}.delegates[{i}].agent = {target_str:?} names this agent itself; an agent cannot delegate to itself",
-                    );
-                }
-                if !self.agents.contains_key(target_str) {
-                    validation_bail!(
-                        DanglingReference,
-                        format!("agents.{alias}.delegates[{i}].agent"),
-                        "agents.{alias}.delegates[{i}].agent = {target_str:?} but agents.{target_str} is not configured",
-                    );
-                }
-                if !seen_delegates.insert(target_str) {
-                    validation_bail!(
-                        InvalidFormat,
-                        format!("agents.{alias}.delegates[{i}].agent"),
-                        "agents.{alias}.delegates[{i}].agent = {target_str:?} duplicates an earlier delegate target",
-                    );
-                }
-            }
-
-            // workspace.access: keys must point at OTHER agents, never
-            // self, and every target must be a configured agent.
-            for (target, mode) in &agent.workspace.access {
-                let target_str = target.as_str();
-                if target_str == alias.as_str() {
-                    validation_bail!(
-                        InvalidFormat,
-                        format!("agents.{alias}.workspace.access.{target_str}"),
-                        "agents.{alias}.workspace.access.{target_str} = {mode:?} but {target_str} is this agent itself; an agent always has full access to its own workspace, so self-references in the cross-agent allowlist are not permitted",
-                    );
-                }
-                if !self.agents.contains_key(target_str) {
-                    validation_bail!(
-                        DanglingReference,
-                        format!("agents.{alias}.workspace.access.{target_str}"),
-                        "agents.{alias}.workspace.access.{target_str} = {mode:?} but agents.{target_str} is not configured",
-                    );
-                }
-            }
-
-            // workspace.read_memory_from: every grant must name a configured
-            // agent, use the same MemoryBackendKind as the declaring agent,
-            // and appear at most once. Legacy string grants are unrestricted;
-            // structured grants may carry an exact category allowlist. An
-            // explicitly empty category list is invalid rather than silently
-            // becoming unrestricted. Mismatched backends fail at config load
-            // rather than producing a runtime error when the per-agent memory
-            // plumbing consumes the allowlist.
-            let agent_backend = agent.memory.backend;
-            let mut seen_memory_grants: std::collections::BTreeSet<&str> =
-                std::collections::BTreeSet::new();
-            for (i, target) in agent.workspace.read_memory_from.iter().enumerate() {
-                let target_str = target.as_str();
-                if target
-                    .categories()
-                    .is_some_and(|categories| categories.is_empty())
-                {
-                    validation_bail!(
-                        InvalidFormat,
-                        format!("agents.{alias}.workspace.read_memory_from[{i}].categories"),
-                        "agents.{alias}.workspace.read_memory_from[{i}].categories must contain at least one category when present",
-                    );
-                }
-                if !seen_memory_grants.insert(target_str) {
-                    validation_bail!(
-                        InvalidFormat,
-                        format!("agents.{alias}.workspace.read_memory_from[{i}].agent"),
-                        "agents.{alias}.workspace.read_memory_from[{i}].agent = {target_str:?} duplicates an earlier memory grant; combine categories into one grant",
-                    );
-                }
-                if target_str == alias.as_str() {
-                    validation_bail!(
-                        InvalidFormat,
-                        format!("agents.{alias}.workspace.read_memory_from[{i}]"),
-                        "agents.{alias}.workspace.read_memory_from[{i}] = {target_str:?} but {target_str} is this agent itself; an agent always sees its own memory rows, so self-references in the cross-agent allowlist are not permitted",
-                    );
-                }
-                let Some(target_agent) = self.agents.get(target_str) else {
-                    validation_bail!(
-                        DanglingReference,
-                        format!("agents.{alias}.workspace.read_memory_from[{i}]"),
-                        "agents.{alias}.workspace.read_memory_from[{i}] = {target_str:?} but agents.{target_str} is not configured",
-                    );
-                };
-                if target.categories().is_some()
-                    && matches!(
-                        agent_backend,
-                        crate::multi_agent::MemoryBackendKind::Markdown
-                    )
-                {
-                    validation_bail!(
-                        InvalidFormat,
-                        format!("agents.{alias}.workspace.read_memory_from[{i}].categories"),
-                        "agents.{alias}.workspace.read_memory_from[{i}] uses a category-scoped grant, but Markdown memory does not preserve per-row categories; use an unrestricted grant or a backend with category attribution",
-                    );
-                }
-                if target_agent.memory.backend != agent_backend {
-                    let target_backend = target_agent.memory.backend;
-                    validation_bail!(
-                        InvalidFormat,
-                        format!("agents.{alias}.workspace.read_memory_from[{i}]"),
-                        "agents.{alias}.workspace.read_memory_from[{i}] points at agents.{target_str} which uses memory backend {target_backend:?}, but agents.{alias} uses {agent_backend:?}; the allowlist must point at same-backend siblings only",
-                    );
-                }
-            }
+            self.validate_agent(alias)?;
         }
 
         // Peer groups: every member alias must exist as a configured
@@ -25958,6 +25968,74 @@ impl Config {
         edited_field != error_field
     }
 
+    fn validate_edited_agent_required_reference(&self, path: &str) -> Result<()> {
+        let Some((alias, field)) = Self::agent_required_field(path) else {
+            return Ok(());
+        };
+        let Some(agent) = self.agents.get(alias) else {
+            validation_bail!(
+                DanglingReference,
+                format!("agents.{alias}"),
+                "agents.{alias} is not configured"
+            );
+        };
+        match field {
+            "model_provider" => {
+                let value = agent.model_provider.trim();
+                if value.is_empty() {
+                    validation_bail!(
+                        RequiredFieldEmpty,
+                        path,
+                        "{path} must reference a configured model provider"
+                    );
+                }
+                let Some((family, provider_alias)) = value.split_once(".") else {
+                    validation_bail!(
+                        InvalidFormat,
+                        path,
+                        "{path} must be dotted form `<type>.<alias>` (got {value:?})"
+                    );
+                };
+                let exists = crate::providers::ModelProviders::slot_names().contains(&family)
+                    && self
+                        .get_map_keys(&format!("providers.models.{family}"))
+                        .is_some_and(|keys| keys.iter().any(|key| key == provider_alias));
+                if !exists {
+                    validation_bail!(
+                        DanglingReference,
+                        path,
+                        "{path} = {value:?} does not reference a configured model provider"
+                    );
+                }
+            }
+            "risk_profile" => {
+                let value = agent.risk_profile.trim();
+                if value.is_empty() {
+                    if agent.enabled {
+                        validation_bail!(
+                            RequiredFieldEmpty,
+                            path,
+                            "{path} must reference a configured risk profile"
+                        );
+                    }
+                    return Ok(());
+                }
+                let exists = self
+                    .get_map_keys("risk_profiles")
+                    .is_some_and(|keys| keys.iter().any(|key| key == value));
+                if !exists {
+                    validation_bail!(
+                        DanglingReference,
+                        path,
+                        "{path} = {value:?} but risk_profiles.{value} is not configured"
+                    );
+                }
+            }
+            _ => unreachable!("agent_required_field returned an unsupported field"),
+        }
+        Ok(())
+    }
+
     fn agent_required_field(path: &str) -> Option<(&str, &str)> {
         let mut parts = path.split('.');
         let (Some("agents"), Some(agent), Some(field), None) =
@@ -25975,6 +26053,7 @@ impl Config {
     pub fn set_prop_persistent_validated(&mut self, name: &str, value_str: &str) -> Result<()> {
         let mut candidate = self.clone();
         candidate.set_prop_persistent(name, value_str)?;
+        candidate.validate_edited_agent_required_reference(name)?;
         if let Err(error) = candidate.validate() {
             let api_error = crate::api_error::ConfigApiError::from_validation(error);
             if !Self::is_complementary_required_agent_field(name, &api_error) {
@@ -31084,6 +31163,22 @@ enabled = true
     }
 
     #[test]
+    async fn validate_agent_ignores_other_incomplete_agents() {
+        let mut config = staged_agent_repair_config();
+        config
+            .agents
+            .insert("alpha".to_string(), AliasedAgentConfig::default());
+        config.agents.get_mut("worker").unwrap().model_provider = "openai.primary".into();
+        config.agents.get_mut("worker").unwrap().risk_profile = "standard".into();
+
+        config
+            .validate_agent("worker")
+            .expect("the selected complete agent should validate independently");
+        assert!(config.validate_agent("alpha").is_err());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     async fn set_prop_persistent_validated_allows_provider_first_agent_repair() {
         let mut config = staged_agent_repair_config();
 
@@ -31138,6 +31233,51 @@ enabled = true
             config.agents["worker"].risk_profile, "",
             "a rejected write must not persist a dangling reference"
         );
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_rejects_dangling_risk_profile_without_any_provider() {
+        let mut config: Config = toml::from_str(
+            r#"
+                [risk_profiles.standard]
+                level = "supervised"
+            "#,
+        )
+        .unwrap();
+        config
+            .agents
+            .insert("worker".to_string(), AliasedAgentConfig::default());
+        let agents_before = toml::to_string(&config.agents).unwrap();
+        let dirty_before = config.dirty_paths.clone();
+
+        let err = config
+            .set_prop_persistent_validated("agents.worker.risk_profile", "does-not-exist")
+            .expect_err("the edited risk profile must be checked without a provider placeholder");
+
+        assert!(err.to_string().contains("does-not-exist"));
+        assert_eq!(toml::to_string(&config.agents).unwrap(), agents_before);
+        assert_eq!(config.dirty_paths, dirty_before);
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_allows_valid_risk_profile_without_any_provider() {
+        let mut config: Config = toml::from_str(
+            r#"
+                [risk_profiles.standard]
+                level = "supervised"
+            "#,
+        )
+        .unwrap();
+        config
+            .agents
+            .insert("worker".to_string(), AliasedAgentConfig::default());
+
+        config
+            .set_prop_persistent_validated("agents.worker.risk_profile", "standard")
+            .expect("a valid edited reference should remain a supported staged write");
+
+        assert_eq!(config.agents["worker"].risk_profile, "standard");
+        assert!(config.validate().is_err());
     }
 
     #[test]
