@@ -1854,7 +1854,11 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Remote media is also accepted via http:// or https:// URLs in the same marker form.\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - When you receive a [Voice message], the user spoke to you. Respond naturally as in conversation.\n\
-             - Your text reply will automatically be converted to audio and sent back as a voice message.\n",
+             - Your text reply will automatically be converted to audio and sent back as a voice message.\n\
+             - When a question needs current, real-time, or external information \
+               (prices, news, weather, web pages, lookups, etc.), use your tools — \
+               e.g. web_research and web_fetch — to obtain it before answering; \
+               never guess or answer from memory alone when a tool can verify it.\n",
         ),
         "discord" => Some(
             "When responding on Discord:\n\
@@ -1865,7 +1869,11 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Remote media is also accepted via http:// or https:// URLs in the same marker form.\n\
              - For a rich embed, emit [EMBED:{...}] where {...} is a Discord embed JSON object (keys: title, description, url, color, timestamp, footer{text,icon_url}, image, thumbnail, author{name,url,icon_url}, fields[{name,value,inline}]). Any image/thumbnail/icon/url MUST be an http(s) URL; local paths are not embeddable. Keep the JSON on one line.\n\
              - To offer interactive buttons or a menu, emit one marker [COMPONENTS:{\"rows\":[[<component>, ...], ...]}] on a single line (up to 5 rows; a row holds up to 5 buttons OR exactly one select). Action button: {\"label\":\"Approve\",\"style\":\"primary|secondary|success|danger\",\"prompt\":\"<text run as a new turn when clicked>\"}; link button: {\"label\":\"Docs\",\"url\":\"https://...\"}; select: {\"select\":\"placeholder\",\"options\":[{\"label\":\"A\",\"value\":\"a\",\"prompt\":\"<run when chosen>\"}, ...]}. A button may instead carry a modal (a popup form) in place of prompt/url: {\"label\":\"Report\",\"style\":\"danger\",\"prompt\":\"<run on submit>\",\"modal\":{\"title\":\"Report\",\"fields\":[{\"id\":\"reason\",\"label\":\"Reason\",\"style\":\"short|paragraph\",\"required\":true,\"placeholder\":\"...\",\"min\":1,\"max\":500}]}} — clicking opens the form and the typed field values are appended to that button's prompt when submitted. Every action button and select option needs a prompt describing what should happen when it is clicked.\n\
-             - Keep normal text outside markers and never wrap markers in code fences.\n",
+             - Keep normal text outside markers and never wrap markers in code fences.\n\
+             - When a question needs current, real-time, or external information \
+               (prices, news, weather, web pages, lookups, etc.), use your tools — \
+               e.g. web_research and web_fetch — to obtain it before answering; \
+               never guess or answer from memory alone when a tool can verify it.\n",
         ),
         "whatsapp" | "whatsapp-web" => Some(
             "When responding on WhatsApp Web:\n\
@@ -1877,7 +1885,11 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - To send a native location pin, use marker: [LOCATION:<latitude>,<longitude>,<name>,<address>] where name and address are optional. Double-quote the name if it contains commas; the trailing address may contain commas without quoting.\n\
              - Marker paths must refer to local files inside the configured workspace directory. Absolute paths and workspace-relative paths are accepted when they stay inside that workspace.\n\
              - Do not use http://, https://, data:, file:, or any other URL scheme in WhatsApp Web media markers.\n\
-             - Keep normal text outside markers and never wrap markers in code fences.\n",
+             - Keep normal text outside markers and never wrap markers in code fences.\n\
+             - When a question needs current, real-time, or external information \
+               (prices, news, weather, web pages, lookups, etc.), use your tools — \
+               e.g. web_research and web_fetch — to obtain it before answering; \
+               never guess or answer from memory alone when a tool can verify it.\n",
         ),
         "lark" | "feishu" => Some(
             "When responding on Lark/Feishu:\n\
@@ -1888,7 +1900,11 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - For media attachments use markers: [IMAGE:<path>], [DOCUMENT:<path>], [VIDEO:<path>], [AUDIO:<path>], or [VOICE:<path>]\n\
              - Marker paths must refer to local files inside the configured workspace directory. Absolute paths and workspace-relative paths are accepted when they stay inside that workspace.\n\
              - Do not use http://, https://, data:, file:, or any other URL scheme in Lark/Feishu media markers.\n\
-             - Keep normal text outside markers and never wrap markers, tool output, or protocol markup in code fences.\n",
+             - Keep normal text outside markers and never wrap markers, tool output, or protocol markup in code fences.\n\
+             - When a question needs current, real-time, or external information \
+               (prices, news, weather, web pages, lookups, etc.), use your tools — \
+               e.g. web_research and web_fetch — to obtain it before answering; \
+               never guess or answer from memory alone when a tool can verify it.\n",
         ),
         "telegram" => Some(
             "When responding on Telegram:\n\
@@ -1904,7 +1920,7 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - When a question needs current, real-time, or external information \
                (prices, news, weather, web pages, lookups, etc.), use your tools — \
-               e.g. web_search_tool and web_fetch — to obtain it before answering; \
+               e.g. web_research and web_fetch — to obtain it before answering; \
                never guess or answer from memory alone when a tool can verify it.\n\
              - Present the final answer to the latest user message directly from the \
                tool results, without narrating delayed/internal tool-execution bookkeeping.",
@@ -1916,7 +1932,11 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], \
                [VIDEO:<path-or-url>], [VOICE:<path-or-url>]\n\
              - Voice supports .wav, .mp3, .silk formats only. Other audio formats use [DOCUMENT:]\n\
-             - Keep normal text outside markers and never wrap markers in code fences.\n",
+             - Keep normal text outside markers and never wrap markers in code fences.\n\
+             - When a question needs current, real-time, or external information \
+               (prices, news, weather, web pages, lookups, etc.), use your tools — \
+               e.g. web_research and web_fetch — to obtain it before answering; \
+               never guess or answer from memory alone when a tool can verify it.\n",
         ),
         "wechat" => Some(
             "When responding on WeChat:\n\
@@ -1924,13 +1944,21 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], \
                [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n\
-             - Use absolute local paths when sending generated files whenever possible.\n",
+             - Use absolute local paths when sending generated files whenever possible.\n\
+             - When a question needs current, real-time, or external information \
+               (prices, news, weather, web pages, lookups, etc.), use your tools — \
+               e.g. web_research and web_fetch — to obtain it before answering; \
+               never guess or answer from memory alone when a tool can verify it.\n",
         ),
         "wecom_ws" => Some(
             "When responding on WeCom AI Bot WebSocket:\n\
              - Be concise and direct\n\
              - Use Markdown text; the channel sends progressive draft updates when enabled\n\
-             - Do not use local attachment markers; outbound image payloads are not supported yet.\n",
+             - Do not use local attachment markers; outbound image payloads are not supported yet.\n\
+             - When a question needs current, real-time, or external information \
+               (prices, news, weather, web pages, lookups, etc.), use your tools — \
+               e.g. web_research and web_fetch — to obtain it before answering; \
+               never guess or answer from memory alone when a tool can verify it.\n",
         ),
         _ => None,
     }
@@ -6742,7 +6770,6 @@ const MATRIX_REQUIRED_SAFE_TOOL_ARGUMENTS: &[(&[&str], &[&str])] = &[
     (&["proxy_config"], &["action", "scope"]),
     (&["browser"], &["action"]),
     (&["http_request"], &["method"]),
-    (&["web_search_tool"], &["query"]),
     (&["image_info"], &["path"]),
     (&["canvas"], &["action"]),
     (&["backup"], &[]),
@@ -6766,6 +6793,7 @@ const MATRIX_REQUIRED_SAFE_TOOL_ARGUMENTS: &[(&[&str], &[&str])] = &[
 // same presentation policy, but the default registry used by the drift test
 // intentionally does not construct them.
 const MATRIX_OPTIONAL_SAFE_TOOL_ARGUMENTS: &[(&[&str], &[&str])] = &[
+    (&["web_research"], &["question"]),
     (
         &["delegate"],
         &["action", "agent", "background", "timeout_ms"],
@@ -35583,7 +35611,7 @@ BTC is currently around $65,000 based on latest tool output."#
             "telegram block must instruct the model to use its tools"
         );
         assert!(
-            block.contains("web_search_tool") && block.contains("web_fetch"),
+            block.contains("web_research") && block.contains("web_fetch"),
             "telegram block must name the real-time tools so the model knows to reach for them"
         );
         assert!(
