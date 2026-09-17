@@ -1316,7 +1316,7 @@ jobs:
           wf='^\.github/workflows/ci\.yml$'
           emit docs     "\.mdx?$|^docs/|^\.markdownlint-cli2\.yaml$|^scripts/ci/(check_internal_docs_links(_test)?\.py|docs_(quality_gate|links_gate)\.sh)$|${wf}"
           emit nix      "\.nix$|^flake\.(nix|lock)$|^nix/|${wf}"
-          emit nix_hash "(^|/)Cargo\.(toml|lock)$|^nix/hashes\.json$|^scripts/ci/list_git_dep_keys\.py$|${wf}"
+          emit nix_hash "(^|/)Cargo\.(toml|lock)$|^nix/hashes\.json$|^scripts/ci/list_git_dep_keys(_test)?\.py$|${wf}"
           # The generated dashboard contract includes schemas owned by the
           # config, runtime, and SOP graph crates and is rendered by the xtask generator.
           # Keep this trigger aligned with every source that can change it.
@@ -1345,39 +1345,10 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Test Nix hash drift detection
+        run: python3 scripts/ci/list_git_dep_keys_test.py
       - name: Validate nix/hashes.json matches Cargo.lock git deps
-        run: |
-          set -euo pipefail
-          if [[ ! -f Cargo.lock ]]; then
-            echo "Cargo.lock not found; nothing to check."
-            exit 0
-          fi
-          # Extract git-dep keys from Cargo.lock using the same Python
-          # logic as refresh-nix-hashes.sh.
-          python3 scripts/ci/list_git_dep_keys.py > /tmp/lock_keys.json
-          LOCK_COUNT=$(jq length /tmp/lock_keys.json)
-          echo "Found $LOCK_COUNT git-sourced package(s) in Cargo.lock."
-          if [[ "$LOCK_COUNT" -eq 0 ]]; then
-            echo "No git deps; nothing to check."
-            exit 0
-          fi
-          if [[ ! -f nix/hashes.json ]]; then
-            echo "error: nix/hashes.json not found — git deps present but no hashes file."
-            exit 1
-          fi
-          HASH_KEYS=$(jq 'keys' nix/hashes.json)
-          MISSING=$(jq -n --argjson lock "$(cat /tmp/lock_keys.json)" \
-            --argjson hash "$HASH_KEYS" \
-            '$lock - $hash')
-          MISSING_COUNT=$(echo "$MISSING" | jq length)
-          if [[ "$MISSING_COUNT" -gt 0 ]]; then
-            echo "error: $MISSING_COUNT git-dep hash(es) missing from nix/hashes.json:"
-            echo "$MISSING" | jq -r '.[]'
-            echo ""
-            echo "Run scripts/dev/refresh-nix-hashes.sh and commit the result."
-            exit 1
-          fi
-          echo "All git deps have hashes in nix/hashes.json."
+        run: python3 scripts/ci/list_git_dep_keys.py --check-hashes nix/hashes.json
 
   docs-style:
     name: Docs Style

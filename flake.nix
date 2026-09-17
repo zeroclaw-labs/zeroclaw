@@ -11,6 +11,10 @@
   outputs = { flake-utils, fenix, nixpkgs, ... }:
     let
       nixosModule = { pkgs, ... }: {
+        # These evaluation-only hosts have no physical root disk or bootloader.
+        boot.loader.grub.enable = false;
+        fileSystems."/" = { device = "none"; fsType = "tmpfs"; };
+        system.stateVersion = "26.05";
         nixpkgs.overlays = [ fenix.overlays.default ];
         environment.systemPackages = [
           (pkgs.fenix.stable.withComponents [
