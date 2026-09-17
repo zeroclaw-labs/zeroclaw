@@ -41,6 +41,10 @@ The durable rule is that authorized channel relationships are explicit. The curr
 
 Cross-agent channel messaging currently requires a shared peer-group relationship on the relevant channel. Peer groups are mutual routing and inbound-acceptance boundaries; agents outside that relationship do not become reachable merely because they are configured in the same install.
 
+An enabled channel reference has exactly one enabled owning agent. Configuration
+validation rejects duplicate claims instead of choosing different owners for
+routing, workspace selection, slash commands, and tool authorization.
+
 For compatibility, the runtime deterministically assigns channel ownership when no configured agent declares any channel binding. That fallback preserves older installs; it does not establish implicit sharing as the multi-agent contract.
 
 Delegation and other cross-agent capabilities may impose additional gates. This ADR does not make peer-group membership a universal authorization mechanism for every capability.

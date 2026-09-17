@@ -205,6 +205,8 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
     let mut init_defaults_ops = Vec::new();
 
     let mut map_key_section_entries: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut map_alias_entry_arms: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut map_alias_entry_recurse: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut get_map_keys_arms: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut create_map_key_arms: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut delete_map_key_arms: Vec<proc_macro2::TokenStream> = Vec::new();
@@ -222,6 +224,22 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
 
     let mut secret_terminal_pushes: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut secret_terminal_recurse: Vec<proc_macro2::TokenStream> = Vec::new();
+
+    // Live `enabled` projection for this section, read straight off the field.
+    // Sections without a plain `enabled: bool` switch report `None` so callers
+    // can tell "declares no switch" from "switched off".
+    let declares_enabled_switch = fields.iter().any(|field| {
+        field
+            .ident
+            .as_ref()
+            .is_some_and(|ident| ident == "enabled" && !has_attr(field, "secret"))
+            && field.ty.to_token_stream().to_string() == "bool"
+    });
+    let enabled_flag_body = if declares_enabled_switch {
+        quote! { Some(self.enabled) }
+    } else {
+        quote! { None }
+    };
 
     for field in fields {
         let field_ident = field.ident.as_ref().expect("Named field must have ident");
@@ -1013,6 +1031,27 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                 }
                                 self.#field_ident.insert(map_key.to_string(), <#value_ty>::default());
                                 return Ok(true);
+                            }
+                        }
+                    });
+
+                    // Typed alias walk for single-level HashMap: the map and
+                    // each block's own `enabled` switch, read in place. No
+                    // serialization, so bounded-stack callers can use it.
+                    map_alias_entry_arms.push(quote! {
+                        {
+                            let prefix = Self::configurable_prefix();
+                            let section = if prefix.is_empty() {
+                                #field_name_lit.to_string()
+                            } else {
+                                format!("{prefix}.{}", #field_name_lit)
+                            };
+                            for (map_key, inner) in &self.#field_ident {
+                                out.push(crate::config::MapAliasEntry {
+                                    section: section.clone(),
+                                    alias: map_key.clone(),
+                                    enabled: inner.enabled_flag(),
+                                });
                             }
                         }
                     });
@@ -1873,6 +1912,9 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         return Some(keys);
                     }
                 });
+                map_alias_entry_recurse.push(quote! {
+                    out.extend(self.#field_ident.map_alias_entries());
+                });
                 create_map_key_recurse.push(quote! {
                     match self.#field_ident.create_map_key(section_path, map_key) {
                         Ok(created) => return Ok(created),
@@ -2208,6 +2250,26 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 let mut out: Vec<crate::config::MapKeySection> = Vec::new();
                 #(#map_key_section_entries)*
                 #(#map_key_recurse)*
+                out
+            }
+
+            /// Live value of this section's own `enabled` switch, or `None`
+            /// when the type declares no `enabled: bool` field.
+            #[must_use]
+            pub fn enabled_flag(&self) -> Option<bool> {
+                #enabled_flag_body
+            }
+
+            /// Walk every populated map-keyed (`HashMap<String, T>`) block
+            /// reachable from this Configurable, reading the typed maps in
+            /// place. Unlike `prop_fields`, this never serializes the
+            /// receiver, so callers on a bounded stack (RPC handlers, tool
+            /// registration) can enumerate aliases safely.
+            #[must_use]
+            pub fn map_alias_entries(&self) -> Vec<crate::config::MapAliasEntry> {
+                let mut out: Vec<crate::config::MapAliasEntry> = Vec::new();
+                #(#map_alias_entry_arms)*
+                #(#map_alias_entry_recurse)*
                 out
             }
 
