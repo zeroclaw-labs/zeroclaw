@@ -69,7 +69,7 @@ pub(crate) use results_collect::{
 pub use steering::drain_steering_messages;
 #[cfg(test)]
 pub(crate) use stream_consume::consume_provider_streaming_response;
-pub(crate) use tool_specs::{IterationToolSpecs, build_iteration_tool_specs};
+pub(crate) use tool_specs::build_iteration_tool_specs;
 pub(crate) use vision_route::{prepare_messages_for_iteration, resolve_vision_provider};
 
 use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
@@ -132,6 +132,14 @@ fn refresh_scoped_tool_protocol_prompt(
     request_messages: &mut [ChatMessage],
     use_native_tools: bool,
 ) {
+    refresh_scoped_history_tool_protocol_prompt(history, use_native_tools);
+    refresh_scoped_request_tool_protocol_prompt(request_messages, use_native_tools);
+}
+
+fn refresh_scoped_history_tool_protocol_prompt(
+    history: &mut [ChatMessage],
+    use_native_tools: bool,
+) {
     let _ = TOOL_PROTOCOL_PROMPTS.try_with(|prompts| {
         if let Some(system) = history.iter_mut().find(|message| message.role == "system") {
             replace_tool_protocol_section(
@@ -140,6 +148,14 @@ fn refresh_scoped_tool_protocol_prompt(
                 use_native_tools,
             );
         }
+    });
+}
+
+fn refresh_scoped_request_tool_protocol_prompt(
+    request_messages: &mut [ChatMessage],
+    use_native_tools: bool,
+) {
+    let _ = TOOL_PROTOCOL_PROMPTS.try_with(|prompts| {
         if let Some(system) = request_messages
             .iter_mut()
             .find(|message| message.role == "system")
@@ -179,6 +195,38 @@ fn replace_tool_protocol_section(
     if !use_native_tools && !text_tools_section.is_empty() {
         let insertion = prompt.find("## Safety").unwrap_or(prompt.len());
         prompt.insert_str(insertion, &format!("{text_tools_section}\n\n"));
+    }
+}
+
+fn custom_native_tools_fallback_warning(alias: &str) -> String {
+    format!(
+        "Native tool calling failed for custom provider alias `{alias}`; this turn fell back to prompt-guided tools. Set `[providers.models.custom.{alias}] native_tools = false` to skip the failing native request next time."
+    )
+}
+
+fn ensure_prompt_guided_tool_instructions(
+    request_messages: &mut Vec<ChatMessage>,
+    tools: &[crate::tools::ToolSpec],
+) {
+    if tools.is_empty()
+        || request_messages
+            .iter()
+            .any(|message| message.role == "system" && message.content.contains("## Tools"))
+    {
+        return;
+    }
+
+    let instructions = zeroclaw_api::model_provider::build_tool_instructions_text(tools);
+    if let Some(system_message) = request_messages
+        .iter_mut()
+        .find(|message| message.role == "system")
+    {
+        if !system_message.content.is_empty() {
+            system_message.content.push_str("\n\n");
+        }
+        system_message.content.push_str(&instructions);
+    } else {
+        request_messages.insert(0, ChatMessage::system(instructions));
     }
 }
 
@@ -813,11 +861,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             active_model
         };
         iteration_tool_specs.refresh_native_tool_mode(active_model_provider, protocol_model);
-        let IterationToolSpecs {
-            ref tool_specs,
-            use_native_tools,
-            ..
-        } = iteration_tool_specs;
+        let use_native_tools = iteration_tool_specs.use_native_tools;
 
         // For scoped direct Agent turns, the hook can choose a different routed
         // model. Every protocol-bearing surface follows that dispatched model.
@@ -831,6 +875,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             use_native_tools,
         );
 
+        let mut prompt_guided_provider_request_messages = None;
+        if use_native_tools {
+            let mut messages = provider_request_messages.clone();
+            refresh_prompt_anchor(&mut messages, false);
+            refresh_scoped_request_tool_protocol_prompt(&mut messages, false);
+            ensure_prompt_guided_tool_instructions(&mut messages, &iteration_tool_specs.tool_specs);
+            prompt_guided_provider_request_messages = Some(messages);
+        }
+
         // Fail closed on the local budget BEFORE announcing the request.
         // `announce_llm_request` emits the user-visible `WaitingOnModel`
         // state, and a rejected turn never reaches the provider — announcing
@@ -839,7 +892,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         enforce_tool_loop_budget()?;
 
         if strict_tool_parsing
-            && !tool_specs.is_empty()
+            && !iteration_tool_specs.tool_specs.is_empty()
             && active_model_provider.has_mixed_native_tool_support_for_model(protocol_model)
         {
             return Err(zeroclaw_providers::ProviderCapabilityError {
@@ -865,7 +918,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // Unified path via ModelProvider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
         let request_tools = if use_native_tools {
-            Some(tool_specs.as_slice())
+            Some(iteration_tool_specs.tool_specs.as_slice())
         } else {
             None
         };
@@ -894,7 +947,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         "active_provider_supports_native_tools": active_provider_supports_native_tools,
                         "active_provider_supports_streaming": active_provider_supports_streaming,
                         "active_provider_supports_streaming_tool_events": active_provider_supports_streaming_tool_events,
-                        "tool_specs_count": tool_specs.len(),
+                        "tool_specs_count": iteration_tool_specs.tool_specs.len(),
                         "request_tools_count": request_tool_count,
                         "use_native_tools": use_native_tools,
                         "should_consume_provider_stream": should_consume_provider_stream,
@@ -903,16 +956,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             );
         }
 
-        let ProviderCallOutcome {
-            chat_result,
-            attempts,
-            accepted_route,
-            streamed_live_deltas,
-            streamed_protocol_suppressed,
-            streamed_visible_text,
-        } = call_provider(
+        let mut provider_call_outcome = call_provider(
             &ctx,
             active_model_provider,
+            active_model_provider_name,
             provider_request_model,
             &provider_request_messages,
             request_tools,
@@ -920,6 +967,82 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             iteration,
         )
         .await?;
+        if let Some(err) = provider_call_outcome.chat_result.as_ref().err()
+            && request_tools.is_some()
+            && let Some(alias) = provider_call::custom_provider_alias(active_model_provider_name)
+            && zeroclaw_providers::rejects_native_tool_calling(err.as_ref())
+        {
+            let mut fallback_messages = prompt_guided_provider_request_messages
+                .take()
+                .unwrap_or_else(|| provider_request_messages.clone());
+            refresh_prompt_anchor(&mut fallback_messages, false);
+            refresh_scoped_request_tool_protocol_prompt(&mut fallback_messages, false);
+            ensure_prompt_guided_tool_instructions(
+                &mut fallback_messages,
+                &iteration_tool_specs.tool_specs,
+            );
+            let warning = custom_native_tools_fallback_warning(alias);
+            ctx.observer
+                .record_event(&zeroclaw_api::observability_traits::ObserverEvent::Error {
+                    component: "model_provider".to_string(),
+                    message: warning.clone(),
+                });
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Retry)
+                    .with_category(::zeroclaw_log::EventCategory::Provider)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "model_provider": active_model_provider_name,
+                        "alias": alias,
+                        "model": provider_request_model,
+                        "iteration": iteration + 1,
+                        "config_key": format!("[providers.models.custom.{alias}] native_tools = false"),
+                        "error": scrub_credentials(&err.to_string()),
+                        "trace_id": turn_id,
+                    })),
+                &warning
+            );
+            if let Some(ref tx) = on_delta {
+                let _ = tx
+                    .send(StreamDelta::Status(format!("Warning: {warning}\n")))
+                    .await;
+            }
+
+            let mut fallback_outcome = call_provider(
+                &ctx,
+                active_model_provider,
+                active_model_provider_name,
+                provider_request_model,
+                &fallback_messages,
+                None,
+                false,
+                iteration,
+            )
+            .await?;
+            provider_call_outcome
+                .attempts
+                .append(&mut fallback_outcome.attempts);
+            provider_call_outcome.chat_result = fallback_outcome.chat_result;
+            provider_call_outcome.accepted_route = fallback_outcome.accepted_route;
+            provider_call_outcome.streamed_live_deltas = fallback_outcome.streamed_live_deltas;
+            provider_call_outcome.streamed_protocol_suppressed =
+                fallback_outcome.streamed_protocol_suppressed;
+            provider_call_outcome.streamed_visible_text = fallback_outcome.streamed_visible_text;
+            provider_request_messages = fallback_messages;
+            iteration_tool_specs.use_native_tools = false;
+            refresh_prompt_anchor(turn_state.history, false);
+            refresh_scoped_history_tool_protocol_prompt(turn_state.history, false);
+        }
+        let ProviderCallOutcome {
+            chat_result,
+            attempts,
+            accepted_route,
+            streamed_live_deltas,
+            streamed_protocol_suppressed,
+            streamed_visible_text,
+        } = provider_call_outcome;
+        let use_native_tools = iteration_tool_specs.use_native_tools;
 
         // Reliable reports its actually served candidate; direct providers
         // intentionally retain the requested route as the accounting fallback.
@@ -2556,6 +2679,254 @@ mod surface3_tests {
         let mut history: Vec<ChatMessage> = Vec::new();
         refresh_prompt_anchor(&mut history, false);
         // Just verifying no panic.
+    }
+}
+
+#[cfg(test)]
+mod native_tool_fallback_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::net::TcpListener;
+    use zeroclaw_api::attribution::{Role, ToolKind};
+    use zeroclaw_api::tool::ToolResult;
+    use zeroclaw_config::schema::{
+        MultimodalConfig, PacingConfig, RiskProfileConfig, SkillsPromptInjectionMode,
+    };
+    use zeroclaw_providers::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
+
+    struct LookupStatusTool;
+
+    #[async_trait]
+    impl crate::tools::Tool for LookupStatusTool {
+        fn name(&self) -> &str {
+            "lookup_status"
+        }
+
+        fn description(&self) -> &str {
+            "Look up current status"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {},
+            })
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
+            Ok(ToolResult::ok("unused"))
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for LookupStatusTool {
+        fn role(&self) -> Role {
+            Role::Tool(ToolKind::Plugin)
+        }
+
+        fn alias(&self) -> &str {
+            <Self as crate::tools::Tool>::name(self)
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_native_tools_rejection_falls_back_to_prompt_guided_tools_with_alias_warning() {
+        let native_attempts = Arc::new(AtomicUsize::new(0));
+        let prompt_guided_attempts = Arc::new(AtomicUsize::new(0));
+        let saw_prompt_guided_tools = Arc::new(AtomicBool::new(false));
+        let native_attempts_for_route = Arc::clone(&native_attempts);
+        let prompt_guided_attempts_for_route = Arc::clone(&prompt_guided_attempts);
+        let saw_prompt_guided_tools_for_route = Arc::clone(&saw_prompt_guided_tools);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let native_attempts = Arc::clone(&native_attempts_for_route);
+                let prompt_guided_attempts = Arc::clone(&prompt_guided_attempts_for_route);
+                let saw_prompt_guided_tools = Arc::clone(&saw_prompt_guided_tools_for_route);
+                async move {
+                    let carries_native_tools = body
+                        .get("tools")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|tools| !tools.is_empty())
+                        || body
+                            .get("tool_choice")
+                            .is_some_and(|value| !value.is_null());
+                    if carries_native_tools {
+                        native_attempts.fetch_add(1, Ordering::Relaxed);
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": {
+                                    "message": "tools are not supported by this endpoint"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+
+                    prompt_guided_attempts.fetch_add(1, Ordering::Relaxed);
+                    let saw_tools = body
+                        .get("messages")
+                        .and_then(serde_json::Value::as_array)
+                        .and_then(|messages| messages.first())
+                        .and_then(|message| message.get("content"))
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|content| {
+                            content.contains("## Tools") && content.contains("lookup_status")
+                        });
+                    saw_prompt_guided_tools.store(saw_tools, Ordering::Relaxed);
+
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "choices": [{
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "completed on prompt-guided tools"
+                                }
+                            }]
+                        })),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind custom compatible endpoint");
+        let addr = listener
+            .local_addr()
+            .expect("read custom compatible endpoint address");
+        let _server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve custom compatible endpoint");
+        });
+        let provider = OpenAiCompatibleModelProvider::builder("rejector")
+            .display_name("Custom")
+            .base_url(&format!("http://{addr}"))
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .build();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                LookupStatusTool,
+            )]);
+        let observer = crate::observability::NoopObserver;
+        let multimodal = MultimodalConfig::default();
+        let pacing = PacingConfig::default();
+        let knobs = LoopKnobs::default();
+        let risk_profile = RiskProfileConfig::default();
+        let native_prompt = crate::agent::loop_::build_system_prompt_for_turn(
+            std::path::Path::new("/tmp"),
+            "test-model",
+            &[("lookup_status", "Look up current status")],
+            "",
+            &[],
+            None,
+            None,
+            &risk_profile,
+            &provider,
+            &tools_registry,
+            &[],
+            None,
+            false,
+            SkillsPromptInjectionMode::Full,
+            false,
+            0,
+            true,
+            false,
+            None,
+            None,
+        )
+        .expect("native prompt builds");
+        let text_prompt = crate::agent::system_prompt::build_system_prompt_with_mode(
+            std::path::Path::new("/tmp"),
+            "test-model",
+            &[("lookup_status", "Look up current status")],
+            &[],
+            None,
+            None,
+            false,
+            SkillsPromptInjectionMode::Full,
+            crate::security::AutonomyLevel::default(),
+        );
+        let prompts = Arc::new(ToolProtocolPrompts::new(native_prompt.clone(), text_prompt));
+        let mut history = vec![
+            ChatMessage::system(native_prompt),
+            ChatMessage::user("check status"),
+        ];
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
+        let exec = ResolvedAgentExecution {
+            model_access: ResolvedModelAccess {
+                model_provider: &provider,
+                provider_name: "custom.rejector",
+                model: "test-model",
+                temperature: None,
+            },
+            tools_registry: &tools_registry,
+            observer: &observer,
+            silent: true,
+            approval: None,
+            multimodal_config: &multimodal,
+            config: None,
+            max_tool_iterations: 2,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            receipt_generator: None,
+            knobs: &knobs,
+        };
+
+        let result = scope_tool_protocol_prompts(
+            prompts,
+            run_tool_call_loop(ToolLoop {
+                exec,
+                history: &mut history,
+                channel_name: "test",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: Some(tx),
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: None,
+                steering: None,
+                new_messages_out: None,
+                image_cache: None,
+                ingress: IngressContext::sub_turn(),
+                memory: None,
+                agent_alias: None,
+                parent_agent_alias: None,
+                turn_id: "native-tool-fallback-test",
+                sop_reassembly: None,
+            }),
+        )
+        .await
+        .expect("turn should complete on the prompt-guided fallback");
+
+        assert_eq!(result, "completed on prompt-guided tools");
+        assert_eq!(native_attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(prompt_guided_attempts.load(Ordering::Relaxed), 1);
+        assert!(saw_prompt_guided_tools.load(Ordering::Relaxed));
+
+        let mut warning_text = String::new();
+        while let Ok(delta) = rx.try_recv() {
+            if let StreamDelta::Status(text) = delta {
+                warning_text.push_str(&text);
+            }
+        }
+        assert!(warning_text.contains("native_tools = false"));
+        assert!(warning_text.contains("rejector"));
     }
 }
 

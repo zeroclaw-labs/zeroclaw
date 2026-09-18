@@ -3793,7 +3793,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 continue;
             }
 
-            if Self::is_native_tool_schema_unsupported(status, &sanitized) {
+            if Self::is_native_tool_schema_unsupported(status, &sanitized) && self.name != "Custom"
+            {
                 let fallback_messages =
                     Self::with_prompt_guided_tool_instructions(request.messages, request.tools);
                 let text = self
