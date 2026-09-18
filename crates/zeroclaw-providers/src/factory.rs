@@ -2191,6 +2191,12 @@ mod tests {
     fn grok_cli_factory_enables_explicit_vision_override() {
         let working_directory = tempfile::tempdir().expect("temporary working directory");
         let config = GrokCliModelProviderConfig {
+            binary_path: Some(
+                std::env::current_exe()
+                    .expect("current test executable")
+                    .display()
+                    .to_string(),
+            ),
             working_directory: working_directory.path().display().to_string(),
             ..Default::default()
         };
