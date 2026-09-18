@@ -1488,6 +1488,12 @@ jobs:
       - name: Run turn-stream regressions
         working-directory: web
         run: npm run test:contexts
+      - name: Run run-surface regressions
+        working-directory: web
+        run: npm run test:sops
+      - name: Run SOP editor regressions
+        working-directory: web
+        run: npm run test:sop-editor
 
   # ── Required gate ─────────────────────────────────────────────────────────
   # Branch protection requires only this single job — internal structure
