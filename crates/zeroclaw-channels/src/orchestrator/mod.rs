@@ -1643,48 +1643,31 @@ fn followup_thread_id(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<Str
 /// key retains `msg.sender` even when conversation history is shared
 /// (`ReplyTarget` scope). Without the sender, one member's message or `/stop`
 /// in a shared session would cancel another member's active request.
-/// Doubles every `_` in one component of an interruption key. Joining escaped
-/// components with a single `_` keeps the join injective, so an alias or a
-/// reply target that contains an underscore cannot collide with another
-/// listener's key.
-fn escape_scope_component(part: &str) -> String {
-    part.replace('_', "__")
-}
-
+/// Encodes the conversation scope tuple canonically using length-prefixed
+/// components to prevent boundary collisions between adjacent components
+/// (e.g., `#room_` + `alice` vs `#room` + `_alice`). Both `Sender` and
+/// `ReplyTarget` variants use the same injective representation.
 fn interruption_scope_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
-    match (msg.conversation_scope, msg.interruption_scope_id.as_deref()) {
-        (zeroclaw_api::channel::ChannelConversationScope::ReplyTarget, Some(scope)) => {
-            sanitize_session_key(&format!("{}_{}_{}", channel_scope(msg), scope, msg.sender))
-        }
-        (zeroclaw_api::channel::ChannelConversationScope::ReplyTarget, None) => {
-            sanitize_session_key(&format!(
-                "{}_{}_{}",
-                channel_scope(msg),
-                msg.reply_target,
-                msg.sender
-            ))
-        }
-        // The Sender arms stay in their raw four/three-component form: an
-        // interruption scope id may legitimately carry characters such as the
-        // `$thread1` form pinned by the tests below, and every consumer of this
-        // key compares only keys produced here. They are alias-aware, though:
-        // two listeners of the same channel type on one reply target must not
-        // share an interruption slot, or one listener's `/stop` cancels the
-        // other's turn. Every component is escaped before the `_` join, so an
-        // underscore inside an alias or a reply target cannot forge the
-        // separator and collapse two listeners back onto one key.
-        (zeroclaw_api::channel::ChannelConversationScope::Sender, Some(scope)) => format!(
-            "{}_{}_{}_{}",
-            escape_scope_component(&channel_scope(msg)),
-            escape_scope_component(&msg.reply_target),
-            escape_scope_component(&msg.sender),
-            escape_scope_component(scope)
+    let tag = match msg.conversation_scope {
+        zeroclaw_api::channel::ChannelConversationScope::Sender => "sender",
+        zeroclaw_api::channel::ChannelConversationScope::ReplyTarget => "reply_target",
+    };
+    let ch = channel_scope(msg);
+    let target = &msg.reply_target;
+    let sender = &msg.sender;
+    match msg.interruption_scope_id.as_deref() {
+        Some(scope) => format!(
+            "{tag}:{}:{ch}:{}:{target}:{}:{sender}:{}:{scope}",
+            ch.len(),
+            target.len(),
+            sender.len(),
+            scope.len()
         ),
-        (zeroclaw_api::channel::ChannelConversationScope::Sender, None) => format!(
-            "{}_{}_{}",
-            escape_scope_component(&channel_scope(msg)),
-            escape_scope_component(&msg.reply_target),
-            escape_scope_component(&msg.sender)
+        None => format!(
+            "{tag}:{}:{ch}:{}:{target}:{}:{sender}",
+            ch.len(),
+            target.len(),
+            sender.len()
         ),
     }
 }
@@ -29819,7 +29802,7 @@ BTC is currently around $65,000 based on latest tool output."#
         // retains the sender so one member cannot cancel another's request.
         assert_eq!(
             interruption_scope_key(&msg),
-            "wecom_ws_work_group--room-1_zeroclaw_user"
+            "reply_target:13:wecom_ws.work:13:group--room-1:13:zeroclaw_user:13:group--room-1"
         );
     }
 
@@ -41684,7 +41667,7 @@ This is an example JSON object for profile settings."#;
 
             ..Default::default()
         };
-        assert_eq!(interruption_scope_key(&msg), "matrix_room_alice");
+        assert_eq!(interruption_scope_key(&msg), "sender:6:matrix:4:room:5:alice");
     }
 
     #[test]
@@ -41704,14 +41687,16 @@ This is an example JSON object for profile settings."#;
 
             ..Default::default()
         };
-        assert_eq!(interruption_scope_key(&msg), "matrix_room_alice_$thread1");
+        assert_eq!(
+            interruption_scope_key(&msg),
+            "sender:6:matrix:4:room:5:alice:8:$thread1"
+        );
     }
 
     #[test]
     fn interruption_scope_key_keeps_listeners_apart_when_underscores_collide() {
-        // Without escaping, `slack.work` + `room_x` and `slack.work_room` + `x`
-        // both render as `slack.work_room_x_alice`, which would let one
-        // listener's `/stop` cancel the other listener's turn.
+        // Without length-prefixed canonical encoding, `slack.work` + `room_x` and `slack.work_room` + `x`
+        // could collide across component boundaries.
         let scoped = |alias: &str, reply_target: &str| zeroclaw_api::channel::ChannelMessage {
             id: "1".into(),
             sender: "alice".into(),
@@ -41731,8 +41716,14 @@ This is an example JSON object for profile settings."#;
         let short_alias = interruption_scope_key(&scoped("work", "room_x"));
         let long_alias = interruption_scope_key(&scoped("work_room", "x"));
 
-        assert_eq!(short_alias, "slack.work_room__x_alice_1234567890.000100");
-        assert_eq!(long_alias, "slack.work__room_x_alice_1234567890.000100");
+        assert_eq!(
+            short_alias,
+            "sender:10:slack.work:6:room_x:5:alice:17:1234567890.000100"
+        );
+        assert_eq!(
+            long_alias,
+            "sender:15:slack.work_room:1:x:5:alice:17:1234567890.000100"
+        );
         assert_ne!(short_alias, long_alias);
     }
 
@@ -41754,7 +41745,7 @@ This is an example JSON object for profile settings."#;
 
             ..Default::default()
         };
-        assert_eq!(interruption_scope_key(&msg), "slack_C123_alice");
+        assert_eq!(interruption_scope_key(&msg), "sender:5:slack:4:C123:5:alice");
     }
 
     /// Two listeners of the same channel type sharing one reply target must not
@@ -41778,7 +41769,10 @@ This is an example JSON object for profile settings."#;
 
             ..Default::default()
         };
-        assert_eq!(interruption_scope_key(&msg), "slack.work_room_alice");
+        assert_eq!(
+            interruption_scope_key(&msg),
+            "sender:10:slack.work:4:room:5:alice"
+        );
 
         let mut other_listener = msg.clone();
         other_listener.channel_alias = Some("personal".into());
@@ -41790,7 +41784,10 @@ This is an example JSON object for profile settings."#;
         // Without an alias the key keeps its historical raw form.
         let mut unaliased = msg.clone();
         unaliased.channel_alias = None;
-        assert_eq!(interruption_scope_key(&unaliased), "slack_room_alice");
+        assert_eq!(
+            interruption_scope_key(&unaliased),
+            "sender:5:slack:4:room:5:alice"
+        );
     }
 
     #[test]
@@ -41814,7 +41811,186 @@ This is an example JSON object for profile settings."#;
         // The scope id keeps its raw form; only the channel scope gains the alias.
         assert_eq!(
             interruption_scope_key(&msg),
-            "slack.work_C123_alice_$thread1"
+            "sender:10:slack.work:4:C123:5:alice:8:$thread1"
+        );
+    }
+
+    #[test]
+    fn interruption_scope_key_prevents_component_boundary_collision() {
+        // Issue #10948: (irc.default, #room_, alice) and (irc.default, #room, _alice)
+        // previously both produced `irc.default_#room___alice` due to delimiter escaping.
+        // Length-prefixed encoding must keep them distinct for both Sender and ReplyTarget.
+        let irc_msg = |target: &str, sender: &str, scope: zeroclaw_api::channel::ChannelConversationScope| {
+            zeroclaw_api::channel::ChannelMessage {
+                id: "1".into(),
+                sender: sender.into(),
+                reply_target: target.into(),
+                content: "hi".into(),
+                channel: "irc".into(),
+                channel_alias: Some("default".into()),
+                timestamp: 0,
+                thread_ts: None,
+                interruption_scope_id: None,
+                conversation_scope: scope,
+                attachments: vec![],
+                subject: None,
+                ..Default::default()
+            }
+        };
+
+        // Sender scope variants
+        let sender_room_underscore = irc_msg("#room_", "alice", zeroclaw_api::channel::ChannelConversationScope::Sender);
+        let sender_user_underscore = irc_msg("#room", "_alice", zeroclaw_api::channel::ChannelConversationScope::Sender);
+        assert_eq!(
+            interruption_scope_key(&sender_room_underscore),
+            "sender:11:irc.default:6:#room_:5:alice"
+        );
+        assert_eq!(
+            interruption_scope_key(&sender_user_underscore),
+            "sender:11:irc.default:5:#room:6:_alice"
+        );
+        assert_ne!(
+            interruption_scope_key(&sender_room_underscore),
+            interruption_scope_key(&sender_user_underscore)
+        );
+
+        // ReplyTarget scope variants
+        let reply_room_underscore = irc_msg("#room_", "alice", zeroclaw_api::channel::ChannelConversationScope::ReplyTarget);
+        let reply_user_underscore = irc_msg("#room", "_alice", zeroclaw_api::channel::ChannelConversationScope::ReplyTarget);
+        assert_eq!(
+            interruption_scope_key(&reply_room_underscore),
+            "reply_target:11:irc.default:6:#room_:5:alice"
+        );
+        assert_eq!(
+            interruption_scope_key(&reply_user_underscore),
+            "reply_target:11:irc.default:5:#room:6:_alice"
+        );
+        assert_ne!(
+            interruption_scope_key(&reply_room_underscore),
+            interruption_scope_key(&reply_user_underscore)
+        );
+
+        // Cross-scope: Sender vs ReplyTarget with identical components must never collide
+        assert_ne!(
+            interruption_scope_key(&sender_room_underscore),
+            interruption_scope_key(&reply_room_underscore)
+        );
+
+        // Leading and trailing underscores across all boundaries:
+        // 1. Channel scope boundary
+        let ch_underscore = zeroclaw_api::channel::ChannelMessage {
+            channel: "irc_default".into(),
+            channel_alias: None,
+            reply_target: "room".into(),
+            sender: "alice".into(),
+            ..Default::default()
+        };
+        let target_underscore = zeroclaw_api::channel::ChannelMessage {
+            channel: "irc".into(),
+            channel_alias: None,
+            reply_target: "_default_room".into(),
+            sender: "alice".into(),
+            ..Default::default()
+        };
+        assert_ne!(
+            interruption_scope_key(&ch_underscore),
+            interruption_scope_key(&target_underscore)
+        );
+
+        // 2. Sender vs scope_id boundary
+        let mut sender_underscore_trailing = sender_room_underscore.clone();
+        sender_underscore_trailing.sender = "alice_".into();
+        sender_underscore_trailing.interruption_scope_id = Some("thread".into());
+
+        let mut scope_underscore_leading = sender_room_underscore.clone();
+        scope_underscore_leading.sender = "alice".into();
+        scope_underscore_leading.interruption_scope_id = Some("_thread".into());
+
+        assert_ne!(
+            interruption_scope_key(&sender_underscore_trailing),
+            interruption_scope_key(&scope_underscore_leading)
+        );
+
+        // 3. None scope_id vs empty string scope_id vs non-empty scope_id
+        let mut msg_none = sender_room_underscore.clone();
+        msg_none.interruption_scope_id = None;
+
+        let mut msg_empty = sender_room_underscore.clone();
+        msg_empty.interruption_scope_id = Some("".into());
+
+        let mut msg_some = sender_room_underscore.clone();
+        msg_some.interruption_scope_id = Some("t".into());
+
+        assert_ne!(interruption_scope_key(&msg_none), interruption_scope_key(&msg_empty));
+        assert_ne!(interruption_scope_key(&msg_none), interruption_scope_key(&msg_some));
+        assert_ne!(interruption_scope_key(&msg_empty), interruption_scope_key(&msg_some));
+    }
+
+    /// Sibling scopes with boundary underscores (e.g. `(telegram.default, room_, alice)`
+    /// vs `(telegram.default, room, _alice)`) must not cancel each other's turn when /stop is sent.
+    #[tokio::test]
+    async fn message_dispatch_boundary_colliding_scopes_do_not_cancel_each_other() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(SlowModelProvider {
+                delay: Duration::from_millis(150),
+            }),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let send_task = zeroclaw_spawn::spawn!(async move {
+            // Scope A: (telegram.default, room_, alice) starts an in-flight turn
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: "m1".into(),
+                sender: "alice".into(),
+                reply_target: "room_".into(),
+                content: "please think slowly".into(),
+                channel: "telegram".into(),
+                channel_alias: Some("default".into()),
+                timestamp: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+            // Scope B: (telegram.default, room, _alice) sends /stop while Scope A is in flight.
+            // Delimiter-escaped keys collapsed both to `telegram.default_room___alice`.
+            // Canonical length-prefixed keys keep them distinct so Scope A continues.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: "s1".into(),
+                sender: "_alice".into(),
+                reply_target: "room".into(),
+                content: "/stop".into(),
+                channel: "telegram".into(),
+                channel_alias: Some("default".into()),
+                timestamp: 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        });
+
+        run_message_dispatch_loop(rx, AgentRouter::single(ctx), 4).await;
+        send_task.await.unwrap();
+
+        let stop_no_task =
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-no-task");
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert!(
+            sent.iter().any(|m| m.contains("please think slowly")),
+            "Scope A turn must complete despite Scope B /stop: {sent:?}"
+        );
+        assert!(
+            sent.iter().any(|m| m.ends_with(&stop_no_task)),
+            "Scope B /stop must resolve to no task of its own: {sent:?}"
         );
     }
 
