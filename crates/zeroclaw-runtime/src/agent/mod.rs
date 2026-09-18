@@ -20,6 +20,7 @@ pub mod prompt;
 pub mod system_prompt;
 pub mod thinking;
 pub(crate) mod tool_call_format;
+pub mod tool_ceiling;
 pub mod tool_execution;
 pub mod tool_receipts;
 pub(crate) mod turn;
