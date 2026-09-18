@@ -2580,11 +2580,13 @@ impl TelegramChannel {
 
     /// Senderless voice-peer check for a destination chat address, used where
     /// no inbound sender exists (proactive delivery) or where a voice note
-    /// accompanies a text reply. A private chat's address is the peer's own id;
-    /// a group's is not a sender identity and will not match.
+    /// accompanies a text reply. Kept as the literal destination comparison
+    /// this channel has always used: a peer group names senders, so a
+    /// destination only stands in for one by coincidence, and widening the
+    /// match here would change proactive modality that sender-side resolution
+    /// does not cover.
     fn destination_is_voice_peer(&self, recipient: &str) -> bool {
-        let (chat_id, _) = Self::parse_reply_target(recipient);
-        self.is_voice_peer(&chat_id)
+        (self.voice_peer_resolver)().iter().any(|p| p == recipient)
     }
 
     /// Set a per-channel proxy URL that overrides the global proxy config.
@@ -3364,8 +3366,7 @@ impl TelegramChannel {
             let recipient = recipient.to_string();
             let proxy_url = self.proxy_url.clone();
             zeroclaw_spawn::spawn!(async move {
-                let is_config_voice_peer =
-                    Self::voice_peer_identity_matches(&voice_peer_resolver(), &chat_id);
+                let is_config_voice_peer = voice_peer_resolver().contains(&recipient);
                 if !is_config_voice_peer && let Ok(mut vc) = voice_chats.lock() {
                     vc.remove(&recipient);
                 }
@@ -3434,8 +3435,7 @@ impl TelegramChannel {
             });
 
             if let Some(text) = to_voice {
-                let is_config_voice_peer =
-                    Self::voice_peer_identity_matches(&voice_peer_resolver(), &chat_id);
+                let is_config_voice_peer = voice_peer_resolver().contains(&recipient);
                 if !is_config_voice_peer && let Ok(mut vc) = voice_chats.lock() {
                     vc.remove(&recipient);
                 }
@@ -8015,7 +8015,7 @@ mod tests {
     }
 
     #[test]
-    fn wildcard_voice_peer_covers_a_senderless_destination() {
+    fn wildcard_voice_peer_does_not_change_a_senderless_destination() {
         use zeroclaw_config::multi_agent::{OutputModality, PeerGroupConfig, PeerUsername};
 
         let mut config = zeroclaw_config::schema::Config::default();
@@ -8040,10 +8040,18 @@ mod tests {
             move || cfg.channel_voice_peers("telegram", "default")
         }));
 
+        // Inbound senders are matched by identity, where the wildcard applies.
         assert!(ch.is_voice_peer("anyone"));
+        // Proactive delivery has no sender to consult, so its destination
+        // comparison keeps the literal behaviour it had before sender-side
+        // resolution existed: a wildcard entry does not voice a chat address.
         assert!(
-            ch.is_voice_chat("-1001234567890"),
-            "a wildcard covers proactive delivery to any chat address"
+            !ch.is_voice_chat("-1001234567890"),
+            "a wildcard peer entry must not voice a senderless group destination"
+        );
+        assert!(
+            !ch.is_voice_chat("111"),
+            "a wildcard peer entry must not voice a senderless private-chat destination"
         );
     }
 
