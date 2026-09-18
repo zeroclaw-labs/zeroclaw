@@ -1912,6 +1912,10 @@ pub async fn run_gateway_with_plugin_webhooks(
             "/api/sops/{name}/run",
             post(api_sop_author::handle_sop_run),
         )
+        .route(
+            "/api/sops/{name}/rename",
+            post(api_sop_author::handle_sop_rename),
+        )
         .route("/api/sops/runs", get(api_sop_author::handle_sop_runs))
         .route(
             "/api/sops/{name}/full",
