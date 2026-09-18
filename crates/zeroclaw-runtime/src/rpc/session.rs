@@ -247,13 +247,21 @@ impl SessionStore {
     /// `Agent`. A supplied session ID is a resume selector: when the live
     /// incarnation already exists, rebuilding it would fork provider history
     /// from an in-flight predecessor turn.
-    pub async fn resume_existing(
+    /// Reattach the live session `id` for a caller, claiming it for
+    /// `owner_tui_id`.
+    ///
+    /// `authorize` judges the session's agent alias and workspace before
+    /// anything changes, under the same lock that guards the claim, so a
+    /// caller it refuses neither takes ownership nor observes a session that
+    /// was swapped in after the check. Its refusal comes back as `Ok(Some(Err))`.
+    pub async fn resume_existing<E>(
         &self,
         id: &str,
         agent_alias: &str,
         chat_mode: &crate::rpc::types::ChatMode,
         owner_tui_id: Option<String>,
-    ) -> Result<Option<ResumedRpcSession>, &'static str> {
+        authorize: impl FnOnce(&str, &str) -> Result<(), E>,
+    ) -> Result<Option<Result<ResumedRpcSession, E>>, &'static str> {
         let mut sessions = self.sessions.lock().await;
         let Some(session) = sessions.get_mut(id) else {
             return Ok(None);
@@ -263,6 +271,9 @@ impl SessionStore {
         }
         if &session.chat_mode != chat_mode {
             return Err("session uses a different chat mode");
+        }
+        if let Err(refused) = authorize(&session.agent_alias, &session.workspace_dir) {
+            return Ok(Some(Err(refused)));
         }
 
         if owner_tui_id.is_some() {
@@ -274,12 +285,12 @@ impl SessionStore {
             .try_lock()
             .map(|agent| agent.history().len())
             .unwrap_or_default();
-        Ok(Some(ResumedRpcSession {
+        Ok(Some(Ok(ResumedRpcSession {
             agent: Arc::clone(&session.agent),
             agent_alias: session.agent_alias.clone(),
             workspace_dir: session.workspace_dir.clone(),
             message_count,
-        }))
+        })))
     }
 
     pub async fn get_agent(&self, id: &str) -> Option<Arc<Mutex<Agent>>> {

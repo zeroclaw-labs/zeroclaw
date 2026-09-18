@@ -224,7 +224,7 @@ pub fn resolve_sops_dir(install_root: &Path, config_dir: Option<&str>) -> PathBu
 
 /// Resolve `<sops_dir>/<name>`, accepting only a single normal path
 /// component so caller-controlled names cannot escape the SOP root.
-fn resolve_sop_dir(sops_dir: &Path, name: &str) -> Result<PathBuf> {
+pub(crate) fn resolve_sop_dir(sops_dir: &Path, name: &str) -> Result<PathBuf> {
     let mut components = Path::new(name).components();
     let single_normal = matches!(
         (components.next(), components.next()),

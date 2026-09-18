@@ -332,6 +332,125 @@ impl Method {
             .map(|(_, wire)| *wire)
             .expect("every variant is in ALL")
     }
+
+    /// Authorization classification (RFC 7141 gate-by-construction). The
+    /// match is arm-complete over the closed `Method` enum, so adding a
+    /// variant without classifying it is a COMPILE ERROR — a new method
+    /// cannot be dispatched unclassified. The explicit
+    /// [`MethodAuthz::Handshake`] sentinel (rather than an `Option`) keeps
+    /// every ungated method greppable and deliberate; initialize and mTLS
+    /// certificate renewal are the only transport-authenticated ones.
+    pub fn authz(self) -> MethodAuthz {
+        use Method as M;
+        use zeroclaw_api::grants::{Resource, Verb};
+        let (resource, verb) = match self {
+            M::Initialize => return MethodAuthz::Handshake,
+            // Certificate renewal is authenticated by the presenting mTLS
+            // client certificate (transport/device layer), not a principal
+            // grant: handle_renew_cert fails closed without peer_cert_fingerprint,
+            // and the ledger renewal precondition only publishes while the
+            // certificate being renewed is still active. Transport-authenticated
+            // like initialize.
+            M::CertRenew => return MethodAuthz::Handshake,
+
+            M::Status | M::Health => (Resource::System, Verb::Read),
+            M::DoctorRun => (Resource::System, Verb::Execute),
+
+            M::SessionNew => (Resource::Sessions, Verb::Create),
+            M::SessionPrompt => (Resource::Sessions, Verb::Execute),
+            M::SessionConfigure | M::SessionApprove => (Resource::Sessions, Verb::Update),
+            M::SessionList
+            | M::SessionListAcp
+            | M::SessionMessages
+            | M::SessionState
+            | M::SessionGitBranch => (Resource::Sessions, Verb::Read),
+            M::SessionClose | M::SessionCancel => (Resource::Sessions, Verb::Update),
+            M::SessionDelete | M::SessionKill => (Resource::Sessions, Verb::Delete),
+
+            M::MemoryList | M::MemorySearch | M::MemoryGet => (Resource::Memory, Verb::Read),
+            M::MemoryStore => (Resource::Memory, Verb::Create),
+            M::MemoryDelete => (Resource::Memory, Verb::Delete),
+
+            M::CronList | M::CronGet | M::CronRuns | M::CronSettings => {
+                (Resource::Cron, Verb::Read)
+            }
+            M::CronAdd => (Resource::Cron, Verb::Create),
+            M::CronPatch => (Resource::Cron, Verb::Update),
+            M::CronDelete => (Resource::Cron, Verb::Delete),
+            M::CronTrigger => (Resource::Cron, Verb::Execute),
+
+            M::ConfigGet
+            | M::ConfigValidate
+            | M::ConfigList
+            | M::ConfigMapKeys
+            | M::ConfigResolveAliasSource
+            | M::ConfigTemplates
+            | M::ConfigSections
+            | M::ConfigStatus
+            | M::ConfigCatalog
+            | M::ConfigCatalogModels => (Resource::Config, Verb::Read),
+            M::ConfigSet | M::ConfigReload | M::ConfigMapKeyRename => {
+                (Resource::Config, Verb::Update)
+            }
+            M::ConfigMapKeyCreate => (Resource::Config, Verb::Create),
+            M::ConfigDelete | M::ConfigMapKeyDelete => (Resource::Config, Verb::Delete),
+
+            M::AgentsList | M::AgentsStatus => (Resource::Agents, Verb::Read),
+
+            M::CostQuery | M::CostOrg => (Resource::Cost, Verb::Read),
+
+            M::SkillsBundles | M::SkillsList | M::SkillsRead => (Resource::Skills, Verb::Read),
+            M::SkillsWrite => (Resource::Skills, Verb::Update),
+            M::SkillsDelete => (Resource::Skills, Verb::Delete),
+
+            M::PersonalityList | M::PersonalityGet | M::PersonalityTemplates => {
+                (Resource::Personality, Verb::Read)
+            }
+            M::PersonalityPut => (Resource::Personality, Verb::Update),
+
+            M::LogsSubscribe | M::LogsQuery | M::LogsGet => (Resource::Logs, Verb::Read),
+
+            M::TuiList => (Resource::Tui, Verb::Read),
+
+            M::FileAttach => (Resource::Files, Verb::Create),
+            M::FsListDir => (Resource::Files, Verb::Read),
+
+            M::LocalesList | M::LocalesFetch => (Resource::Locales, Verb::Read),
+
+            M::QuickstartState | M::QuickstartFields | M::QuickstartValidate => {
+                (Resource::Quickstart, Verb::Read)
+            }
+            M::QuickstartApply => (Resource::Quickstart, Verb::Execute),
+            M::QuickstartDismiss => (Resource::Quickstart, Verb::Update),
+
+            M::SopsList
+            | M::SopsGet
+            | M::SopsGraph
+            | M::SopsRuns
+            | M::SopsRunDetail
+            | M::SopsRunOverlay
+            | M::SopsTriggerSources => (Resource::Sops, Verb::Read),
+            M::SopsCreate => (Resource::Sops, Verb::Create),
+            M::SopsSave => (Resource::Sops, Verb::Update),
+            M::SopsDelete => (Resource::Sops, Verb::Delete),
+            M::SopsRun | M::SopsDecide | M::SopsValidate | M::SopsWireDraft | M::SopsGraphDraft => {
+                (Resource::Sops, Verb::Execute)
+            }
+
+            M::ToolsParamOptions => (Resource::Tools, Verb::Read),
+        };
+        MethodAuthz::Requires(resource, verb)
+    }
+}
+
+/// How a method relates to authorization: the handshake itself, or a
+/// required resource-verb grant. See [`Method::authz`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MethodAuthz {
+    /// Runs before a principal is bound. Only the handshake qualifies.
+    Handshake,
+    /// Requires this grant on the caller's resolved principal.
+    Requires(zeroclaw_api::grants::Resource, zeroclaw_api::grants::Verb),
 }
 
 type RpcResult = Result<Value, JsonRpcError>;
@@ -500,7 +619,14 @@ fn session_should_initialize_mcp(chat_mode: &crate::rpc::types::ChatMode) -> boo
 pub struct RpcDispatcher {
     ctx: Arc<RpcContext>,
     rpc: Arc<RpcOutbound>,
-    authenticated: bool,
+    /// The connection's authenticated state, bound by `initialize`.
+    /// `None` = unbound: every non-handshake method is refused.
+    auth: Option<crate::rpc::auth::ConnectionAuth>,
+    /// Which transport class this connection arrived on.
+    transport_kind: crate::rpc::transport::TransportKind,
+    /// The transport-intrinsic credential (kernel peer uid on local
+    /// sockets), presented during `initialize` when no explicit token is.
+    transport_credential: crate::security::auth_provider::Credential,
     /// TUI session UID assigned during `initialize`. Used for registry
     /// cleanup on disconnect.
     tui_id: Option<String>,
@@ -549,7 +675,9 @@ impl RpcDispatcher {
         Self {
             ctx,
             rpc: Arc::new(RpcOutbound::new(writer_tx)),
-            authenticated: false,
+            auth: None,
+            transport_kind: crate::rpc::transport::TransportKind::Local,
+            transport_credential: crate::security::auth_provider::Credential::None,
             tui_id: None,
             tui_epoch: None,
             peer_label,
@@ -587,6 +715,743 @@ impl RpcDispatcher {
         self.peer_cert_fingerprint.as_deref()
     }
 
+    /// Attach the connection's transport class and intrinsic credential
+    /// (listeners call this; `new` defaults to a credential-less local
+    /// connection, which is also the test posture).
+    #[must_use]
+    pub fn with_transport(
+        mut self,
+        kind: crate::rpc::transport::TransportKind,
+        credential: crate::security::auth_provider::Credential,
+    ) -> Self {
+        self.transport_kind = kind;
+        self.transport_credential = credential;
+        self
+    }
+
+    /// Per-operation authorization: credential expiry, revalidation
+    /// deadline, native pairing liveness, authorization-generation
+    /// re-resolution, then the method's required grant. Fail-closed on
+    /// every path; grant refusals are audited.
+    fn authorize(
+        &mut self,
+        method: Method,
+        resource: zeroclaw_api::grants::Resource,
+        verb: zeroclaw_api::grants::Verb,
+    ) -> Result<(), crate::rpc::auth::AuthDenied> {
+        use crate::rpc::auth::AuthDenied;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        {
+            let Some(auth) = self.auth.as_ref() else {
+                let denied = AuthDenied::auth_required(crate::i18n::get_required_cli_string(
+                    "rpc-auth-first-call-initialize",
+                ));
+                self.audit_auth_denial(method, &denied);
+                return Err(denied);
+            };
+            if let Some(expires_at) = auth.principal.expires_at
+                && expires_at <= now
+            {
+                let denied = AuthDenied::auth_required(crate::i18n::get_required_cli_string(
+                    "rpc-auth-credential-expired",
+                ));
+                self.audit_auth_denial(method, &denied);
+                return Err(denied);
+            }
+            if let Some(revalidate_by) = auth.principal.revalidate_by
+                && revalidate_by <= now
+            {
+                // Fail closed at the revalidation deadline. The client
+                // holds the credential and revalidates by re-initializing,
+                // which re-verifies against the live authority.
+                let denied = AuthDenied::auth_required(crate::i18n::get_required_cli_string(
+                    "rpc-auth-revalidation-due",
+                ));
+                self.audit_auth_denial(method, &denied);
+                return Err(denied);
+            }
+            if let Some(hash) = auth.native_token_hash.as_deref()
+                && !self.ctx.auth.pairing().token_hash_is_paired(hash)
+            {
+                let denied = AuthDenied::auth_required(crate::i18n::get_required_cli_string(
+                    "rpc-auth-pairing-revoked",
+                ));
+                self.audit_auth_denial(method, &denied);
+                return Err(denied);
+            }
+        }
+        // Authorization-policy generation moved: re-resolve grants from
+        // the retained identity so profile/mapping/roster changes reach
+        // this established connection now, not at reconnect.
+        let current_generation = self.ctx.auth.generation();
+        let stale_identity = self
+            .auth
+            .as_ref()
+            .filter(|auth| auth.generation != current_generation)
+            .map(|auth| auth.identity.clone());
+        if stale_identity.is_some() {
+            let stale_auth = self.auth.as_ref().expect("stale auth exists").clone();
+            match self.ctx.auth.revalidate_and_resolve(&stale_auth) {
+                Ok(resolved) => {
+                    if let Some(auth) = self.auth.as_mut() {
+                        auth.principal = resolved.principal;
+                        auth.grants = resolved.grants;
+                        auth.generation = resolved.generation;
+                    }
+                }
+                Err(reason) => {
+                    // The current policy grants this identity nothing:
+                    // drop the binding entirely.
+                    self.auth = None;
+                    let denied = AuthDenied::from_deny_reason(reason);
+                    self.audit_auth_denial(method, &denied);
+                    return Err(denied);
+                }
+            }
+        }
+        let Some(auth) = self.auth.as_ref() else {
+            let denied = AuthDenied::auth_required(crate::i18n::get_required_cli_string(
+                "rpc-auth-first-call-initialize",
+            ));
+            self.audit_auth_denial(method, &denied);
+            return Err(denied);
+        };
+        if !auth.grants.permits(resource, verb) {
+            let denied = AuthDenied::forbidden(format!(
+                "Principal is not granted {resource}:{verb} (required by {})",
+                method.wire_name()
+            ));
+            self.audit_auth_denial(method, &denied);
+            return Err(denied);
+        }
+        Ok(())
+    }
+
+    fn audit_auth_denial(&self, method: Method, denied: &crate::rpc::auth::AuthDenied) {
+        audit_denial(self.auth.as_ref(), method, denied);
+    }
+}
+
+/// Record one authorization denial for the connection bound to `auth`.
+fn audit_denial(
+    auth: Option<&crate::rpc::auth::ConnectionAuth>,
+    method: Method,
+    denied: &crate::rpc::auth::AuthDenied,
+) {
+    let (principal_id, auth_provider) = auth
+        .map(|auth| {
+            (
+                Some(auth.principal.id.as_str()),
+                Some(auth.principal.auth_provider_label()),
+            )
+        })
+        .unwrap_or((None, None));
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+            .with_category(::zeroclaw_log::EventCategory::System)
+            .with_attrs(::serde_json::json!({
+                "method": method.wire_name(),
+                "reason": denied.message,
+                "code": denied.code,
+                "principal_id": principal_id,
+                "auth_provider": auth_provider,
+            })),
+        "RPC authorization denied"
+    );
+}
+
+/// Whether the credential behind `auth` is still live: not expired, not
+/// past its revalidation deadline, and, for a native pairing token, still
+/// paired.
+fn credential_is_live(
+    inbound: &crate::rpc::auth::RpcInboundAuth,
+    auth: &crate::rpc::auth::ConnectionAuth,
+) -> Result<(), crate::rpc::auth::AuthDenied> {
+    use crate::rpc::auth::AuthDenied;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if let Some(expires_at) = auth.principal.expires_at
+        && expires_at <= now
+    {
+        return Err(AuthDenied::auth_required(
+            crate::i18n::get_required_cli_string("rpc-auth-credential-expired"),
+        ));
+    }
+    if let Some(revalidate_by) = auth.principal.revalidate_by
+        && revalidate_by <= now
+    {
+        return Err(AuthDenied::auth_required(
+            crate::i18n::get_required_cli_string("rpc-auth-revalidation-due"),
+        ));
+    }
+    if let Some(hash) = auth.native_token_hash.as_deref()
+        && !inbound.pairing().token_hash_is_paired(hash)
+    {
+        return Err(AuthDenied::auth_required(
+            crate::i18n::get_required_cli_string("rpc-auth-pairing-revoked"),
+        ));
+    }
+    Ok(())
+}
+
+/// The authority `auth` holds for `method` under the accepted policy in force
+/// now: a live credential, a fresh resolution, a generation that did not move
+/// underneath that resolution, and the method's coarse grant.
+fn current_authority(
+    inbound: &crate::rpc::auth::RpcInboundAuth,
+    auth: &crate::rpc::auth::ConnectionAuth,
+    method: Method,
+) -> Result<zeroclaw_api::grants::ResolvedGrants, crate::rpc::auth::AuthDenied> {
+    use crate::rpc::auth::AuthDenied;
+    credential_is_live(inbound, auth)?;
+    let resolved = inbound
+        .resolve_current(auth)
+        .map_err(AuthDenied::from_deny_reason)?;
+    if resolved.generation != inbound.generation() {
+        // The accepted state moved between the resolution and this read.
+        // Fail closed rather than act under a policy nobody observed.
+        return Err(AuthDenied::auth_required(
+            crate::i18n::get_required_cli_string("rpc-auth-revalidation-due"),
+        ));
+    }
+    if let MethodAuthz::Requires(resource, verb) = method.authz()
+        && !resolved.grants.permits(resource, verb)
+    {
+        return Err(AuthDenied::forbidden(format!(
+            "Principal is not granted {resource}:{verb} (required by {})",
+            method.wire_name()
+        )));
+    }
+    Ok(resolved.grants)
+}
+
+impl RpcDispatcher {
+    /// Fine-grained config-path selector. Composes with the coarse
+    /// `Config` grant the gate already enforced: both are required.
+    fn selector_config_write(&self, method: Method, path: &str) -> Result<(), JsonRpcError> {
+        let Some(auth) = self.auth.as_ref() else {
+            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+        };
+        if auth.grants.may_write_config(path) {
+            Ok(())
+        } else {
+            let denied = rpc_err(
+                FORBIDDEN,
+                format!("Principal is not granted config write access to {path:?}"),
+            );
+            self.audit_auth_denial(
+                method,
+                &crate::rpc::auth::AuthDenied {
+                    code: denied.code,
+                    message: denied.message.clone(),
+                },
+            );
+            Err(denied)
+        }
+    }
+
+    /// Fine-grained agent selector for `session/new`, plus the fail-closed
+    /// posture for per-tool selectors: agent sessions are not yet
+    /// principal-aware inside the tool loop, so a principal whose tool
+    /// selector is constrained (neither `admin` nor the explicit `"*"`)
+    /// is refused a session rather than silently un-enforced.
+    fn selector_session_agent(&self, method: Method, alias: &str) -> Result<(), JsonRpcError> {
+        let Some(grants) = self.stamped_grants() else {
+            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+        };
+        self.selector_session_agent_with_grants(method, grants, alias)
+    }
+
+    /// The grants stamped on this connection by the last pass through the
+    /// gate, or `None` for an unbound dispatcher.
+    fn stamped_grants(&self) -> Option<&zeroclaw_api::grants::ResolvedGrants> {
+        self.auth.as_ref().map(|auth| &auth.grants)
+    }
+
+    /// [`Self::selector_session_agent`] evaluated against an explicit grant
+    /// set. A handler that has re-resolved its principal after waiting for
+    /// admission passes the fresh grants here, because the grants stamped on
+    /// the connection are only as current as the last gate.
+    fn selector_session_agent_with_grants(
+        &self,
+        method: Method,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
+        alias: &str,
+    ) -> Result<(), JsonRpcError> {
+        if !grants.may_use_agent(alias) {
+            let denied = rpc_err(
+                FORBIDDEN,
+                format!("Principal is not entitled to agent {alias:?}"),
+            );
+            self.audit_auth_denial(
+                method,
+                &crate::rpc::auth::AuthDenied {
+                    code: denied.code,
+                    message: denied.message.clone(),
+                },
+            );
+            return Err(denied);
+        }
+        let tools_unrestricted = grants.admin
+            || grants
+                .allowed_tools
+                .iter()
+                .any(|t| t == zeroclaw_api::grants::WILDCARD);
+        if !tools_unrestricted {
+            let denied = rpc_err(
+                FORBIDDEN,
+                "This principal's tool selector is constrained, and per-tool \
+                 enforcement inside agent sessions lands with the session-assembly \
+                 slice: grant allowed_tools = [\"*\"] or admin until then (fail \
+                 closed, never silently un-enforced)",
+            );
+            self.audit_auth_denial(
+                method,
+                &crate::rpc::auth::AuthDenied {
+                    code: denied.code,
+                    message: denied.message.clone(),
+                },
+            );
+            return Err(denied);
+        }
+        Ok(())
+    }
+
+    /// Re-establish the caller's authority after a handler has waited for
+    /// admission to a serialized section (the config write lock, or a
+    /// session's actor queue).
+    ///
+    /// Every such handler tests its grants before it queues, and the wait can
+    /// be long (a session queue waits up to its lock timeout, the config write
+    /// lock without limit): another connection can revoke or narrow the
+    /// waiting principal's profile, the credential can expire, the
+    /// revalidation deadline can pass, or the native pairing can be dropped
+    /// while the request is parked. This repeats those checks, and the
+    /// method's coarse grant, against the policy generation that is in force
+    /// now, and returns the freshly resolved grants for the handler's
+    /// fine-grained selectors. Local credential evidence is rechecked only
+    /// when the generation has moved, as the gate does, so an OIDC binding is
+    /// not refused merely for having waited.
+    ///
+    /// This re-resolves rather than comparing against the grants stamped on
+    /// the connection, so a policy change that WIDENS the principal's
+    /// authority while it waits is honoured rather than refused. It is
+    /// non-mutating: the handlers take `&self`, and leaving the stamped
+    /// binding alone keeps `authorize` the single place that re-stamps it. A
+    /// spawned prompt handle carries a copy of the stamped binding, which is
+    /// exactly why the fresh grants are returned instead of read back.
+    ///
+    /// A publication that lands between the resolution and the generation
+    /// read fails the operation closed. The config path holds the lock that
+    /// every publication takes, so it cannot see that race; a session path
+    /// can, and the refused client's next request re-gates normally.
+    ///
+    /// `Ok(None)` means no principal is bound, which only the direct
+    /// unit-test handlers reach; each caller decides what that means for it.
+    fn recheck_authority_after_admission(
+        &self,
+        method: Method,
+    ) -> Result<Option<zeroclaw_api::grants::ResolvedGrants>, JsonRpcError> {
+        let Some(auth) = self.auth.as_ref() else {
+            return Ok(None);
+        };
+        current_authority(&self.ctx.auth, auth, method)
+            .map(Some)
+            .map_err(|denied| {
+                self.audit_auth_denial(method, &denied);
+                rpc_err(denied.code, denied.message)
+            })
+    }
+
+    /// Re-establish the caller's authority to write `path` after the config
+    /// write lock has been granted: [`Self::recheck_authority_after_admission`]
+    /// followed by the concrete path selector.
+    ///
+    /// The generation observed here is the one the commit runs under.
+    /// `refresh_from_config` is reached only from `save_and_swap_config`,
+    /// which asserts this same lock is held, so no accepted policy can be
+    /// installed between this check and the commit. `config/reload` signals
+    /// the supervisor instead of refreshing in process, so it opens no window
+    /// either.
+    ///
+    /// `path` is the concrete config path the handler is about to write, or
+    /// `None` on a surface that has no path selector to repeat (Quickstart
+    /// applies a whole submission); the liveness, generation and coarse-grant
+    /// checks still run there.
+    fn recheck_config_write_authority(
+        &self,
+        method: Method,
+        path: Option<&str>,
+        _guard: &ConfigWriteGuard,
+    ) -> Result<(), JsonRpcError> {
+        use crate::rpc::auth::AuthDenied;
+
+        let refuse = |denied: AuthDenied| -> JsonRpcError {
+            self.audit_auth_denial(method, &denied);
+            rpc_err(denied.code, denied.message)
+        };
+        let Some(grants) = self.recheck_authority_after_admission(method)? else {
+            return Err(refuse(AuthDenied::auth_required(
+                crate::i18n::get_required_cli_string("rpc-auth-first-call-initialize"),
+            )));
+        };
+        if let Some(path) = path
+            && !grants.may_write_config(path)
+        {
+            return Err(refuse(AuthDenied::forbidden(format!(
+                "Principal is not granted config write access to {path:?}"
+            ))));
+        }
+        Ok(())
+    }
+
+    /// Fine-grained agent selector for surfaces that address an agent: cron
+    /// rows, attachments, personality files, per-agent cost, and SOP
+    /// authoring. Composes with the coarse grant the gate already enforced:
+    /// both are required.
+    ///
+    /// This deliberately omits `selector_session_agent`'s constrained-tools
+    /// refusal, which guards the tool loop an interactive session runs. Cron
+    /// jobs do later run an agent turn or a shell command, and keep the posture
+    /// the cron surface settled on; SOP runs and approvals use the session
+    /// posture instead.
+    ///
+    /// A wildcard selector covers every configured agent, not every string.
+    /// Handlers derive paths from the alias, such as an agent's workspace, so
+    /// a principal without operator grants may address only an agent the
+    /// current configuration defines.
+    fn selector_agent(&self, method: Method, alias: &str) -> Result<(), JsonRpcError> {
+        self.check_agent_selector(method, alias, true)
+    }
+
+    /// [`Self::selector_agent`] for a surface that only names an agent and
+    /// derives no path from it, such as rendering personality templates for
+    /// an agent Quickstart is about to create, so the alias need not be
+    /// configured yet.
+    fn selector_agent_name(&self, method: Method, alias: &str) -> Result<(), JsonRpcError> {
+        self.check_agent_selector(method, alias, false)
+    }
+
+    fn check_agent_selector(
+        &self,
+        method: Method,
+        alias: &str,
+        require_configured: bool,
+    ) -> Result<(), JsonRpcError> {
+        let Some(auth) = self.auth.as_ref() else {
+            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+        };
+        let configured = !require_configured
+            || auth.grants.admin
+            || self.ctx.config.read().agents.contains_key(alias);
+        if configured && auth.grants.may_use_agent(alias) {
+            return Ok(());
+        }
+        let denied = rpc_err(
+            FORBIDDEN,
+            format!("Principal is not entitled to agent {alias:?}"),
+        );
+        self.audit_auth_denial(
+            method,
+            &crate::rpc::auth::AuthDenied {
+                code: denied.code,
+                message: denied.message.clone(),
+            },
+        );
+        Err(denied)
+    }
+
+    /// Resolve a cron job and confirm the caller is entitled to its owning
+    /// agent.
+    ///
+    /// A job owned by another agent reports the same `INVALID_PARAMS`
+    /// "Cron job not found" a genuinely missing id reports, so the guard does
+    /// not become an existence oracle. That matches
+    /// [`crate::cron::store::get_job_for_agent`]'s documented contract. Rows
+    /// written before the owner column exists carry an empty alias, and
+    /// `may_use_agent("")` is false for every non-admin principal, so those
+    /// legacy rows stay reachable only from operator-level grants.
+    fn authorize_cron_job(
+        &self,
+        method: Method,
+        config: &Config,
+        id: &str,
+    ) -> Result<crate::cron::CronJob, JsonRpcError> {
+        let Some(auth) = self.auth.as_ref() else {
+            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+        };
+        let job = crate::cron::get_job(config, id)
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron job not found: {e}")))?;
+        if auth.grants.may_use_agent(&job.agent_alias) {
+            return Ok(job);
+        }
+        let denied = rpc_err(
+            INVALID_PARAMS,
+            format!("Cron job not found: {}", crate::cron::job_not_found(id)),
+        );
+        self.audit_auth_denial(
+            method,
+            &crate::rpc::auth::AuthDenied {
+                code: denied.code,
+                message: format!(
+                    "Principal is not entitled to agent {:?}, which owns cron job {id:?}",
+                    job.agent_alias
+                ),
+            },
+        );
+        Err(denied)
+    }
+
+    /// Confine a session workspace to a directory the agent's own policy lets
+    /// it both read and write.
+    ///
+    /// The agent builder makes a session's workspace its jail root, so
+    /// selecting an entitled agent must not also select an arbitrary
+    /// directory on the daemon host. Operator-level principals keep today's
+    /// behaviour, which is what the local TUI, ACP and editor flows use. Every
+    /// other principal is held to the agent's resolved policy: its workspace,
+    /// read-write allowed roots, and read-write sibling workspaces when the
+    /// policy is workspace-only, and any path outside its forbidden paths
+    /// when it is not.
+    ///
+    /// The check runs against the resolved path, so a symlink is judged by its
+    /// target, and a path that cannot be resolved at all is refused rather
+    /// than assumed benign. Any path other than the agent's
+    /// configured workspace is refused before it is resolved when it has `..`
+    /// components or a Windows network or device prefix, and every refusal
+    /// carries the same message, so the answer does not reveal whether a path
+    /// exists.
+    fn confine_session_workspace_with_grants(
+        &self,
+        method: Method,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
+        config: &Config,
+        alias: &str,
+        workspace: &str,
+    ) -> Result<(), JsonRpcError> {
+        if grants.admin {
+            return Ok(());
+        }
+        let refuse = |detail: String| {
+            let denied = rpc_err(FORBIDDEN, detail);
+            self.audit_auth_denial(
+                method,
+                &crate::rpc::auth::AuthDenied {
+                    code: denied.code,
+                    message: denied.message.clone(),
+                },
+            );
+            denied
+        };
+        let policy =
+            zeroclaw_config::policy::SecurityPolicy::for_agent(config, alias).map_err(|e| {
+                rpc_err(
+                    INTERNAL_ERROR,
+                    format!("Failed to resolve agent policy: {e}"),
+                )
+            })?;
+        let refusal = || {
+            refuse(format!(
+                "Session workspace {workspace:?} is not an existing directory agent {alias:?} \
+                 may both read and write; add it to the agent's risk profile allowed_roots to \
+                 authorize it",
+            ))
+        };
+        let requested = std::path::Path::new(workspace);
+        // The agent's configured workspace was chosen by the operator, not by
+        // the request, so it is resolved even when it is spelled with `..` or
+        // lives on a network share.
+        if requested != config.agent_workspace_dir(alias) && !super::fs::resolves_locally(requested)
+        {
+            return Err(refusal());
+        }
+        let resolved = requested.canonicalize().map_err(|_| refusal())?;
+        // The workspace becomes the session's jail root, and a jail root is
+        // readable and writable to the agent. Accept only a directory the
+        // agent's own policy already lets it both read and write, so a
+        // write-only sibling root cannot become readable this way.
+        if resolved.is_dir()
+            && policy.is_resolved_path_allowed(&resolved)
+            && policy.is_resolved_path_readable(&resolved)
+        {
+            return Ok(());
+        }
+        Err(refusal())
+    }
+
+    /// Hold one session binding, its agent and its workspace, to `grants`:
+    /// the agent and tool-posture selector, then workspace confinement. `None`
+    /// is an unbound dispatcher (the direct unit-test handlers) and passes.
+    fn authorize_session_binding(
+        &self,
+        method: Method,
+        grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
+        config: &Config,
+        alias: &str,
+        workspace: &str,
+    ) -> Result<(), JsonRpcError> {
+        let Some(grants) = grants else {
+            return Ok(());
+        };
+        self.selector_session_agent_with_grants(method, grants, alias)?;
+        self.confine_session_workspace_with_grants(method, grants, config, alias, workspace)
+    }
+
+    /// [`Self::authorize_session_binding`] for a live session that
+    /// `session/new` is about to hand back instead of building a new one. The
+    /// live session keeps the workspace it was created with, possibly by
+    /// another principal or under an older policy.
+    fn authorize_resumed_session(
+        &self,
+        grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
+        agent_alias: &str,
+        workspace_dir: &str,
+    ) -> Result<(), JsonRpcError> {
+        let config = self.ctx.config.read();
+        self.authorize_session_binding(
+            Method::SessionNew,
+            grants,
+            &config,
+            agent_alias,
+            workspace_dir,
+        )
+    }
+
+    /// Confine `fs/list_dir` to what the bound principal may read, before the
+    /// handler probes the path, so a refusal does not reveal whether the path
+    /// exists. The coarse `Files:Read` grant has already passed the gate; see
+    /// [`super::fs::listing_is_authorized`] for the root policy.
+    fn authorize_fs_listing(&self, params: &Value) -> Result<(), JsonRpcError> {
+        let Some(grants) = self.stamped_grants() else {
+            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+        };
+        let req: zeroclaw_api::jsonrpc::FsListDirRequest = parse_params(params)?;
+        let requested = std::path::Path::new(&req.path);
+        // Resolving a '..' component succeeds only when everything before it
+        // exists, which would tell a scoped principal whether an arbitrary path
+        // exists, and resolving a Windows UNC or device path makes the daemon
+        // open it. Refuse relative, parent-component, and network or device
+        // paths outright, with the same answer as any other refusal.
+        let plain = requested.is_absolute() && super::fs::resolves_locally(requested);
+        let allowed = grants.admin
+            || (plain && {
+                let config = self.ctx.config.read();
+                super::fs::listing_is_authorized(&config, grants, requested)
+            });
+        if allowed {
+            return Ok(());
+        }
+        let denied = crate::rpc::auth::AuthDenied::forbidden(format!(
+            "Principal is not granted a listing of {:?}: only absolute local paths that an \
+             enabled agent it may use can read can be listed",
+            req.path
+        ));
+        self.audit_auth_denial(Method::FsListDir, &denied);
+        Err(rpc_err(denied.code, denied.message))
+    }
+
+    /// Hold path-mode attachment sources to the destination agent's policy.
+    ///
+    /// Path mode makes the daemon read a local file on the caller's behalf and
+    /// copy it into the agent's workspace. A principal without operator grants
+    /// may name only an absolute local path that the destination agent's own
+    /// policy lets it read, the rule a listing follows, so the daemon
+    /// account's wider read access is not lent to the caller. Inline
+    /// `data_b64` entries carry their own bytes and pass. `None` grants are an
+    /// unbound dispatcher (the direct unit-test handlers) and pass.
+    fn authorize_attachment_sources(
+        &self,
+        method: Method,
+        grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
+        alias: &str,
+        entries: &[FileEntry],
+    ) -> Result<(), JsonRpcError> {
+        let Some(grants) = grants else {
+            return Ok(());
+        };
+        if grants.admin {
+            return Ok(());
+        }
+        let sources: Vec<&str> = entries
+            .iter()
+            .filter(|entry| entry.data_b64.is_none())
+            .filter_map(|entry| entry.path.as_deref())
+            .collect();
+        if sources.is_empty() {
+            return Ok(());
+        }
+        let config = self.ctx.config.read();
+        let policy = zeroclaw_config::policy::SecurityPolicy::for_agent(&config, alias).ok();
+        for source in sources {
+            let path = std::path::Path::new(source);
+            let allowed = path.is_absolute()
+                && super::fs::resolves_locally(path)
+                && policy
+                    .as_ref()
+                    .is_some_and(|policy| policy.is_resolved_path_readable(path));
+            if !allowed {
+                let denied = crate::rpc::auth::AuthDenied::forbidden(format!(
+                    "Principal is not granted attachment source {source:?}: only an absolute local \
+                     path that agent {alias:?} may read can be attached by path"
+                ));
+                self.audit_auth_denial(method, &denied);
+                return Err(rpc_err(denied.code, denied.message));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether this connection holds operator-level (admin) grants. An
+    /// unauthenticated dispatcher (the direct unit-test handlers, which never
+    /// reach a gated method through `process_line`) is not admin.
+    fn has_admin_grants(&self) -> bool {
+        self.auth.as_ref().is_some_and(|auth| auth.grants.admin)
+    }
+
+    /// The forwarded shell environment this connection may keep.
+    ///
+    /// A client may send its process environment in `initialize` so the
+    /// subprocesses the daemon spawns for that client's sessions see the
+    /// user's real `PATH`, credential sockets and helper settings. The shell
+    /// tool applies it verbatim on top of its safe environment, so it also
+    /// chooses what runs as the daemon account. It is therefore retained only
+    /// for an operator-level principal on a local transport, which is the
+    /// local IDE flow it exists for. A remote client's environment describes
+    /// another host, and a scoped principal shaping the daemon's subprocess
+    /// environment would step around its risk profile's command allowlist.
+    fn retained_tui_env(
+        &self,
+        auth: &crate::rpc::auth::ConnectionAuth,
+        env: std::collections::HashMap<String, String>,
+    ) -> std::collections::HashMap<String, String> {
+        if env.is_empty() {
+            return env;
+        }
+        let local = self.transport_kind == crate::rpc::transport::TransportKind::Local;
+        if local && auth.grants.admin {
+            return env;
+        }
+        let transport = self.transport_kind;
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "transport": format!("{transport:?}"),
+                    "principal_id": auth.principal.id.as_str(),
+                    "dropped_vars": env.len(),
+                })
+            ),
+            "forwarded client environment is not retained for this connection"
+        );
+        std::collections::HashMap::new()
+    }
+
     /// TUI ID assigned during initialize, if any.
     pub fn tui_id(&self) -> Option<&str> {
         self.tui_id.as_deref()
@@ -606,8 +1471,73 @@ impl RpcDispatcher {
     }
 
     #[cfg(test)]
+    pub fn expire_credential_for_test(&mut self) {
+        if let Some(auth) = self.auth.as_mut() {
+            auth.principal.expires_at = Some(0);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn set_tui_registration_for_test(
+        &mut self,
+        registration: Option<(String, super::tui_identity::TuiEpoch)>,
+    ) {
+        let (id, epoch) = match registration {
+            Some((id, epoch)) => (Some(id), Some(epoch)),
+            None => (None, None),
+        };
+        self.tui_id = id;
+        self.tui_epoch = epoch;
+    }
+
+    #[cfg(test)]
     pub fn rpc_for_test(&self) -> Arc<RpcOutbound> {
         Arc::clone(&self.rpc)
+    }
+
+    /// Test-only: bind a provider-verified identity with the evidence
+    /// `initialize` would retain for it.
+    #[cfg(test)]
+    pub fn bind_identity_for_test(
+        &mut self,
+        identity: zeroclaw_api::principal::AuthenticatedIdentity,
+        local_evidence: crate::rpc::auth::LocalCredentialEvidence,
+    ) {
+        let resolved = self
+            .ctx
+            .auth
+            .resolve(&identity)
+            .expect("the test identity resolves");
+        self.auth = Some(crate::rpc::auth::ConnectionAuth {
+            identity,
+            principal: resolved.principal,
+            grants: resolved.grants,
+            generation: resolved.generation,
+            native_token_hash: None,
+            local_evidence,
+        });
+    }
+
+    /// Test-only: bind the shared-operator principal directly, standing in
+    /// for a legacy local `initialize`.
+    #[cfg(test)]
+    pub fn set_authenticated_for_test(&mut self) {
+        let identity = zeroclaw_api::principal::AuthenticatedIdentity::shared_operator(
+            zeroclaw_api::principal::AuthMethod::SharedOperator,
+        );
+        let resolved = self
+            .ctx
+            .auth
+            .resolve(&identity)
+            .expect("the shared operator always resolves");
+        self.auth = Some(crate::rpc::auth::ConnectionAuth {
+            identity,
+            principal: resolved.principal,
+            grants: resolved.grants,
+            generation: resolved.generation,
+            native_token_hash: None,
+            local_evidence: crate::rpc::auth::LocalCredentialEvidence::LocalCompatibility,
+        });
     }
 
     /// Construct a pre-authenticated dispatcher sharing the same context and
@@ -621,7 +1551,9 @@ impl RpcDispatcher {
         Self {
             ctx: Arc::clone(&self.ctx),
             rpc: Arc::clone(&self.rpc),
-            authenticated: true,
+            auth: self.auth.clone(),
+            transport_kind: self.transport_kind,
+            transport_credential: self.transport_credential.clone(),
             tui_id: self.tui_id.clone(),
             // Same connection, so the same registration: this handle shares the
             // parent's epoch rather than claiming one of its own. It never runs
@@ -669,29 +1601,77 @@ impl RpcDispatcher {
 
     /// Flush dirty config paths to disk.
     ///
-    /// `_guard` is never read — it is a witness reminding the caller to
-    /// serialize on `ctx.config_write_lock` for the whole read-mutate-flush
-    /// critical section. It is NOT compile-time proof of holding *that*
-    /// mutex (a guard is not statically tied to a specific instance); the
-    /// `debug_assert!` below catches a caller holding a look-alike guard
-    /// from the wrong mutex. The invariant lives on
-    /// [`RpcContext::config_write_lock`]: every mutation of `ctx.config`
-    /// must hold it, and a bypassing writer that re-dirties a just-saved
-    /// path during a flush loses disk persistence of that write.
+    /// Save `snapshot` to disk, then install it as the live config.
     ///
-    /// Clone the config out of the lock (parking_lot guards are !Send, so
-    /// the clone can't be held across `snapshot.save_dirty().await`), save
-    /// the clone to disk, then remove only the paths that were actually
-    /// saved from the LIVE config's dirty set. This must NOT swap the live
-    /// config wholesale: a write landed on `ctx.config` while this method
-    /// awaits disk I/O would otherwise be overwritten by the stale snapshot
-    /// on write-back, silently erasing an in-memory change that was never
-    /// given a chance to be saved.
-    async fn flush_config(&self, _guard: &ConfigWriteGuard) -> Result<(), JsonRpcError> {
+    /// `_guard` is a witness that the caller serializes the whole
+    /// read-mutate-save-swap critical section on `config_write_lock`. Holding
+    /// that lock prevents a concurrent write from being lost while disk I/O
+    /// awaits, and lets auth publication consume the exact saved snapshot.
+    async fn save_and_swap_config(
+        &self,
+        mut snapshot: zeroclaw_config::schema::Config,
+        _guard: &ConfigWriteGuard,
+    ) -> Result<(), JsonRpcError> {
         debug_assert!(
             self.ctx.config_write_lock.try_lock().is_err(),
-            "flush_config caller must hold ctx.config_write_lock"
+            "save_and_swap_config caller must hold ctx.config_write_lock"
         );
+        // Validate the auth sections BEFORE anything is persisted or swapped:
+        // an invalid authorization policy must be rejected without being
+        // installed, and the caller should learn why rather than find the
+        // previous policy silently still in effect after a "successful" save.
+        snapshot.validate_auth().map_err(|e| {
+            rpc_err(
+                INVALID_PARAMS,
+                format!("Authorization config rejected; nothing was saved: {e}"),
+            )
+        })?;
+        self.ctx
+            .auth
+            .validate_refresh_from_config(&snapshot)
+            .map_err(|e| {
+                rpc_err(
+                    INVALID_PARAMS,
+                    format!("Authorization config rejected; nothing was saved: {e}"),
+                )
+            })?;
+        snapshot
+            .save_dirty()
+            .await
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config save failed: {e}")))?;
+        *self.ctx.config.write() = snapshot;
+        // Authorization config may have changed (permission_profiles,
+        // users, oidc, security.trust_daemon_uid): recompile the policy
+        // so a new generation reaches established connections at their
+        // next privileged operation — no reconnect or restart.
+        let refreshed = self.ctx.config.read().clone();
+        // One accepted persistence, one revision. Both the save and this
+        // publication happen under `config_write_lock`, so the revision is
+        // monotonic and the accepted state a consumer observes at revision N
+        // is the policy compiled from the configuration that was persisted as
+        // N.
+        let revision = self.ctx.auth.accepted_revision().saturating_add(1);
+        if let Err(error) = self.ctx.auth.publish_accepted(&refreshed, revision) {
+            // The auth sections were validated before the save, so this is
+            // defensive: the resolver keeps the previous policy and
+            // generation in effect rather than installing anything invalid.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({ "error": format!("{error}") })),
+                "config saved but the authorization policy was rejected; the previous policy remains in effect"
+            );
+        }
+        Ok(())
+    }
+
+    /// Exercise the historical dirty-path persistence boundary directly.
+    /// Production mutations now use `save_and_swap_config` so the accepted
+    /// auth snapshot and persisted config stay one transaction.
+    #[cfg(test)]
+    async fn flush_config(&self, _guard: &ConfigWriteGuard) -> Result<(), JsonRpcError> {
+        debug_assert!(self.ctx.config_write_lock.try_lock().is_err());
         let mut snapshot = self.ctx.config.read().clone();
         let saved_paths = snapshot.dirty_paths.clone();
         snapshot
@@ -703,33 +1683,6 @@ impl RpcDispatcher {
             .write()
             .dirty_paths
             .retain(|path| !saved_paths.contains(path));
-        Ok(())
-    }
-
-    /// Save `snapshot` to disk, then install it as the live config.
-    ///
-    /// `_guard` is the same serialization witness as in
-    /// [`Self::flush_config`] (a reminder, not compile-time proof — see
-    /// there). Unlike `flush_config`, this deliberately swaps: callers pass
-    /// a clone that was itself mutated beyond just `dirty_paths` (e.g. an
-    /// alias rename), and installing that mutated snapshot wholesale is the
-    /// point. Holding `config_write_lock` is what makes the swap safe — no
-    /// other handler can land a concurrent `config` write while this is in
-    /// flight.
-    async fn save_and_swap_config(
-        &self,
-        mut snapshot: zeroclaw_config::schema::Config,
-        _guard: &ConfigWriteGuard,
-    ) -> Result<(), JsonRpcError> {
-        debug_assert!(
-            self.ctx.config_write_lock.try_lock().is_err(),
-            "save_and_swap_config caller must hold ctx.config_write_lock"
-        );
-        snapshot
-            .save_dirty()
-            .await
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config save failed: {e}")))?;
-        *self.ctx.config.write() = snapshot;
         Ok(())
     }
 
@@ -878,12 +1831,16 @@ impl RpcDispatcher {
             }
         };
 
-        if !self.authenticated && method != Method::Initialize {
-            if !is_notification {
-                self.send_error(req_id, AUTH_REQUIRED, "First call must be 'initialize'")
-                    .await;
+        match method.authz() {
+            MethodAuthz::Handshake => {}
+            MethodAuthz::Requires(resource, verb) => {
+                if let Err(denied) = self.authorize(method, resource, verb) {
+                    if !is_notification {
+                        self.send_error(req_id, denied.code, &denied.message).await;
+                    }
+                    return;
+                }
             }
-            return;
         }
 
         // Exhaustive match — compiler enforces every Method has a handler.
@@ -1018,7 +1975,10 @@ impl RpcDispatcher {
 
             // Files
             Method::FileAttach => self.handle_file_attach(&req.params).await,
-            Method::FsListDir => super::fs::handle_fs_list_dir(&req.params).await,
+            Method::FsListDir => match self.authorize_fs_listing(&req.params) {
+                Ok(()) => super::fs::handle_fs_list_dir(&req.params).await,
+                Err(denied) => Err(denied),
+            },
 
             // Locales
             Method::LocalesList => super::locales::handle_locales_list(self.tui_id()),
@@ -1086,6 +2046,26 @@ impl RpcDispatcher {
         self.client_elicitation_caps =
             zeroclaw_api::elicitation::ElicitationCapabilities::from_value(elicitation);
 
+        // Authenticate FIRST: bind a principal or reject, before any
+        // registry mutation. The tui_id/tui_sig continuity below grants no
+        // authority — a credential is re-presented on every initialize, so
+        // reconnect can never outlive or bypass the authentication that
+        // created it.
+        let connection_auth = match self
+            .ctx
+            .auth
+            .authenticate(
+                self.transport_kind,
+                self.transport_credential.clone(),
+                req.auth_token.as_deref(),
+                req.auth_provider.as_deref(),
+            )
+            .await
+        {
+            Ok(auth) => auth,
+            Err(denied) => return Err(rpc_err(denied.code, denied.message)),
+        };
+
         // TUI identity: reconnect with previous credentials or generate new
         let tui_id = if let (Some(claimed_id), Some(sig)) =
             (req.tui_id.as_deref(), req.tui_sig.as_deref())
@@ -1109,6 +2089,7 @@ impl RpcDispatcher {
             self.ctx.tui_registry.generate_unique_tui_id()
         };
 
+        let env = self.retained_tui_env(&connection_auth, req.env);
         let tui_sig = self.ctx.tui_registry.sign(&tui_id);
         let tui_epoch = self
             .ctx
@@ -1122,7 +2103,7 @@ impl RpcDispatcher {
                     .map_or("unknown", |(proto, _)| proto)
                     .to_string(),
                 peer_label: self.peer_label.clone(),
-                env: req.env,
+                env,
             });
         self.tui_id = Some(tui_id.clone());
         self.tui_epoch = Some(tui_epoch);
@@ -1143,7 +2124,20 @@ impl RpcDispatcher {
             );
         }
 
-        self.authenticated = true;
+        let principal_id = connection_auth.principal.id.as_str().to_owned();
+        let auth_provider_label = connection_auth.principal.auth_provider_label();
+        self.auth = Some(connection_auth);
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::System)
+                .with_attrs(::serde_json::json!({
+                    "principal_id": principal_id,
+                    "auth_provider": auth_provider_label,
+                    "transport": self.peer_label,
+                })),
+            "RPC principal bound"
+        );
 
         let capabilities: Vec<String> = Method::ALL
             .iter()
@@ -1169,6 +2163,8 @@ impl RpcDispatcher {
             tui_sig,
             capabilities,
             commands,
+            auth_methods: self.ctx.auth.provider_names(),
+            principal_id: Some(principal_id),
         })
     }
 
@@ -1529,12 +2525,12 @@ impl RpcDispatcher {
 
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
         let req: SessionNewParams = parse_params(params)?;
+        self.selector_session_agent(Method::SessionNew, &req.agent_alias)?;
         let resuming = req.session_id.is_some();
         let session_id = req
             .session_id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-        let config = self.ctx.config.read().clone();
         let chat_mode = req
             .chat_mode
             .clone()
@@ -1564,12 +2560,17 @@ impl RpcDispatcher {
                     &req.agent_alias,
                     &chat_mode,
                     self.tui_id.clone(),
+                    // Nothing has waited yet, so the stamped grants are as
+                    // current as the gate that just ran.
+                    |alias, workspace| {
+                        self.authorize_resumed_session(self.stamped_grants(), alias, workspace)
+                    },
                 )
                 .await
             {
                 Ok(Some(existing)) => {
                     return self
-                        .finish_existing_session_resume(session_id, &chat_mode, existing)
+                        .finish_existing_session_resume(session_id, &chat_mode, existing?)
                         .await;
                 }
                 Ok(None) | Err("session uses a different chat mode") => {}
@@ -1586,6 +2587,16 @@ impl RpcDispatcher {
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
 
+        // The wait for admission is unbounded, so the principal's profile,
+        // credential, or pairing may have changed while this request was
+        // parked. Every selector below is judged by the grants resolved now,
+        // not by the ones stamped on the connection before the wait.
+        let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
+        if let Some(grants) = grants.as_ref() {
+            self.selector_session_agent_with_grants(Method::SessionNew, grants, &req.agent_alias)?;
+        }
+        let config = self.ctx.config.read().clone();
+
         // The mode may have changed while this request waited for admission.
         // Re-read under the permit so concurrent replacements cannot remove a
         // newly installed same-mode canonical session based on stale state.
@@ -1599,12 +2610,15 @@ impl RpcDispatcher {
                     &req.agent_alias,
                     &chat_mode,
                     self.tui_id.clone(),
+                    |alias, workspace| {
+                        self.authorize_resumed_session(grants.as_ref(), alias, workspace)
+                    },
                 )
                 .await
                 .map_err(|message| rpc_err(INVALID_PARAMS, message))?
         {
             return self
-                .finish_existing_session_resume(session_id, &chat_mode, existing)
+                .finish_existing_session_resume(session_id, &chat_mode, existing?)
                 .await;
         }
         if admitted_mode.is_some() {
@@ -1722,11 +2736,29 @@ impl RpcDispatcher {
                     .to_string()
             });
 
+        // Whichever workspace was chosen becomes the agent's jail root below,
+        // so it is authorized here, before anything is built or inserted. A
+        // caller-selected cwd and a resumed ACP row's persisted workspace were
+        // both chosen by a request, possibly another principal's or one made
+        // under an older policy; the agent's own default passes trivially.
+        if let Some(grants) = grants.as_ref() {
+            self.confine_session_workspace_with_grants(
+                Method::SessionNew,
+                grants,
+                &config,
+                &req.agent_alias,
+                &cwd,
+            )?;
+        }
+
         let cwd_path = Some(std::path::Path::new(&cwd));
-        let tui_env = req
-            .tui_id
-            .as_deref()
-            .and_then(|id| self.ctx.tui_registry.get_env(id));
+        // The environment comes from THIS connection's own registration, never
+        // from a request field. The captured environment carries the user's
+        // real shell, credential sockets included, so a caller must not be
+        // able to name someone else's TUI and inherit it.
+        let tui_env = self
+            .tui_registration()
+            .and_then(|(id, epoch)| self.ctx.tui_registry.env_for_registration(id, epoch));
         let chat_mode = req
             .chat_mode
             .clone()
@@ -2207,13 +3239,21 @@ impl RpcDispatcher {
 
     /// Rebuild a reaped ACP session from a restorable durable row so a fresh
     /// prompt recovers to a working session instead of hanging. Returns the
-    /// live agent on success; returns `None` for missing, killed, or unreadable
-    /// durable state.
+    /// live agent on success, and `Ok(None)` for missing, killed, or
+    /// unreadable durable state.
+    ///
+    /// The durable row names the agent and the workspace the session is
+    /// rebuilt with, and it may have been written by another principal or
+    /// under an older policy. With `grants` bound, both are held to them
+    /// before anything is built or installed, and a refusal is the `Err`.
     async fn rehydrate_reaped_session(
         &self,
         sid: &str,
-    ) -> Option<Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>> {
-        let store = self.ctx.acp_session_store.clone()?;
+        grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
+    ) -> Result<Option<Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>>, JsonRpcError> {
+        let Some(store) = self.ctx.acp_session_store.clone() else {
+            return Ok(None);
+        };
         let store_for_load = Arc::clone(&store);
         let sid_owned = sid.to_string();
         let loaded = tokio::task::spawn_blocking(move || {
@@ -2230,7 +3270,7 @@ impl RpcDispatcher {
                         .with_outcome(::zeroclaw_log::EventOutcome::Success),
                     "session/prompt: refusing to rehydrate admin-killed ACP session"
                 );
-                return None;
+                return Ok(None);
             }
             Ok(Err(e)) => {
                 ::zeroclaw_log::record!(
@@ -2244,9 +3284,11 @@ impl RpcDispatcher {
                         })),
                     "session/prompt: failed to query ACP killed marker before rehydrate"
                 );
-                return None;
+                return Ok(None);
             }
-            Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing)) => return None,
+            Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing)) => {
+                return Ok(None);
+            }
             Err(e) => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -2259,31 +3301,44 @@ impl RpcDispatcher {
                         })),
                     "session/prompt: ACP killed-marker query task failed before rehydrate"
                 );
-                return None;
+                return Ok(None);
             }
         };
 
+        {
+            let config = self.ctx.config.read();
+            self.authorize_session_binding(
+                Method::SessionPrompt,
+                grants,
+                &config,
+                &data.agent_alias,
+                &data.workspace_dir,
+            )?;
+        }
+
         let cwd_path = Some(std::path::Path::new(&data.workspace_dir));
         let tui_env = self
-            .tui_id
-            .as_deref()
-            .and_then(|id| self.ctx.tui_registry.get_env(id));
+            .tui_registration()
+            .and_then(|(id, epoch)| self.ctx.tui_registry.env_for_registration(id, epoch));
         let exclude_memory = true;
         // Reaped sessions always rehydrate as ACP, which skips eager MCP init to
         // stay prompt — matching `session_should_initialize_mcp(ChatMode::Acp)`.
-        let mut agent = crate::agent::agent::Agent::from_live_config_with_tui_env_and_acp_sessions(
-            Arc::clone(&self.ctx.config),
-            &data.agent_alias,
-            cwd_path,
-            false,
-            exclude_memory,
-            tui_env,
-            self.ctx.sop_engine.clone(),
-            self.ctx.sop_audit.clone(),
-            store,
-        )
-        .await
-        .ok()?;
+        let Ok(mut agent) =
+            crate::agent::agent::Agent::from_live_config_with_tui_env_and_acp_sessions(
+                Arc::clone(&self.ctx.config),
+                &data.agent_alias,
+                cwd_path,
+                false,
+                exclude_memory,
+                tui_env,
+                self.ctx.sop_engine.clone(),
+                self.ctx.sop_audit.clone(),
+                store,
+            )
+            .await
+        else {
+            return Ok(None);
+        };
         let interaction_context = match data.interaction_surface.as_deref() {
             Some(value) => match crate::agent::prompt::InteractionSurface::from_persisted(value) {
                 Some(surface) => Some(surface.resolve()),
@@ -2299,7 +3354,7 @@ impl RpcDispatcher {
                             })),
                         "session/prompt: refusing to rehydrate an unsupported interaction surface"
                     );
-                    return None;
+                    return Ok(None);
                 }
             },
             None => None,
@@ -2319,7 +3374,8 @@ impl RpcDispatcher {
         agent.channel_handles().register_channel("rpc", approval_ch);
 
         let message_count = data.messages.len();
-        self.ctx
+        if self
+            .ctx
             .sessions
             .insert(
                 sid.to_string(),
@@ -2332,7 +3388,10 @@ impl RpcDispatcher {
                 .with_owner(self.tui_id.clone()),
             )
             .await
-            .ok()?;
+            .is_err()
+        {
+            return Ok(None);
+        }
         let seed_event = self
             .ctx
             .sessions
@@ -2354,7 +3413,7 @@ impl RpcDispatcher {
             "rehydrated reaped session from durable store; turn continues on a working session"
         );
 
-        self.ctx.sessions.get_agent(sid).await
+        Ok(self.ctx.sessions.get_agent(sid).await)
     }
 
     async fn handle_session_prompt(&self, params: &Value) -> RpcResult {
@@ -2400,11 +3459,29 @@ impl RpcDispatcher {
             .wait_test_prompt_registration_pause()
             .await;
 
+        // Admission can wait behind an active turn for as long as that turn
+        // runs, and this handle carries a copy of the connection's binding
+        // from before the wait. Re-resolve against the accepted policy now,
+        // before any lookup, rehydration, attachment, or turn work.
+        let grants = match self.recheck_authority_after_admission(Method::SessionPrompt) {
+            Ok(grants) => grants,
+            Err(denied) => {
+                return Err(self
+                    .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
+                    .await);
+            }
+        };
+
         let agent = match self.ctx.sessions.get_agent(sid).await {
             Some(a) => a,
-            None => match self.rehydrate_reaped_session(sid).await {
-                Some(a) => a,
-                None => {
+            None => match self.rehydrate_reaped_session(sid, grants.as_ref()).await {
+                Ok(Some(a)) => a,
+                Err(denied) => {
+                    return Err(self
+                        .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
+                        .await);
+                }
+                Ok(None) => {
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail,)
@@ -2425,18 +3502,44 @@ impl RpcDispatcher {
                 }
             },
         };
+        // Session/new authorizes a binding only when it creates or reattaches
+        // a session. Reused and rehydrated sessions enter through
+        // session/prompt, so the same agent/tool posture and workspace
+        // confinement are enforced here, against the grants resolved after
+        // admission, before any prompt-side effect. An unbound dispatcher (the
+        // direct unit-test handlers) has no grants to apply.
+        let agent_alias = self
+            .ctx
+            .sessions
+            .get_agent_alias(sid)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        if grants.is_some() {
+            let binding = match self.ctx.sessions.get_workspace_dir(sid).await {
+                Some(workspace) => {
+                    let config = self.ctx.config.read();
+                    self.authorize_session_binding(
+                        Method::SessionPrompt,
+                        grants.as_ref(),
+                        &config,
+                        &agent_alias,
+                        &workspace,
+                    )
+                }
+                None => Err(rpc_err(SESSION_NOT_FOUND, "Session not found")),
+            };
+            if let Err(denied) = binding {
+                return Err(self
+                    .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
+                    .await);
+            }
+        }
 
         // Process inline attachments: upload each, append markers to prompt.
         let mut prompt = req.prompt.clone();
         if !req.attachments.is_empty() {
             use super::attachments::process_file_entry;
 
-            let agent_alias = self
-                .ctx
-                .sessions
-                .get_agent_alias(sid)
-                .await
-                .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
             let upload_root = self
                 .ctx
                 .config
@@ -2445,6 +3548,18 @@ impl RpcDispatcher {
                 .to_string_lossy()
                 .to_string();
             let is_wss = self.peer_label.starts_with("wss:");
+            if !is_wss
+                && let Err(denied) = self.authorize_attachment_sources(
+                    Method::SessionPrompt,
+                    grants.as_ref(),
+                    &agent_alias,
+                    &req.attachments,
+                )
+            {
+                return Err(self
+                    .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
+                    .await);
+            }
             if !prompt.is_empty() {
                 prompt.push('\n');
             }
@@ -2853,6 +3968,30 @@ impl RpcDispatcher {
                 ))
             }
         }
+    }
+
+    /// Refuse a prompt that was already admitted to its session's queue.
+    ///
+    /// The client entered its working state when it sent the prompt, and it
+    /// leaves that state on the terminal `TurnComplete` notification, not on
+    /// the JSON-RPC response. The refusal therefore emits a `Failed`
+    /// completion carrying the same message as the error, as the
+    /// session-not-found path does.
+    async fn refuse_admitted_prompt(
+        &self,
+        session_id: &str,
+        client_turn_generation: Option<u64>,
+        denied: JsonRpcError,
+    ) -> JsonRpcError {
+        self.emit_turn_complete(
+            session_id,
+            crate::rpc::types::TurnCompletionOutcome::Failed,
+            format!("turn refused by daemon: {}", denied.message),
+            client_turn_generation,
+            None,
+        )
+        .await;
+        denied
     }
 
     /// Emit the terminal `session/update` notification for a turn.
@@ -3474,21 +4613,27 @@ impl RpcDispatcher {
 
     async fn handle_cron_list(&self) -> RpcResult {
         let config = self.ctx.config.read().clone();
-        let jobs = crate::cron::list_jobs(&config)
+        let mut jobs = crate::cron::list_jobs(&config)
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron list failed: {e}")))?;
+        // One query, then drop what this principal is not entitled to see.
+        // An operator-level principal keeps the whole list; a scoped one sees
+        // only its own agents' rows, and legacy ownerless rows are nobody's.
+        if let Some(auth) = self.auth.as_ref() {
+            jobs.retain(|job| auth.grants.may_use_agent(&job.agent_alias));
+        }
         to_result(CronListResult { jobs })
     }
 
     async fn handle_cron_get(&self, params: &Value) -> RpcResult {
         let req: CronIdParams = parse_params(params)?;
         let config = self.ctx.config.read().clone();
-        let job = crate::cron::get_job(&config, &req.id)
-            .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron job not found: {e}")))?;
+        let job = self.authorize_cron_job(Method::CronGet, &config, &req.id)?;
         to_result(job)
     }
 
     async fn handle_cron_add(&self, params: &Value) -> RpcResult {
         let req: CronAddParams = parse_params(params)?;
+        self.selector_agent(Method::CronAdd, &req.agent)?;
         let config = self.ctx.config.read().clone();
         let schedule = Schedule::Cron {
             expr: req.schedule,
@@ -3509,6 +4654,7 @@ impl RpcDispatcher {
 
     async fn handle_cron_patch(&self, params: &Value) -> RpcResult {
         let req: CronPatchParams = parse_params(params)?;
+        self.selector_agent(Method::CronPatch, &req.agent)?;
         let config = self.ctx.config.read().clone();
         let patch = CronJobPatch {
             schedule: req.schedule.map(|s| Schedule::Cron {
@@ -3524,16 +4670,32 @@ impl RpcDispatcher {
             name: req.name,
             ..Default::default()
         };
-        let job = crate::cron::update_job(&config, &req.id, patch)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron patch failed: {e}")))?;
+        // The ownership test rides in the `UPDATE` itself for a scoped
+        // principal, so an agent rename landing between the check and the
+        // write cannot open a window. An operator-level principal patches
+        // any row, including the ownerless legacy ones.
+        let owner = self.authorize_cron_job(Method::CronPatch, &config, &req.id)?;
+        let job = if self.has_admin_grants() {
+            crate::cron::update_job(&config, &req.id, patch)
+        } else {
+            crate::cron::update_job_for_agent(&config, &req.id, &owner.agent_alias, patch)
+        }
+        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron patch failed: {e}")))?;
         to_result(job)
     }
 
     async fn handle_cron_delete(&self, params: &Value) -> RpcResult {
         let req: CronIdParams = parse_params(params)?;
         let config = self.ctx.config.read().clone();
-        crate::cron::remove_job(&config, &req.id)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron delete failed: {e}")))?;
+        let job = self.authorize_cron_job(Method::CronDelete, &config, &req.id)?;
+        // As with the patch path, a scoped principal's delete carries the
+        // owner into the statement so a concurrent rename cannot widen it.
+        if self.has_admin_grants() {
+            crate::cron::remove_job(&config, &req.id)
+        } else {
+            crate::cron::remove_job_for_agent(&config, &req.id, &job.agent_alias)
+        }
+        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron delete failed: {e}")))?;
         to_result(CronDeleteResult {
             id: req.id,
             deleted: true,
@@ -3543,17 +4705,25 @@ impl RpcDispatcher {
     async fn handle_cron_runs(&self, params: &Value) -> RpcResult {
         let req: CronRunsParams = parse_params(params)?;
         let config = self.ctx.config.read().clone();
+        let job = self.authorize_cron_job(Method::CronRuns, &config, &req.id)?;
         let limit = req.limit.unwrap_or(20) as usize;
-        let runs = crate::cron::list_runs(&config, &req.id, limit)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron runs failed: {e}")))?;
+        // A scoped principal was authorized against the job's owner at lookup.
+        // Read history only while that agent still owns the job, so an
+        // ownership change between the lookup and the read cannot return
+        // another agent's runs.
+        let runs = if self.has_admin_grants() {
+            crate::cron::list_runs(&config, &req.id, limit)
+        } else {
+            crate::cron::list_runs_for_agent(&config, &req.id, &job.agent_alias, limit)
+        }
+        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron runs failed: {e}")))?;
         to_result(CronRunsResult { runs })
     }
 
     async fn handle_cron_trigger(&self, params: &Value) -> RpcResult {
         let req: CronIdParams = parse_params(params)?;
         let config = self.ctx.config.read().clone();
-        let job = crate::cron::get_job(&config, &req.id)
-            .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron job not found: {e}")))?;
+        let job = self.authorize_cron_job(Method::CronTrigger, &config, &req.id)?;
         let event_tx = self.ctx.event_tx.clone();
         let result = crate::cron::scheduler::run_manual_job(
             &config,
@@ -3575,6 +4745,10 @@ impl RpcDispatcher {
 
     async fn handle_cron_settings(&self, params: &Value) -> RpcResult {
         let config = self.ctx.config.read().clone();
+        // Scheduler settings are global, not per-agent, so no agent selector
+        // applies here. When the write branch below is implemented it must
+        // gate on an operator-level grant rather than an agent selector.
+        //
         // If a "patch" field is present, this is a write; otherwise read.
         if params.get("patch").is_some() {
             not_yet_implemented(Method::CronSettings)
@@ -3604,8 +4778,14 @@ impl RpcDispatcher {
 
     async fn handle_config_set(&self, params: &Value) -> RpcResult {
         let req: ConfigSetParams = parse_params(params)?;
+        self.selector_config_write(Method::ConfigSet, &req.prop)?;
         let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        self.recheck_config_write_authority(
+            Method::ConfigSet,
+            Some(&req.prop),
+            &config_write_guard,
+        )?;
         // Clone the live config and perform every mutation — alias creation,
         // field lookup, value coercion, masked-secret validation, and the
         // persistent write — on the working copy. Any early error simply
@@ -3983,15 +5163,20 @@ impl RpcDispatcher {
 
     async fn handle_config_delete(&self, params: &Value) -> RpcResult {
         let req: ConfigDeleteParams = parse_params(params)?;
+        self.selector_config_write(Method::ConfigDelete, &req.prop)?;
         let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
-        {
-            let mut config = self.ctx.config.write();
-            config
-                .set_prop_persistent(&req.prop, "")
-                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config delete failed: {e}")))?;
-        }
-        self.flush_config(&config_write_guard).await?;
+        self.recheck_config_write_authority(
+            Method::ConfigDelete,
+            Some(&req.prop),
+            &config_write_guard,
+        )?;
+        let mut working = self.ctx.config.read().clone();
+        working
+            .set_prop_persistent(&req.prop, "")
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config delete failed: {e}")))?;
+        self.save_and_swap_config(working, &config_write_guard)
+            .await?;
         if let Some(model_provider_ref) = refresh_model_provider_ref {
             self.refresh_memory_embedder_for_model_provider(&model_provider_ref);
             self.schedule_live_sessions_refresh_for_model_provider(model_provider_ref);
@@ -4029,25 +5214,33 @@ impl RpcDispatcher {
 
     async fn handle_config_map_key_create(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyCreateParams = parse_params(params)?;
+        let key_path = format!("{}.{}", req.path, req.key);
+        self.selector_config_write(Method::ConfigMapKeyCreate, &key_path)?;
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        self.recheck_config_write_authority(
+            Method::ConfigMapKeyCreate,
+            Some(&key_path),
+            &config_write_guard,
+        )?;
+        let mut working = self.ctx.config.read().clone();
         let created = {
-            let mut config = self.ctx.config.write();
             // Shared guarded boundary: enforces the reserved-agent rule (the
             // `default` runtime fallback) on this surface too, so the RPC create
             // path cannot author an `agents.default` the rename guard then traps.
             let created = zeroclaw_config::alias_refs::create_map_key_checked(
-                &mut config,
+                &mut working,
                 &req.path,
                 &req.key,
             )
             .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
             if created {
-                config.mark_dirty(&format!("{}.{}", req.path, req.key));
+                working.mark_dirty(&format!("{}.{}", req.path, req.key));
             }
             created
         };
         if created {
-            self.flush_config(&config_write_guard).await?;
+            self.save_and_swap_config(working, &config_write_guard)
+                .await?;
         }
         to_result(ConfigMapKeyCreateResult {
             path: req.path,
@@ -4058,19 +5251,27 @@ impl RpcDispatcher {
 
     async fn handle_config_map_key_delete(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyDeleteParams = parse_params(params)?;
+        let key_path = format!("{}.{}", req.path, req.key);
+        self.selector_config_write(Method::ConfigMapKeyDelete, &key_path)?;
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        self.recheck_config_write_authority(
+            Method::ConfigMapKeyDelete,
+            Some(&key_path),
+            &config_write_guard,
+        )?;
+        let mut working = self.ctx.config.read().clone();
         let deleted = {
-            let mut config = self.ctx.config.write();
-            let deleted = config
+            let deleted = working
                 .delete_map_key(&req.path, &req.key)
                 .map_err(|e| rpc_err(INVALID_PARAMS, e))?;
             if deleted {
-                config.mark_dirty(&format!("{}.{}", req.path, req.key));
+                working.mark_dirty(&format!("{}.{}", req.path, req.key));
             }
             deleted
         };
         if deleted {
-            self.flush_config(&config_write_guard).await?;
+            self.save_and_swap_config(working, &config_write_guard)
+                .await?;
         }
         to_result(ConfigMapKeyDeleteResult {
             path: req.path,
@@ -4084,6 +5285,21 @@ impl RpcDispatcher {
             Ok(req) => req,
             Err(err) => return Box::pin(std::future::ready(Err(err))),
         };
+        // A rename mutates both the old and new key paths.
+        if let Err(err) = self
+            .selector_config_write(
+                Method::ConfigMapKeyRename,
+                &format!("{}.{}", req.path, req.from),
+            )
+            .and_then(|()| {
+                self.selector_config_write(
+                    Method::ConfigMapKeyRename,
+                    &format!("{}.{}", req.path, req.to),
+                )
+            })
+        {
+            return Box::pin(std::future::ready(Err(err)));
+        }
 
         Box::pin(async move {
             // Acquired once here, not inside `handle_config_alias_rename`:
@@ -4092,25 +5308,38 @@ impl RpcDispatcher {
             // alias-rename path so it can be released at that handler's
             // commit point, before its slow post-commit side effects.
             let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+            // Both endpoints are rechecked here, before the alias branch is
+            // delegated into, so the alias-rename path inherits the recheck.
+            for key_path in [
+                format!("{}.{}", req.path, req.from),
+                format!("{}.{}", req.path, req.to),
+            ] {
+                self.recheck_config_write_authority(
+                    Method::ConfigMapKeyRename,
+                    Some(&key_path),
+                    &config_write_guard,
+                )?;
+            }
             if let Some(kind) = zeroclaw_config::alias_refs::alias_kind_for_map_path(&req.path) {
                 return self
                     .handle_config_alias_rename(req, kind, config_write_guard)
                     .await;
             }
 
+            let mut working = self.ctx.config.read().clone();
             let renamed = {
-                let mut config = self.ctx.config.write();
-                let renamed = config
+                let renamed = working
                     .rename_map_key(&req.path, &req.from, &req.to)
                     .map_err(|e| rpc_err(INVALID_PARAMS, e))?;
                 if renamed {
-                    config.mark_dirty(&format!("{}.{}", req.path, req.from));
-                    config.mark_dirty(&format!("{}.{}", req.path, req.to));
+                    working.mark_dirty(&format!("{}.{}", req.path, req.from));
+                    working.mark_dirty(&format!("{}.{}", req.path, req.to));
                 }
                 renamed
             };
             if renamed {
-                self.flush_config(&config_write_guard).await?;
+                self.save_and_swap_config(working, &config_write_guard)
+                    .await?;
             }
             to_result(ConfigMapKeyRenameResult {
                 path: req.path,
@@ -4328,12 +5557,18 @@ impl RpcDispatcher {
     // ── Cost handler ─────────────────────────────────────────────
 
     fn handle_cost_query(&self, params: &Value) -> RpcResult {
+        let req: CostQueryParams = parse_params(params)?;
+        // A per-agent summary is that agent's usage history, so naming an agent
+        // takes the agent selector. The fleet-wide summary takes only the coarse
+        // `Cost:Read` grant, and its per-agent breakdown is filtered below.
+        if let Some(agent) = req.agent.as_deref() {
+            self.selector_agent(Method::CostQuery, agent)?;
+        }
         let tracker = self
             .ctx
             .cost_tracker
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Cost tracking is not available"))?;
-        let req: CostQueryParams = parse_params(params)?;
         // Optional `[from, to)` window (RFC3339). Lets callers (the dashboard's
         // Reports view, or an external CLI report) pull day/month/quarter/YTD
         // scalars rather than only the daemon's today/this-month aggregates.
@@ -4347,7 +5582,7 @@ impl RpcDispatcher {
         // Precedence (inherited from the existing per-agent path): an explicit
         // `agent` selects that agent's summary and the [from, to) window does
         // NOT apply; the window scopes only the fleet-wide summary.
-        let summary = if let Some(agent) = req.agent {
+        let mut summary = if let Some(agent) = req.agent {
             tracker
                 .get_summary_for_agent(&agent)
                 .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cost query failed: {e}")))?
@@ -4360,6 +5595,11 @@ impl RpcDispatcher {
                 .get_summary()
                 .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cost query failed: {e}")))?
         };
+        if let Some(grants) = self.stamped_grants() {
+            summary
+                .by_agent
+                .retain(|alias, _| grants.may_use_agent(alias));
+        }
         to_result(summary)
     }
 
@@ -4427,9 +5667,7 @@ impl RpcDispatcher {
         let config = self.ctx.config.read().clone();
         let root = config.install_root_dir();
         let svc = crate::skills::service::SkillsService::new(&config, &root);
-        let skill_ref = svc
-            .resolve_ref(&req.name, Some(&req.bundle))
-            .map_err(|e| rpc_err(INVALID_PARAMS, format!("Invalid skill ref: {e}")))?;
+        let skill_ref = resolve_skill_ref(&svc, &req.name, &req.bundle)?;
         let doc = svc
             .read_skill(&skill_ref)
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Skill read failed: {e}")))?;
@@ -4446,9 +5684,7 @@ impl RpcDispatcher {
         let config = self.ctx.config.read().clone();
         let root = config.install_root_dir();
         let svc = crate::skills::service::SkillsService::new(&config, &root);
-        let skill_ref = svc
-            .resolve_ref(&req.name, Some(&req.bundle))
-            .map_err(|e| rpc_err(INVALID_PARAMS, format!("Invalid skill ref: {e}")))?;
+        let skill_ref = resolve_skill_ref(&svc, &req.name, &req.bundle)?;
         let doc = crate::skills::document::SkillDocument {
             frontmatter: req.frontmatter,
             body: req.body,
@@ -4467,9 +5703,7 @@ impl RpcDispatcher {
         let config = self.ctx.config.read().clone();
         let root = config.install_root_dir();
         let svc = crate::skills::service::SkillsService::new(&config, &root);
-        let skill_ref = svc
-            .resolve_ref(&req.name, Some(&req.bundle))
-            .map_err(|e| rpc_err(INVALID_PARAMS, format!("Invalid skill ref: {e}")))?;
+        let skill_ref = resolve_skill_ref(&svc, &req.name, &req.bundle)?;
         svc.remove_skill(&skill_ref, crate::skills::service::RemoveMode::Archive)
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Skill delete failed: {e}")))?;
         to_result(SkillsDeleteResult {
@@ -4483,6 +5717,9 @@ impl RpcDispatcher {
 
     fn handle_personality_list(&self, params: &Value) -> RpcResult {
         let req: PersonalityListParams = parse_params(params)?;
+        if let Some(agent) = req.agent.as_deref() {
+            self.selector_agent(Method::PersonalityList, agent)?;
+        }
         let config = self.ctx.config.read().clone();
         let workspace = req.agent.as_deref().map(|a| config.agent_workspace_dir(a));
         let files: Vec<PersonalityFileEntry> =
@@ -4518,6 +5755,7 @@ impl RpcDispatcher {
 
     fn handle_personality_get(&self, params: &Value) -> RpcResult {
         let req: PersonalityGetParams = parse_params(params)?;
+        self.selector_agent(Method::PersonalityGet, &req.agent)?;
         let config = self.ctx.config.read().clone();
 
         // Sandbox: only allow files from the allowlist.
@@ -4558,6 +5796,7 @@ impl RpcDispatcher {
 
     fn handle_personality_put(&self, params: &Value) -> RpcResult {
         let req: PersonalityPutParams = parse_params(params)?;
+        self.selector_agent(Method::PersonalityPut, &req.agent)?;
         let config = self.ctx.config.read().clone();
 
         if !crate::agent::personality::EDITABLE_PERSONALITY_FILES.contains(&req.filename.as_str()) {
@@ -4596,6 +5835,9 @@ impl RpcDispatcher {
 
     fn handle_personality_templates(&self, params: &Value) -> RpcResult {
         let req: PersonalityTemplatesParams = parse_params(params)?;
+        if let Some(agent) = req.agent.as_deref() {
+            self.selector_agent_name(Method::PersonalityTemplates, agent)?;
+        }
         let config = self.ctx.config.read().clone();
         let ctx = personality_template_context(&config, &req);
         let templates = crate::agent::personality_templates::render_preset_default(&ctx);
@@ -4811,6 +6053,15 @@ impl RpcDispatcher {
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Event streaming is not available"))?;
         let mut rx = event_tx.subscribe();
         let rpc = self.rpc.clone();
+        // A subscription outlives the call that opened it, so the gate alone
+        // cannot end it. Hold every delivery to the connection's authority:
+        // the credential must still be live, and whenever the accepted policy
+        // has moved, the principal is resolved again and must still hold
+        // `Logs:Read`. The first refusal ends the stream. An unbound
+        // dispatcher (the direct unit-test handlers) has nothing to recheck.
+        let inbound = Arc::clone(&self.ctx.auth);
+        let binding = self.auth.clone();
+        let mut checked_generation = binding.as_ref().map(|auth| auth.generation);
         zeroclaw_spawn::spawn!(async move {
             loop {
                 tokio::select! {
@@ -4818,6 +6069,20 @@ impl RpcDispatcher {
                     _ = rpc.closed() => break,
                     event = rx.recv() => match event {
                         Ok(mut event) => {
+                            if let Some(auth) = binding.as_ref() {
+                                let generation = inbound.generation();
+                                let authority = if checked_generation == Some(generation) {
+                                    credential_is_live(&inbound, auth)
+                                } else {
+                                    current_authority(&inbound, auth, Method::LogsSubscribe)
+                                        .map(|_| ())
+                                };
+                                if let Err(denied) = authority {
+                                    audit_denial(Some(auth), Method::LogsSubscribe, &denied);
+                                    break;
+                                }
+                                checked_generation = Some(generation);
+                            }
                             // Pairing secrets (QR payloads, one-shot pair codes)
                             // ride the shared broadcast bus stamped with the
                             // ephemeral marker. `logs/subscribe` is NOT the
@@ -4923,14 +6188,17 @@ impl RpcDispatcher {
         let req: FileAttachParams = parse_params(params)?;
         let sid = &req.session_id;
 
-        // Uploads land in the per-agent workspace, not the session cwd.
-        // See `handle_send_message` for the rationale.
+        // Uploads land in the per-agent workspace, not the session cwd, the
+        // same way `session/prompt` lands its inline attachments. The session
+        // id is caller-selected, so the session's agent must be one the
+        // principal may use before anything is written into its workspace.
         let agent_alias = self
             .ctx
             .sessions
             .get_agent_alias(sid)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        self.selector_agent(Method::FileAttach, &agent_alias)?;
         let upload_root = self
             .ctx
             .config
@@ -4940,6 +6208,14 @@ impl RpcDispatcher {
             .to_string();
 
         let is_wss = self.peer_label.starts_with("wss:");
+        if !is_wss {
+            self.authorize_attachment_sources(
+                Method::FileAttach,
+                self.stamped_grants(),
+                &agent_alias,
+                &req.files,
+            )?;
+        }
 
         let mut total_bytes: u64 = 0;
         let mut results = Vec::with_capacity(req.files.len());
@@ -5020,6 +6296,114 @@ impl RpcDispatcher {
         to_result(body)
     }
 
+    /// Every agent a procedure executes as: each step's effective agent (its
+    /// own override, then the procedure's parent agent), or, where neither is
+    /// named, the lowest configured alias, which is what the headless driver
+    /// falls back to. The parent agent counts even for a procedure with no
+    /// steps. Every step counts whatever the execution mode, so a
+    /// deterministic procedure that never starts an agent is still held to
+    /// these agents and fails closed.
+    fn sop_executing_agents(sop: &crate::sop::Sop, config: &Config) -> Vec<String> {
+        let fallback = config.agents.keys().min().cloned().unwrap_or_default();
+        let mut agents: Vec<String> = sop
+            .steps
+            .iter()
+            .map(|step| {
+                step.effective_agent(sop.agent.as_deref())
+                    .map_or_else(|| fallback.clone(), str::to_string)
+            })
+            .chain(sop.agent.clone())
+            .collect();
+        agents.sort();
+        agents.dedup();
+        agents
+    }
+
+    /// Hold a procedure's agents to the bound principal's selector.
+    ///
+    /// Running or approving a procedure drives its agents' tool loops
+    /// headlessly, so `executes` applies the session posture, constrained
+    /// tool selectors included. Authoring and deleting apply the plain agent
+    /// selector. An unbound dispatcher (the direct unit-test handlers) passes.
+    fn authorize_sop_agents(
+        &self,
+        method: Method,
+        sop: &crate::sop::Sop,
+        executes: bool,
+    ) -> Result<(), JsonRpcError> {
+        let Some(grants) = self.stamped_grants() else {
+            return Ok(());
+        };
+        let agents = {
+            let config = self.ctx.config.read();
+            Self::sop_executing_agents(sop, &config)
+        };
+        for alias in &agents {
+            if executes {
+                self.selector_session_agent_with_grants(method, grants, alias)?;
+            } else {
+                self.selector_agent(method, alias)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The procedure as the engine will load it once `save_sop` has written it.
+    ///
+    /// Step titles and bodies are written into SOP.md as they are, and the
+    /// loader reads bullets and numbered items back out of that file, so text
+    /// inside a step can add steps or per-step agent overrides that the
+    /// submitted definition does not show.
+    fn sop_as_loaded(sop: &crate::sop::Sop) -> crate::sop::Sop {
+        let mut loaded = sop.clone();
+        loaded.steps = crate::sop::parse_steps(&crate::sop::render_steps(&sop.steps));
+        loaded
+    }
+
+    /// Hold a procedure a principal is about to write to its agent selector,
+    /// both as submitted and as it will load from disk.
+    fn authorize_sop_authoring(
+        &self,
+        method: Method,
+        sop: &crate::sop::Sop,
+    ) -> Result<(), JsonRpcError> {
+        self.authorize_sop_agents(method, sop, false)?;
+        self.authorize_sop_agents(method, &Self::sop_as_loaded(sop), false)
+    }
+
+    /// Hold the procedure currently on disk under `name` to the principal
+    /// before it is replaced or deleted.
+    ///
+    /// A directory that exists but cannot be loaded names agents nobody can
+    /// read back, so a principal without operator grants is refused rather
+    /// than allowed to overwrite or remove it.
+    fn authorize_existing_sop(
+        &self,
+        method: Method,
+        dir: &std::path::Path,
+        name: &str,
+        mode: crate::sop::SopExecutionMode,
+    ) -> Result<(), JsonRpcError> {
+        let Some(grants) = self.stamped_grants() else {
+            return Ok(());
+        };
+        match crate::sop::load_sop_by_name(dir, name, mode) {
+            Ok(existing) => self.authorize_sop_agents(method, &existing, false),
+            Err(_) => {
+                let exists = crate::sop::resolve_sop_dir(dir, name).is_ok_and(|path| path.exists());
+                if !exists || grants.admin {
+                    return Ok(());
+                }
+                let denied = crate::rpc::auth::AuthDenied::forbidden(format!(
+                    "Principal may not replace or delete procedure {name:?}: its definition \
+                     cannot be loaded to check which agents it runs as"
+                ));
+                self.audit_auth_denial(method, &denied);
+                Err(rpc_err(denied.code, denied.message))
+            }
+        }
+    }
+
     fn sops_dir_and_mode(&self) -> (std::path::PathBuf, crate::sop::SopExecutionMode) {
         let config = self.ctx.config.read();
         let install_root = config.install_root_dir();
@@ -5072,6 +6456,18 @@ impl RpcDispatcher {
             .sop_engine
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
+        // The run executes as the procedure's agents, so the principal must be
+        // entitled to every one of them before anything is dispatched.
+        if self.stamped_grants().is_some() {
+            let sop = engine
+                .lock()
+                .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?
+                .get_sop(&req.name)
+                .cloned();
+            if let Some(sop) = sop {
+                self.authorize_sop_agents(Method::SopsRun, &sop, true)?;
+            }
+        }
         let audit = self
             .ctx
             .sop_audit
@@ -5229,6 +6625,25 @@ impl RpcDispatcher {
         );
         let _guard = span.enter();
 
+        // Approving resumes the run headlessly as its procedure's agents, so
+        // the principal must be entitled to every one of them before its
+        // decision reaches the broker. The loaded run's procedure is what
+        // executes, whatever is on disk.
+        if self.stamped_grants().is_some() {
+            let run_sop = {
+                let guard = engine
+                    .lock()
+                    .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?;
+                guard
+                    .get_run(&req.run_id)
+                    .and_then(|run| guard.get_sop(&run.sop_name))
+                    .cloned()
+            };
+            if let Some(run_sop) = run_sop {
+                self.authorize_sop_agents(Method::SopsDecide, &run_sop, true)?;
+            }
+        }
+
         let mut resolved_outcome = None;
         {
             let mut guard = engine
@@ -5359,7 +6774,13 @@ impl RpcDispatcher {
                 ),
             ));
         }
-        let (dir, _mode) = self.sops_dir_and_mode();
+        let (dir, mode) = self.sops_dir_and_mode();
+        // Saving replaces a procedure, so the principal must be entitled to the
+        // agents it would run as and to the agents it runs as now.
+        if self.stamped_grants().is_some() {
+            self.authorize_sop_authoring(Method::SopsSave, &sop)?;
+            self.authorize_existing_sop(Method::SopsSave, &dir, &sop.name, mode)?;
+        }
         crate::sop::save_sop(&dir, &sop).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
         to_result(serde_json::json!({ "saved": sop.name }))
     }
@@ -5368,6 +6789,7 @@ impl RpcDispatcher {
         let req: SopSaveRequest = parse_params(params)?;
         let sop = Self::parse_sop(&req.sop)?;
         let (dir, _mode) = self.sops_dir_and_mode();
+        self.authorize_sop_authoring(Method::SopsCreate, &sop)?;
         crate::sop::create_sop_typed(&dir, &sop).map_err(|e| {
             let code = match e {
                 crate::sop::SopAuthorError::AlreadyExists(_) => SOP_ALREADY_EXISTS,
@@ -5380,7 +6802,8 @@ impl RpcDispatcher {
 
     fn handle_sops_delete(&self, params: &Value) -> RpcResult {
         let req: SopSelectRequest = parse_params(params)?;
-        let (dir, _mode) = self.sops_dir_and_mode();
+        let (dir, mode) = self.sops_dir_and_mode();
+        self.authorize_existing_sop(Method::SopsDelete, &dir, &req.name, mode)?;
         crate::sop::delete_sop_typed(&dir, &req.name).map_err(|e| {
             let code = match e {
                 crate::sop::SopAuthorError::NotFound(_) => SOP_NOT_FOUND,
@@ -5492,16 +6915,28 @@ impl RpcDispatcher {
         // clone-apply-save-swap below, so the install on success can't race
         // a concurrent config write (see `ctx.config_write_lock`).
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        // Quickstart writes the authorization sections themselves, so it is
+        // held to the same post-admission authority check as the config
+        // mutation handlers.
+        self.recheck_config_write_authority(Method::QuickstartApply, None, &config_write_guard)?;
         // Clone out of the lock to satisfy `&mut Config`. On success
         // install the mutated snapshot, mirroring the gateway's
         // `handle_apply`. `apply_with_surface` already ran `save_dirty` on
         // the clone, so `save_and_swap_config` performs no second disk
         // write (empty dirty set short-circuits) — just the guarded swap.
         let mut working = self.ctx.config.read().clone();
-        let result = crate::quickstart::apply_with_surface(
+        // The staged policy is compiled BEFORE Quickstart's first write, so a
+        // rejected one cannot reach disk and then be reported as not saved.
+        let result = crate::quickstart::apply_with_surface_checked(
             req.submission,
             &mut working,
             crate::quickstart::Surface::Tui,
+            &|staged| {
+                self.ctx
+                    .auth
+                    .validate_refresh_from_config(staged)
+                    .map_err(|e| e.to_string())
+            },
         )
         .await;
         let body = match result {
@@ -5697,6 +7132,32 @@ fn validate_session_configure_overrides(overrides: &SessionOverrides) -> Result<
         return Err(rpc_err(INVALID_PARAMS, "model_provider must not be blank"));
     }
     Ok(())
+}
+
+/// Resolve an RPC skill reference whose name is one plain directory name.
+///
+/// The skills service joins the name onto the bundle directory, so a name
+/// with a separator, `.` or `..`, or an absolute or prefixed path would read,
+/// overwrite, or archive a `SKILL.md` directory outside every bundle. Refuse
+/// such a name before the service sees it.
+fn resolve_skill_ref(
+    svc: &crate::skills::service::SkillsService<'_>,
+    name: &str,
+    bundle: &str,
+) -> Result<crate::skills::reference::SkillRef, JsonRpcError> {
+    let mut components = std::path::Path::new(name).components();
+    let single_name = matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    ) && !name.contains(['/', '\\', '\0']);
+    if !single_name {
+        return Err(rpc_err(
+            INVALID_PARAMS,
+            format!("Invalid skill ref: {name:?} is not a single skill directory name"),
+        ));
+    }
+    svc.resolve_ref(name, Some(bundle))
+        .map_err(|e| rpc_err(INVALID_PARAMS, format!("Invalid skill ref: {e}")))
 }
 
 fn to_result<T: Serialize>(val: T) -> RpcResult {
@@ -6334,6 +7795,3196 @@ mod tests {
         #[cfg(not(target_os = "windows"))]
         {
             "sh"
+        }
+    }
+
+    #[test]
+    fn handshake_methods_are_the_reviewed_transport_exemptions() {
+        let handshake: Vec<&str> = Method::ALL
+            .iter()
+            .filter(|(m, _)| m.authz() == MethodAuthz::Handshake)
+            .map(|(_, wire)| *wire)
+            .collect();
+        // Every ungated method is a deliberate, reviewed exemption, and there
+        // are exactly two: `initialize` opens the principal handshake, and
+        // `cert/renew` is authenticated by the presenting mTLS client
+        // certificate at the transport/device layer (handle_renew_cert fails
+        // closed without a peer_cert_fingerprint and the ledger renewal
+        // precondition gates promotion), so a principal grant cannot gate it.
+        // Any new entry here must be a reviewed transport-authenticated method.
+        assert_eq!(
+            handshake,
+            vec!["initialize", "cert/renew"],
+            "every ungated method must be a deliberate, reviewed exemption"
+        );
+    }
+
+    #[test]
+    fn every_wire_method_is_classified() {
+        // authz() is an arm-complete match over the closed Method enum, so
+        // completeness is a compile-time property; this pins the runtime
+        // half — every wire-reachable method yields a usable verdict.
+        for (method, wire) in Method::ALL {
+            match method.authz() {
+                MethodAuthz::Handshake => assert!(
+                    matches!(*wire, "initialize" | "cert/renew"),
+                    "unexpected ungated handshake method: {wire}"
+                ),
+                MethodAuthz::Requires(_, _) => {}
+            }
+        }
+    }
+
+    fn enforcement_ctx(config: zeroclaw_config::schema::Config) -> Arc<RpcContext> {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        RpcContext::minimal(config, sessions)
+    }
+
+    fn roster_config(uid: u32) -> zeroclaw_config::schema::Config {
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.permission_profiles.insert(
+            "reader".into(),
+            PermissionProfileConfig {
+                grants: std::collections::HashMap::from([(
+                    zeroclaw_api::grants::Resource::Sessions,
+                    vec![zeroclaw_api::grants::Verb::Read],
+                )]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "alice".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(uid),
+                permission_profiles: vec!["reader".into()],
+            },
+        );
+        config
+    }
+
+    #[tokio::test]
+    async fn wss_initialize_without_a_token_is_denied() {
+        let ctx = enforcement_ctx(zeroclaw_config::schema::Config::default());
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "wss:test".into()).with_transport(
+            crate::rpc::transport::TransportKind::Wss,
+            crate::security::auth_provider::Credential::None,
+        );
+        let err = dispatcher
+            .handle_initialize(&json!({}))
+            .await
+            .expect_err("remote initialize without a credential must be rejected");
+        assert_eq!(err.code, AUTH_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn local_initialize_with_no_roster_keeps_legacy_behavior() {
+        let ctx = enforcement_ctx(zeroclaw_config::schema::Config::default());
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "unix:test".into());
+        let result = dispatcher
+            .handle_initialize(&json!({}))
+            .await
+            .expect("legacy local initialize still succeeds");
+        assert_eq!(
+            result["principal_id"].as_str(),
+            Some("shared-operator"),
+            "the single-operator path binds the shared operator"
+        );
+        assert!(
+            dispatcher
+                .authorize(
+                    Method::ConfigSet,
+                    zeroclaw_api::grants::Resource::Config,
+                    zeroclaw_api::grants::Verb::Update
+                )
+                .is_ok(),
+            "shared operator keeps full access"
+        );
+    }
+
+    #[tokio::test]
+    async fn roster_principal_is_gated_and_narrowed_live() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let ctx = enforcement_ctx(roster_config(4242));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:test".into())
+            .with_transport(
+                crate::rpc::transport::TransportKind::Local,
+                crate::security::auth_provider::Credential::Peercred { uid: 4242 },
+            );
+        let result = dispatcher
+            .handle_initialize(&json!({}))
+            .await
+            .expect("roster uid authenticates");
+        assert_eq!(result["principal_id"].as_str(), Some("user:alice"));
+
+        assert!(
+            dispatcher
+                .authorize(Method::SessionList, Resource::Sessions, Verb::Read)
+                .is_ok(),
+            "granted resource-verb passes"
+        );
+        let denied = dispatcher
+            .authorize(Method::ConfigSet, Resource::Config, Verb::Update)
+            .expect_err("ungranted resource-verb is refused");
+        assert_eq!(denied.code, zeroclaw_api::jsonrpc::error_codes::FORBIDDEN);
+
+        // Remove the roster entry: the next privileged operation rechecks the
+        // kernel uid at the new generation before resolving, then denies the
+        // now-unmapped local credential without reconnect or restart.
+        ctx.auth
+            .refresh_from_config(&zeroclaw_config::schema::Config::default())
+            .expect("the default config is a valid refresh");
+        let denied = dispatcher
+            .authorize(Method::SessionList, Resource::Sessions, Verb::Read)
+            .expect_err("removed roster entry revokes established authorization");
+        assert_eq!(
+            denied.code,
+            zeroclaw_api::jsonrpc::error_codes::AUTH_REQUIRED
+        );
+    }
+
+    #[tokio::test]
+    async fn wss_pairing_token_binds_and_revocation_bites_live() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.paired_tokens = vec!["zc_tok".to_string()];
+        let ctx = enforcement_ctx(config);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(Arc::clone(&ctx), tx, "wss:test".into())
+            .with_transport(
+                crate::rpc::transport::TransportKind::Wss,
+                crate::security::auth_provider::Credential::None,
+            );
+        let result = dispatcher
+            .handle_initialize(&json!({"auth_token": "zc_tok"}))
+            .await
+            .expect("paired token authenticates over wss");
+        assert_eq!(result["principal_id"].as_str(), Some("shared-operator"));
+        assert!(
+            dispatcher
+                .authorize(Method::Status, Resource::System, Verb::Read)
+                .is_ok()
+        );
+
+        // Live revocation on the shared guard denies the ESTABLISHED
+        // connection before its next privileged operation.
+        assert!(ctx.auth.pairing().revoke_token("zc_tok"));
+        let denied = dispatcher
+            .authorize(Method::Status, Resource::System, Verb::Read)
+            .expect_err("revoked pairing token invalidates the connection");
+        assert_eq!(denied.code, AUTH_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn selectors_gate_agents_config_paths_and_constrained_tools() {
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+        let mut config = roster_config(4242);
+        {
+            let profile = config.permission_profiles.get_mut("reader").unwrap();
+            profile.config_write_paths = vec!["cron.*".into()];
+            profile.allowed_tools = vec!["calculator".into()];
+        }
+        config.permission_profiles.insert(
+            "operator".into(),
+            PermissionProfileConfig {
+                allowed_agents: vec!["*".into()],
+                allowed_tools: vec!["*".into()],
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "bob".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4343),
+                permission_profiles: vec!["operator".into()],
+            },
+        );
+        let ctx = enforcement_ctx(config);
+
+        // alice (reader): scoped config paths, no agents, constrained tools.
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut alice = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:test".into())
+            .with_transport(
+                crate::rpc::transport::TransportKind::Local,
+                crate::security::auth_provider::Credential::Peercred { uid: 4242 },
+            );
+        alice
+            .handle_initialize(&json!({}))
+            .await
+            .expect("alice authenticates");
+        assert!(
+            alice
+                .selector_config_write(Method::ConfigSet, "cron.enabled")
+                .is_ok()
+        );
+        let denied = alice
+            .selector_config_write(Method::ConfigSet, "gateway.port")
+            .expect_err("outside the granted subtree");
+        assert_eq!(denied.code, zeroclaw_api::jsonrpc::error_codes::FORBIDDEN);
+        let denied = alice
+            .selector_session_agent(Method::SessionNew, "main")
+            .expect_err("no agent selector granted");
+        assert_eq!(denied.code, zeroclaw_api::jsonrpc::error_codes::FORBIDDEN);
+
+        // A CONSTRAINED tool selector fails closed at session/new until
+        // in-session enforcement exists (never silently un-enforced).
+        {
+            let profile_grants_agents = PermissionProfileConfig {
+                allowed_agents: vec!["*".into()],
+                allowed_tools: vec!["calculator".into()],
+                grants: std::collections::HashMap::from([(
+                    zeroclaw_api::grants::Resource::Sessions,
+                    vec![zeroclaw_api::grants::Verb::Create],
+                )]),
+                ..PermissionProfileConfig::default()
+            };
+            let mut narrowed = roster_config(4242);
+            narrowed
+                .permission_profiles
+                .insert("reader".into(), profile_grants_agents);
+            ctx.auth
+                .refresh_from_config(&narrowed)
+                .expect("a narrowed profile is a valid refresh");
+        }
+        // The gate re-resolves the stamped grants at the new generation
+        // (production order: authorize runs before every handler)...
+        alice
+            .authorize(
+                Method::SessionNew,
+                zeroclaw_api::grants::Resource::Sessions,
+                zeroclaw_api::grants::Verb::Create,
+            )
+            .expect("coarse grant passes after refresh");
+        // ...and the selector then fails closed on the constrained tools.
+        let denied = alice
+            .selector_session_agent(Method::SessionNew, "any-agent")
+            .expect_err("constrained tool selector refuses sessions");
+        assert!(
+            denied.message.contains("session-assembly"),
+            "{}",
+            denied.message
+        );
+
+        // bob (operator): wildcard agents + wildcard tools pass.
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut bob = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:test".into()).with_transport(
+            crate::rpc::transport::TransportKind::Local,
+            crate::security::auth_provider::Credential::Peercred { uid: 4343 },
+        );
+        // restore the two-user policy (the narrowed refresh above dropped bob)
+        let mut config = roster_config(4242);
+        config.permission_profiles.insert(
+            "operator".into(),
+            PermissionProfileConfig {
+                allowed_agents: vec!["*".into()],
+                allowed_tools: vec!["*".into()],
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "bob".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4343),
+                permission_profiles: vec!["operator".into()],
+            },
+        );
+        ctx.auth
+            .refresh_from_config(&config)
+            .expect("a valid roster refreshes");
+        bob.handle_initialize(&json!({}))
+            .await
+            .expect("bob authenticates");
+        assert!(
+            bob.selector_session_agent(Method::SessionNew, "any-agent")
+                .is_ok()
+        );
+    }
+
+    // ── Auth republication through the real config mutation RPCs ─────
+    //
+    // Every mutation below goes through `process_line`: the real gate
+    // (`authorize`), the real handler, and the one validated
+    // save-and-swap boundary. Nothing calls `refresh_from_config`
+    // directly; the effect is observed on an ESTABLISHED connection's next
+    // privileged operation and on a FRESH handshake.
+
+    fn roster_config_in(tmp: &tempfile::TempDir, uid: u32) -> zeroclaw_config::schema::Config {
+        let mut config = roster_config(uid);
+        config.config_path = tmp.path().join("config.toml");
+        config.data_dir = tmp.path().join("data");
+        config
+    }
+
+    fn local_peer(
+        ctx: &Arc<RpcContext>,
+        uid: u32,
+    ) -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(Arc::clone(ctx), tx, format!("unix:uid={uid}"))
+            .with_transport(
+                crate::rpc::transport::TransportKind::Local,
+                crate::security::auth_provider::Credential::Peercred { uid },
+            );
+        (dispatcher, rx)
+    }
+
+    /// A connection bound as the daemon's own uid through the real
+    /// handshake: the trusted local operator that edits policy.
+    async fn local_operator(
+        ctx: &Arc<RpcContext>,
+    ) -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
+        let (mut dispatcher, rx) = local_peer(
+            ctx,
+            crate::security::auth_provider::PeercredAuthProvider::current_process_uid(),
+        );
+        dispatcher
+            .handle_initialize(&json!({}))
+            .await
+            .expect("the daemon's own uid is the trusted local operator");
+        (dispatcher, rx)
+    }
+
+    async fn roster_peer(
+        ctx: &Arc<RpcContext>,
+        uid: u32,
+    ) -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
+        let (mut dispatcher, rx) = local_peer(ctx, uid);
+        dispatcher
+            .handle_initialize(&json!({}))
+            .await
+            .expect("roster uid authenticates");
+        (dispatcher, rx)
+    }
+
+    /// Drive one request through `process_line` and return its response
+    /// frame (notifications interleaved on the same writer are skipped).
+    async fn rpc(
+        dispatcher: &mut RpcDispatcher,
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+        id: u64,
+        method: &str,
+        params: Value,
+    ) -> Value {
+        let line =
+            json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
+        dispatcher.process_line(&line).await;
+        loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                .await
+                .expect("a response within 10s")
+                .expect("writer channel open");
+            let value: Value = serde_json::from_str(&frame).expect("valid JSON-RPC frame");
+            if value.get("id") == Some(&json!(id)) {
+                return value;
+            }
+        }
+    }
+
+    fn can_list_sessions(
+        dispatcher: &mut RpcDispatcher,
+    ) -> Result<(), crate::rpc::auth::AuthDenied> {
+        dispatcher.authorize(
+            Method::SessionList,
+            zeroclaw_api::grants::Resource::Sessions,
+            zeroclaw_api::grants::Verb::Read,
+        )
+    }
+
+    #[tokio::test]
+    async fn map_key_delete_of_a_user_ends_its_binding_for_established_and_fresh_connections() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(roster_config_in(&tmp, 4242));
+        let (mut alice, _alice_rx) = roster_peer(&ctx, 4242).await;
+        can_list_sessions(&mut alice).expect("alice starts granted");
+
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+        let response = rpc(
+            &mut operator,
+            &mut rx,
+            1,
+            "config/map-key-delete",
+            json!({"path": "users", "key": "alice"}),
+        )
+        .await;
+        assert_eq!(response["result"]["deleted"], json!(true), "{response}");
+
+        let denied = can_list_sessions(&mut alice)
+            .expect_err("the deleted user's established binding ends at her next operation");
+        assert_eq!(denied.code, AUTH_REQUIRED);
+        let (mut fresh, _rx) = local_peer(&ctx, 4242);
+        let err = fresh
+            .handle_initialize(&json!({}))
+            .await
+            .expect_err("the old uid no longer binds");
+        assert_eq!(err.code, AUTH_REQUIRED);
+        assert!(!ctx.config.read().users.contains_key("alice"));
+        let on_disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(!on_disk.contains("[users.alice]"), "{on_disk}");
+    }
+
+    #[tokio::test]
+    async fn map_key_delete_that_dangles_a_reference_is_rejected_with_nothing_persisted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(roster_config_in(&tmp, 4242));
+        let (mut alice, _alice_rx) = roster_peer(&ctx, 4242).await;
+        let generation = ctx.auth.generation();
+
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+        let response = rpc(
+            &mut operator,
+            &mut rx,
+            1,
+            "config/map-key-delete",
+            json!({"path": "permission_profiles", "key": "reader"}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(INVALID_PARAMS),
+            "{response}"
+        );
+        assert!(
+            ctx.config.read().permission_profiles.contains_key("reader"),
+            "the live config is untouched"
+        );
+        assert!(
+            !tmp.path().join("config.toml").exists(),
+            "nothing reached disk"
+        );
+        assert_eq!(ctx.auth.generation(), generation, "no policy was published");
+        can_list_sessions(&mut alice).expect("alice keeps her grants");
+    }
+
+    #[tokio::test]
+    async fn map_key_create_of_an_incomplete_user_is_rejected_with_nothing_persisted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(roster_config_in(&tmp, 4242));
+        let generation = ctx.auth.generation();
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+        // A `[users.<name>]` entry with no uid and no profile can never
+        // authenticate; the validated boundary refuses it before disk.
+        let response = rpc(
+            &mut operator,
+            &mut rx,
+            1,
+            "config/map-key-create",
+            json!({"path": "users", "key": "bob"}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(INVALID_PARAMS),
+            "{response}"
+        );
+        assert!(!ctx.config.read().users.contains_key("bob"));
+        assert!(!tmp.path().join("config.toml").exists());
+        assert_eq!(ctx.auth.generation(), generation);
+    }
+
+    #[tokio::test]
+    async fn config_delete_of_a_uid_is_rejected_and_map_key_rename_republishes_the_roster() {
+        // config/delete users.alice.uid would leave an entry that can never
+        // authenticate: refused, alice keeps her binding.
+        {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let ctx = enforcement_ctx(roster_config_in(&tmp, 4242));
+            let (mut alice, _alice_rx) = roster_peer(&ctx, 4242).await;
+            let (mut operator, mut rx) = local_operator(&ctx).await;
+            let response = rpc(
+                &mut operator,
+                &mut rx,
+                1,
+                "config/delete",
+                json!({"prop": "users.alice.uid"}),
+            )
+            .await;
+            assert_eq!(
+                response["error"]["code"],
+                json!(INVALID_PARAMS),
+                "{response}"
+            );
+            assert_eq!(ctx.config.read().users["alice"].uid, Some(4242));
+            can_list_sessions(&mut alice).expect("alice keeps her binding");
+        }
+        // map-key-rename users.alice -> users.carol (the non-cascading
+        // path): the effective principal id changes, so alice's established
+        // binding ends and the uid now binds carol.
+        {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let ctx = enforcement_ctx(roster_config_in(&tmp, 4242));
+            let (mut alice, _alice_rx) = roster_peer(&ctx, 4242).await;
+            let (mut operator, mut rx) = local_operator(&ctx).await;
+            let response = rpc(
+                &mut operator,
+                &mut rx,
+                1,
+                "config/map-key-rename",
+                json!({"path": "users", "from": "alice", "to": "carol"}),
+            )
+            .await;
+            assert_eq!(response["result"]["renamed"], json!(true), "{response}");
+            let denied = can_list_sessions(&mut alice).expect_err("renamed principal");
+            assert_eq!(denied.code, AUTH_REQUIRED);
+            let (mut fresh, _rx) = local_peer(&ctx, 4242);
+            let bound = fresh
+                .handle_initialize(&json!({}))
+                .await
+                .expect("the uid binds the renamed entry");
+            assert_eq!(bound["principal_id"], json!("user:carol"));
+            let on_disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+            assert!(on_disk.contains("[users.carol]"), "{on_disk}");
+            assert!(!on_disk.contains("[users.alice]"), "{on_disk}");
+        }
+    }
+
+    // ── Cron RPC operations are scoped to the principal's agents ─────
+    //
+    // Two agents, one non-admin roster principal entitled to `alpha` only,
+    // and a `beta`-owned job. Every case drives the real wire method through
+    // `process_line`.
+
+    fn cron_roster_config_in(tmp: &tempfile::TempDir, uid: u32) -> zeroclaw_config::schema::Config {
+        use std::collections::HashMap;
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, PermissionProfileConfig, RiskProfileConfig, UserConfig,
+        };
+
+        let mut config = roster_config_in(tmp, uid);
+        std::fs::create_dir_all(&config.data_dir).expect("the data dir is creatable");
+        config.risk_profiles.insert(
+            "cron-profile".into(),
+            RiskProfileConfig {
+                allowed_commands: vec!["echo".into()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        for alias in ["alpha", "beta"] {
+            config.agents.insert(
+                alias.into(),
+                AliasedAgentConfig {
+                    enabled: true,
+                    risk_profile: "cron-profile".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+        }
+        config.permission_profiles.insert(
+            "cron-alpha".into(),
+            PermissionProfileConfig {
+                allowed_agents: vec!["alpha".into()],
+                grants: HashMap::from([(
+                    Resource::Cron,
+                    vec![
+                        Verb::Create,
+                        Verb::Read,
+                        Verb::Update,
+                        Verb::Delete,
+                        Verb::Execute,
+                    ],
+                )]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "alice".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(uid),
+                permission_profiles: vec!["cron-alpha".into()],
+            },
+        );
+        config
+    }
+
+    /// Seed a prompt job owned by `alias`. Prompt jobs need no shell policy,
+    /// which keeps the fixture about ownership rather than command approval.
+    fn seed_cron_job(
+        config: &zeroclaw_config::schema::Config,
+        alias: &str,
+        name: &str,
+    ) -> crate::cron::CronJob {
+        crate::cron::add_agent_job(
+            config,
+            alias,
+            Some(name.to_string()),
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "say hello",
+            crate::cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            false,
+        )
+        .expect("the fixture job is created")
+    }
+
+    #[tokio::test]
+    async fn cron_list_hides_jobs_owned_by_other_agents() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let alpha = seed_cron_job(&config, "alpha", "alpha-job");
+        let beta = seed_cron_job(&config, "beta", "beta-job");
+        let ctx = enforcement_ctx(config);
+
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let response = rpc(&mut alice, &mut rx, 1, "cron/list", json!({})).await;
+        let ids: Vec<&str> = response["result"]["jobs"]
+            .as_array()
+            .expect("a jobs array")
+            .iter()
+            .filter_map(|job| job["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec![alpha.id.as_str()], "{response}");
+
+        let (mut operator, mut op_rx) = local_operator(&ctx).await;
+        let response = rpc(&mut operator, &mut op_rx, 1, "cron/list", json!({})).await;
+        let mut ids: Vec<&str> = response["result"]["jobs"]
+            .as_array()
+            .expect("a jobs array")
+            .iter()
+            .filter_map(|job| job["id"].as_str())
+            .collect();
+        ids.sort_unstable();
+        let mut expected = vec![alpha.id.as_str(), beta.id.as_str()];
+        expected.sort_unstable();
+        assert_eq!(ids, expected, "the operator still sees every job");
+    }
+
+    #[tokio::test]
+    async fn cron_runs_serves_a_scoped_principal_its_own_jobs_history() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let alpha = seed_cron_job(&config, "alpha", "alpha-job");
+        let now = chrono::Utc::now();
+        crate::cron::record_run(&config, &alpha.id, now, now, "ok", Some("done"), 5)
+            .expect("the fixture run is recorded");
+        let ctx = enforcement_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let response = rpc(&mut alice, &mut rx, 1, "cron/runs", json!({"id": alpha.id})).await;
+        let runs = response["result"]["runs"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{response}"));
+        assert_eq!(runs.len(), 1, "{response}");
+        assert_eq!(runs[0]["status"], json!("ok"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn cron_get_runs_and_trigger_refuse_a_foreign_job_as_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        seed_cron_job(&config, "alpha", "alpha-job");
+        let beta = seed_cron_job(&config, "beta", "beta-job");
+        let ctx = enforcement_ctx(config.clone());
+
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let absent = "00000000-0000-4000-8000-000000000000";
+        for (id, method, params) in [
+            (1u64, "cron/get", json!({"id": beta.id})),
+            (2, "cron/runs", json!({"id": beta.id})),
+            (3, "cron/trigger", json!({"id": beta.id})),
+        ] {
+            let response = rpc(&mut alice, &mut rx, id, method, params).await;
+            assert_eq!(
+                response["error"]["code"],
+                json!(INVALID_PARAMS),
+                "{method}: {response}"
+            );
+            assert_eq!(
+                response["error"]["message"].as_str(),
+                Some(format!("Cron job not found: Cron job '{}' not found", beta.id).as_str()),
+                "{method}: a foreign job must not be an existence oracle"
+            );
+        }
+        // The same three methods on an id that genuinely does not exist
+        // produce the identical message shape.
+        for (id, method) in [(4u64, "cron/get"), (5, "cron/runs"), (6, "cron/trigger")] {
+            let response = rpc(&mut alice, &mut rx, id, method, json!({"id": absent})).await;
+            assert_eq!(
+                response["error"]["message"].as_str(),
+                Some(format!("Cron job not found: Cron job '{absent}' not found").as_str()),
+                "{method}: {response}"
+            );
+        }
+        // Nothing ran: the foreign job has no recorded status.
+        let reread = crate::cron::get_job(&config, &beta.id).expect("the beta job still exists");
+        assert!(reread.last_status.is_none(), "the foreign job must not run");
+    }
+
+    #[tokio::test]
+    async fn cron_add_requires_the_agent_selector() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let ctx = enforcement_ctx(config.clone());
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let response = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "cron/add",
+            json!({"agent": "beta", "schedule": "*/5 * * * *", "command": "echo hi"}),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+        assert!(
+            crate::cron::list_jobs(&config)
+                .expect("the store is readable")
+                .is_empty(),
+            "a refused cron/add must not create a job"
+        );
+
+        let response = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "cron/add",
+            json!({"agent": "alpha", "schedule": "*/5 * * * *", "command": "echo hi"}),
+        )
+        .await;
+        assert_eq!(
+            response["result"]["agent_alias"],
+            json!("alpha"),
+            "{response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_patch_and_delete_cannot_reach_a_foreign_job() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let beta = seed_cron_job(&config, "beta", "beta-job");
+        let ctx = enforcement_ctx(config.clone());
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let response = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "cron/patch",
+            json!({"id": beta.id, "agent": "alpha", "name": "hijacked"}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(INVALID_PARAMS),
+            "{response}"
+        );
+
+        let response = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "cron/delete",
+            json!({"id": beta.id}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(INVALID_PARAMS),
+            "{response}"
+        );
+
+        let reread = crate::cron::get_job(&config, &beta.id).expect("the beta job still exists");
+        assert_eq!(reread.name.as_deref(), Some("beta-job"));
+        assert_eq!(reread.prompt.as_deref(), beta.prompt.as_deref());
+    }
+
+    #[tokio::test]
+    async fn cron_admin_still_reaches_ownerless_legacy_rows() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_roster_config_in(&tmp, 4242);
+        let legacy = seed_cron_job(&config, "legacy", "legacy-job");
+        // Rows written before the owner column exists carry an empty alias.
+        crate::cron::rename_jobs_by_agent(&config, "legacy", "")
+            .expect("the fixture row is re-owned");
+        let ctx = enforcement_ctx(config);
+
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let response = rpc(&mut alice, &mut rx, 1, "cron/get", json!({"id": legacy.id})).await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(INVALID_PARAMS),
+            "an ownerless row is not reachable from an agent selector: {response}"
+        );
+
+        let (mut operator, mut op_rx) = local_operator(&ctx).await;
+        let response = rpc(
+            &mut operator,
+            &mut op_rx,
+            1,
+            "cron/get",
+            json!({"id": legacy.id}),
+        )
+        .await;
+        assert_eq!(response["result"]["id"], json!(legacy.id), "{response}");
+    }
+
+    // ── A caller-selected session workspace is confined ──────────────
+    //
+    // `session/new` lets the caller name a `cwd`, which becomes the agent's
+    // workspace root. A scoped principal must not reach outside the agent's
+    // own workspace with it.
+
+    /// A roster principal, alice, scoped to `test-agent` with session create,
+    /// read, and execute grants and unrestricted tools.
+    ///
+    /// The roster closes the legacy local path, so a dispatcher stamped with
+    /// `set_authenticated_for_test` does not revalidate against this config;
+    /// bind principals here through `roster_peer` or `local_operator`.
+    fn session_cwd_config(
+        tmp: &tempfile::TempDir,
+        uid: u32,
+        extra_allowed_root: Option<std::path::PathBuf>,
+    ) -> zeroclaw_config::schema::Config {
+        use std::collections::HashMap;
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+
+        let mut config = make_acp_test_config(tmp);
+        config.config_path = tmp.path().join("config.toml");
+        let agent_workspace = tmp.path().join("agent-workspace");
+        std::fs::create_dir_all(&agent_workspace).expect("the agent workspace is creatable");
+        let agent = config
+            .agents
+            .get_mut("test-agent")
+            .expect("the fixture agent exists");
+        agent.workspace.path = Some(agent_workspace);
+        if let Some(root) = extra_allowed_root {
+            config
+                .risk_profiles
+                .entry("test-profile".into())
+                .or_default()
+                .allowed_roots
+                .push(root.to_string_lossy().to_string());
+        }
+        config.permission_profiles.insert(
+            "session-scoped".into(),
+            PermissionProfileConfig {
+                allowed_agents: vec!["test-agent".into()],
+                allowed_tools: vec![zeroclaw_api::grants::WILDCARD.into()],
+                grants: HashMap::from([(
+                    Resource::Sessions,
+                    vec![Verb::Create, Verb::Read, Verb::Execute],
+                )]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "alice".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(uid),
+                permission_profiles: vec!["session-scoped".into()],
+            },
+        );
+        config
+    }
+
+    async fn session_new_with_cwd(
+        dispatcher: &mut RpcDispatcher,
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+        session_id: &str,
+        cwd: &std::path::Path,
+    ) -> Value {
+        rpc(
+            dispatcher,
+            rx,
+            1,
+            "session/new",
+            json!({
+                "agent_alias": "test-agent",
+                "session_id": session_id,
+                "cwd": cwd.to_string_lossy(),
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_cannot_select_a_cwd_outside_the_agent_workspace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(session_cwd_config(&tmp, 4242, None));
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let response = session_new_with_cwd(&mut alice, &mut rx, "s-outside", outside.path()).await;
+        assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+        assert!(
+            ctx.sessions.get_agent("s-outside").await.is_none(),
+            "a refused session/new must not leave a session behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_session_cwd_refusals_do_not_reveal_whether_a_path_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(session_cwd_config(&tmp, 4242, None));
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let workspace = tmp.path().join("agent-workspace");
+        let mut messages = Vec::new();
+        for (sid, cwd) in [
+            ("s-exists", outside.path().to_path_buf()),
+            ("s-absent", outside.path().join("absent")),
+            ("s-parent", workspace.join("..").join("agent-workspace")),
+        ] {
+            let response = session_new_with_cwd(&mut alice, &mut rx, sid, &cwd).await;
+            assert_eq!(
+                response["error"]["code"],
+                json!(FORBIDDEN),
+                "{sid}: {response}"
+            );
+            let message = response["error"]["message"].as_str().unwrap().to_string();
+            messages.push(message.replace(&*cwd.to_string_lossy(), "<cwd>"));
+        }
+        assert!(
+            messages.windows(2).all(|pair| pair[0] == pair[1]),
+            "existing, absent, and parent-component refusals must read alike: {messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_keeps_a_configured_workspace_spelled_with_parent_components() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = session_cwd_config(&tmp, 4242, None);
+        std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
+        let spelled = tmp.path().join("sub").join("..").join("agent-workspace");
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("the fixture agent exists")
+            .workspace
+            .path = Some(spelled);
+        let ctx = enforcement_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let response = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "session/new",
+            json!({"agent_alias": "test-agent", "session_id": "s-default"}),
+        )
+        .await;
+        assert_eq!(
+            response["result"]["session_id"],
+            json!("s-default"),
+            "{response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_may_select_a_cwd_inside_the_agent_workspace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = session_cwd_config(&tmp, 4242, None);
+        let inside = config.agent_workspace_dir("test-agent").join("project");
+        std::fs::create_dir_all(&inside).unwrap();
+        let ctx = enforcement_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let response = session_new_with_cwd(&mut alice, &mut rx, "s-inside", &inside).await;
+        assert_eq!(
+            response["result"]["session_id"],
+            json!("s-inside"),
+            "{response}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scoped_principal_cwd_confinement_follows_symlinks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let config = session_cwd_config(&tmp, 4242, None);
+        let link = config.agent_workspace_dir("test-agent").join("escape");
+        std::fs::create_dir_all(config.agent_workspace_dir("test-agent")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        let ctx = enforcement_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let response = session_new_with_cwd(&mut alice, &mut rx, "s-link", &link).await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(FORBIDDEN),
+            "a symlink out of the workspace is still out of the workspace: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_may_select_a_configured_allowed_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let canonical = project.path().canonicalize().unwrap();
+        let ctx = enforcement_ctx(session_cwd_config(&tmp, 4242, Some(canonical.clone())));
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let response = session_new_with_cwd(&mut alice, &mut rx, "s-root", &canonical).await;
+        assert_eq!(
+            response["result"]["session_id"],
+            json!("s-root"),
+            "allowed_roots is the operator's escape hatch: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_and_shared_operator_keep_arbitrary_session_cwd() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let anywhere = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(session_cwd_config(&tmp, 4242, None));
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+
+        let response =
+            session_new_with_cwd(&mut operator, &mut rx, "s-operator", anywhere.path()).await;
+        assert_eq!(
+            response["result"]["session_id"],
+            json!("s-operator"),
+            "the local operator's editor flows are untouched: {response}"
+        );
+    }
+
+    // ── Session authority is re-established after queue admission ─────
+    //
+    // `session/new` and `session/prompt` pass the gate before they wait on the
+    // session's actor queue, and that wait is unbounded. These park a request
+    // behind a held admission permit, change what the principal may do while
+    // it waits, and check the request is judged by the policy in force when
+    // it is admitted.
+
+    /// A persistence-backed context (chat backend and ACP store in the
+    /// config's data dir) for principals bound through the real handshake.
+    fn persistence_enforcement_ctx(
+        config: zeroclaw_config::schema::Config,
+    ) -> (
+        Arc<RpcContext>,
+        Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+    ) {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let data_dir = config.data_dir.clone();
+        std::fs::create_dir_all(&data_dir).expect("the data dir is creatable");
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let chat_backend =
+            Arc::new(zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&data_dir).unwrap());
+        let acp_store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(&data_dir).unwrap());
+        let ctx = RpcContext::for_persistence_tests(
+            config,
+            sessions,
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            Some(Arc::clone(&acp_store)),
+        );
+        (ctx, chat_backend, acp_store)
+    }
+
+    /// Republish the accepted policy with alice entitled to no agent, keeping
+    /// her session grants so a refusal is the agent selector's.
+    fn narrow_alice_to_no_agents(ctx: &Arc<RpcContext>) {
+        let mut narrowed = ctx.config.read().clone();
+        narrowed
+            .permission_profiles
+            .get_mut("session-scoped")
+            .expect("the fixture profile exists")
+            .allowed_agents
+            .clear();
+        ctx.auth
+            .refresh_from_config(&narrowed)
+            .expect("the narrowed policy compiles");
+    }
+
+    /// Republish the accepted policy for a reason unrelated to alice, so her
+    /// stamped generation goes stale while her authority stays the same.
+    fn republish_an_unrelated_profile(ctx: &Arc<RpcContext>) {
+        let mut republished = ctx.config.read().clone();
+        republished.permission_profiles.insert(
+            "unrelated-reader".into(),
+            zeroclaw_config::schema::PermissionProfileConfig::default(),
+        );
+        ctx.auth
+            .refresh_from_config(&republished)
+            .expect("the republished policy compiles");
+    }
+
+    /// Wait until a request is queued behind the held admission permit for
+    /// `session_id`.
+    async fn wait_for_session_admission_waiter(ctx: &Arc<RpcContext>, session_id: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while ctx.sessions.session_queue.queue_depth(session_id).await < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the request must park on session admission");
+    }
+
+    /// Park `rpc_call` behind a held admission permit for `session_id`, apply
+    /// `mutate` while it waits, then release the permit and return the call's
+    /// result.
+    async fn rpc_result_after_midwait_session_admission<F>(
+        ctx: Arc<RpcContext>,
+        session_id: &str,
+        rpc_call: F,
+        mutate: impl FnOnce(&Arc<RpcContext>),
+    ) -> RpcResult
+    where
+        F: std::future::Future<Output = RpcResult> + Send + 'static,
+    {
+        let permit = ctx
+            .sessions
+            .session_queue
+            .acquire(session_id)
+            .await
+            .expect("the test takes the admission permit first");
+        let task = zeroclaw_spawn::spawn!(rpc_call);
+        wait_for_session_admission_waiter(&ctx, session_id).await;
+        mutate(&ctx);
+        drop(permit);
+        task.await.expect("the parked RPC task must not panic")
+    }
+
+    /// Read frames until the response with `id`, returning it and every
+    /// notification that preceded it.
+    async fn response_and_notifications(
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+        id: u64,
+    ) -> (Value, Vec<Value>) {
+        let mut notifications = Vec::new();
+        loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                .await
+                .expect("a response within 10s")
+                .expect("writer channel open");
+            let value: Value = serde_json::from_str(&frame).expect("valid JSON-RPC frame");
+            if value.get("id") == Some(&json!(id)) {
+                return (value, notifications);
+            }
+            notifications.push(value);
+        }
+    }
+
+    /// Send `session/prompt` through `process_line` with a client turn
+    /// generation.
+    async fn send_prompt(
+        dispatcher: &mut RpcDispatcher,
+        id: u64,
+        session_id: &str,
+        client_turn_generation: u64,
+    ) {
+        let line = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "session/prompt",
+            "params": {
+                "session_id": session_id,
+                "prompt": "hello",
+                "client_turn_generation": client_turn_generation,
+            },
+        })
+        .to_string();
+        dispatcher.process_line(&line).await;
+    }
+
+    /// A refused, already-admitted prompt must still end the client's turn.
+    fn assert_turn_refused(notifications: &[Value], session_id: &str, generation: u64) {
+        let turn_complete = notifications
+            .iter()
+            .find(|frame| {
+                frame["method"] == notification::SESSION_UPDATE
+                    && frame["params"]["type"] == "turn_complete"
+                    && frame["params"]["session_id"] == session_id
+            })
+            .unwrap_or_else(|| {
+                panic!("a refused prompt must emit TurnComplete: {notifications:?}")
+            });
+        assert_eq!(
+            turn_complete["params"]["outcome"], "failed",
+            "{turn_complete}"
+        );
+        assert_eq!(
+            turn_complete["params"]["client_turn_generation"],
+            json!(generation),
+            "{turn_complete}"
+        );
+        assert!(
+            turn_complete["params"]["content"]
+                .as_str()
+                .is_some_and(|content| content.starts_with("turn refused by daemon")),
+            "{turn_complete}"
+        );
+    }
+
+    fn gated_provider() -> (
+        GatedProvider,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        (
+            GatedProvider {
+                started: started_tx,
+                release: tokio::sync::Mutex::new(Some(release_rx)),
+            },
+            started_rx,
+            release_tx,
+        )
+    }
+
+    #[test]
+    fn session_new_narrowed_while_parked_on_session_admission_is_refused() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let ctx = enforcement_ctx(session_cwd_config(&tmp, 4242, None));
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+
+            let result = rpc_result_after_midwait_session_admission(
+                Arc::clone(&ctx),
+                "s-parked",
+                async move {
+                    alice
+                        .handle_session_new_for_test(&json!({
+                            "agent_alias": "test-agent",
+                            "session_id": "s-parked",
+                        }))
+                        .await
+                },
+                narrow_alice_to_no_agents,
+            )
+            .await;
+
+            let err = result.expect_err("a principal narrowed while parked must not get a session");
+            assert_eq!(err.code, FORBIDDEN, "{err:?}");
+            assert!(
+                ctx.sessions.get_agent("s-parked").await.is_none(),
+                "a refused session/new must not leave a session behind"
+            );
+        });
+    }
+
+    #[test]
+    fn session_new_still_succeeds_when_authority_is_unchanged_after_admission() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let ctx = enforcement_ctx(session_cwd_config(&tmp, 4242, None));
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+
+            let result = rpc_result_after_midwait_session_admission(
+                Arc::clone(&ctx),
+                "s-parked",
+                async move {
+                    alice
+                        .handle_session_new_for_test(&json!({
+                            "agent_alias": "test-agent",
+                            "session_id": "s-parked",
+                        }))
+                        .await
+                },
+                republish_an_unrelated_profile,
+            )
+            .await;
+
+            let created = result.expect("an unchanged principal is still admitted");
+            assert_eq!(created["session_id"], json!("s-parked"));
+        });
+    }
+
+    #[tokio::test]
+    async fn session_prompt_narrowed_after_admission_is_refused_with_turn_complete_failed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = session_cwd_config(&tmp, 4242, None);
+        let agent_workspace = config.agent_workspace_dir("test-agent");
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (provider, mut started_rx, _release_tx) = gated_provider();
+        let sid = "s-prompt-narrowed";
+        install_state_test_session_at(
+            &ctx.sessions,
+            &chat_backend,
+            sid,
+            provider,
+            None,
+            &agent_workspace,
+        )
+        .await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let (admitted, release_admitted) = ctx.sessions.set_test_prompt_registration_pause();
+
+        send_prompt(&mut alice, 7, sid, 3).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), admitted.notified())
+            .await
+            .expect("the prompt must pass the gate and be admitted");
+        narrow_alice_to_no_agents(&ctx);
+        release_admitted.notify_one();
+
+        let (response, notifications) = response_and_notifications(&mut rx, 7).await;
+        assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+        assert_turn_refused(&notifications, sid, 3);
+        assert!(
+            started_rx.try_recv().is_err(),
+            "a refused prompt must never reach the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_prompt_survives_an_unrelated_policy_republication_after_admission() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = session_cwd_config(&tmp, 4242, None);
+        let agent_workspace = config.agent_workspace_dir("test-agent");
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (provider, mut started_rx, release_tx) = gated_provider();
+        let sid = "s-prompt-republished";
+        install_state_test_session_at(
+            &ctx.sessions,
+            &chat_backend,
+            sid,
+            provider,
+            None,
+            &agent_workspace,
+        )
+        .await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let (admitted, release_admitted) = ctx.sessions.set_test_prompt_registration_pause();
+
+        send_prompt(&mut alice, 8, sid, 4).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), admitted.notified())
+            .await
+            .expect("the prompt must pass the gate and be admitted");
+        republish_an_unrelated_profile(&ctx);
+        release_admitted.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), started_rx.recv())
+            .await
+            .expect("a still-authorized prompt must reach the provider")
+            .expect("the provider channel stays open");
+        release_tx
+            .send(())
+            .expect("the turn is waiting on its provider");
+        let (response, _notifications) = response_and_notifications(&mut rx, 8).await;
+        assert!(
+            response.get("error").is_none(),
+            "an unrelated republication must not refuse a still-authorized prompt: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_cannot_root_a_session_in_a_write_only_sibling_workspace() {
+        use zeroclaw_config::multi_agent::{AccessMode, AgentAlias};
+        use zeroclaw_config::schema::AliasedAgentConfig;
+
+        for (mode, admitted) in [(AccessMode::Write, false), (AccessMode::ReadWrite, true)] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = session_cwd_config(&tmp, 4242, None);
+            let inbox = tmp.path().join("inbox-workspace");
+            std::fs::create_dir_all(&inbox).unwrap();
+            config.agents.insert(
+                "inbox".into(),
+                AliasedAgentConfig {
+                    enabled: true,
+                    risk_profile: "test-profile".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+            config.agents.get_mut("inbox").unwrap().workspace.path = Some(inbox.clone());
+            config
+                .agents
+                .get_mut("test-agent")
+                .unwrap()
+                .workspace
+                .access
+                .insert(AgentAlias::new("inbox"), mode);
+            let ctx = enforcement_ctx(config);
+            let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+            let response = session_new_with_cwd(&mut alice, &mut rx, "s-sibling", &inbox).await;
+            if admitted {
+                assert_eq!(
+                    response["result"]["session_id"],
+                    json!("s-sibling"),
+                    "a read-write sibling root is a valid workspace: {response}"
+                );
+            } else {
+                assert_eq!(
+                    response["error"]["code"],
+                    json!(FORBIDDEN),
+                    "a write-only sibling root must not become a readable jail root: {response}"
+                );
+            }
+        }
+    }
+
+    // ── Resumed, rehydrated, and live session workspaces are confined ──
+    //
+    // A session keeps the workspace it was created with. Reattaching to it,
+    // rebuilding it from its durable row, or prompting it must hold that
+    // workspace to the prompting principal's roots, exactly as a
+    // caller-selected cwd is held.
+
+    /// Create an ACP session as `dispatcher` with an explicit `cwd`, then reap
+    /// it from memory so only the durable row remains.
+    async fn durable_acp_session_at(
+        ctx: &Arc<RpcContext>,
+        dispatcher: &mut RpcDispatcher,
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+        session_id: &str,
+        cwd: &std::path::Path,
+    ) {
+        let created = rpc(
+            dispatcher,
+            rx,
+            1,
+            "session/new",
+            json!({
+                "agent_alias": "test-agent",
+                "session_id": session_id,
+                "chat_mode": "acp",
+                "cwd": cwd.to_string_lossy(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            created["result"]["session_id"],
+            json!(session_id),
+            "{created}"
+        );
+        assert!(
+            ctx.sessions.remove(session_id).await,
+            "reap the live session, keeping only the durable row"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_cannot_resume_a_durable_acp_workspace_outside_the_agent_roots() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let (ctx, _chat_backend, acp_store) =
+            persistence_enforcement_ctx(session_cwd_config(&tmp, 4242, None));
+        let sid = "s-durable-outside";
+        let (mut operator, mut op_rx) = local_operator(&ctx).await;
+        durable_acp_session_at(&ctx, &mut operator, &mut op_rx, sid, outside.path()).await;
+
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let resumed = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "session/new",
+            json!({"agent_alias": "test-agent", "session_id": sid, "chat_mode": "acp"}),
+        )
+        .await;
+        assert_eq!(resumed["error"]["code"], json!(FORBIDDEN), "{resumed}");
+        assert!(
+            ctx.sessions.get_agent(sid).await.is_none(),
+            "a refused resume must not install the session"
+        );
+        assert!(
+            acp_store.load_session(sid).unwrap().is_some(),
+            "the durable row is left intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_resumes_a_durable_acp_workspace_inside_an_allowed_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        let (ctx, _chat_backend, _acp_store) =
+            persistence_enforcement_ctx(session_cwd_config(&tmp, 4242, Some(root.clone())));
+        let sid = "s-durable-root";
+        let (mut operator, mut op_rx) = local_operator(&ctx).await;
+        durable_acp_session_at(&ctx, &mut operator, &mut op_rx, sid, &root).await;
+
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let resumed = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "session/new",
+            json!({"agent_alias": "test-agent", "session_id": sid, "chat_mode": "acp"}),
+        )
+        .await;
+        assert_eq!(
+            resumed["result"]["workspace_dir"],
+            json!(root.to_string_lossy()),
+            "{resumed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_cannot_reattach_a_live_session_outside_the_agent_roots() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(session_cwd_config(&tmp, 4242, None));
+        let sid = "s-live-outside";
+        let (mut operator, mut op_rx) = local_operator(&ctx).await;
+        let created = session_new_with_cwd(&mut operator, &mut op_rx, sid, outside.path()).await;
+        assert_eq!(created["result"]["session_id"], json!(sid), "{created}");
+
+        let owner_before = ctx.sessions.session_owner_tui_id(sid).await;
+        assert!(
+            owner_before.as_ref().is_some_and(Option::is_some),
+            "the operator's session has an owner"
+        );
+
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let reattached = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "session/new",
+            json!({"agent_alias": "test-agent", "session_id": sid}),
+        )
+        .await;
+        assert_eq!(
+            reattached["error"]["code"],
+            json!(FORBIDDEN),
+            "{reattached}"
+        );
+        assert_eq!(
+            ctx.sessions.session_owner_tui_id(sid).await,
+            owner_before,
+            "a refused reattach must not take over the session's ownership"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_prompt_refuses_to_rehydrate_a_workspace_whose_allowed_root_was_removed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        let (ctx, _chat_backend, acp_store) =
+            persistence_enforcement_ctx(session_cwd_config(&tmp, 4242, Some(root.clone())));
+        let sid = "s-rehydrate-narrowed";
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        durable_acp_session_at(&ctx, &mut alice, &mut rx, sid, &root).await;
+        ctx.config
+            .write()
+            .risk_profiles
+            .get_mut("test-profile")
+            .expect("the fixture risk profile exists")
+            .allowed_roots
+            .clear();
+
+        send_prompt(&mut alice, 3, sid, 5).await;
+        let (response, notifications) = response_and_notifications(&mut rx, 3).await;
+        assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+        assert_turn_refused(&notifications, sid, 5);
+        assert!(
+            ctx.sessions.get_agent(sid).await.is_none(),
+            "a refused rehydration must not install the session"
+        );
+        assert!(
+            acp_store.load_session(sid).unwrap().is_some(),
+            "the durable row is left intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_rehydrates_a_workspace_inside_an_allowed_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        let (ctx, _chat_backend, _acp_store) =
+            persistence_enforcement_ctx(session_cwd_config(&tmp, 4242, Some(root.clone())));
+        let sid = "s-rehydrate-root";
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        durable_acp_session_at(&ctx, &mut alice, &mut rx, sid, &root).await;
+
+        let recovered = alice
+            .rehydrate_reaped_session(sid, alice.stamped_grants())
+            .await
+            .expect("a workspace inside an allowed root is not refused");
+        assert!(
+            recovered.is_some(),
+            "the durable row rehydrates to a live agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_cannot_prompt_a_live_session_outside_the_agent_roots() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let (ctx, chat_backend, _acp_store) =
+            persistence_enforcement_ctx(session_cwd_config(&tmp, 4242, None));
+        let (provider, mut started_rx, _release_tx) = gated_provider();
+        let sid = "s-prompt-outside";
+        install_state_test_session_at(
+            &ctx.sessions,
+            &chat_backend,
+            sid,
+            provider,
+            None,
+            outside.path(),
+        )
+        .await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        send_prompt(&mut alice, 4, sid, 11).await;
+        let (response, notifications) = response_and_notifications(&mut rx, 4).await;
+        assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+        assert_turn_refused(&notifications, sid, 11);
+        assert!(
+            started_rx.try_recv().is_err(),
+            "a refused prompt must never reach the provider"
+        );
+    }
+
+    // ── Agent-addressed surfaces apply the agent selector ─────────────
+    //
+    // Two agents; alice is entitled to `alpha` only.
+
+    /// `cron_roster_config_in` with each agent given a workspace under `tmp`
+    /// and alice's `alpha`-only profile also granted personality read/update
+    /// and cost read.
+    fn agent_scoped_config_in(
+        tmp: &tempfile::TempDir,
+        uid: u32,
+    ) -> zeroclaw_config::schema::Config {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let mut config = cron_roster_config_in(tmp, uid);
+        for alias in ["alpha", "beta"] {
+            let workspace = tmp.path().join(format!("{alias}-workspace"));
+            std::fs::create_dir_all(&workspace).expect("the agent workspace is creatable");
+            config
+                .agents
+                .get_mut(alias)
+                .expect("the fixture agent exists")
+                .workspace
+                .path = Some(workspace);
+        }
+        let grants = &mut config
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .expect("the fixture profile exists")
+            .grants;
+        grants.insert(Resource::Personality, vec![Verb::Read, Verb::Update]);
+        grants.insert(Resource::Cost, vec![Verb::Read]);
+        config
+    }
+
+    #[tokio::test]
+    async fn personality_surfaces_refuse_an_agent_outside_the_principals_selector() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = agent_scoped_config_in(&tmp, 4242);
+        let beta_soul = config.agent_workspace_dir("beta").join("SOUL.md");
+        std::fs::write(&beta_soul, "beta's own soul").unwrap();
+        let ctx = enforcement_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        for (id, method, params) in [
+            (
+                1u64,
+                "personality/get",
+                json!({"agent": "beta", "filename": "SOUL.md"}),
+            ),
+            (
+                2,
+                "personality/put",
+                json!({"agent": "beta", "filename": "SOUL.md", "content": "overwritten"}),
+            ),
+            (3, "personality/list", json!({"agent": "beta"})),
+            (4, "personality/templates", json!({"agent": "beta"})),
+        ] {
+            let response = rpc(&mut alice, &mut rx, id, method, params).await;
+            assert_eq!(
+                response["error"]["code"],
+                json!(FORBIDDEN),
+                "{method}: {response}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&beta_soul).unwrap(),
+            "beta's own soul",
+            "a refused personality/put must not write"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wildcard_agent_selector_cannot_address_an_unconfigured_alias_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let mut config = agent_scoped_config_in(&tmp, 4242);
+        config
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .expect("the fixture profile exists")
+            .allowed_agents = vec![zeroclaw_api::grants::WILDCARD.into()];
+        let escaped = outside.path().join("workspace");
+        std::fs::create_dir_all(&escaped).unwrap();
+        std::fs::write(escaped.join("SOUL.md"), "not an agent's soul").unwrap();
+        let ctx = enforcement_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let absolute = outside.path().to_string_lossy().to_string();
+        let mut id = 0u64;
+        for alias in [absolute.as_str(), "../escape", "gamma"] {
+            for (method, params) in [
+                (
+                    "personality/get",
+                    json!({"agent": alias, "filename": "SOUL.md"}),
+                ),
+                (
+                    "personality/put",
+                    json!({"agent": alias, "filename": "SOUL.md", "content": "overwritten"}),
+                ),
+                ("personality/list", json!({"agent": alias})),
+            ] {
+                id += 1;
+                let response = rpc(&mut alice, &mut rx, id, method, params).await;
+                assert_eq!(
+                    response["error"]["code"],
+                    json!(FORBIDDEN),
+                    "{method} {alias}: {response}"
+                );
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(escaped.join("SOUL.md")).unwrap(),
+            "not an agent's soul",
+            "a wildcard selector must not reach a path named by an unconfigured alias"
+        );
+
+        let configured = rpc(
+            &mut alice,
+            &mut rx,
+            id + 1,
+            "personality/get",
+            json!({"agent": "beta", "filename": "SOUL.md"}),
+        )
+        .await;
+        assert!(configured.get("result").is_some(), "{configured}");
+
+        // Templates build no path from the alias, so Quickstart can still
+        // render them for an agent it has not created yet.
+        let templates = rpc(
+            &mut alice,
+            &mut rx,
+            id + 2,
+            "personality/templates",
+            json!({"agent": "gamma"}),
+        )
+        .await;
+        assert!(templates.get("result").is_some(), "{templates}");
+    }
+
+    #[tokio::test]
+    async fn skills_surfaces_refuse_a_name_outside_the_bundle() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = session_cwd_config(&tmp, 4242, None);
+        let bundle_dir = tmp.path().join("bundle");
+        let good = bundle_dir.join("good");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let manifest = "---\nname: good\ndescription: A bundled skill\n---\n\nbody\n";
+        std::fs::write(good.join("SKILL.md"), manifest).unwrap();
+        let foreign = "---\nname: outside\ndescription: Not a bundled skill\n---\n\nsecret\n";
+        std::fs::write(outside.join("SKILL.md"), foreign).unwrap();
+        config.skill_bundles.insert(
+            "team".into(),
+            zeroclaw_config::schema::SkillBundleConfig {
+                directory: Some(bundle_dir.to_string_lossy().to_string()),
+                ..Default::default()
+            },
+        );
+        config
+            .permission_profiles
+            .get_mut("session-scoped")
+            .expect("the fixture profile exists")
+            .grants
+            .insert(
+                zeroclaw_api::grants::Resource::Skills,
+                vec![
+                    zeroclaw_api::grants::Verb::Read,
+                    zeroclaw_api::grants::Verb::Update,
+                    zeroclaw_api::grants::Verb::Delete,
+                ],
+            );
+        let ctx = enforcement_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let read = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "skills/read",
+            json!({"bundle": "team", "name": "good"}),
+        )
+        .await;
+        let frontmatter = read["result"]["frontmatter"].clone();
+        assert!(frontmatter.is_object(), "{read}");
+
+        let absolute = outside.to_string_lossy().to_string();
+        let mut id = 1u64;
+        for name in ["../outside", absolute.as_str(), "..", "good/../../outside"] {
+            for (method, params) in [
+                ("skills/read", json!({"bundle": "team", "name": name})),
+                (
+                    "skills/write",
+                    json!({"bundle": "team", "name": name, "frontmatter": frontmatter, "body": "overwritten"}),
+                ),
+                ("skills/delete", json!({"bundle": "team", "name": name})),
+            ] {
+                id += 1;
+                let response = rpc(&mut alice, &mut rx, id, method, params).await;
+                assert_eq!(
+                    response["error"]["code"],
+                    json!(INVALID_PARAMS),
+                    "{method} {name}: {response}"
+                );
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(outside.join("SKILL.md")).unwrap(),
+            foreign,
+            "a skill name must not reach a manifest outside the bundle"
+        );
+    }
+
+    #[tokio::test]
+    async fn personality_surfaces_serve_an_agent_inside_the_principals_selector() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(agent_scoped_config_in(&tmp, 4242));
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let put = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "personality/put",
+            json!({"agent": "alpha", "filename": "SOUL.md", "content": "alpha soul"}),
+        )
+        .await;
+        assert!(put.get("result").is_some(), "{put}");
+        let get = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "personality/get",
+            json!({"agent": "alpha", "filename": "SOUL.md"}),
+        )
+        .await;
+        assert_eq!(get["result"]["content"], json!("alpha soul"), "{get}");
+        for (id, method) in [(3u64, "personality/list"), (4, "personality/templates")] {
+            let response = rpc(&mut alice, &mut rx, id, method, json!({"agent": "alpha"})).await;
+            assert!(response.get("result").is_some(), "{method}: {response}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cost_query_refuses_an_agent_outside_the_principals_selector() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(agent_scoped_config_in(&tmp, 4242));
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let refused = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "cost/query",
+            json!({"agent": "beta"}),
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], json!(FORBIDDEN), "{refused}");
+        // This context has no cost tracker, so an admitted query fails as
+        // unavailable rather than being refused.
+        for (id, params) in [(2u64, json!({"agent": "alpha"})), (3, json!({}))] {
+            let response = rpc(&mut alice, &mut rx, id, "cost/query", params).await;
+            assert_ne!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fleet_cost_summary_lists_only_the_principals_agents() {
+        use zeroclaw_config::cost::types::TokenUsage;
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = agent_scoped_config_in(&tmp, 4242);
+        let tracker = Arc::new(
+            zeroclaw_config::cost::tracker::CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                tmp.path(),
+            )
+            .unwrap(),
+        );
+        for alias in ["alpha", "beta"] {
+            tracker
+                .record_usage_with_agent(
+                    TokenUsage::new("test-model", 100, 50, 0, 1.0, 1.0, 0.0),
+                    Some(alias),
+                )
+                .unwrap();
+        }
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_cost_tracker(config, sessions, tracker);
+
+        let by_agent = |response: &Value| -> Vec<String> {
+            let mut keys: Vec<String> = response["result"]["by_agent"]
+                .as_object()
+                .unwrap_or_else(|| panic!("a by_agent map: {response}"))
+                .keys()
+                .cloned()
+                .collect();
+            keys.sort();
+            keys
+        };
+
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        for (id, params) in [
+            (1u64, json!({})),
+            (2, json!({"from": "2000-01-01T00:00:00Z"})),
+        ] {
+            let response = rpc(&mut alice, &mut rx, id, "cost/query", params).await;
+            assert_eq!(by_agent(&response), vec!["alpha".to_string()], "{response}");
+        }
+
+        let (mut operator, mut op_rx) = local_operator(&ctx).await;
+        let response = rpc(&mut operator, &mut op_rx, 1, "cost/query", json!({})).await;
+        assert_eq!(
+            by_agent(&response),
+            vec!["alpha".to_string(), "beta".to_string()],
+            "the operator still sees every agent: {response}"
+        );
+    }
+
+    fn files_under(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| {
+                        let path = entry.path();
+                        if path.is_dir() { files_under(&path) } else { 1 }
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn file_attach_refuses_a_session_whose_agent_the_principal_may_not_use() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = session_cwd_config(&tmp, 4242, None);
+        config
+            .permission_profiles
+            .get_mut("session-scoped")
+            .expect("the fixture profile exists")
+            .grants
+            .insert(
+                zeroclaw_api::grants::Resource::Files,
+                vec![zeroclaw_api::grants::Verb::Create],
+            );
+        let agent_workspace = config.agent_workspace_dir("test-agent");
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (provider, _started_rx, _release_tx) = gated_provider();
+        let sid = "s-attach";
+        install_state_test_session_at(
+            &ctx.sessions,
+            &chat_backend,
+            sid,
+            provider,
+            None,
+            &agent_workspace,
+        )
+        .await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let attached = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "file/attach",
+            json!({"session_id": sid, "files": [{"data_b64": "aGVsbG8=", "filename": "hello.txt"}]}),
+        )
+        .await;
+        assert!(attached["result"]["files"].is_array(), "{attached}");
+        let files_before = files_under(&agent_workspace);
+
+        narrow_alice_to_no_agents(&ctx);
+        let refused = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "file/attach",
+            json!({"session_id": sid, "files": [{"data_b64": "d29ybGQ=", "filename": "world.txt"}]}),
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], json!(FORBIDDEN), "{refused}");
+        assert_eq!(
+            files_under(&agent_workspace),
+            files_before,
+            "a refused upload must not write into the agent's workspace"
+        );
+    }
+
+    /// `session_cwd_config` with alice also granted `Files:Create`, plus a
+    /// live session for `test-agent` rooted in its workspace, and a readable
+    /// file inside that workspace and another outside every agent root.
+    async fn attachment_source_fixture(
+        tmp: &tempfile::TempDir,
+        outside: &tempfile::TempDir,
+    ) -> (
+        Arc<RpcContext>,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+    ) {
+        let mut config = session_cwd_config(tmp, 4242, None);
+        config
+            .permission_profiles
+            .get_mut("session-scoped")
+            .expect("the fixture profile exists")
+            .grants
+            .insert(
+                zeroclaw_api::grants::Resource::Files,
+                vec![zeroclaw_api::grants::Verb::Create],
+            );
+        let agent_workspace = config.agent_workspace_dir("test-agent");
+        let inside = agent_workspace.join("inside.txt");
+        std::fs::write(&inside, "inside the workspace").unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "outside every agent root").unwrap();
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (provider, started_rx, _release_tx) = gated_provider();
+        install_state_test_session_at(
+            &ctx.sessions,
+            &chat_backend,
+            "s-sources",
+            provider,
+            None,
+            &agent_workspace,
+        )
+        .await;
+        (ctx, agent_workspace, inside, secret, started_rx)
+    }
+
+    #[tokio::test]
+    async fn file_attach_by_path_reads_only_a_source_the_agent_may_read() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let (ctx, agent_workspace, inside, secret, _started_rx) =
+            attachment_source_fixture(&tmp, &outside).await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let files_before = files_under(&agent_workspace);
+
+        let refused = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "file/attach",
+            json!({"session_id": "s-sources", "files": [{"path": secret.to_string_lossy()}]}),
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], json!(FORBIDDEN), "{refused}");
+        assert_eq!(
+            files_under(&agent_workspace),
+            files_before,
+            "a refused source must not be copied into the agent's workspace"
+        );
+
+        let attached = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "file/attach",
+            json!({"session_id": "s-sources", "files": [{"path": inside.to_string_lossy()}]}),
+        )
+        .await;
+        assert!(attached["result"]["files"].is_array(), "{attached}");
+    }
+
+    #[tokio::test]
+    async fn session_prompt_by_path_refuses_a_source_the_agent_may_not_read() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let (ctx, agent_workspace, _inside, secret, mut started_rx) =
+            attachment_source_fixture(&tmp, &outside).await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let files_before = files_under(&agent_workspace);
+
+        let line = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "session/prompt",
+            "params": {
+                "session_id": "s-sources",
+                "prompt": "summarize",
+                "attachments": [{"path": secret.to_string_lossy()}],
+                "client_turn_generation": 5,
+            },
+        })
+        .to_string();
+        alice.process_line(&line).await;
+        let (response, notifications) = response_and_notifications(&mut rx, 3).await;
+        assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+        assert_turn_refused(&notifications, "s-sources", 5);
+        assert!(
+            started_rx.try_recv().is_err(),
+            "a refused prompt must never reach the provider"
+        );
+        assert_eq!(
+            files_under(&agent_workspace),
+            files_before,
+            "a refused source must not be copied into the agent's workspace"
+        );
+    }
+
+    // ── SOP runs, approvals, and authoring apply the agent selector ─────
+
+    fn gated_sop(name: &str, agent: &str) -> crate::sop::Sop {
+        use crate::sop::{Sop, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger};
+        Sop {
+            name: name.to_string(),
+            description: format!("{agent} procedure"),
+            version: "1.0.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Supervised,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Execute after approval".to_string(),
+                kind: SopStepKind::Execute,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            agent: Some(agent.to_string()),
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+        }
+    }
+
+    /// Two agents; alice is entitled to `alpha` with unrestricted tools and
+    /// every SOP verb. The engine holds a gated procedure for each agent.
+    fn sop_scoped_ctx(
+        tmp: &tempfile::TempDir,
+        uid: u32,
+    ) -> (
+        Arc<RpcContext>,
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        std::path::PathBuf,
+    ) {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let mut config = cron_roster_config_in(tmp, uid);
+        let sops_dir = tmp.path().join("sops");
+        config.sop = zeroclaw_config::schema::SopConfig {
+            sops_dir: Some(sops_dir.to_string_lossy().into_owned()),
+            ..zeroclaw_config::schema::SopConfig::default()
+        };
+        let profile = config
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .expect("the fixture profile exists");
+        profile.allowed_tools = vec![zeroclaw_api::grants::WILDCARD.into()];
+        profile.grants.insert(
+            Resource::Sops,
+            vec![
+                Verb::Create,
+                Verb::Read,
+                Verb::Update,
+                Verb::Delete,
+                Verb::Execute,
+            ],
+        );
+        for (name, agent) in [("alpha-sop", "alpha"), ("beta-sop", "beta")] {
+            crate::sop::save_sop(&sops_dir, &gated_sop(name, agent)).expect("save the fixture SOP");
+        }
+        let mut engine = crate::sop::SopEngine::new(config.sop.clone());
+        engine.reload(tmp.path());
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_sop_engine(config, sessions, Arc::clone(&engine));
+        (ctx, engine, sops_dir)
+    }
+
+    fn park_sop_run(engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>, name: &str) -> String {
+        let action = engine
+            .lock()
+            .expect("engine lock")
+            .start_run(
+                name,
+                crate::sop::SopEvent {
+                    source: crate::sop::SopTriggerSource::Manual,
+                    topic: None,
+                    payload: None,
+                    timestamp: crate::sop::engine::now_iso8601(),
+                },
+            )
+            .expect("start the gated SOP");
+        let crate::sop::SopRunAction::WaitApproval { run_id, .. } = action else {
+            panic!("a supervised execute step parks for approval: {action:?}");
+        };
+        run_id
+    }
+
+    #[tokio::test]
+    async fn sop_run_and_decide_refuse_a_procedure_run_as_an_agent_outside_the_selector() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, engine, _sops_dir) = sop_scoped_ctx(&tmp, 4242);
+        let beta_run = park_sop_run(&engine, "beta-sop");
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let run = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "sops/run",
+            json!({"name": "beta-sop"}),
+        )
+        .await;
+        assert_eq!(run["error"]["code"], json!(FORBIDDEN), "{run}");
+
+        let decided = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "sops/decide",
+            json!({"name": "beta-sop", "run_id": beta_run, "decision": "approve"}),
+        )
+        .await;
+        assert_eq!(decided["error"]["code"], json!(FORBIDDEN), "{decided}");
+        assert_eq!(
+            engine
+                .lock()
+                .expect("engine lock")
+                .get_run(&beta_run)
+                .map(|run| run.status),
+            Some(crate::sop::SopRunStatus::WaitingApproval),
+            "a refused approval must leave the run parked"
+        );
+
+        // alpha's procedure passes the selector. This context has no SOP audit
+        // log, so the run then fails as unavailable rather than as refused.
+        let admitted = rpc(
+            &mut alice,
+            &mut rx,
+            3,
+            "sops/run",
+            json!({"name": "alpha-sop"}),
+        )
+        .await;
+        assert_ne!(admitted["error"]["code"], json!(FORBIDDEN), "{admitted}");
+    }
+
+    #[tokio::test]
+    async fn sop_run_refuses_a_constrained_tool_selector_like_a_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, _engine, _sops_dir) = sop_scoped_ctx(&tmp, 4242);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let mut narrowed = ctx.config.read().clone();
+        narrowed
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .expect("the fixture profile exists")
+            .allowed_tools = vec!["calculator".into()];
+        ctx.auth
+            .refresh_from_config(&narrowed)
+            .expect("the narrowed policy compiles");
+
+        let run = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "sops/run",
+            json!({"name": "alpha-sop"}),
+        )
+        .await;
+        assert_eq!(run["error"]["code"], json!(FORBIDDEN), "{run}");
+    }
+
+    #[tokio::test]
+    async fn sop_authoring_refuses_procedures_bound_to_an_agent_outside_the_selector() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, _engine, sops_dir) = sop_scoped_ctx(&tmp, 4242);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let created = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "sops/create",
+            json!({"sop": gated_sop("beta-new", "beta")}),
+        )
+        .await;
+        assert_eq!(created["error"]["code"], json!(FORBIDDEN), "{created}");
+
+        let mut rebound = gated_sop("beta-sop", "alpha");
+        rebound.description = "taken over".into();
+        let saved = rpc(&mut alice, &mut rx, 2, "sops/save", json!({"sop": rebound})).await;
+        assert_eq!(
+            saved["error"]["code"],
+            json!(FORBIDDEN),
+            "rewriting another agent's procedure is refused: {saved}"
+        );
+
+        let deleted = rpc(
+            &mut alice,
+            &mut rx,
+            3,
+            "sops/delete",
+            json!({"name": "beta-sop"}),
+        )
+        .await;
+        assert_eq!(deleted["error"]["code"], json!(FORBIDDEN), "{deleted}");
+        let beta = crate::sop::load_sop_by_name(
+            &sops_dir,
+            "beta-sop",
+            crate::sop::SopExecutionMode::Supervised,
+        )
+        .expect("beta's procedure is still on disk");
+        assert_eq!(beta.agent.as_deref(), Some("beta"));
+        assert_eq!(beta.description, "beta procedure");
+
+        let admitted = rpc(
+            &mut alice,
+            &mut rx,
+            4,
+            "sops/create",
+            json!({"sop": gated_sop("alpha-new", "alpha")}),
+        )
+        .await;
+        assert_ne!(admitted["error"]["code"], json!(FORBIDDEN), "{admitted}");
+    }
+
+    #[tokio::test]
+    async fn sop_authoring_checks_the_definition_as_it_will_load() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, _engine, sops_dir) = sop_scoped_ctx(&tmp, 4242);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        // A step body that renders into SOP.md as a per-step agent override.
+        let mut smuggled = gated_sop("smuggled", "alpha");
+        smuggled.steps[0].body = "ok\n- agent: beta".into();
+        assert_eq!(
+            RpcDispatcher::sop_as_loaded(&smuggled).steps[0]
+                .agent
+                .as_deref(),
+            Some("beta"),
+            "the fixture must reload with the injected override"
+        );
+        let created = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "sops/create",
+            json!({"sop": smuggled}),
+        )
+        .await;
+        assert_eq!(created["error"]["code"], json!(FORBIDDEN), "{created}");
+        assert!(
+            !sops_dir.join("smuggled").exists(),
+            "a refused create must not write the procedure"
+        );
+    }
+
+    /// `sop_as_loaded` restates how `save_sop` writes steps and how the loader
+    /// reads them back. Save and reload real procedures, including injected
+    /// overrides and extra steps, and require the same steps and agents.
+    #[test]
+    fn sop_as_loaded_matches_a_real_save_and_reload() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut in_body = gated_sop("in-body", "alpha");
+        in_body.steps[0].body = "ok\n- agent: beta".into();
+        let mut in_title = gated_sop("in-title", "alpha");
+        in_title.steps[0].title = "Run\n   - agent: beta".into();
+        let mut extra_step = gated_sop("extra-step", "alpha");
+        extra_step.steps[0].body = "first\n2. **Second**\n   - agent: beta".into();
+        let mut overridden = gated_sop("overridden", "alpha");
+        overridden.steps[0].agent = Some("beta".into());
+
+        let mut saved = 0;
+        for sop in [
+            in_body,
+            in_title,
+            extra_step,
+            overridden,
+            gated_sop("plain", "alpha"),
+        ] {
+            if let Err(e) = crate::sop::save_sop(tmp.path(), &sop) {
+                assert_ne!(sop.name, "in-body", "the body case must save: {e}");
+                continue;
+            }
+            saved += 1;
+            let reloaded = crate::sop::load_sop_by_name(
+                tmp.path(),
+                &sop.name,
+                crate::sop::SopExecutionMode::Supervised,
+            )
+            .expect("a saved procedure loads");
+            let predicted = RpcDispatcher::sop_as_loaded(&sop);
+            let agents = |sop: &crate::sop::Sop| -> Vec<Option<String>> {
+                sop.steps.iter().map(|step| step.agent.clone()).collect()
+            };
+            assert_eq!(
+                agents(&predicted),
+                agents(&reloaded),
+                "{}: the authorized steps must be the steps that load",
+                sop.name
+            );
+            assert_eq!(predicted.agent, reloaded.agent, "{}", sop.name);
+        }
+        assert!(saved >= 3, "most fixtures must save, saved {saved}");
+    }
+
+    #[tokio::test]
+    async fn sop_authoring_refuses_to_replace_or_delete_an_unloadable_procedure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, _engine, sops_dir) = sop_scoped_ctx(&tmp, 4242);
+        let broken = sops_dir.join("broken-sop");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(
+            broken.join("SOP.toml"),
+            "[sop\nname = \"broken-sop\"\nagent = \"beta\"\n",
+        )
+        .unwrap();
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let deleted = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "sops/delete",
+            json!({"name": "broken-sop"}),
+        )
+        .await;
+        assert_eq!(deleted["error"]["code"], json!(FORBIDDEN), "{deleted}");
+        let saved = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "sops/save",
+            json!({"sop": gated_sop("broken-sop", "alpha")}),
+        )
+        .await;
+        assert_eq!(saved["error"]["code"], json!(FORBIDDEN), "{saved}");
+        assert_eq!(
+            std::fs::read_to_string(broken.join("SOP.toml")).unwrap(),
+            "[sop\nname = \"broken-sop\"\nagent = \"beta\"\n",
+            "the unloadable procedure is left as it was"
+        );
+
+        let (mut operator, mut op_rx) = local_operator(&ctx).await;
+        let removed = rpc(
+            &mut operator,
+            &mut op_rx,
+            1,
+            "sops/delete",
+            json!({"name": "broken-sop"}),
+        )
+        .await;
+        assert!(
+            removed.get("error").is_none(),
+            "the operator may still remove it: {removed}"
+        );
+    }
+
+    // ── fs/list_dir is confined to the principal's entitled roots ──────
+
+    /// `session_cwd_config` with `Files:Read` added to alice's profile.
+    fn fs_listing_config(
+        tmp: &tempfile::TempDir,
+        uid: u32,
+        extra_allowed_root: Option<std::path::PathBuf>,
+    ) -> zeroclaw_config::schema::Config {
+        let mut config = session_cwd_config(tmp, uid, extra_allowed_root);
+        config
+            .permission_profiles
+            .get_mut("session-scoped")
+            .expect("the fixture profile exists")
+            .grants
+            .insert(
+                zeroclaw_api::grants::Resource::Files,
+                vec![zeroclaw_api::grants::Verb::Read],
+            );
+        config
+    }
+
+    async fn list_dir(
+        dispatcher: &mut RpcDispatcher,
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+        path: &std::path::Path,
+    ) -> Value {
+        rpc(
+            dispatcher,
+            rx,
+            1,
+            "fs/list_dir",
+            json!({"path": path.to_string_lossy()}),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_cannot_list_outside_its_agents_roots() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(fs_listing_config(&tmp, 4242, None));
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        for path in [std::path::Path::new("/"), outside.path()] {
+            let response = list_dir(&mut alice, &mut rx, path).await;
+            assert_eq!(
+                response["error"]["code"],
+                json!(FORBIDDEN),
+                "{path:?}: {response}"
+            );
+        }
+        let absent = outside.path().join("does-not-exist");
+        let response = list_dir(&mut alice, &mut rx, &absent).await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(FORBIDDEN),
+            "an absent path outside the roots is refused before it is probed: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_principal_lists_its_agent_workspace_and_allowed_roots() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        std::fs::write(root.join("notes.txt"), "root").unwrap();
+        let config = fs_listing_config(&tmp, 4242, Some(root.clone()));
+        let workspace = config.agent_workspace_dir("test-agent");
+        std::fs::write(workspace.join("readme.md"), "workspace").unwrap();
+        let ctx = enforcement_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        for (path, expected) in [(workspace, "readme.md"), (root, "notes.txt")] {
+            let response = list_dir(&mut alice, &mut rx, &path).await;
+            let names: Vec<&str> = response["result"]["entries"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{path:?} must list: {response}"))
+                .iter()
+                .filter_map(|entry| entry["name"].as_str())
+                .collect();
+            assert!(names.contains(&expected), "{path:?}: {names:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scoped_principal_listing_does_not_follow_a_symlink_out_of_the_workspace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let config = fs_listing_config(&tmp, 4242, None);
+        let link = config.agent_workspace_dir("test-agent").join("escape");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        let ctx = enforcement_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let response = list_dir(&mut alice, &mut rx, &link).await;
+        assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+    }
+
+    #[tokio::test]
+    async fn principal_narrowed_away_from_the_agent_cannot_list_its_workspace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = fs_listing_config(&tmp, 4242, None);
+        let workspace = config.agent_workspace_dir("test-agent");
+        let ctx = enforcement_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        assert!(
+            list_dir(&mut alice, &mut rx, &workspace)
+                .await
+                .get("result")
+                .is_some(),
+            "alice starts entitled to the agent's workspace"
+        );
+
+        narrow_alice_to_no_agents(&ctx);
+        let response = list_dir(&mut alice, &mut rx, &workspace).await;
+        assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+    }
+
+    #[tokio::test]
+    async fn scoped_listing_refuses_parent_components_whether_or_not_the_path_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let config = fs_listing_config(&tmp, 4242, None);
+        let workspace = config
+            .agent_workspace_dir("test-agent")
+            .canonicalize()
+            .unwrap();
+        let ctx = enforcement_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        // Climb from a probe back to the root and then down into the entitled
+        // workspace. Resolving this succeeds only if the probe exists.
+        let back_into_workspace = |probe: &std::path::Path| {
+            let depth = probe
+                .canonicalize()
+                .unwrap_or_else(|_| probe.to_path_buf())
+                .components()
+                .count();
+            let mut path = probe.to_path_buf();
+            for _ in 0..depth {
+                path.push("..");
+            }
+            path.join(workspace.strip_prefix("/").unwrap())
+        };
+        let existing = back_into_workspace(outside.path());
+        let absent = back_into_workspace(&outside.path().join("absent"));
+        let mut codes = Vec::new();
+        for path in [
+            existing.as_path(),
+            absent.as_path(),
+            std::path::Path::new("agent-workspace"),
+        ] {
+            let response = list_dir(&mut alice, &mut rx, path).await;
+            codes.push(response["error"]["code"].clone());
+        }
+        assert_eq!(
+            codes,
+            vec![json!(FORBIDDEN), json!(FORBIDDEN), json!(FORBIDDEN)],
+            "existing, absent, and relative probes must be indistinguishable"
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_lists_any_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(fs_listing_config(&tmp, 4242, None));
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+
+        let response = list_dir(&mut operator, &mut rx, std::path::Path::new("/")).await;
+        assert!(
+            response["result"]["entries"].is_array(),
+            "the local operator keeps unrestricted listing: {response}"
+        );
+    }
+
+    // ── An OIDC principal is not refused for having waited ─────────────
+
+    /// `session_cwd_config` plus an `[oidc.corp]` trust relationship mapping the
+    /// `ops` group to a profile that may open and prompt `test-agent` sessions
+    /// and write provider settings.
+    fn oidc_session_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+        use std::collections::HashMap;
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_config::schema::{OidcConfig, PermissionProfileConfig};
+
+        let mut config = session_cwd_config(tmp, 4242, None);
+        config.permission_profiles.insert(
+            "oidc-ops".into(),
+            PermissionProfileConfig {
+                allowed_agents: vec!["test-agent".into()],
+                allowed_tools: vec![zeroclaw_api::grants::WILDCARD.into()],
+                config_write_paths: vec!["providers.*".into()],
+                grants: HashMap::from([
+                    (
+                        Resource::Sessions,
+                        vec![Verb::Create, Verb::Read, Verb::Execute],
+                    ),
+                    (Resource::Config, vec![Verb::Read, Verb::Update]),
+                ]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.oidc.insert(
+            "corp".into(),
+            OidcConfig {
+                issuer: "https://sso.example.com".into(),
+                audience: "zeroclaw".into(),
+                claim_path: "groups".into(),
+                profile_map: HashMap::from([("ops".into(), "oidc-ops".into())]),
+                ..OidcConfig::default()
+            },
+        );
+        config
+    }
+
+    fn oidc_identity() -> zeroclaw_api::principal::AuthenticatedIdentity {
+        let serde_json::Value::Object(claims) = json!({ "groups": ["ops"] }) else {
+            unreachable!()
+        };
+        zeroclaw_api::principal::AuthenticatedIdentity::new(
+            zeroclaw_api::principal::IdentitySubject::Oidc {
+                issuer: "https://sso.example.com".into(),
+                subject: "alice".into(),
+            },
+            zeroclaw_api::principal::AuthMethod::Oidc,
+        )
+        .with_provider_alias("corp")
+        .with_claims(claims)
+    }
+
+    fn oidc_peer(ctx: &Arc<RpcContext>) -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(Arc::clone(ctx), tx, "wss:oidc".into())
+            .with_transport(
+                crate::rpc::transport::TransportKind::Wss,
+                crate::security::auth_provider::Credential::None,
+            );
+        dispatcher.bind_identity_for_test(
+            oidc_identity(),
+            crate::rpc::auth::LocalCredentialEvidence::Oidc,
+        );
+        (dispatcher, rx)
+    }
+
+    #[tokio::test]
+    async fn oidc_principal_opens_and_prompts_sessions_at_an_unchanged_generation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = oidc_session_config(&tmp);
+        let agent_workspace = config.agent_workspace_dir("test-agent");
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (mut oidc, mut rx) = oidc_peer(&ctx);
+
+        let created = rpc(
+            &mut oidc,
+            &mut rx,
+            1,
+            "session/new",
+            json!({"agent_alias": "test-agent", "session_id": "s-oidc-new"}),
+        )
+        .await;
+        assert_eq!(
+            created["result"]["session_id"],
+            json!("s-oidc-new"),
+            "{created}"
+        );
+
+        let (provider, mut started_rx, release_tx) = gated_provider();
+        let sid = "s-oidc-prompt";
+        install_state_test_session_at(
+            &ctx.sessions,
+            &chat_backend,
+            sid,
+            provider,
+            None,
+            &agent_workspace,
+        )
+        .await;
+        send_prompt(&mut oidc, 2, sid, 1).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), started_rx.recv())
+            .await
+            .expect("an OIDC principal's prompt must reach the provider")
+            .expect("the provider channel stays open");
+        release_tx
+            .send(())
+            .expect("the turn is waiting on its provider");
+        let (response, _notifications) = response_and_notifications(&mut rx, 2).await;
+        assert!(response.get("error").is_none(), "{response}");
+    }
+
+    #[test]
+    fn oidc_principal_writes_config_at_an_unchanged_generation() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (ctx, _chat_backend, _acp_store) =
+                persistence_enforcement_ctx(oidc_session_config(&tmp));
+            let (mut oidc, mut rx) = oidc_peer(&ctx);
+
+            let response = rpc(
+                &mut oidc,
+                &mut rx,
+                1,
+                "config/set",
+                json!({"prop": "providers.models.openai.test-provider.model", "value": "oidc-model"}),
+            )
+            .await;
+            assert!(response.get("error").is_none(), "{response}");
+            let on_disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+            assert!(on_disk.contains("oidc-model"), "{on_disk}");
+
+            // The save changed no authorization input, so the same binding
+            // keeps working: zerocode's editor reads the config back and may
+            // save again on the same connection.
+            let listed = rpc(&mut oidc, &mut rx, 2, "config/list", json!({})).await;
+            assert!(listed.get("error").is_none(), "{listed}");
+            let again = rpc(
+                &mut oidc,
+                &mut rx,
+                3,
+                "config/set",
+                json!({"prop": "providers.models.openai.test-provider.model", "value": "oidc-model-2"}),
+            )
+            .await;
+            assert!(again.get("error").is_none(), "{again}");
+        });
+    }
+
+    #[tokio::test]
+    async fn session_prompt_admitted_with_an_expired_credential_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = session_cwd_config(&tmp, 4242, None);
+        let agent_workspace = config.agent_workspace_dir("test-agent");
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (provider, mut started_rx, _release_tx) = gated_provider();
+        let sid = "s-prompt-expired";
+        install_state_test_session_at(
+            &ctx.sessions,
+            &chat_backend,
+            sid,
+            provider,
+            None,
+            &agent_workspace,
+        )
+        .await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        // Hold admission, expire the binding the prompt handle copies, and
+        // queue the prompt directly: the gate in `process_line` would refuse
+        // an expired credential before admission, which is not the boundary
+        // under test.
+        let permit = ctx
+            .sessions
+            .session_queue
+            .acquire(sid)
+            .await
+            .expect("the test takes the admission permit first");
+        alice.expire_credential_for_test();
+        let handle = alice.spawn_handle();
+        let task = zeroclaw_spawn::spawn!(async move {
+            handle
+                .handle_session_prompt(&json!({
+                    "session_id": sid,
+                    "prompt": "hello",
+                    "client_turn_generation": 9,
+                }))
+                .await
+        });
+        wait_for_session_admission_waiter(&ctx, sid).await;
+        drop(permit);
+
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the admitted prompt must settle")
+            .expect("the prompt task must not panic")
+            .expect_err("an expired credential must not run a turn");
+        assert_eq!(err.code, AUTH_REQUIRED, "{err:?}");
+        let mut notifications = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            notifications.push(serde_json::from_str::<Value>(&frame).expect("valid frame"));
+        }
+        assert_turn_refused(&notifications, sid, 9);
+        assert!(
+            started_rx.try_recv().is_err(),
+            "a refused prompt must never reach the provider"
+        );
+    }
+
+    // ── The session environment comes from the connection, not the wire ──
+    //
+    // A TUI registration carries the user's real shell environment, including
+    // credential sockets. `session/new` must resolve it from the calling
+    // connection's own registration.
+
+    #[cfg(unix)]
+    fn shell_env_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+        let mut config = make_acp_test_config(tmp);
+        let profile = config
+            .risk_profiles
+            .entry("test-profile".into())
+            .or_default();
+        profile.level = zeroclaw_config::autonomy::AutonomyLevel::Full;
+        profile.allowed_commands = vec!["env".into()];
+        config
+    }
+
+    /// Register a TUI on `dispatcher`'s connection with one sentinel variable,
+    /// the way `initialize` does for a real client.
+    #[cfg(unix)]
+    fn register_tui_env(
+        ctx: &Arc<RpcContext>,
+        dispatcher: &mut RpcDispatcher,
+        tui_id: &str,
+        var: &str,
+        value: &str,
+    ) {
+        let epoch = ctx
+            .tui_registry
+            .register(crate::rpc::tui_identity::TuiEntry {
+                tui_id: tui_id.to_string(),
+                connected_at: chrono::Utc::now(),
+                peer_label: tui_id.to_string(),
+                transport: "unix".to_string(),
+                env: std::collections::HashMap::from([(var.to_string(), value.to_string())]),
+            });
+        dispatcher.set_tui_registration_for_test(Some((tui_id.to_string(), epoch)));
+    }
+
+    /// The environment a session's shell tool actually runs with.
+    #[cfg(unix)]
+    async fn session_shell_env(ctx: &Arc<RpcContext>, session_id: &str) -> String {
+        let agent = ctx
+            .sessions
+            .get_agent(session_id)
+            .await
+            .expect("the session was created");
+        let guard = agent.lock().await;
+        let result = guard
+            .execute_tool_for_test("shell", json!({"command": "env"}))
+            .await
+            .expect("the shell tool is registered")
+            .expect("the environment print command succeeds");
+        result.output.into_string()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_new_ignores_a_foreign_request_tui_id_for_environment() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(shell_env_config(&tmp));
+        let (tx, _victim_rx) = tokio::sync::mpsc::channel(64);
+        let mut victim = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:victim".into());
+        victim.set_authenticated_for_test();
+        register_tui_env(
+            &ctx,
+            &mut victim,
+            "tui_victim01",
+            "SENTINEL_SOCK",
+            "/tmp/victim.sock",
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut attacker = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:attacker".into());
+        attacker.set_authenticated_for_test();
+        register_tui_env(&ctx, &mut attacker, "tui_attack01", "ATTACKER_VAR", "mine");
+
+        let response = rpc(
+            &mut attacker,
+            &mut rx,
+            1,
+            "session/new",
+            json!({
+                "agent_alias": "test-agent",
+                "session_id": "s-foreign-tui",
+                "tui_id": "tui_victim01",
+            }),
+        )
+        .await;
+        assert_eq!(
+            response["result"]["session_id"],
+            json!("s-foreign-tui"),
+            "{response}"
+        );
+
+        let env = session_shell_env(&ctx, "s-foreign-tui").await;
+        assert!(
+            !env.contains("SENTINEL_SOCK"),
+            "naming another connection's TUI must not import its environment:\n{env}"
+        );
+        assert!(
+            env.contains("ATTACKER_VAR=mine"),
+            "the connection's own registration is still used:\n{env}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_new_uses_only_the_connections_own_registration() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(shell_env_config(&tmp));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut client = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:client".into());
+        client.set_authenticated_for_test();
+        register_tui_env(
+            &ctx,
+            &mut client,
+            "tui_own00001",
+            "OWN_SOCK",
+            "/tmp/own.sock",
+        );
+
+        let response = rpc(
+            &mut client,
+            &mut rx,
+            1,
+            "session/new",
+            json!({"agent_alias": "test-agent", "session_id": "s-own-tui"}),
+        )
+        .await;
+        assert_eq!(
+            response["result"]["session_id"],
+            json!("s-own-tui"),
+            "{response}"
+        );
+
+        let env = session_shell_env(&ctx, "s-own-tui").await;
+        assert!(
+            env.contains("OWN_SOCK=/tmp/own.sock"),
+            "the connection's own captured environment must still reach the session:\n{env}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn superseded_registration_cannot_read_its_successors_environment() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(shell_env_config(&tmp));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut displaced = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:displaced".into());
+        displaced.set_authenticated_for_test();
+        register_tui_env(
+            &ctx,
+            &mut displaced,
+            "tui_reconn01",
+            "OLD_SOCK",
+            "/tmp/old.sock",
+        );
+
+        // The client reconnects and re-registers the SAME id under a new
+        // epoch. The displaced connection is still draining.
+        let (tx2, _rx2) = tokio::sync::mpsc::channel(64);
+        let mut reconnected = RpcDispatcher::new(Arc::clone(&ctx), tx2, "unix:reconnect".into());
+        reconnected.set_authenticated_for_test();
+        register_tui_env(
+            &ctx,
+            &mut reconnected,
+            "tui_reconn01",
+            "NEW_SOCK",
+            "/tmp/new.sock",
+        );
+
+        let response = rpc(
+            &mut displaced,
+            &mut rx,
+            1,
+            "session/new",
+            json!({"agent_alias": "test-agent", "session_id": "s-superseded"}),
+        )
+        .await;
+        assert_eq!(
+            response["result"]["session_id"],
+            json!("s-superseded"),
+            "{response}"
+        );
+
+        let env = session_shell_env(&ctx, "s-superseded").await;
+        assert!(
+            !env.contains("NEW_SOCK"),
+            "a superseded registration must not read its successor's environment:\n{env}"
+        );
+    }
+
+    // ── Forwarded environment is retained only where it is trusted ────
+    //
+    // `initialize` may carry the client's process environment. The shell
+    // tool applies it verbatim, PATH included, so the daemon keeps it only
+    // for an operator-level principal on a local transport.
+
+    fn registered_env(
+        ctx: &Arc<RpcContext>,
+        dispatcher: &RpcDispatcher,
+    ) -> std::collections::HashMap<String, String> {
+        let (id, epoch) = dispatcher
+            .tui_registration()
+            .expect("initialize registered the connection");
+        ctx.tui_registry
+            .env_for_registration(id, epoch)
+            .expect("the registration is live")
+    }
+
+    #[tokio::test]
+    async fn wss_initialize_drops_the_forwarded_environment() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.paired_tokens = vec!["zc_tok".to_string()];
+        let ctx = enforcement_ctx(config);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(Arc::clone(&ctx), tx, "wss:test".into())
+            .with_transport(
+                crate::rpc::transport::TransportKind::Wss,
+                crate::security::auth_provider::Credential::None,
+            );
+        dispatcher
+            .handle_initialize(&json!({
+                "auth_token": "zc_tok",
+                "env": {"PATH": "/tmp/evil", "SENTINEL_SOCK": "/tmp/remote.sock"},
+            }))
+            .await
+            .expect("paired token authenticates over wss");
+
+        assert!(
+            registered_env(&ctx, &dispatcher).is_empty(),
+            "a remote client's environment describes another host and must not \
+             reach the daemon's subprocesses"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_local_initialize_drops_the_forwarded_environment() {
+        let ctx = enforcement_ctx(roster_config(4242));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:test".into())
+            .with_transport(
+                crate::rpc::transport::TransportKind::Local,
+                crate::security::auth_provider::Credential::Peercred { uid: 4242 },
+            );
+        dispatcher
+            .handle_initialize(&json!({"env": {"PATH": "/tmp/evil"}}))
+            .await
+            .expect("roster uid authenticates");
+
+        assert!(
+            registered_env(&ctx, &dispatcher).is_empty(),
+            "a scoped principal must not choose the daemon's subprocess environment"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_operator_initialize_keeps_the_forwarded_environment() {
+        let ctx = enforcement_ctx(zeroclaw_config::schema::Config::default());
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:test".into());
+        dispatcher
+            .handle_initialize(&json!({"env": {"SSH_AUTH_SOCK": "/tmp/agent.sock"}}))
+            .await
+            .expect("the local operator initializes");
+
+        assert_eq!(
+            registered_env(&ctx, &dispatcher)
+                .get("SSH_AUTH_SOCK")
+                .map(String::as_str),
+            Some("/tmp/agent.sock"),
+            "the local IDE flow still forwards the operator's environment"
+        );
+    }
+
+    #[test]
+    fn authz_classification_spot_checks() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        for (wire, resource, verb) in [
+            ("config/set", Resource::Config, Verb::Update),
+            ("config/reload", Resource::Config, Verb::Update),
+            ("session/prompt", Resource::Sessions, Verb::Execute),
+            ("session/new", Resource::Sessions, Verb::Create),
+            ("memory/delete", Resource::Memory, Verb::Delete),
+            ("sops/run", Resource::Sops, Verb::Execute),
+            ("skills/write", Resource::Skills, Verb::Update),
+            ("cron/trigger", Resource::Cron, Verb::Execute),
+        ] {
+            let method = Method::from_wire(wire).expect("wire name resolves");
+            assert_eq!(
+                method.authz(),
+                MethodAuthz::Requires(resource, verb),
+                "classification for {wire}"
+            );
         }
     }
 
@@ -6976,6 +11627,82 @@ mod tests {
         assert!(
             !seen.contains(zeroclaw_log::EPHEMERAL_BROADCAST_MARKER),
             "the internal fail-closed marker must be stripped from forwarded frames: {seen:?}"
+        );
+    }
+
+    async fn next_frame_containing(
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+        needle: &str,
+        within: std::time::Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some(frame)) if frame.contains(needle) => return true,
+                Ok(Some(_)) => continue,
+                _ => return false,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn logs_subscription_stops_once_the_principal_loses_the_grant() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let mut config = roster_config(4242);
+        config
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the fixture profile exists")
+            .grants
+            .insert(Resource::Logs, vec![Verb::Read]);
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (event_tx, _rx0) = tokio::sync::broadcast::channel(16);
+        let ctx = RpcContext::minimal_with_event_tx(config.clone(), sessions, event_tx.clone());
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let subscribed = rpc(&mut alice, &mut rx, 1, "logs/subscribe", json!({})).await;
+        assert_eq!(
+            subscribed["result"]["subscribed"],
+            json!(true),
+            "{subscribed}"
+        );
+        event_tx
+            .send(json!({"source": "observability", "tool": "SENTINEL-BEFORE"}))
+            .expect("send the first frame");
+        assert!(
+            next_frame_containing(
+                &mut rx,
+                "SENTINEL-BEFORE",
+                std::time::Duration::from_secs(2)
+            )
+            .await,
+            "an entitled subscriber receives log frames"
+        );
+
+        let mut narrowed = config;
+        narrowed
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the fixture profile exists")
+            .grants
+            .remove(&Resource::Logs);
+        ctx.auth
+            .refresh_from_config(&narrowed)
+            .expect("the narrowed policy compiles");
+        event_tx
+            .send(json!({"source": "observability", "tool": "SENTINEL-AFTER"}))
+            .expect("send the second frame");
+        assert!(
+            !next_frame_containing(
+                &mut rx,
+                "SENTINEL-AFTER",
+                std::time::Duration::from_millis(500)
+            )
+            .await,
+            "a principal that lost Logs:Read must stop receiving log frames"
         );
     }
 
@@ -8515,7 +13242,11 @@ mod tests {
             Some(reload_tx),
         );
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
-        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-quickstart-reload:pid=1".into());
+        let mut dispatcher =
+            RpcDispatcher::new(ctx, tx, "test-peer-quickstart-reload:pid=1".into());
+        // Quickstart is a gated method, so a real caller always arrives with a
+        // bound principal; the post-admission authority recheck expects one.
+        dispatcher.set_authenticated_for_test();
 
         let submission = BuilderSubmission {
             model_provider: SelectorChoice::Fresh(ModelProviderChoice {
@@ -9107,6 +13838,8 @@ mod tests {
             tui_sig: None,
             capabilities: vec![],
             commands: vec![],
+            auth_methods: Vec::new(),
+            principal_id: None,
         };
         let val = to_result(r).unwrap();
         assert_eq!(val["protocol_version"], 1);
@@ -9276,7 +14009,9 @@ mod tests {
             "the reconnect must survive the displaced connection's cleanup"
         );
         assert!(
-            ctx.tui_registry.get_env(&id).is_some(),
+            ctx.tui_registry
+                .env_for_registration(&id, epoch_second)
+                .is_some(),
             "the live TUI must still resolve its captured environment"
         );
 
@@ -9409,7 +14144,8 @@ mod tests {
             .expect("minimal test context should be uniquely owned");
         ctx.event_tx = event_tx;
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
-        let dispatcher = RpcDispatcher::new(Arc::new(ctx), tx, "test-peer".into());
+        let mut dispatcher = RpcDispatcher::new(Arc::new(ctx), tx, "test-peer".into());
+        dispatcher.set_authenticated_for_test();
         (dispatcher, sessions)
     }
 
@@ -9427,7 +14163,7 @@ mod tests {
         let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-stack:pid=1".into());
-        dispatcher.authenticated = true;
+        dispatcher.set_authenticated_for_test();
         (dispatcher, sessions, rx)
     }
 
@@ -10029,7 +14765,8 @@ mod tests {
             Some(Arc::clone(&acp_store)),
         );
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
-        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher.set_authenticated_for_test();
         (dispatcher, sessions, chat_backend, acp_store)
     }
 
@@ -10145,8 +14882,9 @@ mod tests {
 
         assert!(sessions.remove(current).await);
         let rehydrated = dispatcher
-            .rehydrate_reaped_session(current)
+            .rehydrate_reaped_session(current, dispatcher.stamped_grants())
             .await
+            .expect("an operator's rehydration is never refused")
             .expect("real RPC rehydration should rebuild the ACP agent");
         let rehydrated_list =
             execute_session_tool_as(&rehydrated, current, "sessions_list", json!({})).await;
@@ -11357,7 +16095,10 @@ mod tests {
             "post-reap the session must be absent from memory"
         );
 
-        let recovered = dispatcher.rehydrate_reaped_session(sid).await;
+        let recovered = dispatcher
+            .rehydrate_reaped_session(sid, dispatcher.stamped_grants())
+            .await
+            .expect("an operator's rehydration is never refused");
         assert!(
             recovered.is_some(),
             "a reaped session with a live durable row must rehydrate to a \
@@ -11437,8 +16178,9 @@ mod tests {
         assert!(sessions.remove(sid).await, "reap must remove the session");
 
         let recovered = dispatcher
-            .rehydrate_reaped_session(sid)
+            .rehydrate_reaped_session(sid, dispatcher.stamped_grants())
             .await
+            .expect("an operator's rehydration is never refused")
             .expect("a reaped ACP session must rehydrate to a working agent");
 
         let agent = recovered.lock().await;
@@ -11493,7 +16235,10 @@ mod tests {
             "session/kill must preserve durable history"
         );
 
-        let recovered = dispatcher.rehydrate_reaped_session(sid).await;
+        let recovered = dispatcher
+            .rehydrate_reaped_session(sid, dispatcher.stamped_grants())
+            .await
+            .expect("an operator's rehydration is never refused");
         assert!(
             recovered.is_none(),
             "admin-killed ACP sessions must stay killed instead of rehydrating \
@@ -11634,7 +16379,7 @@ mod tests {
         let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
-        dispatcher.authenticated = true;
+        dispatcher.set_authenticated_for_test();
         dispatcher
     }
 
@@ -11645,7 +16390,7 @@ mod tests {
         let ctx = RpcContext::minimal(config, sessions);
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
-        dispatcher.authenticated = true;
+        dispatcher.set_authenticated_for_test();
         dispatcher
     }
 
@@ -12020,7 +16765,7 @@ mod tests {
         );
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
-        dispatcher.authenticated = true;
+        dispatcher.set_authenticated_for_test();
 
         let params = json!({
             "prop": "providers.models.openai.default.api_key",
@@ -12089,7 +16834,7 @@ mod tests {
         let ctx = RpcContext::minimal_with_memory(cfg, Arc::clone(&sessions), Arc::clone(&mem));
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
-        dispatcher.authenticated = true;
+        dispatcher.set_authenticated_for_test();
 
         // Rotate the provider profile's endpoint + key through config/set.
         for (prop, value) in [
@@ -12189,7 +16934,7 @@ mod tests {
         let ctx = RpcContext::minimal(cfg, Arc::clone(&sessions));
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
-        dispatcher.authenticated = true;
+        dispatcher.set_authenticated_for_test();
 
         // Full RPC path: this schedules the live-agent memory refresh.
         let res = dispatcher
@@ -13214,8 +17959,11 @@ mod tests {
         let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
         let (tx_a, _rx_a) = tokio::sync::mpsc::channel(64);
         let (tx_b, _rx_b) = tokio::sync::mpsc::channel(64);
-        let dispatcher_a = RpcDispatcher::new(Arc::clone(&ctx), tx_a, "test-peer-a:pid=1".into());
-        let dispatcher_b = RpcDispatcher::new(ctx, tx_b, "test-peer-b:pid=2".into());
+        let mut dispatcher_a =
+            RpcDispatcher::new(Arc::clone(&ctx), tx_a, "test-peer-a:pid=1".into());
+        dispatcher_a.set_authenticated_for_test();
+        let mut dispatcher_b = RpcDispatcher::new(ctx, tx_b, "test-peer-b:pid=2".into());
+        dispatcher_b.set_authenticated_for_test();
         (dispatcher_a, dispatcher_b, sessions)
     }
 
@@ -13264,7 +18012,8 @@ mod tests {
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-cap:pid=1".into());
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-cap:pid=1".into());
+        dispatcher.set_authenticated_for_test();
         (dispatcher, rx, sessions)
     }
 
@@ -13462,6 +18211,9 @@ mod tests {
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
             cert_audit: None,
+            auth: crate::rpc::auth::RpcInboundAuth::for_tests(
+                &zeroclaw_config::schema::Config::default(),
+            ),
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-close:pid=1".into());
@@ -13506,6 +18258,9 @@ mod tests {
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
             cert_audit: None,
+            auth: crate::rpc::auth::RpcInboundAuth::for_tests(
+                &zeroclaw_config::schema::Config::default(),
+            ),
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-delete:pid=1".into());
@@ -13609,6 +18364,9 @@ mod tests {
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
             cert_audit: None,
+            auth: crate::rpc::auth::RpcInboundAuth::for_tests(
+                &zeroclaw_config::schema::Config::default(),
+            ),
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-real-close:pid=1".into());
@@ -13633,7 +18391,7 @@ mod tests {
         let ctx = RpcContext::minimal(zeroclaw_config::schema::Config::default(), sessions);
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-bidi:pid=1".into());
-        dispatcher.authenticated = true;
+        dispatcher.set_authenticated_for_test();
         (dispatcher, rx)
     }
 
@@ -14123,6 +18881,325 @@ mod tests {
         );
     }
 
+    // ── Config authority is rechecked after write-lock admission ─────
+    //
+    // The path selector runs before the handler queues for the config write
+    // lock, and that wait is unbounded. A second connection can narrow or
+    // revoke the waiting principal's authority while it is parked.
+
+    fn config_write_roster_config(
+        tmp: &tempfile::TempDir,
+        uid: u32,
+        write_paths: &[&str],
+    ) -> zeroclaw_config::schema::Config {
+        use std::collections::HashMap;
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+
+        let mut config = make_two_provider_test_config(tmp);
+        config.permission_profiles.insert(
+            "config-writer".into(),
+            PermissionProfileConfig {
+                config_write_paths: write_paths.iter().map(|p| (*p).to_string()).collect(),
+                grants: HashMap::from([(
+                    Resource::Config,
+                    vec![Verb::Create, Verb::Read, Verb::Update, Verb::Delete],
+                )]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "alice".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(uid),
+                permission_profiles: vec!["config-writer".into()],
+            },
+        );
+        config
+    }
+
+    /// Park `rpc_call` on the config write lock, apply `mutate` to the
+    /// accepted authorization state while it waits, then release the lock and
+    /// return the call's result.
+    async fn rpc_result_after_midwait_policy_change<F>(
+        ctx: Arc<RpcContext>,
+        rpc_call: F,
+        mutate: impl FnOnce(&Arc<RpcContext>),
+    ) -> RpcResult
+    where
+        F: std::future::Future<Output = RpcResult> + Send + 'static,
+    {
+        let guard = Arc::clone(&ctx.config_write_lock).lock_owned().await;
+        let task = zeroclaw_spawn::spawn!(rpc_call);
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            assert!(
+                !task.is_finished(),
+                "the handler must park on the config write lock"
+            );
+        }
+        mutate(&ctx);
+        drop(guard);
+        task.await.expect("the parked RPC task must not panic")
+    }
+
+    /// Republish the accepted policy with alice's config write access gone.
+    fn revoke_alice_config_writes(ctx: &Arc<RpcContext>) {
+        let mut narrowed = ctx.config.read().clone();
+        narrowed
+            .permission_profiles
+            .get_mut("config-writer")
+            .expect("the fixture profile exists")
+            .config_write_paths
+            .clear();
+        ctx.auth
+            .refresh_from_config(&narrowed)
+            .expect("the narrowed policy compiles");
+    }
+
+    /// Run one config-mutation scenario on a thread with a larger stack.
+    ///
+    /// The debug profile's config-handler frames do not fit the default test
+    /// thread stack; that is a build characteristic of these handlers, not a
+    /// property of the recheck under test. The release binary and the daemon's
+    /// own worker threads are unaffected.
+    fn run_on_a_large_stack<F>(body: impl FnOnce() -> F + Send + 'static)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let handle = std::thread::Builder::new()
+            .name("config-authority-recheck".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("the test runtime builds")
+                    .block_on(body());
+            })
+            .expect("the test thread spawns");
+        if let Err(panic) = handle.join() {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[test]
+    fn config_set_revoked_while_queued_on_the_write_lock_is_refused() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            let ctx = enforcement_ctx(config_write_roster_config(&tmp, 4242, &["providers.*"]));
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            let before = std::fs::read_to_string(&config_path).unwrap_or_default();
+
+            let params = json!({
+                "prop": "providers.models.anthropic.default.model",
+                "value": "revoked-value"
+            });
+            let result = rpc_result_after_midwait_policy_change(
+                Arc::clone(&ctx),
+                async move { alice.handle_config_set(&params).await },
+                revoke_alice_config_writes,
+            )
+            .await;
+
+            let err = result.expect_err("a revoked writer must not commit");
+            assert_eq!(err.code, FORBIDDEN, "{err:?}");
+            let after = std::fs::read_to_string(&config_path).unwrap_or_default();
+            assert_eq!(before, after, "the refused write must not reach disk");
+        });
+    }
+
+    #[test]
+    fn config_delete_revoked_while_queued_is_refused() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            let mut config = config_write_roster_config(&tmp, 4242, &["providers.*"]);
+            config
+                .set_prop_persistent("providers.models.anthropic.default.model", "seeded")
+                .expect("seed a value to delete");
+            config.save_dirty().await.expect("seed the config file");
+            let ctx = enforcement_ctx(config);
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+            let before = std::fs::read_to_string(&config_path).unwrap_or_default();
+
+            let params = json!({"prop": "providers.models.anthropic.default.model"});
+            let result = rpc_result_after_midwait_policy_change(
+                Arc::clone(&ctx),
+                async move { alice.handle_config_delete(&params).await },
+                revoke_alice_config_writes,
+            )
+            .await;
+
+            let err = result.expect_err("a revoked writer must not commit");
+            assert_eq!(err.code, FORBIDDEN, "{err:?}");
+            assert_eq!(
+                std::fs::read_to_string(&config_path).unwrap_or_default(),
+                before,
+                "the refused delete must not reach disk"
+            );
+        });
+    }
+
+    #[test]
+    fn config_map_key_create_delete_and_rename_recheck_after_admission() {
+        run_on_a_large_stack(|| async move {
+            for (method, params) in [
+                (
+                    "create",
+                    json!({"path": "providers.models.openai", "key": "fresh"}),
+                ),
+                (
+                    "delete",
+                    json!({"path": "providers.models.openai", "key": "default"}),
+                ),
+                (
+                    "rename",
+                    json!({"path": "providers.models.openai", "from": "default", "to": "renamed"}),
+                ),
+            ] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let config_path = tmp.path().join("config.toml");
+                let ctx = enforcement_ctx(config_write_roster_config(&tmp, 4242, &["providers.*"]));
+                let (alice, _rx) = roster_peer(&ctx, 4242).await;
+                let before = std::fs::read_to_string(&config_path).unwrap_or_default();
+
+                let call = async move {
+                    match method {
+                        "create" => alice.handle_config_map_key_create(&params).await,
+                        "delete" => alice.handle_config_map_key_delete(&params).await,
+                        _ => alice.handle_config_map_key_rename(&params).await,
+                    }
+                };
+                let result = rpc_result_after_midwait_policy_change(
+                    Arc::clone(&ctx),
+                    call,
+                    revoke_alice_config_writes,
+                )
+                .await;
+
+                let err = result.expect_err("a revoked writer must not commit");
+                assert_eq!(err.code, FORBIDDEN, "map-key {method}: {err:?}");
+                assert_eq!(
+                    std::fs::read_to_string(&config_path).unwrap_or_default(),
+                    before,
+                    "map-key {method}: the refused write must not reach disk"
+                );
+                assert!(
+                    ctx.config
+                        .read()
+                        .providers
+                        .models
+                        .openai
+                        .contains_key("default"),
+                    "map-key {method}: the live config must be untouched"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn config_set_with_an_expired_credential_after_a_long_wait_is_refused() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            let ctx = enforcement_ctx(config_write_roster_config(&tmp, 4242, &["providers.*"]));
+            let (mut alice, _rx) = roster_peer(&ctx, 4242).await;
+            alice.expire_credential_for_test();
+            let before = std::fs::read_to_string(&config_path).unwrap_or_default();
+
+            let params = json!({
+                "prop": "providers.models.anthropic.default.model",
+                "value": "expired-value"
+            });
+            let result = rpc_result_after_midwait_policy_change(
+                Arc::clone(&ctx),
+                async move { alice.handle_config_set(&params).await },
+                |_| {},
+            )
+            .await;
+
+            let err = result.expect_err("an expired credential must not commit");
+            assert_eq!(err.code, AUTH_REQUIRED, "{err:?}");
+            assert_eq!(
+                std::fs::read_to_string(&config_path).unwrap_or_default(),
+                before,
+                "the refused write must not reach disk"
+            );
+        });
+    }
+
+    #[test]
+    fn config_set_still_succeeds_when_authority_is_unchanged() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            let ctx = enforcement_ctx(config_write_roster_config(&tmp, 4242, &["providers.*"]));
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+
+            let params = json!({
+                "prop": "providers.models.anthropic.default.model",
+                "value": "unchanged-authority"
+            });
+            let result = rpc_result_after_midwait_policy_change(
+                Arc::clone(&ctx),
+                async move { alice.handle_config_set(&params).await },
+                |_| {},
+            )
+            .await;
+
+            assert!(
+                result.is_ok(),
+                "the recheck must not refuse a live writer: {result:?}"
+            );
+            let on_disk = std::fs::read_to_string(&config_path).unwrap();
+            assert!(on_disk.contains("unchanged-authority"), "{on_disk}");
+        });
+    }
+
+    #[test]
+    fn config_set_survives_an_unrelated_policy_republication_while_queued() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            let ctx = enforcement_ctx(config_write_roster_config(&tmp, 4242, &["providers.*"]));
+            let (alice, _rx) = roster_peer(&ctx, 4242).await;
+
+            // The accepted policy is republished for an unrelated reason while
+            // alice waits, so her stamped generation goes stale. Her authority is
+            // unchanged, and a recheck that re-resolves rather than comparing
+            // against the stamped grants must let the write through.
+            let params = json!({
+                "prop": "providers.models.anthropic.default.model",
+                "value": "still-authorized"
+            });
+            let result = rpc_result_after_midwait_policy_change(
+                Arc::clone(&ctx),
+                async move { alice.handle_config_set(&params).await },
+                |ctx| {
+                    let mut republished = ctx.config.read().clone();
+                    republished.permission_profiles.insert(
+                        "unrelated-reader".into(),
+                        zeroclaw_config::schema::PermissionProfileConfig::default(),
+                    );
+                    ctx.auth
+                        .refresh_from_config(&republished)
+                        .expect("the republished policy compiles");
+                },
+            )
+            .await;
+
+            assert!(
+                result.is_ok(),
+                "an unrelated republication must not refuse a still-authorized writer: {result:?}"
+            );
+            let on_disk = std::fs::read_to_string(&config_path).unwrap();
+            assert!(on_disk.contains("still-authorized"), "{on_disk}");
+        });
+    }
+
     #[tokio::test]
     async fn concurrent_config_sets_both_persist() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -14194,7 +19271,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let mut rename_dispatcher =
             RpcDispatcher::new(Arc::clone(&ctx), tx, "test-peer-rename".into());
-        rename_dispatcher.authenticated = true;
+        rename_dispatcher.set_authenticated_for_test();
         let params = json!({
             "path": "agents",
             "from": "alpha",
@@ -14354,6 +19431,27 @@ mod tests {
         provider: impl zeroclaw_api::model_provider::ModelProvider + 'static,
         owner_tui_id: Option<&str>,
     ) -> String {
+        install_state_test_session_at(
+            sessions,
+            chat_backend,
+            sid,
+            provider,
+            owner_tui_id,
+            &std::env::temp_dir(),
+        )
+        .await
+    }
+
+    /// [`install_state_test_session_with_owner`] with an explicit session
+    /// workspace, for callers whose principal is held to the agent's roots.
+    async fn install_state_test_session_at(
+        sessions: &Arc<crate::rpc::session::SessionStore>,
+        chat_backend: &Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        sid: &str,
+        provider: impl zeroclaw_api::model_provider::ModelProvider + 'static,
+        owner_tui_id: Option<&str>,
+        workspace: &std::path::Path,
+    ) -> String {
         let agent = crate::agent::agent::Agent::builder()
             .model_provider(Box::new(provider))
             .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
@@ -14362,7 +19460,7 @@ mod tests {
             .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
             .observer(Arc::new(crate::observability::noop::NoopObserver))
             .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
-            .workspace_dir(std::env::temp_dir())
+            .workspace_dir(workspace.to_path_buf())
             .agent_alias("test-agent".to_string())
             .build()
             .expect("test agent should build");
@@ -14370,7 +19468,7 @@ mod tests {
         let rpc_session = crate::rpc::session::RpcSession::new(
             agent,
             "test-agent",
-            std::env::temp_dir().to_str().unwrap(),
+            workspace.to_str().unwrap(),
             crate::rpc::types::ChatMode::Chat,
         )
         .with_owner(owner_tui_id.map(str::to_string));
@@ -15472,7 +20570,10 @@ mod tests {
 
         // Replace the session via ACP rehydration while the stale refresh
         // is paused. This installs a same-ID successor via SessionStore::insert.
-        let rehydrated = dispatcher.rehydrate_reaped_session(&session_id).await;
+        let rehydrated = dispatcher
+            .rehydrate_reaped_session(&session_id, dispatcher.stamped_grants())
+            .await
+            .expect("an operator's rehydration is never refused");
         assert!(
             rehydrated.is_some(),
             "ACP rehydration must install the same-ID successor"

@@ -61,6 +61,28 @@ pub async fn process_file_entry(
         if !p.is_absolute() {
             return Err(rpc_err(INVALID_PARAMS, "Path must be absolute"));
         }
+        // Judge the source before reading it: a device such as /dev/zero or
+        // a FIFO never reaches end of file, and a large file should be
+        // refused without first being pulled into memory.
+        let metadata = tokio::fs::metadata(p)
+            .await
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cannot read file: {e}")))?;
+        if !metadata.is_file() {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "Cannot read file: path mode accepts only a regular file",
+            ));
+        }
+        if metadata.len() > MAX_FILE_BYTES {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!(
+                    "File exceeds {} MB limit ({} bytes)",
+                    MAX_FILE_BYTES / (1024 * 1024),
+                    metadata.len()
+                ),
+            ));
+        }
         let bytes = tokio::fs::read(p)
             .await
             .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cannot read file: {e}")))?;
@@ -611,6 +633,63 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, INVALID_PARAMS);
         assert!(err.message.contains("base64"));
+    }
+
+    #[tokio::test]
+    async fn path_mode_refuses_sources_that_are_not_regular_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_string_lossy().to_string();
+        let store = setup_store(&ws).await;
+
+        let mut sources = vec![tmp.path().to_string_lossy().to_string()];
+        if cfg!(unix) {
+            sources.push("/dev/zero".to_string());
+        }
+        for source in sources {
+            let entry = FileEntry {
+                path: Some(source.clone()),
+                data_b64: None,
+                filename: None,
+                mime_type: None,
+                source: FileSource::File,
+            };
+            let err = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                process_file_entry(&entry, "s1", &ws, false, &store),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{source}: the refusal must not wait on the source"))
+            .unwrap_err();
+            assert_eq!(err.code, INVALID_PARAMS, "{source}");
+            assert!(
+                err.message.contains("regular file"),
+                "{source}: {}",
+                err.message
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn path_mode_refuses_an_oversized_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_string_lossy().to_string();
+        let store = setup_store(&ws).await;
+        let big = tmp.path().join("big.bin");
+        let file = std::fs::File::create(&big).unwrap();
+        file.set_len(MAX_FILE_BYTES + 1).unwrap();
+
+        let entry = FileEntry {
+            path: Some(big.to_string_lossy().to_string()),
+            data_b64: None,
+            filename: None,
+            mime_type: None,
+            source: FileSource::File,
+        };
+        let err = process_file_entry(&entry, "s1", &ws, false, &store)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("limit"), "{}", err.message);
     }
 
     #[tokio::test]

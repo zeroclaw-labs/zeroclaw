@@ -293,9 +293,24 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
     Ok(job)
 }
 
+/// The error a lookup for an absent job produces.
+///
+/// Ownership refusals reuse it, so a job owned by someone else is
+/// indistinguishable from one that does not exist. Keeping the wording in one
+/// place is what makes that property structural rather than coincidental.
+#[must_use]
+pub fn job_not_found(job_id: &str) -> anyhow::Error {
+    anyhow::Error::msg(format!("Cron job '{job_id}' not found"))
+}
+
 /// Read a job only when `agent_alias` is its current owner. The ownership
 /// predicate belongs to this SELECT so an operator rename that commits before
 /// the read cannot leave the caller with a stale authorization.
+///
+/// A job owned by someone else reports the same error an absent one reports,
+/// so the guard cannot confirm that it exists. Rows predating the
+/// `agent_alias` column belong to no agent and are reachable only from the
+/// unscoped operator surfaces.
 pub fn get_job_for_agent(config: &Config, job_id: &str, agent_alias: &str) -> Result<CronJob> {
     let Some(mut job) = with_read_connection(config, |conn| {
         let mut stmt = conn.prepare(
@@ -309,11 +324,11 @@ pub fn get_job_for_agent(config: &Config, job_id: &str, agent_alias: &str) -> Re
         if let Some(row) = rows.next()? {
             map_cron_job_row(row).map_err(Into::into)
         } else {
-            anyhow::bail!("Cron job '{job_id}' not found")
+            Err(job_not_found(job_id))
         }
     })?
     else {
-        anyhow::bail!("Cron job '{job_id}' not found")
+        return Err(job_not_found(job_id));
     };
 
     resolve_declarative_shell_output_format(config, &mut job);
@@ -339,11 +354,11 @@ fn get_job_raw(config: &Config, job_id: &str) -> Result<CronJob> {
         if let Some(row) = rows.next()? {
             map_cron_job_row(row).map_err(Into::into)
         } else {
-            anyhow::bail!("Cron job '{job_id}' not found")
+            Err(job_not_found(job_id))
         }
     })?
     else {
-        anyhow::bail!("Cron job '{job_id}' not found")
+        return Err(job_not_found(job_id));
     };
     Ok(job)
 }
