@@ -576,6 +576,18 @@ jobs:
       - name: Run channel egress boundary e2e
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
         run: cargo test --locked --features plugins-wasm-cranelift --test channel_egress_e2e
+      # The root binary's plugin CLI tests. `mod plugins` and the plugin
+      # registry only compile under `plugins-wasm`, so the default-feature Test
+      # job never sees them; this is the one required step that runs them.
+      # `plugins::` covers the egress ceremony (including the POSIX `sh` proof
+      # that a printed grant command reaches `config set` as one literal
+      # argument), `plugin_registry::` the registry client, and `egress` the
+      # CLI-level install/list ceremony tests in `main.rs`. Filters are passed
+      # after `--` because `cargo test` accepts one positional TESTNAME; the
+      # harness ORs them.
+      - name: Run root CLI plugin tests
+        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
+        run: 'cargo test --locked --features plugins-wasm-cranelift --bin zeroclaw -- plugins:: plugin_registry:: egress'
 
   msrv:
     name: MSRV (declared floor)
@@ -998,7 +1010,7 @@ jobs:
             cargo nextest run --locked --no-fail-fast \
               --features plugins-wasm-cranelift \
               --bin zeroclaw \
-              plugin_registry:: 2>&1 | tee "$plugin_cli_log"
+              plugin_registry:: plugins:: egress 2>&1 | tee "$plugin_cli_log"
             plugin_cli_status=${PIPESTATUS[0]}
             cargo nextest run --locked --no-fail-fast \
               --features plugins-wasm-cranelift \
