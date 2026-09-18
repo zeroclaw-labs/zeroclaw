@@ -2040,7 +2040,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"fake-session"}}'
 sleep 30
 "#;
             let model_provider = fake_provider(&temp, body, 1);
-            let prompt = "x".repeat(4 * 1024 * 1024);
+            let prompt = "x".repeat(512 * 1024);
             let started = Instant::now();
             let error = model_provider
                 .invoke_acp(&prompt, "default")
