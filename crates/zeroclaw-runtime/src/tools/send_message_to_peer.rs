@@ -9,8 +9,10 @@ use crate::cron::scheduler::deliver_announcement;
 use crate::peers::resolve_peer_set;
 use anyhow::Result;
 use async_trait::async_trait;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde_json::json;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
@@ -20,16 +22,26 @@ use zeroclaw_config::schema::Config;
 /// agent's resolved peer set.
 pub struct SendMessageToPeerTool {
     config: Arc<Config>,
+    live_config: Option<Arc<RwLock<Config>>>,
     sender_alias: String,
     description: String,
 }
 
 impl SendMessageToPeerTool {
     pub fn new(config: Arc<Config>, sender_alias: impl Into<String>) -> Self {
+        Self::new_with_live_config(config, sender_alias, None)
+    }
+
+    pub(crate) fn new_with_live_config(
+        config: Arc<Config>,
+        sender_alias: impl Into<String>,
+        live_config: Option<Arc<RwLock<Config>>>,
+    ) -> Self {
         let sender_alias = sender_alias.into();
         let description = build_description();
         Self {
             config,
+            live_config,
             sender_alias,
             description,
         }
@@ -190,7 +202,9 @@ impl Tool for SendMessageToPeerTool {
             let cfg = (*self.config).clone();
             let sender = self.sender_alias.clone();
             let recipient_alias = canonical.clone();
+            let turn_recipient_alias = recipient_alias.clone();
             let body = message.clone();
+            let live_config = self.live_config.clone();
             // Build the recipient's cost-tracking context from `&cfg` before
             // `cfg` moves into `process_message` below — a detached
             // `zeroclaw_spawn::spawn!` task does not inherit the caller's
@@ -201,13 +215,28 @@ impl Tool for SendMessageToPeerTool {
                 .as_ref()
                 .map(|_| Arc::new(Mutex::new(TurnUsage::default())));
             zeroclaw_spawn::spawn!(async move {
-                let turn = crate::agent::loop_::process_message(
-                    cfg,
-                    &recipient_alias,
-                    &body,
-                    None,
-                    zeroclaw_api::ingress::TurnOrigin::AgentDirect,
-                );
+                let turn = async move {
+                    let turn: Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> =
+                        if let Some(live_config) = live_config {
+                            Box::pin(crate::agent::loop_::process_message_with_live_config(
+                                cfg,
+                                live_config,
+                                &turn_recipient_alias,
+                                &body,
+                                None,
+                                zeroclaw_api::ingress::TurnOrigin::AgentDirect,
+                            ))
+                        } else {
+                            Box::pin(crate::agent::loop_::process_message(
+                                cfg,
+                                &turn_recipient_alias,
+                                &body,
+                                None,
+                                zeroclaw_api::ingress::TurnOrigin::AgentDirect,
+                            ))
+                        };
+                    turn.await
+                };
                 if let Err(e) = deliver_peer_turn_with_cost_scope(cost_ctx, turn_usage, turn).await
                 {
                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"sender": sender, "recipient": recipient_alias, "error": format!("{}", e)})), "peer-message in-process delivery failed");

@@ -464,6 +464,7 @@ pub struct StreamedTurnError {
 #[derive(Clone, Debug, Default)]
 pub struct ProviderSwitchConfig {
     pub config: Option<std::sync::Arc<zeroclaw_config::schema::Config>>,
+    pub live_config: Option<std::sync::Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
 }
 
 /// Bundle of late-bound channel-map handles owned by an Agent. Cloning is
@@ -1993,7 +1994,7 @@ impl Agent {
         };
 
         let structured_history_cap_resolver: Arc<dyn Fn() -> usize + Send + Sync> =
-            if let Some(cap_config) = live_config {
+            if let Some(cap_config) = live_config.clone() {
                 let cap_agent_alias = agent_alias.to_string();
                 Arc::new(move || {
                     cap_config
@@ -2060,6 +2061,7 @@ impl Agent {
             .approval_manager(Some(Arc::new(approval_manager)))
             .provider_switch_config(ProviderSwitchConfig {
                 config: Some(std::sync::Arc::new(config.clone())),
+                live_config: live_config.clone(),
             })
             .build()?;
 
@@ -2802,15 +2804,19 @@ impl Agent {
                     parent_agent_alias: None,
                     turn_id: &turn_id,
                     // Live-daemon SOP path: re-assemble a nested step's agent
-                    // when it delegates elsewhere. Config survives only via
+                    // when it delegates elsewhere. Snapshot config plus the
+                    // optional live policy handle survive only via
                     // `provider_switch_config`; with `None` (test builder) a
                     // cross-agent step FAILS CLOSED rather than inheriting
                     // this turn's context.
-                    sop_reassembly: self
-                        .provider_switch_config
-                        .as_ref()
-                        .and_then(|c| c.config.as_deref())
-                        .map(|config| crate::agent::turn::SopStepReassembly { config }),
+                    sop_reassembly: self.provider_switch_config.as_ref().and_then(|c| {
+                        c.config
+                            .as_deref()
+                            .map(|config| crate::agent::turn::SopStepReassembly {
+                                config,
+                                live_config: c.live_config.clone(),
+                            })
+                    }),
                 }),
             ),
         );
@@ -3293,15 +3299,19 @@ impl Agent {
                         parent_agent_alias: None,
                         turn_id: &turn_id,
                         // Live-daemon SOP path: re-assemble a nested step's
-                        // agent when it delegates elsewhere. Config survives
-                        // only via `provider_switch_config`; with `None`
-                        // (test builder) a cross-agent step FAILS CLOSED
-                        // rather than inheriting this turn's context.
-                        sop_reassembly: self
-                            .provider_switch_config
-                            .as_ref()
-                            .and_then(|c| c.config.as_deref())
-                            .map(|config| crate::agent::turn::SopStepReassembly { config }),
+                        // agent when it delegates elsewhere. Snapshot config
+                        // plus the optional live policy handle survive only
+                        // via `provider_switch_config`; with `None` (test
+                        // builder) a cross-agent step FAILS CLOSED rather
+                        // than inheriting this turn's context.
+                        sop_reassembly: self.provider_switch_config.as_ref().and_then(|c| {
+                            c.config.as_deref().map(|config| {
+                                crate::agent::turn::SopStepReassembly {
+                                    config,
+                                    live_config: c.live_config.clone(),
+                                }
+                            })
+                        }),
                     }),
                 ),
             );
@@ -13052,6 +13062,7 @@ mod tests {
             config: Some(std::sync::Arc::new(
                 zeroclaw_config::schema::Config::default(),
             )),
+            live_config: None,
         };
 
         let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
@@ -13079,6 +13090,7 @@ mod tests {
             config: Some(std::sync::Arc::new(
                 zeroclaw_config::schema::Config::default(),
             )),
+            live_config: None,
         };
 
         let mut agent = build_test_agent("openai", "shared-name", Some(switch_cfg));
@@ -13115,6 +13127,7 @@ mod tests {
         };
         let switch_cfg = ProviderSwitchConfig {
             config: Some(std::sync::Arc::new(route_config)),
+            live_config: None,
         };
 
         let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
@@ -13309,6 +13322,7 @@ mod tests {
                 },
                 ..zeroclaw_config::schema::Config::default()
             })),
+            live_config: None,
         };
         let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
             resolved: zeroclaw_config::schema::ResolvedRuntime {
