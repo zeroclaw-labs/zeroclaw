@@ -23,6 +23,9 @@ const CRON_TRIGGER_TIMEOUT: Duration = Duration::from_secs(600);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTBOUND_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 const OUTBOUND_RETIRE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The daemon may need one queue wait (30 seconds) after it interrupts an ACP
+/// turn, plus a small allowance for durable tombstoning and its response.
+const SESSION_KILL_TIMEOUT: Duration = Duration::from_secs(35);
 
 /// ONE absolute budget for the entire client-side relay setup: the TCP connect,
 /// the outer TLS and WebSocket upgrade, the route request, the relay's `Opened`
@@ -2773,14 +2776,13 @@ impl RpcClient {
         }
     }
 
-    pub async fn session_kill(&self, session_id: &str) -> Result<()> {
-        let _: serde_json::Value = self
-            .call(
-                method::SESSION_KILL,
-                serde_json::json!({ "session_id": session_id }),
-            )
-            .await?;
-        Ok(())
+    pub async fn session_kill(&self, session_id: &str) -> Result<SessionKillResult> {
+        self.call_with_timeout(
+            method::SESSION_KILL,
+            serde_json::json!({ "session_id": session_id }),
+            SESSION_KILL_TIMEOUT,
+        )
+        .await
     }
 
     // ── Dashboard helpers ────────────────────────────────────────
@@ -4277,6 +4279,13 @@ pub struct SessionStateResult {
     pub plan: Option<Vec<crate::wire::PlanEntry>>,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionKillResult {
+    pub session_id: String,
+    pub killed: bool,
+}
+
 /// Session-scoped overrides mirror of
 /// `zeroclaw_runtime::rpc::session::SessionOverrides`. Sent on
 /// `session/configure`; every field is optional and omitted when `None`.
@@ -5193,6 +5202,35 @@ mod session_method_tests {
             .expect("client.session_cancel must resolve after the response is dispatched")
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_kill_returns_the_daemon_outcome() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task = tokio::spawn(async move { client.session_kill("s1").await });
+
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+            .await
+            .expect("client.session_kill must send a wire request")
+            .unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "session/kill");
+        assert_eq!(req["params"]["session_id"], "s1");
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(&id, Some(json!({"session_id":"s1","killed":false})), None);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client.session_kill must resolve after the response is dispatched")
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.session_id, "s1");
+        assert!(
+            !result.killed,
+            "the UI needs the durable outcome, not just RPC success"
+        );
     }
 
     #[tokio::test]

@@ -51,6 +51,11 @@ struct DashboardMessage {
     level: DashboardMessageLevel,
 }
 
+struct SessionKillUpdate {
+    session_id: String,
+    result: Result<crate::client::SessionKillResult, String>,
+}
+
 // ── Tab enum ─────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -137,6 +142,12 @@ pub(crate) struct Dashboard {
     session_messages_total: usize,
     /// Index of `session_messages[0]` in the full persisted history.
     session_messages_start: usize,
+    session_kill_message: Option<DashboardMessage>,
+    /// Session that owns `session_kill_message`; never render one session's
+    /// lifecycle outcome in another session's detail pane.
+    session_kill_message_id: Option<String>,
+    session_kill_inflight_id: Option<String>,
+    session_kill_rx: Option<tokio::sync::mpsc::UnboundedReceiver<SessionKillUpdate>>,
     // List states
     session_state: ListState,
     agent_state: ListState,
@@ -197,6 +208,10 @@ impl Dashboard {
             session_messages_id: None,
             session_messages_total: 0,
             session_messages_start: 0,
+            session_kill_message: None,
+            session_kill_message_id: None,
+            session_kill_inflight_id: None,
+            session_kill_rx: None,
             session_state: ListState::default(),
             agent_state: ListState::default(),
             memory_state: ListState::default(),
@@ -271,6 +286,10 @@ impl Dashboard {
         self.session_messages_id = None;
         self.session_messages_total = 0;
         self.session_messages_start = 0;
+        self.session_kill_message = None;
+        self.session_kill_message_id = None;
+        self.session_kill_inflight_id = None;
+        self.session_kill_rx = None;
         self.session_state.select(None);
         self.agent_state.select(None);
         self.memory_state.select(None);
@@ -438,6 +457,7 @@ impl Dashboard {
         chat_cwd: Option<&str>,
     ) {
         self.drain_cron_trigger_updates();
+        self.drain_session_kill_updates();
 
         // Clear stale data when disconnected so panels don't show
         // ghost entries from a previous daemon lifetime.
@@ -566,6 +586,16 @@ impl Dashboard {
             if self.tab == Tab::Agents
                 && let Some(message) = &self.agent_rename_message
             {
+                let style = match message.level {
+                    DashboardMessageLevel::Info => theme::dim_style(),
+                    DashboardMessageLevel::Warn | DashboardMessageLevel::Error => {
+                        theme::warn_style()
+                    }
+                };
+                spans.push(Span::styled(&message.text, style));
+                spans.push(Span::styled(" ", theme::dim_style()));
+            }
+            if let Some(message) = self.session_kill_message_for_status_line() {
                 let style = match message.level {
                     DashboardMessageLevel::Info => theme::dim_style(),
                     DashboardMessageLevel::Warn | DashboardMessageLevel::Error => {
@@ -837,6 +867,15 @@ impl Dashboard {
             ),
         ];
 
+        if let Some(message) = self.session_kill_message_for_selected_session() {
+            let style = match message.level {
+                DashboardMessageLevel::Info => theme::dim_style(),
+                DashboardMessageLevel::Warn | DashboardMessageLevel::Error => theme::warn_style(),
+            };
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(&message.text, style)));
+        }
+
         // Show message history if loaded
         if self.session_messages_id.as_deref() == Some(&s.session_id) {
             lines.push(Line::from(""));
@@ -898,6 +937,26 @@ impl Dashboard {
         let filtered = self.filtered_session_indices();
         let sel = self.session_state.selected()?;
         filtered.get(sel).copied()
+    }
+
+    fn session_kill_message_for_selected_session(&self) -> Option<&DashboardMessage> {
+        let selected_id = self
+            .selected_session_index()
+            .and_then(|idx| self.sessions.get(idx))
+            .map(|session| session.session_id.as_str())?;
+        (self.session_kill_message_id.as_deref() == Some(selected_id))
+            .then_some(self.session_kill_message.as_ref())
+            .flatten()
+    }
+
+    /// Detail feedback is scoped to its session. Route every result that is
+    /// not currently displayable there to the status line, so completion,
+    /// no-selection, and cross-selection feedback remains visible.
+    fn session_kill_message_for_status_line(&self) -> Option<&DashboardMessage> {
+        (self.tab == Tab::Sessions
+            && !(self.detail_open && self.session_kill_message_for_selected_session().is_some()))
+        .then_some(self.session_kill_message.as_ref())
+        .flatten()
     }
 
     // ── Agents tab ───────────────────────────────────────────────
@@ -1966,17 +2025,7 @@ impl Dashboard {
                 self.last_poll = None; // re-poll for server-side search
             }
             Some(DashboardTabAction::KillSession) if self.tab == Tab::Sessions => {
-                if let Some(idx) = self.selected_session_index() {
-                    let sid = self.sessions[idx].session_id.clone();
-                    let _ = self.rpc.session_kill(&sid).await;
-                    self.detail_open = false;
-                    self.detail_scroll = 0;
-                    self.session_messages.clear();
-                    self.session_messages_id = None;
-                    self.session_messages_total = 0;
-                    self.session_messages_start = 0;
-                    self.last_poll = None;
-                }
+                self.kill_selected_session();
             }
             Some(DashboardTabAction::TriggerCron) if self.tab == Tab::Cron => {
                 self.trigger_selected_cron();
@@ -2271,6 +2320,107 @@ impl Dashboard {
             });
         });
         self.last_poll = None;
+    }
+
+    fn kill_selected_session(&mut self) {
+        let Some(idx) = self.selected_session_index() else {
+            self.session_kill_message = Some(DashboardMessage {
+                text: crate::i18n::t("zc-dashboard-no-session"),
+                level: DashboardMessageLevel::Warn,
+            });
+            self.session_kill_message_id = None;
+            return;
+        };
+        let session_id = self.sessions[idx].session_id.clone();
+        if let Some(inflight_id) = self.session_kill_inflight_id.as_deref() {
+            self.session_kill_message = Some(DashboardMessage {
+                text: crate::i18n::t_args(
+                    "zc-dashboard-session-kill-already-running",
+                    &[("id", inflight_id)],
+                ),
+                level: DashboardMessageLevel::Warn,
+            });
+            self.session_kill_message_id = Some(inflight_id.to_string());
+            return;
+        }
+
+        self.session_kill_message = Some(DashboardMessage {
+            text: crate::i18n::t_args("zc-dashboard-session-kill-running", &[("id", &session_id)]),
+            level: DashboardMessageLevel::Info,
+        });
+        self.session_kill_message_id = Some(session_id.clone());
+        self.session_kill_inflight_id = Some(session_id.clone());
+        let rpc = Arc::clone(&self.rpc);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.session_kill_rx = Some(rx);
+        tokio::spawn(async move {
+            let result = rpc
+                .session_kill(&session_id)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(SessionKillUpdate { session_id, result });
+        });
+    }
+
+    fn drain_session_kill_updates(&mut self) {
+        let Some(mut rx) = self.session_kill_rx.take() else {
+            return;
+        };
+        while let Ok(update) = rx.try_recv() {
+            let session_id = update.session_id;
+            if self.session_kill_inflight_id.as_deref() == Some(session_id.as_str()) {
+                self.session_kill_inflight_id = None;
+            }
+            match update.result {
+                Ok(result) if result.killed => {
+                    self.session_kill_message = Some(DashboardMessage {
+                        text: crate::i18n::t_args(
+                            "zc-dashboard-session-kill-succeeded",
+                            &[("id", &result.session_id)],
+                        ),
+                        level: DashboardMessageLevel::Info,
+                    });
+                    self.session_kill_message_id = Some(session_id.clone());
+                    if self.detail_open
+                        && self
+                            .selected_session_index()
+                            .and_then(|idx| self.sessions.get(idx))
+                            .is_some_and(|session| session.session_id == result.session_id)
+                    {
+                        self.detail_open = false;
+                        self.detail_scroll = 0;
+                        self.session_messages.clear();
+                        self.session_messages_id = None;
+                        self.session_messages_total = 0;
+                        self.session_messages_start = 0;
+                    }
+                }
+                Ok(result) => {
+                    self.session_kill_message = Some(DashboardMessage {
+                        text: crate::i18n::t_args(
+                            "zc-dashboard-session-kill-not-live",
+                            &[("id", &result.session_id)],
+                        ),
+                        level: DashboardMessageLevel::Warn,
+                    });
+                    self.session_kill_message_id = Some(session_id.clone());
+                }
+                Err(error) => {
+                    self.session_kill_message = Some(DashboardMessage {
+                        text: crate::i18n::t_args(
+                            "zc-dashboard-session-kill-failed",
+                            &[("error", &error)],
+                        ),
+                        level: DashboardMessageLevel::Error,
+                    });
+                    self.session_kill_message_id = Some(session_id.clone());
+                }
+            }
+            self.last_poll = None;
+        }
+        if self.session_kill_inflight_id.is_some() {
+            self.session_kill_rx = Some(rx);
+        }
     }
 
     fn drain_cron_trigger_updates(&mut self) {
@@ -3335,6 +3485,142 @@ mod tests {
         assert!(dashboard.agents.is_empty());
         assert!(!dashboard.sessions_loaded);
         assert!(!dashboard.detail_open);
+    }
+
+    #[tokio::test]
+    async fn session_kill_keeps_detail_open_when_daemon_reports_not_live() {
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(1);
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::new(
+            crate::jsonrpc::RpcOutbound::new(writer_tx),
+        )));
+        let mut dashboard = Dashboard::new(rpc, "local:/daemon.sock", false);
+        dashboard.tab = Tab::Sessions;
+        dashboard.sessions.push(SessionEntry {
+            session_id: "session-1".to_string(),
+            session_key: "key-1".to_string(),
+            created_at: String::new(),
+            last_activity: String::new(),
+            message_count: 1,
+            agent_alias: None,
+            channel_id: None,
+            name: None,
+        });
+        dashboard.session_state.select(Some(0));
+        dashboard.detail_open = true;
+        dashboard.session_kill_inflight_id = Some("session-1".to_string());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        dashboard.session_kill_rx = Some(rx);
+        tx.send(SessionKillUpdate {
+            session_id: "session-1".to_string(),
+            result: Ok(crate::client::SessionKillResult {
+                session_id: "session-1".to_string(),
+                killed: false,
+            }),
+        })
+        .unwrap();
+
+        dashboard.drain_session_kill_updates();
+
+        assert!(
+            dashboard.detail_open,
+            "an unsuccessful kill must keep its detail visible"
+        );
+        assert!(
+            dashboard
+                .session_kill_message_for_selected_session()
+                .expect("the operator must see the result")
+                .text
+                .contains("session-1")
+        );
+
+        dashboard.sessions.push(SessionEntry {
+            session_id: "session-2".to_string(),
+            session_key: "key-2".to_string(),
+            created_at: String::new(),
+            last_activity: String::new(),
+            message_count: 1,
+            agent_alias: None,
+            channel_id: None,
+            name: None,
+        });
+        dashboard.session_state.select(Some(1));
+        assert!(
+            dashboard
+                .session_kill_message_for_selected_session()
+                .is_none(),
+            "a kill result must not be attributed to a different selected session"
+        );
+        assert!(
+            dashboard.session_kill_message_for_status_line().is_some(),
+            "a result for another session must remain visible in the status line"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_kill_success_is_visible_after_closing_detail() {
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(1);
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::new(
+            crate::jsonrpc::RpcOutbound::new(writer_tx),
+        )));
+        let mut dashboard = Dashboard::new(rpc, "local:/daemon.sock", false);
+        dashboard.tab = Tab::Sessions;
+        dashboard.sessions.push(SessionEntry {
+            session_id: "session-1".to_string(),
+            session_key: "key-1".to_string(),
+            created_at: String::new(),
+            last_activity: String::new(),
+            message_count: 1,
+            agent_alias: None,
+            channel_id: None,
+            name: None,
+        });
+        dashboard.session_state.select(Some(0));
+        dashboard.detail_open = true;
+        dashboard.session_kill_inflight_id = Some("session-1".to_string());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        dashboard.session_kill_rx = Some(rx);
+        tx.send(SessionKillUpdate {
+            session_id: "session-1".to_string(),
+            result: Ok(crate::client::SessionKillResult {
+                session_id: "session-1".to_string(),
+                killed: true,
+            }),
+        })
+        .unwrap();
+
+        dashboard.drain_session_kill_updates();
+
+        assert!(
+            !dashboard.detail_open,
+            "a successful kill closes the detail pane"
+        );
+        assert!(
+            dashboard
+                .session_kill_message_for_status_line()
+                .expect("the successful result must remain visible")
+                .text
+                .contains("session-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_kill_without_selection_is_visible_in_status_line() {
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(1);
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::new(
+            crate::jsonrpc::RpcOutbound::new(writer_tx),
+        )));
+        let mut dashboard = Dashboard::new(rpc, "local:/daemon.sock", false);
+        dashboard.tab = Tab::Sessions;
+
+        dashboard.kill_selected_session();
+
+        assert!(
+            dashboard
+                .session_kill_message_for_status_line()
+                .expect("the no-selection warning must remain visible")
+                .text
+                .contains("No session selected")
+        );
     }
 
     fn lines_text(lines: &[Line<'static>]) -> String {

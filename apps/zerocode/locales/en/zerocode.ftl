@@ -335,6 +335,11 @@ zc-dashboard-actions = Actions
 zc-dashboard-cron-action-hint = { $run } run now · { $refresh } refresh
 zc-dashboard-loading-runs = Loading runs…
 zc-dashboard-runs-error = Failed to load runs
+zc-dashboard-session-kill-running = Ending session: { $id }
+zc-dashboard-session-kill-already-running = Session termination is already in progress: { $id }
+zc-dashboard-session-kill-succeeded = Session ended: { $id }
+zc-dashboard-session-kill-not-live = Session was already closed or replaced: { $id }
+zc-dashboard-session-kill-failed = Failed to end session: { $error }
 zc-dashboard-no-runs = No runs recorded yet
 zc-dashboard-run-succeeded = Run succeeded
 zc-dashboard-run-failed = Run failed
@@ -522,8 +527,7 @@ zc-chat-approval-action-allow = Allow
 zc-chat-approval-action-always = Always
 zc-chat-approval-action-reject = Reject
 zc-chat-approval-action-edit = Edit
-
-
+zc-chat-approval-scroll-hint = scroll
 zc-chat-clipboard-you = You: { $text }
 zc-chat-clipboard-agent = Agent: { $text }
 zc-chat-copied-clipboard = Copied to clipboard
