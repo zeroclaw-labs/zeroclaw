@@ -14700,6 +14700,7 @@ dependencies = [
  "pulldown-cmark",
  "ratatui",
  "rcgen",
+ "reqwest 0.12.28",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -14717,6 +14718,7 @@ dependencies = [
  "unicode-width 0.2.2",
  "url",
  "webpki-roots 0.26.11",
+ "wiremock",
  "zeroclaw-api",
  "zeroize",
 ]

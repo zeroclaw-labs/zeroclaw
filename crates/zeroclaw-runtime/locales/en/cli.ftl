@@ -157,6 +157,15 @@ cli-auth-login-about = Login with OAuth (OpenAI Codex, Gemini, or xAI)
 cli-auth-refresh-about = Refresh OAuth access token using refresh token
 cli-auth-logout-about = Remove auth profile
 cli-auth-use-about = Set active profile for a provider
+cli-oidc-unknown-alias = No [oidc.{ $alias }] entry in the config. Configured entries: { $known }
+cli-oidc-device-visit = To sign in, visit { $uri } and enter code { $code }
+cli-oidc-device-waiting = Waiting for identity-provider approval (the code expires in { $seconds } seconds)...
+cli-oidc-device-expired = The device code expired before approval; run the command again.
+cli-oidc-enrolled = Enrolled with [oidc.{ $alias }]. The access token is on stdout; present it as auth_token in the RPC handshake or export it as ZEROCLAW_AUTH_TOKEN.
+cli-oidc-token-expiry = The token expires in { $seconds } seconds.
+cli-oidc-browser-open = Opening your browser to sign in. If nothing opens, visit:
+    { $uri }
+cli-oidc-browser-waiting = Waiting for the browser sign-in to complete...
 cli-auth-list-about = List auth profiles
 cli-auth-status-about = Show auth status with active profile and token expiry info
 
@@ -692,6 +701,7 @@ cli-quickstart-step-agent = Agent
 cli-quickstart-error-internal-no-result = internal error: apply_into returned no result despite no validation errors
 cli-quickstart-error-completion-flag = failed to flip quickstart-completed: {$err}
 cli-quickstart-error-persist-config = failed to persist config: {$err}
+cli-quickstart-error-auth-validation = authorization config rejected before persistence: {$err}
 cli-quickstart-error-not-type-alias-ref = `{$reference}` is not a `<type>.<alias>` reference
 cli-quickstart-error-no-configured-path = no `{$path}` configured
 cli-quickstart-error-provider-required = provider type, alias, and model are required
@@ -1287,3 +1297,18 @@ channel-approval-opt-allow-once = Allow once
 channel-approval-opt-allow-always = Always allow
 channel-approval-opt-reject = Reject
 channel-approval-opt-reject-with-edit = Reject with edit
+
+# ── RPC inbound authentication ──
+rpc-auth-required-token = Authentication required: present auth_token in initialize, or connect from a mapped local uid
+rpc-auth-credential-rejected = Credential rejected
+rpc-auth-credential-expired = Credential expired: re-initialize with a fresh token
+rpc-auth-assurance-required = Authentication assurance not met (MFA/ACR required)
+rpc-auth-unknown-provider = Unknown auth_provider selection
+rpc-auth-not-entitled = Authenticated, but no permission profile grants this identity anything
+rpc-auth-alias-not-entitled = Principal is not entitled to the requested agent
+rpc-auth-misconfigured = Authentication is misconfigured on this daemon (fail closed)
+rpc-auth-local-roster-required = A local user roster is configured: connect from a mapped uid or present auth_token in initialize
+rpc-auth-remote-token-required = Remote connections must present auth_token in initialize
+rpc-auth-first-call-initialize = First call must be 'initialize'
+rpc-auth-revalidation-due = Credential revalidation due: re-initialize to revalidate
+rpc-auth-pairing-revoked = Pairing token revoked: re-pair and re-initialize

@@ -298,6 +298,19 @@ pub async fn apply_with_surface(
                 &[("err", &err.to_string())],
             )]
         })?;
+    // Quickstart shares the daemon's configuration source of truth. Validate
+    // the auth section before its first persistent write so an RPC response
+    // can never say a rejected policy was not saved after disk has changed.
+    config.validate_auth().map_err(|err| {
+        vec![QuickstartError::for_surface(
+            Some(&ctx),
+            QuickstartStep::Agent,
+            "",
+            format!("authorization config rejected before persistence: {err}"),
+            "cli-quickstart-error-auth-validation",
+            &[("err", &err.to_string())],
+        )]
+    })?;
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
@@ -3260,6 +3273,35 @@ mod tests {
         let reloaded: Config = toml::from_str(&after).unwrap();
         assert!(!reloaded.agents.contains_key("bot"));
         assert_eq!(reloaded.channels.webhook.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn invalid_auth_config_is_rejected_before_quickstart_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        config.oidc.insert("broken".into(), Default::default());
+        config.save().await.unwrap();
+        let before = std::fs::read_to_string(&config.config_path).unwrap();
+
+        let errors = apply_with_surface(fresh_submission("bot"), &mut config, Surface::Cli)
+            .await
+            .expect_err("invalid auth must prevent Quickstart persistence");
+
+        assert!(errors.iter().any(|error| {
+            error.step == QuickstartStep::Agent
+                && error.message.contains("authorization config rejected")
+        }));
+        let after = std::fs::read_to_string(&config.config_path).unwrap();
+        assert_eq!(
+            after, before,
+            "rejected auth config must not rewrite config.toml"
+        );
+        let reloaded: Config = toml::from_str(&after).unwrap();
+        assert!(!reloaded.agents.contains_key("bot"));
     }
 
     /// A disabled webhook never starts a listener, so it must not block a new

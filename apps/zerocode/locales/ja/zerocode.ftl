@@ -574,6 +574,11 @@ zc-config-footer-action-new-line = 改行
 zc-config-field-edit-hint = { $keys } → 押して編集
 zc-doctor-log-path = log: { $path }
 
+zc-oidc-enroll-visit = サインインするには { $uri } を開き、コード { $code } を入力してください
+zc-oidc-enroll-waiting = ID プロバイダーの承認を待っています(コードは { $seconds } 秒で失効します)...
+zc-oidc-enroll-missing-url = auth_provider { $provider } が設定されていますが auth_token がありません。対話的にサインインするには [connection.wss] enroll_url にゲートウェイの HTTP オリジンを設定するか、ZEROCLAW_AUTH_TOKEN をエクスポートしてください(参照: zeroclaw oidc login)。
+zc-oidc-enroll-done = サインインしました。トークンはこのセッションのみ保持されます。次回の登録を省略するには ZEROCLAW_AUTH_TOKEN をエクスポートしてください。
+
 ## 設定レジストリのメタデータ。キーは安定した識別子から生成され、RPC が返す英語表示は互換性のためのフォールバックとして残ります。
 zc-config-group-foundation = 基盤
 zc-config-group-agent = エージェント
