@@ -420,19 +420,19 @@ pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
 }
 
 pub fn count_image_markers(messages: &[ChatMessage]) -> usize {
-    let latest_tool_indices = latest_tool_result_indices(messages);
-    count_image_markers_with_latest_tool_results(messages, &latest_tool_indices)
+    let current_turn_tool_indices = current_turn_tool_result_indices(messages);
+    count_image_markers_with_current_turn_tool_results(messages, &current_turn_tool_indices)
 }
 
-fn count_image_markers_with_latest_tool_results(
+fn count_image_markers_with_current_turn_tool_results(
     messages: &[ChatMessage],
-    latest_tool_result_indices: &HashSet<usize>,
+    current_turn_tool_result_indices: &HashSet<usize>,
 ) -> usize {
     messages
         .iter()
         .enumerate()
         .filter(|(index, message)| {
-            should_normalize_message_images(*index, message, latest_tool_result_indices)
+            should_normalize_message_images(*index, message, current_turn_tool_result_indices)
         })
         .map(|(_, message)| parse_image_markers(&message.content).1.len())
         .sum()
@@ -709,36 +709,37 @@ fn is_tool_result_carrier(message: &ChatMessage) -> bool {
     message.role == "tool" || is_prompt_tool_result_message(message)
 }
 
-fn latest_tool_result_indices(messages: &[ChatMessage]) -> HashSet<usize> {
+/// Indices of every tool-result carrier in the CURRENT user turn: the
+/// carriers after the most recent user message that is not itself a
+/// prompt-mode tool-result carrier. If no such user message exists, every
+/// tool-result carrier qualifies. Tool images stay live for the user turn
+/// that produced them; they are stripped once the next user message
+/// arrives, so a tool image is never replayed on every later request
+/// forever.
+fn current_turn_tool_result_indices(messages: &[ChatMessage]) -> HashSet<usize> {
+    let current_turn_start = messages
+        .iter()
+        .rposition(|message| message.role == "user" && !is_prompt_tool_result_message(message));
+
     let mut indices = HashSet::new();
-    let Some((last_index, last_message)) = messages.iter().enumerate().next_back() else {
-        return indices;
-    };
-
-    if is_prompt_tool_result_message(last_message) {
-        indices.insert(last_index);
-        return indices;
-    }
-
-    if last_message.role == "tool" {
-        for (index, message) in messages.iter().enumerate().rev() {
-            if message.role != "tool" {
-                break;
-            }
+    for (index, message) in messages.iter().enumerate() {
+        if current_turn_start.is_some_and(|start| index < start) {
+            continue;
+        }
+        if is_tool_result_carrier(message) {
             indices.insert(index);
         }
     }
-
     indices
 }
 
 fn should_normalize_message_images(
     index: usize,
     message: &ChatMessage,
-    latest_tool_result_indices: &HashSet<usize>,
+    current_turn_tool_result_indices: &HashSet<usize>,
 ) -> bool {
     if is_tool_result_carrier(message) {
-        return latest_tool_result_indices.contains(&index);
+        return current_turn_tool_result_indices.contains(&index);
     }
 
     message.role == "user"
@@ -788,9 +789,9 @@ fn strip_tool_result_image_markers(message: &ChatMessage) -> ChatMessage {
 fn replay_message_without_stale_tool_images(
     index: usize,
     message: &ChatMessage,
-    latest_tool_result_indices: &HashSet<usize>,
+    current_turn_tool_result_indices: &HashSet<usize>,
 ) -> ChatMessage {
-    if is_tool_result_carrier(message) && !latest_tool_result_indices.contains(&index) {
+    if is_tool_result_carrier(message) && !current_turn_tool_result_indices.contains(&index) {
         strip_tool_result_image_markers(message)
     } else {
         message.clone()
@@ -871,8 +872,9 @@ async fn prepare_messages_inner(
     let (max_images, max_image_size_mb) = config.effective_limits();
     let max_bytes = max_image_size_mb.saturating_mul(1024 * 1024);
 
-    let latest_tool_indices = latest_tool_result_indices(messages);
-    let total_images = count_image_markers_with_latest_tool_results(messages, &latest_tool_indices);
+    let current_turn_tool_indices = current_turn_tool_result_indices(messages);
+    let total_images =
+        count_image_markers_with_current_turn_tool_results(messages, &current_turn_tool_indices);
 
     if total_images == 0 {
         return Ok(PreparedMessages {
@@ -880,7 +882,11 @@ async fn prepare_messages_inner(
                 .iter()
                 .enumerate()
                 .map(|(index, message)| {
-                    replay_message_without_stale_tool_images(index, message, &latest_tool_indices)
+                    replay_message_without_stale_tool_images(
+                        index,
+                        message,
+                        &current_turn_tool_indices,
+                    )
                 })
                 .collect(),
             contains_images: false,
@@ -896,16 +902,16 @@ async fn prepare_messages_inner(
     // prevents conversations from sticking once the cumulative count crosses
     // the threshold, so no pre-normalization trim is needed here.
     let remote_client = build_runtime_proxy_client_with_timeouts("model_provider.ollama", 30, 10);
-    let latest_tool_indices = latest_tool_result_indices(messages);
+    let current_turn_tool_indices = current_turn_tool_result_indices(messages);
 
     let mut normalized_messages = Vec::with_capacity(messages.len());
     let mut has_successful_images = false;
     for (index, message) in messages.iter().enumerate() {
-        if !should_normalize_message_images(index, message, &latest_tool_indices) {
+        if !should_normalize_message_images(index, message, &current_turn_tool_indices) {
             normalized_messages.push(replay_message_without_stale_tool_images(
                 index,
                 message,
-                &latest_tool_indices,
+                &current_turn_tool_indices,
             ));
             continue;
         }
@@ -963,8 +969,10 @@ async fn prepare_messages_inner(
         });
     }
 
-    // Apply age-based trimming when configured: strip images from user messages
-    // older than `max_image_turns` turns back from the end of history.
+    // Apply age-based trimming when configured: strip images from user
+    // messages older than `max_image_turns` real user turns back from the end
+    // of history. Prompt-mode tool-result carriers never count as turns and
+    // are never aged out here; the stale-tool rule above owns their lifetime.
     // `max_image_turns == 0` means disabled — no age trimming.
     let age_trimmed = if config.max_image_turns > 0 {
         let before = count_image_markers(&normalized_messages);
@@ -1012,12 +1020,18 @@ async fn prepare_messages_inner(
         messages: capped_messages,
     })
 }
+
+/// Strip image markers from user messages older than `max_turns` conversation
+/// turns, where a turn opens at a user message that is not a prompt-mode
+/// tool-result carrier. Carriers never advance the turn count and are never
+/// stripped here; the stale-tool rule and the post-normalization image cap
+/// govern their lifetime, as the `max_image_turns` schema doc documents.
 fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMessage> {
-    // Count user messages from the end to find the cutoff index.
+    // Count real user turns from the end to find the cutoff index.
     let mut user_turn_count = 0usize;
     let mut cutoff = 0usize; // messages at index < cutoff are "too old"
     for (i, m) in messages.iter().enumerate().rev() {
-        if m.role == "user" {
+        if m.role == "user" && !is_prompt_tool_result_message(m) {
             user_turn_count += 1;
             if user_turn_count > max_turns {
                 // Everything up to and including this index is too old.
@@ -1035,7 +1049,7 @@ fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMes
         .iter()
         .enumerate()
         .map(|(i, m)| {
-            if i < cutoff && m.role == "user" {
+            if i < cutoff && m.role == "user" && !is_prompt_tool_result_message(m) {
                 let (cleaned, refs) = parse_image_markers(&m.content);
                 if refs.is_empty() {
                     return m.clone();
@@ -1063,13 +1077,13 @@ fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMes
 /// are dropped, so a message holding more images than the budget allows keeps
 /// its newest ones instead of losing all of them.
 fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessage> {
-    let latest_tool_indices = latest_tool_result_indices(messages);
+    let current_turn_tool_indices = current_turn_tool_result_indices(messages);
     // Find which messages (by index) contain images, oldest first.
     let image_positions: Vec<(usize, usize)> = messages
         .iter()
         .enumerate()
         .filter(|(index, message)| {
-            should_normalize_message_images(*index, message, &latest_tool_indices)
+            should_normalize_message_images(*index, message, &current_turn_tool_indices)
         })
         .filter_map(|(i, m)| {
             let count = parse_image_markers(&m.content).1.len();
@@ -1101,7 +1115,7 @@ fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessa
         .enumerate()
         .map(|(i, m)| {
             let Some(&drop_here) = drop_counts.get(&i) else {
-                return replay_message_without_stale_tool_images(i, m, &latest_tool_indices);
+                return replay_message_without_stale_tool_images(i, m, &current_turn_tool_indices);
             };
 
             trim_message_images(m, drop_here)
@@ -2714,6 +2728,346 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn prepare_messages_keeps_tool_image_after_unrelated_tool_call_in_same_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("same-turn-tool-result.png");
+        let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        std::fs::write(&image_path, png).unwrap();
+
+        let image_tool_content = serde_json::json!({
+            "tool_call_id": "tc_image",
+            "content": format!(
+                "generated screenshot [IMAGE:{}]",
+                image_path.display().to_string()
+            ),
+        })
+        .to_string();
+        let weather_tool_content = serde_json::json!({
+            "tool_call_id": "tc_weather",
+            "content": "Sunny, 25C".to_string(),
+        })
+        .to_string();
+
+        let messages = vec![
+            ChatMessage::user("Take a screenshot, then check the weather.".to_string()),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "tc_image", "name": "screenshot", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(image_tool_content),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "tc_weather", "name": "weather", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(weather_tool_content),
+        ];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("tool images stay live for the user turn that produced them");
+
+        assert!(
+            prepared.contains_images,
+            "an image tool result followed by an unrelated tool result in the same turn must stay normalized"
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&prepared.messages[2].content)
+            .expect("tool result should remain valid JSON");
+        assert_eq!(
+            value.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("tc_image")
+        );
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content should remain a JSON string");
+        assert!(inner.contains("generated screenshot"));
+        // The marker is rewritten in place to wrap the data URI, so the raw
+        // filesystem path must be gone while the payload is inline.
+        assert!(inner.contains("data:image/png;base64,"));
+        assert!(!inner.contains("same-turn-tool-result.png"));
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_strips_tool_image_after_next_user_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("same-turn-tool-result.png");
+        let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        std::fs::write(&image_path, png).unwrap();
+
+        let image_tool_content = serde_json::json!({
+            "tool_call_id": "tc_image",
+            "content": format!(
+                "generated screenshot [IMAGE:{}]",
+                image_path.display().to_string()
+            ),
+        })
+        .to_string();
+        let weather_tool_content = serde_json::json!({
+            "tool_call_id": "tc_weather",
+            "content": "Sunny, 25C".to_string(),
+        })
+        .to_string();
+
+        let messages = vec![
+            ChatMessage::user("Take a screenshot, then check the weather.".to_string()),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "tc_image", "name": "screenshot", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(image_tool_content),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "tc_weather", "name": "weather", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(weather_tool_content),
+            ChatMessage::user("What did you find?".to_string()),
+        ];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("stale tool images should strip without loading them");
+
+        assert!(
+            !prepared.contains_images,
+            "once the next user message arrives the turn's tool images are stale"
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&prepared.messages[2].content)
+            .expect("stale native tool result should remain valid JSON");
+        assert_eq!(
+            value.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("tc_image")
+        );
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content should remain a JSON string");
+        assert!(inner.contains("generated screenshot"));
+        assert!(!inner.contains("[IMAGE:"));
+        assert!(!inner.contains("data:image"));
+        assert!(!inner.contains("same-turn-tool-result.png"));
+
+        let weather_value: serde_json::Value = serde_json::from_str(&prepared.messages[4].content)
+            .expect("the text-only tool result should remain valid JSON");
+        assert_eq!(
+            weather_value.get("content").and_then(|v| v.as_str()),
+            Some("Sunny, 25C")
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_keeps_prompt_mode_tool_images_within_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("same-turn-prompt-tool-result.png");
+        let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        std::fs::write(&image_path, png).unwrap();
+
+        let messages = vec![
+            ChatMessage::user("Compare these two.".to_string()),
+            ChatMessage::user(format!(
+                "[Tool results]\n<tool_result name=\"image_gen\">Generated [IMAGE:{}]</tool_result>",
+                image_path.display()
+            )),
+            ChatMessage::user(
+                "[Tool results]\n<tool_result name=\"weather\">Sunny, 25C</tool_result>"
+                    .to_string(),
+            ),
+        ];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("prompt-mode tool images stay live for the user turn that produced them");
+
+        assert!(
+            prepared.contains_images,
+            "an earlier prompt-mode tool-result carrier in the same turn must stay normalized"
+        );
+
+        assert!(prepared.messages[1].content.contains("[Tool results]"));
+        assert!(prepared.messages[1].content.contains("Generated"));
+        assert!(
+            prepared.messages[1]
+                .content
+                .contains("data:image/png;base64,")
+        );
+        assert!(
+            !prepared.messages[1]
+                .content
+                .contains("same-turn-prompt-tool-result.png")
+        );
+        assert!(prepared.messages[2].content.contains("Sunny, 25C"));
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_keeps_prompt_mode_tool_images_within_turn_under_age_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_image_path = temp.path().join("age-limit-user-attachment.png");
+        let tool_image_path = temp.path().join("age-limit-tool-result.png");
+        // Minimal valid PNG (1x1 RGB pixel).
+        let png_data = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2, 0x21, 0xBC,
+            0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(&user_image_path, png_data).unwrap();
+        std::fs::write(&tool_image_path, png_data).unwrap();
+
+        let messages = vec![
+            ChatMessage::user(format!(
+                "Inspect the attached image, then check session information\n[IMAGE:{}]",
+                user_image_path.display()
+            )),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "tc_image", "name": "image_tool", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::user(format!(
+                "[Tool results]\n<tool_result name=\"image_tool\">Generated [IMAGE:{}]</tool_result>",
+                tool_image_path.display()
+            )),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "tc_session", "name": "session_info", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::user(
+                "[Tool results]\n<tool_result name=\"session_info\">session id: abc-123</tool_result>"
+                    .to_string(),
+            ),
+        ];
+
+        let config = MultimodalConfig {
+            max_images: 4,
+            max_image_turns: 1,
+            ..Default::default()
+        };
+
+        let prepared = prepare_messages_for_provider(&messages, &config)
+            .await
+            .expect("one user turn holding two carriers must not age the turn's images out");
+
+        assert!(
+            prepared.contains_images,
+            "the user's own image and the same-turn tool image must both survive the age limit"
+        );
+
+        assert!(
+            prepared.messages[0]
+                .content
+                .contains("Inspect the attached image, then check session information")
+        );
+        assert!(
+            prepared.messages[0]
+                .content
+                .contains("data:image/png;base64,")
+        );
+        assert!(
+            !prepared.messages[0]
+                .content
+                .contains("age-limit-user-attachment.png")
+        );
+        assert!(prepared.messages[2].content.contains("[Tool results]"));
+        assert!(prepared.messages[2].content.contains("Generated"));
+        assert!(
+            prepared.messages[2]
+                .content
+                .contains("data:image/png;base64,")
+        );
+        assert!(
+            !prepared.messages[2]
+                .content
+                .contains("age-limit-tool-result.png")
+        );
+        assert!(prepared.messages[4].content.contains("session id: abc-123"));
+    }
+
+    #[test]
+    fn trim_images_by_age_still_strips_real_user_images_past_the_limit() {
+        let messages = vec![
+            ChatMessage::user("[IMAGE:/old/user-image.png]".to_string()),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "Done.".to_string(),
+            },
+            ChatMessage::user("Next question".to_string()),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "Answered.".to_string(),
+            },
+            ChatMessage::user("Follow-up".to_string()),
+        ];
+
+        let trimmed = trim_images_by_age(&messages, 1);
+
+        assert_eq!(trimmed[0].content, "[image removed from history]");
+        assert_eq!(trimmed[1].content, "Done.");
+        assert_eq!(trimmed[2].content, "Next question");
+        assert_eq!(trimmed[3].content, "Answered.");
+        assert_eq!(trimmed[4].content, "Follow-up");
+    }
+
+    #[test]
+    fn trim_images_by_age_ignores_prompt_mode_carriers_when_counting() {
+        let messages = vec![
+            ChatMessage::user("Inspect this screenshot.".to_string()),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "On it.".to_string(),
+            },
+            ChatMessage::user(
+                "[Tool results]\n<tool_result name=\"image_gen\">Generated [IMAGE:/tmp/tool-image.png]</tool_result>"
+                    .to_string(),
+            ),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "Checked.".to_string(),
+            },
+            ChatMessage::user(
+                "[Tool results]\n<tool_result name=\"weather\">Sunny, 25C</tool_result>"
+                    .to_string(),
+            ),
+        ];
+
+        let trimmed = trim_images_by_age(&messages, 1);
+
+        assert_eq!(trimmed[0].content, messages[0].content);
+        assert_eq!(trimmed[2].content, messages[2].content);
+        assert_eq!(trimmed[4].content, messages[4].content);
+    }
+
     #[test]
     fn count_image_markers_ignores_stale_tool_results() {
         let messages = vec![
@@ -2730,6 +3084,23 @@ mod tests {
         let messages = vec![
             ChatMessage::user("Create an image".to_string()),
             ChatMessage::tool("[IMAGE:/tmp/latest-tool.png]\nGenerated".to_string()),
+        ];
+
+        assert_eq!(count_image_markers(&messages), 1);
+    }
+
+    #[test]
+    fn count_image_markers_counts_tool_images_within_turn() {
+        // The image tool result sits before a later, text-only tool result in
+        // the same user turn; the vision gate must still see its image.
+        let messages = vec![
+            ChatMessage::user("Create an image, then check the weather.".to_string()),
+            ChatMessage::tool("[IMAGE:/tmp/same-turn-tool.png]\nGenerated".to_string()),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "Checking the weather next.".to_string(),
+            },
+            ChatMessage::tool("Sunny, 25C".to_string()),
         ];
 
         assert_eq!(count_image_markers(&messages), 1);
