@@ -1,8 +1,10 @@
 //! Bubblewrap sandbox (user namespaces for Linux/macOS)
 
 use crate::security::traits::Sandbox;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use zeroclaw_config::platform::resolve_executable;
 
 const CAPABILITY_DROPS: &[&str] = &["CAP_SYS_ADMIN", "CAP_SYS_PTRACE"];
 
@@ -12,40 +14,58 @@ struct BubblewrapHardeningSupport {
 }
 
 /// Bubblewrap sandbox backend
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct BubblewrapSandbox;
 
 impl BubblewrapSandbox {
     pub fn new() -> std::io::Result<Self> {
-        if Self::is_installed() {
-            Ok(Self)
-        } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Bubblewrap not found",
-            ))
-        }
+        let sandbox = Self;
+        sandbox.version_launcher()?;
+        Ok(sandbox)
     }
 
     pub fn probe() -> std::io::Result<Self> {
         Self::new()
     }
 
-    fn is_installed() -> bool {
-        Command::new("bwrap")
+    fn resolve_launcher() -> std::io::Result<PathBuf> {
+        resolve_executable(OsStr::new("bwrap")).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("Bubblewrap launcher could not be resolved: {error}"),
+            )
+        })
+    }
+
+    fn version_launcher(&self) -> std::io::Result<PathBuf> {
+        let launcher = Self::resolve_launcher()?;
+        let output = Command::new(&launcher)
             .arg("--version")
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+            .map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "Bubblewrap launcher at {} could not be probed: {error}",
+                        launcher.display()
+                    ),
+                )
+            })?;
+        if !output.status.success() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "Bubblewrap launcher at {} is unavailable",
+                    launcher.display()
+                ),
+            ));
+        }
+
+        Ok(launcher)
     }
 
-    fn hardening_support() -> BubblewrapHardeningSupport {
-        static SUPPORT: OnceLock<BubblewrapHardeningSupport> = OnceLock::new();
-        *SUPPORT.get_or_init(Self::detect_hardening_support)
-    }
-
-    fn detect_hardening_support() -> BubblewrapHardeningSupport {
-        let support = Command::new("bwrap")
+    fn detect_hardening_support(launcher: &std::path::Path) -> BubblewrapHardeningSupport {
+        let support = Command::new(launcher)
             .arg("--help")
             .env_clear()
             .output()
@@ -59,6 +79,11 @@ impl BubblewrapSandbox {
 
         Self::log_incomplete_hardening_support(support);
         support
+    }
+
+    #[cfg(test)]
+    fn for_test() -> Self {
+        Self
     }
 
     fn support_from_help(stdout: &str, stderr: &str) -> BubblewrapHardeningSupport {
@@ -96,10 +121,20 @@ impl BubblewrapSandbox {
         }
     }
 
+    #[cfg(test)]
     fn wrap_command_with_support(
         &self,
         cmd: &mut Command,
         support: BubblewrapHardeningSupport,
+    ) -> std::io::Result<()> {
+        self.wrap_command_with_launcher(cmd, support, Path::new("bwrap"))
+    }
+
+    fn wrap_command_with_launcher(
+        &self,
+        cmd: &mut Command,
+        support: BubblewrapHardeningSupport,
+        launcher: &Path,
     ) -> std::io::Result<()> {
         let program = cmd.get_program().to_string_lossy().to_string();
         let args: Vec<String> = cmd
@@ -107,7 +142,7 @@ impl BubblewrapSandbox {
             .map(|s| s.to_string_lossy().to_string())
             .collect();
 
-        let mut bwrap_cmd = Command::new("bwrap");
+        let mut bwrap_cmd = Command::new(launcher);
         bwrap_cmd.args([
             "--ro-bind",
             "/usr",
@@ -147,11 +182,13 @@ impl BubblewrapSandbox {
 
 impl Sandbox for BubblewrapSandbox {
     fn wrap_command(&self, cmd: &mut Command) -> std::io::Result<()> {
-        self.wrap_command_with_support(cmd, Self::hardening_support())
+        let launcher = Self::resolve_launcher()?;
+        let support = Self::detect_hardening_support(&launcher);
+        self.wrap_command_with_launcher(cmd, support, &launcher)
     }
 
     fn is_available(&self) -> bool {
-        Self::is_installed()
+        self.version_launcher().is_ok()
     }
 
     fn name(&self) -> &str {
@@ -181,28 +218,57 @@ mod tests {
 
     #[test]
     fn bubblewrap_sandbox_name() {
-        let sandbox = BubblewrapSandbox;
+        let sandbox = BubblewrapSandbox::for_test();
         assert_eq!(sandbox.name(), "bubblewrap");
     }
 
     #[test]
     fn bubblewrap_is_available_only_if_installed() {
         // Result depends on whether bwrap is installed
-        let sandbox = BubblewrapSandbox;
+        let sandbox = BubblewrapSandbox::for_test();
         let _available = sandbox.is_available();
 
         // Either way, the name should still work
         assert_eq!(sandbox.name(), "bubblewrap");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn bubblewrap_wrap_uses_the_resolved_launcher_identity() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = dir.path().join("bwrap");
+        std::fs::write(&launcher, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let launcher = launcher.canonicalize().unwrap();
+        let sandbox = BubblewrapSandbox;
+        assert!(
+            Command::new(&launcher)
+                .arg("--version")
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let support = BubblewrapSandbox::detect_hardening_support(&launcher);
+        let mut command = Command::new("echo");
+        sandbox
+            .wrap_command_with_launcher(&mut command, support, &launcher)
+            .unwrap();
+        assert_eq!(command.get_program(), launcher.as_os_str());
+    }
+
     // ── §1.1 Sandbox isolation flag tests ──────────────────────
 
     #[test]
     fn bubblewrap_wrap_command_includes_isolation_flags() {
-        let sandbox = BubblewrapSandbox;
+        let sandbox = BubblewrapSandbox::for_test();
         let mut cmd = Command::new("echo");
         cmd.arg("hello");
-        sandbox.wrap_command(&mut cmd).unwrap();
+        sandbox
+            .wrap_command_with_support(&mut cmd, BubblewrapHardeningSupport::default())
+            .unwrap();
 
         assert_eq!(
             cmd.get_program().to_string_lossy(),
@@ -268,7 +334,7 @@ mod tests {
 
     #[test]
     fn bubblewrap_sandbox_rejects_coding_cli_execution() {
-        let sandbox = BubblewrapSandbox;
+        let sandbox = BubblewrapSandbox::for_test();
         let reason = sandbox
             .coding_cli_unsupported_reason()
             .expect("bubblewrap sandbox must fail closed for coding CLIs");
@@ -279,7 +345,7 @@ mod tests {
 
     #[test]
     fn bubblewrap_wrap_command_applies_supported_capability_drops() {
-        let sandbox = BubblewrapSandbox;
+        let sandbox = BubblewrapSandbox::for_test();
         let mut cmd = Command::new("echo");
         sandbox
             .wrap_command_with_support(&mut cmd, BubblewrapHardeningSupport { cap_drop: true })
@@ -298,9 +364,11 @@ mod tests {
 
     #[test]
     fn bubblewrap_wrap_command_does_not_add_bare_seccomp_without_profile_fd() {
-        let sandbox = BubblewrapSandbox;
+        let sandbox = BubblewrapSandbox::for_test();
         let mut cmd = Command::new("echo");
-        sandbox.wrap_command(&mut cmd).unwrap();
+        sandbox
+            .wrap_command_with_support(&mut cmd, BubblewrapHardeningSupport::default())
+            .unwrap();
 
         assert!(
             !args(&cmd).contains(&"--seccomp".to_string()),
@@ -310,11 +378,13 @@ mod tests {
 
     #[test]
     fn bubblewrap_wrap_command_preserves_original_command() {
-        let sandbox = BubblewrapSandbox;
+        let sandbox = BubblewrapSandbox::for_test();
         let mut cmd = Command::new("ls");
         cmd.arg("-la");
         cmd.arg("/tmp");
-        sandbox.wrap_command(&mut cmd).unwrap();
+        sandbox
+            .wrap_command_with_support(&mut cmd, BubblewrapHardeningSupport::default())
+            .unwrap();
 
         let args = args(&cmd);
 
@@ -338,9 +408,11 @@ mod tests {
         // they exist on the host so that dynamically linked binaries (e.g.
         // `cargo`) can find the ELF interpreter and shared libraries inside the
         // sandbox.
-        let sandbox = BubblewrapSandbox;
+        let sandbox = BubblewrapSandbox::for_test();
         let mut cmd = Command::new("echo");
-        sandbox.wrap_command(&mut cmd).unwrap();
+        sandbox
+            .wrap_command_with_support(&mut cmd, BubblewrapHardeningSupport::default())
+            .unwrap();
 
         let args = args(&cmd);
 
@@ -364,9 +436,11 @@ mod tests {
 
     #[test]
     fn bubblewrap_wrap_command_binds_required_paths() {
-        let sandbox = BubblewrapSandbox;
+        let sandbox = BubblewrapSandbox::for_test();
         let mut cmd = Command::new("echo");
-        sandbox.wrap_command(&mut cmd).unwrap();
+        sandbox
+            .wrap_command_with_support(&mut cmd, BubblewrapHardeningSupport::default())
+            .unwrap();
 
         let args = args(&cmd);
 

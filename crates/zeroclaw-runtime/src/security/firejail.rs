@@ -2,8 +2,10 @@
 //! Firejail is a SUID sandbox program that Linux applications use to sandbox themselves.
 
 use crate::security::traits::Sandbox;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use zeroclaw_config::platform::resolve_executable;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct FirejailHardeningSupport {
@@ -13,20 +15,15 @@ struct FirejailHardeningSupport {
 }
 
 /// Firejail sandbox backend for Linux
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct FirejailSandbox;
 
 impl FirejailSandbox {
     /// Create a new Firejail sandbox
     pub fn new() -> std::io::Result<Self> {
-        if Self::is_installed() {
-            Ok(Self)
-        } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Firejail not found. Install with: sudo apt install firejail",
-            ))
-        }
+        let sandbox = Self;
+        sandbox.version_launcher()?;
+        Ok(sandbox)
     }
 
     /// Probe if Firejail is available (for auto-detection)
@@ -34,22 +31,41 @@ impl FirejailSandbox {
         Self::new()
     }
 
-    /// Check if firejail is installed
-    fn is_installed() -> bool {
-        Command::new("firejail")
+    fn resolve_launcher() -> std::io::Result<PathBuf> {
+        resolve_executable(OsStr::new("firejail")).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("Firejail launcher could not be resolved: {error}"),
+            )
+        })
+    }
+
+    fn version_launcher(&self) -> std::io::Result<PathBuf> {
+        let launcher = Self::resolve_launcher()?;
+        let output = Command::new(&launcher)
             .arg("--version")
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+            .map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "Firejail launcher at {} could not be probed: {error}",
+                        launcher.display()
+                    ),
+                )
+            })?;
+        if !output.status.success() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Firejail launcher at {} is unavailable", launcher.display()),
+            ));
+        }
+
+        Ok(launcher)
     }
 
-    fn hardening_support() -> FirejailHardeningSupport {
-        static SUPPORT: OnceLock<FirejailHardeningSupport> = OnceLock::new();
-        *SUPPORT.get_or_init(Self::detect_hardening_support)
-    }
-
-    fn detect_hardening_support() -> FirejailHardeningSupport {
-        let support = Command::new("firejail")
+    fn detect_hardening_support(launcher: &std::path::Path) -> FirejailHardeningSupport {
+        let support = Command::new(launcher)
             .arg("--help")
             .env_clear()
             .output()
@@ -63,6 +79,11 @@ impl FirejailSandbox {
 
         Self::log_incomplete_hardening_support(support);
         support
+    }
+
+    #[cfg(test)]
+    fn for_test() -> Self {
+        Self
     }
 
     fn support_from_help(stdout: &str, stderr: &str) -> FirejailHardeningSupport {
@@ -108,10 +129,20 @@ impl FirejailSandbox {
         }
     }
 
+    #[cfg(test)]
     fn wrap_command_with_support(
         &self,
         cmd: &mut Command,
         support: FirejailHardeningSupport,
+    ) -> std::io::Result<()> {
+        self.wrap_command_with_launcher(cmd, support, Path::new("firejail"))
+    }
+
+    fn wrap_command_with_launcher(
+        &self,
+        cmd: &mut Command,
+        support: FirejailHardeningSupport,
+        launcher: &Path,
     ) -> std::io::Result<()> {
         // Prepend firejail to the command
         let program = cmd.get_program().to_string_lossy().to_string();
@@ -122,7 +153,7 @@ impl FirejailSandbox {
         let current_dir = cmd.get_current_dir().map(std::path::Path::to_path_buf);
 
         // Build firejail wrapper with security flags
-        let mut firejail_cmd = Command::new("firejail");
+        let mut firejail_cmd = Command::new(launcher);
         firejail_cmd.args([
             "--private=home", // New home directory
             "--private-dev",  // Minimal /dev
@@ -151,11 +182,13 @@ impl FirejailSandbox {
 
 impl Sandbox for FirejailSandbox {
     fn wrap_command(&self, cmd: &mut Command) -> std::io::Result<()> {
-        self.wrap_command_with_support(cmd, Self::hardening_support())
+        let launcher = Self::resolve_launcher()?;
+        let support = Self::detect_hardening_support(&launcher);
+        self.wrap_command_with_launcher(cmd, support, &launcher)
     }
 
     fn is_available(&self) -> bool {
-        Self::is_installed()
+        self.version_launcher().is_ok()
     }
 
     fn name(&self) -> &str {
@@ -179,12 +212,13 @@ mod tests {
 
     #[test]
     fn firejail_sandbox_name() {
-        assert_eq!(FirejailSandbox.name(), "firejail");
+        assert_eq!(FirejailSandbox::for_test().name(), "firejail");
     }
 
     #[test]
     fn firejail_description_mentions_dependency() {
-        let desc = FirejailSandbox.description();
+        let sandbox = FirejailSandbox::for_test();
+        let desc = sandbox.description();
         assert!(desc.contains("firejail"));
     }
 
@@ -203,7 +237,7 @@ mod tests {
 
     #[test]
     fn firejail_wrap_command_prepends_firejail() {
-        let sandbox = FirejailSandbox;
+        let sandbox = FirejailSandbox::for_test();
         let mut cmd = Command::new("echo");
         cmd.arg("test");
 
@@ -213,13 +247,14 @@ mod tests {
 
         // After wrapping, the program should be firejail
         if sandbox.is_available() {
-            assert_eq!(cmd.get_program().to_string_lossy(), "firejail");
+            let expected_launcher = FirejailSandbox::resolve_launcher().unwrap();
+            assert_eq!(cmd.get_program(), expected_launcher.as_os_str());
         }
     }
 
     #[test]
     fn firejail_wrap_command_preserves_current_dir() {
-        let sandbox = FirejailSandbox;
+        let sandbox = FirejailSandbox::for_test();
         let workspace = std::env::temp_dir().join("zeroclaw-firejail-workspace");
         let mut cmd = Command::new("echo");
         cmd.current_dir(&workspace).arg("test");
@@ -231,14 +266,43 @@ mod tests {
         assert_eq!(cmd.get_current_dir(), Some(workspace.as_path()));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn firejail_wrap_uses_the_resolved_launcher_identity() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = dir.path().join("firejail");
+        std::fs::write(&launcher, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let launcher = launcher.canonicalize().unwrap();
+        let sandbox = FirejailSandbox;
+        assert!(
+            Command::new(&launcher)
+                .arg("--version")
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let support = FirejailSandbox::detect_hardening_support(&launcher);
+        let mut command = Command::new("echo");
+        sandbox
+            .wrap_command_with_launcher(&mut command, support, &launcher)
+            .unwrap();
+        assert_eq!(command.get_program(), launcher.as_os_str());
+    }
+
     // ── §1.1 Sandbox isolation flag tests ──────────────────────
 
     #[test]
     fn firejail_wrap_command_includes_all_security_flags() {
-        let sandbox = FirejailSandbox;
+        let sandbox = FirejailSandbox::for_test();
         let mut cmd = Command::new("echo");
         cmd.arg("test");
-        sandbox.wrap_command(&mut cmd).unwrap();
+        sandbox
+            .wrap_command_with_support(&mut cmd, FirejailHardeningSupport::default())
+            .unwrap();
 
         assert_eq!(
             cmd.get_program().to_string_lossy(),
@@ -299,7 +363,7 @@ mod tests {
 
     #[test]
     fn firejail_wrap_command_applies_supported_hardening_flags() {
-        let sandbox = FirejailSandbox;
+        let sandbox = FirejailSandbox::for_test();
         let mut cmd = Command::new("echo");
         cmd.arg("test");
         sandbox
@@ -343,11 +407,13 @@ mod tests {
 
     #[test]
     fn firejail_wrap_command_preserves_original_command() {
-        let sandbox = FirejailSandbox;
+        let sandbox = FirejailSandbox::for_test();
         let mut cmd = Command::new("ls");
         cmd.arg("-la");
         cmd.arg("/workspace");
-        sandbox.wrap_command(&mut cmd).unwrap();
+        sandbox
+            .wrap_command_with_support(&mut cmd, FirejailHardeningSupport::default())
+            .unwrap();
 
         let args = args(&cmd);
 

@@ -394,9 +394,13 @@ mod tests {
             !error.contains("outside the workspace"),
             "relative working_directory should resolve inside workspace; got {error:?}"
         );
+        #[cfg(target_os = "windows")]
+        let expected_error = "Codex CLI ('codex') not found in PATH";
+        #[cfg(not(target_os = "windows"))]
+        let expected_error = "Unix coding CLI executable \"codex\" could not be resolved";
         assert!(
-            error.contains("Codex CLI ('codex') not found in PATH"),
-            "expected missing Codex CLI after path validation; got {error:?}"
+            error.contains(expected_error),
+            "unexpected error: {error:?}"
         );
     }
 
