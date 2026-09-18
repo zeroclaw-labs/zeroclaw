@@ -300,6 +300,9 @@ pub fn apply_compat_options(
     if let Some(ref effort) = opts.reasoning_effort {
         b = b.reasoning_effort(Some(effort.clone()));
     }
+    if opts.reasoning_effort_passthrough {
+        b = b.with_reasoning_effort_passthrough();
+    }
     if !opts.extra_headers.is_empty() {
         b = b.extra_headers(opts.extra_headers.clone());
     }

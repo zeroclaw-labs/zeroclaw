@@ -60,6 +60,13 @@ pub struct OpenAiCompatibleModelProvider {
     extra_headers: std::collections::HashMap<String, String>,
     /// Optional reasoning effort for GPT-5/Codex-compatible backends.
     reasoning_effort: Option<String>,
+    /// When true, forward the configured reasoning effort to any model,
+    /// bypassing the OpenAI-reasoning-family name filter. The filter exists
+    /// because some backends reject unknown request params; operators enable
+    /// this only for backends they have verified accept `reasoning_effort`
+    /// (GLM/Kimi/DeepSeek/Qwen-style reasoners behind OpenAI-compatible
+    /// gateways commonly do).
+    reasoning_effort_passthrough: bool,
     /// Whether stored assistant reasoning should be replayed on outbound
     /// assistant history messages. Some providers reject reasoning fields as
     /// input even though they may return them in responses.
@@ -469,6 +476,11 @@ pub struct OpenAiCompatibleBuilder {
     timeout_secs: Option<u64>,
     extra_headers: std::collections::HashMap<String, String>,
     reasoning_effort: Option<String>,
+    /// Set to `true` by
+    /// [`OpenAiCompatibleBuilder::with_reasoning_effort_passthrough`].
+    /// Default `false` keeps the OpenAI-reasoning-family name filter in
+    /// charge of which models receive `reasoning_effort`.
+    reasoning_effort_passthrough: bool,
     /// Set to `Some(false)` by
     /// [`OpenAiCompatibleBuilder::without_assistant_reasoning_replay`]. `None`
     /// preserves the default (replay enabled).
@@ -605,6 +617,15 @@ impl OpenAiCompatibleBuilder {
     /// Set reasoning effort for GPT-5/Codex-compatible chat-completions APIs.
     pub fn reasoning_effort(mut self, reasoning_effort: Option<String>) -> Self {
         self.reasoning_effort = reasoning_effort;
+        self
+    }
+
+    /// Forward the configured reasoning effort to every model on this
+    /// provider, bypassing the OpenAI-reasoning-family name filter. The
+    /// filter exists because some backends reject unknown request params;
+    /// enable this only on backends verified to accept `reasoning_effort`.
+    pub fn with_reasoning_effort_passthrough(mut self) -> Self {
+        self.reasoning_effort_passthrough = true;
         self
     }
 
@@ -760,6 +781,7 @@ impl OpenAiCompatibleBuilder {
             timeout_secs: self.timeout_secs.unwrap_or(120),
             extra_headers: self.extra_headers,
             reasoning_effort: self.reasoning_effort,
+            reasoning_effort_passthrough: self.reasoning_effort_passthrough,
             replay_assistant_reasoning: self.replay_assistant_reasoning_override.unwrap_or(true),
             cache_passthrough: self.cache_passthrough,
             api_path: self.api_path,
@@ -801,6 +823,7 @@ impl OpenAiCompatibleModelProvider {
             timeout_secs: None,
             extra_headers: std::collections::HashMap::new(),
             reasoning_effort: None,
+            reasoning_effort_passthrough: false,
             replay_assistant_reasoning_override: None,
             cache_passthrough: false,
             api_path: None,
@@ -1179,6 +1202,15 @@ impl OpenAiCompatibleModelProvider {
 
     fn reasoning_effort_for_model(&self, model: &str) -> Option<String> {
         let effort = self.reasoning_effort.as_ref()?;
+        // The name filter below exists because some OpenAI-compatible
+        // backends reject unknown request params (HTTP 400 for
+        // `reasoning_effort` on models they do not treat as reasoners).
+        // Operators who have verified their backend honors the param —
+        // GLM/Kimi/DeepSeek/Qwen-style reasoners behind OpenAI-compatible
+        // gateways commonly do — can bypass the filter per provider.
+        if self.reasoning_effort_passthrough {
+            return Some(effort.clone());
+        }
         let id = model
             .rsplit('/')
             .next()
@@ -5688,6 +5720,104 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("high"),
             "reasoning_effort must be present when no tools are sent; got: {value}"
+        );
+    }
+
+    // Opt-in reasoning-effort passthrough: the name filter is fail-closed
+    // because some backends reject unknown request params, so only an
+    // explicit per-provider flag forwards effort to non-OpenAI model names.
+    #[test]
+    fn reasoning_effort_passthrough_default_keeps_name_filter_for_glm_style_models() {
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_effort(Some("high".to_string()))
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "fireworks-primary/glm-5p3",
+            None,
+            false,
+            false,
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert!(
+            value.get("reasoning_effort").is_none(),
+            "flag unset must preserve the name filter: glm-style models never receive reasoning_effort; got: {value}"
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_passthrough_forwards_effort_to_glm_style_models() {
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_effort(Some("high".to_string()))
+            .with_reasoning_effort_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "fireworks-primary/glm-5p3",
+            None,
+            false,
+            false,
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("high"),
+            "flag on must forward the configured effort to glm-style models; got: {value}"
+        );
+
+        // Models the filter already passes keep the same outcome with the
+        // flag on: passthrough only widens coverage, it never narrows it.
+        let req =
+            p.build_native_tool_chat_request(&messages, None, "openai/o3-mini", None, false, false);
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("high"),
+            "o3-style models must keep receiving the effort with the flag on; got: {value}"
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_passthrough_without_configured_effort_sends_none() {
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_reasoning_effort_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "fireworks-primary/glm-5p3",
+            None,
+            false,
+            false,
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert!(
+            value.get("reasoning_effort").is_none(),
+            "passthrough without a configured effort must not invent one; got: {value}"
         );
     }
 

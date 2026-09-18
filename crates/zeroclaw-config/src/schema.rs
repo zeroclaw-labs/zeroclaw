@@ -960,6 +960,17 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "is_false")]
     pub cache_passthrough: bool,
+    /// Forward the runtime-configured `reasoning_effort` to every model on
+    /// this OpenAI-compatible provider, not only OpenAI reasoning-family
+    /// names (o1*/o3*/o4*/gpt-5*/gpt-*codex*). The name filter exists because
+    /// some strict backends reject unknown request params with HTTP 400;
+    /// enable this only on a backend verified to accept `reasoning_effort`
+    /// (GLM/Kimi/DeepSeek/Qwen-style reasoners behind OpenAI-compatible
+    /// gateways commonly do). Default `false`: the name filter keeps
+    /// deciding, and non-OpenAI model names never receive the param.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reasoning_effort_passthrough: bool,
     /// Pull live token prices for this provider's models from its own
     /// OpenAI-compatible `/models` listing (the gateway is the source of truth
     /// for its prices), filling cost-tracking rates for models the operator
