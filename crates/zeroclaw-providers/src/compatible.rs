@@ -23,6 +23,21 @@ use zeroclaw_config::schema::ToolResultImagePolicy;
 
 const TOOL_RESULT_IMAGE_OMITTED_NOTICE: &str = "[tool-result image omitted by provider policy]";
 
+tokio::task_local! {
+    static EXACT_REQUEST_REPLAY: ();
+}
+
+/// Run one compatible-provider dispatch without provider-internal retries or
+/// request-shape fallbacks. Runtime uses this only for exact image recovery.
+#[doc(hidden)]
+pub async fn scope_exact_request_replay<F: std::future::Future>(future: F) -> F::Output {
+    EXACT_REQUEST_REPLAY.scope((), future).await
+}
+
+fn exact_request_replay_active() -> bool {
+    EXACT_REQUEST_REPLAY.try_with(|_| ()).is_ok()
+}
+
 /// A model_provider that speaks the OpenAI-compatible chat completions API.
 /// Used by: Venice, Vercel AI Gateway, Cloudflare AI Gateway, Moonshot,
 /// Synthetic, `OpenCode` Zen, `OpenCode` Go, `Z.AI`, `GLM`, `MiniMax`, Bedrock, Qianfan, Groq, Mistral, `xAI`, etc.
@@ -329,7 +344,18 @@ fn streaming_api_error(status: reqwest::StatusCode, body: &str) -> StreamError {
         .ok()
         .and_then(|value| structured_api_error_message(&value));
     let sanitized = super::sanitize_api_error(message.as_deref().unwrap_or(body));
-    StreamError::ModelProvider(format!("{status}: {sanitized}"))
+    StreamError::HttpStatus {
+        status: status.as_u16(),
+        message: sanitized,
+    }
+}
+
+fn provider_http_error(name: &str, status: reqwest::StatusCode, body: &str) -> anyhow::Error {
+    let error = super::api_error_from_parts(name, status, body);
+    anyhow::Error::new(crate::reliable::ProviderHttpError::new(
+        status,
+        error.to_string(),
+    ))
 }
 
 /// Upper bound on a `/models` catalog response buffered before parsing. Real
@@ -3163,6 +3189,27 @@ impl OpenAiCompatibleModelProvider {
 
 #[async_trait]
 impl ModelProvider for OpenAiCompatibleModelProvider {
+    fn supports_exact_request_replay(
+        &self,
+        request: ProviderChatRequest<'_>,
+        _model: &str,
+    ) -> bool {
+        // Tools can activate reasoning/schema fallback, and provider-backed
+        // auth can refresh or replace the credential between physical calls.
+        let uses_static_credential = self
+            .credential
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|credential| !credential.is_empty())
+            || self.auth_service.is_none();
+        request.tools.is_none()
+            && self
+                .extra_body
+                .as_ref()
+                .is_none_or(|extra| extra.get("tools").is_none())
+            && uses_static_credential
+    }
+
     fn default_base_url(&self) -> Option<&str> {
         self.canonical_base_url
     }
@@ -3448,8 +3495,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         if !response.status().is_success() {
             let status = response.status();
             let error = response.text().await?;
-            let sanitized = super::sanitize_api_error(&error);
-            anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
+            return Err(provider_http_error(&self.name, status, &error));
         }
 
         let body = response.text().await?;
@@ -3541,7 +3587,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         };
 
         if !response.status().is_success() {
-            return Err(super::api_error(&self.name, response).await);
+            let status = response.status();
+            let body = response.text().await?;
+            return Err(provider_http_error(&self.name, status, &body));
         }
 
         let body = response.text().await?;
@@ -3583,6 +3631,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        let exact_request_replay = exact_request_replay_active();
         let credential = self.resolve_credential().await?;
 
         let normalized = self.normalize_messages_for_upstream(messages).await?;
@@ -3618,6 +3667,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 .await
             {
                 Ok(response) => response,
+                Err(error) if exact_request_replay => return Err(error.into()),
                 Err(error) => {
                     ::zeroclaw_log::record!(
                         WARN,
@@ -3643,7 +3693,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
             let status = response.status();
             let error = response.text().await?;
-            if tools_count > 0
+            if !exact_request_replay
+                && tools_count > 0
                 && super::rejects_tools_with_reasoning_effort(status, &error)
                 && ensure_reasoning_effort_none(&mut payload)
             {
@@ -3668,7 +3719,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 continue;
             }
 
-            return Err(super::api_error_from_parts(&self.name, status, &error));
+            return Err(provider_http_error(&self.name, status, &error));
         };
 
         let body = response.text().await?;
@@ -3696,6 +3747,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        let exact_request_replay = exact_request_replay_active();
         let credential = self.resolve_credential().await?;
 
         let normalized = self
@@ -3768,7 +3820,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let error = response.text().await?;
             let sanitized = super::sanitize_api_error(&error);
 
-            if tools_count > 0
+            if !exact_request_replay
+                && tools_count > 0
                 && super::rejects_tools_with_reasoning_effort(status, &error)
                 && ensure_reasoning_effort_none(&mut payload)
             {
@@ -3793,7 +3846,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 continue;
             }
 
-            if Self::is_native_tool_schema_unsupported(status, &sanitized) {
+            if !exact_request_replay
+                && tools_count > 0
+                && Self::is_native_tool_schema_unsupported(status, &sanitized)
+            {
                 let fallback_messages =
                     Self::with_prompt_guided_tool_instructions(request.messages, request.tools);
                 let text = self
@@ -3807,7 +3863,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 });
             }
 
-            anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
+            return Err(provider_http_error(&self.name, status, &error));
         };
 
         let body = response.text().await?;
@@ -3869,6 +3925,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let model = model.to_string();
         let count_tokens = options.count_tokens;
         let options_enabled = options.enabled;
+        let exact_request_replay = exact_request_replay_active();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
@@ -4030,7 +4087,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     Ok(text) => text,
                     Err(_) => format!("HTTP error: {}", status),
                 };
-                if tools_count > 0
+                if !exact_request_replay
+                    && tools_count > 0
                     && super::rejects_tools_with_reasoning_effort(status, &error)
                     && ensure_reasoning_effort_none(&mut payload)
                 {
@@ -4545,12 +4603,15 @@ mod tests {
     fn streaming_api_error_sanitizes_and_bounds_upstream_body() {
         let secret = "sk-test-streaming-secret";
         let body = format!(r#"{{"error":"{secret} {}"}}"#, "x".repeat(4_000));
-        let error = streaming_api_error(reqwest::StatusCode::UNAUTHORIZED, &body).to_string();
+        let error = streaming_api_error(reqwest::StatusCode::UNAUTHORIZED, &body);
 
-        assert!(error.starts_with("ModelProvider error: 401 Unauthorized:"));
-        assert!(error.contains("[REDACTED]"));
-        assert!(!error.contains(secret));
-        assert!(error.chars().count() <= 550);
+        let StreamError::HttpStatus { status, message } = error else {
+            panic!("expected HTTP status error, got {error}");
+        };
+        assert_eq!(status, 401);
+        assert!(message.contains("[REDACTED]"));
+        assert!(!message.contains(secret));
+        assert!(message.chars().count() <= 512);
     }
 
     #[test]
@@ -4571,13 +4632,17 @@ mod tests {
         })
         .to_string();
 
-        let error =
-            streaming_api_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &body).to_string();
+        let error = streaming_api_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &body);
 
-        assert_eq!(
-            error,
-            format!("ModelProvider error: 500 Internal Server Error: {message}")
-        );
+        let StreamError::HttpStatus {
+            status,
+            message: actual_message,
+        } = error
+        else {
+            panic!("expected HTTP status error, got {error}");
+        };
+        assert_eq!(status, 500);
+        assert_eq!(actual_message, message);
     }
 
     fn make_model_provider(
@@ -5840,7 +5905,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejecting_endpoint_retries_once_with_reasoning_disabled() {
+    async fn tool_bearing_request_is_ineligible_and_retains_reasoning_fallback() {
         let (addr, bodies, server) = spawn_reasoning_rejecting_endpoint(false).await;
 
         let provider = OpenAiCompatibleModelProvider::builder("test")
@@ -5858,18 +5923,14 @@ mod tests {
             serde_json::json!({"type": "object", "properties": {}}),
         )];
 
-        let response = provider
-            .chat(
-                crate::traits::ChatRequest {
-                    messages: &messages,
-                    tools: Some(&tools),
-                    thinking: None,
-                },
-                "gpt-5",
-                None,
-            )
-            .await
-            .unwrap();
+        let request = crate::traits::ChatRequest {
+            messages: &messages,
+            tools: Some(&tools),
+            thinking: None,
+        };
+        assert!(!provider.supports_exact_request_replay(request, "gpt-5"));
+
+        let response = provider.chat(request, "gpt-5", None).await.unwrap();
         assert_eq!(response.text.as_deref(), Some("ok"));
 
         let bodies = bodies.lock().unwrap();
@@ -5951,6 +6012,54 @@ mod tests {
             Some("none")
         );
         assert!(bodies.iter().all(|body| body.get("tools").is_some()));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn exact_replay_scope_suppresses_stream_reasoning_retry() {
+        use futures_util::StreamExt as _;
+
+        let (addr, bodies, server) = spawn_reasoning_rejecting_endpoint(true).await;
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url(&format!("http://{addr}"))
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_effort(Some("high".to_string()))
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "get_weather",
+            "Get weather",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+
+        let events = scope_exact_request_replay(async {
+            provider
+                .stream_chat(
+                    crate::traits::ChatRequest {
+                        messages: &messages,
+                        tools: Some(&tools),
+                        thinking: None,
+                    },
+                    "gpt-5",
+                    None,
+                    StreamOptions {
+                        enabled: true,
+                        count_tokens: false,
+                    },
+                )
+                .collect::<Vec<_>>()
+                .await
+        })
+        .await;
+
+        assert!(events.iter().any(Result::is_err));
+        assert_eq!(
+            bodies.lock().unwrap().len(),
+            1,
+            "exact replay must suppress the spawned stream worker's reasoning retry"
+        );
         server.abort();
     }
 
@@ -7672,13 +7781,13 @@ mod tests {
     }
 
     fn assert_sanitized_streaming_error(error: StreamError, secret: &str) {
-        let StreamError::ModelProvider(message) = error else {
-            panic!("expected model-provider error, got {error}");
+        let StreamError::HttpStatus { status, message } = error else {
+            panic!("expected HTTP status error, got {error}");
         };
-        assert!(message.contains("401 Unauthorized"));
+        assert_eq!(status, 401);
         assert!(message.contains("[REDACTED]"));
         assert!(!message.contains(secret));
-        assert!(message.chars().count() <= 525);
+        assert!(message.chars().count() <= 512);
     }
 
     #[test]
@@ -8580,6 +8689,80 @@ mod tests {
         assert_eq!(output[0].role, "system");
         assert!(output[0].content.contains("Available Tools"));
         assert!(output[0].content.contains("shell_exec"));
+    }
+
+    #[tokio::test]
+    async fn normal_chat_retains_native_tool_schema_fallback() {
+        use axum::Json;
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let bodies_for_route = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let bodies = Arc::clone(&bodies_for_route);
+                async move {
+                    let has_tools = body.get("tools").is_some();
+                    bodies.lock().unwrap().push(body);
+                    if has_tools {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": {"message": "unknown parameter: tools"}
+                            })),
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "prompt fallback"}}]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url(&format!("http://{addr}"))
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "inspect",
+            "Inspect input",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+
+        let response = provider
+            .chat(
+                crate::traits::ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await
+            .expect("normal call uses prompt-guided fallback");
+
+        assert_eq!(response.text.as_deref(), Some("prompt fallback"));
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[0].get("tools").is_some());
+        assert!(bodies[1].get("tools").is_none());
+        server.abort();
     }
 
     #[test]
@@ -12071,5 +12254,21 @@ mod tests {
         assert_eq!(native.len(), 2);
         assert_eq!(native[1].role, "tool");
         assert_eq!(native[1].tool_call_id.as_deref(), Some("fc_456"));
+    }
+
+    #[test]
+    fn message_only_bad_request_preserves_http_status_without_prose_classification() {
+        let error = provider_http_error(
+            "test",
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"request could not be processed"}}"#,
+        );
+
+        assert_eq!(
+            error
+                .downcast_ref::<crate::reliable::ProviderHttpError>()
+                .map(crate::reliable::ProviderHttpError::status),
+            Some(400)
+        );
     }
 }

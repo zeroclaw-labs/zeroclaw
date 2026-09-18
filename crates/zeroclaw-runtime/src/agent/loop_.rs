@@ -2185,6 +2185,8 @@ pub async fn run(
             } else {
                 vec![ChatMessage::system(&system_prompt)]
             };
+            let mut image_cache = zeroclaw_providers::multimodal::LocalImageCache::new();
+            let mut provider_image_state = crate::agent::turn::ProviderImageState::default();
 
             loop {
                 print!("> ");
@@ -2250,6 +2252,8 @@ pub async fn run(
 
                         history.clear();
                         history.push(ChatMessage::system(&system_prompt));
+                        image_cache = zeroclaw_providers::multimodal::LocalImageCache::new();
+                        provider_image_state = crate::agent::turn::ProviderImageState::default();
                         // Clear conversation and daily memory
                         let mut cleared = 0;
                         for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
@@ -2542,7 +2546,10 @@ pub async fn run(
                                     event_tx: None,
                                     steering: None,
                                     new_messages_out: None,
-                                    image_cache: None,
+                                    image_cache: Some(crate::agent::turn::ToolLoopImageState {
+                                        cache: &mut image_cache,
+                                        provider_state: &mut provider_image_state,
+                                    }),
                                     // Origin is threaded from the entry point;
                                     // source/transport/trust stay phase-1
                                     // placeholders until per-transport stamping.
@@ -5827,6 +5834,169 @@ mod tests {
         assert_eq!(result, "done");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    }
+
+    struct ImageRecoveryContinuationProvider {
+        image_counts: Mutex<Vec<usize>>,
+        resubmission: Option<(tokio::sync::mpsc::Sender<String>, String)>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ImageRecoveryContinuationProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "image-recovery-continuation"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ImageRecoveryContinuationProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                vision: true,
+                ..ProviderCapabilities::default()
+            }
+        }
+
+        fn supports_exact_request_replay(&self, _request: ChatRequest<'_>, _model: &str) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("structured chat is required");
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let call = {
+                let mut counts = self.image_counts.lock().unwrap();
+                let call = counts.len();
+                counts.push(zeroclaw_providers::multimodal::count_image_markers(
+                    request.messages,
+                ));
+                call
+            };
+            if call == 0 {
+                return Err(zeroclaw_api::model_provider::StreamError::HttpStatus {
+                    status: 400,
+                    message: "request could not be processed".to_string(),
+                }
+                .into());
+            }
+            let text = if call == 1 {
+                if let Some((tx, message)) = &self.resubmission {
+                    tx.send(message.clone()).await.unwrap();
+                }
+                r#"<tool_call>
+{"name":"probe","arguments":{"value":"ok"}}
+</tool_call>"#
+            } else {
+                "done"
+            };
+            Ok(ChatResponse {
+                text: Some(text.to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn image_recovery_continuation_requires_new_input_to_restore_images() {
+        for resubmit in [false, true] {
+            let image = "data:image/png;base64,iVBORw0KGgoBAgME";
+            let original = format!("inspect [IMAGE:{image}]");
+            let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel(4);
+            let model_provider = ImageRecoveryContinuationProvider {
+                image_counts: Mutex::new(Vec::new()),
+                resubmission: resubmit.then_some((steering_tx, format!("retry [IMAGE:{image}]"))),
+            };
+            let invocations = Arc::new(AtomicUsize::new(0));
+            let tools_registry =
+                crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                    CountingTool::new("probe", Arc::clone(&invocations)),
+                )]);
+            let mut history = vec![ChatMessage::user(original.clone())];
+            let observer = NoopObserver;
+
+            let result = run_tool_call_loop(ToolLoop {
+                parent_agent_alias: None,
+                sop_reassembly: None,
+                exec: ResolvedAgentExecution {
+                    model_access: ResolvedModelAccess {
+                        model_provider: &model_provider,
+                        provider_name: "mock-provider",
+                        model: "mock-model",
+                        temperature: Some(0.0),
+                    },
+                    tools_registry: &tools_registry,
+                    observer: &observer,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    config: None,
+                    max_tool_iterations: 3,
+                    hooks: None,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 0,
+                    context_token_budget: 0,
+                    receipt_generator: None,
+                    knobs: &LoopKnobs::default(),
+                },
+                history: &mut history,
+                channel_name: "cli",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: None,
+                steering: Some(&mut steering_rx),
+                new_messages_out: None,
+                image_cache: None,
+                memory: None,
+                ingress: IngressContext::sub_turn(),
+                agent_alias: None,
+                turn_id: "image-recovery-continuation",
+            })
+            .await
+            .expect("recovery and tool continuation complete");
+
+            assert!(result.contains("done"));
+            assert_eq!(
+                *model_provider.image_counts.lock().unwrap(),
+                vec![1, 0, usize::from(resubmit)]
+            );
+            assert_eq!(invocations.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                history[0].content, original,
+                "canonical image history is unchanged"
+            );
+        }
     }
 
     #[tokio::test]
