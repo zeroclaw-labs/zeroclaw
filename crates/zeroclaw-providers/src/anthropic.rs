@@ -18,16 +18,16 @@ use zeroclaw_api::tool::ToolSpec;
 const TEMPERATURE_DEFAULT: f64 = 1.0;
 /// Anthropic's public API endpoint. Overrideable via `model_providers.<name>.base_url`.
 pub(crate) const BASE_URL: &str = "https://api.anthropic.com";
+/// Per-image ceiling for base64-encoded payloads, shared with the multimodal
+/// structural check so this adapter and the pre-dispatch resolvability count
+/// cannot drift apart on what an image may weigh (see
+/// `MAX_ENCODED_IMAGE_PAYLOAD_BYTES` in `crate::multimodal`). Anthropic
+/// documents 10 MB encoded per image for the direct API; its separate
+/// per-request budget (32 MB across all images) is not enforced here.
+use crate::multimodal::MAX_ENCODED_IMAGE_PAYLOAD_BYTES;
 use crate::safeguard_notice::{
     SafeguardFallbackKind, SafeguardFallbackNotice, commit_safeguard_fallback,
 };
-/// Anthropic's documented per-image ceiling for the direct API: 10 MB
-/// **base64-encoded**. Measured on the encoded payload length, unlike the
-/// multimodal config's `max_image_size_mb`, which bounds decoded bytes. MB is
-/// read as 1024 * 1024 here, the same way `max_image_size_mb` reads it, so the
-/// two ceilings stay consistent with each other. Anthropic's separate
-/// per-request budget (32 MB across all images) is not enforced here.
-const MAX_ENCODED_IMAGE_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
 /// Replaces a raw `data:<media type>;base64,<payload>` run that survived marker
 /// parsing and would otherwise sit in a text position. See
 /// [`AnthropicModelProvider::sweep_residual_image_data`].

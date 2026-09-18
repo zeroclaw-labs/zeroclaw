@@ -40391,6 +40391,13 @@ This is an example JSON object for profile settings."#;
             sop_audit: None,
         });
 
+        // The attachment must be a real file: the no-vision gate rejects only
+        // image markers that resolve, and treats a marker with nothing behind
+        // it as prose. Existence is all the gate checks.
+        let photo_dir = tempfile::tempdir().expect("temp dir");
+        let photo_path = photo_dir.path().join("photo_99_1.jpg");
+        std::fs::write(&photo_path, b"not a real jpeg, existence is enough").expect("write photo");
+
         // Simulate a photo attachment message with [IMAGE:] marker.
         process_channel_message(
             runtime_ctx,
@@ -40398,7 +40405,7 @@ This is an example JSON object for profile settings."#;
                 id: "msg-photo-1".to_string(),
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-photo".to_string(),
-                content: "[IMAGE:/tmp/workspace/photo_99_1.jpg]\n\nWhat is this?".to_string(),
+                content: format!("[IMAGE:{}]\n\nWhat is this?", photo_path.display()),
                 channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
@@ -40508,13 +40515,20 @@ This is an example JSON object for profile settings."#;
             sop_audit: None,
         });
 
+        // The attachment must be a real file: the no-vision gate rejects only
+        // image markers that resolve, and treats a marker with nothing behind
+        // it as prose. Existence is all the gate checks.
+        let photo_dir = tempfile::tempdir().expect("temp dir");
+        let photo_path = photo_dir.path().join("photo_99_1.jpg");
+        std::fs::write(&photo_path, b"not a real jpeg, existence is enough").expect("write photo");
+
         process_channel_message(
             Arc::clone(&runtime_ctx),
             zeroclaw_api::channel::ChannelMessage {
                 id: "msg-photo-1".to_string(),
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-photo".to_string(),
-                content: "[IMAGE:/tmp/workspace/photo_99_1.jpg]\n\nWhat is this?".to_string(),
+                content: format!("[IMAGE:{}]\n\nWhat is this?", photo_path.display()),
                 channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,

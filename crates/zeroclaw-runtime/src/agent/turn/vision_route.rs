@@ -20,6 +20,11 @@ pub(crate) fn resolve_vision_provider(
 ) -> Result<(Option<ResolvedVisionProvider>, bool)> {
     let image_marker_count = multimodal::count_image_markers(history);
     let latest_user_image_marker_count = multimodal::count_latest_user_image_markers(history);
+    let latest_user_resolvable_marker_count =
+        multimodal::count_latest_user_resolvable_image_markers(
+            history,
+            multimodal_config.allow_remote_fetch,
+        );
 
     let mut degrade_strip_images = false;
     let vision_model_provider: Option<ResolvedVisionProvider> = if image_marker_count > 0
@@ -84,14 +89,23 @@ pub(crate) fn resolve_vision_provider(
                 provider_name: vp.clone(),
                 model: vision_model,
             })
-        } else if latest_user_image_marker_count > 0 {
+        } else if latest_user_resolvable_marker_count > 0 {
+            // Marker syntax alone must not fail the turn: prose that
+            // discusses marker syntax parses into markers whose references
+            // resolve to nothing (a missing file, a malformed data URI, a
+            // remote URL while remote fetch is off). Only references that
+            // would actually be sent reach this hard error, so the count in
+            // the refusal is the count of loadable attachments; the rest
+            // fall through to the degrade branch and the turn proceeds as
+            // text.
+            //
             // `vision_limited_by` already excludes the primary entry (it
             // returns `None` when the primary itself is the non-vision
             // entry), so any `Some` here names a genuine fallback and is
             // safe to surface without re-deriving primary-vs-fallback from
             // `provider_name`, whose format is not guaranteed to line up
             // with the dotted entry name.
-            let marker_count = latest_user_image_marker_count.to_string();
+            let marker_count = latest_user_resolvable_marker_count.to_string();
             let message = match model_provider.vision_limited_by(model) {
                 Some(fallback_name) => crate::i18n::get_required_cli_string_with_args(
                     "cli-agent-vision-unsupported-by-fallback",
@@ -120,8 +134,11 @@ pub(crate) fn resolve_vision_provider(
                     .with_attrs(::serde_json::json!({
                         "model_provider": provider_name,
                         "image_marker_count": image_marker_count,
+                        "latest_user_image_marker_count": latest_user_image_marker_count,
+                        "latest_user_resolvable_marker_count":
+                            latest_user_resolvable_marker_count,
                     })),
-                "no vision route for carried-over/tool-result image marker(s); degrading to text-only (markers stripped)"
+                "no vision route for image marker(s) that are carried over, tool results, or unresolvable; degrading to text-only (markers stripped)"
             );
             degrade_strip_images = true;
             None
@@ -419,8 +436,14 @@ vision = false
             }
         }
 
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("shot.png");
+        std::fs::write(&image_path, b"existence is all the gate checks").unwrap();
         let multimodal = MultimodalConfig::default();
-        let history = vec![ChatMessage::user("look [IMAGE:/tmp/x.png]".to_string())];
+        let history = vec![ChatMessage::user(format!(
+            "look [IMAGE:{}]",
+            image_path.display()
+        ))];
 
         let err = resolve_vision_provider(
             None,
@@ -475,8 +498,14 @@ vision = false
             }
         }
 
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("shot.png");
+        std::fs::write(&image_path, b"existence is all the gate checks").unwrap();
         let multimodal = MultimodalConfig::default();
-        let history = vec![ChatMessage::user("look [IMAGE:/tmp/x.png]".to_string())];
+        let history = vec![ChatMessage::user(format!(
+            "look [IMAGE:{}]",
+            image_path.display()
+        ))];
 
         let err = resolve_vision_provider(
             None,
@@ -497,6 +526,126 @@ vision = false
         assert!(
             !capability_error.message.is_empty(),
             "the localized primary-provider refusal must remain user-visible"
+        );
+    }
+
+    /// Marker-shaped prose whose references resolve to nothing (a missing
+    /// file, a malformed data URI) must not fail the turn on a non-vision
+    /// provider: it takes the same degrade branch as carried-over markers,
+    /// so the turn proceeds with the markers stripped.
+    #[test]
+    fn no_vision_provider_with_unresolvable_marker_degrades_instead_of_failing() {
+        struct PlainNonVisionPrimary;
+        #[async_trait::async_trait]
+        impl ModelProvider for PlainNonVisionPrimary {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for PlainNonVisionPrimary {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "PlainNonVisionPrimary"
+            }
+        }
+
+        let multimodal = MultimodalConfig::default();
+        let missing = "/definitely/not/a/real/shot.png";
+        let malformed_uri = "data:image/png;base64,%%%";
+        let history = vec![ChatMessage::user(format!(
+            "the brief says [IMAGE:{missing}] and [IMAGE:{malformed_uri}] as fixtures"
+        ))];
+
+        let (vision_provider, degrade_strip_images) = resolve_vision_provider(
+            None,
+            &PlainNonVisionPrimary,
+            &history,
+            &multimodal,
+            "primary",
+            "primary-model",
+        )
+        .expect("unresolvable markers must degrade instead of failing the turn");
+        assert!(
+            vision_provider.is_none(),
+            "no vision route exists, so the degrade branch must return None"
+        );
+        assert!(
+            degrade_strip_images,
+            "marker-shaped prose must be stripped so the turn proceeds as text"
+        );
+    }
+
+    /// A marker whose reference resolves (an existing file) still fails the
+    /// turn on a non-vision provider, and the refusal counts the loadable
+    /// marker(s) rather than every marker-shaped span in the text.
+    #[test]
+    fn no_vision_provider_with_resolvable_marker_still_fails() {
+        struct PlainNonVisionPrimary;
+        #[async_trait::async_trait]
+        impl ModelProvider for PlainNonVisionPrimary {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for PlainNonVisionPrimary {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "PlainNonVisionPrimary"
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("shot.png");
+        std::fs::write(&image_path, b"existence is all the gate checks").unwrap();
+        let multimodal = MultimodalConfig::default();
+        let history = vec![ChatMessage::user(format!(
+            "look at this [IMAGE:{}]",
+            image_path.display()
+        ))];
+
+        let err = resolve_vision_provider(
+            None,
+            &PlainNonVisionPrimary,
+            &history,
+            &multimodal,
+            "primary",
+            "primary-model",
+        )
+        .err()
+        .expect("a resolvable image marker on a non-vision provider must fail");
+
+        let capability_error = err
+            .downcast_ref::<ProviderCapabilityError>()
+            .expect("vision refusal must retain its structured capability error");
+        assert_eq!(capability_error.model_provider, "primary");
+        assert_eq!(capability_error.capability, "vision");
+        assert!(
+            capability_error.message.contains("1 image marker(s)"),
+            "the refusal must count the loadable marker: {capability_error}"
         );
     }
 

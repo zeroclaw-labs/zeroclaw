@@ -186,6 +186,18 @@ impl std::fmt::Display for ImageDataUriRejection {
     }
 }
 
+/// Per-image ceiling on the **base64-encoded** payload length accepted by
+/// `split_base64_image_data_uri`: 10 MB. Measured on the encoded payload,
+/// unlike the multimodal config's `max_image_size_mb`, which bounds decoded
+/// bytes. MB is read as 1024 * 1024, the same way `max_image_size_mb` reads
+/// it, so the two ceilings stay consistent with each other. Anthropic
+/// documents 10 MB encoded as its per-image limit for the direct API; its
+/// separate per-request budget (32 MB across all images) is not enforced
+/// here. The adapters pass this same const so the structural check, the
+/// adapter sweeps and the resolvability count cannot drift apart on what an
+/// image may weigh.
+pub(crate) const MAX_ENCODED_IMAGE_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
+
 /// Splits a `data:` image reference into its media type and base64 payload,
 /// checking the structure without decoding it.
 ///
@@ -457,6 +469,49 @@ pub fn count_latest_user_image_markers(messages: &[ChatMessage]) -> usize {
         .find(|message| message.role == "user" && !is_prompt_tool_result_message(message))
         .map(|message| parse_image_markers(&message.content).1.len())
         .unwrap_or(0)
+}
+
+/// Count image markers in the latest user message whose references would
+/// actually resolve to an attachment: an inline `data:` URI that passes the
+/// shared structural check, a remote `http(s)` URL when `remote_allowed` is
+/// set (counted without any network access), or a local path that exists as
+/// a file. Marker syntax alone does not count, so prose that merely looks
+/// like a marker cannot fail a turn on a text-only model.
+///
+/// This touches at most the markers of the latest user message and performs
+/// only synchronous filesystem metadata checks (`Path::is_file`); it does no
+/// network I/O and no decoding. `parse_image_markers` remains the single
+/// source of truth for what a marker reference is, and
+/// `split_base64_image_data_uri` for what a valid inline data URI is.
+pub fn count_latest_user_resolvable_image_markers(
+    messages: &[ChatMessage],
+    remote_allowed: bool,
+) -> usize {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user" && !is_prompt_tool_result_message(message))
+        .map(|message| {
+            parse_image_markers(&message.content)
+                .1
+                .into_iter()
+                .filter(|reference| image_reference_resolves(reference, remote_allowed))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// True when a parsed marker reference would resolve to a loadable image:
+/// structurally valid inline data URIs, remote URLs when allowed (cheap to
+/// count, impossible to verify without a fetch), and existing local files.
+fn image_reference_resolves(reference: &str, remote_allowed: bool) -> bool {
+    if reference.starts_with("data:") {
+        return split_base64_image_data_uri(reference, MAX_ENCODED_IMAGE_PAYLOAD_BYTES).is_ok();
+    }
+    if reference.starts_with("http://") || reference.starts_with("https://") {
+        return remote_allowed;
+    }
+    Path::new(reference).is_file()
 }
 
 /// Media-marker kinds this module recognizes. `IMAGE` is the only kind
@@ -2771,6 +2826,82 @@ mod tests {
             ChatMessage::tool("[IMAGE:/tmp/tool.png]\nGenerated".to_string()),
         ];
         assert_eq!(count_latest_user_image_markers(&trailing_tool_result), 1);
+    }
+
+    #[test]
+    fn resolvable_count_ignores_missing_path() {
+        let messages = vec![ChatMessage::user(format!(
+            "look at this [IMAGE:{}]",
+            "/definitely/not/a/real/screenshot.png"
+        ))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false),
+            0
+        );
+    }
+
+    #[test]
+    fn resolvable_count_accepts_existing_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("shot.png");
+        std::fs::write(&image_path, b"not a real png; existence is all that counts").unwrap();
+        let messages = vec![ChatMessage::user(format!(
+            "look at this [IMAGE:{}]",
+            image_path.display()
+        ))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false),
+            1
+        );
+    }
+
+    #[test]
+    fn resolvable_count_accepts_structurally_valid_data_uri() {
+        let uri = format!("data:image/png;base64,{CANONICAL_PNG_B64}");
+        let messages = vec![ChatMessage::user(format!("inline [IMAGE:{uri}]"))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false),
+            1
+        );
+    }
+
+    #[test]
+    fn resolvable_count_rejects_malformed_data_uri() {
+        let uri = "data:image/png;base64,%%%";
+        let messages = vec![ChatMessage::user(format!("inline [IMAGE:{uri}]"))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false),
+            0
+        );
+    }
+
+    #[test]
+    fn resolvable_count_remote_follows_flag() {
+        let reference = "https://example.com/cat.png";
+        let messages = vec![ChatMessage::user(format!("see [IMAGE:{reference}]"))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false),
+            0
+        );
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, true),
+            1
+        );
+    }
+
+    #[test]
+    fn resolvable_count_looks_only_at_latest_user_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("older.png");
+        std::fs::write(&image_path, b"an older turn's real image").unwrap();
+        let messages = vec![
+            ChatMessage::user(format!("look [IMAGE:{}]", image_path.display())),
+            ChatMessage::user("what is WAL?".to_string()),
+        ];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false),
+            0
+        );
     }
 
     #[tokio::test]
