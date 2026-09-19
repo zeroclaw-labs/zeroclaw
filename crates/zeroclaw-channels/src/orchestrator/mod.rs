@@ -7028,7 +7028,6 @@ const MATRIX_REQUIRED_SAFE_TOOL_ARGUMENTS: &[(&[&str], &[&str])] = &[
     ),
     (&["model_switch"], &["action", "model_provider", "model"]),
     (&["proxy_config"], &["action", "scope"]),
-    (&["browser"], &["action"]),
     (&["http_request"], &["method"]),
     (&["web_search_tool"], &["query"]),
     (&["image_info"], &["path"]),
@@ -7068,6 +7067,7 @@ const MATRIX_OPTIONAL_SAFE_TOOL_ARGUMENTS: &[(&[&str], &[&str])] = &[
     ),
     (&["sop_workshop"], &["action", "name"]),
     (&["sop_list"], &[]),
+    (&["browser"], &["action"]),
     (&["browser_delegate", "text_browser"], &["action"]),
     (&["tool_search"], &["query", "max_results"]),
     (
