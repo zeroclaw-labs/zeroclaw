@@ -1,0 +1,26 @@
+{
+  "risk:high": [
+    {
+      "changed-files": {
+        "any-glob-to-any-file": [
+          "crates/zeroclaw-runtime/src/security/**",
+          "crates/zeroclaw-runtime/src/approval/**",
+          "crates/zeroclaw-runtime/src/trust/**",
+          "crates/zeroclaw-providers/src/auth/**",
+          "wit/**",
+          ".cargo/**",
+          "rust-toolchain",
+          "rust-toolchain.toml",
+          ".github/CODEOWNERS",
+          ".github/risk-labeler.yml",
+          ".github/workflows/pr-risk-labeler.yml",
+          ".github/workflows/*release*.yml",
+          ".github/workflows/*publish*.yml",
+          ".github/workflows/pub-*.yml",
+          "scripts/github/pr_risk_label.py",
+          "scripts/release/**"
+        ]
+      }
+    }
+  ]
+}

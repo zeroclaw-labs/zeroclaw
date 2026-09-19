@@ -1,0 +1,63 @@
+name: PR Risk Report
+
+on:
+  pull_request_target:
+    branches: [master]
+    types: [opened, reopened, synchronize, edited, ready_for_review, converted_to_draft, labeled, unlabeled]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to evaluate
+        required: true
+        type: number
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: pr-risk-report-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  report:
+    name: Report proposed PR risk
+    if: >-
+      ${{
+        github.event_name != 'pull_request_target' ||
+        (github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+        startsWith(github.event.label.name, 'risk:') ||
+        github.event.label.name == 'domain:security'
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPOSITORY: ${{ github.repository }}
+      TRUSTED_REF: ${{ github.event_name == 'pull_request_target' && github.sha || github.event.repository.default_branch }}
+      PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+    steps:
+      - name: Fetch trusted classifier and policy
+        run: |
+          set -euo pipefail
+          fetch_trusted() {
+            local path="$1"
+            local output="$2"
+            gh api "repos/$REPOSITORY/contents/$path?ref=$TRUSTED_REF" \
+              --jq .content | base64 --decode > "$output"
+            test -s "$output" || {
+              echo "trusted file fetch produced an empty file: $path" >&2
+              exit 1
+            }
+          }
+          fetch_trusted "scripts/github/pr_risk_label.py" "$RUNNER_TEMP/pr_risk_label.py"
+          fetch_trusted ".github/risk-labeler.yml" "$RUNNER_TEMP/risk-labeler.yml"
+
+      - name: Generate report-only risk evidence
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/pr_risk_label.py" \
+            --repository "$REPOSITORY" \
+            --pr-number "$PR_NUMBER" \
+            --policy "$RUNNER_TEMP/risk-labeler.yml" \
+            --summary "$GITHUB_STEP_SUMMARY"
