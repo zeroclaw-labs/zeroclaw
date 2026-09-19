@@ -442,10 +442,13 @@ jobs:
       - name: Test Windows task-owner recovery
         if: runner.os == 'Windows'
         shell: bash
-        run: >-
-           cargo test --profile ci --locked -p zeroclaw-runtime --lib
-           --target x86_64-pc-windows-msvc
-           control_plane::authority::tests::windows_process_exit_is_detected -- --exact
+        run: |
+          cargo test --profile ci --locked -p zeroclaw-runtime --lib \
+            --target x86_64-pc-windows-msvc \
+            control_plane::authority::tests::windows_process_exit_is_detected -- --exact
+          cargo test --profile ci --locked -p zeroclaw-runtime --lib \
+            --target x86_64-pc-windows-msvc \
+            control_plane::boot::tests::recovery_retains_live_foreign_process_then_reclaims_after_exit -- --exact
 
   check:
     name: Check (${{ matrix.name }})
