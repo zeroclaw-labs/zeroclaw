@@ -50,6 +50,7 @@ pub mod skill_http {
     #[allow(unused_imports)]
     pub use zeroclaw_runtime::skills::skill_http::*;
 }
+mod discovery;
 
 // The lib target sees this as dead; only the bin target calls it from main.rs.
 pub async fn handle_command(
@@ -234,6 +235,7 @@ pub async fn handle_command(
             bundle,
             no_tier_banner,
             skill,
+            well_known,
         } => {
             println!(
                 "{}",
@@ -247,7 +249,34 @@ pub async fn handle_command(
             let skills_path = location.dir().to_path_buf();
             std::fs::create_dir_all(&skills_path)?;
 
-            let (installed_dir, files_scanned) = if let Some(skill_name) = skill.as_deref() {
+            let (installed_dir, files_scanned) = if well_known {
+                let skill_name = skill.as_deref().ok_or_else(|| {
+                    anyhow::Error::msg(get_required_cli_string(
+                        "cli-skills-install-well-known-requires-skill",
+                    ))
+                })?;
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-install-resolving-well-known",
+                        &[("source", &source), ("skill", skill_name)],
+                    )
+                );
+                discovery::install_well_known_skill(
+                    &source,
+                    skill_name,
+                    &skills_path,
+                    config.skills.allow_scripts,
+                    &config.security.nat64_prefixes,
+                )
+                .await
+                .with_context(|| {
+                    get_required_cli_string_with_args(
+                        "cli-skills-install-well-known-failed",
+                        &[("skill", skill_name), ("source", &source)],
+                    )
+                })?
+            } else if let Some(skill_name) = skill.as_deref() {
                 if !is_git_source(&source) {
                     anyhow::bail!(get_required_cli_string_with_args(
                         "cli-skills-install-skill-requires-git",
@@ -1458,6 +1487,7 @@ mod install_location_tests {
                 bundle: None,
                 no_tier_banner: true,
                 skill: None,
+                well_known: false,
             },
             &c,
         )
