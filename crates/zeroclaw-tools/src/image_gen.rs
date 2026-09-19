@@ -6,6 +6,7 @@ use serde_json::json;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use zeroclaw_api::media::{MarkerKind, RenderedMarker};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
@@ -156,8 +157,7 @@ fn format_image_tool_output(
          File: {path_display}\n\
          Size: {size_kb} KB\n\
          Model: {model}\n\
-         Prompt: {prompt}\n\
-         [IMAGE:{path_display}]",
+         Prompt: {prompt}",
     )
 }
 
@@ -461,11 +461,18 @@ impl ImageGenTool {
         let path_display = output_path.display().to_string();
         let output = format_image_tool_output(&path_display, size_kb, model, &prompt);
 
+        // The generated image is declared as an attachment; the body keeps
+        // the durable File: line instead of marker syntax (which is text
+        // under the attachment-identity contract and would never promote).
         Ok(ToolResult {
             success: true,
             output: output.into(),
             error: None,
-        })
+        }
+        .with_attachment(RenderedMarker {
+            target: path_display,
+            kind: MarkerKind::Image,
+        }))
     }
 }
 
@@ -1045,7 +1052,7 @@ mod tests {
     }
 
     #[test]
-    fn image_output_emits_matching_file_line_and_image_marker() {
+    fn image_output_carries_file_line_and_no_inline_marker() {
         let path = "/ws/images/generated_image_42.png";
         let out = format_image_tool_output(path, 12, "fal-ai/flux", "a cat");
         assert!(
@@ -1053,8 +1060,8 @@ mod tests {
             "output must carry a durable File: line: {out}"
         );
         assert!(
-            out.contains(&format!("[IMAGE:{path}]")),
-            "output must carry a matching [IMAGE:<path>] marker: {out}"
+            !out.contains("[IMAGE:"),
+            "the body must not carry marker syntax: {out}"
         );
     }
 

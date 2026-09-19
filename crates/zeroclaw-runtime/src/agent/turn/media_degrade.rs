@@ -1,6 +1,6 @@
 //! Failed-turn media degradation, shared by the ACP restore and live-session paths.
 
-use zeroclaw_api::model_provider::ConversationMessage;
+use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
 use zeroclaw_providers::multimodal;
 
 /// Whether this typed message opens a turn for failed-turn span purposes: a
@@ -29,11 +29,67 @@ pub fn is_turn_opening_user_message(message: &ConversationMessage) -> bool {
 /// their own span bookkeeping (for example a provenance-preserving projection
 /// of seed rows) apply it row by row, while span-shaped callers keep using the
 /// slice form. Returns the number of image references degraded.
+///
+/// Tool-result carriers degrade only their declared attachments — the count
+/// header / array entries — and keep the body verbatim, because a marker in
+/// tool body text is text under the attachment-identity contract. A legacy
+/// carrier (no declaration) carries no attachments, so nothing degrades and
+/// its inline markers survive as text; that is the deliberate behaviour change
+/// for pre-upgrade spans.
 pub fn degrade_media_in_message(message: &mut ConversationMessage) -> usize {
     let omitted = crate::i18n::get_required_cli_string("turn-failed-attachment-omitted");
     let ConversationMessage::Chat(chat) = message else {
         return 0;
     };
+    if chat.role == "tool"
+        && let Some(parsed) = zeroclaw_api::tool_carrier::parse_native_tool_carrier(&chat.content)
+        && parsed.declared
+    {
+        if parsed.attachments.is_empty() {
+            return 0;
+        }
+        let count = parsed.attachments.len();
+        let body_with_note = if parsed.text.is_empty() {
+            omitted.to_string()
+        } else {
+            format!("{}\n\n{omitted}", parsed.text)
+        };
+        let mut obj = match serde_json::from_str::<serde_json::Value>(&chat.content) {
+            Ok(serde_json::Value::Object(obj)) => obj,
+            _ => return 0,
+        };
+        obj.insert(
+            "content".to_string(),
+            serde_json::Value::String(body_with_note),
+        );
+        obj.insert(
+            "attachments".to_string(),
+            zeroclaw_api::tool_carrier::render_native_attachments(&[]),
+        );
+        chat.content = serde_json::Value::Object(obj).to_string();
+        return count;
+    }
+    if zeroclaw_api::tool_carrier::is_prompt_tool_carrier(&chat.content)
+        && let Some(parsed) = zeroclaw_api::tool_carrier::parse_prompt_tool_carrier(&chat.content)
+        && parsed.declared
+    {
+        if parsed.attachments.is_empty() {
+            return 0;
+        }
+        let count = parsed.attachments.len();
+        let body_with_note = if parsed.text.is_empty() {
+            omitted.to_string()
+        } else {
+            format!("{}\n\n{omitted}", parsed.text)
+        };
+        chat.content = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(&body_with_note, &[]);
+        return count;
+    }
+    if is_tool_result_carrier_chat(chat) {
+        // Legacy carrier: no declared attachments, and its inline markers are
+        // body text — leave it verbatim.
+        return 0;
+    }
     let (cleaned, refs) = multimodal::parse_image_markers(&chat.content);
     if refs.is_empty() {
         return 0;
@@ -44,6 +100,15 @@ pub fn degrade_media_in_message(message: &mut ConversationMessage) -> usize {
         format!("{cleaned}\n\n{omitted}")
     };
     refs.len()
+}
+
+/// Whether this flat chat message is a tool-result carrier in either shape,
+/// including legacy ones (raw non-JSON tool text, or a user message with the
+/// results prefix).
+fn is_tool_result_carrier_chat(chat: &ChatMessage) -> bool {
+    chat.role == "tool"
+        || (chat.role == "user"
+            && zeroclaw_api::tool_carrier::is_prompt_tool_carrier(&chat.content))
 }
 
 /// Replace image references in this message span with an omission note.
@@ -60,4 +125,132 @@ pub fn degrade_media_in_message(message: &mut ConversationMessage) -> usize {
 /// performs the projection.
 pub fn degrade_media_in_messages(messages: &mut [ConversationMessage]) -> usize {
     messages.iter_mut().map(degrade_media_in_message).sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chat(role: &str, content: String) -> ConversationMessage {
+        ConversationMessage::Chat(ChatMessage {
+            role: role.to_string(),
+            content,
+        })
+    }
+
+    /// A declared native carrier degrades only its attachments array; the
+    /// body gains the omission note and otherwise survives verbatim.
+    #[test]
+    fn degrade_media_in_message_degrades_native_carrier_array_only() {
+        let body = "screenshot saved; source mentions [IMAGE:/tmp/example.png] as text";
+        let carrier = chat(
+            "tool",
+            serde_json::json!({
+                "tool_call_id": "tc1",
+                "content": body,
+                "attachments": [{"kind": "image", "target": "/tmp/real.png"}],
+            })
+            .to_string(),
+        );
+        let mut message = carrier;
+        let degraded = degrade_media_in_message(&mut message);
+        assert_eq!(degraded, 1);
+
+        let parsed = match &message {
+            ConversationMessage::Chat(chat) => {
+                zeroclaw_api::tool_carrier::parse_native_tool_carrier(&chat.content)
+            }
+            _ => panic!("carrier stays a chat message"),
+        }
+        .expect("degraded carrier still parses");
+        assert!(parsed.declared);
+        assert!(parsed.attachments.is_empty());
+        assert!(
+            parsed.text.contains(body),
+            "the body survives verbatim, note appended after it"
+        );
+        assert!(parsed.text.contains("[IMAGE:/tmp/example.png]"));
+        let omitted = crate::i18n::get_required_cli_string("turn-failed-attachment-omitted");
+        assert!(parsed.text.contains(omitted.as_str()));
+    }
+
+    /// A declared prompt carrier degrades only its count header and marker
+    /// lines; the body keeps its inline markers as text.
+    #[test]
+    fn degrade_media_in_message_degrades_prompt_carrier_header_only() {
+        let body = "[Tool attachments: 9]\nnotes mention [IMAGE:/tmp/example.png] inline";
+        let carrier = chat(
+            "user",
+            zeroclaw_api::tool_carrier::render_prompt_tool_carrier(
+                body,
+                &[zeroclaw_api::media::RenderedMarker {
+                    target: "/tmp/real.png".to_string(),
+                    kind: zeroclaw_api::media::MarkerKind::Image,
+                }],
+            ),
+        );
+        let mut message = carrier;
+        let degraded = degrade_media_in_message(&mut message);
+        assert_eq!(degraded, 1);
+
+        let parsed = match &message {
+            ConversationMessage::Chat(chat) => {
+                zeroclaw_api::tool_carrier::parse_prompt_tool_carrier(&chat.content)
+            }
+            _ => panic!("carrier stays a chat message"),
+        }
+        .expect("degraded prompt carrier still parses");
+        assert!(parsed.declared);
+        assert!(parsed.attachments.is_empty());
+        let omitted = crate::i18n::get_required_cli_string("turn-failed-attachment-omitted");
+        assert_eq!(
+            parsed.text,
+            format!("{body}\n\n{omitted}"),
+            "the body, inline markers included, is untouched apart from the appended note"
+        );
+    }
+
+    /// Pre-upgrade spans: a legacy carrier's inline tool markers are text
+    /// under the attachment-identity contract, so the failed-turn degrade
+    /// leaves them alone. This pins the behaviour change from the old
+    /// marker-stripping degrade.
+    #[test]
+    fn degrade_media_in_message_leaves_legacy_carrier_markers_as_text() {
+        let legacy_prompt_text =
+            format!("[Tool results]\nresult mentions [IMAGE:/tmp/old-inline.png] here");
+        let mut message = chat("user", legacy_prompt_text.clone());
+        assert_eq!(degrade_media_in_message(&mut message), 0);
+        assert!(
+            matches!(&message, ConversationMessage::Chat(chat) if chat.content == legacy_prompt_text),
+            "a legacy carrier is untouched"
+        );
+
+        let legacy_native_text = serde_json::json!({
+            "tool_call_id": "tc1",
+            "content": "result mentions [IMAGE:/tmp/old-inline.png] here",
+        })
+        .to_string();
+        let mut message = chat("tool", legacy_native_text.clone());
+        assert_eq!(degrade_media_in_message(&mut message), 0);
+        assert!(
+            matches!(&message, ConversationMessage::Chat(chat) if chat.content == legacy_native_text),
+            "a legacy native carrier is untouched"
+        );
+    }
+
+    /// Real user messages still degrade their image markers as before.
+    #[test]
+    fn degrade_media_in_message_still_degrades_user_markers() {
+        let mut message = chat("user", "look at this [IMAGE:/tmp/a.png]".to_string());
+        assert_eq!(degrade_media_in_message(&mut message), 1);
+        match &message {
+            ConversationMessage::Chat(chat) => {
+                assert!(!chat.content.contains("[IMAGE:"));
+                let omitted =
+                    crate::i18n::get_required_cli_string("turn-failed-attachment-omitted");
+                assert!(chat.content.contains(omitted.as_str()));
+            }
+            _ => panic!("user message stays a chat message"),
+        }
+    }
 }

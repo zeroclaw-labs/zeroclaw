@@ -4,6 +4,7 @@ use std::fmt::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use zeroclaw_api::media::{MarkerKind, RenderedMarker};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
@@ -149,6 +150,11 @@ impl ScreenshotTool {
     }
 
     /// Read the screenshot file and return base64-encoded result.
+    ///
+    /// The saved file is also declared as an image attachment: the tool
+    /// produced it, and under the attachment-identity contract the model
+    /// seeing it depends on this declaration, never on the path printed in
+    /// the text.
     async fn read_and_encode(output_path: &std::path::Path) -> anyhow::Result<ToolResult> {
         // Check file size before reading to prevent OOM on large screenshots
         const MAX_RAW_BYTES: u64 = 1_572_864; // ~1.5 MB (base64 expands ~33%)
@@ -164,7 +170,11 @@ impl ScreenshotTool {
                 )
                 .into(),
                 error: None,
-            });
+            }
+            .with_attachment(RenderedMarker {
+                target: output_path.display().to_string(),
+                kind: MarkerKind::Image,
+            }));
         }
 
         match tokio::fs::read(output_path).await {
@@ -204,7 +214,11 @@ impl ScreenshotTool {
                     success: true,
                     output: output_msg.into(),
                     error: None,
-                })
+                }
+                .with_attachment(RenderedMarker {
+                    target: output_path.display().to_string(),
+                    kind: MarkerKind::Image,
+                }))
             }
             Err(e) => Ok(ToolResult {
                 success: false,
@@ -331,5 +345,39 @@ mod tests {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     fn screenshot_command_is_unsupported_on_other_platforms() {
         assert!(ScreenshotTool::screenshot_command("screenshot.png").is_none());
+    }
+
+    #[tokio::test]
+    async fn read_and_encode_declares_the_saved_png_as_attachment() {
+        // The saved screenshot is a produced image: the tool must declare it
+        // (exactly one image attachment) while leaving the text unchanged,
+        // because nothing downstream scans the text for the path anymore.
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("shot.png");
+        std::fs::write(&image, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+
+        let result = ScreenshotTool::read_and_encode(&image)
+            .await
+            .expect("read_and_encode succeeds on a small PNG");
+
+        assert!(result.success);
+        assert_eq!(result.output.attachments().len(), 1);
+        assert_eq!(result.output.attachments()[0].kind, MarkerKind::Image);
+        assert_eq!(
+            result.output.attachments()[0].target,
+            image.display().to_string()
+        );
+        assert!(
+            result
+                .output
+                .as_str()
+                .contains(&format!("Screenshot saved to: {}", image.display())),
+            "the text still names the saved path: {}",
+            result.output.as_str()
+        );
+        assert!(
+            !result.output.as_str().contains("[IMAGE:"),
+            "the declaration never rides the text as marker syntax"
+        );
     }
 }

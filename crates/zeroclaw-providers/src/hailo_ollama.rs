@@ -531,7 +531,7 @@ impl HailoOllamaModelProvider {
     }
 
     fn convert_user_message_content(content: &str) -> (Option<String>, Option<Vec<String>>) {
-        let (cleaned, image_refs) = multimodal::parse_image_markers(content);
+        let (cleaned, image_refs) = multimodal::parse_user_message_image_refs(content);
         if image_refs.is_empty() {
             return (Some(content.to_string()), None);
         }

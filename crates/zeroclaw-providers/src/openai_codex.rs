@@ -362,7 +362,8 @@ pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Va
         match msg.role.as_str() {
             "system" => system_parts.push(&msg.content),
             "user" => {
-                let (cleaned_text, image_refs) = multimodal::parse_image_markers(&msg.content);
+                let (cleaned_text, image_refs) =
+                    multimodal::parse_user_message_image_refs(&msg.content);
 
                 let mut content_items = Vec::new();
 
