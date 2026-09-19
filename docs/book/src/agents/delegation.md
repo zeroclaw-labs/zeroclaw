@@ -55,6 +55,21 @@ One thing: the child's **final assistant message**, as a string, wrapped in `Too
 
 There is no streaming or partial-progress channel back to the parent. Long-running SubAgents stall the parent's tool execution for their full duration; there is no per-call timeout knob.
 
+### Execution-tree iteration budget
+
+Set `max_execution_tree_iterations` on the target's `[runtime_profiles.<alias>]` entry to cap aggregate tool-loop iterations across one foreground execution tree:
+
+```toml
+[runtime_profiles.default]
+max_execution_tree_iterations = 12
+```
+
+The field is optional. Omission disables the aggregate budget, while an explicit `0` is invalid. This budget is separate from `max_tool_iterations`, which remains the local per-loop cap for each agent turn.
+
+One logical root turn owns one atomic budget handle. Foreground `spawn_subagent`, bounded synchronous or parallel `delegate` targets, and explicit live SOP child work consume from that handle; a child may reserve only while more than one slot remains. When the root has only its final slot left, it consumes that slot for the existing tools-free completion path. A child that exhausts its view returns a failed `ToolResult`, allowing the parent root turn to continue, and concurrent reservations cannot wrap the counter.
+
+Independent foreground `delegate` targets use their own runtime profile's budget, not the caller's remaining allowance. Omitting the target's limit leaves that independent turn uncapped by an execution-tree budget even when the caller has one. Detached background `delegate` tasks and peer turns also mint a new root from the recipient's runtime profile rather than sharing the launching turn's budget.
+
 ### Multiple calls in one turn
 
 The agent loop applies a per-turn duplicate-call guard: a tool called twice with identical arguments in the same turn normally has the second call skipped. `spawn_subagent` and `delegate` are **exempt** from that guard. Launching several with the same prompt (redundancy, sampling, fan-out) is an intentional pattern, not an accidental repeat, so each identical call runs and each result is returned. Without the exemption only the first identical call would execute and only its output would reach the model.

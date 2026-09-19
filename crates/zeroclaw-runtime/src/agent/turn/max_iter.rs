@@ -10,9 +10,26 @@ use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::TurnEvent;
-use zeroclaw_config::schema::{MultimodalConfig, PacingConfig};
+use zeroclaw_config::schema::{Config, MultimodalConfig, PacingConfig};
 use zeroclaw_providers::{ChatMessage, ModelProvider};
 use zeroclaw_tool_call_parser::{strip_think_tags, strip_trailing_terminal_markers};
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CompletionLimit {
+    LocalIterations(usize),
+    ExecutionTree,
+}
+
+impl CompletionLimit {
+    fn explanation(self) -> String {
+        match self {
+            Self::LocalIterations(limit) => {
+                format!("Agent exceeded maximum tool iterations ({limit})")
+            }
+            Self::ExecutionTree => "Agent exhausted the execution-tree iteration budget".into(),
+        }
+    }
+}
 
 /// Project a finished summary call's settled attempts as `TurnEvent::Usage`
 /// so the gateway ledger includes the final-summary billed work. Mirrors
@@ -46,16 +63,20 @@ pub(crate) async fn finish_after_max_iterations(
     provider_name: &str,
     model: &str,
     temperature: Option<f64>,
-    multimodal_config: &MultimodalConfig,
     pacing: &PacingConfig,
     cancellation_token: Option<&CancellationToken>,
-    max_iterations: usize,
+    limit: CompletionLimit,
     mut accumulated_display_text: String,
     turn_id: &str,
     knobs: &LoopKnobs,
     event_tx: Option<&Sender<TurnEvent>>,
     mut new_messages_out: Option<&mut Vec<ChatMessage>>,
+    config: Option<&Config>,
+    multimodal_config: &MultimodalConfig,
+    hooks: Option<&crate::hooks::HookRunner>,
+    image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
 ) -> Result<String> {
+    let exhaustion = limit.explanation();
     ::zeroclaw_log::record!(
         WARN,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -63,7 +84,7 @@ pub(crate) async fn finish_after_max_iterations(
             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
             .with_attrs(::serde_json::json!({
                 "model": model,
-                "max_iterations": max_iterations,
+                "limit": format!("{limit:?}"),
                 "trace_id": turn_id,
             })),
         "tool_loop_exhausted"
@@ -72,7 +93,7 @@ pub(crate) async fn finish_after_max_iterations(
     // ErrorAtCap callers (embedders driving Agent::turn) treat the cap as a
     // control signal: bail instead of spending another LLM call on a summary.
     if knobs.max_iteration_behavior == MaxIterationBehavior::ErrorAtCap {
-        anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+        anyhow::bail!("{exhaustion}")
     }
 
     // Graceful shutdown: ask the LLM for a final summary without tools
@@ -81,8 +102,8 @@ pub(crate) async fn finish_after_max_iterations(
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
             .with_category(::zeroclaw_log::EventCategory::Agent)
             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-            .with_attrs(::serde_json::json!({"max_iterations": max_iterations})),
-        "Max iterations reached, requesting final summary"
+            .with_attrs(::serde_json::json!({"limit": format!("{limit:?}")})),
+        "Iteration allowance exhausted, requesting final summary"
     );
     let tool_calls_stripped =
         crate::agent::history_pruner::strip_orphaned_tool_calls_from_assistants(history);
@@ -101,39 +122,32 @@ pub(crate) async fn finish_after_max_iterations(
         );
     }
 
-    let summary_prompt = ChatMessage::user(
-        "You have reached the maximum number of tool iterations. \
-         Please provide your best answer based on the work completed so far. \
-         Summarize what you accomplished and what remains to be done."
-            .to_string(),
-    );
-    let summary_prompt_mirror = summary_prompt.clone();
-
-    // The summary may see the turn's images, so the accumulated history goes
-    // through the same multimodal normalizer an in-loop request does (size,
-    // MIME and image-cap limits all apply) instead of being sent verbatim.
-    // Preparing before the summary prompt is appended keeps the trailing
-    // tool results the latest tool-result run, so their markers normalize
-    // exactly as an in-loop dispatch would. A provider that cannot see
-    // images degrades to text-only exactly like the in-loop rule, minus the
-    // vision-fallback resolution: handing validated inline images to a
-    // provider that rejects them would turn the graceful exit into a hard
-    // request failure.
-    let degrade_strip_images = !model_provider.capabilities_for_model(model).vision
-        && zeroclaw_providers::multimodal::count_image_markers(history) > 0;
-    let mut request_messages = match super::prepare_messages_for_iteration(
+    // Resolve against the real latest user turn, before the synthetic summary
+    // prompt could hide a fresh image from the vision-capability policy.
+    let (vision_provider, degrade_strip_images) = super::vision_route::resolve_vision_provider(
+        config,
+        model_provider,
         history,
         multimodal_config,
-        degrade_strip_images,
-        None,
-    )
-    .await
-    {
-        Ok(prepared) => prepared.messages,
-        Err(error) => return Err(error),
+        provider_name,
+        model,
+    )?;
+    let (model_provider, provider_name, model) = match vision_provider.as_ref() {
+        Some(route) => (
+            route.provider.as_ref(),
+            route.provider_name.as_str(),
+            route.model.as_str(),
+        ),
+        None => (model_provider, provider_name, model),
     };
+    let summary_prompt = ChatMessage::user(format!(
+        "{exhaustion}. Please provide your best answer based on the work completed so far. \
+         Summarize what you accomplished and what remains to be done."
+    ));
+    let summary_prompt_mirror = summary_prompt.clone();
+
+    let summary_history_len = history.len();
     history.push(summary_prompt);
-    request_messages.push(summary_prompt_mirror.clone());
 
     enum SummaryCall {
         Cancelled,
@@ -146,26 +160,51 @@ pub(crate) async fn finish_after_max_iterations(
     // match arms below can read it after the future completes.
     let mut summary_attempts = Vec::new();
     let summary_call = {
-        let summary_request = zeroclaw_providers::ChatRequest {
-            messages: &request_messages,
-            tools: None, // No tools — force a text response
-            thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                .try_with(Clone::clone)
-                .ok()
-                .flatten(),
+        // Preparation and hooks belong to the same timeout/cancellation scope
+        // as dispatch; every unsuccessful outcome below removes the prompt.
+        let summary_future = async {
+            // Exclude the synthetic prompt so trailing tool-result images
+            // remain in the latest run and receive normal image validation.
+            let mut messages = super::vision_route::prepare_messages_for_iteration(
+                &history[..summary_history_len],
+                multimodal_config,
+                degrade_strip_images,
+                image_cache,
+            )
+            .await?
+            .messages;
+            messages.push(summary_prompt_mirror.clone());
+            let mut selected_model = model.to_string();
+            if let Some(hooks) = hooks.filter(|hooks| !hooks.is_empty())
+                && let crate::hooks::HookResult::Cancel(reason) = hooks
+                    .run_before_llm_call(&mut messages, &mut selected_model)
+                    .await
+            {
+                anyhow::bail!("LLM call cancelled by hook: {reason}");
+            }
+            let summary_request = zeroclaw_providers::ChatRequest {
+                messages: &messages,
+                tools: None, // No tools — force a text response
+                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten(),
+            };
+            let access = crate::agent::turn::execution::ResolvedModelAccess {
+                model_provider,
+                provider_name,
+                model: &selected_model,
+                temperature,
+            };
+            // Route the graceful-summary call through the metered provider seam. This
+            // was the one tool-loop provider call that skipped the budget check and
+            // recorded no cost; through the seam it now fails closed when the turn's
+            // budget is exhausted and its token usage is charged like any in-loop
+            // call. Metering is a no-op when the turn is unscoped.
+            access
+                .run_model_query(summary_request, &mut summary_attempts)
+                .await
         };
-        let access = crate::agent::turn::execution::ResolvedModelAccess {
-            model_provider,
-            provider_name,
-            model,
-            temperature,
-        };
-        // Route the graceful-summary call through the metered provider seam. This
-        // was the one tool-loop provider call that skipped the budget check and
-        // recorded no cost; through the seam it now fails closed when the turn's
-        // budget is exhausted and its token usage is charged like any in-loop
-        // call. Metering is a no-op when the turn is unscoped.
-        let summary_future = access.run_model_query(summary_request, &mut summary_attempts);
         match pacing.step_timeout_secs {
             Some(step_secs) if step_secs > 0 => {
                 let step_timeout = Duration::from_secs(step_secs);
@@ -215,7 +254,7 @@ pub(crate) async fn finish_after_max_iterations(
                     .with_attrs(::serde_json::json!({
                         "model": model,
                         "provider": provider_name,
-                        "max_iterations": max_iterations,
+                        "limit": format!("{limit:?}"),
                         "trace_id": turn_id,
                         "error": format!("{e}"),
                     })),
@@ -223,9 +262,7 @@ pub(crate) async fn finish_after_max_iterations(
             );
             emit_summary_attempt_usage(event_tx, &summary_attempts).await;
             history.pop();
-            return Err(e).context(format!(
-                "Agent exceeded maximum tool iterations ({max_iterations})"
-            ));
+            return Err(e).context(exhaustion);
         }
         SummaryCall::Done(Ok(resp)) => {
             emit_summary_attempt_usage(event_tx, &summary_attempts).await;
@@ -236,7 +273,7 @@ pub(crate) async fn finish_after_max_iterations(
     let raw_text = resp.text.unwrap_or_default();
     if raw_text.is_empty() {
         history.pop();
-        anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+        anyhow::bail!("{exhaustion}")
     }
     // The summary is raw provider text, and emitting it as a chunk makes this
     // a new automatic display sink: ACP renders `agent_message_chunk` live,
@@ -257,7 +294,7 @@ pub(crate) async fn finish_after_max_iterations(
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                 .with_attrs(::serde_json::json!({
                     "model": model,
-                    "max_iterations": max_iterations,
+                    "limit": format!("{limit:?}"),
                     "trace_id": turn_id,
                     "error": "malformed internal tool protocol omitted from max-iteration summary",
                 })),
@@ -271,7 +308,7 @@ pub(crate) async fn finish_after_max_iterations(
     };
     if display_text.trim().is_empty() {
         history.pop();
-        anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+        anyhow::bail!("{exhaustion}")
     }
     // History and result payloads keep the unmodified provider text; only the
     // display path is normalized, matching the final-response contract.
@@ -283,10 +320,17 @@ pub(crate) async fn finish_after_max_iterations(
     history.push(summary_msg);
     // Graceful shutdown with a visible reason so the user knows why the
     // agent stopped making progress.
-    let stop_reason = crate::i18n::get_required_cli_string_with_args(
-        "turn-max-iterations-reached",
-        &[("max_iterations", &max_iterations.to_string())],
-    );
+    let stop_reason = match limit {
+        CompletionLimit::LocalIterations(max_iterations) => {
+            crate::i18n::get_required_cli_string_with_args(
+                "turn-max-iterations-reached",
+                &[("max_iterations", &max_iterations.to_string())],
+            )
+        }
+        CompletionLimit::ExecutionTree => {
+            crate::i18n::get_required_cli_string("turn-execution-tree-budget-reached")
+        }
+    };
     let segment = format!("{display_text}\n\n{stop_reason}");
     // This summary is the turn's only visible output on the max-iteration
     // exit path, and it comes from a fresh non-streaming call — there is no
@@ -302,7 +346,7 @@ pub(crate) async fn finish_after_max_iterations(
 
 #[cfg(test)]
 mod graceful_summary_metering_tests {
-    use super::finish_after_max_iterations;
+    use super::{CompletionLimit, finish_after_max_iterations};
     use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
     use crate::agent::turn::LoopKnobs;
     use async_trait::async_trait;
@@ -381,14 +425,17 @@ mod graceful_summary_metering_tests {
             "custom",
             "test-model",
             None,
-            &multimodal_config,
             &pacing,
             None,
-            2,
+            CompletionLimit::LocalIterations(2),
             accumulated_display_text,
             "trace-req-test",
             &knobs,
             event_tx,
+            None,
+            None,
+            &multimodal_config,
+            None,
             None,
         )
         .await
@@ -668,13 +715,16 @@ mod graceful_summary_metering_tests {
             "custom",
             "test-model",
             None,
-            &multimodal_config,
             &pacing,
             None,
-            2,
+            CompletionLimit::LocalIterations(2),
             String::new(),
             "trace-req-audio",
             &knobs,
+            None,
+            None,
+            None,
+            &multimodal_config,
             None,
             None,
         )
@@ -734,13 +784,16 @@ mod graceful_summary_metering_tests {
             "custom",
             "test-model",
             None,
-            &multimodal_config,
             &pacing,
             None,
-            2,
+            CompletionLimit::LocalIterations(2),
             String::new(),
             "trace-req-img-drop",
             &knobs,
+            None,
+            None,
+            None,
+            &multimodal_config,
             None,
             None,
         )
@@ -804,13 +857,16 @@ mod graceful_summary_metering_tests {
             "custom",
             "test-model",
             None,
-            &multimodal_config,
             &pacing,
             None,
-            2,
+            CompletionLimit::LocalIterations(2),
             String::new(),
             "trace-req-img-inline",
             &knobs,
+            None,
+            None,
+            None,
+            &multimodal_config,
             None,
             None,
         )
