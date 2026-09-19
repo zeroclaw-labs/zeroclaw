@@ -1476,6 +1476,7 @@ mod tests {
                 command_logger: false,
                 webhook_audit: zeroclaw_config::schema::WebhookAuditConfig::default(),
             },
+            lifecycle_commands: Vec::new(),
         };
         let runner = HookRunner::from_config(&config);
         assert!(
@@ -1492,6 +1493,7 @@ mod tests {
                 command_logger: true,
                 webhook_audit: zeroclaw_config::schema::WebhookAuditConfig::default(),
             },
+            lifecycle_commands: Vec::new(),
         };
         let runner = HookRunner::from_config(&config);
         let names: Vec<&str> = runner.handlers.iter().map(|h| h.name()).collect();
@@ -1513,6 +1515,7 @@ mod tests {
                     ..Default::default()
                 },
             },
+            lifecycle_commands: Vec::new(),
         };
 
         let runner = HookRunner::from_config(&config);

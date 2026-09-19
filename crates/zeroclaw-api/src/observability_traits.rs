@@ -183,6 +183,25 @@ pub enum ObserverEvent {
         parent_agent_alias: Option<String>,
         turn_id: Option<String>,
     },
+    /// Operator authorization is required before the named tool can proceed.
+    ///
+    /// This event deliberately excludes the approval prompt and tool arguments.
+    AuthorizationRequested {
+        tool_name: String,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
+    },
+    /// The operator answered an authorization request.
+    ///
+    /// This event carries only whether the original action was granted.
+    AuthorizationResponded {
+        tool_name: String,
+        granted: bool,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
+    },
     /// A memory recall (search) operation has completed.
     ///
     /// Emitted at the runtime boundary after a hybrid-search query against

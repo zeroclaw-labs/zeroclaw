@@ -68,6 +68,7 @@ Key properties:
 - **Security gates every tool call.** `evaluate_tool_access` consults the [autonomy level](../security/autonomy.md), allow/deny lists, and path boundaries. Medium-risk calls under `Supervised` autonomy go to the operator-approval path.
 - **Memory context is engine-injected.** Before the first provider call, the turn engine resolves an injection policy from the turn's `TurnOrigin` (who initiated the turn): nested sub-turns never inject, scheduled origins (cron, daemon) inject with conversation-category entries excluded, and user-facing origins inject (excluding conversation entries when the turn has no session scope). A spawn site can suppress injection for any origin (for example a cron job with `uses_memory = false`), and turns that carry no memory backend skip it entirely. A single renderer applies time decay, relevance filtering, a prompt-poisoning skip set, and budget caps uniformly on every path; memory backends only answer `recall`, they do not format context.
 - **History and memory are separate.** Session history preserves conversation, tool-call, and tool-result continuity. Explicit memory writes persist selected entries in the memory backend. Receipts ride in-band in the conversation text rather than as a separate persisted artifact. For payload ownership details, see [Memory and payload lifecycle](./memory-payload-lifecycle.md).
+- **External lifecycle projection is content-free.** Every turn surface emits the same `AgentStart`/tool/approval/`AgentEnd` observer sequence. When an operator configures a lifecycle command, one generation-owned observer reduces those events to versioned state (`idle`, `working`, `blocked`, or `done`) and sends JSON to the command. Prompts, responses, tool arguments/results, credentials, memory, and unrestricted metadata never enter that payload. See [Logs & observability](../ops/observability.md#lifecycle-command-projection).
 
 ## Tool receipts
 
@@ -84,6 +85,7 @@ Outbound messages go back through the same channel adapter. Adapters with multi-
 - Tool-call access checks: `crates/zeroclaw-runtime/src/security/` (`iam_policy.rs` `evaluate_tool_access`)
 - Channel orchestration: `crates/zeroclaw-channels/src/orchestrator/`
 - Provider streaming: `crates/zeroclaw-api/src/model_provider.rs` (`StreamEvent` enum, re-exported from `zeroclaw-providers`), `compatible.rs` (SSE parser)
+- Lifecycle contract and reducer: `crates/zeroclaw-api/src/lifecycle.rs`; bounded command delivery: `crates/zeroclaw-infra/src/lifecycle_command.rs`
 
 Since #7415, every transport (channels, CLI, cron, gateway WebSocket, RPC/zerocode, ACP, and the embedded `Agent` API) runs the same turn engine: `run_tool_call_loop` in `crates/zeroclaw-runtime/src/agent/turn/`. The streaming and embedded entry points are thin wrappers in `agent.rs` that set per-caller knobs (dedup, iteration-cap behavior, event emission) around the shared loop. The `turn/` module is one file per step:
 
