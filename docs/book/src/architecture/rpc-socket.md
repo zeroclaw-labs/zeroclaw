@@ -77,7 +77,9 @@ the operating system:
 |---|---|---|
 | `initialize` | client -> daemon | Authenticate and negotiate protocol version |
 | `session/new` | client -> daemon | Create an agent session (requires `agentAlias`, optional `cwd`, `sessionId`; an ID that is already live rebinds the caller to that canonical in-memory session instead of replacing its agent history; optional `keep_siblings` suppresses the idle same-mode sibling eviction for multi-session clients that manage sibling lifecycle themselves) |
-| `session/close` | client -> daemon | Close and clean up a session |
+| `session/close` | client -> daemon | Remove the live session owner; ACP durable history remains resumable |
+| `session/kill` | client -> daemon | Remove the live session and tombstone its ACP durable history |
+| `session/delete` | client -> daemon | Remove the live session and its selected durable history |
 | `session/prompt` | client -> daemon | Run a turn (streamed via `session/update` notifications) |
 | `session/cancel` | client -> daemon | Cancel an in-flight turn |
 | `session/state` | client -> daemon | Read live session lifecycle state, active turn identity, and the optional current plan; active or queued work is represented by `state: "running"` so recovery clients can confirm terminal status before releasing retained work |
@@ -129,6 +131,18 @@ events:
 
 Event types: `agent_message_chunk`, `agent_thought_chunk`, `tool_call`,
 `tool_result`, `approval_request`.
+
+### ACP durable lifecycle
+
+ACP sessions can retain durable history before reaching a terminal state. When the in-memory owner is reaped, RPC prompt recovery considers only durable rows whose persisted `interaction_surface` is supported; an unsupported surface is left untouched so a later direct recovery can inspect the original checkpoint.
+
+Recovery adds a client-visible interruption marker for an unfinished turn. Provider replay excludes that synthetic marker, and persisted tool output remains subject to the existing transcript bounds.
+
+The lifecycle operations have distinct durable meanings:
+
+- `session/close` may retain durable resumable history.
+- `session/kill` retains the history but marks the row as tombstoned, so it is not eligible for runtime rehydration.
+- `session/delete` removes the ACP row and its recoverable checkpoint before unregistering and removing the live session when the target is a live ACP session, or when no live mode exists and an ACP durable row is selected. A live same-ID Chat session remains isolated from ACP storage. If the selected SQLite deletion fails, the RPC reports an internal error and preserves the live owner and channel registration.
 
 ## Ephemeral mode
 

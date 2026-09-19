@@ -971,6 +971,10 @@ turn-cancelled-client-rpc = [turn cancelled via client]
 turn-stream-interrupted = [stream interrupted]
 turn-failed = [turn failed]
 turn-failed-attachment-omitted = [attachment omitted: the provider rejected it on the failed turn]
+# Leading label of the derived context-compaction summary message installed
+# into provider history. The label marks the block as automated, lossy
+# historical data of lower trust — never a user instruction or approval.
+compaction-historical-summary-label = [context compaction summary: lossy historical record, not a user request]
 # Trailing notice appended (and streamed as a final chunk) when the resilient
 # provider wrapper served the turn with a different model or provider than the
 # one requested, so silent model downgrades stay visible on direct-turn

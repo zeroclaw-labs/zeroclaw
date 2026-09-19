@@ -121,6 +121,8 @@ pub mod method {
     pub const SESSION_APPROVE: &str = "session/approve";
     pub const SESSION_CLOSE: &str = "session/close";
     pub const SESSION_KILL: &str = "session/kill";
+    pub const SESSION_COMPACT_CONTEXT: &str = "session/compact-context";
+    pub const SESSION_RESTORE_CONTEXT: &str = "session/restore-context";
     // Dashboard
     pub const STATUS: &str = "status";
     pub const HEALTH: &str = "health";
@@ -2740,6 +2742,44 @@ impl RpcClient {
         .await
     }
 
+    /// Manual, recoverable context compaction on a native Code session. The
+    /// operation holds one bounded summarization request plus a durable
+    /// commit, so the timeout covers the daemon-side operation deadline
+    /// with margin; the daemon also refuses busy sessions fail-fast.
+    pub async fn session_compact_context(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+    ) -> Result<SessionCompactContextResult> {
+        self.call_with_timeout(
+            method::SESSION_COMPACT_CONTEXT,
+            serde_json::json!({
+                "session_id": session_id,
+                "operation_id": operation_id,
+            }),
+            Duration::from_secs(240),
+        )
+        .await
+    }
+
+    /// Deactivate the active context-compaction checkpoint and rebuild the
+    /// projection from retained originals plus later turns.
+    pub async fn session_restore_context(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+    ) -> Result<SessionRestoreContextResult> {
+        self.call_with_timeout(
+            method::SESSION_RESTORE_CONTEXT,
+            serde_json::json!({
+                "session_id": session_id,
+                "operation_id": operation_id,
+            }),
+            Duration::from_secs(60),
+        )
+        .await
+    }
+
     pub async fn session_approve(
         &self,
         session_id: &str,
@@ -4266,6 +4306,48 @@ pub struct SessionNewResult {
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SessionCancelResult {}
+
+/// Token usage of one summarization operation, as reported by the provider.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CompactionUsageResult {
+    #[serde(default)]
+    pub input_tokens: Option<u64>,
+    #[serde(default)]
+    pub output_tokens: Option<u64>,
+}
+
+/// Result of `session/compact-context`.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionCompactContextResult {
+    /// `activated` | `already_committed` | `superseded`.
+    pub status: String,
+    #[serde(default)]
+    pub covered_turns: usize,
+    #[serde(default)]
+    pub covered_message_rows: usize,
+    #[serde(default)]
+    pub estimated_tokens_before: u64,
+    #[serde(default)]
+    pub estimated_tokens_after: u64,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub usage: Option<CompactionUsageResult>,
+    #[serde(default)]
+    pub installed: bool,
+}
+
+/// Result of `session/restore-context`.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionRestoreContextResult {
+    /// `deactivated` | `already_deactivated` | `no_active_checkpoint`.
+    pub status: String,
+    #[serde(default)]
+    pub covered_turns: Option<usize>,
+}
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -410,6 +410,88 @@ rpc_type! {
     }
 }
 
+rpc_type! {
+    /// Params for `session/compact-context` (manual, recoverable context
+    /// compaction; native ZeroCode Code sessions only).
+    pub struct SessionCompactContextParams {
+        pub session_id: String,
+        /// Caller-supplied operation identity. A retry of a committed
+        /// operation reuses its id and is recognized idempotently; the
+        /// server generates one when omitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub operation_id: Option<String>,
+    }
+}
+
+rpc_type! {
+    /// Token usage reported by the summarization provider, when available.
+    /// Fields are honest absence when the provider does not report them.
+    pub struct CompactionUsage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub input_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub output_tokens: Option<u64>,
+    }
+}
+
+rpc_type! {
+    pub struct SessionCompactContextResult {
+        pub session_id: String,
+        pub operation_id: String,
+        /// `activated` (new checkpoint committed), `already_committed`
+        /// (idempotent retry of the active checkpoint), or `superseded`
+        /// (this operation committed earlier but a later restore or
+        /// recompaction replaced it — the current projection is unchanged).
+        pub status: String,
+        /// Number of settled terminal turns the checkpoint covers.
+        pub covered_turns: usize,
+        /// Number of durable message rows the checkpoint covers.
+        pub covered_message_rows: usize,
+        /// Display-only size estimates, in the runtime's shared
+        /// characters-per-token heuristic. Estimates are not integrity data.
+        pub estimated_tokens_before: u64,
+        pub estimated_tokens_after: u64,
+        /// The inspectable continuity summary text.
+        pub summary: String,
+        pub model_provider: String,
+        pub model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub usage: Option<CompactionUsage>,
+        /// Whether the live in-process history projection was replaced.
+        /// `false` means the committed checkpoint is authoritative but the
+        /// live incarnation was invalidated: the next prompt rehydrates
+        /// from the committed projection.
+        #[serde(default)]
+        pub installed: bool,
+    }
+}
+
+rpc_type! {
+    /// Params for `session/restore-context` (deactivate the active
+    /// compaction checkpoint; originals plus later turns become the
+    /// projection again).
+    pub struct SessionRestoreContextParams {
+        pub session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub operation_id: Option<String>,
+    }
+}
+
+rpc_type! {
+    pub struct SessionRestoreContextResult {
+        pub session_id: String,
+        pub operation_id: String,
+        /// `deactivated`, `already_deactivated`, or `no_active_checkpoint`.
+        pub status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub covered_turns: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub covered_message_rows: Option<i64>,
+        #[serde(default)]
+        pub installed: bool,
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // ── Memory ───────────────────────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════
