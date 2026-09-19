@@ -151,6 +151,13 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
             println!(
                 "{}",
                 get_required_cli_string_with_args(
+                    "cli-sop-global-ceiling",
+                    &[("value", &config.sop.max_concurrent_total.to_string())]
+                )
+            );
+            println!(
+                "{}",
+                get_required_cli_string_with_args(
                     "cli-sop-admission-policy",
                     &[("value", &sop.admission_policy.to_string())]
                 )
