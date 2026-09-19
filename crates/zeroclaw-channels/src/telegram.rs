@@ -9692,7 +9692,7 @@ mod tests {
             false,
         )
         .with_persistence(Arc::new(RwLock::new(model_picker_config())))
-        .with_api_base(server.uri());
+        .with_mock_api_base(server.uri());
         let request = ChannelModelPickerRequest {
             requesting_user: "test_user".into(),
             requesting_user_id: "123".into(),
@@ -9774,7 +9774,7 @@ mod tests {
                 false,
             )
             .with_persistence(Arc::new(RwLock::new(model_picker_config())))
-            .with_api_base(server.uri()),
+            .with_mock_api_base(server.uri()),
         );
         let pacing = zeroclaw_config::schema::TelegramConfig {
             reply_min_interval_secs: 3600,
@@ -9828,7 +9828,7 @@ mod tests {
             false,
         )
         .with_persistence(Arc::new(RwLock::new(model_picker_config())))
-        .with_api_base(server.uri());
+        .with_mock_api_base(server.uri());
         let request = ChannelModelPickerRequest {
             requesting_user: "test_user".into(),
             requesting_user_id: "123".into(),
@@ -9885,7 +9885,7 @@ mod tests {
             false,
         )
         .with_persistence(Arc::new(RwLock::new(model_picker_config())))
-        .with_api_base(server.uri());
+        .with_mock_api_base(server.uri());
         let request = ChannelModelPickerRequest {
             requesting_user: "test_user".into(),
             requesting_user_id: "123".into(),
@@ -10288,7 +10288,7 @@ mod tests {
             Arc::new(|| vec!["123".into()]),
             false,
         )
-        .with_api_base(server.uri());
+        .with_mock_api_base(server.uri());
         let _writer_guard = zeroclaw_log::__private_test_writer_lock();
         let _hook_guard = zeroclaw_log::__private_test_hook_lock();
         let _hook_cleanup = BroadcastHookGuard;
@@ -10360,7 +10360,7 @@ mod tests {
             false,
         )
         .with_persistence(Arc::new(RwLock::new(model_picker_config())))
-        .with_api_base(server.uri());
+        .with_mock_api_base(server.uri());
         let token = uuid::Uuid::new_v4().to_string();
         channel
             .insert_pending_model_picker_batch(vec![(
@@ -10436,7 +10436,7 @@ mod tests {
             false,
         )
         .with_persistence(Arc::new(RwLock::new(model_picker_config())))
-        .with_api_base(server.uri());
+        .with_mock_api_base(server.uri());
         let open_token = uuid::Uuid::new_v4().to_string();
         let cancel_token = uuid::Uuid::new_v4().to_string();
         let base = PendingModelPicker {
@@ -10540,7 +10540,7 @@ mod tests {
             false,
         )
         .with_persistence(Arc::new(RwLock::new(model_picker_config())))
-        .with_api_base(server.uri());
+        .with_mock_api_base(server.uri());
         let open_token = uuid::Uuid::new_v4().to_string();
         let cancel_token = uuid::Uuid::new_v4().to_string();
         let base = PendingModelPicker {
@@ -10696,7 +10696,7 @@ mod tests {
             false,
         )
         .with_persistence(Arc::new(RwLock::new(model_picker_config())))
-        .with_api_base(server.uri());
+        .with_mock_api_base(server.uri());
         let token = uuid::Uuid::new_v4().to_string();
         channel
             .insert_pending_model_picker_batch(vec![(
@@ -10783,7 +10783,7 @@ mod tests {
             false,
         )
         .with_persistence(Arc::new(RwLock::new(model_picker_config())))
-        .with_api_base(server.uri());
+        .with_mock_api_base(server.uri());
         let token = uuid::Uuid::new_v4().to_string();
         channel
             .insert_pending_model_picker_batch(vec![(
@@ -10890,7 +10890,7 @@ mod tests {
             false,
         )
         .with_persistence(Arc::new(RwLock::new(model_picker_config())))
-        .with_api_base(server.uri());
+        .with_mock_api_base(server.uri());
         let token = uuid::Uuid::new_v4().to_string();
         channel
             .insert_pending_model_picker_batch(vec![(
@@ -10997,7 +10997,7 @@ mod tests {
             false,
         )
         .with_persistence(Arc::new(RwLock::new(model_picker_config())))
-        .with_api_base(server.uri());
+        .with_mock_api_base(server.uri());
         let token = uuid::Uuid::new_v4().to_string();
         channel
             .insert_pending_model_picker_batch(vec![(
@@ -11104,7 +11104,7 @@ mod tests {
             false,
         )
         .with_persistence(Arc::new(RwLock::new(model_picker_config())))
-        .with_api_base(server.uri());
+        .with_mock_api_base(server.uri());
         let token = uuid::Uuid::new_v4().to_string();
         channel
             .insert_pending_model_picker_batch(vec![(
@@ -13773,7 +13773,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_api_base(mock_server.uri())
+        .with_mock_api_base(mock_server.uri())
         .with_transcription(tc);
         let update = serde_json::json!({
             "message": {

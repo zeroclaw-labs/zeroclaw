@@ -97,6 +97,35 @@ pub(crate) const MAX_MALFORMED_TOOL_PROTOCOL_RETRIES: usize = 2;
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 pub(crate) const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
+async fn emit_unforwarded_native_narration(
+    event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
+    remainder: &str,
+    protocol_suppressed: bool,
+    has_native_tool_calls: bool,
+) {
+    if !remainder.is_empty() && !protocol_suppressed && has_native_tool_calls {
+        events::emit_posthoc_turn_chunk(event_tx, remainder).await;
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn streamed_prefix_relays_only_unforwarded_native_narration_suffix() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+    let remainder = unforwarded_narration("About to check the count.", "About to ");
+
+    emit_unforwarded_native_narration(Some(&tx), remainder, false, true).await;
+
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(TurnEvent::Chunk { delta }) if delta == "check the count."
+    ));
+    assert!(
+        rx.try_recv().is_err(),
+        "the live prefix must not be replayed"
+    );
+}
+
 /// Complete system-prompt variants for the two tool transports supported by a
 /// turn. The caller owns construction; the loop only selects the variant after
 /// a before-LLM hook has finalized the model that will receive the request.
@@ -1153,6 +1182,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             let fallback =
                 crate::i18n::get_required_cli_string("channel-runtime-malformed-tool-output");
             accumulated_display_text.push_str(&fallback);
+            // The fallback is synthesized here, never streamed live, and is the
+            // turn's only visible output on this exit: an event consumer that
+            // already flushed streamed narration would otherwise hide the
+            // TurnComplete payload. Same rationale as the max-iteration emit.
+            events::emit_posthoc_turn_chunk(event_tx.as_ref(), &fallback).await;
             if let Some(ref tx) = on_delta {
                 let _ = tx.send(StreamDelta::Text(fallback.to_string())).await;
             }
@@ -1258,20 +1292,33 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // Relay only the portion of narration the live stream did not already
         // deliver: re-sending the whole thing duplicates it.
         if !display_text.is_empty() {
+            let remainder = unforwarded_narration(&display_text, &streamed_visible_text);
+            // Send any unforwarded remainder as a post-hoc Chunk, even when an
+            // earlier prefix streamed live. Gated on event_tx independently of
+            // on_delta (never nested — §8.4). The native-tool-calls condition
+            // is parity with the on_delta relay below: text-parsed tool calls
+            // have their markup stripped from display, so only native
+            // providers carry separable narration. Loosen both together if a
+            // parsed-tool provider is ever shown to leave visible narration.
+            emit_unforwarded_native_narration(
+                event_tx.as_ref(),
+                remainder,
+                protocol_suppressed,
+                !native_tool_calls.is_empty(),
+            )
+            .await;
             // `protocol_suppressed` withholds the whole turn; the empty-remainder
             // skip below handles the guard-passed case where the live stream already forwarded every byte.
             if !native_tool_calls.is_empty()
                 && !protocol_suppressed
+                && !remainder.is_empty()
                 && let Some(ref tx) = on_delta
             {
-                let remainder = unforwarded_narration(&display_text, &streamed_visible_text);
-                if !remainder.is_empty() {
-                    let mut narration = remainder.to_string();
-                    if !narration.ends_with('\n') {
-                        narration.push('\n');
-                    }
-                    let _ = tx.send(StreamDelta::Text(narration)).await;
+                let mut narration = remainder.to_string();
+                if !narration.ends_with('\n') {
+                    narration.push('\n');
                 }
+                let _ = tx.send(StreamDelta::Text(narration)).await;
             }
             if !silent {
                 eprint!("{display_text}");
