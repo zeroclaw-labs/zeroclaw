@@ -62,8 +62,11 @@ tool-file-download-error-move = Échec du déplacement du fichier téléchargé 
 tool-file-download-success = { $written } octets téléchargés vers { $dest_path } ({ $status })
 tool-file-read = Lire le contenu du fichier avec les numéros de ligne. Prise en charge de la lecture partielle via offset et limite. Les fichiers binaires et images sont rejetés (utilisez l'outil image_info pour les images). Définissez encoding="base64" pour renvoyer les octets bruts encodés en base64 (pour les fichiers binaires tels que .pdf/.xlsx/.docx) ; offset/limit sont ignorés dans ce mode.
 tool-file-write = Écrire le contenu dans un fichier de l'espace de travail
-tool-git-operations = Effectue des opérations Git structurées (état, diff, journal, branche, engagement, ajouter, checkout, stash). Fournit une sortie JSON analysée et s'intègre à la politique de sécurité pour les contrôles d'autonomie.
+tool-git-operations = Effectue des opérations Git structurées (état, diff, journal, branche, engagement, ajouter, checkout, stash, worktree). Fournit une sortie JSON analysée et s'intègre à la politique de sécurité pour les contrôles d'autonomie.
 tool-git-operations-error-not-in-repo = Pas dans un dépôt Git à '{ $path }'. Choisissez un chemin dans un arbre de travail Git, passez 'path' pour un sous-répertoire du dépôt, ou initialisez un dépôt avant d'exécuter git_operations.
+tool-git-operations-error-repository-outside-authorized-roots = Aucun dépôt Git n'est accessible dans les racines autorisées pour '{ $path }'. Choisissez un chemin dans un dépôt couvert par la racine autorisée applicable, ou initialisez un dépôt avant d'exécuter git_operations.
+tool-git-operations-error-repository-not-authorized = Les métadonnées du dépôt Git à '{ $path }' ne sont pas autorisées pour cette opération. Choisissez un dépôt couvert par la racine autorisée applicable.
+tool-git-operations-error-path-not-authorized = Le chemin Git '{ $path }' n'est pas autorisé pour cette opération. Choisissez un chemin couvert par la racine autorisée applicable.
 tool-git-forge-error-requires-field = { $resource }.{ $action } nécessite '{ $field }'.
 tool-git-forge-error-requires-number = { $resource }.{ $action } nécessite 'number'.
 tool-git-forge-error-issue-close-reason = issue.close 'reason' doit être 'completed' ou 'not_planned'.
