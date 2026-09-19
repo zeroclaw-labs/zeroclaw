@@ -21,7 +21,10 @@
 //! is for in-daemon tasks. Mirrors the `apps/zerocode` exemption.
 #![allow(clippy::disallowed_methods)]
 
-mod ws_accept;
+mod enroll_proxy;
+mod enroll_route;
+mod frontdoor;
+mod frontdoor_assets;
 
 use anyhow::Result;
 use base64::Engine as _;
@@ -96,6 +99,15 @@ const DAEMON_WRITE_STALL: Duration = Duration::from_secs(60);
 /// drains a 256-slot channel instantly; needing longer than this means the link
 /// is wedged, and the client is refused exactly as if it were gone.
 const DAEMON_HANDOFF_BUDGET: Duration = Duration::from_secs(5);
+
+/// Concurrent browser frontdoor HTTP sessions (see `Inner::frontdoor_permits`).
+///
+/// Small on purpose. Each session can hold an enrollment route open against a
+/// daemon, and enrollment is an operator-driven, one-at-a-time act - not a
+/// traffic plane. A relay under a browser flood should shed frontdoor sessions
+/// long before it degrades the relay plane, which is why this pool is both
+/// separate from and much smaller than `max_pending_handshakes`.
+const MAX_FRONTDOOR_SESSIONS: usize = 16;
 
 /// Which daemons may register a rendezvous on this relay.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,6 +291,20 @@ pub struct RelayConfig {
     /// shared-token modes one permitted party can mint unlimited signing keys
     /// and node-ids, so the registry needs its own aggregate bound.
     pub max_registered_nodes: usize,
+    /// Serve the browser enrollment frontdoor (page + enrollment routes) from
+    /// this relay.
+    ///
+    /// OFF by default, and a narrowing of the blind-forwarder guarantee in two
+    /// distinct ways. A relay that serves enrollment code is a TRUSTED CODE
+    /// ORIGIN for those browsers, and - because a browser cannot speak the
+    /// daemon's TLS enrollment protocol - this relay also becomes a PRINCIPAL in
+    /// their enrollment: it performs the exchange itself and sees the pairing
+    /// code and the issued certificate. It does not see the private key, which
+    /// the browser generates and keeps.
+    ///
+    /// zerocode/native enrollment is relay-blind regardless of this knob, and
+    /// the RPC plane is unaffected.
+    pub frontdoor_enabled: bool,
 }
 
 impl RelayConfig {
@@ -311,6 +337,7 @@ impl Default for RelayConfig {
             max_pending_handshakes: 256,
             handshake_timeout: Duration::from_secs(10),
             max_registered_nodes: 1024,
+            frontdoor_enabled: false,
         }
     }
 }
@@ -489,6 +516,17 @@ struct Inner {
     /// Pre-admission handshake permits (see `RelayConfig::max_pending_handshakes`).
     handshake_permits: Arc<tokio::sync::Semaphore>,
     handshake_timeout: Duration,
+    /// Serve the browser frontdoor on plain HTTP hits (opt-in; see
+    /// [`RelayConfig::frontdoor_enabled`]).
+    frontdoor_enabled: bool,
+    /// Concurrent frontdoor HTTP sessions.
+    ///
+    /// Deliberately a SEPARATE pool from `handshake_permits`. A frontdoor
+    /// session performs a whole enrollment exchange, which is far longer than a
+    /// handshake, so charging it to the pre-admission pool would let browser
+    /// traffic shed the daemons and clients that pool exists to protect. This
+    /// bounds the frontdoor on its own instead.
+    frontdoor_permits: Arc<tokio::sync::Semaphore>,
     max_registered_nodes: usize,
     daemons: Mutex<HashMap<String, DaemonHandle>>,
     next_conn: AtomicU64,
@@ -573,6 +611,8 @@ impl RelayServer {
                     cfg.max_pending_handshakes.max(1),
                 )),
                 handshake_timeout: cfg.handshake_timeout,
+                frontdoor_enabled: cfg.frontdoor_enabled,
+                frontdoor_permits: Arc::new(tokio::sync::Semaphore::new(MAX_FRONTDOOR_SESSIONS)),
                 max_registered_nodes: cfg.max_registered_nodes.max(1),
                 daemons: Mutex::new(HashMap::new()),
                 next_conn: AtomicU64::new(1),
@@ -665,15 +705,40 @@ impl RelayServer {
                     } else {
                         None
                     };
-                    match ws_accept::accept_websocket(accepted).await {
-                        Ok(ws_accept::Accepted::WebSocket(w)) => Some((w, cert_node_id)),
-                        Ok(ws_accept::Accepted::Rejected) | Err(_) => None,
+                    match frontdoor::accept(accepted, hs_inner.frontdoor_enabled).await {
+                        Ok(frontdoor::Accepted::WebSocket(w)) => {
+                            Some(Classified::WebSocket(w, cert_node_id))
+                        }
+                        Ok(frontdoor::Accepted::Http(session)) => {
+                            Some(Classified::Frontdoor(session))
+                        }
+                        Ok(frontdoor::Accepted::Rejected) | Err(_) => None,
                     }
                 };
-                let Ok(Some((ws, cert_node_id))) =
-                    tokio::time::timeout_at(deadline, handshake).await
+                let Ok(Some(classified)) = tokio::time::timeout_at(deadline, handshake).await
                 else {
-                    return; // shed: timed out or never became a relay WebSocket
+                    return; // shed: timed out or never became a relay connection
+                };
+                let (ws, cert_node_id) = match classified {
+                    Classified::WebSocket(ws, cert_node_id) => (ws, cert_node_id),
+                    // A frontdoor session is served OUTSIDE the handshake
+                    // deadline: that budget bounds how long a socket may take to
+                    // become a relay connection, while an enrollment exchange is
+                    // a whole multi-second conversation with a daemon. It is
+                    // bounded instead by its own session budget and its own
+                    // permit pool, and it releases the pre-admission permit so
+                    // browser traffic cannot shed daemons and clients.
+                    Classified::Frontdoor(session) => {
+                        drop(permit);
+                        let Ok(frontdoor_permit) =
+                            inner.frontdoor_permits.clone().try_acquire_owned()
+                        else {
+                            return; // at frontdoor capacity: shed this session
+                        };
+                        let _frontdoor_permit = frontdoor_permit;
+                        frontdoor::serve_http(session, inner).await;
+                        return;
+                    }
                 };
                 let mut ws = *ws;
                 let first = match tokio::time::timeout_at(deadline, next_control(&mut ws)).await {
@@ -687,6 +752,21 @@ impl RelayServer {
             });
         }
     }
+}
+
+/// What an accepted socket turned out to be, once its request head was read.
+///
+/// The two arms have different lifetimes on purpose: a WebSocket continues under
+/// the pre-admission handshake deadline, while a frontdoor session is served
+/// after it (see the accept loop).
+enum Classified<S> {
+    /// A relay WebSocket, with the outer-mTLS-derived target node-id if any.
+    WebSocket(
+        Box<WebSocketStream<frontdoor::PrefixedIo<S>>>,
+        Option<String>,
+    ),
+    /// A plain HTTP request for the opt-in browser frontdoor.
+    Frontdoor(frontdoor::HttpSession<S>),
 }
 
 /// The target node-id for a client: the outer client cert CN (outer-mTLS variant)
@@ -3309,5 +3389,138 @@ mod graceful_close_tests {
         );
         drop((daemon, client));
         daemon_task.abort();
+    }
+}
+
+/// Regression coverage for the frontdoor enrollment route's teardown.
+///
+/// A leg (`crate::enroll_proxy`) opens a route, uses it, and then drops the
+/// route's guard on EVERY exit - success and failure alike (a TLS failure, the
+/// 64 KiB byte cap, a 15s read or 30s leg timeout, a refused pin). That guard
+/// drop must reclaim the conn slot in the per-node `conns` map AND tell the
+/// daemon to release its half, right then. The map is shared with the WS data
+/// plane, so a slot the teardown forgets is a slot a legitimate relay client on
+/// that node cannot use until the daemon's own timeout eventually fires - a
+/// window an unauthenticated frontdoor caller who knows a node-id can drive.
+///
+/// Lives here, not in `enroll_route.rs`, because it registers a `DaemonHandle`
+/// (whose fields are private to this module) and reads the private `conns` map
+/// to assert reclamation - the only place that observation is possible.
+#[cfg(test)]
+mod enroll_route_reclaim_tests {
+    use super::*;
+    use crate::enroll_route::open_enroll_route;
+
+    /// Register a routable node directly and hand back its outbound channel and
+    /// conn map, so the test can play a daemon without a second handshake.
+    async fn register_stub_daemon(
+        server: &RelayServer,
+        node_id: &str,
+    ) -> (mpsc::Receiver<Message>, Arc<Mutex<ConnRoutes>>) {
+        let (to_daemon, daemon_rx) = mpsc::channel::<Message>(64);
+        let conns: Arc<Mutex<ConnRoutes>> = Arc::new(Mutex::new(HashMap::new()));
+        server.inner.daemons.lock().await.insert(
+            node_id.to_string(),
+            DaemonHandle {
+                fpr: "stub-fingerprint".into(),
+                epoch: 1,
+                to_daemon,
+                conns: conns.clone(),
+                metrics: Arc::new(NodeMetrics::default()),
+                // Generous so the per-node connect budget (A6) never refuses a
+                // leg in this test; reclamation, not rate-limiting, is the point.
+                connect_bucket: Arc::new(Mutex::new(TokenBucket::new(4096, 4096.0))),
+                supersede: Arc::new(tokio::sync::Notify::new()),
+            },
+        );
+        (daemon_rx, conns)
+    }
+
+    /// Play the daemon: pair every `Open` by delivering `Opened` to the matching
+    /// route. Every other frame (the pump's up-front `Window`, the `Close` a
+    /// torn-down route emits) is drained and ignored, which is all pairing needs.
+    fn spawn_pairing_daemon(
+        mut daemon_rx: mpsc::Receiver<Message>,
+        conns: Arc<Mutex<ConnRoutes>>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            while let Some(msg) = daemon_rx.recv().await {
+                let Ok(text) = msg.into_text() else { continue };
+                if let Ok(Control::Open { conn_id, .. }) = Control::from_json(text.as_str()) {
+                    let events = conns
+                        .lock()
+                        .await
+                        .get(&conn_id)
+                        .map(|route| route.events.clone());
+                    if let Some(events) = events {
+                        let _ = events.send(ConnEvent::Opened).await;
+                    }
+                }
+            }
+        })
+    }
+
+    /// Wait, bounded, for the conn map to drain to empty. The pump reclaims on
+    /// its own task once the guard signals it, so this yields until it has.
+    async fn wait_until_empty(conns: &Arc<Mutex<ConnRoutes>>) {
+        for _ in 0..2000 {
+            if conns.lock().await.is_empty() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!(
+            "the conn map never drained: {} slot(s) leaked after a torn-down leg",
+            conns.lock().await.len()
+        );
+    }
+
+    /// (a) Every torn-down leg reclaims its slot, and (b) a later legitimate
+    /// enrollment on the node still opens after more failed legs than the node's
+    /// whole connection budget.
+    #[tokio::test]
+    async fn a_dropped_enrollment_route_reclaims_its_conn_slot() {
+        const CAP: usize = 4;
+        let server = RelayServer::new(RelayConfig {
+            max_conns_per_node: CAP,
+            ..RelayConfig::default()
+        });
+        let (daemon_rx, conns) = register_stub_daemon(&server, "node").await;
+        let daemon = spawn_pairing_daemon(daemon_rx, conns.clone());
+
+        // Drive MORE post-pairing legs than the node's whole budget. If a torn
+        // -down leg leaked its slot, the map would fill at CAP and the next open
+        // would be refused `Busy`; reaching CAP + 2 opens proves each reclaimed.
+        for leg in 0..(CAP + 2) {
+            let route = open_enroll_route(&server.inner, "node")
+                .await
+                .unwrap_or_else(|e| panic!("leg {leg} must open (slot leak?): {e:?}"));
+            assert_eq!(
+                conns.lock().await.len(),
+                1,
+                "leg {leg}: exactly one live slot while the route is held"
+            );
+
+            // Keep the byte stream ALIVE and drop only the guard, so the guard
+            // drop is the SOLE thing that can reclaim the slot - this asserts the
+            // guard's teardown, not an incidental stream EOF.
+            let (stream, guard) = route.split();
+            drop(guard);
+            wait_until_empty(&conns).await;
+            assert!(
+                conns.lock().await.is_empty(),
+                "leg {leg}: the conn slot must be reclaimed when the guard drops"
+            );
+            drop(stream);
+        }
+
+        let route = open_enroll_route(&server.inner, "node")
+            .await
+            .expect("a later enrollment on the node must still open");
+        assert_eq!(conns.lock().await.len(), 1);
+        drop(route);
+        wait_until_empty(&conns).await;
+
+        daemon.abort();
     }
 }
