@@ -231,6 +231,11 @@ impl Observer for ChannelNotifyObserver {
 /// Per-sender conversation history for channel messages.
 /// Bounded by `MAX_CONVERSATION_SENDERS` — oldest-accessed senders are evicted.
 type ConversationHistoryMap = Arc<Mutex<lru::LruCache<String, Vec<ChatMessage>>>>;
+/// Per-sender breadcrumb provenance for channel histories. Carried alongside
+/// the transcript so a synthetic crumb is not re-inferred from user-controlled
+/// text on every restore. `true` means the stored history's first non-system
+/// message is the synthetic trim marker.
+type HistoryCrumbMap = Arc<Mutex<lru::LruCache<String, bool>>>;
 /// Senders that requested `/new` or `/clear` and must force a fresh prompt on their next message.
 type PendingNewSessionSet = Arc<Mutex<HashSet<String>>>;
 /// Maximum conversation senders kept in memory (LRU eviction beyond this).
@@ -626,6 +631,7 @@ struct ChannelRuntimeContext {
     max_tool_iterations: usize,
     min_relevance_score: f64,
     conversation_histories: ConversationHistoryMap,
+    history_crumb_flags: HistoryCrumbMap,
     pending_new_sessions: PendingNewSessionSet,
     provider_cache: ProviderCacheMap,
     route_overrides: RouteSelectionMap,
@@ -3223,6 +3229,10 @@ fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .pop(sender_key);
+    ctx.history_crumb_flags
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pop(sender_key);
 }
 
 fn mark_sender_for_new_session(ctx: &ChannelRuntimeContext, sender_key: &str) {
@@ -3620,11 +3630,155 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
 /// Number of most-recent turns whose tool-result payloads are kept at full size
 /// when proactively trimming. The active exchange stays intact; only older
 /// tool results are shrunk to a bounded extract.
-fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
+///
+/// Returns `Some` with the resulting cached turns for `sender_key`, taken
+/// under the same lock that performed the append. A caller that needs to know
+/// exactly what its own turn observed (to reconcile a later wholesale
+/// replacement against concurrent same-sender writes, see
+/// `turns_appended_after`) must use this return value rather than a second,
+/// separately-locked read: a second read can observe another worker's write
+/// that raced in between, silently shifting what "this turn's own prefix"
+/// means.
+///
+/// Returns `None` when the durable transcript and its breadcrumb provenance
+/// could not both be verified (see `hydration_unavailable` below): the turn
+/// was deliberately NOT appended, persisted, or cached. A caller that treats
+/// `None` like a normal empty-history result would run the request with only
+/// this one message instead of the sender's real conversation; the caller
+/// must defer or refuse the turn instead.
+fn append_sender_turn(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    turn: ChatMessage,
+) -> Option<Vec<ChatMessage>> {
     // Serialize per-sender persistence to prevent interleaving across concurrent
     // workers that share the same conversation_history_key
     let persist_lock = acquire_persist_lock(ctx, sender_key);
     let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    // A failed trim resync evicts the cache so the next turn does not build
+    // on unreconciled state. Reload the durable transcript here, on the next
+    // cache miss, before appending: otherwise `get_or_insert_mut` below would
+    // seed an empty history and the next provider request would contain only
+    // the new message while prior durable turns still exist on disk.
+    // `hydrate_session_transcript` is the canonical reload (cap, orphan
+    // closure, breadcrumb provenance), matching startup hydration.
+    if ctx.session_store.is_some() {
+        let missing = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .peek(sender_key)
+            .is_none();
+        // When the durable transcript and its provenance cannot both be
+        // verified, the turn must not run with only the new message and must
+        // not install a new-message-only cache or durable overwrite: leave
+        // the cache missing so the next turn retries hydration.
+        let mut hydration_unavailable = false;
+        if missing && let Some(ref store) = ctx.session_store {
+            match hydrate_session_transcript(store.as_ref(), sender_key) {
+                Ok(Some(hydrated)) => {
+                    ctx.history_crumb_flags
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .put(sender_key.to_string(), hydrated.crumb_present);
+                    ctx.conversation_histories
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .put(sender_key.to_string(), hydrated.messages);
+                }
+                Ok(None) => {
+                    // No durable transcript: fall through and seed empty below.
+                }
+                Err(_) => {
+                    // Reconciliation failed, but a durable transcript exists
+                    // (hydration only fails after loading a non-empty one).
+                    // Install a verified durable fallback — a fresh load
+                    // plus provenance resolution — instead of seeding an
+                    // empty cache: the provider must not lose its context
+                    // to a recoverable persistence problem, and a
+                    // new-message-only cache would also stop later turns
+                    // from retrying hydration. Deliberately uncapped: the
+                    // next successful reconciliation re-caps and persists.
+                    // If the transcript vanished concurrently, the load is
+                    // empty and we fall through to seed empty as usual.
+                    // Use `try_load` so an unreadable transcript does not
+                    // become an empty cache — leave the cache missing so the
+                    // next turn retries hydration instead of running with
+                    // only the new message.
+                    match store.try_load(sender_key) {
+                        Ok(fallback) if !fallback.is_empty() => {
+                            match resolve_cold_crumb_provenance_result(
+                                Some(store.as_ref()),
+                                sender_key,
+                                &fallback,
+                            ) {
+                                Ok(flag) => {
+                                    ctx.history_crumb_flags
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .put(sender_key.to_string(), flag);
+                                    ctx.conversation_histories
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .put(sender_key.to_string(), fallback);
+                                }
+                                Err(()) => {
+                                    // The transcript is readable but its
+                                    // provenance record is not: installing
+                                    // the fallback with a guessed `false`
+                                    // flag would let a persisted synthetic
+                                    // breadcrumb be counted as a real turn.
+                                    // Leave the cache unreconciled instead;
+                                    // the next turn retries hydration.
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                        .with_attrs(
+                                            ::serde_json::json!({
+                                                "sender_key": sender_key,
+                                            })
+                                        ),
+                                        "Breadcrumb provenance unreadable after hydration failure; leaving cache unreconciled"
+                                    );
+                                    hydration_unavailable = true;
+                                }
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({
+                                    "sender_key": sender_key,
+                                    "error": format!("{}", e),
+                                })),
+                                "Failed to load durable fallback after hydration failure; leaving cache unreconciled"
+                            );
+                            hydration_unavailable = true;
+                        }
+                    }
+                }
+            }
+            if hydration_unavailable {
+                // Fail closed: signal unavailable instead of persisting the
+                // turn or installing a cache entry, so the durable transcript
+                // is neither discarded nor replaced from an unverified state,
+                // the next turn retries hydration, and the caller does not
+                // mistake this for a genuine empty-history turn.
+                return None;
+            }
+        }
+    }
 
     // Persist to JSONL before adding to in-memory history.
     if let Some(ref store) = ctx.session_store
@@ -3659,6 +3813,303 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
     while turns.len() > max_history {
         turns.remove(0);
     }
+    Some(turns.clone())
+}
+
+/// Return `retained_turns` with its last message's content replaced by
+/// `raw_current_turn_content`, if set. `retained_turns` ends with the
+/// current turn's working-buffer user message, which the caller has
+/// prepended with the volatile turn-context preamble (reply_target,
+/// sender, message_id, recalled memory) for the LLM call only; the durable
+/// transcript must store the clean raw content instead, so a restart or
+/// reload never surfaces per-message routing metadata or recalled memory
+/// to a later turn.
+fn strip_volatile_preamble_before_persist(
+    retained_turns: &[ChatMessage],
+    raw_current_turn_content: Option<&str>,
+) -> Vec<ChatMessage> {
+    let mut cleaned = retained_turns.to_vec();
+    if let Some(raw) = raw_current_turn_content
+        && let Some(last) = cleaned.last_mut()
+    {
+        last.content = raw.to_string();
+    }
+    cleaned
+}
+
+/// Return the suffix of `live` that was appended after `known_prefix` was
+/// observed. Finds the longest suffix of `known_prefix` that still matches a
+/// prefix of `live` (by role and content) and returns whatever follows it in
+/// `live`. A same-sender cache is bounded and evicts from the front, so
+/// `known_prefix`'s own earliest messages can be rotated out of `live` by a
+/// concurrent worker's append without changing `live`'s length — comparing
+/// lengths alone cannot tell that rotation apart from no concurrent write at
+/// all, or from a concurrent write that also happened to bring the length
+/// back down. When no overlap is found at all (e.g. the whole prefix was
+/// evicted, or a concurrent `/new` reset replaced it), this returns the
+/// entire live slice: a duplicated turn is recoverable, a silently dropped
+/// one is not.
+fn turns_appended_after<'a>(
+    known_prefix: &[ChatMessage],
+    live: &'a [ChatMessage],
+) -> &'a [ChatMessage] {
+    let max_overlap = known_prefix.len().min(live.len());
+    let overlap = (0..=max_overlap)
+        .rev()
+        .find(|&n| {
+            known_prefix[known_prefix.len() - n..]
+                .iter()
+                .zip(&live[..n])
+                .all(|(a, b)| a.role == b.role && a.content == b.content)
+        })
+        .unwrap_or(0);
+    &live[overlap..]
+}
+
+/// Replace the cached and durable transcript for `sender_key` with
+/// `trimmed_turns` (the loop-owned history, still including the current
+/// user turn and any synthetic breadcrumb, minus the leading system
+/// prompt), and record `breadcrumb_present` as the same durable fact. The
+/// tool-call loop may have dropped older whole turns and/or inserted a
+/// breadcrumb directly on its working buffer; without this, the cache and
+/// JSONL store keep the pre-trim transcript and the wrong breadcrumb
+/// provenance, so a restart resurrects context the prior `HistoryTrimmed`
+/// event said was removed. Both writes happen under the same per-sender
+/// persist lock so the transcript and its provenance cannot observably
+/// diverge. Callers append this turn's own new tool/assistant messages
+/// afterward, so this only resyncs the base the loop actually trimmed.
+///
+/// `known_prefix` is the cache content this turn observed right after
+/// appending its own inbound message (via `append_sender_turn`'s return
+/// value), before the tool loop ran. Without `interrupt_on_new_message`,
+/// another worker for the same `sender_key` can run concurrently and append
+/// its own complete turn under this same lock while this turn's loop is
+/// still in flight. `turns_appended_after` finds whatever the live cache has
+/// beyond `known_prefix` — by content, not length — and that tail is
+/// appended after `trimmed_turns` instead of being silently discarded by a
+/// wholesale replace. A raw length comparison is not enough here: the cache
+/// is bounded by `max_history_messages` and evicts from the front, so a
+/// concurrent worker's append can rotate `known_prefix`'s own earliest
+/// messages out of the live cache without changing its length, or even
+/// shrinking it below `known_prefix.len()`.
+///
+/// Returns `true` once the durable write (if any) has succeeded and the
+/// in-memory cache and `history_crumb_flags` now match the published state.
+/// Returns `false` when a session store is configured but
+/// `replace_conversation_state` failed. `replace_conversation_state` may
+/// have partially applied (e.g. a JSONL transcript rewrite that lands before
+/// a breadcrumb sidecar write fails), so on failure this reloads whatever is
+/// actually durable now and publishes that to both the cache and
+/// `history_crumb_flags` — falling back to `crumb_present_before_loop` only
+/// when the backend reports the provenance was genuinely never recorded
+/// (`Ok(None)`). When the provenance read itself errors, this leaves the
+/// cache and flag exactly as they were before this call instead of pairing
+/// a possibly-incomplete transcript reload with a guessed flag: an unread
+/// provenance is not the same as a confirmed absence, and publishing a
+/// guess in its place could make a later trim treat a synthetic marker as
+/// a real turn or vice versa.
+fn resync_sender_history_after_trim(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    trimmed_turns: &[ChatMessage],
+    breadcrumb_present: bool,
+    known_prefix: &[ChatMessage],
+    crumb_present_before_loop: bool,
+) -> bool {
+    let persist_lock = acquire_persist_lock(ctx, sender_key);
+    let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut published_turns = trimmed_turns.to_vec();
+    {
+        let histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(live) = histories.peek(sender_key) {
+            published_turns.extend_from_slice(turns_appended_after(known_prefix, live));
+        }
+    }
+
+    if let Some(ref store) = ctx.session_store {
+        // One call, not two independent best-effort writes: if the transcript
+        // write fails but the flag write then succeeded, durable
+        // `trim_breadcrumb` would describe a trim that was never committed;
+        // if the flag write failed after the transcript succeeded, a restart
+        // could re-infer provenance from text. `replace_conversation_state`
+        // is atomic on backends that can make it so (SQLite) and otherwise
+        // serializes both writes under this same lock. A failure can still
+        // mean the transcript half landed and the breadcrumb half did not
+        // (or vice versa), so on error we reload the backend's actual
+        // current state below instead of assuming nothing changed.
+        if let Err(e) =
+            store.replace_conversation_state(sender_key, &published_turns, breadcrumb_present)
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "Failed to persist trimmed session history and breadcrumb provenance"
+            );
+            match store.get_session_trim_breadcrumb(sender_key) {
+                Ok(reloaded_breadcrumb) => {
+                    let reloaded_turns = store.load(sender_key);
+                    let reloaded_breadcrumb =
+                        reloaded_breadcrumb.unwrap_or(crumb_present_before_loop);
+                    let mut histories = ctx
+                        .conversation_histories
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    histories.put(sender_key.to_string(), reloaded_turns);
+                    drop(histories);
+                    let mut flags = ctx
+                        .history_crumb_flags
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    flags.put(sender_key.to_string(), reloaded_breadcrumb);
+                }
+                Err(e) => {
+                    // The provenance read failed outright: `Err(_)` is not
+                    // `Ok(None)`, so treating it as a confirmed absence
+                    // could publish a guessed flag beside a transcript
+                    // reload that may itself be incomplete. Leave the cache
+                    // and flag untouched rather than claim reconciliation
+                    // that didn't happen; the next successful resync or a
+                    // fresh restart-time reload will reconcile once the
+                    // backend can be read again.
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "Failed to read trim breadcrumb provenance after a persistence \
+                         failure; leaving cached history and breadcrumb flag unreconciled \
+                         rather than publishing a guess"
+                    );
+                }
+            }
+            return false;
+        }
+    }
+
+    let mut histories = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    histories.put(sender_key.to_string(), published_turns);
+    drop(histories);
+    let mut flags = ctx
+        .history_crumb_flags
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    flags.put(sender_key.to_string(), breadcrumb_present);
+    true
+}
+
+/// Resync the cache and durable transcript to the tool-call loop's trimmed
+/// `history` working buffer when the loop changed the breadcrumb or dropped
+/// prior turns, and report whether that resync could be confirmed.
+///
+/// `history_crumb_flags` is written here rather than unconditionally ahead
+/// of this check: `resync_sender_history_after_trim` owns that write on the
+/// resync path (including the failure fallback described on its own doc
+/// comment), and writing it ahead of the check would overwrite the pre-trim
+/// value that failure fallback relies on to decide whether the backend
+/// genuinely never recorded provenance. When nothing was trimmed, this is
+/// the sole writer of the flag.
+///
+/// Returns `true` when a resync was attempted and could not be confirmed
+/// reconciled. Callers must not append this turn's own new messages on top
+/// of the cache in that case: this function has already evicted the cache
+/// entry for `sender_key`, so a caller that appended anyway would just
+/// recreate an unreconciled entry from its own working buffer instead of
+/// letting the next turn reload from the backend.
+#[allow(clippy::too_many_arguments)]
+fn resync_history_after_trim_or_evict_cache(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    history: &[ChatMessage],
+    history_has_trim_breadcrumb: bool,
+    crumb_present_before_loop: bool,
+    prior_turns_len_before_loop: usize,
+    known_prefix: &[ChatMessage],
+    outgoing_user_turn_raw_content: Option<&str>,
+) -> bool {
+    let last_user_idx = history.iter().rposition(|m| m.role == "user").unwrap_or(0);
+    let retained_prior_turns = if last_user_idx >= 1 {
+        &history[1..=last_user_idx]
+    } else {
+        &history[1..1]
+    };
+
+    if history_has_trim_breadcrumb == crumb_present_before_loop
+        && retained_prior_turns.len() == prior_turns_len_before_loop
+    {
+        // Serialize with the trim publication path (`resync_sender_history_after_trim`
+        // holds this same lock while publishing the cache plus `history_crumb_flags`
+        // together). Without it, a stale no-trim worker that snapshotted
+        // `crumb_present_before_loop = false` can complete after a concurrent trim
+        // published `true` and overwrite the newer provenance, pairing a cache that
+        // contains the synthetic breadcrumb with a `false` flag.
+        let persist_lock = acquire_persist_lock(ctx, sender_key);
+        let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
+        // Validate against the current generation before publishing: when the cache
+        // is gone (evicted after an unreconciled resync) there is nothing to confirm,
+        // and the next turn reloads from the backend via `append_sender_turn`;
+        // when the live flag no longer equals what this worker observed, a newer
+        // trim published first and this stale completion must not overwrite it.
+        let cache_present = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .peek(sender_key)
+            .is_some();
+        if !cache_present {
+            return false;
+        }
+        let live_flag = ctx
+            .history_crumb_flags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .peek(sender_key)
+            .copied();
+        if live_flag.is_some_and(|v| v != crumb_present_before_loop) {
+            return false;
+        }
+        let mut flags = ctx
+            .history_crumb_flags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        flags.put(sender_key.to_string(), history_has_trim_breadcrumb);
+        return false;
+    }
+
+    let clean_retained_turns = strip_volatile_preamble_before_persist(
+        retained_prior_turns,
+        outgoing_user_turn_raw_content,
+    );
+    let reconciled = resync_sender_history_after_trim(
+        ctx,
+        sender_key,
+        &clean_retained_turns,
+        history_has_trim_breadcrumb,
+        known_prefix,
+        crumb_present_before_loop,
+    );
+    if !reconciled {
+        // The resync could not confirm that the cache matches whatever
+        // ended up durable (e.g. a partially applied replacement whose
+        // provenance re-read then also failed). Evict the cache entry
+        // instead of leaving it in place: the next turn for this sender
+        // reloads from the backend rather than extending a cache this
+        // turn can no longer vouch for.
+        let mut histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        histories.pop(sender_key);
+    }
+    !reconciled
 }
 
 /// Extract tool-call (assistant with tool_call content) and tool-result
@@ -7621,6 +8072,89 @@ fn record_passive_context(ctx: &ChannelRuntimeContext, msg: &ChannelMessage, his
     );
 }
 
+/// Resolve the cold-start breadcrumb flag for `history_key`: the in-memory
+/// map first, then the durable store's canonical column, and only for
+/// legacy sessions with no record anywhere, inference from the transcript.
+///
+/// A provenance-read error (`Err`) is fail-closed to `false` and never
+/// falls through to text inference. Collapsing `Err` into `None` would let
+/// an unreadable backend coincide with a user-controlled first message that
+/// collides with the breadcrumb text, manufacturing synthetic ownership the
+/// backend never recorded — precisely when the canonical owner state is
+/// unavailable. Legacy inference therefore runs only on `Ok(None)` (a
+/// backend that answers but has never recorded a flag for this sender).
+/// Callers that need to distinguish "confirmed absent" from "unreadable"
+/// re-check the store before publishing authoritative trim state; the
+/// post-loop resync leaves cache and flag untouched on a provenance-read
+/// error rather than pairing a guess with a possibly-incomplete reload.
+fn resolve_cold_crumb_provenance(
+    store: Option<&dyn zeroclaw_infra::session_backend::SessionBackend>,
+    history_key: &str,
+    history: &[ChatMessage],
+) -> bool {
+    // Lenient contract: an unreadable record is treated as absent without
+    // text inference. Callers that install authoritative state must use the
+    // tri-state result instead.
+    resolve_cold_crumb_provenance_result(store, history_key, history).unwrap_or_default()
+}
+
+/// Tri-state provenance resolution: `Ok(flag)` for an explicit record or a
+/// legacy migration, `Err(())` when the provenance record is unreadable.
+/// Callers that pair the result with an installed cache or authoritative
+/// trim state must treat `Err(())` as "unreconciled", never as a confirmed
+/// `false`.
+fn resolve_cold_crumb_provenance_result(
+    store: Option<&dyn zeroclaw_infra::session_backend::SessionBackend>,
+    history_key: &str,
+    history: &[ChatMessage],
+) -> Result<bool, ()> {
+    // Legacy fallback, used only when no owner record exists anywhere:
+    // infer from the restored transcript for old histories predating the
+    // provenance column. A fresh v2 session that happens to start with the
+    // breadcrumb text will have an explicit `false` entry after its first
+    // turn, so it will not be misclassified here. Migration is
+    // locale-independent: check the canonical English breadcrumb (stable
+    // across locales) plus the current-locale string, covering both the
+    // historical value and any future translation. This is best-effort for
+    // unmarked legacy state; a genuine user message that collides with the
+    // breadcrumb on its one-time v1 migration will be misclassified until
+    // the next persist upgrades it to v2.
+    fn legacy_inference(history: &[ChatMessage]) -> bool {
+        let leading_system = history.iter().take_while(|m| m.role == "system").count();
+        if let Some(first) = history.get(leading_system) {
+            first.role == "user"
+                && zeroclaw_runtime::agent::history::is_history_trim_breadcrumb_text(&first.content)
+        } else {
+            false
+        }
+    }
+    let Some(store) = store else {
+        // No durability at all: the in-memory map is the only owner, and
+        // there is no canonical record to consult. Preserve the original
+        // inference behavior for this configuration.
+        return Ok(legacy_inference(history));
+    };
+    match store.get_session_trim_breadcrumb(history_key) {
+        Ok(Some(flag)) => Ok(flag),
+        // The backend answers but has never recorded a flag for this
+        // sender: a legacy session, so inference is the documented
+        // migration path.
+        Ok(None) => Ok(legacy_inference(history)),
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "history_key": history_key,
+                        "error": format!("{}", e),
+                    })),
+                "Trim breadcrumb provenance unreadable; treating as absent without text inference"
+            );
+            Err(())
+        }
+    }
+}
+
 async fn process_channel_message_body(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
@@ -7965,24 +8499,40 @@ async fn process_channel_message_body(
     // full content for every marker type so a later turn can re-load it.
     let timestamped_content =
         timestamped_channel_user_history_content(&msg, WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL);
-    append_sender_turn(
+    // The returned snapshot is exactly what this turn's own append produced
+    // (including any race with a concurrent same-sender worker still in
+    // flight), taken under the same lock as the append itself. A separate,
+    // later read of the cache would risk observing a different worker's
+    // write that landed in between and silently shifting what "this turn's
+    // own prefix" means once the post-loop resync tries to reconcile against
+    // it (see `turns_appended_after`).
+    let Some(known_prefix) = append_sender_turn(
         ctx.as_ref(),
         &history_key,
         ChatMessage::user(&timestamped_content),
-    );
+    ) else {
+        // The durable transcript and its breadcrumb provenance could not both
+        // be verified (see `append_sender_turn`). Running this turn anyway
+        // would send the model only this one message instead of the
+        // sender's real conversation, and persisting it would risk
+        // recreating an unreconciled cache entry. Defer instead: drop this
+        // turn without persisting or replying, so the next inbound message
+        // retries hydration against the still-intact durable transcript.
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "sender": msg.sender,
+                    "history_key": history_key,
+                })),
+            "deferring channel turn: durable history unavailable and unverified"
+        );
+        return;
+    };
 
     // Build history from per-sender conversation cache.
-    let prior_turns_raw = if force_fresh_session {
-        vec![ChatMessage::user(&timestamped_content)]
-    } else {
-        ctx.conversation_histories
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&history_key)
-            .cloned()
-            .unwrap_or_default()
-    };
-    let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
+    let mut prior_turns = normalize_cached_channel_turns(known_prefix.clone());
 
     // Strip stale tool_result blocks from cached turns so the LLM never
     // sees a `<tool_result>` without a preceding `<tool_call>`, which
@@ -8086,15 +8636,49 @@ async fn process_channel_message_body(
     if let Some(ref prefix) = thinking.params.system_prompt_prefix {
         system_prompt = format!("{prefix}\n\n{system_prompt}");
     }
+    // Captured before the tool-call loop can drop whole turns, so the
+    // post-loop resync below can detect that a trim happened.
+    let prior_turns_len_before_loop = prior_turns.len();
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
+    // Breadcrumb provenance is carried alongside the transcript so a synthetic
+    // crumb is not re-inferred from user-controlled text. The per-sender
+    // `history_crumb_flags` in-memory map is checked first; on a cold cache
+    // (e.g. after a restart) the durable session store's canonical column is
+    // consulted next, since it survives process restarts. Only when neither
+    // has ever recorded a flag for this sender do we fall back to inferring
+    // from the restored transcript — legacy sessions predating this column.
+    // A provenance-read error fails closed to `false` (see
+    // `resolve_cold_crumb_provenance`); it is never collapsed into the
+    // legacy inference.
+    let mut history_has_trim_breadcrumb = match ctx
+        .history_crumb_flags
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&history_key)
+        .copied()
+    {
+        Some(flag) => flag,
+        None => resolve_cold_crumb_provenance(ctx.session_store.as_deref(), &history_key, &history),
+    };
+    let crumb_present_before_loop = history_has_trim_breadcrumb;
+    // Unused by this channel path: the pre-injection raw turn content is
+    // already captured and restored wholesale below (`outgoing_user_turn_raw_content`
+    // / `strip_volatile_preamble_before_persist`), which covers the recalled-memory
+    // preamble too, so there is no separate byte-length to record here.
+    let mut channel_injected_memory_preamble: Option<String> = None;
 
+    // Kept so a post-loop trim resync can restore the current turn to this
+    // clean content before persisting; the durable transcript must never
+    // carry the volatile preamble (see the resync call below).
+    let mut outgoing_user_turn_raw_content: Option<String> = None;
     let preamble = build_channel_turn_context_preamble(&msg, target_channel.as_ref());
     if let Some(last_turn) = history.last_mut()
         && last_turn.role == "user"
     {
         let raw_content = last_turn.content.clone();
         last_turn.content = compose_outgoing_user_turn_with_context(&preamble, &raw_content);
+        outgoing_user_turn_raw_content = Some(raw_content);
     }
 
     let matrix_single_message_streaming =
@@ -8648,6 +9232,8 @@ async fn process_channel_message_body(
                     },
                 ),
                 history: &mut history,
+                history_has_trim_breadcrumb: &mut history_has_trim_breadcrumb,
+                injected_memory_preamble: &mut channel_injected_memory_preamble,
                 channel_name: msg.channel.as_str(),
                 channel_reply_target: Some(msg.reply_target.as_str()),
                 cancellation_token: Some(cancellation_token.clone()),
@@ -8847,6 +9433,17 @@ async fn process_channel_message_body(
     // Attribute the closing event to the final route and attach aggregate
     // usage. Explicit completion records the normal duration; the guard's
     // `Drop` path supplies the same matched end on panic or early unwind.
+    let history_resync_failed = resync_history_after_trim_or_evict_cache(
+        ctx.as_ref(),
+        &history_key,
+        &history,
+        history_has_trim_breadcrumb,
+        crumb_present_before_loop,
+        prior_turns_len_before_loop,
+        &known_prefix,
+        outgoing_user_turn_raw_content.as_deref(),
+    );
+
     let turn_tokens_used = cost_tracking_context.as_ref().and_then(|ctx| {
         let usage = ctx.snapshot_turn_usage();
         (usage.input_tokens > 0 || usage.output_tokens > 0).then_some(
@@ -9048,8 +9645,15 @@ async fn process_channel_message_body(
             // Persist intermediate tool-call/result messages from this turn
             // so the model retains concrete "I used tools" examples in
             // context, preventing drift toward tool-less responses.
+            //
+            // Skipped when the pre-trim resync above could not confirm the
+            // cache matches what's durable: appending onto an evicted cache
+            // would just recreate an unreconciled entry from this turn's
+            // own working buffer. The reply is still delivered to the user
+            // below; only this turn's contribution to the stored transcript
+            // is dropped, and the next turn reloads from the backend.
             let keep_tool_turns = ctx.agent_cfg.resolved.keep_tool_context_turns;
-            if keep_tool_turns > 0 {
+            if !history_resync_failed && keep_tool_turns > 0 {
                 // Find tool messages for the current turn: everything after
                 // the last user message up to (but not including) the final
                 // assistant response that matches our delivered text.
@@ -9059,11 +9663,13 @@ async fn process_channel_message_body(
                 }
             }
 
-            append_sender_turn(
-                ctx.as_ref(),
-                &history_key,
-                ChatMessage::assistant(&history_response),
-            );
+            if !history_resync_failed {
+                append_sender_turn(
+                    ctx.as_ref(),
+                    &history_key,
+                    ChatMessage::assistant(&history_response),
+                );
+            }
 
             // Fire-and-forget LLM-driven memory consolidation. Passes the
             // agent's resolved temperature through unchanged — `None`
@@ -9428,7 +10034,14 @@ async fn process_channel_message_body(
                 let rolled_back = should_rollback_user_turn
                     && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &timestamped_content);
 
-                if !rolled_back {
+                // Mirror the successful-response path: when the pre-trim
+                // resync above could not confirm the cache matches what's
+                // durable, `rollback_orphan_user_turn` already declines
+                // (returns false) rather than mutate an unreconciled cache.
+                // Appending here regardless would recreate exactly the cache
+                // entry the resync failure was trying to avoid, from this
+                // turn's own unverified working buffer.
+                if !rolled_back && !history_resync_failed {
                     // Close the orphan user turn so subsequent messages don't
                     // inherit this failed request as unfinished context.
                     append_sender_turn(
@@ -9477,12 +10090,19 @@ async fn process_channel_message_body(
                 started_at.elapsed().as_millis()
             );
             // Close the orphan user turn so subsequent messages don't
-            // inherit this timed-out request as unfinished context.
-            append_sender_turn(
-                ctx.as_ref(),
-                &history_key,
-                ChatMessage::assistant("[Task timed out — not continuing this request]"),
-            );
+            // inherit this timed-out request as unfinished context. Skipped
+            // when the pre-trim resync above could not confirm the cache
+            // matches what's durable — same rationale as the error path
+            // above and the successful-response path's tool/assistant
+            // append: appending here would recreate an unreconciled cache
+            // entry from this turn's own unverified working buffer.
+            if !history_resync_failed {
+                append_sender_turn(
+                    ctx.as_ref(),
+                    &history_key,
+                    ChatMessage::assistant("[Task timed out — not continuing this request]"),
+                );
+            }
             if let Some(channel) = target_channel.as_ref() {
                 // Localized error text (master) delivered with suppress_voice
                 // (RFCerror-path fix): cancel the draft, then send as
@@ -14338,6 +14958,176 @@ fn compose_channel_mcp_prompt_sections(
     expose_text_tool_protocol
 }
 
+/// Result of hydrating one session's transcript at startup.
+struct HydratedSession {
+    messages: Vec<ChatMessage>,
+    crumb_present: bool,
+    orphan_closed: bool,
+}
+
+/// Marker for a [`hydrate_session_transcript`] attempt that loaded a durable
+/// transcript but could not reconcile it with the store (cap truncation or
+/// flag correction failed to persist). Distinct from `Ok(None)`, which means
+/// there is no durable transcript at all: callers must not treat a failed
+/// reconciliation like an empty session, or the next inbound turn would seed
+/// an empty cache over an existing transcript — and, once the cache exists,
+/// later turns would stop retrying hydration entirely.
+#[derive(Debug)]
+struct HydrationFailed;
+
+/// Load one session's transcript for startup hydration: apply the
+/// `MAX_CHANNEL_HISTORY` cap, close a trailing orphaned user turn, and
+/// resolve breadcrumb ownership.
+///
+/// The durable `trim_breadcrumb` flag is authoritative and is never
+/// overridden by comparing message text — an explicit `false` survives even
+/// when a genuine user turn collides with the breadcrumb text. The only
+/// correction applied is structural: if the flag says the marker was
+/// present and the cap actually removed that leading message, ownership
+/// follows it down to `false`, and the truncated transcript is persisted
+/// together with the corrected flag so a later restart does not reload the
+/// untruncated transcript and resurrect the turn this pass already dropped.
+/// Legacy sessions that never recorded a flag (`None`) infer once from
+/// text, matching the per-turn cold-cache fallback in the message path.
+/// Returns `Ok(None)` for an empty/missing session and
+/// `Err(HydrationFailed)` when a transcript was loaded but its
+/// reconciliation write failed — callers must keep those distinct (see
+/// [`HydrationFailed`]).
+fn hydrate_session_transcript(
+    store: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    session_key: &str,
+) -> Result<Option<HydratedSession>, HydrationFailed> {
+    let mut msgs = match store.try_load(session_key) {
+        Ok(v) => v,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "session_key": session_key,
+                        "error": format!("{}", e),
+                    })),
+                &format!("Failed to load transcript for {session_key}; hydration fails closed")
+            );
+            return Err(HydrationFailed);
+        }
+    };
+    if msgs.is_empty() {
+        return Ok(None);
+    }
+    // A transient read failure must not silently collapse into "no record"
+    // and fall through to legacy text inference: that would let a
+    // user-controlled first message that happens to collide with the
+    // breadcrumb text manufacture ownership the backend never recorded.
+    // Fail closed: an unreadable flag is not the same as a verified
+    // explicit `false`, so return `HydrationFailed` and leave the session
+    // unreconciled until provenance can be read together with the transcript.
+    let durable_crumb = match store.get_session_trim_breadcrumb(session_key) {
+        Ok(v) => v,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "session_key": session_key,
+                        "error": format!("{}", e),
+                    })),
+                &format!(
+                    "Failed to read trim breadcrumb flag for {session_key}; hydration fails closed"
+                )
+            );
+            return Err(HydrationFailed);
+        }
+    };
+    // Structural check made BEFORE the cap below can remove it: whether the
+    // loaded transcript's leading message is physically the synthetic
+    // marker the durable flag says is present.
+    let marker_present_pre_drain = msgs.first().is_some_and(|first| {
+        first.role == "user"
+            && zeroclaw_runtime::agent::history::is_history_trim_breadcrumb_text(&first.content)
+    });
+    let truncated = msgs.len() > MAX_CHANNEL_HISTORY;
+    if truncated {
+        msgs.drain(..msgs.len() - MAX_CHANNEL_HISTORY);
+    }
+
+    let mut orphan_closed = false;
+    if msgs.last().is_some_and(|msg| msg.role == "user") {
+        let closure = ChatMessage::assistant("[Session interrupted — not continuing this request]");
+        if let Err(e) = store.append(session_key, &closure) {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                &format!("Failed to persist orphan closure for {session_key}")
+            );
+        }
+        msgs.push(closure);
+        orphan_closed = true;
+    }
+
+    // Legacy inference (no recorded flag) must reflect the transcript
+    // actually returned to the caller, not the pre-cap snapshot: if the cap
+    // drained the marker off the front, the post-cap transcript no longer
+    // carries it and ownership must not be inferred from a message that is
+    // no longer there.
+    let marker_present_post_cap = if truncated {
+        msgs.first().is_some_and(|first| {
+            first.role == "user"
+                && zeroclaw_runtime::agent::history::is_history_trim_breadcrumb_text(&first.content)
+        })
+    } else {
+        marker_present_pre_drain
+    };
+
+    let crumb_present = match durable_crumb {
+        Some(true) => !(truncated && marker_present_pre_drain),
+        Some(false) => false,
+        None => marker_present_post_cap,
+    };
+    // Truncation itself must trigger persistence even when ownership is
+    // unchanged: the in-memory transcript returned to the caller no longer
+    // matches the durable one, and skipping the write here means a later
+    // restart reloads the untruncated transcript and repeats this
+    // reconciliation instead of converging.
+    if truncated || durable_crumb != Some(crumb_present) {
+        let persist_result = if truncated {
+            store.replace_conversation_state(session_key, &msgs, crumb_present)
+        } else {
+            store.set_session_trim_breadcrumb(session_key, crumb_present)
+        };
+        if let Err(e) = persist_result {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                &format!("Failed to reconcile stale trim breadcrumb flag for {session_key}")
+            );
+            // Do not publish the locally reconciled transcript as
+            // authoritative. The live process would otherwise append to a
+            // cache durable storage did not accept, and a later restart
+            // would resurrect the turns the live process discarded. Keep
+            // the uncapped durable state by skipping hydration: the next
+            // turn reloads from the store, and the next restart retries
+            // this reconciliation, instead of building on the unconfirmed
+            // truncation. This covers both the truncated-transcript write
+            // and the flag-only correction above — an unverified flag must
+            // not be published alongside the cache either. The `Err`
+            // distinguishes this from an empty session (see
+            // [`HydrationFailed`]).
+            return Err(HydrationFailed);
+        }
+    }
+
+    Ok(Some(HydratedSession {
+        messages: msgs,
+        crumb_present,
+        orphan_closed,
+    }))
+}
+
 /// Start all configured channels and route messages to the agent
 pub async fn start_channels(
     config: Config,
@@ -14979,6 +15769,10 @@ pub async fn start_channels_with_plugin_webhooks(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -15080,25 +15874,16 @@ pub async fn start_channels_with_plugin_webhooks(
                 Some(ctx) => ctx,
                 None => continue,
             };
-            let mut msgs = store.load(&m.key);
-            if msgs.is_empty() {
+            // Both a missing transcript (`Ok(None)`) and a failed
+            // reconciliation (`Err`) skip startup installation: the next
+            // inbound turn retries hydration (or installs a verified
+            // durable fallback) instead of building on unconfirmed state.
+            let Ok(Some(hydrated_session)) = hydrate_session_transcript(store.as_ref(), &m.key)
+            else {
                 continue;
-            }
-            if msgs.len() > MAX_CHANNEL_HISTORY {
-                msgs.drain(..msgs.len() - MAX_CHANNEL_HISTORY);
-            }
-            if msgs.last().is_some_and(|msg| msg.role == "user") {
-                let closure =
-                    ChatMessage::assistant("[Session interrupted — not continuing this request]");
-                if let Err(e) = store.append(&m.key, &closure) {
-                    ::zeroclaw_log::record!(
-                        DEBUG,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        &format!("Failed to persist orphan closure for {}", m.key)
-                    );
-                }
-                msgs.push(closure);
+            };
+            let mut msgs = hydrated_session.messages;
+            if hydrated_session.orphan_closed {
                 orphans_closed += 1;
             }
             let pruned =
@@ -15106,6 +15891,11 @@ pub async fn start_channels_with_plugin_webhooks(
             if !pruned.is_empty() {
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"category": "agent", "agent_alias": owner_agent.as_deref().unwrap_or(""), "channel": m.channel_id.as_deref().unwrap_or(""), "session_key": m.key, "removed": pruned.removed, "orphan_tool_call_ids": pruned.orphan_tool_call_ids})), "removed orphaned tool messages from restored history (tool_use/tool_result pairing inconsistency auto-healed)");
             }
+            target_ctx
+                .history_crumb_flags
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .put(m.key.clone(), hydrated_session.crumb_present);
 
             let mut histories = target_ctx
                 .conversation_histories
@@ -15582,6 +16372,10 @@ fn concurrent_persist_lock_serialization() {
             std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
         ))),
         pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                .expect("MAX_CONVERSATION_SENDERS must be positive"),
+        ))),
         provider_cache: Arc::new(Mutex::new(HashMap::new())),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
         thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -15680,6 +16474,1259 @@ fn concurrent_persist_lock_serialization() {
         backend_order.len(),
         4,
         "all 4 concurrent appends must be recorded"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn strip_volatile_preamble_before_persist_restores_clean_content() {
+    use zeroclaw_providers::ChatMessage;
+
+    let old_turn = ChatMessage::user("older turn that survives the trim");
+    let enriched_current_turn = ChatMessage::user(
+        "[turn-context] reply_target=#general sender=@alice message_id=42\n\
+         [memory] the user prefers concise answers\n\n\
+         what's the weather like?",
+    );
+    let retained = vec![old_turn.clone(), enriched_current_turn];
+
+    let cleaned =
+        strip_volatile_preamble_before_persist(&retained, Some("what's the weather like?"));
+
+    assert_eq!(cleaned[0].content, old_turn.content);
+    assert_eq!(
+        cleaned[1].content, "what's the weather like?",
+        "the durable transcript must store the raw user turn, not the \
+         preamble-enriched working copy with routing metadata and recalled memory"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn strip_volatile_preamble_before_persist_is_a_no_op_without_raw_content() {
+    use zeroclaw_providers::ChatMessage;
+
+    let retained = vec![ChatMessage::user("no preamble was injected this turn")];
+    let cleaned = strip_volatile_preamble_before_persist(&retained, None);
+
+    assert_eq!(cleaned[0].content, retained[0].content);
+}
+
+// ── Channel trim resync test ─────────────────────────────
+// Lives outside `mod tests` so it has direct access to `resync_sender_history_after_trim`.
+
+/// A minimal `ChannelRuntimeContext` wired to `backend`, shared by the
+/// resync tests below so each only has to name the backend under test.
+#[cfg(test)]
+fn test_channel_ctx_with_backend(
+    backend: Arc<dyn zeroclaw_infra::session_backend::SessionBackend>,
+) -> Arc<ChannelRuntimeContext> {
+    Arc::new(ChannelRuntimeContext {
+        channels_by_name: Arc::new(HashMap::new()),
+        model_provider: Arc::new(tests::DummyModelProvider),
+        model_provider_ref: Arc::new("test".into()),
+        agent_alias: Arc::new("test".into()),
+        agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+        memory: Arc::new(tests::NoopMemory),
+        memory_strategy: Arc::new(
+            zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                Arc::new(tests::NoopMemory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            ),
+        ),
+        tools_registry: Arc::new(
+            zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+        ),
+        observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+        system_prompt: Arc::new(String::new()),
+        model: Arc::new("test".into()),
+        temperature: Some(0.0),
+        auto_save_memory: false,
+        max_tool_iterations: 5,
+        min_relevance_score: 0.0,
+        conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+        ))),
+        pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                .expect("MAX_CONVERSATION_SENDERS must be positive"),
+        ))),
+        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+        scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+        reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+        interrupt_on_new_message: InterruptOnNewMessageConfig {
+            telegram: false,
+            slack: false,
+            discord: false,
+            mattermost: false,
+            matrix: false,
+            whatsapp: false,
+        },
+        multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+        media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+        transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+        agent_transcription_provider: String::new(),
+        hooks: None,
+        provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+        workspace_dir: Arc::new(std::env::temp_dir()),
+        prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        non_cli_excluded_tools: Arc::new(Vec::new()),
+        autonomy_level: AutonomyLevel::default(),
+        tool_call_dedup_exempt: Arc::new(Vec::new()),
+        model_routes: Arc::new(Vec::new()),
+        query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+        ack_reactions: true,
+        show_tool_calls: true,
+        session_store: Some(backend),
+        approval_manager: Arc::new(
+            zeroclaw_runtime::approval::ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            ),
+        ),
+        activated_tools: None,
+        cost_tracking: None,
+        pacing: zeroclaw_config::schema::PacingConfig::default(),
+        max_tool_result_chars: 0,
+        context_token_budget: 0,
+        debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+            std::time::Duration::ZERO,
+        )),
+        receipt_generator: None,
+        show_receipts_in_response: false,
+        last_applied_config_stamp: Arc::new(Mutex::new(None)),
+        runtime_defaults_override: Arc::new(Mutex::new(None)),
+        persist_locks: Arc::new(Mutex::new(HashMap::new())),
+        sop_engine: None,
+        sop_audit: None,
+    })
+}
+
+/// Like [`test_channel_ctx_with_backend`], but also wires a real channel and
+/// model provider so `process_channel_message`'s full error/timeout paths
+/// (not just the isolated resync helpers) can be exercised end to end
+/// against a forced-failing durable backend. `context_token_budget` lets a
+/// caller force the pre-dispatch gate to drop a whole turn locally, before
+/// any provider round trip, so the resync-failure path can be reached
+/// without needing a real provider-reported budget.
+#[cfg(test)]
+fn test_channel_ctx_with_backend_channel_and_provider(
+    backend: Arc<dyn zeroclaw_infra::session_backend::SessionBackend>,
+    channel: Arc<dyn Channel>,
+    model_provider: Arc<dyn ModelProvider>,
+    context_token_budget: usize,
+) -> Arc<ChannelRuntimeContext> {
+    let mut channels_by_name = HashMap::new();
+    channels_by_name.insert(channel.name().to_string(), channel);
+
+    Arc::new(ChannelRuntimeContext {
+        channels_by_name: Arc::new(channels_by_name),
+        model_provider,
+        model_provider_ref: Arc::new("test".into()),
+        agent_alias: Arc::new("test".into()),
+        agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+        memory: Arc::new(tests::NoopMemory),
+        memory_strategy: Arc::new(
+            zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                Arc::new(tests::NoopMemory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            ),
+        ),
+        tools_registry: Arc::new(
+            zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+        ),
+        observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+        system_prompt: Arc::new(String::new()),
+        model: Arc::new("test".into()),
+        temperature: Some(0.0),
+        auto_save_memory: false,
+        max_tool_iterations: 5,
+        min_relevance_score: 0.0,
+        conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+        ))),
+        pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                .expect("MAX_CONVERSATION_SENDERS must be positive"),
+        ))),
+        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+        scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+        reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+        interrupt_on_new_message: InterruptOnNewMessageConfig {
+            telegram: false,
+            slack: false,
+            discord: false,
+            mattermost: false,
+            matrix: false,
+            whatsapp: false,
+        },
+        multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+        media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+        transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+        agent_transcription_provider: String::new(),
+        hooks: None,
+        provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+        workspace_dir: Arc::new(std::env::temp_dir()),
+        prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        non_cli_excluded_tools: Arc::new(Vec::new()),
+        autonomy_level: AutonomyLevel::default(),
+        tool_call_dedup_exempt: Arc::new(Vec::new()),
+        model_routes: Arc::new(Vec::new()),
+        query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+        ack_reactions: true,
+        show_tool_calls: true,
+        session_store: Some(backend),
+        approval_manager: Arc::new(
+            zeroclaw_runtime::approval::ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            ),
+        ),
+        activated_tools: None,
+        cost_tracking: None,
+        pacing: zeroclaw_config::schema::PacingConfig::default(),
+        max_tool_result_chars: 0,
+        context_token_budget,
+        debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+            std::time::Duration::ZERO,
+        )),
+        receipt_generator: None,
+        show_receipts_in_response: false,
+        last_applied_config_stamp: Arc::new(Mutex::new(None)),
+        runtime_defaults_override: Arc::new(Mutex::new(None)),
+        persist_locks: Arc::new(Mutex::new(HashMap::new())),
+        sop_engine: None,
+        sop_audit: None,
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn channel_trim_resync_survives_restart() {
+    use std::sync::Mutex as StdMutex;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_providers::ChatMessage;
+
+    // A durable backend that supports `rewrite_messages`, mirroring the
+    // JSONL/SQLite backends this fix targets (the default trait impl is a
+    // no-op, which is exactly the pre-fix bug: a trim would vanish on
+    // reload). Standing in for "restart", `load` always re-reads from this
+    // same store rather than any process-local cache.
+    #[derive(Default)]
+    struct RewritableBackend {
+        messages: StdMutex<Vec<ChatMessage>>,
+        breadcrumb: StdMutex<Option<bool>>,
+    }
+    impl SessionBackend for RewritableBackend {
+        fn load(&self, _key: &str) -> Vec<ChatMessage> {
+            self.messages
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+        fn append(&self, _key: &str, msg: &ChatMessage) -> std::io::Result<()> {
+            self.messages
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(msg.clone());
+            Ok(())
+        }
+        fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+            Ok(self
+                .messages
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop()
+                .is_some())
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            vec![]
+        }
+        fn rewrite_messages(&self, _key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
+            *self.messages.lock().unwrap_or_else(|e| e.into_inner()) = messages.to_vec();
+            Ok(())
+        }
+        fn set_session_trim_breadcrumb(&self, _key: &str, present: bool) -> std::io::Result<()> {
+            *self.breadcrumb.lock().unwrap_or_else(|e| e.into_inner()) = Some(present);
+            Ok(())
+        }
+        fn get_session_trim_breadcrumb(&self, _key: &str) -> std::io::Result<Option<bool>> {
+            Ok(*self.breadcrumb.lock().unwrap_or_else(|e| e.into_inner()))
+        }
+    }
+
+    let sender = "trim_resync_test_key".to_string();
+    let backend = Arc::new(RewritableBackend::default());
+
+    // Simulate the pre-trim sender transcript: two old turns that a token
+    // trim is about to drop, plus a synthetic breadcrumb and the retained
+    // recent turn.
+    let dropped_turn = ChatMessage::user("first old turn that gets trimmed away");
+    let dropped_reply = ChatMessage::assistant("first old reply that gets trimmed away");
+    let breadcrumb = ChatMessage::system("(earlier history was trimmed)");
+    let retained_turn = ChatMessage::user("most recent turn that survives the trim");
+    backend.append(&sender, &dropped_turn).expect("seed append");
+    backend
+        .append(&sender, &dropped_reply)
+        .expect("seed append");
+    backend
+        .append(&sender, &retained_turn)
+        .expect("seed append");
+
+    let ctx = test_channel_ctx_with_backend(backend.clone() as Arc<dyn SessionBackend>);
+
+    // Pre-trim cache mirrors the pre-trim durable transcript.
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(
+            sender.clone(),
+            vec![
+                dropped_turn.clone(),
+                dropped_reply.clone(),
+                retained_turn.clone(),
+            ],
+        );
+
+    // `ChatMessage` doesn't implement `PartialEq`, so compare on
+    // (role, content) instead.
+    fn same(a: &ChatMessage, b: &ChatMessage) -> bool {
+        a.role == b.role && a.content == b.content
+    }
+    fn same_as_any(msgs: &[ChatMessage], target: &ChatMessage) -> bool {
+        msgs.iter().any(|m| same(m, target))
+    }
+
+    // The tool-call loop trimmed its own working buffer: the two old turns
+    // are gone and a breadcrumb was inserted ahead of the retained turn.
+    let trimmed_turns = vec![breadcrumb.clone(), retained_turn.clone()];
+    let known_prefix = [
+        dropped_turn.clone(),
+        dropped_reply.clone(),
+        retained_turn.clone(),
+    ];
+    assert!(
+        resync_sender_history_after_trim(
+            ctx.as_ref(),
+            &sender,
+            &trimmed_turns,
+            true,
+            &known_prefix,
+            false
+        ),
+        "resync must report success when the durable write succeeds"
+    );
+
+    // The in-memory cache must reflect the trim immediately.
+    let cached = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .peek(&sender)
+        .expect("history must exist for sender")
+        .clone();
+    assert!(
+        cached.len() == trimmed_turns.len()
+            && cached.iter().zip(&trimmed_turns).all(|(a, b)| same(a, b)),
+        "cache must be resynced to the loop's trimmed history"
+    );
+
+    // Simulate a daemon restart: reload straight from the durable backend,
+    // bypassing any in-process cache.
+    let reloaded = backend.load(&sender);
+    assert!(
+        reloaded.len() == trimmed_turns.len()
+            && reloaded.iter().zip(&trimmed_turns).all(|(a, b)| same(a, b)),
+        "durable store must be resynced so a restart cannot resurrect dropped turns"
+    );
+    assert!(
+        !same_as_any(&reloaded, &dropped_turn) && !same_as_any(&reloaded, &dropped_reply),
+        "dropped turns must stay absent from the durable transcript after a restart"
+    );
+    assert_eq!(
+        reloaded.iter().filter(|m| same(m, &breadcrumb)).count(),
+        1,
+        "the breadcrumb must be present exactly once, not duplicated across trims"
+    );
+    assert_eq!(
+        backend
+            .get_session_trim_breadcrumb(&sender)
+            .expect("breadcrumb flag read"),
+        Some(true),
+        "the durable breadcrumb flag must survive a restart, not just the in-memory cache"
+    );
+
+    // A second message that only forwards new turns (the ordinary
+    // `append_sender_turn` path) must build on the resynced, trimmed base —
+    // not resurrect the pre-trim transcript.
+    backend
+        .append(&sender, &ChatMessage::user("second message after the trim"))
+        .expect("append after resync");
+    let after_second_message = backend.load(&sender);
+    assert!(
+        !same_as_any(&after_second_message, &dropped_turn),
+        "the dropped turn must stay absent after a later message"
+    );
+    assert_eq!(
+        after_second_message
+            .iter()
+            .filter(|m| same(m, &breadcrumb))
+            .count(),
+        1,
+        "the breadcrumb must still appear exactly once after a later message"
+    );
+}
+
+/// If the transcript half of a trim resync fails, the breadcrumb flag must
+/// not be written either — otherwise durable `trim_breadcrumb` could describe
+/// a trimmed transcript that was never actually committed. Routing both
+/// writes through `SessionBackend::replace_conversation_state` (rather than
+/// two independent calls) makes this ordering a property of the shared
+/// default implementation instead of something each caller has to get right.
+#[cfg(test)]
+#[test]
+fn channel_trim_resync_does_not_record_breadcrumb_when_transcript_write_fails() {
+    use std::sync::Mutex as StdMutex;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_providers::ChatMessage;
+
+    #[derive(Default)]
+    struct FailingRewriteBackend {
+        messages: StdMutex<Vec<ChatMessage>>,
+        breadcrumb: StdMutex<Option<bool>>,
+    }
+    impl SessionBackend for FailingRewriteBackend {
+        fn load(&self, _key: &str) -> Vec<ChatMessage> {
+            self.messages
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+        fn append(&self, _key: &str, msg: &ChatMessage) -> std::io::Result<()> {
+            self.messages
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(msg.clone());
+            Ok(())
+        }
+        fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            vec![]
+        }
+        fn rewrite_messages(&self, _key: &str, _messages: &[ChatMessage]) -> std::io::Result<()> {
+            Err(std::io::Error::other("simulated transcript write failure"))
+        }
+        fn set_session_trim_breadcrumb(&self, _key: &str, present: bool) -> std::io::Result<()> {
+            *self.breadcrumb.lock().unwrap_or_else(|e| e.into_inner()) = Some(present);
+            Ok(())
+        }
+        fn get_session_trim_breadcrumb(&self, _key: &str) -> std::io::Result<Option<bool>> {
+            Ok(*self.breadcrumb.lock().unwrap_or_else(|e| e.into_inner()))
+        }
+    }
+
+    let sender = "trim_resync_failure_test_key".to_string();
+    let backend = Arc::new(FailingRewriteBackend::default());
+    backend
+        .set_session_trim_breadcrumb(&sender, false)
+        .expect("seed the pre-trim flag");
+
+    let pre_trim_turn = ChatMessage::user("pre-trim turn that must survive the failed resync");
+    backend
+        .append(&sender, &pre_trim_turn)
+        .expect("seed pre-trim durable turn");
+
+    let ctx = test_channel_ctx_with_backend(backend.clone() as Arc<dyn SessionBackend>);
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(sender.clone(), vec![pre_trim_turn.clone()]);
+
+    let trimmed_turns = vec![
+        ChatMessage::system("(earlier history was trimmed)"),
+        ChatMessage::user("most recent turn"),
+    ];
+
+    fn same(a: &ChatMessage, b: &ChatMessage) -> bool {
+        a.role == b.role && a.content == b.content
+    }
+
+    // The transcript write fails; this must not proceed to write a new
+    // breadcrumb flag describing a transcript that was never committed, and
+    // must not publish the trimmed cache either.
+    let known_prefix = [pre_trim_turn.clone()];
+    assert!(
+        !resync_sender_history_after_trim(
+            ctx.as_ref(),
+            &sender,
+            &trimmed_turns,
+            true,
+            &known_prefix,
+            false
+        ),
+        "resync must report failure when the durable transcript write fails"
+    );
+
+    assert_eq!(
+        backend
+            .get_session_trim_breadcrumb(&sender)
+            .expect("breadcrumb flag read"),
+        Some(false),
+        "the pre-trim flag must be left in place when the transcript write fails, \
+         not overwritten with a value describing an uncommitted transcript"
+    );
+
+    // The in-memory cache must still agree with the durable pre-trim state,
+    // not the trimmed turns that never actually landed.
+    let cached = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .peek(&sender)
+        .expect("history must exist for sender")
+        .clone();
+    assert!(
+        cached.len() == 1 && same(&cached[0], &pre_trim_turn),
+        "the cache must not publish the trimmed turns when the durable write failed"
+    );
+
+    // A later message appended through the ordinary path must build on the
+    // last-known-good durable base, so the live cache and a reload agree.
+    backend
+        .append(&sender, &ChatMessage::user("turn after the failed resync"))
+        .expect("append after failed resync");
+    let reloaded = backend.load(&sender);
+    assert_eq!(
+        reloaded.len(),
+        2,
+        "a restart must see the pre-trim turn plus the newly appended turn, \
+         not the trimmed transcript that was never durably committed"
+    );
+    assert!(
+        same(&reloaded[0], &pre_trim_turn),
+        "the pre-trim turn must survive the failed resync across a restart"
+    );
+}
+
+/// When `replace_conversation_state` fails and the subsequent provenance
+/// re-read also errors (rather than confirming the flag was never
+/// recorded), the resync must not collapse that error into `Ok(None)` and
+/// publish a guessed flag beside a transcript reload that may itself be
+/// incomplete. It must leave the cache and flag exactly as they were.
+#[cfg(test)]
+#[test]
+fn channel_trim_resync_does_not_guess_breadcrumb_when_provenance_read_fails() {
+    use std::sync::Mutex as StdMutex;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_providers::ChatMessage;
+
+    #[derive(Default)]
+    struct FailingRewriteAndProvenanceBackend {
+        messages: StdMutex<Vec<ChatMessage>>,
+    }
+    impl SessionBackend for FailingRewriteAndProvenanceBackend {
+        fn load(&self, _key: &str) -> Vec<ChatMessage> {
+            self.messages
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+        fn append(&self, _key: &str, msg: &ChatMessage) -> std::io::Result<()> {
+            self.messages
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(msg.clone());
+            Ok(())
+        }
+        fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            vec![]
+        }
+        fn rewrite_messages(&self, _key: &str, _messages: &[ChatMessage]) -> std::io::Result<()> {
+            Err(std::io::Error::other("simulated transcript write failure"))
+        }
+        fn set_session_trim_breadcrumb(&self, _key: &str, _present: bool) -> std::io::Result<()> {
+            Err(std::io::Error::other("simulated breadcrumb write failure"))
+        }
+        fn get_session_trim_breadcrumb(&self, _key: &str) -> std::io::Result<Option<bool>> {
+            Err(std::io::Error::other(
+                "simulated breadcrumb provenance read failure",
+            ))
+        }
+    }
+
+    let sender = "trim_resync_provenance_failure_test_key".to_string();
+    let backend = Arc::new(FailingRewriteAndProvenanceBackend::default());
+
+    let pre_trim_turn = ChatMessage::user("pre-trim turn that must survive the failed resync");
+    backend
+        .append(&sender, &pre_trim_turn)
+        .expect("seed pre-trim durable turn");
+
+    let ctx = test_channel_ctx_with_backend(backend.clone() as Arc<dyn SessionBackend>);
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(sender.clone(), vec![pre_trim_turn.clone()]);
+    ctx.history_crumb_flags
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(sender.clone(), false);
+
+    let trimmed_turns = vec![
+        ChatMessage::system("(earlier history was trimmed)"),
+        ChatMessage::user("most recent turn"),
+    ];
+
+    fn same(a: &ChatMessage, b: &ChatMessage) -> bool {
+        a.role == b.role && a.content == b.content
+    }
+
+    let known_prefix = [pre_trim_turn.clone()];
+    assert!(
+        !resync_sender_history_after_trim(
+            ctx.as_ref(),
+            &sender,
+            &trimmed_turns,
+            true,
+            &known_prefix,
+            false
+        ),
+        "resync must report failure when the durable transcript write fails"
+    );
+
+    // Neither the cache nor the flag may change: an unread provenance is
+    // not a confirmed absence, so nothing here counts as reconciled.
+    let cached = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .peek(&sender)
+        .expect("history must exist for sender")
+        .clone();
+    assert!(
+        cached.len() == 1 && same(&cached[0], &pre_trim_turn),
+        "the cache must stay exactly as it was before the failed resync, \
+         not be replaced by a reload paired with a guessed flag"
+    );
+    assert_eq!(
+        ctx.history_crumb_flags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .peek(&sender)
+            .copied(),
+        Some(false),
+        "the flag must stay exactly as it was before the failed resync, \
+         not be overwritten with crumb_present_before_loop as if the \
+         backend had confirmed no breadcrumb was recorded"
+    );
+}
+
+/// Caller-level regression for the same failure as
+/// `channel_trim_resync_does_not_guess_breadcrumb_when_provenance_read_fails`,
+/// but exercised through `resync_history_after_trim_or_evict_cache` — the
+/// function the message-handling caller actually calls. A prior version of
+/// that caller wrote `history_crumb_flags` unconditionally before this
+/// check and ignored the resync's return value, so a failed resync left a
+/// stale cache paired with a flag describing the unconfirmed trimmed state.
+/// This asserts the caller-facing contract instead: report failure, and
+/// leave no stale cache entry for a later append to build on.
+#[cfg(test)]
+#[test]
+fn caller_evicts_cache_and_does_not_guess_flag_when_trim_resync_fails() {
+    use std::sync::Mutex as StdMutex;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_providers::ChatMessage;
+
+    #[derive(Default)]
+    struct FailingRewriteAndProvenanceBackend {
+        messages: StdMutex<Vec<ChatMessage>>,
+    }
+    impl SessionBackend for FailingRewriteAndProvenanceBackend {
+        fn load(&self, _key: &str) -> Vec<ChatMessage> {
+            self.messages
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+        fn append(&self, _key: &str, msg: &ChatMessage) -> std::io::Result<()> {
+            self.messages
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(msg.clone());
+            Ok(())
+        }
+        fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            vec![]
+        }
+        fn rewrite_messages(&self, _key: &str, _messages: &[ChatMessage]) -> std::io::Result<()> {
+            Err(std::io::Error::other("simulated transcript write failure"))
+        }
+        fn set_session_trim_breadcrumb(&self, _key: &str, _present: bool) -> std::io::Result<()> {
+            Err(std::io::Error::other("simulated breadcrumb write failure"))
+        }
+        fn get_session_trim_breadcrumb(&self, _key: &str) -> std::io::Result<Option<bool>> {
+            Err(std::io::Error::other(
+                "simulated breadcrumb provenance read failure",
+            ))
+        }
+    }
+
+    let sender = "caller_trim_resync_provenance_failure_test_key".to_string();
+    let backend = Arc::new(FailingRewriteAndProvenanceBackend::default());
+
+    let pre_trim_turn = ChatMessage::user("pre-trim turn that must survive the failed resync");
+    backend
+        .append(&sender, &pre_trim_turn)
+        .expect("seed pre-trim durable turn");
+
+    let ctx = test_channel_ctx_with_backend(backend as Arc<dyn SessionBackend>);
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(sender.clone(), vec![pre_trim_turn.clone()]);
+    ctx.history_crumb_flags
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(sender.clone(), false);
+
+    // The loop's working buffer: a breadcrumb was inserted and the older
+    // turn was dropped, which is exactly what makes the caller decide a
+    // resync is needed.
+    let loop_history = vec![
+        ChatMessage::system("system prompt"),
+        ChatMessage::system("(earlier history was trimmed)"),
+        ChatMessage::user("most recent turn"),
+    ];
+    let known_prefix = [pre_trim_turn.clone()];
+
+    let resync_failed = resync_history_after_trim_or_evict_cache(
+        ctx.as_ref(),
+        &sender,
+        &loop_history,
+        true,  // history_has_trim_breadcrumb
+        false, // crumb_present_before_loop
+        1,     // prior_turns_len_before_loop
+        &known_prefix,
+        None,
+    );
+
+    assert!(
+        resync_failed,
+        "the caller must be told the resync could not be confirmed"
+    );
+    assert!(
+        ctx.conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .peek(&sender)
+            .is_none(),
+        "a failed resync must evict the cache entry rather than leave a stale \
+         one for the caller to append this turn's own messages onto"
+    );
+    assert_eq!(
+        ctx.history_crumb_flags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .peek(&sender)
+            .copied(),
+        Some(false),
+        "the flag must not be published as a guessed pair alongside the \
+         unconfirmed cache state"
+    );
+}
+
+/// Cold-start breadcrumb provenance must fail closed when the store is
+/// unreadable: a provenance-read error resolves to an explicit `false`,
+/// never a fall-through to legacy text inference. The previous code
+/// collapsed `Err` into `None` with `.ok().flatten()`, so an unreadable
+/// backend paired with a user-controlled first message colliding with the
+/// breadcrumb text manufactured synthetic ownership the backend never
+/// recorded — precisely when the canonical owner state was unavailable.
+#[cfg(test)]
+#[test]
+fn cold_crumb_provenance_fails_closed_on_provenance_read_error() {
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_providers::ChatMessage;
+
+    fn crumb_text() -> String {
+        zeroclaw_runtime::agent::history::HISTORY_TRIM_BREADCRUMB_CANONICAL.to_string()
+    }
+
+    struct UnreadableProvenanceBackend;
+    impl SessionBackend for UnreadableProvenanceBackend {
+        fn load(&self, _key: &str) -> Vec<ChatMessage> {
+            Vec::new()
+        }
+        fn append(&self, _key: &str, _msg: &ChatMessage) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn get_session_trim_breadcrumb(&self, _key: &str) -> std::io::Result<Option<bool>> {
+            Err(std::io::Error::other(
+                "simulated breadcrumb provenance read failure",
+            ))
+        }
+    }
+
+    struct AnsweringBackend {
+        flag: Option<bool>,
+    }
+    impl SessionBackend for AnsweringBackend {
+        fn load(&self, _key: &str) -> Vec<ChatMessage> {
+            Vec::new()
+        }
+        fn append(&self, _key: &str, _msg: &ChatMessage) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn get_session_trim_breadcrumb(&self, _key: &str) -> std::io::Result<Option<bool>> {
+            Ok(self.flag)
+        }
+    }
+
+    // A restored transcript whose first user message collides with the
+    // breadcrumb text after the leading system messages.
+    let colliding = vec![
+        ChatMessage::system("system prompt"),
+        ChatMessage::user(crumb_text()),
+        ChatMessage::assistant("ok"),
+    ];
+    let unreadable = UnreadableProvenanceBackend;
+    assert!(
+        !resolve_cold_crumb_provenance(Some(&unreadable), "sender", &colliding),
+        "an unreadable provenance must resolve to false, never to text inference"
+    );
+
+    // The legacy migration path is preserved: a backend that answers but
+    // never recorded a flag still infers from the transcript.
+    let legacy = AnsweringBackend { flag: None };
+    assert!(
+        resolve_cold_crumb_provenance(Some(&legacy), "sender", &colliding),
+        "Ok(None) must keep the legacy text-inference migration"
+    );
+
+    // Explicit records win over message text either way.
+    let recorded_true = AnsweringBackend { flag: Some(true) };
+    assert!(resolve_cold_crumb_provenance(
+        Some(&recorded_true),
+        "sender",
+        &colliding
+    ));
+    let recorded_false = AnsweringBackend { flag: Some(false) };
+    assert!(!resolve_cold_crumb_provenance(
+        Some(&recorded_false),
+        "sender",
+        &colliding
+    ));
+}
+
+/// A stale no-trim worker must not overwrite a newer trim's breadcrumb
+/// provenance. Worker A snapshots `crumb_present_before_loop = false`; worker B
+/// trims and publishes the cache plus `history_crumb_flags = true` under the
+/// per-sender persist lock; worker A then completes on its no-trim fast path.
+/// The fast path takes the same lock and validates against the live flag, so
+/// the stale completion leaves the newer `true` (and the breadcrumb-bearing
+/// cache) in place instead of pairing that cache with a `false` flag.
+#[cfg(test)]
+#[test]
+fn stale_no_trim_completion_does_not_overwrite_a_newer_trims_flag() {
+    use tempfile::TempDir;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_store::SessionStore;
+    use zeroclaw_providers::ChatMessage;
+
+    fn same(a: &ChatMessage, b: &ChatMessage) -> bool {
+        a.role == b.role && a.content == b.content
+    }
+
+    let tmp = TempDir::new().expect("tempdir");
+    let backend: Arc<dyn SessionBackend> =
+        Arc::new(SessionStore::new(tmp.path()).expect("session store"));
+    let sender = "stale_no_trim_vs_newer_trim_test_key".to_string();
+
+    let old_turn = ChatMessage::user("old turn worker A is about to keep");
+    let recent_turn = ChatMessage::assistant("recent reply both workers observed");
+    backend.append(&sender, &old_turn).expect("seed append");
+    backend.append(&sender, &recent_turn).expect("seed append");
+
+    let ctx = test_channel_ctx_with_backend(backend.clone());
+
+    // Worker A appends its own inbound message and snapshots the cache.
+    let worker_a_user = ChatMessage::user("worker A's own inbound message");
+    let known_prefix_a = append_sender_turn(ctx.as_ref(), &sender, worker_a_user.clone())
+        .expect("append must succeed with no hydration to verify");
+    let prior_len_a = known_prefix_a.len();
+    assert_eq!(prior_len_a, 3);
+
+    // Worker B trims the old turn and publishes under the persist lock. Its
+    // `known_prefix` predates A's append, so A's inbound is merged after the
+    // trimmed prefix instead of being discarded.
+    let breadcrumb = ChatMessage::system("(earlier history was trimmed)");
+    let trimmed_turns = vec![breadcrumb.clone(), recent_turn.clone()];
+    let known_prefix_b = [old_turn.clone(), recent_turn.clone()];
+    assert!(
+        resync_sender_history_after_trim(
+            ctx.as_ref(),
+            &sender,
+            &trimmed_turns,
+            true,
+            &known_prefix_b,
+            false,
+        ),
+        "worker B's trim resync must succeed"
+    );
+
+    // Worker A completes without trimming: its retained prior turns still
+    // match what it observed and its flag still matches its snapshot.
+    let loop_history = vec![
+        ChatMessage::system("system prompt"),
+        old_turn.clone(),
+        recent_turn.clone(),
+        worker_a_user.clone(),
+        ChatMessage::assistant("worker A's reply"),
+    ];
+    let resync_failed = resync_history_after_trim_or_evict_cache(
+        ctx.as_ref(),
+        &sender,
+        &loop_history,
+        false, // history_has_trim_breadcrumb
+        false, // crumb_present_before_loop (worker A's stale snapshot)
+        prior_len_a,
+        &known_prefix_a,
+        None,
+    );
+    assert!(
+        !resync_failed,
+        "a no-trim completion reports no resync failure"
+    );
+    assert_eq!(
+        ctx.history_crumb_flags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .peek(&sender)
+            .copied(),
+        Some(true),
+        "the stale no-trim completion must not overwrite worker B's newer `true` flag"
+    );
+    let cached = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .peek(&sender)
+        .expect("history must exist for sender")
+        .clone();
+    let expected = [
+        breadcrumb.clone(),
+        recent_turn.clone(),
+        worker_a_user.clone(),
+    ];
+    assert!(
+        cached.len() == expected.len() && cached.iter().zip(&expected).all(|(a, b)| same(a, b)),
+        "the cache must keep worker B's breadcrumb-bearing transcript, not a \
+         stale no-trim rewrite: got {cached:?}"
+    );
+}
+
+/// After a failed trim resync evicts the cache, the next turn's
+/// `append_sender_turn` must reload the durable transcript before appending.
+/// Otherwise the miss seeds an empty history and the next provider request
+/// contains only the new message while prior durable turns still exist on
+/// disk.
+#[cfg(test)]
+#[test]
+fn evicted_cache_reloads_durable_transcript_on_next_append() {
+    use tempfile::TempDir;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_store::SessionStore;
+    use zeroclaw_providers::ChatMessage;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let backend: Arc<dyn SessionBackend> =
+        Arc::new(SessionStore::new(tmp.path()).expect("session store"));
+    let sender = "evicted_cache_reload_test_key".to_string();
+
+    let first = ChatMessage::user("durable turn one");
+    let second = ChatMessage::assistant("durable reply two");
+    backend.append(&sender, &first).expect("seed append");
+    backend.append(&sender, &second).expect("seed append");
+    backend
+        .set_session_trim_breadcrumb(&sender, false)
+        .expect("seed breadcrumb flag");
+
+    let ctx = test_channel_ctx_with_backend(backend.clone());
+    assert!(
+        ctx.conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .peek(&sender)
+            .is_none(),
+        "the cache starts evicted, as after a failed trim resync"
+    );
+
+    let new_turn = ChatMessage::user("next turn after the eviction");
+    let known_prefix = append_sender_turn(ctx.as_ref(), &sender, new_turn.clone())
+        .expect("evicted cache must reload the durable transcript, not signal unavailable");
+
+    fn same_msg(a: &ChatMessage, b: &ChatMessage) -> bool {
+        a.role == b.role && a.content == b.content
+    }
+    let expected = [first.clone(), second.clone(), new_turn.clone()];
+    assert!(
+        known_prefix.len() == expected.len()
+            && known_prefix
+                .iter()
+                .zip(&expected)
+                .all(|(a, b)| same_msg(a, b)),
+        "the next turn must observe the reloaded durable transcript plus its own message: got {known_prefix:?}"
+    );
+    let cached = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .peek(&sender)
+        .cloned();
+    assert!(
+        cached
+            .is_some_and(|c| c.len() == expected.len()
+                && c.iter().zip(&expected).all(|(a, b)| same_msg(a, b))),
+        "the reloaded transcript must be republished to the cache"
+    );
+    assert_eq!(
+        ctx.history_crumb_flags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .peek(&sender)
+            .copied(),
+        Some(false),
+        "the reload must repopulate breadcrumb provenance from the backend"
+    );
+    let durable = backend.load(&sender);
+    assert!(
+        durable.len() == expected.len()
+            && durable.iter().zip(&expected).all(|(a, b)| same_msg(a, b)),
+        "durable order must remain the reloaded turns followed by the new append: got {durable:?}"
+    );
+}
+
+/// With `interrupt_on_new_message` disabled, two workers for the same sender
+/// can run concurrently. If a second worker completes a full turn (via the
+/// ordinary `append_sender_turn` path) after the first worker snapshotted its
+/// history but before the first worker's post-trim resync takes the persist
+/// lock, the resync must not wipe out the second worker's turns with its own
+/// stale, loop-owned trimmed snapshot.
+#[cfg(test)]
+#[test]
+fn channel_trim_resync_preserves_a_concurrent_workers_later_turn() {
+    use tempfile::TempDir;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_store::SessionStore;
+    use zeroclaw_providers::ChatMessage;
+
+    fn same(a: &ChatMessage, b: &ChatMessage) -> bool {
+        a.role == b.role && a.content == b.content
+    }
+
+    let tmp = TempDir::new().expect("tempdir");
+    let backend: Arc<dyn SessionBackend> =
+        Arc::new(SessionStore::new(tmp.path()).expect("session store"));
+    let sender = "concurrent_resync_test_key".to_string();
+
+    let dropped_turn = ChatMessage::user("old turn worker A is about to trim away");
+    let retained_turn = ChatMessage::user("recent turn worker A retains");
+    backend.append(&sender, &dropped_turn).expect("seed append");
+    backend
+        .append(&sender, &retained_turn)
+        .expect("seed append");
+
+    let ctx = test_channel_ctx_with_backend(backend.clone());
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(
+            sender.clone(),
+            vec![dropped_turn.clone(), retained_turn.clone()],
+        );
+
+    // Worker A observes this two-turn cache right after appending its own
+    // inbound message, before its tool loop runs.
+    let known_prefix = [dropped_turn.clone(), retained_turn.clone()];
+
+    // Worker B, for the same sender, runs concurrently and completes a full
+    // turn — its own inbound message plus the assistant's reply — through
+    // the ordinary append path before worker A's resync takes the lock.
+    let worker_b_user = ChatMessage::user("worker B's own inbound message");
+    let worker_b_reply = ChatMessage::assistant("worker B's completed reply");
+    append_sender_turn(ctx.as_ref(), &sender, worker_b_user.clone());
+    append_sender_turn(ctx.as_ref(), &sender, worker_b_reply.clone());
+
+    // Worker A's tool loop trimmed the old turn and inserted a breadcrumb in
+    // its own working buffer, unaware that worker B already appended turns.
+    let breadcrumb = ChatMessage::system("(earlier history was trimmed)");
+    let trimmed_turns = vec![breadcrumb.clone(), retained_turn.clone()];
+    assert!(
+        resync_sender_history_after_trim(
+            ctx.as_ref(),
+            &sender,
+            &trimmed_turns,
+            true,
+            &known_prefix,
+            false,
+        ),
+        "resync must report success when the durable write succeeds"
+    );
+
+    let expected = [
+        breadcrumb.clone(),
+        retained_turn.clone(),
+        worker_b_user.clone(),
+        worker_b_reply.clone(),
+    ];
+
+    let cached = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .peek(&sender)
+        .expect("history must exist for sender")
+        .clone();
+    assert!(
+        cached.len() == expected.len() && cached.iter().zip(&expected).all(|(a, b)| same(a, b)),
+        "the resync must append worker A's trimmed prefix ahead of worker B's turns, \
+         not discard worker B's completed turn: got {cached:?}"
+    );
+
+    let reloaded = backend.load(&sender);
+    assert!(
+        reloaded.len() == expected.len() && reloaded.iter().zip(&expected).all(|(a, b)| same(a, b)),
+        "the durable transcript must agree with the cache after the merge, \
+         so a restart does not lose worker B's turn either: got {reloaded:?}"
+    );
+}
+
+/// A bounded cache (`max_history_messages`) evicts from the front, so a
+/// concurrent worker's turns can rotate worker A's own observed prefix out of
+/// the cache without growing it past `known_prefix.len()` — the exact case a
+/// raw length comparison cannot distinguish from "nothing changed". With
+/// `max_history_messages = 2`, worker A observes `[old, A-user]`; worker B
+/// then appends its own user/reply pair, which evicts both of A's messages
+/// and leaves the cache at the same length (`2`) it was when A took its
+/// snapshot. A's resync must still preserve B's turns instead of discarding
+/// them because the length check saw no growth.
+#[cfg(test)]
+#[test]
+fn channel_trim_resync_preserves_a_concurrent_workers_later_turn_across_eviction() {
+    use tempfile::TempDir;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_store::SessionStore;
+    use zeroclaw_providers::ChatMessage;
+
+    fn same(a: &ChatMessage, b: &ChatMessage) -> bool {
+        a.role == b.role && a.content == b.content
+    }
+
+    let tmp = TempDir::new().expect("tempdir");
+    let backend: Arc<dyn SessionBackend> =
+        Arc::new(SessionStore::new(tmp.path()).expect("session store"));
+    let sender = "concurrent_resync_eviction_test_key".to_string();
+
+    let old_turn = ChatMessage::user("old turn that predates worker A's own message");
+    let a_user = ChatMessage::user("worker A's own inbound message");
+    backend.append(&sender, &old_turn).expect("seed append");
+    backend.append(&sender, &a_user).expect("seed append");
+
+    let mut ctx = test_channel_ctx_with_backend(backend.clone());
+    Arc::get_mut(&mut ctx)
+        .expect("sole owner right after construction")
+        .agent_cfg = Arc::new({
+        let mut cfg = zeroclaw_config::schema::AliasedAgentConfig::default();
+        cfg.resolved.max_history_messages = 2;
+        cfg
+    });
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(sender.clone(), vec![old_turn.clone(), a_user.clone()]);
+
+    // Worker A observes this two-turn, at-cap cache right after appending its
+    // own inbound message, before its tool loop runs.
+    let known_prefix = [old_turn.clone(), a_user.clone()];
+
+    // Worker B, for the same sender, completes a full turn through the
+    // ordinary append path before worker A's resync takes the lock. Both
+    // appends evict from the front: the first evicts `old_turn`, the second
+    // evicts `a_user` — the live cache ends at length 2, identical to
+    // `known_prefix.len()`, even though neither of A's own messages survives.
+    let worker_b_user = ChatMessage::user("worker B's own inbound message");
+    let worker_b_reply = ChatMessage::assistant("worker B's completed reply");
+    append_sender_turn(ctx.as_ref(), &sender, worker_b_user.clone());
+    append_sender_turn(ctx.as_ref(), &sender, worker_b_reply.clone());
+
+    // Worker A's tool loop retained its own turn unchanged (nothing to trim
+    // at a two-message prefix), unaware that worker B already rotated it out
+    // of the shared cache.
+    let trimmed_turns = vec![a_user.clone()];
+    assert!(
+        resync_sender_history_after_trim(
+            ctx.as_ref(),
+            &sender,
+            &trimmed_turns,
+            false,
+            &known_prefix,
+            false,
+        ),
+        "resync must report success when the durable write succeeds"
+    );
+
+    let expected = [
+        a_user.clone(),
+        worker_b_user.clone(),
+        worker_b_reply.clone(),
+    ];
+
+    let cached = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .peek(&sender)
+        .expect("history must exist for sender")
+        .clone();
+    assert!(
+        cached.len() == expected.len() && cached.iter().zip(&expected).all(|(a, b)| same(a, b)),
+        "a cache rotation that coincidentally leaves the length unchanged must not let the \
+         resync discard worker B's completed turn: got {cached:?}"
+    );
+
+    let reloaded = backend.load(&sender);
+    assert!(
+        reloaded.len() == expected.len() && reloaded.iter().zip(&expected).all(|(a, b)| same(a, b)),
+        "the durable transcript must agree with the cache after the merge, \
+         so a restart does not lose worker B's turn either: got {reloaded:?}"
     );
 }
 
@@ -17493,6 +19540,10 @@ temperature = 0.3
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -18450,6 +20501,10 @@ temperature = 0.3
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -18926,6 +20981,10 @@ api_key = "anthropic-key"
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -19026,6 +21085,10 @@ api_key = "anthropic-key"
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -19142,6 +21205,10 @@ api_key = "anthropic-key"
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -19263,6 +21330,10 @@ api_key = "anthropic-key"
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -19356,6 +21427,528 @@ api_key = "anthropic-key"
         assert!(
             should_rollback_failed_user_turn(&client_error),
             "genuine 4xx client errors must still roll the failed turn back"
+        );
+    }
+
+    fn breadcrumb_text() -> String {
+        zeroclaw_runtime::agent::history::HISTORY_TRIM_BREADCRUMB_CANONICAL.to_string()
+    }
+
+    #[test]
+    fn hydration_keeps_an_explicit_false_flag_despite_a_marker_text_collision() {
+        // A genuine user turn that happens to equal the breadcrumb text,
+        // with the durable flag explicitly recorded false. Hydration must
+        // not override that explicit record with a from-scratch text guess.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap();
+        let sender = "chan_collision".to_string();
+        store
+            .append(&sender, &ChatMessage::user(breadcrumb_text()))
+            .unwrap();
+        store
+            .append(&sender, &ChatMessage::assistant("ok"))
+            .unwrap();
+        store.set_session_trim_breadcrumb(&sender, false).unwrap();
+
+        let hydrated = hydrate_session_transcript(&store, &sender)
+            .expect("reconciliation must succeed")
+            .expect("session must hydrate");
+
+        assert!(
+            !hydrated.crumb_present,
+            "an explicit false flag must survive a text collision"
+        );
+        assert_eq!(
+            store.get_session_trim_breadcrumb(&sender).unwrap(),
+            Some(false),
+            "hydration must not have overwritten the explicit false flag"
+        );
+    }
+
+    #[test]
+    fn hydration_drops_ownership_when_the_cap_removes_the_owned_marker() {
+        // Durable flag says the marker is present, and the transcript
+        // exceeds MAX_CHANNEL_HISTORY so the cap removes the leading
+        // marker. Ownership must follow it down to false, and the
+        // truncated transcript must be persisted together with the
+        // corrected flag.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap();
+        let sender = "chan_capped".to_string();
+        store
+            .append(&sender, &ChatMessage::user(breadcrumb_text()))
+            .unwrap();
+        for i in 0..MAX_CHANNEL_HISTORY {
+            let msg = if i % 2 == 0 {
+                ChatMessage::user(format!("turn {i}"))
+            } else {
+                ChatMessage::assistant(format!("reply {i}"))
+            };
+            store.append(&sender, &msg).unwrap();
+        }
+        store.set_session_trim_breadcrumb(&sender, true).unwrap();
+
+        let hydrated = hydrate_session_transcript(&store, &sender)
+            .expect("reconciliation must succeed")
+            .expect("session must hydrate");
+
+        assert!(
+            !hydrated.crumb_present,
+            "the cap dropped the owned marker, so ownership must follow it to false"
+        );
+        assert_eq!(
+            hydrated.messages.len(),
+            MAX_CHANNEL_HISTORY,
+            "the returned transcript must already be capped"
+        );
+        assert_eq!(
+            store.get_session_trim_breadcrumb(&sender).unwrap(),
+            Some(false),
+            "the durable flag must be corrected"
+        );
+        assert_eq!(
+            store.load(&sender).len(),
+            MAX_CHANNEL_HISTORY,
+            "the durable transcript must be truncated together with the flag, \
+             so a later restart does not reload the marker this pass dropped"
+        );
+    }
+
+    #[test]
+    fn hydration_keeps_ownership_when_the_marker_survives_the_cap() {
+        // Durable flag says the marker is present and the transcript is
+        // short enough that the cap is a no-op: ownership must stay true
+        // and nothing needs to be rewritten.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap();
+        let sender = "chan_uncapped".to_string();
+        store
+            .append(&sender, &ChatMessage::user(breadcrumb_text()))
+            .unwrap();
+        store
+            .append(&sender, &ChatMessage::assistant("ok"))
+            .unwrap();
+        store.set_session_trim_breadcrumb(&sender, true).unwrap();
+
+        let hydrated = hydrate_session_transcript(&store, &sender)
+            .expect("reconciliation must succeed")
+            .expect("session must hydrate");
+
+        assert!(
+            hydrated.crumb_present,
+            "the marker was never dropped, so ownership must stay true"
+        );
+        assert_eq!(
+            store.get_session_trim_breadcrumb(&sender).unwrap(),
+            Some(true),
+            "an already-correct flag must not be rewritten"
+        );
+    }
+
+    #[test]
+    fn hydration_skips_a_session_whose_reconciliation_write_fails() {
+        // The transcript exceeds MAX_CHANNEL_HISTORY, so hydration truncates
+        // and must persist the truncated pair. When that write fails,
+        // hydration must return None instead of publishing the locally
+        // truncated transcript: the live process would otherwise append to
+        // a cache durable storage did not accept, and a later restart would
+        // resurrect the turns the live process discarded.
+        use std::sync::Mutex as StdMutex;
+        use zeroclaw_infra::session_backend::SessionBackend;
+
+        struct UnwritableBackend {
+            messages: StdMutex<Vec<ChatMessage>>,
+        }
+        impl SessionBackend for UnwritableBackend {
+            fn load(&self, _key: &str) -> Vec<ChatMessage> {
+                self.messages.lock().unwrap().clone()
+            }
+            fn append(&self, _key: &str, msg: &ChatMessage) -> std::io::Result<()> {
+                self.messages.lock().unwrap().push(msg.clone());
+                Ok(())
+            }
+            fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+                Ok(false)
+            }
+            fn list_sessions(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn rewrite_messages(
+                &self,
+                _key: &str,
+                _messages: &[ChatMessage],
+            ) -> std::io::Result<()> {
+                Err(std::io::Error::other("simulated durable write failure"))
+            }
+            fn set_session_trim_breadcrumb(
+                &self,
+                _key: &str,
+                _present: bool,
+            ) -> std::io::Result<()> {
+                Err(std::io::Error::other("simulated durable write failure"))
+            }
+            fn get_session_trim_breadcrumb(&self, _key: &str) -> std::io::Result<Option<bool>> {
+                Ok(Some(false))
+            }
+        }
+
+        let backend = UnwritableBackend {
+            messages: StdMutex::new(Vec::new()),
+        };
+        for i in 0..=MAX_CHANNEL_HISTORY {
+            let msg = if i % 2 == 0 {
+                ChatMessage::user(format!("turn {i}"))
+            } else {
+                ChatMessage::assistant(format!("reply {i}"))
+            };
+            backend.append("sender", &msg).unwrap();
+        }
+
+        assert!(
+            hydrate_session_transcript(&backend, "sender").is_err(),
+            "a failed reconciliation write must be reported, not published as a truncated cache"
+        );
+    }
+
+    #[test]
+    fn append_after_failed_hydration_installs_a_verified_durable_fallback() {
+        // Extend the hydration-failure regression through the next inbound
+        // append: with a backend whose reconciliation writes fail but whose
+        // transcript reads work, the first turn after startup must install
+        // the durable transcript plus the new turn — never a
+        // new-message-only cache over an existing transcript (which would
+        // also stop later turns from retrying hydration, since the cache
+        // would then exist).
+        use std::sync::Mutex as StdMutex;
+        use zeroclaw_infra::session_backend::SessionBackend;
+
+        struct ReadableButUnreconcilableBackend {
+            messages: StdMutex<Vec<ChatMessage>>,
+        }
+        impl SessionBackend for ReadableButUnreconcilableBackend {
+            fn load(&self, _key: &str) -> Vec<ChatMessage> {
+                self.messages.lock().unwrap().clone()
+            }
+            fn append(&self, _key: &str, msg: &ChatMessage) -> std::io::Result<()> {
+                self.messages.lock().unwrap().push(msg.clone());
+                Ok(())
+            }
+            fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+                Ok(false)
+            }
+            fn list_sessions(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn rewrite_messages(
+                &self,
+                _key: &str,
+                _messages: &[ChatMessage],
+            ) -> std::io::Result<()> {
+                Err(std::io::Error::other("simulated durable write failure"))
+            }
+            fn set_session_trim_breadcrumb(
+                &self,
+                _key: &str,
+                _present: bool,
+            ) -> std::io::Result<()> {
+                Err(std::io::Error::other("simulated durable write failure"))
+            }
+            fn get_session_trim_breadcrumb(&self, _key: &str) -> std::io::Result<Option<bool>> {
+                Ok(Some(false))
+            }
+        }
+
+        let backend = Arc::new(ReadableButUnreconcilableBackend {
+            messages: StdMutex::new(Vec::new()),
+        });
+        let sender = "append_after_failed_hydration".to_string();
+        // Seed an over-cap durable transcript so hydration must reconcile
+        // (and fail), then drive one inbound turn through the append path.
+        for i in 0..=MAX_CHANNEL_HISTORY {
+            let msg = if i % 2 == 0 {
+                ChatMessage::user(format!("durable turn {i}"))
+            } else {
+                ChatMessage::assistant(format!("durable reply {i}"))
+            };
+            backend.append(&sender, &msg).unwrap();
+        }
+        let ctx = test_channel_ctx_with_backend(backend.clone() as Arc<dyn SessionBackend>);
+
+        let returned = append_sender_turn(ctx.as_ref(), &sender, ChatMessage::user("new inbound"))
+            .expect("a verified durable fallback must still let the turn proceed");
+
+        let cached = ctx
+            .conversation_histories
+            .lock()
+            .unwrap()
+            .peek(&sender)
+            .expect("a cache entry must be installed")
+            .clone();
+        assert!(
+            cached.len() > 1,
+            "the cache must carry the durable transcript, not only the new turn"
+        );
+        assert!(
+            cached.iter().any(|m| m.content.starts_with("durable turn")),
+            "durable context must survive a failed reconciliation: {cached:?}"
+        );
+        assert_eq!(
+            cached.last().map(|m| m.content.as_str()),
+            Some("new inbound"),
+            "the new turn still lands last"
+        );
+        assert_eq!(
+            returned
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>(),
+            cached.iter().map(|m| m.content.clone()).collect::<Vec<_>>(),
+            "the provider snapshot must match the installed cache"
+        );
+        assert_eq!(
+            ctx.history_crumb_flags
+                .lock()
+                .unwrap()
+                .peek(&sender)
+                .copied(),
+            Some(false),
+            "the fallback flag comes from the verified store read"
+        );
+    }
+
+    #[test]
+    fn append_after_failed_hydration_does_not_install_a_cache_when_provenance_is_unreadable() {
+        // Caller-level fail-closed regression for the fallback path: with a
+        // readable transcript but an unreadable provenance record, hydration
+        // fails and the fallback must not pair the durable transcript with a
+        // guessed `false` flag. `append_sender_turn` signals unavailable with
+        // `None` rather than returning the turn ephemerally — a caller that
+        // ran the request on `Some(vec![turn])` here would send the model
+        // only this one message instead of the sender's real conversation.
+        // No cache entry or crumb flag is installed, and the next turn
+        // retries hydration.
+        use std::sync::Mutex as StdMutex;
+        use zeroclaw_infra::session_backend::SessionBackend;
+
+        struct ReadableTranscriptUnreadableProvenance {
+            messages: StdMutex<Vec<ChatMessage>>,
+        }
+        impl SessionBackend for ReadableTranscriptUnreadableProvenance {
+            fn load(&self, _key: &str) -> Vec<ChatMessage> {
+                self.messages.lock().unwrap().clone()
+            }
+            fn append(&self, _key: &str, msg: &ChatMessage) -> std::io::Result<()> {
+                self.messages.lock().unwrap().push(msg.clone());
+                Ok(())
+            }
+            fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+                Ok(false)
+            }
+            fn list_sessions(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn rewrite_messages(
+                &self,
+                _key: &str,
+                _messages: &[ChatMessage],
+            ) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn set_session_trim_breadcrumb(
+                &self,
+                _key: &str,
+                _present: bool,
+            ) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn get_session_trim_breadcrumb(&self, _key: &str) -> std::io::Result<Option<bool>> {
+                Err(std::io::Error::other("simulated provenance read failure"))
+            }
+        }
+
+        let backend = Arc::new(ReadableTranscriptUnreadableProvenance {
+            messages: StdMutex::new(Vec::new()),
+        });
+        let sender = "append_unreadable_provenance".to_string();
+        // Seed an over-cap durable transcript so hydration must reconcile,
+        // then fail on the provenance read.
+        for i in 0..=MAX_CHANNEL_HISTORY {
+            let msg = if i % 2 == 0 {
+                ChatMessage::user(format!("durable turn {i}"))
+            } else {
+                ChatMessage::assistant(format!("durable reply {i}"))
+            };
+            backend.append(&sender, &msg).unwrap();
+        }
+        let ctx = test_channel_ctx_with_backend(backend.clone() as Arc<dyn SessionBackend>);
+
+        let returned = append_sender_turn(ctx.as_ref(), &sender, ChatMessage::user("new inbound"));
+
+        assert!(
+            returned.is_none(),
+            "unreadable provenance must signal unavailable, not an ephemeral \
+             contextless turn a caller could mistake for a genuine reply"
+        );
+        assert!(
+            ctx.conversation_histories
+                .lock()
+                .unwrap()
+                .peek(&sender)
+                .is_none(),
+            "no cache entry may be installed when provenance is unreadable"
+        );
+        assert!(
+            ctx.history_crumb_flags
+                .lock()
+                .unwrap()
+                .peek(&sender)
+                .is_none(),
+            "no crumb flag may be installed when provenance is unreadable"
+        );
+    }
+
+    #[test]
+    fn hydration_persists_the_cap_even_when_the_explicit_flag_is_already_false() {
+        // Durable flag is explicitly false and the transcript exceeds
+        // MAX_CHANNEL_HISTORY. Ownership doesn't change, but the cap must
+        // still be written back: otherwise the durable transcript stays
+        // over the cap and a later restart reloads the untruncated state.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap();
+        let sender = "chan_capped_false".to_string();
+        for i in 0..(MAX_CHANNEL_HISTORY + 4) {
+            let msg = if i % 2 == 0 {
+                ChatMessage::user(format!("turn {i}"))
+            } else {
+                ChatMessage::assistant(format!("reply {i}"))
+            };
+            store.append(&sender, &msg).unwrap();
+        }
+        store.set_session_trim_breadcrumb(&sender, false).unwrap();
+
+        let hydrated = hydrate_session_transcript(&store, &sender)
+            .expect("reconciliation must succeed")
+            .expect("session must hydrate");
+
+        assert!(!hydrated.crumb_present, "the flag stays false");
+        assert_eq!(
+            hydrated.messages.len(),
+            MAX_CHANNEL_HISTORY,
+            "the returned transcript must be capped"
+        );
+        assert_eq!(
+            store.load(&sender).len(),
+            MAX_CHANNEL_HISTORY,
+            "the durable transcript must be capped too, even though ownership \
+             didn't change, so a restart doesn't reload the uncapped state"
+        );
+    }
+
+    #[test]
+    fn hydration_drops_legacy_marker_ownership_when_the_cap_removes_it() {
+        // No recorded flag (legacy session) and the leading synthetic
+        // marker is old enough that the cap drains it off. Ownership must
+        // be inferred from the transcript actually returned, not from a
+        // pre-cap snapshot that no longer matches what's kept.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap();
+        let sender = "chan_legacy_capped".to_string();
+        store
+            .append(&sender, &ChatMessage::user(breadcrumb_text()))
+            .unwrap();
+        for i in 0..MAX_CHANNEL_HISTORY {
+            let msg = if i % 2 == 0 {
+                ChatMessage::user(format!("turn {i}"))
+            } else {
+                ChatMessage::assistant(format!("reply {i}"))
+            };
+            store.append(&sender, &msg).unwrap();
+        }
+        // No set_session_trim_breadcrumb call: this session never recorded
+        // a flag, matching a pre-upgrade transcript.
+
+        let hydrated = hydrate_session_transcript(&store, &sender)
+            .expect("reconciliation must succeed")
+            .expect("session must hydrate");
+
+        assert!(
+            !hydrated.crumb_present,
+            "the marker was drained by the cap, so legacy inference must not claim ownership"
+        );
+        assert_eq!(
+            store.get_session_trim_breadcrumb(&sender).unwrap(),
+            Some(false),
+            "the inferred flag must be persisted"
+        );
+        assert_eq!(
+            store.load(&sender).len(),
+            MAX_CHANNEL_HISTORY,
+            "the durable transcript must be capped together with the flag"
+        );
+    }
+
+    #[test]
+    fn hydration_fails_closed_when_the_breadcrumb_flag_is_unreadable() {
+        // A backend read error must not be treated the same as "no record":
+        // that would fall through to legacy text inference and let a
+        // colliding first user message manufacture ownership the backend
+        // never actually recorded.
+        struct FailingBreadcrumbStore(zeroclaw_infra::session_store::SessionStore);
+
+        impl zeroclaw_infra::session_backend::SessionBackend for FailingBreadcrumbStore {
+            fn load(&self, session_key: &str) -> Vec<ChatMessage> {
+                self.0.load(session_key)
+            }
+            fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
+                self.0.append(session_key, message)
+            }
+            fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
+                self.0.remove_last(session_key)
+            }
+            fn list_sessions(&self) -> Vec<String> {
+                self.0.list_sessions()
+            }
+            fn get_session_trim_breadcrumb(
+                &self,
+                _session_key: &str,
+            ) -> std::io::Result<Option<bool>> {
+                Err(std::io::Error::other("simulated read failure"))
+            }
+            fn set_session_trim_breadcrumb(
+                &self,
+                session_key: &str,
+                present: bool,
+            ) -> std::io::Result<()> {
+                self.0.set_session_trim_breadcrumb(session_key, present)
+            }
+            fn replace_conversation_state(
+                &self,
+                session_key: &str,
+                messages: &[ChatMessage],
+                crumb_present: bool,
+            ) -> std::io::Result<()> {
+                self.0
+                    .replace_conversation_state(session_key, messages, crumb_present)
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let inner = zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap();
+        let sender = "chan_unreadable_flag".to_string();
+        inner
+            .append(&sender, &ChatMessage::user(breadcrumb_text()))
+            .unwrap();
+        inner
+            .append(&sender, &ChatMessage::assistant("ok"))
+            .unwrap();
+        let store = FailingBreadcrumbStore(inner);
+
+        let hydrated = hydrate_session_transcript(&store, &sender);
+
+        assert!(
+            hydrated.is_err(),
+            "an unreadable flag must fail closed as HydrationFailed instead of publishing a \
+             cache whose crumb_present is a text guess"
         );
     }
 
@@ -20448,6 +23041,10 @@ api_key = "anthropic-key"
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -20548,6 +23145,10 @@ api_key = "anthropic-key"
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -21063,6 +23664,124 @@ api_key = "anthropic-key"
             "brackets must share a turn_id even on error"
         );
         assert!(starts[0].2.is_some(), "brackets must carry a turn_id");
+    }
+
+    /// Regression: a provider error must not recreate the channel cache from
+    /// this turn's own unverified working buffer when the pre-trim resync
+    /// above could not confirm the durable transcript matches it. Mirrors
+    /// the successful-response path's existing `!history_resync_failed`
+    /// guard on the tool/assistant appends.
+    #[tokio::test]
+    async fn process_channel_message_does_not_recreate_cache_after_provider_error_and_failed_resync()
+     {
+        use zeroclaw_infra::session_backend::SessionBackend;
+
+        #[derive(Default)]
+        struct FailingRewriteAndProvenanceBackend {
+            messages: std::sync::Mutex<Vec<ChatMessage>>,
+        }
+        impl SessionBackend for FailingRewriteAndProvenanceBackend {
+            fn load(&self, _key: &str) -> Vec<ChatMessage> {
+                self.messages
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+            }
+            fn append(&self, _key: &str, msg: &ChatMessage) -> std::io::Result<()> {
+                self.messages
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(msg.clone());
+                Ok(())
+            }
+            fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+                Ok(false)
+            }
+            fn list_sessions(&self) -> Vec<String> {
+                vec![]
+            }
+            fn rewrite_messages(
+                &self,
+                _key: &str,
+                _messages: &[ChatMessage],
+            ) -> std::io::Result<()> {
+                Err(std::io::Error::other("simulated transcript write failure"))
+            }
+            fn set_session_trim_breadcrumb(
+                &self,
+                _key: &str,
+                _present: bool,
+            ) -> std::io::Result<()> {
+                Err(std::io::Error::other("simulated breadcrumb write failure"))
+            }
+            fn get_session_trim_breadcrumb(&self, _key: &str) -> std::io::Result<Option<bool>> {
+                Err(std::io::Error::other(
+                    "simulated breadcrumb provenance read failure",
+                ))
+            }
+        }
+
+        let mut msg = message_sent_hook_test_message();
+        msg.content = "trigger format error".to_string();
+        let history_key = conversation_history_key(&msg);
+
+        let backend = Arc::new(FailingRewriteAndProvenanceBackend::default());
+        // A whole old turn (user + assistant), so a tiny `context_token_budget`
+        // forces the pre-dispatch gate to drop it before the (erroring)
+        // provider call, giving the resync below something real to detect.
+        let old_user_turn =
+            ChatMessage::user("pre-existing turn that must survive a failed resync");
+        let old_assistant_turn = ChatMessage::assistant("pre-existing reply".to_string());
+        for turn in [&old_user_turn, &old_assistant_turn] {
+            backend
+                .append(&history_key, turn)
+                .expect("seed pre-existing durable turn");
+        }
+
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = test_channel_ctx_with_backend_channel_and_provider(
+            backend.clone() as Arc<dyn SessionBackend>,
+            channel,
+            Arc::new(FormatErrorModelProvider),
+            1, // context_token_budget: force a whole-turn drop pre-dispatch
+        );
+        runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(
+                history_key.clone(),
+                vec![old_user_turn.clone(), old_assistant_turn.clone()],
+            );
+        runtime_ctx
+            .history_crumb_flags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(history_key.clone(), false);
+
+        process_channel_message(runtime_ctx.clone(), msg, CancellationToken::new()).await;
+
+        assert!(
+            !backend
+                .messages
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|m| m.content.contains("Task failed")),
+            "a provider error after a failed resync must not append the \
+             failure marker onto an unreconciled durable transcript"
+        );
+        assert!(
+            runtime_ctx
+                .conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .peek(&history_key)
+                .is_none(),
+            "the failed resync must have evicted the cache entry, and the \
+             error path must not have recreated it"
+        );
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -22903,6 +25622,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -22992,6 +25715,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -23115,6 +25842,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -23233,6 +25964,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -23529,6 +26264,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -23656,6 +26395,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -23805,6 +26548,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -23937,6 +26684,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -24054,6 +26805,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -24189,6 +26944,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -24348,6 +27107,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(route_overrides)),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -24528,6 +27291,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -25016,6 +27783,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -25128,6 +27899,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -25250,6 +28025,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -26722,6 +29501,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -26868,6 +29651,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -27029,6 +29816,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -27238,6 +30029,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -27463,6 +30258,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -27599,6 +30398,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -28086,6 +30889,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -28216,6 +31023,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -28349,6 +31160,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -28474,6 +31289,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -28599,6 +31418,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -29011,6 +31834,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -30530,6 +33357,10 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -35704,6 +38535,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -35885,6 +38720,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -36405,6 +39244,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -36892,6 +39735,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -37049,6 +39896,10 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -40573,6 +43424,10 @@ This is an example JSON object for profile settings."#;
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -40690,6 +43545,10 @@ This is an example JSON object for profile settings."#;
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -40854,6 +43713,10 @@ This is an example JSON object for profile settings."#;
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -41161,6 +44024,10 @@ This is an example JSON object for profile settings."#;
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -41316,6 +44183,10 @@ This is an example JSON object for profile settings."#;
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -41463,6 +44334,10 @@ This is an example JSON object for profile settings."#;
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -41630,6 +44505,10 @@ This is an example JSON object for profile settings."#;
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -42337,6 +45216,10 @@ This is an example JSON object for profile settings."#;
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
