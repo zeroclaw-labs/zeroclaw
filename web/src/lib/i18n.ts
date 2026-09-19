@@ -757,6 +757,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'logs.clear_filters': "clear",
     'logs.filter_where_prefix': "Filter logs where ",
     'logs.hide_internal': "Hide internal",
+    'logs.incomplete': "partial: some history unreadable",
     'logs.load_older': "Load older",
     'logs.no_events': "No events match the current filters.",
     'logs.pick_a_key': "Pick a key…",
