@@ -4,7 +4,7 @@ An RFC records a durable project-level decision before implementation. The proce
 
 Most work does not need one. The RFC trigger is deliberately narrow so that proposals which genuinely need a project-level decision are not queued behind ordinary features.
 
-RFC scope, discussion timing, and ratification rules were last set by [#9496](https://github.com/zeroclaw-labs/zeroclaw/issues/9496), accepted 2026-08-10 and adopted as FND-003 Rev. 15, then clarified by FND-003 Rev. 17. See [FND-003](../foundations/fnd-003-governance.md) for the durable protocol.
+RFC scope and ratification rules are defined by [FND-003](../foundations/fnd-003-governance.md). The current protocol was narrowed by [#9496](https://github.com/zeroclaw-labs/zeroclaw/issues/9496), clarified for deferred votes by [#10288](https://github.com/zeroclaw-labs/zeroclaw/pull/10288), and simplified by [#10549](https://github.com/zeroclaw-labs/zeroclaw/issues/10549).
 
 ## When to file an RFC vs. just a PR
 
@@ -48,9 +48,9 @@ Body structure: adapt to the size of the proposal:
 6. **Risks and mitigations**: what could go wrong, and what's the rollback story
 7. **Rollout**: feature-flagged? schema-versioned? breaking change window?
 
-Filed RFCs go through a minimum discussion period against a visible proposal: **48 hours** for an ordinary RFC, **72 hours** for one requesting the exceptional unanimous path. Anyone can comment. Maintainers weigh in. The author iterates on the body in response.
+Filed RFCs go through snapshot preparation and discussion, but there is no mandatory minimum discussion timer. Anyone can comment. Maintainers weigh in. The author iterates on the body in response.
 
-Ordinary revisions and clarifications during discussion do not restart the clock. A revision that materially changes the proposed decision establishes a new stable snapshot, identified publicly, and restarts the applicable minimum period. Voting opens only after the period has elapsed and the proposal is stable.
+A Core vote may open once the proposal has a visible stable snapshot, the vote opener identifies the RFC trigger, and a Core contributor is willing to put that snapshot to a decision. Body edits before a vote do not restart an automatic waiting period; body edits after a vote opens either stop the current vote as a material replacement or stay outside the voted snapshot until the next revision.
 
 ## Ratification
 
@@ -58,21 +58,32 @@ A vote cycle normally stays open for **72 hours** against an immutable proposal 
 
 **Electorate.** An active Core contributor is a current Core Team member who cast an explicit ballot in a formally opened RFC vote within the preceding 30 days. Any current Core Team member outside that set may still ballot; doing so joins them to that vote's electorate and reactivates them for later votes.
 
-**Ballots** are `APPROVE`, `REVISE`, or `REJECT`. `REVISE` withholds approval but does not veto. `REJECT` is a blocking objection and needs a specific reason. Your latest ballot before the recorded deadline for the current vote cycle supersedes your earlier one.
+**Ballots** are `APPROVE`, `REVISE`, or `REJECT`. `APPROVE` accepts the snapshot as written, optionally with implementation boundaries. `REVISE` stops the current snapshot when it names the affected contract or body term, the concrete body change or decision needed, and why the ambiguity prevents approval. `REJECT` is a blocking objection and needs a specific reason. While a vote remains open, your latest `APPROVE` or `REJECT` before the recorded deadline supersedes your earlier ballot; a valid `REVISE` is terminal for that snapshot.
 
 **Threshold.** Two-thirds of the final active electorate by default, rounded up to a whole voter. Quorum requires at least two explicit ballots; silence never counts toward quorum. Once quorum is met, silence from the electorate counts as `APPROVE` for ordinary votes. Unanimity is reserved for decisions whose cost or irreversibility makes a supermajority inadequate, such as license or legal-ownership changes; it requires explicit `APPROVE` from every assigned voter, and silence cannot establish it.
 
 Outcomes, applied in this order:
 
-- **Deferred**: the vote cannot close because it has fewer than two explicit ballots, or because quorum is met with no `REJECT` but the applicable threshold or required explicit approvals are not yet satisfied. The proposal may enter another 72-hour cycle against the same immutable snapshot. Existing explicit ballots count toward quorum and outcome in the renewed cycle, and carry forward until replaced by a later ballot. A material proposal change creates a new snapshot and follows the applicable discussion or vote handling.
+- **Returned to revision**: a valid eligible `REVISE` before the deadline stops the current snapshot. The return record names the blocking body change or decision needed.
+- **Deferred**: the vote cannot close because it has fewer than two explicit ballots, or because quorum is met with no valid `REVISE` or `REJECT` but the applicable threshold or required explicit approvals are not yet satisfied. The proposal may enter another 72-hour cycle against the same immutable snapshot. The continuation or reopening record names the unchanged snapshot, carried ballots, electorate so far, threshold, missing condition, and exact UTC deadline. Existing explicit ballots count toward quorum and outcome in the renewed cycle, and carry forward until replaced by a later ballot. A material proposal change creates a new snapshot.
 - **Rejected**: quorum met and any final ballot is `REJECT`. Issue closed with the blocking objection recorded, linking any issue where the underlying problem continues. This rejects the proposal, not necessarily the problem.
-- **Accepted**: quorum met, no `REJECT`, and the applicable threshold is satisfied. By default, that means at least two-thirds approve explicitly or by silence; exceptional-unanimous votes require explicit `APPROVE` from every assigned voter. Issue carries `status:accepted`, and the closing record addresses every `REVISE` concern rather than discarding it. Implementation PRs can proceed once that handoff is visible.
+- **Accepted**: quorum met, no valid `REVISE` or `REJECT`, and the applicable threshold is satisfied. By default, that means at least two-thirds approve explicitly or by silence; exceptional-unanimous votes require explicit `APPROVE` from every assigned voter. Issue carries `status:accepted`, and the closing record or implementation handoff records non-blocking implementation boundaries when they were raised. Implementation PRs can proceed once that handoff is visible.
 - **Returned to discussion**: the proposal body materially changes, or the author asks to revise before a decision. The return record names the next stable proposal target or the revision needed.
 - **Withdrawn**: the author pulls it. Closed without prejudice.
 
+A vague `REVISE` that does not name a concrete body blocker does not stop the vote or count toward quorum until it is cured. The vote opener may ask for clarification, but cannot set aside a facially valid `REVISE` alone; if validity is disputed, one other Core contributor must agree that the ballot is invalid or the ballot stands.
+
+Silence-as-approval is evaluated only at the deadline for a vote that remains open and has no valid `REVISE` or `REJECT`. Silence never overrides a stopped snapshot.
+
 A vote may close early only when every member of the final active electorate has explicitly approved and no inactive Core contributor has asked for the full window. The closing record must say why it closed early.
 
-The current protocol applies to RFC votes opened after ratification. It does not automatically invalidate earlier accepted RFCs; historical-process audit and correction work are tracked separately.
+The current protocol applies to RFC votes opened after the documentation PR that ratifies that revision lands, unless Core explicitly records earlier use on a specific issue. It does not automatically invalidate earlier accepted RFCs; historical-process audit and correction work are tracked separately.
+
+### Vote records
+
+Use the prose requirements in this guide as the canonical format for vote-opening, continuation, and closing comments. There are no separate required vote-record templates; the RFC issue form collects the initial proposal, not the vote record. [FND-003](../foundations/fnd-003-governance.md#81-the-full-rfc-lifecycle) governs ballot validity, deadlines, and outcome precedence.
+
+An opening record includes the RFC trigger and why the snapshot is ready, alongside the ratification fields above. An unchanged-snapshot continuation lists carried ballots and sets a new exact UTC deadline; it does not leave the vote pending indefinitely. A closing or return record identifies the snapshot, eligible ballots, outcome and reason, and the required revision, implementation boundaries, or continuation. A valid eligible `REVISE` stops that snapshot rather than becoming a concern to tally past at closure.
 
 ## Implementing an accepted RFC
 
