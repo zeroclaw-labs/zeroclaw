@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["EPHEMERAL_WORKSPACE_WARNING"],"enum":["OptionDomain"],"fn":["invocation_trigger_matches","with_ephemeral_workspace_warning"],"struct":["OptionEntry","ToolOutput","ToolResult","ToolSpec"],"trait":["Tool"]};

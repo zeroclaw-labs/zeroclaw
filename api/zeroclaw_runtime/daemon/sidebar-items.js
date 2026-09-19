@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["DaemonExit","GatewayBindMode"],"fn":["detect_gateway_bind_mode","echo_daemon_starting_to_terminal","run","state_file_path","stderr_is_interactive_foreground"],"struct":["DaemonRegistry","GatewayReadinessReporter","GatewayReloadControls","SocketReadinessReporter"]};

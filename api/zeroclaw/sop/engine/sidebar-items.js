@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["CancelOutcome"],"fn":["err_is_cancellation_persistence_retained","err_is_resume_at_capacity","err_is_terminal_persistence_retained","now_iso8601"],"struct":["MaintenanceSummary","SopEngine"]};

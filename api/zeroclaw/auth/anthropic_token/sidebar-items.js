@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["AnthropicAuthKind"],"fn":["detect_auth_kind"]};

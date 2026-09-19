@@ -1,0 +1,40 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Canonicalize one egress allowlist entry, or explain why it is rejected."><title>normalize_egress_pattern in zeroclaw_infra::net_guard - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><script id="default-settings" 
+data-use_system_theme="false"
+data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="zeroclaw_infra" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">normalize_egress_pattern</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../zeroclaw_infra/index.html">zeroclaw_<wbr>infra</a><span class="version">0.8.5</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">normalize_<wbr>egress_<wbr>pattern</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#errors" title="Errors">Errors</a></li></ul></section><div id="rustdoc-modnav"><h2><a href="index.html">In zeroclaw_<wbr>infra::<wbr>net_<wbr>guard</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">zeroclaw_infra</a>::<wbr><a href="index.html">net_guard</a></div><h1>Function <span class="fn">normalize_<wbr>egress_<wbr>pattern</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"> </span></div><pre class="rust item-decl"><code>pub fn normalize_egress_pattern(raw: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.98.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>, <a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>&gt;</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Canonicalize one egress allowlist entry, or explain why it is rejected.</p>
+<p>This is the single grammar for both halves of the egress contract: the signed
+manifest’s <code>egress.hosts</code> declaration and the operator’s
+<code>plugins.entries[].egress_hosts</code> grant. Both validate here so a pattern that
+a publisher can declare is exactly a pattern an operator can grant.</p>
+<p>Accepted forms:</p>
+<ul>
+<li>an <strong>exact host</strong>: a lowercase domain name, IPv4 literal, or IPv6 literal
+(bare <code>::1</code> or bracketed <code>[::1]</code>; both canonicalize to bare). It matches
+that host and nothing else — a bare domain never implies its subdomains.</li>
+<li>an <strong>explicit suffix pattern</strong> <code>*.example.com</code>: matches strict subdomains
+of <code>example.com</code> and <strong>not</strong> the apex itself. Grant the apex by listing it
+separately.</li>
+</ul>
+<p>Rejected, each with a message naming the reason:</p>
+<ul>
+<li>a bare <code>*</code>. There is no “everything” pattern; deny-by-default has no
+escape hatch at the grammar level.</li>
+<li>empty or whitespace-bearing entries.</li>
+<li>anything carrying a scheme, path, query, fragment, or userinfo (<code>/</code>, <code>@</code>,
+<code>?</code>, <code>#</code>, <code>\</code>), so an entry is never a URL that silently loses its path.</li>
+<li>a <code>*</code> anywhere other than the leading <code>*.</code> (no <code>a*.b</code>, no <code>*.*.c</code>).</li>
+<li><strong>a port</strong> (<code>example.com:8443</code>). Ports are deliberately not part of this
+slice’s grammar: a granted host is granted on <em>every</em> port, all-or-nothing.
+Rejecting the syntax outright keeps an operator from writing a port and
+believing it narrowed the grant when it would in fact have been dropped.</li>
+<li>a wildcard over an IP literal (<code>*.10.0.0.1</code>), which has no meaning.</li>
+<li>a single-label wildcard suffix (<code>*.com</code>, <code>*.internal</code>). This is a footgun
+guard, not a public-suffix check: no public-suffix list is imported here,
+so <code>*.co.uk</code> is <strong>accepted</strong> even though it is just as broad. The rule only
+removes the most obvious way to write an accidental internet-wide grant.</li>
+<li>any entry that is not already canonical (a trailing dot, uppercase, or a
+form <a href="fn.normalize_domain.html" title="fn zeroclaw_infra::net_guard::normalize_domain"><code>normalize_domain</code></a> would silently rewrite), so the file an operator
+audits reads exactly as the policy that is enforced.</li>
+</ul>
+<h2 id="errors"><a class="doc-anchor" href="#errors">§</a>Errors</h2>
+<p>Returns the human-readable reason the entry is not a legal egress pattern.</p>
+</div></details></section></div></main></body></html>

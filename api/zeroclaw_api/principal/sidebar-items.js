@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ActorKind","AuthMethod","AuthOutcome","DenyReason","IdentitySubject"],"struct":["AgentAlias","AuthenticatedIdentity","Principal","PrincipalId"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["migrate_plugins_dir"],"struct":["PluginHost"]};
