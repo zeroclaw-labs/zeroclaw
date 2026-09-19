@@ -1191,6 +1191,7 @@ pub fn all_tools_with_runtime_and_acp_sessions(
                 max_coordinate_x: browser_config.computer_use.max_coordinate_x,
                 max_coordinate_y: browser_config.computer_use.max_coordinate_y,
             },
+            browser_config.timeout_secs,
             browser_config.allowed_private_hosts.clone(),
         ) {
             Ok(tool) => {
