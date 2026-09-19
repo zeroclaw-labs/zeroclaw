@@ -8,10 +8,10 @@ use crate::component::{
     PluginState, PluginStoreSpec, WarmPluginState, call_plugin, call_store, call_tool_execute,
     engine, load_component, wt, wt_instantiate,
 };
+use crate::host::AdmittedComponent;
 use crate::instance::PluginInstanceScope;
 use crate::services::PluginHostServices;
 use anyhow::{Context, Result};
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
@@ -73,12 +73,12 @@ fn tool_linker_http() -> &'static Linker<PluginState> {
 /// prevents authority from drifting between instantiation and execution. The
 /// required service bundle resolves canonical live config for that same scope.
 pub async fn create_plugin(
-    wasm_path: &Path,
+    component: &AdmittedComponent,
     scope: &PluginInstanceScope,
     services: &PluginHostServices,
     limits: crate::component::PluginLimits,
 ) -> Result<Plugin> {
-    create_plugin_with_egress(wasm_path, scope, services, limits, None).await
+    create_plugin_with_egress(component, scope, services, limits, None).await
 }
 
 /// [`create_plugin`], plus the host-owned egress authority for this instance.
@@ -88,14 +88,14 @@ pub async fn create_plugin(
 /// resolves policy per request rather than snapshotting it, so an operator's
 /// edit applies to the next dial.
 pub async fn create_plugin_with_egress(
-    wasm_path: &Path,
+    component: &AdmittedComponent,
     scope: &PluginInstanceScope,
     services: &PluginHostServices,
     limits: crate::component::PluginLimits,
     egress: Option<crate::egress::EgressHostService>,
 ) -> Result<Plugin> {
     scope.require_capability(PluginCapability::Tool)?;
-    let component = load_component(wasm_path)?;
+    let component = load_component(component)?;
     let mut store = crate::component::new_store(
         PluginStoreSpec::new(scope.clone(), services.clone(), limits)
             .with_granted_http()
@@ -270,8 +270,9 @@ mod tests {
     #[tokio::test]
     async fn create_plugin_rejects_a_scope_for_another_capability() {
         let scope = crate::instance::test_scope(PluginCapability::Channel, "main", []);
+        let component = AdmittedComponent::test_component(b"not-a-component");
         let result = create_plugin(
-            Path::new("/path/that/must/not-be-read.wasm"),
+            &component,
             &scope,
             &crate::services::test_host_services(),
             crate::component::test_limits(0),
