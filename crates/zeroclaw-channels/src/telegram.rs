@@ -2547,10 +2547,45 @@ impl TelegramChannel {
         }
     }
 
-    /// Returns `true` if `recipient` is in a peer group configured with
+    /// Returns `true` if `identity` belongs to a peer group configured with
     /// `output_modality = "voice"` for this channel. Resolved live from config
     /// via `voice_peer_resolver` so it stays correct across hot-reloads.
-    pub(crate) fn is_voice_peer(&self, recipient: &str) -> bool {
+    ///
+    /// `identity` is a sender identity. A peer group names senders, and a
+    /// group's chat id does not identify the member who asked for the reply;
+    /// only a private chat's address is the peer's own id.
+    pub(crate) fn is_voice_peer(&self, identity: &str) -> bool {
+        Self::voice_peer_identity_matches(&(self.voice_peer_resolver)(), identity)
+    }
+
+    /// Canonical voice-peer match for a resolved peer list: an optional leading
+    /// `@` and ASCII case are ignored, and `"*"` matches anyone. Mirrors the
+    /// shape inbound admission uses, so a configured peer matches the sender
+    /// identity it was written for.
+    fn voice_peer_identity_matches(peers: &[String], identity: &str) -> bool {
+        let identity = Self::normalize_identity(identity);
+        if identity.is_empty() {
+            return false;
+        }
+        let peers: Vec<String> = peers
+            .iter()
+            .map(|peer| Self::normalize_identity(peer))
+            .collect();
+        crate::allowlist::is_user_allowed(
+            &peers,
+            &identity,
+            crate::allowlist::Match::CaseInsensitive,
+        )
+    }
+
+    /// Senderless voice-peer check for a destination chat address, used where
+    /// no inbound sender exists (proactive delivery) or where a voice note
+    /// accompanies a text reply. Kept as the literal destination comparison
+    /// this channel has always used: a peer group names senders, so a
+    /// destination only stands in for one by coincidence, and widening the
+    /// match here would change proactive modality that sender-side resolution
+    /// does not cover.
+    fn destination_is_voice_peer(&self, recipient: &str) -> bool {
         (self.voice_peer_resolver)().iter().any(|p| p == recipient)
     }
 
@@ -3281,12 +3316,15 @@ impl TelegramChannel {
         }
     }
 
+    /// Whether a destination should receive a TTS voice reply: the session is
+    /// in input-driven voice mode, or — where the runtime has no inbound sender
+    /// to consult — the target chat address is itself a configured voice peer.
     fn is_voice_chat(&self, recipient: &str) -> bool {
         self.voice_chats
             .lock()
             .map(|vs| vs.contains(recipient))
             .unwrap_or(false)
-            || (self.voice_peer_resolver)().iter().any(|p| p == recipient)
+            || self.destination_is_voice_peer(recipient)
     }
 
     fn try_queue_voice_reply(&self, recipient: &str, content: &str, immediate: bool, force: bool) {
@@ -5117,12 +5155,15 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             content
         };
 
-        // Exit input-driven voice mode when user switches back to typing.
-        // Config-mandated voice peers (output_modality = "voice") stay in
-        // voice mode regardless of whether they send text or voice.
-        if !self.is_voice_peer(&reply_target)
-            && let Ok(mut vc) = self.voice_chats.lock()
-        {
+        // Exit input-driven voice mode when a sender switches back to typing.
+        // A sender configured for voice output (output_modality = "voice") keeps
+        // the conversation in voice mode regardless of whether they send text or
+        // voice. The peer group names their identity, not this chat's address.
+        let sender_is_voice_peer = self.is_voice_peer(&sender_identity)
+            || sender_id
+                .as_deref()
+                .is_some_and(|id| self.is_voice_peer(id));
+        if !sender_is_voice_peer && let Ok(mut vc) = self.voice_chats.lock() {
             vc.remove(&reply_target);
         }
 
@@ -6958,7 +6999,7 @@ impl Channel for TelegramChannel {
 
         // Voice-only peers: delete the draft placeholder and let the voice
         // bubble be the sole reply. Bypassed when suppress_voice forces text.
-        if !suppress_voice && self.is_voice_peer(recipient) {
+        if !suppress_voice && self.destination_is_voice_peer(recipient) {
             if let Ok(id) = message_id.parse::<i64>() {
                 let _ = self
                     .http_client()
@@ -7203,7 +7244,7 @@ impl Channel for TelegramChannel {
 
         // Voice-only peers (or explicit force_voice): the voice note is the sole reply — skip text.
         if !message.suppress_voice
-            && (self.is_voice_peer(&message.recipient) || message.force_voice)
+            && (self.destination_is_voice_peer(&message.recipient) || message.force_voice)
         {
             return Ok(());
         }
@@ -7869,18 +7910,18 @@ mod tests {
             move || cfg.channel_voice_peers("telegram", "default")
         }));
 
-        // is_voice_chat resolves live via voice_peer_resolver — no cache.
+        // is_voice_peer resolves live via voice_peer_resolver — no cache.
         assert!(
-            ch.is_voice_chat("@alice"),
+            ch.is_voice_peer("@alice"),
             "voice peer should be recognized"
         );
-        assert!(ch.is_voice_chat("@bob"), "voice peer should be recognized");
+        assert!(ch.is_voice_peer("@bob"), "voice peer should be recognized");
         assert!(
-            !ch.is_voice_chat("@carol"),
+            !ch.is_voice_peer("@carol"),
             "peers on another channel must not be recognized"
         );
         assert!(
-            !ch.is_voice_chat("@dave"),
+            !ch.is_voice_peer("@dave"),
             "mirror-modality peers must not be recognized"
         );
 
@@ -7922,10 +7963,95 @@ mod tests {
         // she was never in it — this proves live-resolved peers are separate).
         ch.voice_chats.lock().unwrap().remove("@alice");
 
-        // is_voice_chat must still return true via voice_peer_resolver.
+        // is_voice_peer must still return true via voice_peer_resolver.
         assert!(
-            ch.is_voice_chat("@alice"),
+            ch.is_voice_peer("@alice"),
             "live-resolved voice peer must remain active after voice_chats removal"
+        );
+    }
+
+    #[test]
+    fn voice_peers_match_sender_identities_not_group_addresses() {
+        use zeroclaw_config::multi_agent::{OutputModality, PeerGroupConfig, PeerUsername};
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.peer_groups.insert(
+            "voicers".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                external_peers: vec![PeerUsername::new("111")],
+                output_modality: OutputModality::Voice,
+                ..Default::default()
+            },
+        );
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_voice_peer_resolver(Arc::new({
+            let cfg = config.clone();
+            move || cfg.channel_voice_peers("telegram", "default")
+        }));
+
+        assert!(
+            ch.is_voice_peer("111"),
+            "the configured sender identity matches its own numeric id"
+        );
+        assert!(
+            !ch.is_voice_peer("-1001234567890"),
+            "a group's chat address is not a sender identity"
+        );
+        assert!(
+            !ch.is_voice_chat("-1001234567890"),
+            "a group address does not voice on the senderless fallback either"
+        );
+        assert!(
+            ch.is_voice_chat("111"),
+            "a private chat's address is the peer's own identity"
+        );
+    }
+
+    #[test]
+    fn wildcard_voice_peer_does_not_change_a_senderless_destination() {
+        use zeroclaw_config::multi_agent::{OutputModality, PeerGroupConfig, PeerUsername};
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.peer_groups.insert(
+            "voicers".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                external_peers: vec![PeerUsername::new("*")],
+                output_modality: OutputModality::Voice,
+                ..Default::default()
+            },
+        );
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_voice_peer_resolver(Arc::new({
+            let cfg = config.clone();
+            move || cfg.channel_voice_peers("telegram", "default")
+        }));
+
+        // Inbound senders are matched by identity, where the wildcard applies.
+        assert!(ch.is_voice_peer("anyone"));
+        // Proactive delivery has no sender to consult, so its destination
+        // comparison keeps the literal behaviour it had before sender-side
+        // resolution existed: a wildcard entry does not voice a chat address.
+        assert!(
+            !ch.is_voice_chat("-1001234567890"),
+            "a wildcard peer entry must not voice a senderless group destination"
+        );
+        assert!(
+            !ch.is_voice_chat("111"),
+            "a wildcard peer entry must not voice a senderless private-chat destination"
         );
     }
 
