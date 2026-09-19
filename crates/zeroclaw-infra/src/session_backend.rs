@@ -71,6 +71,17 @@ pub trait SessionBackend: Send + Sync {
     /// Load all messages for a session. Returns empty vec if session doesn't exist.
     fn load(&self, session_key: &str) -> Vec<ChatMessage>;
 
+    /// Like `load`, but distinguishes an unreadable transcript from a genuinely
+    /// missing/empty session. `Ok(vec)` is the verified durable transcript
+    /// (empty means no session), `Err` means the transcript could not be read
+    /// or parsed and must not be treated as empty. The default impl
+    /// delegates to `load` and never errors; backends that can detect read
+    /// failures (JSONL) override this so callers can fail closed instead of
+    /// seeding a new-message-only cache over an existing transcript.
+    fn try_load(&self, session_key: &str) -> std::io::Result<Vec<ChatMessage>> {
+        Ok(self.load(session_key))
+    }
+
     /// Same as `load`, but each row carries its persisted `created_at`
     /// when the backend has one. Default impl falls back to `load`
     /// without timestamps so non-SQLite backends keep working.
@@ -89,6 +100,24 @@ pub trait SessionBackend: Send + Sync {
 
     /// Remove the last message from a session. Returns `true` if a message was removed.
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool>;
+
+    /// Replace a session's entire durable transcript with `messages`. Used to
+    /// keep the canonical stored history in sync with a caller-owned buffer
+    /// that trimmed or rewrote turns in place (e.g. history-budget
+    /// enforcement), rather than appending on top of a now-stale transcript.
+    /// The default clears the session (`clear_messages`) and re-appends
+    /// every message through the required `append` primitive, so every
+    /// backend gets real replacement semantics — a backend that never
+    /// overrides this does not silently drop the caller's authoritative
+    /// trimmed history. It is O(n) calls and not atomic; backends with a
+    /// native batch/transactional rewrite (JSONL, SQLite) override this.
+    fn rewrite_messages(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
+        self.clear_messages(session_key)?;
+        for message in messages {
+            self.append(session_key, message)?;
+        }
+        Ok(())
+    }
 
     fn update_last(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<bool> {
         if self.remove_last(session_key)? {
@@ -192,6 +221,91 @@ pub trait SessionBackend: Send + Sync {
     /// Get the agent alias associated with a session, if recorded.
     fn get_session_agent_alias(&self, _session_key: &str) -> std::io::Result<Option<String>> {
         Ok(None)
+    }
+
+    /// Record whether this session's persisted transcript currently starts
+    /// with the synthetic trim breadcrumb, as one canonical fact alongside
+    /// the transcript itself. Callers must not infer this from message text
+    /// on restore: a genuine first user turn that happens to equal the
+    /// localized breadcrumb string must keep its turn-boundary role, and a
+    /// crumb written under another locale must stay classified as synthetic.
+    /// No-op for backends that don't track it (the caller falls back to
+    /// treating the session as having no breadcrumb).
+    fn set_session_trim_breadcrumb(
+        &self,
+        _session_key: &str,
+        _present: bool,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Get the recorded breadcrumb provenance for a session. `None` means
+    /// the backend doesn't track it or no session-level state exists yet
+    /// (callers should assume `false`, not attempt text inference).
+    fn get_session_trim_breadcrumb(&self, _session_key: &str) -> std::io::Result<Option<bool>> {
+        Ok(None)
+    }
+
+    /// Replace a session's durable transcript and its breadcrumb provenance
+    /// with the agent's authoritative post-turn state. Callers that own a
+    /// trimmed in-memory history must use this instead of appending only the
+    /// turn's delta. The default implementation performs two separate writes
+    /// (`rewrite_messages` then `set_session_trim_breadcrumb`); they are
+    /// serialized under the caller's lock (channel per-sender lock or the
+    /// store's mutation guard) so concurrent turns cannot interleave, but the
+    /// pair is not crash-atomic. A crash between the two writes can leave
+    /// transcript and flag temporarily out of sync, recoverable on the next
+    /// trim. Both built-in backends override this with a stronger guarantee:
+    /// `SqliteSessionBackend` makes the pair atomic inside one transaction,
+    /// and the JSONL `SessionStore` rolls the transcript back to its
+    /// pre-replace content when the breadcrumb write fails, so an in-process
+    /// failure converges back to the last known-good pair instead of leaving
+    /// a new transcript paired with a stale flag (a process crash between the
+    /// two file writes can still split them, since JSONL uses two files).
+    /// Backends that can provide a transaction should follow SQLite's
+    /// example; ones limited to independent writes should follow JSONL's.
+    fn replace_conversation_state(
+        &self,
+        session_key: &str,
+        messages: &[ChatMessage],
+        breadcrumb_present: bool,
+    ) -> std::io::Result<()> {
+        self.rewrite_messages(session_key, messages)?;
+        self.set_session_trim_breadcrumb(session_key, breadcrumb_present)
+    }
+
+    /// Replace the durable transcript and breadcrumb flag only if the session
+    /// still exists. Returns `Ok(true)` when the replacement was written and
+    /// `Ok(false)` when the session was already deleted, in which case
+    /// nothing is written and, in particular, no fresh session row or file is
+    /// recreated for the deleted key.
+    ///
+    /// Post-turn persistence must use this instead of
+    /// [`replace_conversation_state`](Self::replace_conversation_state):
+    /// a bare existence check followed by a separate replace is a
+    /// check-then-act race — a `DELETE /api/sessions/{id}` (or any other
+    /// deleter) committing between the two recreates durable state the user
+    /// just wiped, since both the SQLite breadcrumb upsert and the JSONL
+    /// rewrite recreate their rows/files unconditionally.
+    ///
+    /// The default implementation is check-then-act and therefore only
+    /// best-effort. Backends with a serializing primitive close the race by
+    /// overriding it: `SqliteSessionBackend` performs the existence check and
+    /// both writes inside one transaction under the connection mutex (which
+    /// the deleter also holds), and the JSONL `SessionStore` holds its
+    /// mutation guard across the existence probe and both file writes (which
+    /// its deleter also holds).
+    fn replace_conversation_state_if_exists(
+        &self,
+        session_key: &str,
+        messages: &[ChatMessage],
+        breadcrumb_present: bool,
+    ) -> std::io::Result<bool> {
+        if !self.session_exists(session_key) {
+            return Ok(false);
+        }
+        self.replace_conversation_state(session_key, messages, breadcrumb_present)?;
+        Ok(true)
     }
 
     fn set_session_context(
