@@ -1622,7 +1622,7 @@ fn sop_step_excluded_tools(
     excluded_tools: &[String],
 ) -> Vec<String> {
     let mut scoped = excluded_tools.to_vec();
-    for tool in ["sop_execute", "sop_advance", "sop_approve"] {
+    for tool in crate::sop::executor::SOP_STEP_SELF_DRIVE_TOOLS {
         push_excluded_tool(&mut scoped, tool);
     }
 
