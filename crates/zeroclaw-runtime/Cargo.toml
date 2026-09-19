@@ -32,6 +32,7 @@ cap-fs-ext = "4"
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 chrono-tz = "0.10"
+chardetng = "0.1"
 console = "0.16"
 cron = "0.15"
 # Raw-mode terminal secret input (cli_input::SecretInput). Blocking
@@ -39,6 +40,7 @@ cron = "0.15"
 crossterm = "0.29"
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
 directories = "6.0"
+encoding_rs = "0.8"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 glob = "0.3"
 hex = "0.4"
@@ -100,7 +102,6 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Console", "Win32_Globalization"] }
-encoding_rs = "0.8"
 process-wrap = { version = "=9.0.0", default-features = false, features = ["job-object", "kill-on-drop", "tokio1"] }
 
 [features]
@@ -131,7 +132,6 @@ test-util = []
 
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
-encoding_rs = "0.8"
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 # Enable the shared cert/CSR test fixtures for the enrollment + relay tests.
