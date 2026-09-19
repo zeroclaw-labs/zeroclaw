@@ -1592,6 +1592,28 @@ pub fn sync_declarative_jobs(
                 .unwrap_or(false);
 
             if exists {
+                // Ownership lives in `[agents.<x>].cron_jobs`, so it can move
+                // between agents while the row's id stays the same. The stored
+                // `agent_alias` is what every agent-scoped read, update and
+                // delete filters on, so leaving it behind on an update splits
+                // the row in two: the scheduler runs it as the new owner while
+                // the old owner keeps the only handle to it.
+                //
+                // Resolve it the same way the insert branch does, and skip
+                // rather than fall back when nothing claims the id - a row no
+                // enabled agent owns must not stay reachable by whoever
+                // happened to own it last.
+                let Some(current_owner) = config.agent_for_cron_job(id) else {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"job_id": id})),
+                        "Skipping declarative cron job update: no [agents.<x>].cron_jobs entry claims this id"
+                    );
+                    continue;
+                };
+
                 // Update existing declarative job — preserve runtime state
                 // (next_run, last_run, last_status, last_output, created_at).
                 // Only update the schedule's next_run if the schedule itself changed.
@@ -1610,8 +1632,8 @@ pub fn sync_declarative_jobs(
                              prompt = ?5, name = ?6, session_target = ?7, model = ?8,
                              enabled = ?9, delivery = ?10, delete_after_run = ?11,
                              allowed_tools = ?12, source = 'declarative', next_run = ?13,
-                             uses_memory = ?14
-                         WHERE id = ?15",
+                             uses_memory = ?14, agent_alias = ?15
+                         WHERE id = ?16",
                         params![
                             expression,
                             command,
@@ -1627,6 +1649,7 @@ pub fn sync_declarative_jobs(
                             allowed_tools_json,
                             next_run.to_rfc3339(),
                             i32::from(decl.uses_memory),
+                            current_owner,
                             id,
                         ],
                     )
@@ -1638,8 +1661,8 @@ pub fn sync_declarative_jobs(
                              prompt = ?5, name = ?6, session_target = ?7, model = ?8,
                              enabled = ?9, delivery = ?10, delete_after_run = ?11,
                              allowed_tools = ?12, source = 'declarative',
-                             uses_memory = ?13
-                         WHERE id = ?14",
+                             uses_memory = ?13, agent_alias = ?14
+                         WHERE id = ?15",
                         params![
                             expression,
                             command,
@@ -1654,6 +1677,7 @@ pub fn sync_declarative_jobs(
                             i32::from(delete_after_run),
                             allowed_tools_json,
                             i32::from(decl.uses_memory),
+                            current_owner,
                             id,
                         ],
                     )
@@ -3672,6 +3696,77 @@ mod tests {
         assert_eq!(job.command, "echo backup");
         assert_eq!(job.source, "declarative");
         assert_eq!(job.name.as_deref(), Some("decl-daily-backup"));
+    }
+
+    /// Moving a declaration between agents must move the row's owner with it.
+    ///
+    /// Ownership lives in `[agents.<x>].cron_jobs`, but every agent-scoped
+    /// read, update and delete filters on the row's stored `agent_alias`. When
+    /// sync left that behind, the scheduler ran the job as the new owner while
+    /// only the old owner could still reach it through the cron tools: the new
+    /// owner could not see its own job, and the old one could delete a job it
+    /// no longer owned.
+    #[test]
+    fn sync_moves_the_stored_owner_when_the_declaration_moves() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["movable"]);
+
+        let decls = decls_map(vec![make_shell_decl("movable", "0 2 * * *", "echo v1")]);
+        sync_declarative_jobs(&config, &decls).unwrap();
+        assert!(
+            get_job_for_agent(&config, "movable", "test-agent").is_ok(),
+            "the original owner starts with the row"
+        );
+
+        // The operator moves the entry to a different agent. Nothing else
+        // about the declaration changes.
+        config.agents.remove("test-agent");
+        config.agents.insert(
+            "second-agent".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                cron_jobs: vec!["movable".to_string()],
+                ..Default::default()
+            },
+        );
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        assert!(
+            get_job_for_agent(&config, "movable", "second-agent").is_ok(),
+            "the new owner must be able to reach the job it now owns"
+        );
+        assert!(
+            get_job_for_agent(&config, "movable", "test-agent").is_err(),
+            "the previous owner must lose its handle on the row"
+        );
+    }
+
+    /// A declaration nothing claims must not stay bound to its last owner.
+    #[test]
+    fn sync_skips_an_existing_row_no_enabled_agent_claims() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["orphanable"]);
+
+        let decls = decls_map(vec![make_shell_decl("orphanable", "0 2 * * *", "echo v1")]);
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        // The claiming agent is disabled, so nothing owns the declaration.
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("seeded agent")
+            .enabled = false;
+
+        let moved = decls_map(vec![make_shell_decl("orphanable", "0 2 * * *", "echo v2")]);
+        sync_declarative_jobs(&config, &moved).unwrap();
+
+        let job = get_job(&config, "orphanable").unwrap();
+        assert_eq!(
+            job.command, "echo v1",
+            "an unclaimed declaration must not be applied to the stored row"
+        );
     }
 
     #[test]
