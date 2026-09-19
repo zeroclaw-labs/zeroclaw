@@ -770,11 +770,17 @@ mod graceful_summary_metering_tests {
     // the summary path: the summary may see the turn's images.
     #[tokio::test]
     async fn graceful_summary_normalizes_local_and_inline_tool_image_markers() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
         let temp = tempfile::tempdir().expect("temp dir");
         let png_path = temp.path().join("shot.png");
-        std::fs::write(&png_path, [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
-            .expect("write png signature");
-        let inline_uri = "data:image/png;base64,iVBORw0KGgo=";
+        std::fs::write(
+            &png_path,
+            STANDARD.decode(PNG_B64).expect("valid PNG fixture"),
+        )
+        .expect("write PNG fixture");
+        let inline_uri = format!("data:image/png;base64,{PNG_B64}");
         let inline_marker = format!("[{}:{}]", "IMAGE", inline_uri);
         let local_marker = format!("[{}:{}]", "IMAGE", png_path.display());
 

@@ -907,11 +907,14 @@ impl AnthropicModelProvider {
     fn tool_result_content(content: &str) -> ToolResultContent {
         let (cleaned, refs) = crate::multimodal::parse_image_markers(content);
         if refs.is_empty() {
-            // The early return still sweeps. An unterminated marker yields zero
-            // references and copies its payload verbatim into the cleaned text,
-            // so returning here without sweeping would leave raw base64 in a
-            // text position on exactly the path that has no references.
-            return ToolResultContent::Text(Self::sweep_residual_image_data(content).into_owned());
+            // Sweep the *cleaned* text, never the original. An over-ceiling
+            // marker yields zero references and lands in `cleaned` as the
+            // fixed refusal note - returning the original instead would
+            // forward its raw oversized body past the marker ceiling. The
+            // sweep is still needed on top of `cleaned` because an
+            // unterminated marker also yields zero references and copies its
+            // payload verbatim into the cleaned text.
+            return ToolResultContent::Text(Self::sweep_residual_image_data(&cleaned).into_owned());
         }
 
         let (sources, omitted) = Self::deliverable_image_sources(&refs);
@@ -1416,12 +1419,37 @@ impl AnthropicModelProvider {
                                 Ok((mime, payload)) => {
                                     (mime.to_ascii_lowercase(), payload.to_string())
                                 }
-                                Err(_) => {
+                                Err(reason) => {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                        .with_attrs(::serde_json::json!({
+                                            "error": format!("{reason}"),
+                                            "error_key": "anthropic_image_marker_malformed_data_uri",
+                                        })),
+                                        "dropping image marker: data URI failed the structural check"
+                                    );
                                     omitted += 1;
                                     continue;
                                 }
                             }
                         } else {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({
+                                    "error_key": "anthropic_image_source_missing",
+                                })),
+                                "dropping image marker: source is neither a data URI nor an existing file"
+                            );
                             // Counted exactly like the tool-result arm. The
                             // multimodal normalizer is the only component that
                             // may turn a file reference into inline image
@@ -6069,6 +6097,51 @@ data: {\"type\":\"message_stop\"}\n\n";
         }
     }
 
+    /// An oversized local-path marker in a tool result is refused with the
+    /// fixed note, never forwarded as raw text.
+    #[test]
+    fn oversized_local_tool_result_marker_is_refused_not_forwarded() {
+        for (label, marker) in [
+            (
+                "terminated",
+                format!(
+                    "[IMAGE:/tmp/{}.png]",
+                    "A".repeat(crate::multimodal::MAX_IMAGE_MARKER_BYTES + 1)
+                ),
+            ),
+            (
+                "unterminated",
+                format!(
+                    "[IMAGE:/tmp/{}",
+                    "A".repeat(crate::multimodal::MAX_IMAGE_MARKER_BYTES + 1)
+                ),
+            ),
+        ] {
+            let messages = history_with_tool_result(&format!("screenshot {marker}"));
+
+            let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+            let tool_result = first_tool_result_on_the_wire(&native_msgs);
+
+            let text = tool_result["content"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{label}: expected plain text content: {tool_result}"));
+            assert!(
+                text.contains("screenshot"),
+                "{label}: prose must survive: {text}"
+            );
+            assert!(
+                text.contains("[image omitted: image marker exceeds safety limit]"),
+                "{label}: the refusal note must replace the oversized marker: {text}"
+            );
+
+            let wire = serde_json::to_string(&native_msgs).expect("serialize");
+            assert!(
+                !wire.contains("AAAA"),
+                "{label}: the raw oversized body must not reach the wire"
+            );
+        }
+    }
+
     /// A tool result whose content is a block list still takes the conversation
     /// cache breakpoint.
     ///
@@ -7747,13 +7820,20 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn prepared_local_image_reaches_the_wire_as_a_nested_block() {
         let temp = tempfile::tempdir().expect("temp dir");
         let image_path = temp.path().join("screenshot.png");
-        // A PNG signature is enough for MIME detection, and its 12-character
-        // base64 is canonical.
-        std::fs::write(
-            &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
-        )
-        .expect("write png");
+        // A real 1x1 PNG, not a bare signature. Preparation decodes pixels to
+        // reject corrupt images, so a signature-only file would be dropped.
+        let png_bytes = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                1,
+                1,
+                image::Rgba([255, 0, 0, 255]),
+            ))
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .expect("test PNG encodes");
+            buf.into_inner()
+        };
+        std::fs::write(&image_path, &png_bytes).expect("write png");
 
         let messages = vec![
             ChatMessage::user("take a screenshot"),
@@ -7808,7 +7888,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             base64::engine::general_purpose::STANDARD
                 .decode(data)
                 .expect("payload must be decodable base64"),
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+            png_bytes,
             "the bytes written to disk must be the bytes on the wire"
         );
 

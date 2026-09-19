@@ -5590,7 +5590,7 @@ mod tests {
         };
 
         let mut history = vec![ChatMessage::user(
-            "please inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+            "please inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
         )];
         let tools_registry =
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
@@ -5747,8 +5747,15 @@ mod tests {
         let uploads = temp.path().join("uploads");
         std::fs::create_dir(&uploads).unwrap();
         let image_path = uploads.join("cached.png");
-        let original_bytes = [
-            0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 1, 2, 3, 4,
+        // A real decodable 1x1 PNG, not a bare signature: preparation fully
+        // decodes image content now, so bytes that only carry the magic
+        // number are refused and no data URI would ever reach the provider.
+        let original_bytes: [u8; 67] = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
         ];
         let replacement_bytes = vec![
             0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 5, 6, 7, 8,
@@ -5767,9 +5774,10 @@ mod tests {
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
                 CountingTool::new("probe", Arc::clone(&invocations)),
             )]);
+        let marker_path = image_path.to_string_lossy().replace('\\', "/");
         let mut history = vec![ChatMessage::user(format!(
             "inspect [IMAGE:{}]",
-            image_path.display()
+            marker_path
         ))];
         let observer = NoopObserver;
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -5838,7 +5846,7 @@ mod tests {
         // message is plain text.
         let mut history = vec![
             ChatMessage::user(
-                "please inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+                "please inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
             ),
             ChatMessage::user("what is WAL?".to_string()),
         ];
@@ -5931,7 +5939,7 @@ mod tests {
         };
 
         let mut history = vec![ChatMessage::user(
-            "Analyze this [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+            "Analyze this [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
         )];
         let tools_registry =
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
@@ -6005,7 +6013,7 @@ mod tests {
         let mut history = vec![
             ChatMessage::user("inspect the screenshot".to_string()),
             ChatMessage::tool(
-                "File: /tmp/x.png\n[IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+                "File: /tmp/x.png\n[IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
             ),
         ];
         let tools_registry =
@@ -6078,7 +6086,7 @@ mod tests {
         };
 
         let mut history = vec![ChatMessage::user(
-            "inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+            "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
         )];
         let tools_registry =
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
@@ -6533,7 +6541,7 @@ mod tests {
         };
 
         let mut history = vec![ChatMessage::user(
-            "look [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+            "look [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
         )];
         let tools_registry =
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());

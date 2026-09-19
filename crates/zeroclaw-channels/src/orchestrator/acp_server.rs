@@ -3490,6 +3490,18 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
 
+    fn valid_1x1_png() -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([255, 0, 0, 255]),
+        ))
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .expect("test PNG encodes");
+        bytes.into_inner()
+    }
+
     struct RecordingNativeProvider {
         requests: Arc<parking_lot::Mutex<Vec<Vec<ChatMessage>>>>,
     }
@@ -7527,11 +7539,7 @@ mod tests {
         // attachment and renders the marker localized at projection time.
         let cwd = tempfile::tempdir().unwrap();
         let image_path = cwd.path().join("cross-locale.png");
-        std::fs::write(
-            &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
-        )
-        .unwrap();
+        std::fs::write(&image_path, valid_1x1_png()).unwrap();
         let marker = format!("look at this [IMAGE:{}]", image_path.display());
 
         let store =
@@ -7730,11 +7738,7 @@ mod tests {
 
         let cwd = tempfile::tempdir().unwrap();
         let image_path = cwd.path().join("rejected-live.png");
-        std::fs::write(
-            &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
-        )
-        .unwrap();
+        std::fs::write(&image_path, valid_1x1_png()).unwrap();
         let marker = format!("look at this [IMAGE:{}]", image_path.display());
 
         let store =
@@ -7853,8 +7857,8 @@ mod tests {
         // ── Phase A: restore path ────────────────────────────────────
         let cwd = tempfile::tempdir().unwrap();
         let image_path = cwd.path().join("carrier-rejected.png");
-        let file_bytes = [0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
-        std::fs::write(&image_path, file_bytes).unwrap();
+        let file_bytes = valid_1x1_png();
+        std::fs::write(&image_path, &file_bytes).unwrap();
         let marker = format!("look at this [IMAGE:{}]", image_path.display());
 
         let store =
@@ -8021,7 +8025,7 @@ mod tests {
 
         let live_cwd = tempfile::tempdir().unwrap();
         let live_image = live_cwd.path().join("carrier-live.png");
-        std::fs::write(&live_image, file_bytes).unwrap();
+        std::fs::write(&live_image, &file_bytes).unwrap();
         let live_marker = format!("look at this [IMAGE:{}]", live_image.display());
         let tool_call_response = format!(
             "<tool_call>\n{{\"name\": \"file_read\", \"arguments\": {{\"path\": {}}}}}\n</tool_call>",
