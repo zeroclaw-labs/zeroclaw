@@ -1,5 +1,6 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Shell language understood by a runtime's command builder.
 ///
@@ -251,6 +252,13 @@ pub trait RuntimeAdapter: Send + Sync {
         ShellProfile::from_dialect(self.shell_dialect())
     }
 
+    /// Namespace in which shell action segments resolve their executables.
+    /// The default is the host; container runtimes override this so approval
+    /// facts never mistake a host PATH result for an in-container program.
+    fn shell_execution_domain(&self) -> ShellExecutionDomain {
+        ShellExecutionDomain::Host
+    }
+
     /// Build a shell command process configured for this runtime.
     ///
     /// Constructs a [`tokio::process::Command`] that will execute `command`
@@ -268,6 +276,45 @@ pub trait RuntimeAdapter: Send + Sync {
         workspace_dir: &Path,
     ) -> anyhow::Result<tokio::process::Command>;
 
+    /// Build the same shell command while pinning the outer runtime program
+    /// to an executable already resolved from the final child environment.
+    /// Runtime owners override this when reconstructing the command is needed
+    /// to preserve platform-specific argument and process options.
+    fn build_shell_command_with_program(
+        &self,
+        command: &str,
+        workspace_dir: &Path,
+        program: &Path,
+    ) -> anyhow::Result<tokio::process::Command> {
+        let process = self.build_shell_command(command, workspace_dir)?;
+        if Path::new(process.as_std().get_program()) != program {
+            anyhow::bail!(
+                "runtime '{}' cannot pin shell program '{}' to '{}'",
+                self.name(),
+                Path::new(process.as_std().get_program()).display(),
+                program.display()
+            );
+        }
+        Ok(process)
+    }
+
+    /// Replace mutable runtime references in a prepared shell launch with
+    /// immutable execution identities before approval facts are computed.
+    ///
+    /// Container runtimes use this boundary to resolve a configured image
+    /// tag to its local content-addressed image ID and rebuild the launch with
+    /// that ID. The same prepared command is then fingerprinted and spawned,
+    /// so a tag move between approval and dispatch cannot change the code that
+    /// runs. Host runtimes have no additional reference to pin.
+    fn pin_shell_command(
+        &self,
+        _command: &mut Command,
+        _resolved_launcher: &Path,
+        _workspace_dir: &Path,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Build a shell command process with runtime-visible environment names.
     ///
     /// `env_keys` contains variable names selected by the caller for
@@ -283,6 +330,18 @@ pub trait RuntimeAdapter: Send + Sync {
         let _ = env_keys;
         self.build_shell_command(command, workspace_dir)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellExecutionDomain {
+    Host,
+    Isolated {
+        name: &'static str,
+        /// Whether host-controlled files are visible in the executable
+        /// namespace. External programs cannot be identity-bound in this
+        /// domain without a resolver for the mounted content.
+        mutable_mount: bool,
+    },
 }
 
 #[cfg(test)]

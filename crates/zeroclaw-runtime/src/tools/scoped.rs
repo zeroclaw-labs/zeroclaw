@@ -220,6 +220,7 @@ impl ScopedToolRegistry {
             escalate_handle,
             channel_room_handle,
             unfiltered_tool_arcs,
+            shell_execution: _,
             // Test-only capture of the concrete delegate instance; `assemble`
             // has no use for it and must keep destructuring exhaustively so a
             // new field cannot be silently dropped here.
@@ -704,6 +705,7 @@ mod tests {
 
     fn built_with(tools: Vec<Box<dyn Tool>>) -> AllToolsResult {
         AllToolsResult {
+            shell_execution: None,
             tools,
             delegate_handle: None,
             ask_user_handle: None,
@@ -735,6 +737,7 @@ mod tests {
             .map(|tool| Box::new(tools::ArcToolRef(tool)) as Box<dyn Tool>)
             .collect();
         AllToolsResult {
+            shell_execution: None,
             tools,
             delegate_handle: None,
             ask_user_handle: None,

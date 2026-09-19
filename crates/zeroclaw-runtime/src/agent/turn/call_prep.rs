@@ -44,6 +44,13 @@ fn tool_call_signature(tool_name: &str, tool_args: &serde_json::Value) -> (Strin
     (tool_name.trim().to_ascii_lowercase(), args_json)
 }
 
+fn shell_prompt_signature(tool_args: &serde_json::Value) -> (String, String) {
+    // ShellTool's execution semantics are the command string alone. Intent
+    // and unknown fields remain displayable but cannot mint another prompt.
+    let command = tool_args.get("command").and_then(serde_json::Value::as_str);
+    tool_call_signature("shell", &serde_json::json!({ "command": command }))
+}
+
 async fn record_duplicate_tool_call(
     ctx: &TurnCtx<'_>,
     tool_name: &str,
@@ -152,6 +159,7 @@ pub(crate) async fn prepare_tool_calls(
         // ── Hook: before_tool_call (modifying) ──────────
         let mut tool_name = call.name.clone();
         let mut tool_args = call.arguments.clone();
+        crate::agent::strip_runtime_authorization_args(&tool_name, &mut tool_args);
         let hook_context = crate::hooks::tool_call_hook_context(ctx.turn_id, iteration, idx);
         if let Some(hooks) = ctx.hooks {
             match hooks
@@ -204,7 +212,12 @@ pub(crate) async fn prepare_tool_calls(
                     // hook-cancel outcome as a ToolCall/ToolResult pair,
                     // as the direct execution path always emitted.
                     if let Some(tx) = ctx.event_tx {
-                        emit_tool_call_pair(tx, call, &outcome).await;
+                        let visible_call = ParsedToolCall {
+                            name: tool_name.clone(),
+                            arguments: tool_args.clone(),
+                            tool_call_id: call.tool_call_id.clone(),
+                        };
+                        emit_tool_call_pair(tx, &visible_call, &outcome).await;
                     }
                     ordered_results[idx] =
                         Some((call.name.clone(), call.tool_call_id.clone(), outcome));
@@ -226,27 +239,27 @@ pub(crate) async fn prepare_tool_calls(
             ctx.channel_reply_target,
         );
 
+        crate::agent::strip_runtime_authorization_args(&tool_name, &mut tool_args);
         crate::agent::set_runtime_approved_arg(&tool_name, &mut tool_args, false);
+        crate::agent::set_runtime_confirmation_id(&tool_name, &mut tool_args, None);
 
-        let requires_prompt = ctx
-            .approval
-            .map(|mgr| mgr.needs_approval(&tool_name))
-            .unwrap_or(false);
         let reentrant_agent_tool =
             crate::tools::REENTRANT_AGENT_TOOLS.contains(&tool_name.as_str());
-        if requires_prompt && tool_name == "shell" && !reentrant_agent_tool {
-            let prompt_signature = tool_call_signature(&tool_name, &tool_args);
-            if !prompt_approval_tool_signatures_this_round.insert(prompt_signature.clone()) {
+        let visible_args = crate::agent::visible_tool_arguments(&tool_name, &tool_args);
+        let prompt_signature = (tool_name == "shell" && !reentrant_agent_tool)
+            .then(|| shell_prompt_signature(&visible_args));
+        if let Some(prompt_signature) = prompt_signature.as_ref() {
+            if prompt_approval_tool_signatures_this_round.contains(prompt_signature) {
                 let duplicate =
-                    record_duplicate_tool_call(ctx, &tool_name, &tool_args, iteration).await;
+                    record_duplicate_tool_call(ctx, &tool_name, &visible_args, iteration).await;
                 abandon_prepared_context(ctx, &hook_context, &tool_name).await;
                 ordered_results[idx] =
                     Some((tool_name.clone(), call.tool_call_id.clone(), duplicate));
                 continue;
             }
-            if !prompt_approval_tool_signatures.insert(prompt_signature) {
+            if prompt_approval_tool_signatures.contains(prompt_signature) {
                 let repeated = format!(
-                    "Agent loop aborted: repeated prompt-required tool call '{tool_name}' with identical arguments before approval."
+                    "Agent loop aborted: repeated prompt-required tool call '{tool_name}' with identical arguments after an earlier approval prompt."
                 );
                 ::zeroclaw_log::record!(
                     WARN,
@@ -256,7 +269,7 @@ pub(crate) async fn prepare_tool_calls(
                             "model": ctx.model,
                             "iteration": iteration + 1,
                             "tool": tool_name.clone(),
-                            "arguments": scrub_credentials(&tool_args.to_string()),
+                            "arguments": scrub_credentials(&visible_args.to_string()),
                             "result": repeated,
                             "trace_id": ctx.turn_id,
                         })),
@@ -289,41 +302,59 @@ pub(crate) async fn prepare_tool_calls(
             index: u32::try_from(idx + 1).unwrap_or(u32::MAX),
             total: u32::try_from(tool_calls.len()).unwrap_or(u32::MAX),
         };
-        let approved =
-            match gate_tool_approval(ctx, &tool_name, &tool_args, iteration, position).await {
-                ApprovalGateOutcome::Proceed { approved } => approved,
-                ApprovalGateOutcome::Deny(outcome) | ApprovalGateOutcome::Replace(outcome) => {
-                    // The before phase ran but this call will never execute:
-                    // its only terminal lifecycle operation is abandonment.
-                    abandon_prepared_context(ctx, &hook_context, &tool_name).await;
-                    // Streaming consumers see the denied/replaced call and its
-                    // synthesized result (e.g. a DenyWithEdit replacement) as a
-                    // ToolCall/ToolResult pair, as the direct path always did.
-                    if let Some(tx) = ctx.event_tx {
-                        emit_tool_call_pair(tx, call, &outcome).await;
-                    }
-                    ordered_results[idx] =
-                        Some((tool_name.clone(), call.tool_call_id.clone(), outcome));
-                    continue;
+        let gate_outcome =
+            gate_tool_approval(ctx, &tool_name, &visible_args, iteration, position).await;
+        if gate_outcome.prompted()
+            && let Some(prompt_signature) = prompt_signature
+        {
+            prompt_approval_tool_signatures_this_round.insert(prompt_signature.clone());
+            prompt_approval_tool_signatures.insert(prompt_signature);
+        }
+        let (approved, confirmation_id) = match gate_outcome {
+            ApprovalGateOutcome::Proceed {
+                approved,
+                confirmation_id,
+                ..
+            } => (approved, confirmation_id),
+            ApprovalGateOutcome::Deny { outcome, .. }
+            | ApprovalGateOutcome::Replace { outcome, .. } => {
+                // The before phase ran but this call will never execute:
+                // its only terminal lifecycle operation is abandonment.
+                abandon_prepared_context(ctx, &hook_context, &tool_name).await;
+                // Streaming consumers see the denied/replaced call and its
+                // synthesized result (e.g. a DenyWithEdit replacement) as a
+                // ToolCall/ToolResult pair, as the direct path always did.
+                if let Some(tx) = ctx.event_tx {
+                    let visible_call = ParsedToolCall {
+                        name: tool_name.clone(),
+                        arguments: visible_args.clone(),
+                        tool_call_id: call.tool_call_id.clone(),
+                    };
+                    emit_tool_call_pair(tx, &visible_call, &outcome).await;
                 }
-                ApprovalGateOutcome::Cancelled => {
-                    // Preparation aborts before execution takes ownership of
-                    // the retained contexts or the call awaiting approval.
-                    for (retained_context, retained_tool) in &retained_hook_contexts {
-                        abandon_prepared_context(ctx, retained_context, retained_tool).await;
-                    }
-                    abandon_prepared_context(ctx, &hook_context, &tool_name).await;
-                    return Err(ToolLoopCancelled.into());
+                ordered_results[idx] =
+                    Some((tool_name.clone(), call.tool_call_id.clone(), outcome));
+                continue;
+            }
+            ApprovalGateOutcome::Cancelled => {
+                // Preparation aborts before execution takes ownership of the
+                // retained contexts or the call awaiting approval.
+                for (retained_context, retained_tool) in &retained_hook_contexts {
+                    abandon_prepared_context(ctx, retained_context, retained_tool).await;
                 }
-            };
+                abandon_prepared_context(ctx, &hook_context, &tool_name).await;
+                return Err(ToolLoopCancelled.into());
+            }
+        };
+        crate::agent::set_runtime_confirmation_id(&tool_name, &mut tool_args, confirmation_id);
         crate::agent::set_runtime_approved_arg(&tool_name, &mut tool_args, approved);
 
-        let signature = tool_call_signature(&tool_name, &tool_args);
+        let signature = tool_call_signature(&tool_name, &visible_args);
         let dedup_exempt =
             ctx.dedup_exempt_tools.iter().any(|e| e == &tool_name) || reentrant_agent_tool;
         if dedup_enabled && !dedup_exempt && !seen_tool_signatures.insert(signature) {
             let duplicate =
-                record_duplicate_tool_call(ctx, &tool_name, &tool_args, iteration).await;
+                record_duplicate_tool_call(ctx, &tool_name, &visible_args, iteration).await;
             abandon_prepared_context(ctx, &hook_context, &tool_name).await;
             ordered_results[idx] = Some((tool_name.clone(), call.tool_call_id.clone(), duplicate));
             continue;
@@ -337,7 +368,7 @@ pub(crate) async fn prepare_tool_calls(
                     "model": ctx.model,
                     "iteration": iteration + 1,
                     "tool": tool_name.clone(),
-                    "arguments": scrub_credentials(&tool_args.to_string()),
+                    "arguments": scrub_credentials(&visible_args.to_string()),
                     "trace_id": ctx.turn_id,
                 })),
             "tool_call_start"
@@ -346,7 +377,7 @@ pub(crate) async fn prepare_tool_calls(
         // ── Progress: tool start ────────────────────────────
         send_progress(ctx.on_delta, ProgressEvent::RunningTool).await;
         let stream_call = ctx.on_delta.map(|_| StreamToolCall {
-            arguments: Arc::new(tool_args.clone()),
+            arguments: Arc::new(visible_args),
             tool_provenance: crate::agent::tool_execution::resolved_tool_provenance(
                 tools_registry,
                 activated_tools,
@@ -402,12 +433,18 @@ pub(crate) async fn prepare_tool_calls(
 
 #[cfg(test)]
 mod tests {
-    use super::{PreparedToolCalls, prepare_tool_calls};
+    use super::{
+        PreparedToolCalls, prepare_tool_calls, shell_prompt_signature, tool_call_signature,
+    };
     use crate::agent::tool_execution::ToolExecutionOutcome;
     use crate::agent::turn::context::TurnCtx;
     use crate::agent::turn::post_exec::record_executed_outcomes;
     use crate::agent::turn::{DraftEvent, StreamDelta};
+    use crate::approval::ApprovalManager;
     use crate::observability::NoopObserver;
+    use crate::platform::{NativeRuntime, RuntimeAdapter, ShellDialect};
+    use crate::rpc::approval_channel::RpcApprovalChannel;
+    use crate::rpc::context::ApprovalPendingMap;
     use crate::skills::SkillTool;
     use crate::tools::skill_tool::SkillBuiltinTool;
     use crate::tools::{Tool, ToolResult};
@@ -417,7 +454,9 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::mpsc;
     use zeroclaw_api::attribution::{Attributable, ToolProvenance};
-    use zeroclaw_config::schema::{PacingConfig, StreamReasoningMode};
+    use zeroclaw_api::jsonrpc::RpcOutbound;
+    use zeroclaw_config::schema::{PacingConfig, RiskProfileConfig, StreamReasoningMode};
+    use zeroclaw_config::tool_policy::{Decision, PolicyRuleConfig, ResolutionReason, RuleSource};
     use zeroclaw_tool_call_parser::ParsedToolCall;
 
     struct AttributedTool {
@@ -574,6 +613,383 @@ mod tests {
             vec![None, None],
             "an unresolved tool must remain untrusted through both events"
         );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn shell_authorization_args_only_reach_the_executable_call() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut log_rx = zeroclaw_log::subscribe_or_install();
+        while log_rx.try_recv().is_ok() {}
+
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (tx, mut rx) = mpsc::channel(8);
+        let ctx = test_ctx(&observer, &pacing, &tx);
+        let raw_arguments = serde_json::json!({
+            "command": "echo visible",
+            "approved": true,
+            (crate::agent::RUNTIME_CONFIRMATION_ID_ARG): uuid::Uuid::new_v4().to_string(),
+            (crate::agent::RUNTIME_CONFIRMATION_FINGERPRINT_ARG): "model-fingerprint",
+            (crate::agent::RUNTIME_CONFIRMATION_EXPIRES_AT_ARG): 1,
+            (crate::agent::RUNTIME_POLICY_ALLOW_ARG): true,
+            (crate::agent::RUNTIME_AUTHORIZATION_REJECTED_ARG): true,
+            "__zeroclaw_confirmation_consumed": true,
+        });
+        let tool_calls = [
+            ParsedToolCall {
+                name: "shell".to_string(),
+                arguments: raw_arguments.clone(),
+                tool_call_id: Some("call-1".to_string()),
+            },
+            ParsedToolCall {
+                name: "shell".to_string(),
+                arguments: raw_arguments,
+                tool_call_id: Some("call-2".to_string()),
+            },
+        ];
+        let mut seen = HashSet::new();
+        let mut prompt_seen = HashSet::new();
+        let mut prepared = prepare_tool_calls(
+            &ctx,
+            &[],
+            None,
+            &tool_calls,
+            &mut seen,
+            &mut prompt_seen,
+            0,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(prepared.executable_calls.len(), 1);
+        let execution_arguments = &prepared.executable_calls[0].arguments;
+        assert_eq!(execution_arguments["approved"], false);
+        let forbidden = [
+            "approved",
+            crate::agent::RUNTIME_CONFIRMATION_ID_ARG,
+            crate::agent::RUNTIME_CONFIRMATION_FINGERPRINT_ARG,
+            crate::agent::RUNTIME_CONFIRMATION_EXPIRES_AT_ARG,
+            crate::agent::RUNTIME_POLICY_ALLOW_ARG,
+            crate::agent::RUNTIME_AUTHORIZATION_REJECTED_ARG,
+            "__zeroclaw_confirmation_consumed",
+        ];
+        let visible_arguments = prepared.stream_calls[0]
+            .as_ref()
+            .unwrap()
+            .arguments
+            .as_ref();
+        for key in forbidden {
+            assert!(
+                visible_arguments.get(key).is_none(),
+                "prepared stream args leaked {key}: {visible_arguments}"
+            );
+        }
+
+        loop {
+            if let StreamDelta::ToolStart { arguments, .. } =
+                rx.recv().await.expect("tool start event")
+            {
+                for key in forbidden {
+                    assert!(
+                        arguments.get(key).is_none(),
+                        "ToolStart leaked {key}: {arguments}"
+                    );
+                }
+                break;
+            }
+        }
+
+        let sink = crate::sop::executor::new_step_call_sink();
+        crate::sop::executor::scope_step_call_sink(sink.clone(), async {
+            record_executed_outcomes(
+                &ctx,
+                &prepared.executable_indices,
+                &prepared.executable_calls,
+                &prepared.stream_calls,
+                vec![ToolExecutionOutcome {
+                    output: "ok".to_string(),
+                    output_data: None,
+                    success: true,
+                    error_reason: None,
+                    duration: Duration::ZERO,
+                    receipt: None,
+                }],
+                &mut prepared.ordered_results,
+                0,
+            )
+            .await;
+        })
+        .await;
+        let captured = crate::sop::executor::drain_step_calls(&sink);
+        assert_eq!(captured.len(), 1);
+        for key in forbidden {
+            assert!(
+                captured[0].args.get(key).is_none(),
+                "SOP capture leaked {key}: {}",
+                captured[0].args
+            );
+        }
+
+        let mut matching_logs = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while matching_logs.len() < 3 && tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, log_rx.recv()).await {
+                Ok(Ok(value))
+                    if value
+                        .get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|message| {
+                            message == "tool_call_start" || message == "tool_call_result"
+                        }) =>
+                {
+                    matching_logs.push(value)
+                }
+                Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) | Err(_) => break,
+            }
+        }
+        assert!(
+            matching_logs.len() >= 2,
+            "missing call preparation lifecycle logs"
+        );
+        for rendered in matching_logs.into_iter().map(|value| value.to_string()) {
+            for key in forbidden {
+                assert!(
+                    !rendered.contains(key),
+                    "call prep log leaked {key}: {rendered}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn full_auto_approve_shell_asks_deduplicate_by_command_after_gate_resolution() {
+        for (case, command) in [("explicit", "echo ask"), ("unmatched", "printf unmatched")] {
+            let workspace = tempfile::TempDir::new().unwrap();
+            let mut profile = RiskProfileConfig {
+                level: crate::security::AutonomyLevel::Full,
+                auto_approve: vec!["shell".to_string()],
+                ..RiskProfileConfig::default()
+            };
+            profile.tool_policy.rules.push(PolicyRuleConfig {
+                pattern: "Shell(echo:*)".to_string(),
+                decision: Decision::Ask,
+            });
+            let security = Arc::new(crate::security::SecurityPolicy::from_risk_profile(
+                &profile,
+                workspace.path(),
+            ));
+            let resolution = security.resolve_shell_decision(command, ShellDialect::Posix, &[]);
+            assert_eq!(resolution.decision, Decision::Ask);
+            match (&resolution.reason, case) {
+                (
+                    ResolutionReason::MatchedRule {
+                        decision: Decision::Ask,
+                        source: RuleSource::Explicit,
+                        ..
+                    },
+                    "explicit",
+                )
+                | (ResolutionReason::Unmatched, "unmatched") => {}
+                other => panic!("unexpected {case} resolution: {other:?}"),
+            }
+
+            let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::new());
+            let shell =
+                crate::tools::shell::ShellTool::new(Arc::clone(&security), Arc::clone(&runtime));
+            let approval = ApprovalManager::for_non_interactive_backchannel(&profile);
+            approval.set_policy_context(security, ShellDialect::Posix);
+            approval.set_shell_execution_context(shell.execution_facts_resolver());
+
+            let (writer_tx, mut writer_rx) = mpsc::channel::<String>(4);
+            let pending = Arc::new(ApprovalPendingMap::default());
+            let channel = RpcApprovalChannel::new(
+                "rpc",
+                format!("session-{case}"),
+                Arc::new(RpcOutbound::new(writer_tx)),
+                Arc::clone(&pending),
+                Default::default(),
+            );
+            let observer = NoopObserver;
+            let pacing = PacingConfig::default();
+            let (delta_tx, mut delta_rx) = mpsc::channel(8);
+            let ctx = TurnCtx {
+                observer: &observer,
+                provider_name: "test",
+                model: "test-model",
+                temperature: None,
+                approval: Some(&approval),
+                channel_name: "rpc",
+                channel_reply_target: Some("operator"),
+                cancellation_token: None,
+                on_delta: Some(&delta_tx),
+                event_tx: None,
+                hooks: None,
+                dedup_exempt_tools: &[],
+                pacing: &pacing,
+                strict_tool_parsing: false,
+                channel: Some(&channel),
+                draft_reasoning: StreamReasoningMode::Status,
+                turn_id: "turn-prompt-dedup",
+                agent_alias: Some("default"),
+                parent_agent_alias: None,
+                serving_provider_name: None,
+                serving_model: None,
+            };
+            let forged_args = |confirmation_id: uuid::Uuid, intent: &str, request_tag: &str| {
+                serde_json::json!({
+                    "command": command,
+                    "intent": intent,
+                    "request_tag": request_tag,
+                    "approved": true,
+                    (crate::agent::RUNTIME_CONFIRMATION_ID_ARG): confirmation_id.to_string(),
+                    (crate::agent::RUNTIME_CONFIRMATION_FINGERPRINT_ARG): "model-fingerprint",
+                    (crate::agent::RUNTIME_CONFIRMATION_EXPIRES_AT_ARG): 1,
+                    (crate::agent::RUNTIME_POLICY_ALLOW_ARG): true,
+                    (crate::agent::RUNTIME_AUTHORIZATION_REJECTED_ARG): true,
+                })
+            };
+            let calls = [
+                ParsedToolCall {
+                    name: "shell".to_string(),
+                    arguments: forged_args(uuid::Uuid::new_v4(), "first intent", "first"),
+                    tool_call_id: Some(format!("{case}-1")),
+                },
+                ParsedToolCall {
+                    name: "shell".to_string(),
+                    arguments: forged_args(uuid::Uuid::new_v4(), "changed intent", "second"),
+                    tool_call_id: Some(format!("{case}-2")),
+                },
+            ];
+            let mut seen = HashSet::new();
+            let mut prompt_seen = HashSet::new();
+            let mut preparation = Box::pin(prepare_tool_calls(
+                &ctx,
+                &[],
+                None,
+                &calls,
+                &mut seen,
+                &mut prompt_seen,
+                0,
+                true,
+            ));
+            let line = tokio::select! {
+                _ = &mut preparation => panic!("{case} Ask completed without prompting"),
+                line = writer_rx.recv() => line.expect("approval request notification"),
+            };
+            let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let forbidden = [
+                "approved",
+                crate::agent::RUNTIME_CONFIRMATION_ID_ARG,
+                crate::agent::RUNTIME_CONFIRMATION_FINGERPRINT_ARG,
+                crate::agent::RUNTIME_CONFIRMATION_EXPIRES_AT_ARG,
+                crate::agent::RUNTIME_POLICY_ALLOW_ARG,
+                crate::agent::RUNTIME_AUTHORIZATION_REJECTED_ARG,
+            ];
+            let summary = frame["params"]["arguments_summary"]
+                .as_str()
+                .expect("approval arguments summary");
+            for key in forbidden {
+                assert!(
+                    !summary.contains(key),
+                    "approval prompt leaked {key}: {summary}"
+                );
+            }
+            let request_id = frame["params"]["request_id"].as_str().unwrap();
+            assert!(pending.resolve(
+                request_id,
+                zeroclaw_api::channel::ChannelApprovalResponse::Approve,
+            ));
+            let prepared = preparation.await.expect("approved call preparation");
+
+            assert_eq!(prepared.executable_calls.len(), 1);
+            assert!(
+                prepared.executable_calls[0]
+                    .arguments
+                    .get(crate::agent::RUNTIME_CONFIRMATION_ID_ARG)
+                    .is_some(),
+                "execution must retain the host-minted confirmation"
+            );
+            let duplicate = prepared.ordered_results[1]
+                .as_ref()
+                .expect("same-round duplicate result");
+            assert!(duplicate.2.output.contains("Skipped duplicate tool call"));
+            assert!(
+                writer_rx.try_recv().is_err(),
+                "same-round duplicate issued a second approval request"
+            );
+
+            let first_visible_args = serde_json::json!({
+                "command": command,
+                "intent": "first intent",
+                "request_tag": "first",
+            });
+            let prompt_signature = shell_prompt_signature(&first_visible_args);
+            let execution_signature = tool_call_signature("shell", &first_visible_args);
+            assert_eq!(prompt_seen, HashSet::from([prompt_signature]));
+            assert_eq!(seen, HashSet::from([execution_signature]));
+            for signatures in [&prompt_seen, &seen] {
+                let signature_json = &signatures.iter().next().unwrap().1;
+                for key in forbidden {
+                    assert!(
+                        !signature_json.contains(key),
+                        "tool signature leaked {key}: {signature_json}"
+                    );
+                }
+            }
+
+            loop {
+                match delta_rx.recv().await.expect("tool start event") {
+                    StreamDelta::ToolStart { arguments, .. } => {
+                        for key in forbidden {
+                            assert!(
+                                arguments.get(key).is_none(),
+                                "ToolStart leaked {key}: {arguments}"
+                            );
+                        }
+                        break;
+                    }
+                    StreamDelta::Lifecycle(_) | StreamDelta::Status(_) => {}
+                    other => panic!("expected tool start event, got {other:?}"),
+                }
+            }
+
+            let repeated = [ParsedToolCall {
+                name: "shell".to_string(),
+                arguments: forged_args(uuid::Uuid::new_v4(), "third intent", "next-round"),
+                tool_call_id: Some(format!("{case}-next-round")),
+            }];
+            let error = match prepare_tool_calls(
+                &ctx,
+                &[],
+                None,
+                &repeated,
+                &mut seen,
+                &mut prompt_seen,
+                1,
+                true,
+            )
+            .await
+            {
+                Ok(_) => panic!("next-round duplicate must stop before prompting"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("repeated prompt-required tool call 'shell'"),
+                "unexpected repeated-call error: {error:#}"
+            );
+            assert!(
+                writer_rx.try_recv().is_err(),
+                "next-round duplicate issued another approval request"
+            );
+        }
     }
 
     #[tokio::test]

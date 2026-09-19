@@ -303,6 +303,7 @@ pub(crate) struct IndependentTargetTools {
     activated_handle: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     workspace_dir: PathBuf,
     skills: Vec<crate::skills::Skill>,
+    shell_execution: Option<Arc<crate::tools::shell::ShellExecutionFactsResolver>>,
 }
 
 impl DelegateTool {
@@ -922,6 +923,7 @@ impl DelegateTool {
             // handle (one-shot callers), which keeps the snapshot fallback.
             self.live_config.clone(),
         );
+        let shell_execution = all_tools_result.shell_execution.clone();
 
         let target_workspace = config.agent_workspace_dir(agent_name);
         let skills = crate::skills::load_skills_for_agent_from_config(config, agent_name);
@@ -970,6 +972,7 @@ impl DelegateTool {
             activated_handle,
             workspace_dir: target_workspace,
             skills,
+            shell_execution,
         })
     }
 
@@ -3494,7 +3497,20 @@ impl DelegateTool {
             self.root_config
                 .as_ref()
                 .and_then(|config| config.risk_profile_for_agent(agent_name))
-                .map(ApprovalManager::for_non_interactive)
+                .map(|profile| {
+                    let manager = ApprovalManager::for_non_interactive(profile);
+                    // Independent turns execute under the target's policy. In
+                    // particular, Full autonomy must not lose the target
+                    // policy context and thereby bypass an explicit shell Ask.
+                    manager.set_policy_context(
+                        Arc::clone(&target_policy),
+                        self.runtime.as_ref().map_or(
+                            zeroclaw_api::runtime_traits::ShellDialect::Posix,
+                            |runtime| runtime.shell_dialect(),
+                        ),
+                    );
+                    manager
+                })
         } else {
             None
         };
@@ -3520,6 +3536,12 @@ impl DelegateTool {
                     .await
                 {
                     Ok(independent) => {
+                        if let (Some(manager), Some(resolver)) = (
+                            approval_manager.as_ref(),
+                            independent.shell_execution.as_ref(),
+                        ) {
+                            manager.set_shell_execution_context(Arc::clone(resolver));
+                        }
                         sub_deferred_section = independent.deferred_section;
                         sub_activated = independent.activated_handle;
                         sub_workspace = Some(independent.workspace_dir);
@@ -5395,6 +5417,81 @@ mod tests {
 
         fn alias(&self) -> &str {
             "IndependentRiskPolicyModelProvider"
+        }
+    }
+
+    #[derive(Default)]
+    struct IndependentExplicitAskModelProvider {
+        tool_messages: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl IndependentExplicitAskModelProvider {
+        fn tool_messages(&self) -> Vec<String> {
+            self.tool_messages.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for IndependentExplicitAskModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let tool_messages: Vec<String> = request
+                .messages
+                .iter()
+                .filter(|message| message.role == "tool")
+                .map(|message| message.content.clone())
+                .collect();
+            if !tool_messages.is_empty() {
+                self.tool_messages.lock().unwrap().extend(tool_messages);
+                return Ok(ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                });
+            }
+
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_shell_touch".to_string(),
+                    name: "shell".to_string(),
+                    arguments:
+                        r#"{"command":"touch independent-explicit-ask-marker","approved":true}"#
+                            .to_string(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for IndependentExplicitAskModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "IndependentExplicitAskModelProvider"
         }
     }
 
@@ -12469,6 +12566,129 @@ command = "echo hi"
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn independent_full_target_still_denies_explicit_shell_ask_without_approval() {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
+        };
+        use zeroclaw_config::tool_policy::{Decision, PolicyRuleConfig, ToolPolicyConfig};
+
+        let tmp = TempDir::new().unwrap();
+        let target_ws = tmp.path().join("target-workspace");
+        let marker = target_ws.join("independent-explicit-ask-marker");
+        std::fs::create_dir_all(&target_ws).unwrap();
+
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "target".to_string(),
+            RiskProfileConfig {
+                level: AutonomyLevel::Full,
+                allowed_commands: vec!["touch".to_string()],
+                allowed_tools: vec!["shell".to_string()],
+                block_high_risk_commands: false,
+                require_approval_for_medium_risk: false,
+                tool_policy: ToolPolicyConfig {
+                    rules: vec![PolicyRuleConfig {
+                        pattern: "Shell(touch independent-explicit-ask-marker)".to_string(),
+                        decision: Decision::Ask,
+                    }],
+                    ..ToolPolicyConfig::default()
+                },
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 2,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                model_provider: "ollama.caller".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Independent,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "target".into(),
+                runtime_profile: "agentic".into(),
+                model_provider: "ollama.target".into(),
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(target_ws.clone()),
+                    ..Default::default()
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let delegate = DelegateTool::new(config.agents.clone(), None, caller_policy)
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_runtime(Arc::new(NativeRuntime::new()))
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+        let target = config.agents.get("target").unwrap();
+        let provider = IndependentExplicitAskModelProvider::default();
+
+        let result = delegate
+            .execute_agentic(
+                "target",
+                target,
+                "test",
+                "test-model",
+                &provider,
+                "touch the marker",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "target should complete after denial: {result:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "a Full-autonomy independent target must not bypass its explicit shell Ask"
+        );
+        let tool_messages = provider.tool_messages();
+        assert!(
+            tool_messages.iter().any(|message| message.contains(
+                "shell policy requires approval and no operator approval route is available"
+            )),
+            "the nested shell result must report a fail-closed policy denial: {tool_messages:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn independent_delegate_denies_prompt_required_skill_tools_without_approval_route() {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{
@@ -12597,10 +12817,10 @@ command = "rm independent-delegate-marker"
             "nested tool result must report runtime fail-closed denial: {tool_messages:?}"
         );
         assert!(
-            tool_messages.iter().any(|message| {
-                message.contains("Command requires explicit approval (approved=true)")
-            }),
-            "built-in shell must still receive approved=false and enforce command policy: {tool_messages:?}"
+            tool_messages.iter().any(|message| message.contains(
+                "shell policy requires approval and no operator approval route is available"
+            )),
+            "built-in shell must still fail closed without an approval route: {tool_messages:?}"
         );
     }
 

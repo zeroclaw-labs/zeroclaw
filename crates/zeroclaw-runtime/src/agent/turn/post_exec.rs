@@ -100,9 +100,11 @@ pub(crate) async fn record_executed_outcomes(
 
         // Capture into the innermost live SOP step scope (no-op otherwise).
         if crate::sop::executor::step_capture_active() {
+            let visible_arguments =
+                crate::agent::visible_tool_arguments(&call.name, &call.arguments);
             crate::sop::executor::record_step_tool_call(
                 &call.name,
-                &call.arguments,
+                &visible_arguments,
                 outcome.success,
                 outcome.output.clone(),
                 outcome.output_data.clone(),

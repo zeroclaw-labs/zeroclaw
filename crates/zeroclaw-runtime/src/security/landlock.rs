@@ -661,6 +661,39 @@ impl Sandbox for LandlockSandbox {
             .is_ok()
     }
 
+    fn execution_fingerprint_material(
+        &self,
+        _launch_program: &std::path::Path,
+    ) -> std::io::Result<Vec<u8>> {
+        let mut material = b"sandbox-policy-v1:landlock".to_vec();
+        append_optional_path_material(&mut material, b"workspace", self.workspace_dir.as_deref())?;
+        for (label, roots) in [
+            (b"read-write".as_slice(), &self.allowed_roots),
+            (b"read-only".as_slice(), &self.allowed_roots_read_only),
+            (b"write-only".as_slice(), &self.allowed_roots_write_only),
+        ] {
+            for root in roots {
+                append_optional_path_material(&mut material, label, Some(root))?;
+            }
+        }
+        for (path, rights, required) in generic_rules() {
+            append_field(&mut material, b"generic-source", path.as_bytes());
+            append_field(
+                &mut material,
+                b"generic-rights",
+                format!("{rights:?}:{required}").as_bytes(),
+            );
+            match Path::new(path).canonicalize() {
+                Ok(resolved) => append_path_field(&mut material, b"generic-resolved", &resolved),
+                Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => {
+                    append_field(&mut material, b"generic-absent", b"");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(material)
+    }
+
     fn name(&self) -> &str {
         "landlock"
     }
@@ -668,6 +701,33 @@ impl Sandbox for LandlockSandbox {
     fn description(&self) -> &str {
         "Linux kernel LSM sandboxing (filesystem access control)"
     }
+}
+
+#[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+fn append_optional_path_material(
+    material: &mut Vec<u8>,
+    label: &[u8],
+    path: Option<&Path>,
+) -> std::io::Result<()> {
+    match path {
+        Some(path) => append_path_field(material, label, &path.canonicalize()?),
+        None => append_field(material, label, b"none"),
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+fn append_path_field(material: &mut Vec<u8>, label: &[u8], path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    append_field(material, label, path.as_os_str().as_bytes());
+}
+
+#[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+fn append_field(material: &mut Vec<u8>, label: &[u8], value: &[u8]) {
+    material.extend_from_slice(&(label.len() as u64).to_be_bytes());
+    material.extend_from_slice(label);
+    material.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    material.extend_from_slice(value);
 }
 
 // Stub implementations for non-Linux or when feature is disabled

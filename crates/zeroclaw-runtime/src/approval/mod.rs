@@ -1,6 +1,11 @@
 //! Interactive approval workflow for supervised mode.
 //! Provides a pre-execution hook that prompts the user before tool calls,
-//! with session-scoped "Always" allowlists and audit logging.
+//! with session-scoped "Always" rules and audit logging, plus the
+//! single-use confirmation ledger of RFC 7155 §5.2.
+
+pub mod ledger;
+
+pub use ledger::ConfirmationLedger;
 
 use crate::security::AutonomyLevel;
 use chrono::Utc;
@@ -10,7 +15,15 @@ use std::collections::HashSet;
 #[cfg(unix)]
 use std::io::BufReader;
 use std::io::{self, BufRead, Write};
+use std::sync::{Arc, OnceLock};
+use uuid::Uuid;
+use zeroclaw_api::permission::{
+    ActionFingerprint, ApproveOrDeny, ApproverKind, ConsumeOutcome, RouteId, TimeWindow,
+    TrustedConfirmation,
+};
+use zeroclaw_api::runtime_traits::ShellDialect;
 use zeroclaw_config::schema::RiskProfileConfig;
+use zeroclaw_config::tool_policy::{ArgPattern, PolicyRule, RuleMatcher, RuleSource};
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -19,6 +32,12 @@ use zeroclaw_config::schema::RiskProfileConfig;
 pub struct ApprovalRequest {
     pub tool_name: String,
     pub arguments: serde_json::Value,
+    /// The model-stated intent, for HUMAN display only (RFC 7155 §5.5):
+    /// shown side-by-side with the real action, explicitly labeled
+    /// untrusted. NEVER an authorization input — the confirmation binds the
+    /// action fingerprint, and changing `intent` satisfies no approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
 }
 
 /// The user's response to an approval request.
@@ -70,6 +89,31 @@ pub struct ApprovalLogEntry {
     pub arguments_summary: String,
     pub decision: ApprovalResponse,
     pub channel: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation_id: Option<String>,
+    /// The hex action fingerprint of the confirmation minted for an
+    /// approved shell command (RFC 7155 §5.2), when one was minted.
+    /// `None` for tool-name-level decisions without a shell resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_fingerprint: Option<String>,
+    /// The trusted route the decision arrived on (`cli`, channel alias,
+    /// approval-route name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_route: Option<String>,
+    /// How the minted confirmation was consumed (`consumed`, `replay`,
+    /// `expired`, ...) — present only when a confirmation existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_state: Option<String>,
+}
+
+/// The confirmation provenance recorded alongside an approval decision
+/// (RFC 7155 §3.5 audit fields).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmationAudit {
+    pub confirmation_id: String,
+    pub action_fingerprint: String,
+    pub trusted_route: String,
+    pub terminal_state: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +121,14 @@ pub enum ApprovalRequirement {
     Prompt,
     Approved,
     NotRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShellAuthorizationOutcome {
+    StaticAllow,
+    SessionAllow,
+    Confirmation(ConsumeOutcome),
+    Rejected,
 }
 
 // ── ApprovalManager ──────────────────────────────────────────────
@@ -94,46 +146,139 @@ pub struct ApprovalManager {
     /// When `true`, shell calls in non-interactive mode still enter the outer
     /// approval flow because a real client approval channel exists.
     non_interactive_shell_requires_approval: bool,
-    /// Session-scoped allowlist built from "Always" responses.
-    session_allowlist: Mutex<HashSet<String>>,
+    /// Session-scoped rules built from "Always" responses. RFC 7155
+    /// §3.3.4: an "always approve" answer mints a NARROW rule — for shell
+    /// commands the exact executable plus the approved argument prefix,
+    /// for other tools the tool name (the legacy semantics).
+    session_rules: Mutex<Vec<PolicyRule>>,
+    /// Single-use confirmations minted after real operator answers
+    /// (RFC 7155 §5.2).
+    confirmation_ledger: ConfirmationLedger,
+    /// Security policy + shell dialect for the RFC 7155 shell approval
+    /// path, set once by the site that constructed this manager (it owns
+    /// both). Unset (tests, configless paths) => the gate falls back to the
+    /// legacy tool-name-only gating.
+    policy_context: OnceLock<PolicyContextHolder>,
+    /// On-demand shell execution facts from the same runtime/sandbox/env
+    /// objects as the registered ShellTool. Facts are never cached here.
+    shell_execution: OnceLock<Arc<crate::tools::shell::ShellExecutionFactsResolver>>,
     /// Audit trail of approval decisions.
     audit_log: Mutex<Vec<ApprovalLogEntry>>,
 }
 
+/// The set-once policy context (see
+/// [`ApprovalManager::set_policy_context`]).
+pub struct PolicyContextHolder {
+    pub security: Arc<crate::security::SecurityPolicy>,
+    pub shell_dialect: ShellDialect,
+}
+
+fn canonical_tool_set(values: &[String]) -> HashSet<String> {
+    values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 impl ApprovalManager {
+    /// Attach the security policy and shell dialect this manager's agent
+    /// runs under (RFC 7155: the approval gate resolves the actual shell
+    /// command, which needs both). Call once, right after construction, at
+    /// the site that owns the policy. Sites without a policy (tests,
+    /// configless paths) leave it unset and get the legacy tool-name-only
+    /// gating.
+    pub fn set_policy_context(
+        &self,
+        security: Arc<crate::security::SecurityPolicy>,
+        shell_dialect: ShellDialect,
+    ) {
+        let _ = self.policy_context.set(PolicyContextHolder {
+            security,
+            shell_dialect,
+        });
+    }
+
+    /// Attach the concrete shell tool's execution-fact resolver. Production
+    /// shell confirmation minting and consumption fail closed when this is
+    /// absent rather than falling back to a partial command-only fingerprint.
+    pub(crate) fn set_shell_execution_context(
+        &self,
+        resolver: Arc<crate::tools::shell::ShellExecutionFactsResolver>,
+    ) {
+        let _ = self.shell_execution.set(resolver);
+    }
+
+    pub(crate) fn shell_fingerprint_facts(
+        &self,
+        command: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.shell_execution
+            .get()
+            .ok_or_else(|| anyhow::Error::msg("shell execution context is not attached"))?
+            .prepare(command)
+            .map(|prepared| prepared.facts)
+    }
+
+    /// The attached security policy, when the construction site provided
+    /// one.
+    pub fn policy(&self) -> Option<&crate::security::SecurityPolicy> {
+        self.policy_context
+            .get()
+            .map(|holder| holder.security.as_ref())
+    }
+
+    /// The attached shell dialect (`Posix` when no policy context was set -
+    /// the same conservative default the legacy path used).
+    pub fn shell_dialect(&self) -> ShellDialect {
+        self.policy_context
+            .get()
+            .map_or(ShellDialect::Posix, |holder| holder.shell_dialect)
+    }
+
     /// Create an interactive (CLI) approval manager from a risk profile.
     pub fn from_risk_profile(risk_profile: &RiskProfileConfig) -> Self {
         Self {
-            auto_approve: risk_profile.auto_approve.iter().cloned().collect(),
-            always_ask: risk_profile.always_ask.iter().cloned().collect(),
+            auto_approve: canonical_tool_set(&risk_profile.auto_approve),
+            always_ask: canonical_tool_set(&risk_profile.always_ask),
             autonomy_level: risk_profile.level,
             non_interactive: false,
             non_interactive_shell_requires_approval: false,
-            session_allowlist: Mutex::new(HashSet::new()),
+            session_rules: Mutex::new(Vec::new()),
+            confirmation_ledger: ConfirmationLedger::new(),
+            policy_context: OnceLock::new(),
+            shell_execution: OnceLock::new(),
             audit_log: Mutex::new(Vec::new()),
         }
     }
 
     pub fn for_non_interactive(risk_profile: &RiskProfileConfig) -> Self {
         Self {
-            auto_approve: risk_profile.auto_approve.iter().cloned().collect(),
-            always_ask: risk_profile.always_ask.iter().cloned().collect(),
+            auto_approve: canonical_tool_set(&risk_profile.auto_approve),
+            always_ask: canonical_tool_set(&risk_profile.always_ask),
             autonomy_level: risk_profile.level,
             non_interactive: true,
             non_interactive_shell_requires_approval: false,
-            session_allowlist: Mutex::new(HashSet::new()),
+            session_rules: Mutex::new(Vec::new()),
+            confirmation_ledger: ConfirmationLedger::new(),
+            policy_context: OnceLock::new(),
+            shell_execution: OnceLock::new(),
             audit_log: Mutex::new(Vec::new()),
         }
     }
 
     pub fn for_non_interactive_backchannel(risk_profile: &RiskProfileConfig) -> Self {
         Self {
-            auto_approve: risk_profile.auto_approve.iter().cloned().collect(),
-            always_ask: risk_profile.always_ask.iter().cloned().collect(),
+            auto_approve: canonical_tool_set(&risk_profile.auto_approve),
+            always_ask: canonical_tool_set(&risk_profile.always_ask),
             autonomy_level: risk_profile.level,
             non_interactive: true,
             non_interactive_shell_requires_approval: true,
-            session_allowlist: Mutex::new(HashSet::new()),
+            session_rules: Mutex::new(Vec::new()),
+            confirmation_ledger: ConfirmationLedger::new(),
+            policy_context: OnceLock::new(),
+            shell_execution: OnceLock::new(),
             audit_log: Mutex::new(Vec::new()),
         }
     }
@@ -149,21 +294,34 @@ impl ApprovalManager {
     /// from `risk_profile`; the session allowlist and audit trail start
     /// fresh — "Always" grants to one agent never transfer to another.
     pub fn derive_for_risk_profile(&self, risk_profile: &RiskProfileConfig) -> Self {
-        Self {
-            auto_approve: risk_profile.auto_approve.iter().cloned().collect(),
-            always_ask: risk_profile.always_ask.iter().cloned().collect(),
+        let derived = Self {
+            auto_approve: canonical_tool_set(&risk_profile.auto_approve),
+            always_ask: canonical_tool_set(&risk_profile.always_ask),
             autonomy_level: risk_profile.level,
             non_interactive: self.non_interactive,
             non_interactive_shell_requires_approval: self.non_interactive_shell_requires_approval,
-            session_allowlist: Mutex::new(HashSet::new()),
+            session_rules: Mutex::new(Vec::new()),
+            confirmation_ledger: ConfirmationLedger::new(),
+            policy_context: OnceLock::new(),
+            shell_execution: OnceLock::new(),
             audit_log: Mutex::new(Vec::new()),
-        }
+        };
+        // Execution context is intentionally not inherited: the caller must
+        // attach the derived agent's own policy and the resolver from its
+        // actually registered ShellTool. Only interactivity mode is inherited.
+        derived
     }
 
     /// Returns `true` when this manager operates in non-interactive mode
     /// (i.e. for channel-driven runs where no operator can approve).
     pub fn is_non_interactive(&self) -> bool {
         self.non_interactive
+    }
+
+    /// Whether this manager has a route that can obtain a fresh shell
+    /// decision when command policy resolves to `Ask`.
+    pub(crate) fn can_request_shell_approval(&self) -> bool {
+        !self.non_interactive || self.non_interactive_shell_requires_approval
     }
 
     /// Check whether a tool call requires interactive approval.
@@ -200,9 +358,15 @@ impl ApprovalManager {
             return ApprovalRequirement::Approved;
         }
 
-        // Session allowlist (from prior "Always" responses).
-        let allowlist = self.session_allowlist.lock();
-        if allowlist.contains(tool_name) {
+        // Session rules (from prior "Always" responses): a tool-name
+        // Allow rule skips the prompt. The NARROW shell rules minted for
+        // shell "Always" answers are consulted by the shell resolver
+        // through `session_rules()`, not here.
+        let session = self.session_rules.lock();
+        if session.iter().any(|rule| {
+            rule.decision == zeroclaw_config::tool_policy::Decision::Allow
+                && matches!(&rule.matcher, RuleMatcher::ToolName { tool } if tool == tool_name || tool.trim() == "*")
+        }) {
             return ApprovalRequirement::Approved;
         }
 
@@ -211,17 +375,25 @@ impl ApprovalManager {
     }
 
     /// Record an approval decision and update session state.
+    ///
+    /// `confirmation` carries the audit provenance of the confirmation
+    /// minted for this decision (fingerprint, route, terminal state), when
+    /// one was minted (RFC 7155 §3.5 audit fields).
     pub fn record_decision(
         &self,
         tool_name: &str,
         args: &serde_json::Value,
         decision: &ApprovalResponse,
         channel: &str,
+        confirmation: Option<ConfirmationAudit>,
     ) {
-        // If "Always", add to session allowlist.
+        // If "Always", mint the session rule.
         if *decision == ApprovalResponse::Always {
-            let mut allowlist = self.session_allowlist.lock();
-            allowlist.insert(tool_name.to_string());
+            let rule = self.always_session_rule(tool_name, args);
+            let mut session = self.session_rules.lock();
+            if !session.contains(&rule) {
+                session.push(rule);
+            }
         }
 
         // Append to audit log.
@@ -232,6 +404,18 @@ impl ApprovalManager {
             arguments_summary: summary,
             decision: decision.clone(),
             channel: channel.to_string(),
+            confirmation_id: confirmation
+                .as_ref()
+                .map(|audit| audit.confirmation_id.clone()),
+            action_fingerprint: confirmation
+                .as_ref()
+                .map(|audit| audit.action_fingerprint.clone()),
+            trusted_route: confirmation
+                .as_ref()
+                .map(|audit| audit.trusted_route.clone()),
+            terminal_state: confirmation
+                .as_ref()
+                .map(|audit| audit.terminal_state.clone()),
         };
         let mut log = self.audit_log.lock();
         log.push(entry);
@@ -242,9 +426,199 @@ impl ApprovalManager {
         self.audit_log.lock().clone()
     }
 
-    /// Get the current session allowlist.
-    pub fn session_allowlist(&self) -> HashSet<String> {
-        self.session_allowlist.lock().clone()
+    fn record_confirmation_terminal_state(&self, confirmation_id: Uuid, outcome: ConsumeOutcome) {
+        let state = match outcome {
+            ConsumeOutcome::Consumed => "consumed",
+            ConsumeOutcome::Replay => "replay",
+            ConsumeOutcome::Expired => "expired",
+            ConsumeOutcome::Superseded => "superseded",
+            ConsumeOutcome::Conflicting => "conflicting",
+            ConsumeOutcome::Cancelled => "cancelled",
+            ConsumeOutcome::Stale => "stale",
+        };
+        let confirmation_id = confirmation_id.to_string();
+        if let Some(entry) = self
+            .audit_log
+            .lock()
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.confirmation_id.as_deref() == Some(confirmation_id.as_str()))
+        {
+            entry.terminal_state = Some(state.to_string());
+        }
+    }
+
+    /// The session rules minted so far ("Always" answers). The shell
+    /// resolver consumes these as an additional scope.
+    pub fn session_rules(&self) -> Vec<PolicyRule> {
+        self.session_rules.lock().clone()
+    }
+
+    /// Whether a hard `always_ask` entry covers this tool (`*` or the exact
+    /// name). A hard ask forces the prompt even for resolver-`Allow` shell
+    /// commands — a configured `always_ask` must not be skippable.
+    pub fn hard_asks(&self, tool_name: &str) -> bool {
+        self.always_ask.contains("*") || self.always_ask.contains(tool_name)
+    }
+
+    /// Mint a fresh trusted confirmation for an approved action and record
+    /// it in the ledger. Only the approval gate calls this, after a real
+    /// operator answer (RFC 7155 §5.1: nothing model-supplied can produce
+    /// one).
+    pub fn mint_confirmation(
+        &self,
+        action_facts: &serde_json::Value,
+        route: RouteId,
+        validity_secs: u64,
+    ) -> TrustedConfirmation {
+        let now = Utc::now().timestamp().max(0) as u64;
+        let confirmation = TrustedConfirmation::new(
+            Uuid::new_v4(),
+            ActionFingerprint::compute(action_facts),
+            ApproveOrDeny::Approve,
+            TimeWindow::new(now, validity_secs),
+            ApproverKind::Human,
+            route,
+            None,
+        );
+        self.confirmation_ledger.mint(confirmation.clone());
+        confirmation
+    }
+
+    /// Consume a confirmation for the action with these facts. `Consumed`
+    /// is the only outcome that authorizes execution.
+    pub fn consume_confirmation(
+        &self,
+        confirmation_id: &Uuid,
+        action_facts: &serde_json::Value,
+    ) -> ConsumeOutcome {
+        let now = Utc::now().timestamp().max(0) as u64;
+        self.confirmation_ledger.consume(
+            confirmation_id,
+            &ActionFingerprint::compute(action_facts),
+            now,
+        )
+    }
+
+    /// Re-resolve shell policy and execution facts at dispatch. A current
+    /// policy/session `Allow` authorizes directly; an `Ask` requires a valid
+    /// single-use confirmation. Denied or malformed actions never consume a
+    /// pending confirmation.
+    pub(crate) fn authorize_shell_execution(
+        &self,
+        args: &serde_json::Value,
+    ) -> (
+        ShellAuthorizationOutcome,
+        Option<ActionFingerprint>,
+        Option<u64>,
+    ) {
+        let Some(command) = args.get("command").and_then(serde_json::Value::as_str) else {
+            return (ShellAuthorizationOutcome::Rejected, None, None);
+        };
+        let Some(security) = self.policy() else {
+            return (ShellAuthorizationOutcome::Rejected, None, None);
+        };
+        let resolution =
+            security.resolve_shell_decision(command, self.shell_dialect(), &self.session_rules());
+        if resolution.decision == zeroclaw_config::tool_policy::Decision::Deny {
+            return (ShellAuthorizationOutcome::Rejected, None, None);
+        }
+        let session_allow = resolution.relies_on_session;
+        let confirmation_id = args
+            .get(crate::agent::RUNTIME_CONFIRMATION_ID_ARG)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|raw| Uuid::parse_str(raw).ok());
+        if resolution.decision == zeroclaw_config::tool_policy::Decision::Allow
+            && !self.hard_asks("shell")
+            && confirmation_id.is_none()
+            && !session_allow
+        {
+            return (ShellAuthorizationOutcome::StaticAllow, None, None);
+        }
+        let facts = match self.shell_fingerprint_facts(command) {
+            Ok(facts) => facts,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_category(::zeroclaw_log::EventCategory::Tool)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                    "shell confirmation execution facts could not be resolved"
+                );
+                return (ShellAuthorizationOutcome::Rejected, None, None);
+            }
+        };
+        let fingerprint = ActionFingerprint::compute(&facts);
+        if resolution.decision == zeroclaw_config::tool_policy::Decision::Allow
+            && !self.hard_asks("shell")
+            && confirmation_id.is_none()
+        {
+            debug_assert!(session_allow);
+            return (
+                ShellAuthorizationOutcome::SessionAllow,
+                Some(fingerprint),
+                None,
+            );
+        }
+        let Some(id) = confirmation_id else {
+            return (
+                ShellAuthorizationOutcome::Confirmation(ConsumeOutcome::Stale),
+                None,
+                None,
+            );
+        };
+        let now = Utc::now().timestamp().max(0) as u64;
+        let (outcome, expires_at, transitioned) =
+            self.confirmation_ledger
+                .consume_with_expiry(&id, &fingerprint, now);
+        if transitioned {
+            self.record_confirmation_terminal_state(id, outcome);
+        }
+        (
+            ShellAuthorizationOutcome::Confirmation(outcome),
+            (outcome == ConsumeOutcome::Consumed).then_some(fingerprint),
+            expires_at,
+        )
+    }
+
+    /// The narrow session rule an "Always" answer mints (RFC 7155 §3.3.4):
+    /// for a shell-family tool, the exact executable plus the approved
+    /// argument prefix. As with every [`ArgPattern::Prefix`], later calls may
+    /// add arguments after that prefix; they may not change or omit an
+    /// approved argument. For any other tool, the tool name retains the
+    /// legacy semantics.
+    fn always_session_rule(&self, tool_name: &str, args: &serde_json::Value) -> PolicyRule {
+        // Narrow only under an attached policy context (the RFC 7155
+        // shell path). A contextless manager keeps the legacy tool-name
+        // rule so its behavior is unchanged.
+        if self.policy().is_some()
+            && crate::agent::is_runtime_approved_arg_tool(tool_name)
+            && let Some(command) = args.get("command").and_then(serde_json::Value::as_str)
+        {
+            let dialect = self.shell_dialect();
+            let action = zeroclaw_config::tool_policy::extract_shell_action(command, dialect, None);
+            let zeroclaw_config::tool_policy::ToolAction::Shell(shell) = &action;
+            if let Some(segment) = shell.segments.first() {
+                return PolicyRule {
+                    matcher: RuleMatcher::ShellCommand {
+                        executable: segment.base.clone(),
+                        arg_pattern: Some(ArgPattern::Prefix(segment.arguments.clone())),
+                    },
+                    decision: zeroclaw_config::tool_policy::Decision::Allow,
+                    overridable: true,
+                    source: RuleSource::Session,
+                };
+            }
+        }
+        PolicyRule {
+            matcher: RuleMatcher::ToolName {
+                tool: tool_name.to_string(),
+            },
+            decision: zeroclaw_config::tool_policy::Decision::Allow,
+            overridable: true,
+            source: RuleSource::Session,
+        }
     }
 
     /// Prompt the user on the CLI and return their decision.
@@ -268,6 +642,21 @@ fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
         crate::i18n::get_required_cli_string_with_args("cli-approval-request", &tool_args)
     );
     eprintln!("   {summary}");
+    // RFC 7155 §5.5: the agent-stated intent is shown next to the real
+    // command, explicitly labeled untrusted. It is never an authorization
+    // input; a harmless-looking intent must never mask the real command
+    // above it.
+    if let Some(intent) = request
+        .intent
+        .as_deref()
+        .filter(|intent| !intent.is_empty())
+    {
+        let intent_args = [("intent", intent)];
+        eprintln!(
+            "{}",
+            crate::i18n::get_required_cli_string_with_args("cli-approval-intent", &intent_args)
+        );
+    }
     eprint!(
         "{}",
         crate::i18n::get_required_cli_string_with_args("cli-approval-prompt", &tool_args)
@@ -563,6 +952,29 @@ mod tests {
     }
 
     #[test]
+    fn static_shell_allow_does_not_require_confirmation_facts() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let profile = RiskProfileConfig {
+            level: AutonomyLevel::Full,
+            allowed_commands: vec!["echo".to_string()],
+            ..RiskProfileConfig::default()
+        };
+        let security = Arc::new(crate::security::SecurityPolicy::from_risk_profile(
+            &profile,
+            workspace.path(),
+        ));
+        let manager = ApprovalManager::from_risk_profile(&profile);
+        manager.set_policy_context(security, zeroclaw_api::runtime_traits::ShellDialect::Posix);
+
+        assert_eq!(
+            manager
+                .authorize_shell_execution(&serde_json::json!({"command": "echo static"}))
+                .0,
+            ShellAuthorizationOutcome::StaticAllow
+        );
+    }
+
+    #[test]
     fn readonly_never_prompts() {
         let config = RiskProfileConfig {
             level: AutonomyLevel::ReadOnly,
@@ -584,6 +996,7 @@ mod tests {
             &serde_json::json!({"path": "test.txt"}),
             &ApprovalResponse::Always,
             "cli",
+            None,
         );
 
         // Now file_write should be in session allowlist.
@@ -600,6 +1013,7 @@ mod tests {
             &serde_json::json!({"command": "ls"}),
             &ApprovalResponse::Always,
             "cli",
+            None,
         );
 
         // shell is in always_ask, so it still needs approval.
@@ -614,8 +1028,153 @@ mod tests {
             &serde_json::json!({}),
             &ApprovalResponse::Yes,
             "cli",
+            None,
         );
         assert!(mgr.needs_approval("file_write"));
+    }
+
+    #[cfg(unix)]
+    fn confirmation_manager_fixture() -> (
+        tempfile::TempDir,
+        Arc<ApprovalManager>,
+        serde_json::Value,
+        TrustedConfirmation,
+    ) {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let profile = RiskProfileConfig::default();
+        let mut security =
+            crate::security::SecurityPolicy::from_risk_profile(&profile, workspace.path());
+        security.allowed_commands.clear();
+        let security = Arc::new(security);
+        let shell = crate::tools::shell::ShellTool::new(
+            Arc::clone(&security),
+            Arc::new(crate::platform::NativeRuntime::new()),
+        );
+        let manager = Arc::new(ApprovalManager::from_risk_profile(&profile));
+        manager.set_policy_context(security, zeroclaw_api::runtime_traits::ShellDialect::Posix);
+        manager.set_shell_execution_context(shell.execution_facts_resolver());
+        let args = serde_json::json!({"command": "echo lifecycle"});
+        let facts = manager.shell_fingerprint_facts("echo lifecycle").unwrap();
+        let confirmation =
+            manager.mint_confirmation(&facts, zeroclaw_api::permission::RouteId::cli(), 300);
+        manager.record_decision(
+            "shell",
+            &args,
+            &ApprovalResponse::Yes,
+            "cli",
+            Some(ConfirmationAudit {
+                confirmation_id: confirmation.confirmation_id.to_string(),
+                action_fingerprint: confirmation.action_fingerprint.as_hex(),
+                trusted_route: confirmation.trusted_route.to_string(),
+                terminal_state: "pending".to_string(),
+            }),
+        );
+        (workspace, manager, args, confirmation)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_confirmation_consumption_keeps_consumed_audit_terminal() {
+        let (_workspace, manager, args, confirmation) = confirmation_manager_fixture();
+        let mut authorized_args = args.clone();
+        authorized_args.as_object_mut().unwrap().insert(
+            crate::agent::RUNTIME_CONFIRMATION_ID_ARG.to_string(),
+            confirmation.confirmation_id.to_string().into(),
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let outcomes = std::thread::scope(|scope| {
+            let handles = (0..8)
+                .map(|_| {
+                    let manager = Arc::clone(&manager);
+                    let barrier = Arc::clone(&barrier);
+                    let args = authorized_args.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        manager.authorize_shell_execution(&args).0
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(
+                    outcome,
+                    ShellAuthorizationOutcome::Confirmation(ConsumeOutcome::Consumed)
+                ))
+                .count(),
+            1
+        );
+        assert!(outcomes.iter().any(|outcome| matches!(
+            outcome,
+            ShellAuthorizationOutcome::Confirmation(ConsumeOutcome::Replay)
+        )));
+        let audit = manager.audit_log();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].terminal_state.as_deref(), Some("consumed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn always_first_consumes_confirmation_then_uses_session_allow() {
+        let (_workspace, manager, args, confirmation) = confirmation_manager_fixture();
+        manager.record_decision("shell", &args, &ApprovalResponse::Always, "cli", None);
+        let mut first_args = args.clone();
+        first_args.as_object_mut().unwrap().insert(
+            crate::agent::RUNTIME_CONFIRMATION_ID_ARG.to_string(),
+            confirmation.confirmation_id.to_string().into(),
+        );
+        assert!(matches!(
+            manager.authorize_shell_execution(&first_args).0,
+            ShellAuthorizationOutcome::Confirmation(ConsumeOutcome::Consumed)
+        ));
+        let (outcome, fingerprint, expires_at) = manager.authorize_shell_execution(&args);
+        assert_eq!(outcome, ShellAuthorizationOutcome::SessionAllow);
+        assert!(fingerprint.is_some());
+        assert!(expires_at.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compound_session_allow_is_independent_of_segment_order() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let profile = RiskProfileConfig {
+            level: AutonomyLevel::Full,
+            allowed_commands: vec!["echo".to_string()],
+            ..RiskProfileConfig::default()
+        };
+        let security = Arc::new(crate::security::SecurityPolicy::from_risk_profile(
+            &profile,
+            workspace.path(),
+        ));
+        let shell = crate::tools::shell::ShellTool::new(
+            Arc::clone(&security),
+            Arc::new(crate::platform::NativeRuntime::new()),
+        );
+        let manager = ApprovalManager::from_risk_profile(&profile);
+        manager.set_policy_context(security, zeroclaw_api::runtime_traits::ShellDialect::Posix);
+        manager.set_shell_execution_context(shell.execution_facts_resolver());
+        manager.record_decision(
+            "shell",
+            &serde_json::json!({"command": "printf session"}),
+            &ApprovalResponse::Always,
+            "cli",
+            None,
+        );
+
+        for command in ["echo static; printf session", "printf session; echo static"] {
+            assert_eq!(
+                manager
+                    .authorize_shell_execution(&serde_json::json!({"command": command}))
+                    .0,
+                ShellAuthorizationOutcome::SessionAllow,
+                "session-dependent compound command should not depend on segment order: {command}"
+            );
+        }
     }
 
     // ── audit log ────────────────────────────────────────────
@@ -629,12 +1188,14 @@ mod tests {
             &serde_json::json!({"command": "rm -rf ./build/"}),
             &ApprovalResponse::No,
             "cli",
+            None,
         );
         mgr.record_decision(
             "file_write",
             &serde_json::json!({"path": "out.txt", "content": "hello"}),
             &ApprovalResponse::Yes,
             "cli",
+            None,
         );
 
         let log = mgr.audit_log();
@@ -653,6 +1214,7 @@ mod tests {
             &serde_json::json!({"command": "ls"}),
             &ApprovalResponse::Yes,
             "telegram",
+            None,
         );
 
         let log = mgr.audit_log();
@@ -793,6 +1355,7 @@ mod tests {
             &serde_json::json!({"path": "test.txt"}),
             &ApprovalResponse::Always,
             "telegram",
+            None,
         );
 
         assert!(!mgr.needs_approval("file_write"));
@@ -807,6 +1370,7 @@ mod tests {
             &serde_json::json!({"command": "ls"}),
             &ApprovalResponse::Always,
             "telegram",
+            None,
         );
 
         // shell is in always_ask, so it still needs approval even after "Always".
@@ -834,6 +1398,7 @@ mod tests {
         let req = ApprovalRequest {
             tool_name: "shell".into(),
             arguments: serde_json::json!({"command": "echo hi"}),
+            intent: Some("clean the build directory".into()),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ApprovalRequest = serde_json::from_str(&json).unwrap();
