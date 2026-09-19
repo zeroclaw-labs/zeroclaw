@@ -291,12 +291,16 @@ where
         };
         match resolved {
             Some(Ok(outcome)) => {
-                let config = state.config.read();
-                zeroclaw_runtime::sop::drive_resumed_broker_action(
+                let config = state.config.read().clone();
+                zeroclaw_runtime::sop::drive_resumed_broker_action_with_capability(
                     &config,
                     std::sync::Arc::clone(engine),
                     state.sop_audit.clone(),
                     &outcome,
+                    Some(zeroclaw_runtime::live_config_authority::AgentExecutionCapability::from_parts(
+                        std::sync::Arc::clone(&state.config),
+                        state.agent_lifecycle.clone(),
+                    )),
                 );
                 serde_json::json!({
                     "type": "sop_approval_result",
@@ -384,20 +388,17 @@ async fn handle_socket(
             stored_messages = messages;
             resumed = true;
         }
-        // Set session name if provided (non-empty) on connect
+        // Resolve the requested/stored name for the initial frame. Publishing
+        // metadata waits until agent construction is lifecycle-admitted below.
         if let Some(ref name) = session_name
             && !name.is_empty()
         {
-            let _ = backend.set_session_name(&session_key, name);
             effective_name = Some(name.clone());
         }
         // If no name was provided via query param, load the stored name
         if effective_name.is_none() {
             effective_name = backend.get_session_name(&session_key).unwrap_or(None);
         }
-        // Stamp the agent alias so future /api/sessions queries and
-        // per-agent filters can attribute this session to its agent.
-        let _ = backend.set_session_agent_alias(&session_key, &agent_alias);
     }
 
     // Send session_start message to client
@@ -476,6 +477,31 @@ async fn handle_socket(
         }
     }
 
+    let construction_reservation =
+        match state.agent_lifecycle.reserve_admission(agent_alias.clone()) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": error.to_string(),
+                    "code": "AGENT_LIFECYCLE_UNAVAILABLE"
+                });
+                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                return;
+            }
+        };
+    let turn_generation = state.agent_lifecycle.alias_generation(&agent_alias);
+    let config = state.config.read().clone();
+    if let Some(ref backend) = state.session_backend {
+        if let Some(ref name) = session_name
+            && !name.is_empty()
+        {
+            let _ = backend.set_session_name(&session_key, name);
+        }
+        // Stamp attribution only while the same alias generation is admitted.
+        let _ = backend.set_session_agent_alias(&session_key, &agent_alias);
+    }
+
     let session_cwd = match resolve_ws_session_cwd(requested_cwd.as_deref(), &config, &agent_alias)
     {
         Ok(cwd) => cwd,
@@ -495,8 +521,12 @@ async fn handle_socket(
         return;
     }
 
+    let execution_capability = zeroclaw_runtime::AgentExecutionCapability::from_parts(
+        Arc::clone(&state.config),
+        state.agent_lifecycle.clone(),
+    );
     let mut agent =
-        match zeroclaw_runtime::agent::Agent::from_live_config_with_session_cwd_and_mcp_backchannel(
+        match zeroclaw_runtime::agent::Agent::from_live_config_with_session_cwd_and_mcp_backchannel_with_capability(
             Arc::clone(&state.config),
             &agent_alias,
             Some(&session_cwd),
@@ -507,6 +537,7 @@ async fn handle_socket(
             state.sop_engine.clone(),
             state.sop_audit.clone(),
             Some(state.canvas_store.clone()),
+            Some(execution_capability),
         )
         .await
         {
@@ -579,6 +610,9 @@ async fn handle_socket(
             "Seeded {} channel(s) into dashboard agent session",
         );
     }
+    // Construction is complete. Keep only the generation token for future
+    // turns so an idle socket does not block agent deletion.
+    drop(construction_reservation);
 
     // Seeding happens before the connection's agent setup is complete. Forward
     // its one-shot trim outcome only after channels are registered, so restore
@@ -598,6 +632,19 @@ async fn handle_socket(
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
             if parsed["type"].as_str() == Some("message") {
                 if let Some(content) = first_chat_message_content(text) {
+                    let _turn_lease =
+                        match state.reserve_agent_turn_at(agent_alias.clone(), turn_generation) {
+                            Ok(lease) => lease,
+                            Err(error) => {
+                                let err = serde_json::json!({
+                                    "type": "error",
+                                    "message": error.to_string(),
+                                    "code": "AGENT_LIFECYCLE_UNAVAILABLE"
+                                });
+                                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                return;
+                            }
+                        };
                     let _session_guard = match state.session_queue.acquire(&session_key).await {
                         Ok(guard) => guard,
                         Err(e) => {
@@ -767,6 +814,21 @@ async fn handle_socket(
                     let _ = sender.send(Message::Text(err.to_string().into())).await;
                     continue;
                 }
+
+                let _turn_lease = match state
+                    .reserve_agent_turn_at(agent_alias.clone(), turn_generation)
+                {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        let err = serde_json::json!({
+                            "type": "error",
+                            "message": error.to_string(),
+                            "code": "AGENT_LIFECYCLE_UNAVAILABLE"
+                        });
+                        let _ = sender.send(Message::Text(err.to_string().into())).await;
+                        continue;
+                    }
+                };
 
                 // Acquire session lock to serialize concurrent turns
                 let _session_guard = match state.session_queue.acquire(&session_key).await {

@@ -1119,7 +1119,7 @@ pub async fn handle_section_select(
         .into_response();
     }
 
-    if let Err(e) = persist_and_swap(&state, working, &_cfg_guard).await {
+    if let Err(e) = persist_and_swap(&state, working, _cfg_guard).await {
         return error_response(e);
     }
 
@@ -1422,6 +1422,7 @@ mod tests {
         AppState {
             config: std::sync::Arc::new(parking_lot::RwLock::new(config)),
             config_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider: std::sync::Arc::new(crate::UnconfiguredModelProvider),
             model: "test-model".to_string(),
             temperature: None,
