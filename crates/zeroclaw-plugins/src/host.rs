@@ -25,6 +25,107 @@ struct LoadedPlugin {
     wasm_path: Option<PathBuf>,
 }
 
+/// The file name a staged component is held under while it is verified.
+const STAGED_COMPONENT_FILE: &str = "component.wasm";
+
+/// A source that passed admission and is ready to install: see
+/// [`PluginHost::admit_source`]. Dropping it without installing removes the
+/// staged component.
+#[derive(Debug)]
+pub struct AdmittedSource {
+    manifest: PluginManifest,
+    manifest_toml: String,
+    source_dir: PathBuf,
+    staging_dir: PathBuf,
+    component: Option<StagedComponent>,
+}
+
+/// The single copy of a component read at admission.
+#[derive(Debug)]
+struct StagedComponent {
+    /// Where the manifest places it, relative to the plugin directory.
+    relative_path: PathBuf,
+    /// Where the admitted bytes sit until they are installed.
+    staged_path: PathBuf,
+}
+
+impl AdmittedSource {
+    /// The admitted manifest.
+    #[must_use]
+    pub fn manifest(&self) -> &PluginManifest {
+        &self.manifest
+    }
+
+    /// The staged component to load-check, or `None` for a package that ships
+    /// no WASM. This is the file [`PluginHost::install_admitted`] moves into
+    /// place, so a check against it is a check of what gets installed.
+    #[must_use]
+    pub fn staged_component(&self) -> Option<&Path> {
+        self.component.as_ref().map(|c| c.staged_path.as_path())
+    }
+}
+
+impl Drop for AdmittedSource {
+    fn drop(&mut self) {
+        // Best effort: after `install_admitted` the component has already been
+        // renamed away, and an admission that was never installed leaves
+        // nothing behind either way.
+        let _ = std::fs::remove_dir_all(&self.staging_dir);
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const O_NOFOLLOW: i32 = 0o400_000;
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+const O_NOFOLLOW: i32 = 0x0100;
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+/// Read a component's bytes without following a symlink at the final path
+/// component, and refuse anything that is not a regular file.
+///
+/// The `symlink_metadata` check gives the clear error; the no-follow open
+/// flag is what makes a swap between the check and the open fail closed
+/// instead of reading through the link.
+fn read_component_no_follow(path: &Path) -> Result<Vec<u8>, PluginError> {
+    let meta = std::fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            PluginError::NotFound(format!("WASM file not found: {}", path.display()))
+        } else {
+            PluginError::Io(error)
+        }
+    })?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(PluginError::InvalidManifest(format!(
+            "wasm_path {} must be a regular file inside the plugin source, not a symlink",
+            path.display()
+        )));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options.open(path)?;
+    let opened = file.metadata()?;
+    if opened.file_type().is_symlink() || !opened.is_file() {
+        return Err(PluginError::InvalidManifest(format!(
+            "wasm_path {} must be a regular file inside the plugin source, not a symlink",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(opened.len()).unwrap_or(0));
+    std::io::Read::read_to_end(&mut file, &mut bytes)?;
+    Ok(bytes)
+}
+
 impl PluginHost {
     /// Create a new plugin host rooted at `workspace_dir`, scanning its
     /// `plugins/` subdirectory.
@@ -222,7 +323,32 @@ impl PluginHost {
     /// Install a plugin from a directory path. Returns the installed
     /// plugin's manifest name so callers can key follow-up work (config
     /// seeding, messaging) off the canonical name rather than the source path.
+    ///
+    /// This is [`Self::admit_source`] followed by [`Self::install_admitted`].
+    /// A caller that wants to load-check the component in between (the CLI's
+    /// install-time verification) calls the two halves itself; either way,
+    /// the bytes that were admitted are the bytes that get installed.
     pub fn install(&mut self, source: &str) -> Result<String, PluginError> {
+        let admitted = self.admit_source(source)?;
+        self.install_admitted(admitted)
+    }
+
+    /// Admit a source without installing it.
+    ///
+    /// Parses and signature-checks the manifest, validates its shape and
+    /// config, refuses a name the host has already loaded, and reads the
+    /// component **once** into a host-owned staging file. Everything
+    /// [`Self::install_admitted`] persists comes from the returned
+    /// [`AdmittedSource`] and never from `source` again, so whatever a caller
+    /// verifies between the two calls is, byte for byte, what gets installed:
+    /// a source directory that is edited or symlink-swapped after admission
+    /// changes nothing. The component is opened without following symlinks,
+    /// and a source whose `wasm_path` is itself a symlink is refused.
+    ///
+    /// The duplicate-name check runs before a byte of the component is read,
+    /// so a package the host would refuse anyway never yields an executable
+    /// path. `Ok` with no staged component means the plugin ships no WASM.
+    pub fn admit_source(&self, source: &str) -> Result<AdmittedSource, PluginError> {
         let source_path = PathBuf::from(source);
         let manifest_path = if source_path.is_dir() {
             source_path.join("manifest.toml")
@@ -240,9 +366,10 @@ impl PluginHost {
         let (manifest, manifest_toml) = self.load_manifest(&manifest_path)?;
         let source_dir = manifest_path
             .parent()
-            .ok_or_else(|| PluginError::InvalidManifest("no parent directory".into()))?;
+            .ok_or_else(|| PluginError::InvalidManifest("no parent directory".into()))?
+            .to_path_buf();
 
-        validate_manifest_shape(&manifest, source_dir)?;
+        validate_manifest_shape(&manifest, &source_dir)?;
 
         let wasm_source = manifest.wasm_path.as_deref().map(|p| source_dir.join(p));
         if let Some(ref wasm_source) = wasm_source
@@ -254,54 +381,120 @@ impl PluginHost {
             )));
         }
 
+        // Refuse a duplicate before the signature check and before the
+        // component is read: nothing downstream may run for a package the host
+        // has already decided not to install.
         if self.loaded.contains_key(&manifest.name) {
             return Err(PluginError::AlreadyLoaded(manifest.name));
         }
 
-        // Verify plugin signature before installing
+        // Verify plugin signature before anything is staged.
         self.verify_plugin_signature(&manifest.name, &manifest_toml, &manifest)?;
         validate_manifest_config(&manifest)?;
 
-        // Copy plugin to plugins directory
-        let dest_dir = self.plugins_dir.join(&manifest.name);
+        let staging_dir = self.fresh_staging_dir(&manifest.name)?;
+        // Built before the component is read so that a failed read drops the
+        // value and its staging directory together.
+        let mut admitted = AdmittedSource {
+            manifest,
+            manifest_toml,
+            source_dir,
+            staging_dir,
+            component: None,
+        };
+        if let Some(wasm_source) = wasm_source {
+            let relative_path = PathBuf::from(
+                admitted
+                    .manifest
+                    .wasm_path
+                    .as_deref()
+                    .expect("wasm_source exists only with a wasm_path"),
+            );
+            let bytes = read_component_no_follow(&wasm_source)?;
+            let staged_path = admitted.staging_dir.join(STAGED_COMPONENT_FILE);
+            std::fs::write(&staged_path, &bytes)?;
+            admitted.component = Some(StagedComponent {
+                relative_path,
+                staged_path,
+            });
+        }
+        Ok(admitted)
+    }
+
+    /// Install a source admitted by [`Self::admit_source`].
+    ///
+    /// Persists the manifest bytes that were parsed and signature-checked and
+    /// moves the staged component into place (a rename inside the plugins
+    /// directory, so the file a verifier read is the file the daemon will
+    /// load). The `skills/` subtree of a skill-capable package is copied from
+    /// the source directory as before; it is data, not executable code.
+    pub fn install_admitted(&mut self, admitted: AdmittedSource) -> Result<String, PluginError> {
+        // Re-checked here as well: the host may have loaded the name between
+        // admission and installation.
+        if self.loaded.contains_key(&admitted.manifest.name) {
+            return Err(PluginError::AlreadyLoaded(admitted.manifest.name.clone()));
+        }
+
+        let dest_dir = self.plugins_dir.join(&admitted.manifest.name);
         std::fs::create_dir_all(&dest_dir)?;
 
         // Persist the exact manifest bytes parsed and signature-checked above.
-        std::fs::write(dest_dir.join("manifest.toml"), manifest_toml.as_bytes())?;
+        std::fs::write(
+            dest_dir.join("manifest.toml"),
+            admitted.manifest_toml.as_bytes(),
+        )?;
 
-        // Copy WASM file (if any)
-        let wasm_dest = if let (Some(rel), Some(src)) = (manifest.wasm_path.as_deref(), wasm_source)
-        {
-            let dest = dest_dir.join(rel);
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)?;
+        let wasm_dest = match &admitted.component {
+            Some(staged) => {
+                let dest = dest_dir.join(&staged.relative_path);
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::rename(&staged.staged_path, &dest)?;
+                Some(dest)
             }
-            std::fs::copy(&src, &dest)?;
-            Some(dest)
-        } else {
-            None
+            None => None,
         };
 
         // Copy skills/ subtree for skill-capable plugins.
-        if manifest.capabilities.contains(&PluginCapability::Skill) {
-            let src_skills = source_dir.join(SKILLS_SUBDIR);
+        if admitted
+            .manifest
+            .capabilities
+            .contains(&PluginCapability::Skill)
+        {
+            let src_skills = admitted.source_dir.join(SKILLS_SUBDIR);
             let dest_skills = dest_dir.join(SKILLS_SUBDIR);
             if src_skills.is_dir() {
                 copy_dir_recursive(&src_skills, &dest_skills)?;
             }
         }
 
-        let installed_name = manifest.name.clone();
+        let installed_name = admitted.manifest.name.clone();
         self.loaded.insert(
-            manifest.name.clone(),
+            installed_name.clone(),
             LoadedPlugin {
-                manifest,
+                manifest: admitted.manifest.clone(),
                 plugin_dir: dest_dir,
                 wasm_path: wasm_dest,
             },
         );
 
         Ok(installed_name)
+    }
+
+    /// A fresh, host-owned directory under the plugins dir for one admission.
+    /// Discovery ignores it (no `manifest.toml` inside), and the owning
+    /// [`AdmittedSource`] removes it when dropped.
+    fn fresh_staging_dir(&self, name: &str) -> Result<PathBuf, PluginError> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = self
+            .plugins_dir
+            .join(format!(".staging-{name}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
     }
 
     /// Remove a plugin by name.
@@ -1312,6 +1505,183 @@ capabilities = ["tool"]
             host.list_plugins().is_empty(),
             "strict mode must reject an unsigned plugin during discovery"
         );
+    }
+
+    #[test]
+    fn admit_source_rejects_unsigned_plugin_before_load_verification() {
+        let source = tempdir().unwrap();
+        std::fs::write(
+            source.path().join("manifest.toml"),
+            "name = \"unsigned-source\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n",
+        )
+        .unwrap();
+        std::fs::write(source.path().join("plugin.wasm"), b"not a component").unwrap();
+
+        let plugins = tempdir().unwrap();
+        let host = PluginHost::from_plugins_dir_with_security(
+            plugins.path(),
+            SignatureMode::Strict,
+            Vec::new(),
+        )
+        .unwrap();
+
+        let err = host
+            .admit_source(source.path().to_str().unwrap())
+            .expect_err("strict policy must reject an unsigned source before load verification");
+        assert!(matches!(err, PluginError::UnsignedPlugin(_)));
+    }
+
+    #[test]
+    fn admit_source_rejects_invalid_config_before_load_verification() {
+        let source = tempdir().unwrap();
+        std::fs::write(
+            source.path().join("manifest.toml"),
+            "name = \"invalid-config-source\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\npermissions = [\"config_read\"]\n",
+        )
+        .unwrap();
+        std::fs::write(source.path().join("plugin.wasm"), b"not a component").unwrap();
+
+        let plugins = tempdir().unwrap();
+        let host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+
+        let err = host
+            .admit_source(source.path().to_str().unwrap())
+            .expect_err("invalid config must be rejected before load verification");
+        assert!(matches!(err, PluginError::InvalidManifest(_)));
+    }
+
+    fn write_tool_source(dir: &Path, name: &str, wasm: &[u8]) {
+        std::fs::write(
+            dir.join("manifest.toml"),
+            format!(
+                "name = \"{name}\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("plugin.wasm"), wasm).unwrap();
+    }
+
+    fn staging_entries(plugins_dir: &Path) -> Vec<String> {
+        std::fs::read_dir(plugins_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".staging-"))
+            .collect()
+    }
+
+    /// A second source carrying an already-loaded name is refused at
+    /// admission. The proof that its component is never touched is
+    /// observable: the candidate's bytes are not a component at all, so any
+    /// load would have failed with a load error, yet the answer is
+    /// `AlreadyLoaded`, no staging directory was created for a verifier to
+    /// run against, and the installed component still holds the first
+    /// source's bytes.
+    #[test]
+    fn admit_source_refuses_a_duplicate_name_before_touching_its_component() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+
+        let first = tempdir().unwrap();
+        write_tool_source(first.path(), "dup", b"\0asm first");
+        host.install(first.path().to_str().unwrap()).unwrap();
+
+        let second = tempdir().unwrap();
+        write_tool_source(second.path(), "dup", b"not a component at all");
+        let err = host
+            .admit_source(second.path().to_str().unwrap())
+            .expect_err("a loaded name must be refused at admission");
+        assert!(
+            matches!(err, PluginError::AlreadyLoaded(ref name) if name == "dup"),
+            "{err}"
+        );
+        assert!(
+            staging_entries(plugins.path()).is_empty(),
+            "no staged copy may exist for a refused duplicate"
+        );
+        assert_eq!(
+            std::fs::read(plugins.path().join("dup/plugin.wasm")).unwrap(),
+            b"\0asm first",
+            "the installed component is untouched"
+        );
+    }
+
+    /// What was admitted is what gets installed: a source swapped after
+    /// admission (the window in which the CLI runs its load-check) does not
+    /// change the installed bytes.
+    #[test]
+    fn install_persists_the_admitted_bytes_not_the_source_after_a_swap() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        let source = tempdir().unwrap();
+        write_tool_source(source.path(), "swapped", b"\0asm admitted");
+
+        let admitted = host.admit_source(source.path().to_str().unwrap()).unwrap();
+        let staged = admitted
+            .staged_component()
+            .expect("a tool ships a component");
+        assert_eq!(std::fs::read(staged).unwrap(), b"\0asm admitted");
+
+        // The source changes underneath: a different payload, then a symlink
+        // to yet another file, as an attacker racing the install would do.
+        std::fs::write(source.path().join("plugin.wasm"), b"\0asm swapped in").unwrap();
+
+        let name = host.install_admitted(admitted).unwrap();
+        assert_eq!(name, "swapped");
+        assert_eq!(
+            std::fs::read(plugins.path().join("swapped/plugin.wasm")).unwrap(),
+            b"\0asm admitted",
+            "the verified bytes are the installed bytes"
+        );
+        assert!(
+            staging_entries(plugins.path()).is_empty(),
+            "installing consumes the staging directory"
+        );
+    }
+
+    #[test]
+    fn dropping_an_admitted_source_removes_its_staging_directory() {
+        let plugins = tempdir().unwrap();
+        let host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        let source = tempdir().unwrap();
+        write_tool_source(source.path(), "dropped", b"\0asm");
+
+        let admitted = host.admit_source(source.path().to_str().unwrap()).unwrap();
+        assert_eq!(staging_entries(plugins.path()).len(), 1);
+        drop(admitted);
+        assert!(staging_entries(plugins.path()).is_empty());
+        assert!(
+            host.get_plugin("dropped").is_none(),
+            "nothing was installed"
+        );
+    }
+
+    /// A `wasm_path` that is a symlink is refused: the component must be a
+    /// regular file inside the source, so the bytes admitted are the bytes at
+    /// that path and not whatever the link points at by the time of the read.
+    #[cfg(unix)]
+    #[test]
+    fn admit_source_refuses_a_symlinked_component() {
+        let plugins = tempdir().unwrap();
+        let host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        let elsewhere = tempdir().unwrap();
+        std::fs::write(elsewhere.path().join("real.wasm"), b"\0asm elsewhere").unwrap();
+        let source = tempdir().unwrap();
+        std::fs::write(
+            source.path().join("manifest.toml"),
+            "name = \"linked\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            elsewhere.path().join("real.wasm"),
+            source.path().join("plugin.wasm"),
+        )
+        .unwrap();
+
+        let err = host
+            .admit_source(source.path().to_str().unwrap())
+            .expect_err("a symlinked component must be refused");
+        assert!(matches!(err, PluginError::InvalidManifest(_)), "{err}");
+        assert!(staging_entries(plugins.path()).is_empty());
     }
 
     #[test]

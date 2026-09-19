@@ -3295,6 +3295,10 @@ enum PluginCommands {
         /// Registry JSON URL used for install-by-name
         #[arg(long)]
         registry: Option<String>,
+        /// Install even if the plugin fails to load against this host's WIT ABI
+        /// (skips the install-time load-check)
+        #[arg(long)]
+        no_verify: bool,
     },
     /// Remove an installed plugin
     Remove {
@@ -3308,6 +3312,54 @@ enum PluginCommands {
     },
     /// Move plugins from legacy install directories into the configured one
     Migrate,
+}
+
+/// Run the install-time load-check on an admitted source and decide whether
+/// the install may proceed. A plugin that does not instantiate against this
+/// host's WIT world would install cleanly and then be silently skipped at
+/// daemon startup; this surfaces that failure at the CLI with its full
+/// diagnostic. The check runs against the bytes the host staged at admission,
+/// which are the bytes [`PluginHost::install_admitted`] then installs, so what
+/// was verified is what gets installed. With `--no-verify` the check is not
+/// run at all (nothing is compiled or instantiated) and a note says so; a
+/// source with no WASM component has nothing to instantiate and passes.
+#[cfg(feature = "plugins-wasm")]
+async fn verify_plugin_loads_or_bail(
+    admitted: &zeroclaw::plugins::host::AdmittedSource,
+    no_verify: bool,
+) -> Result<()> {
+    let manifest = admitted.manifest();
+    let Some(staged) = admitted.staged_component() else {
+        return Ok(());
+    };
+    if no_verify {
+        eprintln!(
+            "{}",
+            ta(
+                "cli-plugin-install-verify-bypassed",
+                &[("name", manifest.name.as_str())],
+                format!(
+                    "note: skipping the install-time load check for '{}' (--no-verify); if it does not load against this host it will be skipped at startup",
+                    manifest.name
+                ),
+            )
+        );
+        return Ok(());
+    }
+    match zeroclaw::plugins::validate::verify_component_loads(staged, manifest).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let detail = format!("{error:#}");
+            bail!(ta(
+                "cli-plugin-install-verify-failed",
+                &[("name", manifest.name.as_str()), ("error", detail.as_str())],
+                format!(
+                    "install failed: '{}' does not load against this host:\n{detail}\nOverride with --no-verify to install anyway.",
+                    manifest.name
+                ),
+            ))
+        }
+    }
 }
 
 #[cfg(feature = "plugins-wasm")]
@@ -8628,7 +8680,11 @@ Add pricing to the active provider profile or supply a catalog entry."
                 }
                 Ok(())
             }
-            PluginCommands::Install { source, registry } => {
+            PluginCommands::Install {
+                source,
+                registry,
+                no_verify,
+            } => {
                 if plugin_registry::looks_like_url(&source) {
                     bail!(
                         "`zeroclaw plugin install <url>` is not supported; use `--registry <url>` with a plugin name, or install a local plugin path"
@@ -8636,7 +8692,9 @@ Add pricing to the active provider profile or supply a catalog entry."
                 }
                 let mut host = plugin_host_with_configured_security(&config)?;
                 if plugin_registry::is_local_plugin_source(&source) {
-                    let name = host.install(&source)?;
+                    let admitted = host.admit_source(&source)?;
+                    verify_plugin_loads_or_bail(&admitted, no_verify).await?;
+                    let name = host.install_admitted(admitted)?;
                     let config_entries = installed_plugin_config_entries(&host, &name)?;
                     println!(
                         "{}",
@@ -8664,7 +8722,9 @@ Add pricing to the active provider profile or supply a catalog entry."
                     )
                     .await?;
                     let plugin_dir = downloaded.plugin_dir().display().to_string();
-                    let name = host.install(&plugin_dir)?;
+                    let admitted = host.admit_source(&plugin_dir)?;
+                    verify_plugin_loads_or_bail(&admitted, no_verify).await?;
+                    let name = host.install_admitted(admitted)?;
                     let config_entries = installed_plugin_config_entries(&host, &name)?;
                     println!(
                         "{}",
