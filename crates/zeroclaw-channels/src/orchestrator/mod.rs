@@ -7540,6 +7540,9 @@ async fn reconcile_early_ack(
     let Some(channel) = target_channel else {
         return;
     };
+    if !channel.supports_orchestrator_ack_reactions() {
+        return;
+    }
     // Wait for the spawned 👀 add to land first; otherwise a fast early-return
     // path could remove before the add runs and strand the ack.
     if let Some(task) = early_ack_task {
@@ -7719,6 +7722,7 @@ async fn process_channel_message_body(
     let early_ack_task: Option<tokio::task::JoinHandle<()>> =
         if resolve_channel_ack_reactions(&ctx, &msg)
             && let Some(channel) = target_channel.clone()
+            && channel.supports_orchestrator_ack_reactions()
         {
             let reply_target = msg.reply_target.clone();
             let message_id = msg.id.clone();
@@ -8264,6 +8268,7 @@ async fn process_channel_message_body(
         .await;
         if resolve_channel_ack_reactions(&ctx, &msg)
             && let Some(channel) = target_channel.as_ref()
+            && channel.supports_orchestrator_ack_reactions()
         {
             let emoji = kind.emoji();
             if let Err(e) = channel
@@ -9504,6 +9509,7 @@ async fn process_channel_message_body(
     // spawned ack add first so the remove can never race ahead of it.
     if resolve_channel_ack_reactions(&ctx, &msg)
         && let Some(channel) = target_channel.as_ref()
+        && channel.supports_orchestrator_ack_reactions()
     {
         if let Some(task) = early_ack_task {
             let _ = task.await;
@@ -19525,6 +19531,7 @@ api_key = "anthropic-key"
         reactions_added: tokio::sync::Mutex<Vec<(String, String, String)>>,
         reactions_removed: tokio::sync::Mutex<Vec<(String, String, String)>>,
         finalized_gate_prompts: tokio::sync::Mutex<Vec<(String, String)>>,
+        disable_orchestrator_acks: bool,
     }
 
     /// Records every outbound `SendMessage` whole, so a test can assert on
@@ -20322,6 +20329,10 @@ api_key = "anthropic-key"
                 emoji.to_string(),
             ));
             Ok(())
+        }
+
+        fn supports_orchestrator_ack_reactions(&self) -> bool {
+            !self.disable_orchestrator_acks
         }
 
         async fn finalize_gate_prompt(
@@ -28048,15 +28059,11 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
-    #[tokio::test]
-    async fn process_channel_message_adds_and_swaps_reactions() {
-        let channel_impl = Arc::new(RecordingChannel::default());
-        let channel: Arc<dyn Channel> = channel_impl.clone();
-
+    fn ack_reaction_test_ctx(channel: Arc<dyn Channel>) -> Arc<ChannelRuntimeContext> {
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
-        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+        Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(SlowModelProvider {
                 delay: Duration::from_millis(5),
@@ -28134,7 +28141,15 @@ BTC is currently around $65,000 based on latest tool output."#
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: None,
             sop_audit: None,
-        });
+        })
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_adds_and_swaps_reactions() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let runtime_ctx = ack_reaction_test_ctx(channel);
 
         process_channel_message(
             runtime_ctx,
@@ -28173,6 +28188,51 @@ BTC is currently around $65,000 based on latest tool output."#
         let removed = channel_impl.reactions_removed.lock().await;
         assert_eq!(removed.len(), 1, "eyes reaction should be removed once");
         assert_eq!(removed[0].2, "\u{1F440}");
+    }
+
+    /// A channel that owns a native ack mechanism must receive no
+    /// orchestrator-driven reaction writes at all: no early 👀, no
+    /// completion swap, no no-reply emoji.
+    #[tokio::test]
+    async fn orchestrator_ack_reactions_skipped_when_channel_declines() {
+        let channel_impl = Arc::new(RecordingChannel {
+            disable_orchestrator_acks: true,
+            ..Default::default()
+        });
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = ack_reaction_test_ctx(channel);
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "react-msg".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-react".to_string(),
+                content: "hello".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let added = channel_impl.reactions_added.lock().await;
+        assert!(
+            added.is_empty(),
+            "orchestrator ack reactions must not run: {added:?}"
+        );
+        let removed = channel_impl.reactions_removed.lock().await;
+        assert!(
+            removed.is_empty(),
+            "orchestrator ack cleanup must not run: {removed:?}"
+        );
     }
 
     // Pins the no_reply reconciliation: when the agent deliberately chooses

@@ -1115,14 +1115,29 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(())
     }
 
+    /// Whether generic orchestrator-driven acknowledgement reactions (the
+    /// early 👀 and the end-of-turn completion swap) run on this channel.
+    /// Channels that own a native ack mechanism override this to `false` so
+    /// the two mechanisms do not compete for the same reaction slot.
+    fn supports_orchestrator_ack_reactions(&self) -> bool {
+        true
+    }
+
     /// Add a reaction (emoji) to a message.
+    ///
+    /// Automatic, auxiliary reactions (acknowledgements) flow through this
+    /// method and its `remove_reaction` counterpart. Agent-driven reactions
+    /// flow through `set_explicit_reaction` so channels can tell the two
+    /// apart. Channels that support reactions must override these; the
+    /// defaults fail loudly so an unimplemented channel never surfaces a
+    /// fabricated success to agents (see `ReactionTool`).
     async fn add_reaction(
         &self,
         _channel_id: &str,
         _message_id: &str,
         _emoji: &str,
     ) -> anyhow::Result<()> {
-        Ok(())
+        anyhow::bail!("reactions are not supported by this channel")
     }
 
     /// Remove a reaction (emoji) from a message previously added by this bot.
@@ -1132,7 +1147,25 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         _message_id: &str,
         _emoji: &str,
     ) -> anyhow::Result<()> {
-        Ok(())
+        anyhow::bail!("reactions are not supported by this channel")
+    }
+
+    /// Add or remove an agent-driven (explicit) reaction from the `reaction`
+    /// tool. Channels use the explicit flag to protect user-requested
+    /// reactions from later automatic-acknowledgement cleanup. The default
+    /// delegates to `add_reaction` / `remove_reaction`.
+    async fn set_explicit_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+        add: bool,
+    ) -> anyhow::Result<()> {
+        if add {
+            self.add_reaction(channel_id, message_id, emoji).await
+        } else {
+            self.remove_reaction(channel_id, message_id, emoji).await
+        }
     }
 
     /// Pin a message in the channel.

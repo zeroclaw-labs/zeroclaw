@@ -173,9 +173,13 @@ impl Tool for ReactionTool {
         };
 
         let result = if action == "add" {
-            channel.add_reaction(channel_id, message_id, emoji).await
+            channel
+                .set_explicit_reaction(channel_id, message_id, emoji, true)
+                .await
         } else {
-            channel.remove_reaction(channel_id, message_id, emoji).await
+            channel
+                .set_explicit_reaction(channel_id, message_id, emoji, false)
+                .await
         };
 
         let past_tense = if action == "remove" {
