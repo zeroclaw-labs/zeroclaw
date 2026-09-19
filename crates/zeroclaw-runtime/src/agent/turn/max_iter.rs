@@ -834,6 +834,154 @@ mod graceful_summary_metering_tests {
         );
     }
 
+    // The graceful summary replays history through the metered one-shot seam,
+    // whose sanitizers used to rewrite each message as a whole string — so a
+    // marker inside an assistant envelope's signed thinking text was replaced
+    // while its signature stayed, which Anthropic rejects on replay. The
+    // envelope (signed thinking included) must reach the provider
+    // byte-for-byte, so the assistant entry is built with the production
+    // `build_native_assistant_history` builder the adapters parse back.
+    #[tokio::test]
+    async fn graceful_summary_replays_signed_thinking_unmodified() {
+        let marker = format!("[{}:{}]", "IMAGE", "/tmp/shot.png");
+        let reasoning =
+            format!(r#"{{"thinking":"check {marker} before answering","signature":"sig_replay"}}"#);
+        let assistant_content = super::super::parse_response::build_native_assistant_history(
+            "",
+            &[zeroclaw_api::model_provider::ToolCall {
+                id: "toolu_think".into(),
+                name: "shell".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }],
+            Some(&reasoning),
+        );
+        let mut history = vec![
+            ChatMessage::user("run the tool"),
+            ChatMessage::assistant(assistant_content.clone()),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "content": "done",
+                    "tool_call_id": "toolu_think",
+                })
+                .to_string(),
+            ),
+        ];
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            seen: Arc::clone(&seen),
+            vision: true,
+        };
+        let pacing = PacingConfig::default();
+        let knobs = LoopKnobs::default();
+        let multimodal_config = MultimodalConfig::default();
+
+        let out = finish_after_max_iterations(
+            &provider,
+            &mut history,
+            "custom",
+            "test-model",
+            None,
+            &multimodal_config,
+            &pacing,
+            None,
+            2,
+            String::new(),
+            "trace-req-signed-thinking",
+            &knobs,
+            None,
+            None,
+        )
+        .await
+        .expect("graceful summary should succeed");
+
+        assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
+        let captured = seen.lock().unwrap().join("\n");
+        assert!(
+            captured.contains(&assistant_content),
+            "the assistant envelope (signed thinking included) must reach the provider byte-for-byte: {captured}"
+        );
+        assert!(
+            !captured.contains(zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER),
+            "nothing in this history is a deliverable marker outside the thinking, so a placeholder anywhere means the reasoning was touched: {captured}"
+        );
+    }
+
+    // Degrade twin of the signed-thinking replay: `vision: false` is what a
+    // reliable wrapper reports whenever any fallback lacks vision — even
+    // when the primary that receives the request verifies thinking
+    // signatures — so the summary's text-only degrade path must keep the
+    // envelope byte-identical too, not just the one-shot seam. The history
+    // carries a path-form marker in the user turn so the summary actually
+    // takes the degrade branch; the placeholder in the captured request is
+    // the probe that it ran.
+    #[tokio::test]
+    async fn graceful_summary_degrade_replays_signed_thinking_unmodified() {
+        let user_marker = format!("[{}:{}]", "IMAGE", "/tmp/degrade.png");
+        let marker = format!("[{}:{}]", "IMAGE", "/tmp/shot.png");
+        let reasoning =
+            format!(r#"{{"thinking":"check {marker} before answering","signature":"sig_replay"}}"#);
+        let assistant_content = super::super::parse_response::build_native_assistant_history(
+            "",
+            &[zeroclaw_api::model_provider::ToolCall {
+                id: "toolu_think".into(),
+                name: "shell".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }],
+            Some(&reasoning),
+        );
+        let mut history = vec![
+            ChatMessage::user(format!("run the tool on {user_marker}")),
+            ChatMessage::assistant(assistant_content.clone()),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "content": "done",
+                    "tool_call_id": "toolu_think",
+                })
+                .to_string(),
+            ),
+        ];
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            seen: Arc::clone(&seen),
+            vision: false,
+        };
+        let pacing = PacingConfig::default();
+        let knobs = LoopKnobs::default();
+        let multimodal_config = MultimodalConfig::default();
+
+        let out = finish_after_max_iterations(
+            &provider,
+            &mut history,
+            "custom",
+            "test-model",
+            None,
+            &multimodal_config,
+            &pacing,
+            None,
+            2,
+            String::new(),
+            "trace-req-signed-thinking-degrade",
+            &knobs,
+            None,
+            None,
+        )
+        .await
+        .expect("graceful summary should succeed");
+
+        assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
+        let captured = seen.lock().unwrap().join("\n");
+        assert!(
+            captured.contains(&assistant_content),
+            "the assistant envelope (signed thinking included) must survive the degrade path byte-for-byte: {captured}"
+        );
+        assert!(
+            captured.contains(zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER),
+            "the user-turn marker must be replaced, proving the degrade branch ran: {captured}"
+        );
+    }
+
     // ACP and other event-driven clients render message content exclusively
     // from `TurnEvent::Chunk`. The max-iteration exit must emit one, and it
     // must carry only the newly-produced segment — narration from earlier

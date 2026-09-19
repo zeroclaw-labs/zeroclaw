@@ -1423,13 +1423,16 @@ impl AnthropicModelProvider {
                             }
                         } else {
                             // Counted exactly like the tool-result arm. The
-                            // multimodal normalizer is the only component that
-                            // may turn a file reference into inline image
-                            // content, and it has already run by the time a
-                            // message reaches this adapter; reading the path
-                            // here (extension-inferred MIME, no size or
-                            // content validation) would reopen the hole the
-                            // normalizer exists to close.
+                            // multimodal normalizer is the only component
+                            // allowed to turn a file reference into inline
+                            // image content: callers that want images run it
+                            // before dispatch, and the seam replaces any
+                            // path/URL marker that reaches it with a
+                            // placeholder. This adapter therefore counts a
+                            // non-inline reference as omitted instead of
+                            // reading it; reading the path (extension-inferred
+                            // MIME, no size or content validation) would
+                            // reopen the hole the normalizer exists to close.
                             omitted += 1;
                             continue;
                         };
@@ -4941,6 +4944,77 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(native_msgs[0].role, "user");
         assert_eq!(native_msgs[1].role, "assistant");
         assert_eq!(native_msgs[2].role, "user");
+    }
+
+    // The seam sanitizer rewrites an assistant tool-call envelope
+    // field-wise, so the thinking text (marker included) and its signature
+    // survive to the adapter. This converts the sanitized envelope through
+    // the real conversion path and asserts the native blocks the provider
+    // would send: the leading thinking block replays the exact signed bytes
+    // and the following text block carries the placeholder, not the path.
+    #[test]
+    fn convert_messages_replays_sanitized_envelope_thinking_and_signature_byte_for_byte() {
+        let marker = format!("[{}:{}]", "IMAGE", "/tmp/shot.png");
+        let thinking_text = format!("look at {marker} first");
+        let reasoning = format!(r#"{{"thinking":"{thinking_text}","signature":"sig_abc"}}"#);
+        let envelope = serde_json::json!({
+            "content": format!("saved {marker}"),
+            "tool_calls": [{
+                "id": "toolu_1",
+                "name": "shell",
+                "arguments": "{}",
+                "extra_content": {"google": {"thought_signature": "sig_gemini"}},
+            }],
+            "reasoning_content": reasoning,
+        })
+        .to_string();
+        let messages = vec![
+            ChatMessage::user("describe the screenshot"),
+            ChatMessage::assistant(envelope),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "content": "done",
+                    "tool_call_id": "toolu_1",
+                })
+                .to_string(),
+            ),
+        ];
+        let sanitized = crate::multimodal::sanitize_image_markers(&messages);
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&sanitized);
+        let assistant = native_msgs
+            .iter()
+            .find(|m| m.role == "assistant")
+            .expect("assistant message survives conversion");
+        match &assistant.content[0] {
+            NativeContentOut::Thinking {
+                thinking,
+                signature,
+            } => {
+                assert_eq!(
+                    thinking, &thinking_text,
+                    "thinking text must replay byte-for-byte, marker included"
+                );
+                assert_eq!(
+                    signature,
+                    &Some("sig_abc".to_string()),
+                    "the thinking signature must round-trip unchanged"
+                );
+            }
+            other => panic!("expected a leading thinking block, got {other:?}"),
+        }
+        match &assistant.content[1] {
+            NativeContentOut::Text { text, .. } => {
+                assert!(
+                    text.contains(crate::multimodal::MEDIA_PLACEHOLDER),
+                    "the content marker must be replaced with the placeholder: {text}"
+                );
+                assert!(
+                    !text.contains("/tmp/shot.png"),
+                    "no raw path may reach the provider as visible text: {text}"
+                );
+            }
+            other => panic!("expected a text block after the thinking block, got {other:?}"),
+        }
     }
 
     #[tokio::test]
