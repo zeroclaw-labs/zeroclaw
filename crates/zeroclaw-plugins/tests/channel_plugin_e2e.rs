@@ -219,6 +219,8 @@ fn outbound(content: &str, recipient: &str) -> SendMessage {
         attachments: Vec::new(),
         in_reply_to: None,
         references: Vec::new(),
+        cc: Vec::new(),
+        bcc: Vec::new(),
         suppress_voice: false,
         force_voice: false,
     }
