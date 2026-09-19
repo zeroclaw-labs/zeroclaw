@@ -320,6 +320,9 @@ pub fn apply_compat_options(
     if opts.cache_passthrough {
         b = b.with_cache_passthrough();
     }
+    if let Some(cache_ttl) = opts.cache_ttl {
+        b = b.with_cache_ttl(cache_ttl);
+    }
     // `provider_extra` alias is captured before `build()` because the WARN
     // path below reads it for logging. Only object-shaped JSON is threaded
     // through; other shapes produce a WARN and are ignored (matching the
@@ -1209,6 +1212,9 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         }
         if let Some(ts) = opts.provider_timeout_secs {
             b = b.timeout_secs(ts);
+        }
+        if let Some(cache_ttl) = opts.cache_ttl {
+            b = b.cache_ttl(cache_ttl);
         }
         Ok(Box::new(b.build()))
     }
