@@ -1,5 +1,5 @@
 //! Shell-level agent sidebar: every session the chat-like panes track, with
-//! live status dots, a `+` picker to add an agent, and the Quickstart
+//! live status dots, `+`/`-` session controls, and the Quickstart
 //! launcher at the bottom.
 //!
 //! The sidebar owns only widget state (visibility, width, scroll, hit rects,
@@ -94,11 +94,12 @@ pub(crate) struct AgentSidebar {
     // Geometry recorded by draw, read by the mouse handler (repo convention:
     // draw records, mouse reads). All `Rect::default()` while hidden.
     area: Rect,
+    minus_rect: Rect,
+    /// The focused session in the active pane, captured during the last draw.
+    minus_target: Option<(PaneKind, String)>,
     plus_rect: Rect,
     quickstart_rect: Rect,
     row_rects: Vec<(PaneKind, String, Rect)>,
-    /// The `✕` cell on the focused row of the active pane, if drawn.
-    close_rect: Option<(PaneKind, String, Rect)>,
     picker: Option<SidebarPicker>,
 }
 
@@ -112,10 +113,11 @@ impl AgentSidebar {
             width: section.width,
             scroll: 0,
             area: Rect::default(),
+            minus_rect: Rect::default(),
+            minus_target: None,
             plus_rect: Rect::default(),
             quickstart_rect: Rect::default(),
             row_rects: Vec::new(),
-            close_rect: None,
             picker: None,
         }
     }
@@ -145,10 +147,11 @@ impl AgentSidebar {
     /// at [`CONTENT_MIN_COLS`].
     pub(crate) fn carve(&mut self, content: Rect) -> (Option<Rect>, Rect) {
         self.area = Rect::default();
+        self.minus_rect = Rect::default();
+        self.minus_target = None;
         self.plus_rect = Rect::default();
         self.quickstart_rect = Rect::default();
         self.row_rects.clear();
-        self.close_rect = None;
         if !self.visible {
             return (None, content);
         }
@@ -180,8 +183,28 @@ impl AgentSidebar {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        // The `+` affordance lives on the top border, right-aligned. It dims
-        // while disconnected (the shell gates the actions anyway).
+        // The session controls live on the top border. `-` targets only the
+        // visibly focused session in the active pane; the shell still gates
+        // both actions while disconnected.
+        self.minus_target = rows
+            .iter()
+            .find(|summary| summary.focused && ctx.active_pane == Some(summary.pane_kind))
+            .map(|summary| (summary.pane_kind, summary.session_id.clone()));
+        if area.width >= 10 {
+            let minus = Rect {
+                x: area.x + area.width - 8,
+                y: area.y,
+                width: 3,
+                height: 1,
+            };
+            let minus_style = if ctx.connected && self.minus_target.is_some() {
+                theme::accent_style()
+            } else {
+                theme::dim_style()
+            };
+            frame.render_widget(Paragraph::new(Span::styled("[-]", minus_style)), minus);
+            self.minus_rect = minus;
+        }
         if area.width >= 6 {
             let plus = Rect {
                 x: area.x + area.width - 4,
@@ -298,22 +321,22 @@ impl AgentSidebar {
                 Style::default()
             };
 
-            // Focused row of the active pane swaps its pane tag for a close
-            // affordance; other rows show the dim pane tag when wide enough.
-            let tag = if focused_here {
-                Some(("\u{2715}".to_string(), true))
-            } else if row_rect.width >= PANE_TAG_MIN_COLS {
+            // Every row shows the dim pane tag when the sidebar is wide enough.
+            // The focused row used to swap this tag for a `✕` close affordance;
+            // session rows now only carry focus and status, so no row performs a
+            // lifecycle action on click.
+            let tag = if row_rect.width >= PANE_TAG_MIN_COLS {
                 let label = match summary.pane_kind {
                     PaneKind::Chat => t("zc-pane-chat"),
                     PaneKind::Acp => t("zc-pane-code"),
                 };
-                Some((label, false))
+                Some(label)
             } else {
                 None
             };
             let tag_width = tag
                 .as_ref()
-                .map(|(s, _)| crate::display_width::display_width(s) + 1)
+                .map(|s| crate::display_width::display_width(s) + 1)
                 .unwrap_or(0);
 
             let name_width = (row_rect.width as usize).saturating_sub(2 + tag_width);
@@ -350,21 +373,9 @@ impl AgentSidebar {
                 Span::styled(status_glyph, status_style(summary.status)),
                 Span::styled(name, theme::body_style()),
             ];
-            if let Some((label, is_close)) = tag {
+            if let Some(label) = tag {
                 spans.push(Span::raw(" ".repeat(pad + 1)));
                 spans.push(Span::styled(label, theme::dim_style()));
-                if is_close {
-                    // The clickable ✕ zone: last two cells of the row.
-                    self.close_rect = Some((
-                        summary.pane_kind,
-                        summary.session_id.clone(),
-                        Rect {
-                            x: row_rect.x + row_rect.width.saturating_sub(2),
-                            width: 2,
-                            ..row_rect
-                        },
-                    ));
-                }
             }
             frame.render_widget(Paragraph::new(Line::from(spans)).style(row_style), row_rect);
             self.row_rects
@@ -509,20 +520,19 @@ impl AgentSidebar {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let (col, row) = (mouse.column, mouse.row);
+                if mouse::in_rect(col, row, self.minus_rect)
+                    && let Some((pane, session_id)) = self.minus_target.clone()
+                {
+                    return Some(SidebarEvent::CloseSession { pane, session_id });
+                }
                 if mouse::in_rect(col, row, self.plus_rect) {
                     return Some(SidebarEvent::OpenPicker);
                 }
                 if mouse::in_rect(col, row, self.quickstart_rect) {
                     return Some(SidebarEvent::OpenQuickstart);
                 }
-                if let Some((pane, sid, rect)) = &self.close_rect
-                    && mouse::in_rect(col, row, *rect)
-                {
-                    return Some(SidebarEvent::CloseSession {
-                        pane: *pane,
-                        session_id: sid.clone(),
-                    });
-                }
+                // Row clicks only move focus. There is no per-row lifecycle
+                // action: adding a session goes through the `[+]` picker.
                 for (pane, sid, rect) in &self.row_rects {
                     if mouse::in_rect(col, row, *rect) {
                         return Some(SidebarEvent::FocusSession {
@@ -603,10 +613,11 @@ mod tests {
             width: 24,
             scroll: 0,
             area: Rect::default(),
+            minus_rect: Rect::default(),
+            minus_target: None,
             plus_rect: Rect::default(),
             quickstart_rect: Rect::default(),
             row_rects: Vec::new(),
-            close_rect: None,
             picker: None,
         }
     }
@@ -674,7 +685,7 @@ mod tests {
     }
 
     #[test]
-    fn draw_records_row_plus_and_quickstart_rects() {
+    fn draw_records_row_controls_and_quickstart_rects() {
         let mut s = sidebar();
         let area = s.carve(Rect::new(0, 1, 100, 12)).0.unwrap();
         let rows = vec![summary("alpha", "s1", true), summary("beta", "s2", false)];
@@ -688,12 +699,12 @@ mod tests {
         term.draw(|frame| s.draw(frame, area, &rows, &ctx)).unwrap();
 
         assert_eq!(s.row_rects.len(), 2);
+        assert!(s.minus_rect.width > 0, "minus affordance recorded");
         assert!(s.plus_rect.width > 0, "plus affordance recorded");
         assert!(s.quickstart_rect.width > 0, "quickstart row recorded");
-        let (pane, sid, rect) = s.close_rect.clone().expect("focused row shows close");
-        assert_eq!((pane, sid.as_str()), (PaneKind::Chat, "s1"));
 
-        // Click routing through the recorded rects.
+        // Click routing through the recorded rects. Every row cell, including
+        // the trailing tag cells, only focuses its session.
         let (_, sid, row2) = s.row_rects[1].clone();
         assert_eq!(
             s.handle_mouse(&click(row2.x + 1, row2.y)),
@@ -702,8 +713,20 @@ mod tests {
                 session_id: sid,
             })
         );
+        let (focused_pane, focused_sid, focused_row) = s.row_rects[0].clone();
+        assert_eq!((focused_pane, focused_sid.as_str()), (PaneKind::Chat, "s1"));
+        for x in focused_row.x..focused_row.right() {
+            assert_eq!(
+                s.handle_mouse(&click(x, focused_row.y)),
+                Some(SidebarEvent::FocusSession {
+                    pane: PaneKind::Chat,
+                    session_id: "s1".into(),
+                }),
+                "no cell of a session row may close it (column {x})"
+            );
+        }
         assert_eq!(
-            s.handle_mouse(&click(rect.x, rect.y)),
+            s.handle_mouse(&click(s.minus_rect.x, s.minus_rect.y)),
             Some(SidebarEvent::CloseSession {
                 pane: PaneKind::Chat,
                 session_id: "s1".into(),
@@ -716,6 +739,31 @@ mod tests {
         assert_eq!(
             s.handle_mouse(&click(s.quickstart_rect.x, s.quickstart_rect.y)),
             Some(SidebarEvent::OpenQuickstart)
+        );
+    }
+
+    #[test]
+    fn minus_targets_the_focused_session_in_the_active_pane() {
+        let mut sidebar = sidebar();
+        let area = sidebar.carve(Rect::new(0, 0, 100, 10)).0.unwrap();
+        let chat = summary("chat-agent", "chat-session", true);
+        let mut code = summary("code-agent", "code-session", true);
+        code.pane_kind = PaneKind::Acp;
+        let ctx = SidebarCtx {
+            active_pane: Some(PaneKind::Acp),
+            quickstart_active: false,
+            connected: true,
+        };
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 10)).unwrap();
+        term.draw(|frame| sidebar.draw(frame, area, &[chat, code], &ctx))
+            .unwrap();
+
+        assert_eq!(
+            sidebar.handle_mouse(&click(sidebar.minus_rect.x, sidebar.minus_rect.y)),
+            Some(SidebarEvent::CloseSession {
+                pane: PaneKind::Acp,
+                session_id: "code-session".into(),
+            })
         );
     }
 
@@ -748,7 +796,7 @@ mod tests {
     }
 
     #[test]
-    fn running_row_is_explicit_without_showing_count_or_losing_close_target() {
+    fn running_row_is_explicit_without_showing_message_counts() {
         let mut sidebar = sidebar();
         sidebar.width = SIDEBAR_COLS_MIN;
         let area = sidebar
@@ -784,14 +832,70 @@ mod tests {
             !text.contains("(42)"),
             "message counts are not session identity: {text}"
         );
-        let (_, _, close) = sidebar.close_rect.clone().expect("close target retained");
-        assert_eq!(close.right(), rect.right());
+        // The trailing cells of a running row are not a close target: they only
+        // focus the session.
+        let (_, _, row) = sidebar.row_rects[0].clone();
         assert_eq!(
-            sidebar.handle_mouse(&click(close.x, close.y)),
-            Some(SidebarEvent::CloseSession {
+            sidebar.handle_mouse(&click(row.right() - 1, row.y)),
+            Some(SidebarEvent::FocusSession {
                 pane: PaneKind::Chat,
                 session_id: "s1".into(),
             })
+        );
+    }
+
+    #[test]
+    fn no_row_exposes_a_close_target_in_any_row_state() {
+        // The focused row used to swap its pane tag for a clickable `✕`. Rows
+        // now carry focus and status only; this pins the absence of a close
+        // target for every row state so a lifecycle affordance cannot return
+        // unnoticed on the row cell.
+        let mut sidebar = sidebar();
+        let area = sidebar
+            .carve(Rect::new(0, 0, SIDEBAR_COLS_MAX + CONTENT_MIN_COLS, 10))
+            .0
+            .unwrap();
+        let mut running = summary("running-agent", "s-running", true);
+        running.status = SidebarStatus::Running;
+        let rows = vec![
+            running,
+            summary("idle-agent", "s-idle", false),
+            summary("other-pane", "s-acp", false),
+        ];
+        let ctx = SidebarCtx {
+            active_pane: Some(PaneKind::Chat),
+            quickstart_active: false,
+            connected: true,
+        };
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
+            SIDEBAR_COLS_MAX + CONTENT_MIN_COLS,
+            10,
+        ))
+        .unwrap();
+        term.draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+
+        let mut focused_seen = false;
+        for (row_index, (pane, sid, rect)) in sidebar.row_rects.clone().iter().enumerate() {
+            if *sid == "s-running" {
+                focused_seen = true;
+            }
+            for x in rect.x..rect.right() {
+                match sidebar.handle_mouse(&click(x, rect.y)) {
+                    Some(SidebarEvent::FocusSession {
+                        pane: hit_pane,
+                        session_id,
+                    }) => {
+                        assert_eq!(hit_pane, *pane, "row {row_index} hit the wrong pane");
+                        assert_eq!(session_id, *sid, "row {row_index} hit the wrong session");
+                    }
+                    other => panic!("row {row_index} column {x} produced {other:?}"),
+                }
+            }
+        }
+        assert!(
+            focused_seen,
+            "the focused row must be part of this coverage"
         );
     }
 

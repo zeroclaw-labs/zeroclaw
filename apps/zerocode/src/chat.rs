@@ -310,6 +310,11 @@ pub(crate) struct Chat {
     /// One-shot app-level Help request, set by the `/help` slash command and
     /// drained immediately by `app.rs` after this pane handles the key.
     help_requested: bool,
+    /// One-shot app-level "add a session" request, set by `Ctrl+N` and drained
+    /// immediately by `app.rs` after this pane handles the key. The app turns it
+    /// into the same sidebar picker the `[+]` affordance opens, so the keyboard
+    /// and the affordance share one additive-session path.
+    add_session_requested: bool,
     /// Owns the Chat-only entry retry so leaving the pane invalidates its result.
     entry_retry_attempt: Option<EntryRetryAttempt>,
     /// A temporary retry borrows retained queues until the resident pane adopts
@@ -555,6 +560,7 @@ impl Chat {
             pick_agent_double_click: crate::mouse::DoubleClickTracker::new(),
             session_list_double_click: crate::mouse::DoubleClickTracker::new(),
             help_requested: false,
+            add_session_requested: false,
             entry_retry_attempt: None,
             entry_retry_preparing: false,
             entry_retry_session_ownership: None,
@@ -915,6 +921,9 @@ impl Chat {
     /// the sidebar entry disappears. Focus moves to the next tracked session,
     /// or back to the agent picker when none remain. Returns false when the
     /// id is unknown.
+    ///
+    /// The sidebar title's explicit `-` action is the only user-facing caller;
+    /// session rows remain focus-only to prevent accidental lifecycle actions.
     pub(crate) async fn close_session(&mut self, session_id: &str) -> bool {
         let was_focused = matches!(
             &self.phase,
@@ -3546,15 +3555,12 @@ impl Chat {
                 }
             }
             Some(ChatTabAction::NewSession) if !state.turn_in_flight => {
-                let rpc = self.rpc.clone();
-                let pane_kind = self.pane_kind;
-                let old_sid = state.session_id.clone();
-                if let Some(next_phase) =
-                    Self::restart_session_for_state(&rpc, pane_kind, state).await
-                {
-                    self.phase = next_phase;
-                }
-                self.note_session_replaced(&old_sid);
+                // `Ctrl+N` no longer restarts the focused session in place.
+                // It asks the app to open the same add-session picker the
+                // sidebar `[+]` opens, so the focused session stays tracked and
+                // the cap, cancellation, error and remote-Code directory
+                // behavior cannot drift between the chord and the affordance.
+                self.add_session_requested = true;
             }
             Some(ChatTabAction::SwitchSession) => {
                 // ACP and Chat live in separate stores and must not cross-pick:
@@ -4627,6 +4633,11 @@ impl Chat {
 
     pub(crate) fn take_help_request(&mut self) -> bool {
         std::mem::take(&mut self.help_requested)
+    }
+
+    /// Drain the one-shot `Ctrl+N` add-session request.
+    pub(crate) fn take_add_session_request(&mut self) -> bool {
+        std::mem::take(&mut self.add_session_requested)
     }
 
     pub(crate) fn wants_text_input(&self) -> bool {
@@ -14235,6 +14246,102 @@ mod tests {
         assert_eq!(
             ids,
             vec![("sess-a".to_string(), true), ("sess-b".to_string(), false)]
+        );
+    }
+
+    /// A `Term` over a fixed viewport, for tests that drive `handle_key`.
+    fn key_term() -> crate::config_manager::Term {
+        ratatui::Terminal::with_options(
+            crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+            },
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn ctrl_n_requests_additive_creation_without_replacing_the_focused_session() {
+        // This regression test keeps Ctrl+N aligned with the sidebar `[+]`.
+        // It must ask the app for the add-session picker and leave the focused
+        // session tracked, instead of restarting it in place.
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = two_session_chat(&rpc);
+        let mut term = key_term();
+
+        let before: Vec<_> = chat
+            .session_summaries()
+            .into_iter()
+            .map(|s| (s.session_id, s.focused))
+            .collect();
+        assert_eq!(
+            before,
+            vec![("sess-a".to_string(), true), ("sess-b".to_string(), false)]
+        );
+
+        let quit = chat
+            .handle_key(
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+                &mut term,
+            )
+            .await;
+
+        assert!(!quit, "Ctrl+N must not quit");
+        assert!(
+            chat.take_add_session_request(),
+            "Ctrl+N must request the add-session picker"
+        );
+        assert!(
+            !chat.take_add_session_request(),
+            "the add-session request is one-shot"
+        );
+
+        // The focused session is preserved: same tracked set, same focus, and
+        // the pane is still on the session rather than a picker phase.
+        let after: Vec<_> = chat
+            .session_summaries()
+            .into_iter()
+            .map(|s| (s.session_id, s.focused))
+            .collect();
+        assert_eq!(
+            after, before,
+            "Ctrl+N must preserve the focused session instead of replacing it"
+        );
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("Ctrl+N must leave the pane on its active session");
+        };
+        assert_eq!(
+            state.session_id, "sess-a",
+            "Ctrl+N must not swap the tracked session ID"
+        );
+    }
+
+    #[tokio::test]
+    async fn ctrl_n_keeps_its_turn_in_flight_guard() {
+        // The chord keeps the guard it had before it became additive: the
+        // conversation is not swapped out from under a running turn. `[+]`
+        // stays the surface for that case.
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = two_session_chat(&rpc);
+        let mut term = key_term();
+        let ChatPhase::Active(state) = &mut chat.phase else {
+            unreachable!()
+        };
+        state.turn_in_flight = true;
+
+        chat.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            &mut term,
+        )
+        .await;
+
+        assert!(
+            !chat.take_add_session_request(),
+            "a running turn still refuses the new-session chord"
         );
     }
 

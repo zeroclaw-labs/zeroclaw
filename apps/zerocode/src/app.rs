@@ -1104,6 +1104,9 @@ pub async fn run(
                 crate::agent_sidebar::SidebarEvent::CloseSession { pane, session_id }
                     if connected =>
                 {
+                    // The pane keeps the row until the daemon acknowledges the
+                    // close. The daemon cancels and fences an in-flight turn
+                    // before removing the live session; durable history stays.
                     match pane {
                         chat::PaneKind::Chat => {
                             chat_pane.close_session(&session_id).await;
@@ -1837,6 +1840,21 @@ pub async fn run(
                         help_overlay = Some(HelpOverlayState::default());
                     }
                     _ => {}
+                }
+                // Ctrl+N is the keyboard form of the sidebar `[+]`. Routing it
+                // through the same event keeps the picker, the session cap, the
+                // cancellation/error handling and the remote-Code directory
+                // selection on one path instead of two.
+                let add_session_requested = match mode {
+                    Mode::Acp => acp_pane.take_add_session_request(),
+                    Mode::Chat => chat_pane.take_add_session_request(),
+                    _ => false,
+                };
+                if add_session_requested {
+                    apply_sidebar_event!(
+                        crate::agent_sidebar::SidebarEvent::OpenPicker,
+                        dispatch_state
+                    );
                 }
                 if mode == Mode::Quickstart && quickstart.take_leave_request() {
                     // Return to wherever the sidebar launched the wizard from
