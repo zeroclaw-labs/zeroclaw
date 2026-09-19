@@ -115,6 +115,39 @@ retry.
 - `use_markdown_blocks`: render replies with Slack Block Kit formatting for
   richer layout. Turn off for plain text.
 
+## Messages from other apps
+
+Slack delivers Workflow Builder steps and other app posts as
+`subtype = "bot_message"`, usually with no `user` field. These are ignored by
+default, so @-mentioning the agent from a workflow does nothing until you opt
+in:
+
+```toml
+[channels.slack.default]
+allow_bot_messages = true
+
+[peer_groups.slack_default]
+channel = "slack.default"
+external_peers = ["B01ABCDEFGH"]   # the posting app's bot ID
+```
+
+Enabling this widens *which senders are considered*; it does not skip
+authorization. The posting app's bot ID still has to match the channel's peer
+allowlist, so list the exact `B...` IDs you trust rather than `"*"` unless
+every app in the workspace is trusted. Admitted app posts also become
+model-visible, which is a prompt-injection surface: an app that can post can
+put text in front of the model.
+
+Two boundaries hold regardless of the allowlist. App-authored text can never
+answer an approval prompt, so permission to post never becomes permission to
+authorize a tool call. And the agent's own posts are always ignored, which is
+what stops it replying to itself. That self-check needs the agent's own bot ID,
+which it learns from `auth.test` at startup; if that lookup fails or omits the
+ID, app posts are dropped rather than risked, and the channel logs a warning
+saying so.
+
+The setting has no live reload: change it, then restart the channel.
+
 ## Streaming
 
 {{#streaming channel="Slack" mode="stream_drafts" path="channels.slack.<alias>.stream_drafts"}}
@@ -132,6 +165,8 @@ users can react with to cancel an in-flight reply.
 | Bot never connects | Missing `app_token` or Socket Mode off | Turn on Socket Mode and set the `xapp-` token (step 3) |
 | Bot ignores most messages | `mention_only = true` | @-mention the bot, or set it to `false` |
 | Replies have no formatting | `use_markdown_blocks = false` | Set it to `true` |
+| Workflow or app posts are ignored | `allow_bot_messages` off, or the app's bot ID is not allow-listed | Set it to `true`, add the `B...` ID to the peer group, restart the channel |
+| App posts still ignored after opting in | `auth.test` did not return the agent's own bot ID, so app posts fail closed | Check the startup warning and the bot token's scopes, then restart |
 
 ## See also
 
