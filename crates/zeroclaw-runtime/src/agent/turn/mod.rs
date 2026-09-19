@@ -79,7 +79,7 @@ use crate::agent::tool_execution::{
 };
 use crate::security::ingress::{IngressPolicy, ingress_policy};
 use crate::util::truncate_with_ellipsis;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use std::collections::HashSet;
 use std::io::Write as _;
 use std::sync::Arc;
@@ -1860,21 +1860,9 @@ pub(crate) async fn assemble_owned_execution(
     // Stays sealed into `OwnedAgentExecution.tools_registry` (a `ScopedToolRegistry`).
     let tools_registry = registry;
 
-    let provider_ref = config
-        .resolved_model_provider_for_agent(alias)
-        .map(|(ty, al, _)| format!("{ty}.{al}"))
-        .ok_or_else(|| {
-            anyhow::Error::msg(format!(
-                "SOP step agent '{alias}' has no resolved model provider"
-            ))
-        })?;
-    let (model_provider, provider_name, model) =
-        crate::agent::agent::build_session_model_provider(config, &provider_ref, None)?;
-    // The step agent's own configured temperature — the same source the
-    // headless driver reads for `crate::agent::run`.
-    let temperature = config
-        .model_provider_for_agent(alias)
-        .and_then(|e| e.temperature);
+    let model_runtime =
+        crate::agent::agent::build_model(config, alias, agent.model_provider.as_str(), None)
+            .with_context(|| format!("SOP step agent '{alias}' has no resolved model provider"))?;
 
     // The step agent's risk profile under the PARENT surface's interactivity
     // mode: an operator approval route available to the outer turn stays
@@ -1885,10 +1873,10 @@ pub(crate) async fn assemble_owned_execution(
     };
 
     Ok(OwnedAgentExecution {
-        model_provider,
-        provider_name,
-        model,
-        temperature,
+        model_provider: model_runtime.provider,
+        provider_name: model_runtime.provider_name,
+        model: model_runtime.model_name,
+        temperature: model_runtime.temperature,
         tools_registry,
         approval,
         activated_tools: activated_handle,
@@ -2840,8 +2828,8 @@ mod sop_step_reassembly_tests {
     async fn reassembly_yields_the_named_agents_own_scope() {
         use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind};
         use zeroclaw_config::schema::{
-            AliasedAgentConfig, Config, ModelProviderConfig, OllamaModelProviderConfig,
-            RiskProfileConfig, SopConfig,
+            AliasedAgentConfig, Config, ModelEntryConfig, ModelProviderConfig,
+            OllamaModelProviderConfig, RiskProfileConfig, SopConfig,
         };
 
         let root =
@@ -2871,7 +2859,25 @@ mod sop_step_reassembly_tests {
             "p".to_string(),
             OllamaModelProviderConfig {
                 base: ModelProviderConfig {
-                    model: Some("test-model".to_string()),
+                    model: Some("legacy-model".to_string()),
+                    models: std::collections::HashMap::from([
+                        (
+                            "default".to_string(),
+                            ModelEntryConfig {
+                                id: Some("default-model".to_string()),
+                                temperature: Some(0.1),
+                                ..Default::default()
+                            },
+                        ),
+                        (
+                            "fast".to_string(),
+                            ModelEntryConfig {
+                                id: Some("fast-model".to_string()),
+                                temperature: Some(0.42),
+                                ..Default::default()
+                            },
+                        ),
+                    ]),
                     ..ModelProviderConfig::default()
                 },
                 ..OllamaModelProviderConfig::default()
@@ -2882,7 +2888,7 @@ mod sop_step_reassembly_tests {
                 alias.to_string(),
                 AliasedAgentConfig {
                     enabled: true,
-                    model_provider: "ollama.p".into(),
+                    model_provider: "ollama.p.fast".into(),
                     risk_profile: profile.into(),
                     memory: AgentMemoryConfig {
                         backend: MemoryBackendKind::Markdown,
@@ -2903,6 +2909,12 @@ mod sop_step_reassembly_tests {
             .expect("writer assembles");
         let reader_names = tool_names(&reader.tools_registry);
         let writer_names = tool_names(&writer.tools_registry);
+
+        for owned in [&reader, &writer] {
+            assert_eq!(owned.provider_name, "ollama.p");
+            assert_eq!(owned.model, "fast-model");
+            assert_eq!(owned.temperature, Some(0.42));
+        }
 
         assert!(
             reader_names.contains(&"file_read".to_string())
