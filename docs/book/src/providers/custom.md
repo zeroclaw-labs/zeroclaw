@@ -12,7 +12,7 @@ If the service speaks OpenAI chat-completions, this is a config-only change. The
 
 This is the same `OpenAiCompatibleModelProvider` runtime impl used by `groq`, `mistral`, `xai`, and every other vendor with its own canonical slot in the [catalog](./catalog.md). The difference is which family slot you use: `custom` is the catch-all for endpoints not represented by a vendor slot.
 
-For a gateway that cannot accept image-bearing tool results, omit those payloads while retaining the surrounding tool text:
+Gateways that cannot accept image-bearing tool results are handled by default: `tool_result_image_policy` defaults to `"relocate"`, which moves the image out of the tool result into a following user message such gateways accept, so a vision model still sees the image with no extra config. Override it only if you need different handling: `"image_url"` to keep the image inside the tool message (for gateways that accept it), or `"omit"` to drop the image and retain only the surrounding tool text:
 
 ```toml
 [providers.models.custom.gateway]
