@@ -447,6 +447,14 @@ jobs:
            --target x86_64-pc-windows-msvc
            control_plane::authority::tests::windows_process_exit_is_detected -- --exact
 
+      - name: Test Windows WhatsApp passkey handoffs
+        if: runner.os == 'Windows'
+        shell: bash
+        run: >-
+          cargo test --profile ci --locked -p zeroclaw-channels
+          --no-default-features --features whatsapp-web
+          --target x86_64-pc-windows-msvc --lib whatsapp_passkey::tests::
+
   check:
     name: Check (${{ matrix.name }})
     runs-on: blacksmith-8vcpu-ubuntu-2404
