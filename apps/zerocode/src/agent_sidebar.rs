@@ -2,7 +2,7 @@
 //! live status dots, a `+` picker to add an agent, and the Quickstart
 //! launcher at the bottom.
 //!
-//! The sidebar owns only widget state (visibility, width, scroll, hit rects,
+//! The sidebar owns only widget state (scroll, hit rects,
 //! picker). Session rows are derived per frame from the panes'
 //! `session_summaries()` — the panes stay the single source of truth.
 
@@ -21,10 +21,8 @@ use crate::chat::{PaneKind, SidebarSessionSummary, SidebarStatus};
 use crate::client::RpcClient;
 use crate::i18n::{t, t_args};
 use crate::keymap::ModalAction;
-use crate::{config, mouse, theme, widgets};
+use crate::{mouse, theme, widgets};
 
-pub(crate) const SIDEBAR_COLS_MIN: u16 = 18;
-pub(crate) const SIDEBAR_COLS_MAX: u16 = 40;
 /// Minimum columns the main content keeps; below this the sidebar auto-skips
 /// for the frame instead of squeezing the pane.
 pub(crate) const CONTENT_MIN_COLS: u16 = 40;
@@ -86,9 +84,6 @@ impl SidebarPicker {
 }
 
 pub(crate) struct AgentSidebar {
-    visible: bool,
-    /// Configured target width (clamped per frame in `carve`).
-    width: u16,
     /// Scroll offset into the session rows.
     scroll: u16,
     // Geometry recorded by draw, read by the mouse handler (repo convention:
@@ -103,13 +98,8 @@ pub(crate) struct AgentSidebar {
 }
 
 impl AgentSidebar {
-    pub(crate) fn from_config_dir(config_dir: &std::path::Path) -> Self {
-        let section = config::ensure_and_load(config_dir)
-            .map(|c| c.sidebar)
-            .unwrap_or_default();
+    pub(crate) fn new() -> Self {
         Self {
-            visible: section.visible,
-            width: section.width,
             scroll: 0,
             area: Rect::default(),
             plus_rect: Rect::default(),
@@ -118,13 +108,6 @@ impl AgentSidebar {
             close_rect: None,
             picker: None,
         }
-    }
-
-    /// Flip visibility and persist the toggle. A persist failure only loses
-    /// the preference across restarts, so it is not surfaced.
-    pub(crate) fn toggle(&mut self, config_dir: &std::path::Path) {
-        self.visible = !self.visible;
-        let _ = config::persist_sidebar_visible(config_dir, self.visible);
     }
 
     pub(crate) fn picker_open(&self) -> bool {
@@ -140,32 +123,17 @@ impl AgentSidebar {
         self.area.width > 0 && mouse::in_rect(col, row, self.area)
     }
 
-    /// Split the content area into (sidebar, body). Returns `(None, content)`
-    /// when hidden or when the terminal is too narrow to keep the main pane
-    /// at [`CONTENT_MIN_COLS`].
-    pub(crate) fn carve(&mut self, content: Rect) -> (Option<Rect>, Rect) {
+    /// Invalidate panel hit targets when the shell hides or relocates Sessions.
+    /// Scroll and picker lifecycle are deliberately preserved.
+    pub(crate) fn clear_geometry(&mut self) {
         self.area = Rect::default();
         self.plus_rect = Rect::default();
         self.quickstart_rect = Rect::default();
         self.row_rects.clear();
         self.close_rect = None;
-        if !self.visible {
-            return (None, content);
-        }
-        let width = self.width.clamp(SIDEBAR_COLS_MIN, SIDEBAR_COLS_MAX);
-        if content.width < width + CONTENT_MIN_COLS {
-            return (None, content);
-        }
-        let sidebar = Rect { width, ..content };
-        let body = Rect {
-            x: content.x + width,
-            width: content.width - width,
-            ..content
-        };
-        (Some(sidebar), body)
     }
 
-    /// Render the sidebar into `area` (as returned by [`Self::carve`]),
+    /// Render the sidebar into the shell-provided `area`,
     /// recording hit rects for the mouse handler.
     pub(crate) fn draw(
         &mut self,
@@ -174,6 +142,10 @@ impl AgentSidebar {
         rows: &[SidebarSessionSummary],
         ctx: &SidebarCtx,
     ) {
+        self.clear_geometry();
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
         self.area = area;
         frame.render_widget(Clear, area);
         let block = theme::panel_block(&t("zc-sidebar-title")).style(theme::fill_style());
@@ -599,8 +571,6 @@ mod tests {
 
     fn sidebar() -> AgentSidebar {
         AgentSidebar {
-            visible: true,
-            width: 24,
             scroll: 0,
             area: Rect::default(),
             plus_rect: Rect::default(),
@@ -632,51 +602,9 @@ mod tests {
     }
 
     #[test]
-    fn carve_hidden_passes_content_through() {
-        let mut s = sidebar();
-        s.visible = false;
-        let content = Rect::new(0, 1, 100, 30);
-        let (side, body) = s.carve(content);
-        assert!(side.is_none());
-        assert_eq!(body, content);
-        assert!(!s.contains(1, 2), "hidden sidebar owns no cells");
-    }
-
-    #[test]
-    fn carve_splits_at_configured_width() {
-        let mut s = sidebar();
-        let content = Rect::new(0, 1, 100, 30);
-        let (side, body) = s.carve(content);
-        let side = side.expect("visible sidebar carves");
-        assert_eq!(side, Rect::new(0, 1, 24, 30));
-        assert_eq!(body, Rect::new(24, 1, 76, 30));
-    }
-
-    #[test]
-    fn carve_clamps_width_to_supported_range() {
-        let mut s = sidebar();
-        s.width = 200;
-        let (side, _) = s.carve(Rect::new(0, 0, 120, 30));
-        assert_eq!(side.expect("carves").width, SIDEBAR_COLS_MAX);
-        s.width = 1;
-        let (side, _) = s.carve(Rect::new(0, 0, 120, 30));
-        assert_eq!(side.expect("carves").width, SIDEBAR_COLS_MIN);
-    }
-
-    #[test]
-    fn carve_auto_skips_on_narrow_terminals() {
-        let mut s = sidebar();
-        let content = Rect::new(0, 1, 24 + CONTENT_MIN_COLS - 1, 30);
-        let (side, body) = s.carve(content);
-        assert!(side.is_none(), "content below the floor keeps full width");
-        assert_eq!(body, content);
-        assert!(s.visible, "auto-skip must not flip the persisted toggle");
-    }
-
-    #[test]
     fn draw_records_row_plus_and_quickstart_rects() {
         let mut s = sidebar();
-        let area = s.carve(Rect::new(0, 1, 100, 12)).0.unwrap();
+        let area = Rect::new(0, 1, 24, 12);
         let rows = vec![summary("alpha", "s1", true), summary("beta", "s2", false)];
         let ctx = SidebarCtx {
             active_pane: Some(PaneKind::Chat),
@@ -722,7 +650,7 @@ mod tests {
     #[test]
     fn duplicate_alias_rows_have_distinct_labels_and_session_targets() {
         let mut sidebar = sidebar();
-        let area = sidebar.carve(Rect::new(0, 0, 100, 10)).0.unwrap();
+        let area = Rect::new(0, 0, 24, 10);
         let rows = vec![summary("alpha", "s1", true), summary("alpha", "s2", false)];
         let ctx = SidebarCtx {
             active_pane: Some(PaneKind::Chat),
@@ -748,13 +676,55 @@ mod tests {
     }
 
     #[test]
+    fn shell_draw_and_clear_invalidate_stale_panel_targets() {
+        let mut sidebar = sidebar();
+        let rows = vec![summary("alpha", "s1", true)];
+        let ctx = SidebarCtx {
+            active_pane: Some(PaneKind::Chat),
+            quickstart_active: false,
+            connected: true,
+        };
+        let area = Rect::new(70, 0, 30, 12);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 14)).unwrap();
+        term.draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+        let old_targets = [
+            sidebar.plus_rect,
+            sidebar.quickstart_rect,
+            sidebar.row_rects[0].2,
+            sidebar.close_rect.as_ref().unwrap().2,
+        ];
+        sidebar.scroll = 3;
+        sidebar.clear_geometry();
+        assert_eq!(sidebar.scroll, 3);
+        assert!(!sidebar.contains(area.x, area.y));
+        for rect in old_targets {
+            assert_eq!(sidebar.handle_mouse(&click(rect.x, rect.y)), None);
+        }
+
+        term.draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+        assert!(sidebar.contains(area.x, area.y));
+        assert!(sidebar.close_rect.is_some());
+        // A smaller shell rectangle must invalidate the previous hit targets.
+        term.draw(|frame| sidebar.draw(frame, Rect::new(0, 0, 4, 1), &[], &ctx))
+            .unwrap();
+        assert!(sidebar.row_rects.is_empty());
+        assert!(sidebar.close_rect.is_none());
+        assert_eq!(sidebar.plus_rect, Rect::default());
+        assert_eq!(sidebar.quickstart_rect, Rect::default());
+        for rect in old_targets {
+            assert_eq!(sidebar.handle_mouse(&click(rect.x, rect.y)), None);
+        }
+        term.draw(|frame| sidebar.draw(frame, Rect::new(0, 0, 30, 0), &rows, &ctx))
+            .unwrap();
+        assert_eq!(sidebar.area, Rect::default());
+    }
+
+    #[test]
     fn running_row_is_explicit_without_showing_count_or_losing_close_target() {
         let mut sidebar = sidebar();
-        sidebar.width = SIDEBAR_COLS_MIN;
-        let area = sidebar
-            .carve(Rect::new(0, 0, SIDEBAR_COLS_MIN + CONTENT_MIN_COLS, 8))
-            .0
-            .unwrap();
+        let area = Rect::new(0, 0, crate::config::SIDEBAR_WIDTH_MIN, 8);
         let mut row = summary("long-agent-name", "s1", true);
         row.status = SidebarStatus::Running;
         row.message_count = 42;
@@ -764,7 +734,7 @@ mod tests {
             connected: true,
         };
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
-            SIDEBAR_COLS_MIN + CONTENT_MIN_COLS,
+            crate::config::SIDEBAR_WIDTH_MIN + CONTENT_MIN_COLS,
             8,
         ))
         .unwrap();
@@ -798,7 +768,7 @@ mod tests {
     #[test]
     fn scroll_clamps_to_row_overflow() {
         let mut s = sidebar();
-        let area = s.carve(Rect::new(0, 0, 100, 6)).0.unwrap();
+        let area = Rect::new(0, 0, 24, 6);
         // inner height 4 => rows area 2 (separator + quickstart take 2).
         let rows: Vec<_> = (0..5)
             .map(|i| summary(&format!("a{i}"), &format!("s{i}"), false))
