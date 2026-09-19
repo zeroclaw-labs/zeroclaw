@@ -167,7 +167,7 @@ Some scoped component labels are manual routing labels rather than synchronized 
 
 `domain:security` identifies an effective authentication, authorization, credential, secret-handling, confinement, tool-permission, security-policy, cryptographic-identity, or untrusted-input boundary. Apply it when the changed behavior crosses that boundary, including outside canonical security paths. Do not apply it only because a PR discusses security, changes security documentation or tests, updates an advisory dependency, or performs generic hardening without changing a trust boundary. The label remains manual because path matching cannot reliably infer this consequence.
 
-`domain:security` is independent from `risk:*`. A PR carrying either `risk:high` or `domain:security` requires deep review and two independent Core Team approvals before merge. Automated review does not count as a Core Team approval.
+`domain:security` is independent from `risk:*`. A PR carrying either `risk:high` or `domain:security` requires deep review and defaults to two independent Core Team approvals before merge. Only the [expedited second-review lane](./pr-workflow.md#expedited-second-review-lane) provides a standing exception, and automated review never counts as a Core Team approval.
 
 The following duplicate domain and product-surface labels are pending retirement. Do not apply them to new work. They remain live only until a separate exact operation packet migrates any remaining open references and deletes the definitions.
 
@@ -310,8 +310,8 @@ New or manual applications should use the canonical no-space labels below. Exist
 |---|---|
 | `risk:low` | Documentation, localization, fixtures, generated references, or mechanical metadata with no production, compatibility, build, release, or governance effect |
 | `risk:medium` | Ordinary behavioral production change, including most runtime, gateway, provider, channel, tool, config, application, and CI work |
-| `risk:high` | A concrete trust, credential, compatibility, governance, or release-authority boundary that needs deep review and two independent Core Team approvals |
-| `risk:manual` | Maintainer override that freezes future automated risk replacement; it does not lower review or approval requirements |
+| `risk:high` | A concrete trust, credential, compatibility, governance, or release-authority boundary that needs deep review and defaults to two independent Core Team approvals; see the [expedited second-review lane](./pr-workflow.md#expedited-second-review-lane) |
+| `risk:manual` | Maintainer override that freezes future automated risk replacement; it does not by itself lower review or approval requirements |
 
 `risk:*` describes the actual diff and its consequence, not broad component location. A production-inert test-only change inside a high-risk boundary may be `risk:medium` when the complete test-only boundary is demonstrable; #9530 is authoritative for that exception.
 
