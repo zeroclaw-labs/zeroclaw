@@ -3,7 +3,8 @@
 use std::collections::HashSet;
 use zeroclaw_tool_call_parser::{
     ParsedToolCall, ToolProtocolEnvelopeKind, classify_tool_protocol_envelope,
-    contains_tool_protocol_tag_call, looks_like_malformed_tool_protocol_envelope,
+    contains_tool_protocol_tag_call, embedded_tool_protocol_envelope_mentions_known_tool,
+    looks_like_malformed_tool_protocol_envelope,
     looks_like_malformed_tool_protocol_envelope_for_known_tools, looks_like_tool_protocol_envelope,
     looks_like_tool_protocol_example, tool_protocol_envelope_mentions_known_tool,
 };
@@ -34,7 +35,12 @@ pub(crate) fn find_embedded_protocol_candidate_start(text: &str) -> Option<usize
         }
     }
 
-    for key in ["\"tool_calls\"", "\"toolcalls\"", "\"function_call\""] {
+    for key in [
+        "\"tool_calls\"",
+        "\"toolcalls\"",
+        "\"function_call\"",
+        "\"tool_code\"",
+    ] {
         if let Some(key_idx) = lower.find(key)
             && let Some(json_start) = text[..key_idx].rfind(['{', '['])
         {
@@ -65,10 +71,21 @@ pub(crate) fn find_incomplete_protocol_candidate_start(text: &str) -> Option<usi
     for delimiter in ['{', '['] {
         if let Some(idx) = text.rfind(delimiter) {
             let tail = &lower[idx..];
+            // A JSON value that has started but not yet shown a protocol
+            // key — an opener followed by a quoted key — is held as well: a
+            // leaked envelope split across deltas otherwise forwards its
+            // first half before any key that would identify it arrives.
+            // Only while it is still unfinished, though: once the value has
+            // closed, nothing further can identify it, and holding an
+            // ordinary inline object like `config: {"retries": 3} and …`
+            // would stall the rest of the reply to end of stream.
+            let json_like_start = tail[delimiter.len_utf8()..].trim_start().starts_with('"')
+                && !starts_with_complete_json_value(&text[idx..]);
             if tail.contains("\"tool")
                 || tail.contains("\"function")
                 || tail.contains("\"call")
                 || tail.len() <= 16
+                || json_like_start
             {
                 earliest = Some(earliest.map_or(idx, |current| current.min(idx)));
             }
@@ -76,6 +93,16 @@ pub(crate) fn find_incomplete_protocol_candidate_start(text: &str) -> Option<usi
     }
 
     earliest
+}
+
+/// Whether `text` begins with a complete JSON value, ignoring anything after
+/// it. Trailing prose is expected: this answers "has the value closed", not
+/// "is the whole text JSON".
+fn starts_with_complete_json_value(text: &str) -> bool {
+    serde_json::Deserializer::from_str(text)
+        .into_iter::<serde_json::Value>()
+        .next()
+        .is_some_and(|value| value.is_ok())
 }
 
 pub(crate) fn starts_suspicious_protocol_prefix(text: &str) -> bool {
@@ -175,7 +202,13 @@ pub(crate) fn detect_tool_call_parse_issue_for_known_tools(
         .then(|| message.into());
     }
 
-    looks_like_tool_protocol_envelope(trimmed).then(|| message.into())
+    // A protocol object for a known tool embedded anywhere in the text —
+    // after prose, inside other JSON, amid malformed structure — is never
+    // executed (whether it is a leak or quoted data cannot be told from
+    // text); reject and retry rather than render protocol bytes.
+    (looks_like_tool_protocol_envelope(trimmed)
+        || embedded_tool_protocol_envelope_mentions_known_tool(trimmed, known_tool_names))
+    .then(|| message.into())
 }
 
 pub(crate) fn json_fence_body(trimmed: &str) -> Option<&str> {

@@ -295,6 +295,18 @@ fn classify_tool_protocol_json_value(
     None
 }
 
+/// Whether a name carried by a leaked protocol object refers to an active
+/// tool. Applies the same alias normalization the executable parser uses, so
+/// a leaked `bash` call is recognized as naming the active `shell` tool.
+pub fn names_known_tool(name: &str, known_tool_names: &HashSet<String>) -> bool {
+    let name = name.trim();
+    if name.is_empty() {
+        return false;
+    }
+    let lower = name.to_ascii_lowercase();
+    known_tool_names.contains(&lower) || known_tool_names.contains(map_tool_name_alias(&lower))
+}
+
 fn json_value_mentions_known_tool(
     value: &serde_json::Value,
     known_tool_names: &HashSet<String>,
@@ -314,9 +326,7 @@ fn json_value_mentions_known_tool(
     let name_matches = |candidate: Option<&serde_json::Value>| {
         candidate
             .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .is_some_and(|name| known_tool_names.contains(&name.to_ascii_lowercase()))
+            .is_some_and(|name| names_known_tool(name, known_tool_names))
     };
 
     if name_matches(object.get("name")) {
@@ -373,7 +383,7 @@ pub fn tool_protocol_envelope_mentions_known_tool(
         let (_, calls) = parse_tool_calls(trimmed);
         if calls
             .iter()
-            .any(|call| known_tool_names.contains(&call.name.to_ascii_lowercase()))
+            .any(|call| names_known_tool(&call.name, known_tool_names))
         {
             return true;
         }
@@ -467,34 +477,94 @@ pub fn looks_like_tool_protocol_example(text: &str) -> bool {
 
     if let Some((body, visible_text)) = leading_json_fence_body_and_trailing_text(trimmed)
         && classify_tool_protocol_envelope(body).is_some()
-        && has_example_context(visible_text)
+        && has_explicit_example_phrase(visible_text)
     {
         return true;
     }
 
     if starts_with_tool_protocol_fence(trimmed) || contains_tool_protocol_tag_marker(trimmed) {
         let (visible_text, calls) = parse_tool_calls(trimmed);
-        if !calls.is_empty() && has_example_context(&visible_text) {
+        if !calls.is_empty() && has_explicit_example_phrase(&visible_text) {
             return true;
         }
+    }
+
+    // Bare protocol objects embedded in prose have no tag or fence marker, so
+    // the checks above never see them; an envelope quoted while explaining
+    // the protocol is documentation, not a leak to reject. Every embedded
+    // protocol object must be framed by the clause immediately before it —
+    // an unrelated "for example" elsewhere in the reply exempts nothing.
+    if embedded_protocol_objects_are_all_framed_as_examples(trimmed) {
+        return true;
     }
 
     false
 }
 
-fn has_example_context(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    lower.contains("example")
-        || lower.contains("sample")
-        || lower.contains("示例")
-        // Common Chinese "for example" / "sample" markers. We keep this list
-        // intentionally small to avoid accidentally exempting real protocol leaks.
-        || lower.contains("例如")
-        || lower.contains("比如")
-        || lower.contains("举例")
-        || lower.contains("例子")
-        || lower.contains("比方说")
-        || lower.contains("譬如")
+/// How much text before an embedded protocol object can frame it as an
+/// example. Framing must sit in the clause that ends at the object: after the
+/// last clause terminator before it and within this many bytes, so "For
+/// example, the schema is above. Run this now: {...}" is not exempt while
+/// "For example, the protocol looks like this: {...}" is.
+pub const EXAMPLE_FRAMING_WINDOW: usize = 200;
+
+/// Whether `prose_before` — the text immediately preceding an embedded
+/// protocol object — frames that object as an illustration. Shared by the
+/// completed-response check and the streaming guard so both paths reach the
+/// same verdict for the same text.
+pub fn example_framing_precedes(prose_before: &str) -> bool {
+    let mut window_start = prose_before.len().saturating_sub(EXAMPLE_FRAMING_WINDOW);
+    while !prose_before.is_char_boundary(window_start) {
+        window_start += 1;
+    }
+    let window = &prose_before[window_start..];
+    let mut clause = window.trim_end();
+    // A fenced example carries its framing phrase before the fence opener,
+    // so the opener line is not a clause of its own. Strip a trailing opener
+    // (optionally with a language tag) before splitting.
+    if let Some(fence) = clause.rfind("```") {
+        let tag = &clause[fence + 3..];
+        if !tag.contains('\n')
+            && tag
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '+' || c == '-')
+        {
+            clause = clause[..fence].trim_end();
+        }
+    }
+    // Only the clause that ends at the object counts. A line break closes it
+    // as firmly as a sentence terminator does: in "For example:\nI am now
+    // going to run the command for you\n{...}" the framing introduces the
+    // paragraph, not the object on the last line.
+    let clause_start = clause
+        .rfind(['.', '!', '?', '\n', '\r'])
+        .map_or(0, |idx| idx + 1);
+    has_explicit_example_phrase(&clause[clause_start..])
+}
+
+/// Whether prose explicitly frames a protocol object as an example. A bare
+/// "sample" or "examples/" is ordinary narration in real leaks ("creating
+/// the sample page now"), so only phrases that introduce an illustration
+/// count, and documentation-domain links (`https://example.com/...`) never do.
+fn has_explicit_example_phrase(prose: &str) -> bool {
+    let lower = prose.to_ascii_lowercase();
+    [
+        "for example",
+        "for instance",
+        "e.g.",
+        "example:",
+        "an example",
+        "example of",
+        "looks like this",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase))
+        // `例子` is the plain noun, like "an example" above; `示例` is left
+        // out because it also reads as "sample" (`示例页面`, a sample page),
+        // the same narration trap as the English word.
+        || ["例如", "比如", "举例", "譬如", "比方说", "例子"]
+            .iter()
+            .any(|phrase| prose.contains(phrase))
 }
 
 fn leading_json_fence_body_and_trailing_text(trimmed: &str) -> Option<(&str, &str)> {
@@ -644,8 +714,7 @@ fn malformed_text_mentions_known_tool(text: &str, known_tool_names: &HashSet<Str
 
     JSON_NAME_FIELD_RE.captures_iter(text).any(|cap| {
         cap.get(1)
-            .map(|name| name.as_str().trim().to_ascii_lowercase())
-            .is_some_and(|name| known_tool_names.contains(&name))
+            .is_some_and(|name| names_known_tool(name.as_str(), known_tool_names))
     })
 }
 
@@ -2059,6 +2128,263 @@ fn range_hits_rejected_span(rejected: &[std::ops::Range<usize>], start: usize, e
         .any(|span| !span.is_empty() && start < span.end && span.start < end)
 }
 
+/// Protocol keys checked as a cheap gate before the scan in
+/// [`for_each_embedded_json_value`]; text containing none of them cannot
+/// embed an object detection would flag.
+const EMBEDDED_ENVELOPE_KEYS: [&str; 5] = [
+    "\"tool_calls\"",
+    "\"toolcalls\"",
+    "\"function_call\"",
+    "\"tool_code\"",
+    "\"tool_call_id\"",
+];
+
+/// Upper bound on the text the embedded scan examines. Parse attempts restart
+/// at every `{`/`[`, so cost grows with size; genuine leaks observed in the
+/// field are a few KB, and longer replies keep the pre-existing behavior of
+/// being rendered rather than scanned.
+const MAX_EMBEDDED_SCAN_BYTES: usize = 64 * 1024;
+
+/// Remove the one malformed-JSON escape leaked envelopes actually carry: a
+/// python-style `\'` inside a JSON string (observed in the field inside a
+/// leaked `arguments` payload, and the very defect that makes the envelope
+/// unparseable everywhere -- provider side included, which is plausibly WHY it
+/// arrived as text). `\'` is never valid JSON, so dropping the backslash
+/// cannot change the meaning of any well-formed payload; a backslash run of
+/// even length before the quote means every backslash is itself escaped and
+/// the run is left alone.
+///
+/// Returns the repaired text plus the repaired byte positions of the affected
+/// quotes, so spans found in the repaired text can be mapped back to original
+/// offsets: each breakpoint strictly before an offset stands for one removed
+/// byte. `None` when there is nothing to repair.
+fn repair_python_escaped_quotes(text: &str) -> Option<(String, Vec<usize>)> {
+    if !text.contains("\\'") {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut breakpoints: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        let run_start = i;
+        while i < bytes.len() && bytes[i] == b'\\' {
+            i += 1;
+        }
+        let run = i - run_start;
+        if i < bytes.len() && bytes[i] == b'\'' && run % 2 == 1 {
+            out.extend(std::iter::repeat_n(b'\\', run - 1));
+            breakpoints.push(out.len());
+            out.push(b'\'');
+            i += 1;
+        } else {
+            out.extend(std::iter::repeat_n(b'\\', run));
+        }
+    }
+    if breakpoints.is_empty() {
+        return None;
+    }
+    let repaired = String::from_utf8(out).expect("only ascii backslashes were removed");
+    Some((repaired, breakpoints))
+}
+
+/// Walk `response` for JSON values embedded in prose and offer each complete
+/// parsed value to `visit` with its byte span in `response` coordinates. A
+/// value that fails to parse is stepped into one character at a time, so
+/// objects inside malformed or truncated structure are still reached, and
+/// consumers inspect every parsed value's whole tree, so nothing nested inside
+/// a parsed value is missed either. Nothing here decides whether an object is
+/// "top level": that cannot be recovered reliably from text, which is why
+/// embedded protocol objects are only ever detected, never executed.
+///
+/// The scan runs over a `\'`-repaired copy when one is needed: any well-formed
+/// value contains no `\'` and is byte-identical in the repaired text, so
+/// scanning the repaired text is strictly more capable, and the mapped spans
+/// keep callers slicing the ORIGINAL bytes.
+fn for_each_embedded_json_value(
+    response: &str,
+    visit: &mut dyn FnMut(&serde_json::Value, usize, usize),
+) {
+    if response.len() > MAX_EMBEDDED_SCAN_BYTES {
+        return;
+    }
+    // A JSON key written with unicode escapes (`"\u0074ool_calls"`) decodes
+    // to a protocol key the raw text does not contain, so any escape in the
+    // text disables the cheap gate and lets the parser decide.
+    if !response.contains("\\u")
+        && !EMBEDDED_ENVELOPE_KEYS
+            .iter()
+            .any(|key| response.contains(key))
+    {
+        return;
+    }
+
+    if let Some((repaired, breakpoints)) = repair_python_escaped_quotes(response) {
+        scan_embedded_json_values(&repaired, &mut |value, start, end| {
+            let orig_start = start + breakpoints.partition_point(|&b| b < start);
+            let orig_end = end + breakpoints.partition_point(|&b| b < end);
+            visit(value, orig_start, orig_end);
+        });
+    } else {
+        scan_embedded_json_values(response, visit);
+    }
+}
+
+fn scan_embedded_json_values(
+    response: &str,
+    visit: &mut dyn FnMut(&serde_json::Value, usize, usize),
+) {
+    let char_positions: Vec<(usize, char)> = response.char_indices().collect();
+    let mut idx = 0;
+    while idx < char_positions.len() {
+        let (byte_idx, ch) = char_positions[idx];
+        if ch != '{' && ch != '[' {
+            idx += 1;
+            continue;
+        }
+        let slice = &response[byte_idx..];
+        let mut stream = serde_json::Deserializer::from_str(slice).into_iter::<serde_json::Value>();
+        if let Some(Ok(value)) = stream.next() {
+            let consumed = stream.byte_offset();
+            if consumed > 0 {
+                let end = byte_idx + consumed;
+                visit(&value, byte_idx, end);
+                while idx < char_positions.len() && char_positions[idx].0 < end {
+                    idx += 1;
+                }
+                continue;
+            }
+        }
+        idx += 1;
+    }
+}
+
+/// Whether `value` or any value nested inside it satisfies `predicate`.
+fn json_tree_contains(
+    value: &serde_json::Value,
+    predicate: &mut dyn FnMut(&serde_json::Value) -> bool,
+) -> bool {
+    if predicate(value) {
+        return true;
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            for child in map.values() {
+                if json_tree_contains(child, predicate) {
+                    return true;
+                }
+            }
+            false
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                if json_tree_contains(child, predicate) {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Whether an embedded object is a Gemini-style python tool stub:
+/// `{"content":..., "tool_code":"print(shell(...))", "tool_name":"shell"}`.
+fn is_embedded_python_tool_stub(value: &serde_json::Value) -> bool {
+    has_non_empty_string(value, "tool_name") && has_non_empty_string(value, "tool_code")
+}
+
+fn embedded_python_stub_mentions_known_tool(
+    value: &serde_json::Value,
+    known_tool_names: &HashSet<String>,
+) -> bool {
+    value
+        .get("tool_name")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|name| names_known_tool(name, known_tool_names))
+}
+
+fn is_embedded_protocol_object(value: &serde_json::Value) -> bool {
+    is_embedded_python_tool_stub(value)
+        || classify_tool_protocol_json_value(value).is_some()
+        || has_malformed_tool_protocol_json_signal(value)
+}
+
+fn protocol_object_mentions_known_tool(
+    value: &serde_json::Value,
+    known_tool_names: &HashSet<String>,
+) -> bool {
+    if is_embedded_python_tool_stub(value) {
+        return embedded_python_stub_mentions_known_tool(value, known_tool_names);
+    }
+    is_embedded_protocol_object(value) && json_value_mentions_known_tool(value, known_tool_names)
+}
+
+/// Whether the text embeds at least one protocol object and every one of
+/// them is framed as an example by the clause immediately before it.
+fn embedded_protocol_objects_are_all_framed_as_examples(text: &str) -> bool {
+    let mut found = false;
+    let mut all_framed = true;
+    // Only the PROSE between the previous embedded value and this one can
+    // frame it. `previous_end` advances past every embedded JSON value, not
+    // just protocol-bearing ones: a model quoting business data can carry an
+    // attacker-supplied string like {"note":"the format looks like this:"},
+    // and if that span stayed inside the window it would frame the leak that
+    // follows it. A framing phrase before an earlier object must not carry
+    // over to a later one either.
+    let mut previous_end = 0usize;
+    for_each_embedded_json_value(text, &mut |value, start, end| {
+        let prose_before = &text[previous_end.min(start)..start];
+        if json_tree_contains(value, &mut is_embedded_protocol_object) {
+            found = true;
+            if !example_framing_precedes(prose_before) {
+                all_framed = false;
+            }
+        }
+        previous_end = previous_end.max(end);
+    });
+    found && all_framed
+}
+
+/// Whether `text` embeds a tool protocol object naming a known tool anywhere
+/// — after prose, inside another JSON value, or amid malformed structure.
+/// Such text is never executed: the caller rejects the turn and retries it
+/// with feedback instead of rendering protocol bytes to the user.
+///
+/// Known gaps, each keeping the pre-existing behavior of rendering the text
+/// rather than introducing a new one:
+/// - A bare call object with no container key (`{"name":…,"arguments":…}`)
+///   is not treated as protocol here. The shape is indistinguishable from
+///   ordinary data without tool names, and the channel orchestrator already
+///   strips it from replies; recognizing it here as well would change that
+///   established behavior and belongs in its own change.
+/// - Detection reads the PARSED value, so a duplicate or whitespace-padded
+///   protocol key (`"tool_calls"` twice, `"tool_calls "`) hides the leak
+///   from the scan while the bytes still reach the reply.
+/// - Replies longer than the embedded scan bound (64 KiB) are not scanned.
+pub fn embedded_tool_protocol_envelope_mentions_known_tool(
+    text: &str,
+    known_tool_names: &HashSet<String>,
+) -> bool {
+    if known_tool_names.is_empty() {
+        return false;
+    }
+    let mut found = false;
+    for_each_embedded_json_value(text, &mut |value, _start, _end| {
+        if !found {
+            found = json_tree_contains(value, &mut |node| {
+                protocol_object_mentions_known_tool(node, known_tool_names)
+            });
+        }
+    });
+    found
+}
+
 pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     // Strip `<think>...</think>` blocks before parsing.  Qwen and other
     // reasoning models embed chain-of-thought inline in the response text;
@@ -2877,6 +3203,392 @@ mod tools_wrapper_body_boundary_tests {
             1,
             "whitespace padding must not disqualify, got {calls:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod embedded_protocol_detection_tests {
+    use super::*;
+
+    /// The observed leak, structurally exact: narration, then ZeroClaw's own
+    /// assistant-history envelope shape with string-encoded arguments -- made
+    /// unparseable by a python-style `\'` escape inside the arguments string,
+    /// exactly as seen in the field -- then a Gemini-style python tool stub
+    /// carrying its own narration, then a trailing narration line.
+    fn leaked_response() -> String {
+        concat!(
+            "Okay! I can create that webinar page for you.\n",
+            "{\"content\":null,\"tool_calls\":[{\"arguments\":\"{\\\"command\\\":\\\"python3 scripts/wp.py webinar-create --slug 'tesla-frand' --caption 'We\\'ll delve into it'\\\"}\",\"id\":\"call_U9gW6D9hK7Q1G41gJ9c1v4dF\",\"name\":\"shell\"}]}",
+            "{\"content\":\"I'm preparing the command now to create the webinar.\",\"tool_code\":\"print(json.dumps(shell(\\\"python3 scripts/wp.py webinar-create\\\")))\",\"tool_name\":\"shell\"}",
+            "I am creating the draft now.\n",
+        )
+        .to_string()
+    }
+
+    /// A canonical envelope naming a known tool.
+    const ENVELOPE: &str = r#"{"content":null,"tool_calls":[{"arguments":"{\"command\":\"echo should-not-run\"}","id":"call-nested","name":"shell"}]}"#;
+
+    fn shell_is_known() -> HashSet<String> {
+        HashSet::from(["shell".to_string()])
+    }
+
+    /// The contract for any text embedding a protocol object: no call is
+    /// ever parsed out of it, and detection flags it so the runtime rejects
+    /// and retries the turn instead of rendering protocol bytes.
+    fn assert_detected_never_executed(text: &str) {
+        assert!(
+            !looks_like_tool_protocol_example(text),
+            "a leak must not pass as documentation, or the runtime renders it: {text:?}"
+        );
+        let (_visible, calls) = parse_tool_calls(text);
+        assert!(
+            calls.is_empty(),
+            "embedded envelope executed from {text:?}: {calls:?}"
+        );
+        assert!(
+            embedded_tool_protocol_envelope_mentions_known_tool(text, &shell_is_known()),
+            "embedded envelope naming a known tool must be detected: {text:?}"
+        );
+    }
+
+    #[test]
+    fn observed_leak_is_detected_and_never_executed() {
+        let text = leaked_response();
+        let (visible, calls) = parse_tool_calls(&text);
+        assert!(
+            calls.is_empty(),
+            "a leaked envelope must never execute: {calls:?}"
+        );
+        assert_eq!(
+            visible,
+            text.trim(),
+            "text is never altered when nothing runs"
+        );
+        assert!(embedded_tool_protocol_envelope_mentions_known_tool(
+            &text,
+            &shell_is_known()
+        ));
+    }
+
+    #[test]
+    fn second_field_payload_is_detected_despite_placeholder_link() {
+        // The "continue" turn: a prose plan, two envelopes each echoed by a
+        // python stub, a placeholder `https://example.com/...` link inside a
+        // leaked command, an inner `\'`, and a trailing unparseable stub.
+        let plan = "Here's the plan to get this webinar draft created correctly.\n";
+        let env1 = r#"{"content":null,"tool_calls":[{"arguments":"{\"command\":\"python3 docx_to_html.py --extract-images assets\"}","id":"call_1","name":"shell"}]}"#;
+        let stub1 = r#"{"content":"Extracting now.","tool_code":"print(shell(\"python3 docx_to_html.py --extract-images assets\"))","tool_name":"shell"}"#;
+        let env2 = r#"{"content":null,"tool_calls":[{"arguments":"{\"command\":\"wp.py webinar-create --caption 'We\\'ll deliver' --zoom-link 'https://example.com/z'\"}","id":"call_2","name":"shell"}]}"#;
+        let bad_stub = "{\"content\":\"I've created it!\nSee the page.\",\"tool_code\":\"print(1)\",\"tool_name\":\"shell\"}";
+        let payload =
+            format!("{plan}{env1}{stub1}Extracting now.\n{env2}{bad_stub}All done for review.");
+
+        assert!(
+            !looks_like_tool_protocol_example(&payload),
+            "a placeholder example.com link inside a leaked command is data, not documentation"
+        );
+        assert_detected_never_executed(&payload);
+    }
+
+    #[test]
+    fn leak_made_unparseable_by_a_python_escape_is_detected() {
+        // No stub beside it: only the `\'` repair makes this envelope parse,
+        // so detection depends on the repair alone.
+        let text = r#"Creating it now. {"content":null,"tool_calls":[{"arguments":"{\"command\":\"wp.py create --caption 'We\'ll deliver'\"}","id":"call_1","name":"shell"}]}"#;
+        assert_detected_never_executed(text);
+    }
+
+    #[test]
+    fn placeholder_link_in_prose_does_not_disguise_a_leak() {
+        let text = format!("I'll set the link to https://example.com/z now. {ENVELOPE}");
+        assert!(
+            !looks_like_tool_protocol_example(&text),
+            "a documentation-domain link in the narration is data, not example context"
+        );
+        assert_detected_never_executed(&text);
+    }
+
+    #[test]
+    fn narration_words_do_not_disguise_a_leak_as_documentation() {
+        assert_detected_never_executed(&format!(
+            "I'll create the sample webinar page now. {ENVELOPE}"
+        ));
+        assert_detected_never_executed(&format!(
+            "Copying the template from examples/ now. {ENVELOPE}"
+        ));
+        let docs_link = r#"{"content":null,"tool_calls":[{"arguments":"{\"command\":\"curl https://docs.example.io/x\"}","id":"call_1","name":"shell"}]}"#;
+        assert_detected_never_executed(&format!("Fetching the docs page. {docs_link}"));
+    }
+
+    #[test]
+    fn known_tool_aliases_and_escaped_keys_are_detected() {
+        // `bash` is the parser's alias for the active `shell` tool; a key
+        // written with unicode escapes decodes to `tool_calls`; the
+        // Responses-style envelope carries `"type":"function_call"`.
+        let alias = r#"Running now: {"content":null,"tool_calls":[{"arguments":{"command":"id"},"id":"c1","name":"bash"}]}"#;
+        let escaped = r#"Running now: {"content":null,"\u0074ool_calls":[{"arguments":{"command":"id"},"id":"c1","name":"shell"}]}"#;
+        let responses = r#"Running now: {"type":"function_call","name":"shell","arguments":{"command":"id"},"call_id":"c1"}"#;
+        for text in [alias, escaped, responses] {
+            assert_detected_never_executed(text);
+        }
+    }
+
+    #[test]
+    fn a_python_stub_naming_a_tool_alias_is_detected() {
+        // The stub path must normalize names exactly as the envelope path
+        // does: a stub naming `bash` or `readfile` leaks a call to the
+        // active `shell` and `file_read` tools and must not be rendered.
+        let known = HashSet::from(["shell".to_string(), "file_read".to_string()]);
+        let stubs = [
+            r#"Let me check that.
+{"content":null,"tool_code":"print(bash('ls'))","tool_name":"bash"}
+Done!"#,
+            r#"{"content":"One moment.","tool_code":"print(readfile('x'))","tool_name":"readfile"}"#,
+            r#"{"content":null,"tool_code":"print(tools.bash('id'))","tool_name":"tools.bash"}"#,
+        ];
+        for text in stubs {
+            let (_visible, calls) = parse_tool_calls(text);
+            assert!(calls.is_empty(), "stub must never execute: {text:?}");
+            assert!(
+                embedded_tool_protocol_envelope_mentions_known_tool(text, &known),
+                "aliased stub naming a known tool must be detected: {text:?}"
+            );
+        }
+        // A stub naming a tool that is not active, under any alias, stays
+        // unflagged: detection is scoped to the turn's own tools.
+        let unknown =
+            r#"{"content":null,"tool_code":"print(send_email('x'))","tool_name":"send_email"}"#;
+        assert!(!embedded_tool_protocol_envelope_mentions_known_tool(
+            unknown, &known
+        ));
+    }
+
+    #[test]
+    fn tag_and_malformed_leaks_naming_an_alias_are_detected() {
+        // Two detection arms reach a name without going through the JSON
+        // value walk: the tag/fence parse and the regex over malformed
+        // text. Both must normalize aliases, or a leak naming `bash`
+        // reaches the user while the same leak naming `shell` is caught.
+        let known = shell_is_known();
+        let tagged = r#"<tool_call><bash>{"command":"echo should-not-run"}</bash></tool_call>"#;
+        assert!(
+            tool_protocol_envelope_mentions_known_tool(tagged, &known),
+            "a tag-style leak naming an alias must be detected"
+        );
+        // Truncated mid-arguments: no parseable JSON value, so only the
+        // malformed-text arm can see it.
+        let truncated = r#"{"tool_calls":[{"id":"c1","name":"bash","arguments":{"command":"id"#;
+        assert!(
+            looks_like_malformed_tool_protocol_envelope_for_known_tools(truncated, &known),
+            "a truncated leak naming an alias must be detected"
+        );
+        let unrelated = r#"{"tool_calls":[{"id":"c1","name":"send_email","arguments":{"to":"x"#;
+        assert!(!looks_like_malformed_tool_protocol_envelope_for_known_tools(unrelated, &known));
+    }
+
+    #[test]
+    fn quoted_data_cannot_frame_the_leak_that_follows_it() {
+        // The framing window must contain only PROSE. A model echoing a
+        // record can carry an attacker-supplied string ending in a framing
+        // phrase; if that JSON span stayed in the window it would exempt the
+        // leak after it, which is a leak the attacker chose to render.
+        let text = format!(
+            r#"Here is the record you asked for: {{"note":"the format looks like this:"}} {ENVELOPE}"#
+        );
+        assert_detected_never_executed(&text);
+    }
+
+    #[test]
+    fn a_line_break_closes_the_framing_clause() {
+        // "For example:" introduces the paragraph, not the object several
+        // lines below it, so the leak is not documentation.
+        let text = format!("For example:\nI am now going to run the command for you\n{ENVELOPE}");
+        assert_detected_never_executed(&text);
+        // But a fenced example keeps its phrase before the opener, and the
+        // opener line must not be mistaken for an intervening clause.
+        let fenced = format!("Here is an example of the protocol:\n```json\n{ENVELOPE}\n```");
+        assert!(
+            looks_like_tool_protocol_example(&fenced),
+            "genuine fenced documentation must stay exempt"
+        );
+    }
+
+    #[test]
+    fn chinese_example_noun_keeps_fenced_documentation_exempt() {
+        // The strict phrase list must not narrow what master accepted for
+        // genuine fenced documentation: `例子` is the plain noun "example".
+        let text = format!("```json\n{ENVELOPE}\n```\n这是协议的一个例子。");
+        assert!(looks_like_tool_protocol_example(&text));
+    }
+
+    #[test]
+    fn narration_does_not_exempt_a_fenced_or_tagged_leak() {
+        // Both fence arms take the strict phrase test. "sample" as ordinary
+        // narration is exactly the wording seen in a real leak.
+        let text = format!("```json\n{ENVELOPE}\n```\nI'll create the sample page now.");
+        assert!(
+            !looks_like_tool_protocol_example(&text),
+            "narration must not disguise a fenced leak as documentation"
+        );
+        assert!(embedded_tool_protocol_envelope_mentions_known_tool(
+            &text,
+            &shell_is_known()
+        ));
+    }
+
+    #[test]
+    fn unrelated_example_phrase_does_not_exempt_a_leak() {
+        // The framing must be the clause that ends at the object; "for
+        // example" in an earlier sentence exempts nothing.
+        let text = format!(
+            "For example, the API schema is documented above. Execute this now: {ENVELOPE}"
+        );
+        assert_detected_never_executed(&text);
+        let far = format!(
+            "For example, see the schema. {} Execute this now: {ENVELOPE}",
+            "Details follow. ".repeat(20)
+        );
+        assert_detected_never_executed(&far);
+    }
+
+    #[test]
+    fn adjacent_example_framing_exempts_only_that_object() {
+        let framed = format!("For example, the protocol looks like this: {ENVELOPE}");
+        assert!(looks_like_tool_protocol_example(&framed));
+        // One framed and one unframed object: the reply is not documentation.
+        let mixed =
+            format!("For example, the protocol looks like this: {ENVELOPE} Now run it: {ENVELOPE}");
+        assert!(!looks_like_tool_protocol_example(&mixed));
+        assert_detected_never_executed(&mixed);
+    }
+
+    #[test]
+    fn concatenated_envelopes_are_detected() {
+        assert_detected_never_executed(&format!("Working on it.\n{ENVELOPE}{ENVELOPE}"));
+    }
+
+    #[test]
+    fn every_placement_is_detected_and_never_executed() {
+        // Whether an embedded object is a genuine leak or data the model is
+        // quoting cannot be decided from text, so placement never matters:
+        // after prose, inside valid or malformed JSON, beside tags, in a
+        // quoted transcript tail — all detected, none executed.
+        let cases = [
+            format!("Business payload: [{{\"kind\":\"metadata\"}},{ENVELOPE}]"),
+            format!("Running now: [{ENVELOPE}]"),
+            format!("Running now: [{ENVELOPE}, {ENVELOPE}]"),
+            format!("Export: {{\"result\": {ENVELOPE}}}"),
+            format!("Export: {{\"rows\": [{ENVELOPE}]}}"),
+            format!("Export: [{{\"wrap\": {ENVELOPE}}}]"),
+            format!("Truncated export: [{{\"kind\":\"metadata\"}},{ENVELOPE}"),
+            format!("Export: [\"closed]\", 2026-09-17, {ENVELOPE}]"),
+            format!("Rows: [{{'label': 'a]'}}, {ENVELOPE}]"),
+            format!("Rows: [it's [a, b's], {ENVELOPE}]"),
+            format!("Specs: [5\" screen [x, 6\" ], {ENVELOPE}]"),
+            format!("Rows: ['it\\'s', [1, 'don\\'t'], {ENVELOPE}]"),
+            format!("Export: {{\"result\": {ENVELOPE}, \"cursor\": undefined}}"),
+            format!("Export: {{\"result\": {ENVELOPE}"),
+            format!("Bad dump: [{{\"a\": 1]}}] then {ENVELOPE}"),
+            format!("Range [0, 10) scanned. {ENVELOPE}"),
+            format!("See [the author's notes](https://example.org/notes) first. {ENVELOPE}"),
+            format!("Export: [\"<tool_call>\", \"</tool_call>\", {ENVELOPE}]"),
+            format!("Rows: [{{'a': 1}}, <tool_call>x</tool_call> {ENVELOPE}]"),
+            format!("Export: [{{\"kind\":\"x\"}}, \"<tools>\", \"</tools>\", {ENVELOPE}]"),
+            format!("Rows: <think>[</think> {ENVELOPE}]"),
+            format!("...tail of log: {{\"role\":\"user\"}}, {ENVELOPE}, {{\"role\":\"tool\"}}]}}"),
+            format!("Export: {{\"meta\": {{\"n\": 1}}}}}}, \"result\": {ENVELOPE}}}"),
+            format!("Pair: ({{\"a\": 1}}, {ENVELOPE})"),
+            format!("I'll run it now, it's quick. {ENVELOPE}"),
+        ];
+        for text in &cases {
+            assert_detected_never_executed(text);
+        }
+    }
+
+    #[test]
+    fn envelope_for_an_unknown_tool_is_not_flagged() {
+        let text = format!("Running now: {ENVELOPE}");
+        let (_visible, calls) = parse_tool_calls(&text);
+        assert!(calls.is_empty());
+        let other: HashSet<String> = HashSet::from(["web_search".to_string()]);
+        assert!(!embedded_tool_protocol_envelope_mentions_known_tool(
+            &text, &other
+        ));
+    }
+
+    #[test]
+    fn bare_invocation_object_in_prose_stays_inert() {
+        // A bare invocation object mid-prose is never turned into a call.
+        let text = "To run it manually, send {\"name\":\"shell\",\"arguments\":{\"command\":\"rm -rf /tmp/x\"}} to the API.";
+        let (visible, calls) = parse_tool_calls(text);
+        assert!(calls.is_empty(), "bare invocation dispatched: {calls:?}");
+        assert_eq!(visible, text);
+    }
+
+    #[test]
+    fn embedded_envelope_with_example_context_is_an_example() {
+        let text = "For example, the internal protocol looks like this: {\"content\":null,\"tool_calls\":[{\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\",\"id\":\"call_1\",\"name\":\"shell\"}]} and the runtime parses it.";
+        assert!(looks_like_tool_protocol_example(text));
+    }
+
+    #[test]
+    fn python_stub_only_leak_is_detected_and_never_executed() {
+        let text = "{\"content\":\"Running it now.\",\"tool_code\":\"print(shell(\\\"ls\\\"))\",\"tool_name\":\"shell\"} Running it now.";
+        let with_prose = format!("Let me check that. {text}");
+
+        let (visible, calls) = parse_tool_calls(&with_prose);
+        assert!(calls.is_empty(), "a leaked stub never executes");
+        assert_eq!(
+            visible, with_prose,
+            "text is never altered when nothing runs"
+        );
+
+        let known: HashSet<String> = HashSet::from(["shell".to_string()]);
+        assert!(embedded_tool_protocol_envelope_mentions_known_tool(
+            &with_prose,
+            &known
+        ));
+        let other: HashSet<String> = HashSet::from(["web_search".to_string()]);
+        assert!(!embedded_tool_protocol_envelope_mentions_known_tool(
+            &with_prose,
+            &other
+        ));
+    }
+
+    #[test]
+    fn tool_result_echo_stays_inert() {
+        let text = "The provider then answers with {\"tool_call_id\":\"call_1\",\"content\":\"file contents here\"} on the wire.";
+        let (visible, calls) = parse_tool_calls(text);
+        assert!(calls.is_empty());
+        assert_eq!(visible, text);
+    }
+
+    #[test]
+    fn plain_prose_with_braces_is_untouched() {
+        let text = "Use {curly} braces {like this} in the template.";
+        let (visible, calls) = parse_tool_calls(text);
+        assert!(calls.is_empty());
+        assert_eq!(visible, text);
+    }
+
+    #[test]
+    fn escaped_backslash_before_quote_is_not_repaired() {
+        // `\\'` is VALID JSON (escaped backslash, then a literal quote); the
+        // parity rule must leave it alone.
+        assert!(repair_python_escaped_quotes(r#"{"a":"echo back\\'slash"}"#).is_none());
+        assert!(repair_python_escaped_quotes(r#"{"a":"it\'s"}"#).is_some());
+    }
+
+    #[test]
+    fn repair_offsets_map_spans_back_to_original_bytes() {
+        // A repaired `\'` BEFORE the envelope shifts every later offset by
+        // one; the visited span must still slice exactly the envelope out of
+        // the ORIGINAL text.
+        let text = format!("It\\'s ready.\n{ENVELOPE}\nNext step follows.");
+        let mut spans = Vec::new();
+        for_each_embedded_json_value(&text, &mut |_value, start, end| spans.push(start..end));
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert_eq!(&text[spans[0].clone()], ENVELOPE);
     }
 }
 

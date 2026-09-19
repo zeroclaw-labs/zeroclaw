@@ -965,6 +965,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             provider_request_model,
             &provider_request_messages,
             request_tools,
+            &iteration_tool_specs.known_tool_names,
             should_consume_provider_stream,
             iteration,
         )
