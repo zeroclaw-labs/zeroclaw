@@ -3,7 +3,7 @@
 use super::traits::{
     ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, ProceduralMessage, StoreOptions,
 };
-use crate::sqlite_permissions::harden_sqlite_storage;
+use crate::sqlite_permissions::{check_sqlite_storage, prepare_sqlite_storage};
 use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::Mutex;
@@ -54,10 +54,12 @@ impl<M: Memory> ::zeroclaw_api::attribution::Attributable for AuditedMemory<M> {
 
 impl<M: Memory> AuditedMemory<M> {
     pub fn new(inner: M, workspace_dir: &Path) -> anyhow::Result<Self> {
-        let db_path = workspace_dir.join("memory").join("audit.db");
-        harden_sqlite_storage(&db_path)?;
+        let db_path = prepare_sqlite_storage(workspace_dir, "audit.db")?;
 
-        let conn = Connection::open(&db_path)?;
+        let flags = rusqlite::OpenFlags::default();
+        #[cfg(unix)]
+        let flags = flags | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        let conn = Connection::open_with_flags(&db_path, flags)?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
@@ -73,7 +75,7 @@ impl<M: Memory> AuditedMemory<M> {
              CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON memory_audit(timestamp);
              CREATE INDEX IF NOT EXISTS idx_audit_operation ON memory_audit(operation);",
         )?;
-        harden_sqlite_storage(&db_path)?;
+        check_sqlite_storage(&db_path)?;
 
         Ok(Self {
             inner,
@@ -553,7 +555,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn audited_memory_hardens_existing_audit_storage_permissions() {
+    fn audited_memory_rejects_permissive_storage_and_reopens_after_operator_repair() {
         use std::os::unix::fs::PermissionsExt;
 
         fn mode(path: &Path) -> u32 {
@@ -591,7 +593,18 @@ mod tests {
             }
         }
 
-        let _audited = AuditedMemory::new(NoneMemory::new("none"), tmp.path()).unwrap();
+        assert!(AuditedMemory::new(NoneMemory::new("none"), tmp.path()).is_err());
+        assert_eq!(mode(&db_path), 0o666);
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = crate::sqlite_permissions::sqlite_sidecar_path(&db_path, suffix);
+            if sidecar.exists() {
+                assert_eq!(mode(&sidecar), 0o666);
+                std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let audited = AuditedMemory::new(NoneMemory::new("none"), tmp.path()).unwrap();
+        assert_eq!(audited.audit_count().unwrap(), 1);
 
         assert_eq!(mode(&memory_dir), 0o700);
         assert_eq!(mode(&db_path), 0o600);
