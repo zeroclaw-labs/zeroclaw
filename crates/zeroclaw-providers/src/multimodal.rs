@@ -1476,7 +1476,74 @@ fn normalize_data_uri(source: &str, max_bytes: usize) -> anyhow::Result<String> 
 
     validate_size(source, decoded.len(), max_bytes)?;
 
+    match complete_image_mime_from_magic(&decoded) {
+        None => {
+            return Err(MultimodalError::InvalidMarker {
+                input: source.to_string(),
+                reason: format!("decoded payload is not a recognized image (declared {mime})"),
+            }
+            .into());
+        }
+        Some(sniffed) if sniffed != mime.as_str() => {
+            return Err(MultimodalError::InvalidMarker {
+                input: source.to_string(),
+                reason: format!(
+                    "decoded image signature is {sniffed}, but the marker declared {mime}"
+                ),
+            }
+            .into());
+        }
+        Some(_) => {}
+    }
+
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(decoded)))
+}
+
+/// Sniff decoded data-URI bytes and require the payload to decode as a
+/// complete image of the sniffed type.
+///
+/// [`image_mime_from_magic`] matches leading signature bytes only, so a
+/// truncated fragment — a JPEG SOI plus the APP0 header of a segment it does
+/// not carry, a bare PNG signature — still sniffs as the declared type.
+/// Promoting marker-shaped text out of a tool result needs more than a
+/// prefix: the bytes must decode as an image the provider accepts, otherwise
+/// the marker keeps flowing as text.
+fn complete_image_mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
+    let mime = image_mime_from_magic(bytes)?;
+    let format = match mime {
+        "image/png" => image::ImageFormat::Png,
+        "image/jpeg" => image::ImageFormat::Jpeg,
+        "image/gif" => image::ImageFormat::Gif,
+        "image/webp" => image::ImageFormat::WebP,
+        // BMP is recognized but never accepted by `PROVIDER_IMAGE_MIME_TYPES`,
+        // so callers reject it as a declared-type mismatch before a decode
+        // could matter.
+        _ => return Some(mime),
+    };
+    // A decompression-bomb cap for untrusted bytes, not a content policy.
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
+    reader.limits(limits);
+    match reader.decode() {
+        // Decodability is the whole question: the decoded image is dropped
+        // here, and the original bytes are what travel to the provider.
+        Ok(_) => Some(mime),
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "mime": mime,
+                        "error": error.to_string(),
+                    })),
+                "multimodal: data-URI payload failed to decode as the sniffed image type"
+            );
+            None
+        }
+    }
 }
 
 async fn normalize_remote_image(
@@ -2002,6 +2069,300 @@ mod tests {
         assert_eq!(
             ImageDataUriRejection::MalformedBase64.to_string(),
             "malformed base64 payload"
+        );
+    }
+
+    /// A structurally complete 1x1 PNG — IHDR, IDAT and an exact IEND
+    /// termination: the smallest payload that frames as a PNG through the
+    /// decoded-byte check.
+    const MINIMAL_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+    #[test]
+    fn normalize_data_uri_rejects_truncated_jpeg_fragment() {
+        // The regression payload: canonical base64 that decodes to six bytes —
+        // a JPEG SOI plus the APP0 header of a segment it does not carry.
+        // Prefix sniffing alone would accept it; framing must not.
+        let source = format!("data:image/jpeg;base64,{}", "/9j/4AAQ");
+        let error = normalize_data_uri(&source, TEN_MB).unwrap_err();
+        let reason = match error.downcast_ref::<MultimodalError>() {
+            Some(MultimodalError::InvalidMarker { reason, .. }) => reason.clone(),
+            _ => panic!("truncated JPEG fragment must fail as InvalidMarker"),
+        };
+        assert!(
+            reason.contains("not a recognized image"),
+            "reason should name the failure: {reason}"
+        );
+        assert!(
+            !reason.contains("data:") && !reason.contains("/9j"),
+            "reason must not echo the payload: {reason}"
+        );
+    }
+
+    #[test]
+    fn normalize_data_uri_rejects_jpeg_header_without_frame() {
+        // The maintainer's named false positive: SOI plus a complete 16-byte
+        // APP0 JFIF segment plus EOI. Every byte of container framing is
+        // here, but there is no SOF, no SOS and no entropy data, so the
+        // payload is not an image any decoder would accept.
+        let jpeg: &[u8] = &[
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x00,
+            0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
+        ];
+        let source = format!("data:image/jpeg;base64,{}", STANDARD.encode(jpeg));
+        let error = normalize_data_uri(&source, TEN_MB).unwrap_err();
+        let reason = match error.downcast_ref::<MultimodalError>() {
+            Some(MultimodalError::InvalidMarker { reason, .. }) => reason.clone(),
+            _ => panic!("header-only JPEG must fail as InvalidMarker"),
+        };
+        assert!(
+            reason.contains("not a recognized image"),
+            "reason should name the failure: {reason}"
+        );
+        assert!(
+            !reason.contains("data:") && !reason.contains("/9j"),
+            "reason must not echo the payload: {reason}"
+        );
+    }
+
+    #[test]
+    fn normalize_data_uri_rejects_png_without_idat() {
+        // Signature + IHDR (with a valid CRC) + IEND: the chunk walk of the
+        // old framing check ended exactly at IEND and accepted it. A decoder
+        // gets past the header and fails: there is no IDAT, so no image data.
+        let mut png: Vec<u8> = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n'];
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&[
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00,
+        ]);
+        png.extend_from_slice(&[0x1F, 0x15, 0xC4, 0x89]);
+        png.extend_from_slice(&0u32.to_be_bytes());
+        png.extend_from_slice(b"IEND");
+        png.extend_from_slice(&[0xAE, 0x42, 0x60, 0x82]);
+        let source = format!("data:image/png;base64,{}", STANDARD.encode(&png));
+        let error = normalize_data_uri(&source, TEN_MB).unwrap_err();
+        let reason = match error.downcast_ref::<MultimodalError>() {
+            Some(MultimodalError::InvalidMarker { reason, .. }) => reason.clone(),
+            _ => panic!("PNG without IDAT must fail as InvalidMarker"),
+        };
+        assert!(
+            reason.contains("not a recognized image"),
+            "reason should name the failure: {reason}"
+        );
+        assert!(
+            !reason.contains("data:") && !reason.contains("iVBOR"),
+            "reason must not echo the payload: {reason}"
+        );
+    }
+
+    #[test]
+    fn normalize_data_uri_rejects_gif_without_image_descriptor() {
+        // `GIF89a` + a 7-byte logical screen descriptor + the 0x3B trailer:
+        // header, descriptor and trailer are the whole file, which is all the
+        // old framing check asked for. No image descriptor, no image data.
+        let gif: &[u8] = &[
+            b'G', b'I', b'F', b'8', b'9', b'a', 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x3B,
+        ];
+        let source = format!("data:image/gif;base64,{}", STANDARD.encode(gif));
+        let error = normalize_data_uri(&source, TEN_MB).unwrap_err();
+        let reason = match error.downcast_ref::<MultimodalError>() {
+            Some(MultimodalError::InvalidMarker { reason, .. }) => reason.clone(),
+            _ => panic!("GIF without an image descriptor must fail as InvalidMarker"),
+        };
+        assert!(
+            reason.contains("not a recognized image"),
+            "reason should name the failure: {reason}"
+        );
+        assert!(
+            !reason.contains("data:") && !reason.contains("R0lGOD"),
+            "reason must not echo the payload: {reason}"
+        );
+    }
+
+    #[test]
+    fn normalize_data_uri_rejects_webp_without_bitstream() {
+        // `RIFF` + size + `WEBP` + four zero bytes, with the RIFF size
+        // accounting for every remaining byte: the container declares its
+        // own extent, which is all the old framing check verified. There is
+        // no VP8/VP8L/VP8X chunk, so no bitstream to decode.
+        let mut webp: Vec<u8> = Vec::new();
+        webp.extend_from_slice(b"RIFF");
+        webp.extend_from_slice(&8u32.to_le_bytes());
+        webp.extend_from_slice(b"WEBP");
+        webp.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        let source = format!("data:image/webp;base64,{}", STANDARD.encode(&webp));
+        let error = normalize_data_uri(&source, TEN_MB).unwrap_err();
+        let reason = match error.downcast_ref::<MultimodalError>() {
+            Some(MultimodalError::InvalidMarker { reason, .. }) => reason.clone(),
+            _ => panic!("WebP without a bitstream must fail as InvalidMarker"),
+        };
+        assert!(
+            reason.contains("not a recognized image"),
+            "reason should name the failure: {reason}"
+        );
+        assert!(
+            !reason.contains("data:") && !reason.contains("UklGR"),
+            "reason must not echo the payload: {reason}"
+        );
+    }
+
+    /// Encode a solid red 1x1 image in the given format, so accept-path
+    /// tests ride payloads a real encoder produced (and a real decoder
+    /// accepts) instead of hand-built byte stubs.
+    fn encoded_1x1(format: image::ImageFormat) -> Vec<u8> {
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([255, 0, 0, 255]),
+        ));
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut cursor, format)
+            .expect("1x1 test image should encode");
+        cursor.into_inner()
+    }
+
+    #[test]
+    fn normalize_data_uri_accepts_decodable_png() {
+        let source = format!(
+            "data:image/png;base64,{}",
+            STANDARD.encode(encoded_1x1(image::ImageFormat::Png))
+        );
+        let normalized = normalize_data_uri(&source, TEN_MB)
+            .unwrap_or_else(|error| panic!("decodable PNG must pass: {error}"));
+        assert_eq!(normalized, source);
+    }
+
+    #[test]
+    fn normalize_data_uri_accepts_decodable_jpeg() {
+        let source = format!(
+            "data:image/jpeg;base64,{}",
+            STANDARD.encode(encoded_1x1(image::ImageFormat::Jpeg))
+        );
+        let normalized = normalize_data_uri(&source, TEN_MB)
+            .unwrap_or_else(|error| panic!("decodable JPEG must pass: {error}"));
+        assert_eq!(normalized, source);
+    }
+
+    #[test]
+    fn normalize_data_uri_accepts_decodable_gif() {
+        let source = format!(
+            "data:image/gif;base64,{}",
+            STANDARD.encode(encoded_1x1(image::ImageFormat::Gif))
+        );
+        let normalized = normalize_data_uri(&source, TEN_MB)
+            .unwrap_or_else(|error| panic!("decodable GIF must pass: {error}"));
+        assert_eq!(normalized, source);
+    }
+
+    #[test]
+    fn normalize_data_uri_accepts_decodable_webp() {
+        let source = format!(
+            "data:image/webp;base64,{}",
+            STANDARD.encode(encoded_1x1(image::ImageFormat::WebP))
+        );
+        let normalized = normalize_data_uri(&source, TEN_MB)
+            .unwrap_or_else(|error| panic!("decodable WebP must pass: {error}"));
+        assert_eq!(normalized, source);
+    }
+
+    #[test]
+    fn normalize_data_uri_rejects_signature_that_disagrees_with_declaration() {
+        // A framed PNG declared as JPEG is rejected, not re-labelled: a marker
+        // lifted out of arbitrary tool text has no provenance, so the bytes
+        // and the declaration must agree.
+        let source = format!("data:image/jpeg;base64,{MINIMAL_PNG_B64}");
+        let error = normalize_data_uri(&source, TEN_MB).unwrap_err();
+        let reason = match error.downcast_ref::<MultimodalError>() {
+            Some(MultimodalError::InvalidMarker { reason, .. }) => reason.clone(),
+            _ => panic!("sniffed/declared mismatch must fail as InvalidMarker"),
+        };
+        assert!(
+            reason.contains("image/png") && reason.contains("image/jpeg"),
+            "reason should name both types: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_keeps_truncated_tool_result_marker_as_text() {
+        // The reported scenario: a text-returning tool printed marker-shaped
+        // text whose payload decodes but does not frame an image. The tool
+        // result must stay textual — the skipped-image note replaces the
+        // marker — so nothing image-shaped reaches the provider.
+        let marker = format!("[{}:{}]", "IMAGE", "data:image/jpeg;base64,/9j/4AAQ");
+        let native_tool_content = serde_json::json!({
+            "tool_call_id": "call_shell",
+            "content": format!("rg done\n{marker}"),
+        })
+        .to_string();
+
+        let prepared = prepare_messages_for_provider(
+            &[ChatMessage::tool(native_tool_content)],
+            &MultimodalConfig::default(),
+        )
+        .await
+        .expect("marker-shaped text must not fail preparation");
+
+        assert!(!prepared.contains_images);
+        let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
+            .expect("native tool result must remain valid JSON");
+        assert_eq!(
+            value.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("call_shell")
+        );
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content should remain a JSON string");
+        assert!(inner.contains("rg done"));
+        assert!(
+            inner.contains("1 attached image(s) could not be loaded"),
+            "the skipped-image note is the safe textual representation: {inner}"
+        );
+        assert!(
+            !inner.contains(IMAGE_MARKER_PREFIX),
+            "no marker may survive: {inner}"
+        );
+        assert!(
+            !inner.contains("data:image"),
+            "no image payload may survive: {inner}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_promotes_framed_tool_result_image_marker() {
+        // The other side of the boundary: a tool result whose marker decodes
+        // to a framed image of the declared type still rides as an image
+        // marker for the provider to lift.
+        let marker = format!("[{}:data:image/png;base64,{}]", "IMAGE", MINIMAL_PNG_B64);
+        let native_tool_content = serde_json::json!({
+            "tool_call_id": "call_snapshot",
+            "content": format!("snapshot captured\n{marker}"),
+        })
+        .to_string();
+
+        let prepared = prepare_messages_for_provider(
+            &[ChatMessage::tool(native_tool_content)],
+            &MultimodalConfig::default(),
+        )
+        .await
+        .expect("a framed tool-result image must prepare");
+
+        assert!(prepared.contains_images);
+        let value: serde_json::Value = serde_json::from_str(&prepared.messages[0].content)
+            .expect("native tool result must remain valid JSON");
+        assert_eq!(
+            value.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("call_snapshot")
+        );
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content should remain a JSON string");
+        assert!(inner.contains("snapshot captured"));
+        assert!(
+            inner.contains("data:image/png;base64,"),
+            "the promoted marker rides inside the tool content: {inner}"
         );
     }
 

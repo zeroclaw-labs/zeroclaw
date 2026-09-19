@@ -306,6 +306,7 @@ mod graceful_summary_metering_tests {
     use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
     use crate::agent::turn::LoopKnobs;
     use async_trait::async_trait;
+    use base64::Engine as _;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -772,9 +773,21 @@ mod graceful_summary_metering_tests {
     async fn graceful_summary_normalizes_local_and_inline_tool_image_markers() {
         let temp = tempfile::tempdir().expect("temp dir");
         let png_path = temp.path().join("shot.png");
-        std::fs::write(&png_path, [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
-            .expect("write png signature");
-        let inline_uri = "data:image/png;base64,iVBORw0KGgo=";
+        // A structurally complete 1x1 PNG (IHDR + IDAT + IEND): data-URI
+        // preparation decodes the payload before promoting it, so a bare
+        // signature prefix would be kept as text and never reach the provider.
+        let minimal_png: &[u8] = &[
+            0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 0x00, 0x00, 0x00, 0x0d, b'I', b'H',
+            b'D', b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, b'I', b'D', b'A', b'T', 0x78,
+            0xda, 0x63, 0x64, 0x60, 0xf8, 0x5f, 0x0f, 0x00, 0x02, 0x87, 0x01, 0x80, 0xeb, 0x47,
+            0xba, 0x92, 0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(&png_path, minimal_png).expect("write png");
+        let inline_uri = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(minimal_png)
+        );
         let inline_marker = format!("[{}:{}]", "IMAGE", inline_uri);
         let local_marker = format!("[{}:{}]", "IMAGE", png_path.display());
 
