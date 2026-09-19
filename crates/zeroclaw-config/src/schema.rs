@@ -15722,6 +15722,28 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default = "default_true")]
     pub per_user_session: bool,
+    /// When true in Telegram group chats, unaddressed messages that pass
+    /// sender/chat authorization are recorded as passive conversation context
+    /// without starting an agent turn. Lets the bot follow the discussion and
+    /// answer with full context when later @-mentioned. Default: `false`.
+    ///
+    /// Recording passive messages requires `mention_only = true`: with the
+    /// default `mention_only = false` the bot already answers every
+    /// authorized group message, so no unaddressed message is left to record.
+    ///
+    /// Shared history is not gated that way. Enabling this flag puts every
+    /// group/topic message on one shared session, the way
+    /// `per_user_session = false` does, whatever `mention_only` says and
+    /// whatever `per_user_session` says, because an observation filed in the
+    /// observed member's own session could never answer the participant who
+    /// later @-mentions the bot. Members therefore share conversation
+    /// context and the session-scoped controls that come with it, so any
+    /// member's `/new` resets the history for the whole group/topic.
+    /// Scheduling stays personal: message debouncing, `/stop` and
+    /// interruption still key on the sender.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub passive_group_context: bool,
     /// Override for the top-level `ack_reactions` setting. When `None`, the
     /// channel falls back to `[channels].ack_reactions`. When set
     /// explicitly, it takes precedence.
@@ -15768,6 +15790,7 @@ impl Default for TelegramConfig {
             interrupt_on_new_message: false,
             mention_only: false,
             per_user_session: true,
+            passive_group_context: false,
             ack_reactions: None,
             proxy_url: None,
             approval_timeout_secs: default_telegram_approval_timeout_secs(),
@@ -29971,6 +29994,7 @@ auto_save = true
                         interrupt_on_new_message: false,
                         mention_only: false,
                         per_user_session: true,
+                        passive_group_context: false,
                         ack_reactions: None,
                         proxy_url: None,
                         approval_timeout_secs: default_telegram_approval_timeout_secs(),
@@ -31659,6 +31683,7 @@ default_temperature = 0.7
             interrupt_on_new_message: true,
             mention_only: false,
             per_user_session: true,
+            passive_group_context: false,
             ack_reactions: None,
             proxy_url: None,
             approval_timeout_secs: 120,
@@ -31696,6 +31721,19 @@ stream_mode = "single_message"
         .unwrap_err();
 
         assert!(err.to_string().contains("single_message"));
+    }
+
+    #[test]
+    async fn telegram_config_passive_group_context_defaults_off() {
+        let parsed: TelegramConfig = serde_json::from_str(r#"{"bot_token":"t"}"#).unwrap();
+        assert!(!parsed.passive_group_context);
+    }
+
+    #[test]
+    async fn telegram_config_passive_group_context_deserializes_true() {
+        let parsed: TelegramConfig =
+            serde_json::from_str(r#"{"bot_token":"t","passive_group_context":true}"#).unwrap();
+        assert!(parsed.passive_group_context);
     }
 
     #[test]
@@ -37310,6 +37348,7 @@ high_entropy_tokens = false
                 interrupt_on_new_message: false,
                 mention_only: false,
                 per_user_session: true,
+                passive_group_context: false,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: default_telegram_approval_timeout_secs(),
