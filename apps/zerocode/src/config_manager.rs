@@ -2380,6 +2380,50 @@ impl App {
 
     // ── Field list ───────────────────────────────────────────────
 
+    async fn complete_field_list(&mut self) -> Result<()> {
+        let agent_alias = match &self.screen {
+            Screen::FieldList { prefix, .. } => prefix
+                .strip_prefix("agents.")
+                .filter(|alias| !alias.is_empty())
+                .map(str::to_owned),
+            _ => None,
+        };
+        if let Some(agent_alias) = agent_alias {
+            let result = self.rpc.config_validate(Some(&agent_alias)).await?;
+            if !result.valid {
+                self.status_msg = Some(crate::i18n::t_args(
+                    "zc-config-status-validation-failed",
+                    &[(
+                        "err",
+                        result
+                            .error
+                            .as_deref()
+                            .unwrap_or("unknown validation error"),
+                    )],
+                ));
+                return Ok(());
+            }
+        }
+
+        let screen = std::mem::replace(&mut self.screen, Screen::SectionList);
+        if let Screen::FieldList {
+            section_idx,
+            prefix,
+            breadcrumb,
+            ..
+        } = screen
+        {
+            if self.is_typed_family_root_field_list(section_idx, &prefix) {
+                self.screen = Screen::TypeList { section_idx };
+            } else if breadcrumb.len() >= 2 {
+                self.restore_alias_list_from_field_back(section_idx, breadcrumb)
+                    .await?;
+            }
+        }
+        self.status_msg = None;
+        Ok(())
+    }
+
     async fn handle_field_list(&mut self, key: KeyEvent, term: &mut Term) -> Result<()> {
         // Composite tabs get their own handler; only ←/→/Esc fall through.
         if self.is_composite_tab() {
@@ -2435,22 +2479,7 @@ impl App {
                 return Ok(());
             }
             Some(ConfigTabAction::Back | ConfigTabAction::TabLeft) => {
-                let screen = std::mem::replace(&mut self.screen, Screen::SectionList);
-                if let Screen::FieldList {
-                    section_idx,
-                    prefix,
-                    breadcrumb,
-                    ..
-                } = screen
-                {
-                    if self.is_typed_family_root_field_list(section_idx, &prefix) {
-                        self.screen = Screen::TypeList { section_idx };
-                    } else if breadcrumb.len() >= 2 {
-                        self.restore_alias_list_from_field_back(section_idx, breadcrumb)
-                            .await?;
-                    }
-                }
-                self.status_msg = None;
+                self.complete_field_list().await?;
             }
             Some(ConfigTabAction::Up) => {
                 if let Some(pos) = visible.iter().position(|&i| i == self.field_cursor) {
@@ -2572,31 +2601,7 @@ impl App {
                 return Ok(());
             }
             Some(ConfigTabAction::Back | ConfigTabAction::TabLeft) => {
-                // Back to alias list (reuse the normal Esc logic).
-                let screen = std::mem::replace(&mut self.screen, Screen::SectionList);
-                if let Screen::FieldList {
-                    section_idx,
-                    breadcrumb,
-                    ..
-                } = screen
-                    && breadcrumb.len() >= 2
-                {
-                    let mut bc = breadcrumb;
-                    bc.pop();
-                    let section_key = &self.sections[section_idx].key;
-                    let map_path = if bc.len() == 1 {
-                        section_key.clone()
-                    } else {
-                        format!("{}.{}", section_key, bc[1..].join("."))
-                    };
-                    self.load_aliases(&map_path).await?;
-                    self.screen = Screen::AliasList {
-                        section_idx,
-                        map_path,
-                        breadcrumb: bc,
-                    };
-                }
-                self.status_msg = None;
+                self.complete_field_list().await?;
                 return Ok(());
             }
             Some(ConfigTabAction::Up) => {
@@ -2835,30 +2840,7 @@ impl App {
                 return Ok(());
             }
             Some(ConfigTabAction::Back | ConfigTabAction::TabLeft) => {
-                let screen = std::mem::replace(&mut self.screen, Screen::SectionList);
-                if let Screen::FieldList {
-                    section_idx,
-                    breadcrumb,
-                    ..
-                } = screen
-                    && breadcrumb.len() >= 2
-                {
-                    let mut bc = breadcrumb;
-                    bc.pop();
-                    let section_key = &self.sections[section_idx].key;
-                    let map_path = if bc.len() == 1 {
-                        section_key.clone()
-                    } else {
-                        format!("{}.{}", section_key, bc[1..].join("."))
-                    };
-                    self.load_aliases(&map_path).await?;
-                    self.screen = Screen::AliasList {
-                        section_idx,
-                        map_path,
-                        breadcrumb: bc,
-                    };
-                }
-                self.status_msg = None;
+                self.complete_field_list().await?;
                 return Ok(());
             }
             Some(ConfigTabAction::Up) => {
@@ -5079,6 +5061,78 @@ mod tests {
         App::new(rpc, std::path::Path::new("/tmp"))
     }
 
+    /// Builds a [`Term`] that never queries the real terminal.
+    ///
+    /// `Terminal::new` uses `Viewport::Fullscreen`, which asks the backend for
+    /// its size; over a `Stdout` backend that is a `TIOCGWINSZ` ioctl against
+    /// the process's terminal. Under a test harness stdout is a pipe or
+    /// `/dev/null`, so the query has no terminal to answer it and construction
+    /// is at the mercy of how the runner happens to wire up stdout.
+    ///
+    /// `Viewport::Fixed` takes the area verbatim and skips the size query
+    /// entirely (see `Terminal::with_options`), so the handlers under test get
+    /// a real `Term` with deterministic geometry and no environmental
+    /// dependency. Writes still go to stdout and are swallowed by the harness;
+    /// these tests assert on `App` state, never on rendered bytes.
+    fn headless_term() -> Term {
+        Terminal::with_options(
+            WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 120, 40)),
+            },
+        )
+        .expect("Viewport::Fixed skips the terminal size query, so this cannot fail")
+    }
+
+    fn test_manager_with_config_validation(
+        valid: bool,
+        error: Option<&str>,
+    ) -> (
+        App,
+        tokio::task::JoinHandle<()>,
+        Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        use crate::jsonrpc::RpcOutbound;
+        use tokio::sync::mpsc;
+
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let responder = Arc::clone(&outbound);
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded_requests = Arc::clone(&requests);
+        let error = error.map(str::to_string);
+        let task = tokio::spawn(async move {
+            while let Some(raw) = rx.recv().await {
+                let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                let id = request["id"].as_str().unwrap();
+                if request["method"] == "config/validate" {
+                    recorded_requests
+                        .lock()
+                        .unwrap()
+                        .push(request["params"].clone());
+                }
+                let result = match request["method"].as_str().unwrap() {
+                    "config/validate" if valid => serde_json::json!({ "valid": true }),
+                    "config/validate" => serde_json::json!({
+                        "valid": false,
+                        "error": error,
+                    }),
+                    "config/map-keys" => serde_json::json!({ "keys": [] }),
+                    method => panic!("unexpected RPC method: {method}"),
+                };
+                responder.dispatch_response(id, Some(result), None);
+            }
+        });
+        (
+            App::new(
+                Arc::new(RpcClient::with_rpc(outbound)),
+                std::path::Path::new("/tmp"),
+            ),
+            task,
+            requests,
+        )
+    }
+
     fn entry_with_cost(key: &str, cost_category: &str) -> ConfigSectionEntry {
         ConfigSectionEntry {
             key: key.to_string(),
@@ -5289,6 +5343,140 @@ mod tests {
             matches!(mgr.screen, Screen::TypeList { section_idx: 0 }),
             "Left on the leftmost alias tab walks out to the type list like Back"
         );
+    }
+
+    #[tokio::test]
+    async fn agent_field_back_validates_and_stays_when_invalid() {
+        let validation_error =
+            "agents.worker.risk_profile must reference a configured risk profile";
+        let (mut mgr, responder, requests) =
+            test_manager_with_config_validation(false, Some(validation_error));
+        mgr.sections = vec![entry_with_cost("agents", "")];
+        mgr.screen = Screen::FieldList {
+            section_idx: 0,
+            prefix: "agents.worker".into(),
+            breadcrumb: vec!["agents".into(), "worker".into()],
+        };
+        let mut term = headless_term();
+
+        mgr.handle_field_list(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut term)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            mgr.screen,
+            Screen::FieldList {
+                ref prefix,
+                ..
+            } if prefix == "agents.worker"
+        ));
+        assert!(
+            mgr.status_msg
+                .as_deref()
+                .is_some_and(|message| message.contains(validation_error))
+        );
+        assert_eq!(
+            requests.lock().unwrap().as_slice(),
+            &[serde_json::json!({ "agent": "worker" })]
+        );
+        responder.abort();
+    }
+
+    #[tokio::test]
+    async fn agent_field_back_validates_and_returns_to_alias_list_when_valid() {
+        let (mut mgr, responder, requests) = test_manager_with_config_validation(true, None);
+        mgr.sections = vec![entry_with_cost("agents", "")];
+        mgr.screen = Screen::FieldList {
+            section_idx: 0,
+            prefix: "agents.worker".into(),
+            breadcrumb: vec!["agents".into(), "worker".into()],
+        };
+        let mut term = headless_term();
+
+        mgr.handle_field_list(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut term)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            mgr.screen,
+            Screen::AliasList {
+                ref map_path,
+                ..
+            } if map_path == "agents"
+        ));
+        assert_eq!(
+            requests.lock().unwrap().as_slice(),
+            &[serde_json::json!({ "agent": "worker" })]
+        );
+        responder.abort();
+    }
+
+    #[tokio::test]
+    async fn personality_tab_cannot_bypass_invalid_agent_completion() {
+        let validation_error = "agents.worker.risk_profile is required";
+        let (mut mgr, responder, _requests) =
+            test_manager_with_config_validation(false, Some(validation_error));
+        mgr.sections = vec![entry_with_cost("agents", "")];
+        mgr.screen = Screen::FieldList {
+            section_idx: 0,
+            prefix: "agents.worker".into(),
+            breadcrumb: vec!["agents".into(), "worker".into()],
+        };
+        mgr.tab_names = vec![ConfigTab::Personality];
+        mgr.active_tab = 0;
+        let mut term = headless_term();
+
+        mgr.handle_field_list(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut term)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            mgr.screen,
+            Screen::FieldList {
+                ref prefix,
+                ..
+            } if prefix == "agents.worker"
+        ));
+        assert!(
+            mgr.status_msg
+                .as_deref()
+                .is_some_and(|message| message.contains(validation_error))
+        );
+        responder.abort();
+    }
+
+    #[tokio::test]
+    async fn skills_tab_cannot_bypass_invalid_agent_completion() {
+        let validation_error = "agents.worker.model_provider is required";
+        let (mut mgr, responder, _requests) =
+            test_manager_with_config_validation(false, Some(validation_error));
+        mgr.sections = vec![entry_with_cost("agents", "")];
+        mgr.screen = Screen::FieldList {
+            section_idx: 0,
+            prefix: "agents.worker".into(),
+            breadcrumb: vec!["agents".into(), "worker".into()],
+        };
+        mgr.tab_names = vec![ConfigTab::Skills];
+        mgr.active_tab = 0;
+        let mut term = headless_term();
+
+        mgr.handle_field_list(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut term)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            mgr.screen,
+            Screen::FieldList {
+                ref prefix,
+                ..
+            } if prefix == "agents.worker"
+        ));
+        assert!(
+            mgr.status_msg
+                .as_deref()
+                .is_some_and(|message| message.contains(validation_error))
+        );
+        responder.abort();
     }
 
     fn field_with_value(kind: PropKind, value: &str, populated: bool) -> ConfigFieldEntry {
