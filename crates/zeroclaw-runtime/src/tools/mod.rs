@@ -2031,19 +2031,7 @@ pub fn all_tools_with_runtime_and_acp_sessions(
                     if root_config.pipeline.enabled {
                         registered_names.insert(PipelineTool::NAME.to_string());
                     }
-                    let plugin_limits = zeroclaw_plugins::component::PluginLimits {
-                        call_fuel: config.plugins.limits.call_fuel,
-                        max_memory_bytes: config
-                            .plugins
-                            .limits
-                            .max_memory_mb
-                            .saturating_mul(1024 * 1024),
-                        max_table_elements: config.plugins.limits.max_table_elements,
-                        max_instances: config.plugins.limits.max_instances,
-                        call_timeout: std::time::Duration::from_millis(
-                            config.plugins.limits.call_timeout_ms,
-                        ),
-                    };
+                    let plugin_limits = crate::plugin_runtime::plugin_limits(&config);
                     let egress_service =
                         plugin_egress_service(Arc::clone(&config), live_config.clone());
                     register_plugin_tools(

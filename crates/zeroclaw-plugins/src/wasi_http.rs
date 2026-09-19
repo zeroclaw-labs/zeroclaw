@@ -107,7 +107,52 @@ fn dns_failure() -> ErrorCode {
 /// instance. The destination host and the boundary's reason are recorded
 /// host-side — the operator needs both to seed a grant — while only the guest's
 /// error is masked.
-fn record_denial(id: &PluginInstanceId, host: &str, reason: &str) {
+/// The operator-facing next step for a missing grant: the exact command that
+/// grants this instance reach to the refused host. `config set` replaces the
+/// whole `egress_hosts` list, so an operator with existing grants should add
+/// this host to them rather than run this verbatim — but naming the key, the
+/// field, and the host turns a bare deny into an actionable fix. Kept separate
+/// from [`record_denial`] so its format is unit-testable without a log capture.
+/// Returns `None` only if the instance identity cannot be encoded (it always
+/// can for an admitted instance).
+fn egress_grant_remedy(id: &PluginInstanceId, host: &str) -> Option<String> {
+    let key = id.config_entry_key().ok()?;
+    Some(format!(
+        "grant reach with: zeroclaw config set plugins.entries.{key}.egress_hosts '[\"{host}\"]'"
+    ))
+}
+
+/// The remedy for a granted host that resolved to a private, loopback or
+/// link-local address: the grant is in place, what is missing is the
+/// per-host `egress_allow_private` carveout.
+fn egress_private_remedy(id: &PluginInstanceId, host: &str) -> Option<String> {
+    let key = id.config_entry_key().ok()?;
+    Some(format!(
+        "the host is granted but resolves to a private, loopback or link-local address; allow that address class for it with: zeroclaw config set plugins.entries.{key}.egress_allow_private '[\"{host}\"]'"
+    ))
+}
+
+/// The remedy that matches what the policy refused, or `None` when no
+/// configuration change would help.
+///
+/// A missing destination grant is fixed by `egress_hosts`; a granted host that
+/// resolved into private address space needs `egress_allow_private` as well,
+/// and telling the operator to add the grant again would leave the request
+/// denied. A missing manifest permission, a cloud-metadata address, a
+/// malformed destination or a DNS failure have no config-set fix, so those
+/// carry no command at all rather than a misleading one.
+fn egress_remedy(id: &PluginInstanceId, host: &str, error: &EgressError) -> Option<String> {
+    match error {
+        EgressError::DestinationNotGranted { .. } => egress_grant_remedy(id, host),
+        EgressError::Network(
+            NetworkGuardError::PrivateHostDenied(_)
+            | NetworkGuardError::PrivateNetworkDenied { .. },
+        ) => egress_private_remedy(id, host),
+        _ => None,
+    }
+}
+
+fn record_denial(id: &PluginInstanceId, host: &str, reason: &str, remedy: Option<String>) {
     ::zeroclaw_log::record!(
         WARN,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -118,6 +163,7 @@ fn record_denial(id: &PluginInstanceId, host: &str, reason: &str) {
                 "binding": id.binding(),
                 "host": host,
                 "reason": reason,
+                "remedy": remedy,
                 "error_key": "plugin_egress_denied",
             })),
         "Denied plugin outbound request by egress policy"
@@ -549,10 +595,13 @@ impl WasiHttpHooks for PluginEgressHooks {
         // looked up: a store that links `wasi:http` without a host-owned egress
         // service reaches nothing.
         let Some(service) = self.egress.clone() else {
+            // No configuration grants reach to a store that was built without
+            // an egress service, so there is no operator command to print.
             record_denial(
                 self.scope.id(),
                 &host,
                 "no egress policy granted for this instance",
+                None,
             );
             return Ok(HostFutureIncomingResponse::ready(Ok(Err(denied()))));
         };
@@ -573,7 +622,7 @@ impl WasiHttpHooks for PluginEgressHooks {
             // A malformed destination never becomes a request, so it never
             // reaches DNS. The guest still sees only the masked denial.
             Err(error) => {
-                record_denial(self.scope.id(), &host, &error.to_string());
+                record_denial(self.scope.id(), &host, &error.to_string(), None);
                 return Ok(HostFutureIncomingResponse::ready(Ok(Err(denied()))));
             }
         };
@@ -677,7 +726,9 @@ async fn send(
                 return Err(match error {
                     EgressError::DnsFailed { .. }
                     | EgressError::Network(NetworkGuardError::NoAddresses { .. }) => {
-                        record_denial(&id, &host, &error.to_string());
+                        // The destination may well be granted; a grant does
+                        // not repair a name that did not resolve.
+                        record_denial(&id, &host, &error.to_string(), None);
                         dns_failure()
                     }
                     // A full budget is a ceiling the guest hit, not a verdict on
@@ -687,7 +738,8 @@ async fn send(
                         connection_limit_reached()
                     }
                     _ => {
-                        record_denial(&id, &host, &error.to_string());
+                        let remedy = egress_remedy(&id, &host, &error);
+                        record_denial(&id, &host, &error.to_string(), remedy);
                         denied()
                     }
                 });
@@ -866,6 +918,151 @@ mod tests {
             [PluginPermission::HttpClient],
         );
         PluginEgressHooks::new(scope, egress)
+    }
+
+    #[test]
+    fn egress_grant_remedy_names_the_key_field_and_host() {
+        // A denied instance's operator-facing next step must be a runnable
+        // command that names the exact grant row, the field, and the host —
+        // otherwise the denial is a dead end.
+        let scope = crate::instance::test_scope(
+            PluginCapability::Tool,
+            "main",
+            [PluginPermission::HttpClient],
+        );
+        let id = scope.id();
+        let key = id
+            .config_entry_key()
+            .expect("an admitted instance has a config-entry key");
+        let remedy = egress_grant_remedy(id, "api.example.com")
+            .expect("an admitted instance always yields a remedy");
+        assert!(
+            remedy.contains(&key),
+            "remedy must name the exact config-entry key: {remedy}"
+        );
+        assert!(
+            remedy.contains("plugins.entries."),
+            "remedy must target the plugins.entries path: {remedy}"
+        );
+        assert!(
+            remedy.contains("egress_hosts"),
+            "remedy must name the egress_hosts field: {remedy}"
+        );
+        assert!(
+            remedy.contains("api.example.com"),
+            "remedy must name the denied host: {remedy}"
+        );
+        assert!(
+            remedy.contains("config set"),
+            "remedy must be a runnable config-set command: {remedy}"
+        );
+    }
+
+    /// The remedy names the field each refusal actually needs, and is absent
+    /// where no config change would help: a granted host that resolved into
+    /// private address space must be pointed at `egress_allow_private`, not
+    /// told to add a grant it already has.
+    #[test]
+    fn egress_remedy_matches_the_refusal() {
+        let scope = crate::instance::test_scope(
+            PluginCapability::Tool,
+            "main",
+            [PluginPermission::HttpClient],
+        );
+        let id = scope.id();
+        let host = "gitea.internal.example";
+
+        let not_granted = EgressError::DestinationNotGranted {
+            instance: "main".to_string(),
+            host: host.to_string(),
+        };
+        let remedy = egress_remedy(id, host, &not_granted).expect("a missing grant has a fix");
+        assert!(
+            remedy.contains("egress_hosts") && !remedy.contains("egress_allow_private"),
+            "{remedy}"
+        );
+
+        let private = EgressError::Network(NetworkGuardError::PrivateNetworkDenied {
+            host: host.to_string(),
+            reason: "resolved to 10.0.0.5".to_string(),
+        });
+        let remedy = egress_remedy(id, host, &private).expect("a private address has a fix");
+        assert!(
+            remedy.contains(&format!(".egress_allow_private '[\"{host}\"]'")),
+            "the private case must name the carveout field and the host: {remedy}"
+        );
+        let literal = EgressError::Network(NetworkGuardError::PrivateHostDenied(host.to_string()));
+        assert!(
+            egress_remedy(id, host, &literal).is_some_and(|r| r.contains("egress_allow_private"))
+        );
+
+        for no_fix in [
+            EgressError::DnsFailed {
+                host: host.to_string(),
+                port: 443,
+                reason: "no such host".to_string(),
+            },
+            EgressError::Network(NetworkGuardError::NoAddresses {
+                host: host.to_string(),
+                port: 443,
+            }),
+            EgressError::Network(NetworkGuardError::CloudMetadata {
+                host: host.to_string(),
+                reason: "metadata endpoint".to_string(),
+            }),
+            EgressError::PermissionDenied {
+                transport: crate::egress::EgressTransport::Http { encrypted: true },
+                permission: PluginPermission::HttpClient,
+            },
+        ] {
+            assert!(
+                egress_remedy(id, host, &no_fix).is_none(),
+                "no config-set command repairs {no_fix}"
+            );
+        }
+    }
+
+    /// Through the real policy: a host that is granted but not carved out
+    /// resolves into loopback space, is refused as a private-network denial,
+    /// and the remedy for that refusal names `egress_allow_private`.
+    #[tokio::test]
+    async fn a_granted_private_host_without_the_carveout_is_pointed_at_allow_private() {
+        let scope = crate::instance::test_scope(
+            PluginCapability::Tool,
+            "main",
+            [PluginPermission::HttpClient],
+        );
+        let policy = EgressPolicy::new(&["127.0.0.1".to_string()], &[], &[], 16)
+            .expect("a loopback grant is a valid policy");
+        let service = EgressHostService::with_private_connection_accounting(
+            EgressPolicyResolver::new(move |_| Ok(policy.clone())),
+        );
+        let request = crate::egress::EgressRequest::new(
+            scope.clone(),
+            crate::egress::EgressTransport::Http { encrypted: false },
+            "127.0.0.1",
+            80,
+        )
+        .expect("a loopback destination is a valid request");
+        let error = service
+            .authorize(request)
+            .await
+            .expect_err("granted but not carved out must be refused");
+        // A literal loopback host is refused up front as a private host; a
+        // granted name that resolves into private space is refused after
+        // resolution. Both are the same operator situation.
+        assert!(
+            matches!(
+                error,
+                EgressError::Network(
+                    NetworkGuardError::PrivateHostDenied(_)
+                        | NetworkGuardError::PrivateNetworkDenied { .. }
+                )
+            ),
+            "{error}"
+        );
+        let remedy = egress_remedy(scope.id(), "127.0.0.1", &error).expect("has a fix");
+        assert!(remedy.contains("egress_allow_private"), "{remedy}");
     }
 
     fn request(uri: &str) -> hyper::Request<HyperOutgoingBody> {

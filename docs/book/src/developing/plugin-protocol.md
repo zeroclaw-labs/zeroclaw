@@ -182,8 +182,21 @@ or treating registry metadata as proof that code was installed.
 
 `zeroclaw plugin install <name>` resolves the name from the registry, downloads
 the selected zip archive, verifies the optional SHA-256 digest, safely extracts
-the archive, and then hands the extracted plugin directory to the existing
-`PluginHost::install` path. Local path installs are unchanged:
+the archive, and then hands the extracted plugin directory to the same
+admission path a local install uses. Admission (`PluginHost::admit_source`)
+parses and signature-checks the manifest, validates its shape and config,
+refuses a name that is already installed, and reads the component once into a
+host-owned staging file without following symlinks. The CLI then runs the
+install-time load check against that staged file: the same instantiation the
+daemon performs at startup, so a component built against a drifted WIT fails
+at install with its full diagnostic instead of being skipped silently later.
+`plugin install --no-verify` skips the load check entirely (nothing is
+compiled) and prints a note; it does not bypass admission. A host built
+without a WASM backend has nothing to instantiate against and installs without
+the check. Installation (`PluginHost::install_admitted`) then persists the
+admitted manifest bytes and moves the staged component into place, so what
+was verified is byte for byte what the daemon will load. Local path installs
+follow the same sequence:
 
 When no version is pinned, ZeroClaw chooses the last matching entry in the
 registry index, so registry publishers should order repeated names
