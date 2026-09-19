@@ -28,6 +28,17 @@ struct SessionSlot {
 pub struct SessionGuard {
     _permit: OwnedSemaphorePermit,
     _registration: PendingRegistration,
+    /// The session this guard admits. Lets admission-aware helpers (e.g.
+    /// `SessionStore::insert_admitted`) verify the caller holds the permit
+    /// for the session it is about to mutate.
+    session_id: String,
+}
+
+impl SessionGuard {
+    /// The session id whose admission permit this guard owns.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
 }
 
 struct PendingRegistration {
@@ -128,6 +139,7 @@ impl SessionActorQueue {
                 Ok(SessionGuard {
                     _permit: permit,
                     _registration: registration,
+                    session_id: session_id.to_string(),
                 })
             }
             Ok(Err(_)) | Err(_) => Err(SessionQueueError::Timeout {

@@ -278,6 +278,9 @@ pub enum SessionUpdate {
         timeout_secs: u64,
     },
     /// Emitted once per LLM call with current context size and configured limit.
+    /// `max_context_tokens` is the preemptive-trim budget the bar fills toward;
+    /// `model_context_window` is the model's full capacity, used as the bar
+    /// denominator when present so the trim budget can be drawn as a marker.
     ContextUsage {
         session_id: String,
         input_tokens: Option<u64>,
@@ -6185,6 +6188,27 @@ mod notification_tests {
         });
         let update = parse_session_update(&params).unwrap();
         assert!(matches!(update, SessionUpdate::ApprovalRequest { .. }));
+    }
+
+    #[test]
+    fn parse_context_usage_keeps_budget_and_model_window_distinct() {
+        let params = serde_json::json!({
+            "type": "context_usage",
+            "session_id": "s-context",
+            "input_tokens": 100_000,
+            "max_context_tokens": 180_000,
+            "model_context_window": 200_000
+        });
+
+        assert!(matches!(
+            parse_session_update(&params),
+            Some(SessionUpdate::ContextUsage {
+                session_id,
+                input_tokens: Some(100_000),
+                max_context_tokens: Some(180_000),
+                model_context_window: Some(200_000),
+            }) if session_id == "s-context"
+        ));
     }
 
     #[test]

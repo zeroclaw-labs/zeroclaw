@@ -1067,7 +1067,7 @@ pub async fn run_gateway_with_plugin_webhooks(
                 sop_engine.clone(),
                 sop_audit.clone(),
                 None,
-            );
+            )?;
             let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
                 config: &config,
                 agent_alias,
@@ -1201,7 +1201,7 @@ pub async fn run_gateway_with_plugin_webhooks(
             sop_engine.clone(),
             sop_audit.clone(),
             None,
-        );
+        )?;
         // Same gated seam as the dashboard seed above, so this listing shows
         // the agent's policy-filtered set (filter + MCP). The tools are only
         // enumerated for their specs, never invoked, so the returned channel

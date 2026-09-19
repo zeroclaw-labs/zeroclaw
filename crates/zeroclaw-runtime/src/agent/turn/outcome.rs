@@ -6,6 +6,21 @@ use std::sync::{Arc, Mutex};
 /// Returns Some((model_provider, model)) if a switch was requested, None otherwise.
 pub type ModelSwitchCallback = Arc<Mutex<Option<(String, String)>>>;
 
+/// The provider/model and resolved limits that actually served the most recent
+/// LLM call in a tool loop. Written every dispatching iteration so the last
+/// value is the FINAL serving route — including a per-call vision switch that
+/// differs from the turn's selected text route.
+#[derive(Clone, Debug)]
+pub struct ServedRoute {
+    pub provider_name: String,
+    pub model: String,
+    pub context_limits: zeroclaw_config::schema::ResolvedContextLimits,
+}
+
+/// Shared sink a caller hands the loop to observe the final serving route.
+/// `None` on paths that do not return serving-route metadata (tests, sub-turns).
+pub type ServedRouteSink = Arc<Mutex<Option<ServedRoute>>>;
+
 tokio::task_local! {
     /// Pending model switch for one active tool loop. The loop owns this state;
     /// tools only borrow the current task-local handle while they execute.

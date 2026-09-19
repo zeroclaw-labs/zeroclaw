@@ -216,6 +216,7 @@ fn outcome_from_task_result(
             response,
             new_messages,
             safeguard_fallback,
+            ..
         }) => Ok(TurnOutcome::Completed {
             text: response,
             messages: new_messages,
@@ -622,6 +623,9 @@ mod tests {
             Ok(StreamedTurnSuccess {
                 response: "accepted response".into(),
                 new_messages: messages.clone(),
+                provider_name: "requested-provider".into(),
+                model: "requested-model".into(),
+                final_context_limits: None,
                 safeguard_fallback: Some(safeguard),
             }),
             "accepted response".into(),
@@ -1323,7 +1327,7 @@ mod tests {
         use crate::rpc::dispatch::forward_turn_event;
         use tokio::sync::mpsc;
         use zeroclaw_api::jsonrpc::RpcOutbound;
-        use zeroclaw_config::schema::{Config, MemoryConfig};
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, MemoryConfig};
 
         // Build a config with a known context_window for the provider.
         let mut config = Config::default();
@@ -1334,6 +1338,16 @@ mod tests {
             .expect("ensure provider entry");
         provider_entry.context_window = Some(128_000);
         provider_entry.model = Some("w1-model".to_string());
+        config.agents.insert(
+            "rpc-w1".to_string(),
+            AliasedAgentConfig {
+                model_provider: zeroclaw_config::providers::ModelProviderRef::new("openai.default"),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let agent_config = config
+            .resolved_agent_config("rpc-w1")
+            .expect("test agent config should resolve");
 
         let memory_cfg = MemoryConfig {
             backend: "none".into(),
@@ -1401,18 +1415,9 @@ mod tests {
             .model_name("w1-model".into())
             .model_provider_name("openai.default".into())
             .agent_alias("rpc-w1".into())
+            .config(agent_config)
             .build()
             .expect("agent builder should succeed");
-
-        // Use parking_lot::RwLock for config so that .read() returns the
-        // guard directly (no Result wrapping), matching the existing
-        // drain-callback pattern in the matrix test.
-        let cfg_arc: Arc<parking_lot::RwLock<Config>> = Arc::new(parking_lot::RwLock::new(config));
-        let cfg_for_cb = Arc::clone(&cfg_arc);
-
-        // Resolve max_context_tokens from the config using the public
-        // Config method (context_usage_max_tokens is private to dispatch).
-        let max_ctx = cfg_arc.read().effective_max_context_tokens("rpc-w1") as u64;
 
         // Drive the turn through execute_turn, forwarding each event
         // through the real RPC boundary using forward_turn_event.
@@ -1432,26 +1437,9 @@ mod tests {
             None,
             move |event| {
                 let rpc = Arc::clone(&rpc);
-                let cfg = Arc::clone(&cfg_for_cb);
                 async move {
-                    // Resolve model_context_window per event from the embedded
-                    // provider_ref (only Usage events carry it).
-                    let model_ctx_window = if let TurnEvent::Usage {
-                        provider_ref,
-                        model,
-                        ..
-                    } = &event
-                    {
-                        let cfg = cfg.read();
-                        cfg.model_provider_context_window_opt(provider_ref, model)
-                            .map(|v| v as u64)
-                    } else {
-                        None
-                    };
-
                     // Forward through the real RPC boundary.
-                    forward_turn_event(&rpc, "w1-test", &event, Some(max_ctx), model_ctx_window)
-                        .await;
+                    forward_turn_event(&rpc, "w1-test", &event).await;
                 }
             },
         )

@@ -496,7 +496,7 @@ async fn handle_socket(
     }
 
     let mut agent =
-        match zeroclaw_runtime::agent::Agent::from_live_config_with_session_cwd_and_mcp_backchannel(
+        match zeroclaw_runtime::agent::Agent::from_pinned_live_config_with_session_cwd_and_mcp_backchannel(
             Arc::clone(&state.config),
             &agent_alias,
             Some(&session_cwd),
@@ -1017,6 +1017,54 @@ fn is_observability_telemetry(event: &serde_json::Value) -> bool {
     event.get("source").and_then(serde_json::Value::as_str) == Some("observability")
 }
 
+fn resolve_done_context_limits(
+    usage_budget: Option<u64>,
+    usage_model_window: Option<u64>,
+    active_limits: zeroclaw_config::schema::ResolvedContextLimits,
+) -> (u64, Option<u64>) {
+    (
+        usage_budget.unwrap_or(active_limits.context_token_budget as u64),
+        usage_model_window.or_else(|| {
+            active_limits
+                .configured_model_context_window()
+                .map(|tokens| tokens as u64)
+        }),
+    )
+}
+
+/// Terminal-frame budget/window for the `done` event.
+///
+/// `final_limits` is the route that actually served the LAST call, carried out
+/// of the turn loop. When present it is AUTHORITATIVE and overrides the
+/// usage-derived values, which can be stale: an earlier usage-bearing route
+/// before a final no-usage call (e.g. a vision reply without token usage) would
+/// otherwise leave the frame on the earlier route's numbers. Only when no call
+/// was served this turn (a cache hit) does `final_limits` become `None`, and the
+/// frame falls back to the usage values, then to `fallback_limits`.
+fn done_frame_context_limits(
+    final_limits: Option<zeroclaw_config::schema::ResolvedContextLimits>,
+    usage_budget: Option<u64>,
+    usage_model_window: Option<u64>,
+    fallback_limits: Option<zeroclaw_config::schema::ResolvedContextLimits>,
+) -> (u64, Option<u64>) {
+    match final_limits {
+        Some(limits) => (
+            limits.context_token_budget as u64,
+            limits.configured_model_context_window().map(|t| t as u64),
+        ),
+        None => resolve_done_context_limits(
+            usage_budget,
+            usage_model_window,
+            fallback_limits.unwrap_or(zeroclaw_config::schema::ResolvedContextLimits {
+                model_context_window: zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+                context_token_budget: 0,
+                model_context_window_source:
+                    zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
+            }),
+        ),
+    }
+}
+
 /// Per-provider usage snapshot in the `usage_by_provider` done-frame array.
 /// Tracks ALL billable attempts (accepted + rejected Reliable attempts).
 /// The scalar `cost_usd` in the done frame is the sum of `usage_by_provider[*].cost_usd`,
@@ -1048,6 +1096,8 @@ struct UsageFold {
     last_provider_ref: Option<String>,
     last_model: Option<String>,
     last_input_tokens: Option<u64>,
+    last_context_token_budget: Option<u64>,
+    last_model_context_window: Option<u64>,
     usage_by_provider: std::collections::HashMap<(String, String), ProviderUsageEntry>,
 }
 
@@ -1058,6 +1108,8 @@ impl UsageFold {
             cached_input_tokens,
             output_tokens,
             cost_usd,
+            context_token_budget,
+            model_context_window,
             provider_ref,
             model: served_model,
             accepted,
@@ -1078,6 +1130,8 @@ impl UsageFold {
         if accepted {
             self.last_provider_ref = Some(provider_ref.clone());
             self.last_model = Some(served_model.clone());
+            self.last_context_token_budget = context_token_budget;
+            self.last_model_context_window = model_context_window;
             if let Some(it) = input_tokens {
                 self.last_input_tokens = Some(it);
             } else {
@@ -1235,11 +1289,6 @@ async fn process_chat_message(
             zeroclaw_runtime::agent::cost::TurnUsage::default(),
         ))
     });
-
-    let max_context_tokens = {
-        let cfg = state.config.read();
-        cfg.effective_max_context_tokens(&turn_alias) as u64
-    };
 
     // Broadcast agent_start event
     let _ = state.event_tx.send(serde_json::json!({
@@ -1685,38 +1734,26 @@ async fn process_chat_message(
             // the breakdown the single source of truth.
             let cost_usd = UsageFold::total_cost_usd(&usage_by_provider_vec);
 
-            // Resolve context_window from the last-served provider's config.
-            // The served model must match the entry's configured primary model;
-            // fallback/vision/override models omit the window so clients fall
-            // back to the trim budget instead of understating fullness.
-            // Use the last served model from usage events when available so
-            // the terminal metadata is one coherent tuple with the provider.
-            let effective_model = usage_fold.last_model.as_deref().unwrap_or(&turn_model);
-            let model_context_window = if let Some(ref provider_ref) = usage_fold.last_provider_ref
-            {
-                state
-                    .config
-                    .read()
-                    .model_provider_context_window_opt(provider_ref, effective_model)
-                    .map(|v| v as u64)
-            } else {
-                let (_, live_provider, live_model) = agent.attribution_fields();
-                if live_provider.is_empty() {
-                    None
-                } else {
-                    state
-                        .config
-                        .read()
-                        .model_provider_context_window_opt(&live_provider, &live_model)
-                        .map(|v| v as u64)
-                }
-            };
-            // Full provider_ref for the done frame: last served ref when
-            // available, otherwise fall back to the turn-start provider label.
+            let active_provider = outcome.provider_name.clone();
+            let active_model = outcome.model.clone();
+            // The route that actually served the FINAL call is authoritative for
+            // the terminal frame (see `done_frame_context_limits`). Resolve from
+            // the final route only when no call was served (e.g. a cache hit).
+            let fallback_limits = outcome
+                .final_context_limits
+                .is_none()
+                .then(|| agent.context_limits_for_route(&active_provider, &active_model));
+            let (max_context_tokens, model_context_window) = done_frame_context_limits(
+                outcome.final_context_limits,
+                usage_fold.last_context_token_budget,
+                usage_fold.last_model_context_window,
+                fallback_limits,
+            );
+            let effective_model = usage_fold.last_model.as_deref().unwrap_or(&active_model);
             let provider_ref_full = usage_fold
                 .last_provider_ref
                 .as_deref()
-                .unwrap_or(&provider_label);
+                .unwrap_or(&active_provider);
             let meta = DoneFrameMeta {
                 full_response: &outcome.response,
                 input_tokens: usage_fold.total_input_tokens,
@@ -1900,6 +1937,117 @@ mod tests {
                 .contains(diagnostic),
             "WebSocket delivery must not fall back to the diagnostic when Fluent supplies text"
         );
+    }
+
+    #[test]
+    fn done_context_limits_prefer_active_usage_route() {
+        let stale_startup_limits = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: 200_000,
+            context_token_budget: 180_000,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+        };
+        assert_eq!(
+            resolve_done_context_limits(Some(7_200), Some(8_000), stale_startup_limits),
+            (7_200, Some(8_000)),
+            "the done frame must report the route that produced the usage event"
+        );
+    }
+
+    #[test]
+    fn done_context_limits_fall_back_to_agent_active_route_without_usage() {
+        let active_limits = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: 8_000,
+            context_token_budget: 0,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+        };
+        assert_eq!(
+            resolve_done_context_limits(None, None, active_limits),
+            (0, Some(8_000)),
+        );
+    }
+
+    #[test]
+    fn done_context_limits_omit_unknown_compatibility_capacity() {
+        let active_limits = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+            context_token_budget: 16_000,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
+        };
+        assert_eq!(
+            resolve_done_context_limits(None, None, active_limits),
+            (16_000, None),
+        );
+    }
+
+    // B4: the final served route overrides stale usage values in the terminal
+    // frame. A route switch after an earlier usage-bearing call (a no-usage
+    // vision reply) must report the FINAL route, not the earlier one.
+    #[test]
+    fn done_frame_prefers_final_served_route_over_stale_usage() {
+        let final_vision = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: 8_000,
+            context_token_budget: 7_200,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+        };
+        // Earlier usage-bearing text route left 180k/200k on the wire trackers.
+        assert_eq!(
+            done_frame_context_limits(Some(final_vision), Some(180_000), Some(200_000), None),
+            (7_200, Some(8_000)),
+            "a final no-usage vision route must override the earlier text route's usage numbers"
+        );
+    }
+
+    // B4: with no served call (cache hit), the frame falls back to usage values,
+    // then to the resolved fallback route — preserving legacy behavior.
+    #[test]
+    fn done_frame_falls_back_when_no_call_served() {
+        let fallback = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: 200_000,
+            context_token_budget: 180_000,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+        };
+        // No final route, no usage: fall back to the resolved route.
+        assert_eq!(
+            done_frame_context_limits(None, None, None, Some(fallback)),
+            (180_000, Some(200_000)),
+        );
+        // No final route but usage present: usage wins (legacy path).
+        assert_eq!(
+            done_frame_context_limits(None, Some(7_200), Some(8_000), Some(fallback)),
+            (7_200, Some(8_000)),
+        );
+    }
+
+    #[test]
+    fn usage_less_final_route_clears_the_previous_context_fill() {
+        let mut fold = UsageFold::default();
+        fold.apply(usage_event(
+            "openai.default",
+            "model-a",
+            Some(1_024),
+            None,
+            Some(64),
+            None,
+            true,
+        ));
+        fold.apply(usage_event(
+            "openai.default",
+            "model-a",
+            None,
+            None,
+            Some(32),
+            None,
+            true,
+        ));
+
+        assert_eq!(fold.total_input_tokens, Some(1_024));
+        assert_eq!(fold.total_output_tokens, Some(96));
+        assert_eq!(fold.last_input_tokens, None);
     }
 
     #[test]
@@ -2987,7 +3135,7 @@ data: {\"type\":\"message_stop\"}\n\n",
         // expected_max_context_tokens)
         let cases: &[(&str, Option<usize>, Option<u64>, u64)] = &[
             // Provider has no context_window — field must be absent.
-            ("openrouter.default", None, None, 128_000),
+            ("openrouter.default", None, None, 32_000),
             // Provider sets context_window — field must appear on the wire.
             (
                 "openrouter.glm-5.2",
@@ -3036,10 +3184,9 @@ data: {\"type\":\"message_stop\"}\n\n",
                 ..Config::default()
             };
 
-            let max_ctx = cfg.effective_max_context_tokens("coder") as u64;
-            let model_ctx_window = cfg
-                .model_provider_context_window_opt(provider_alias, "glm-5.2")
-                .map(|v| v as u64);
+            let limits = cfg.resolved_context_limits_for_route("coder", provider_alias, "glm-5.2");
+            let max_ctx = limits.context_token_budget as u64;
+            let model_ctx_window = limits.configured_model_context_window().map(|v| v as u64);
             assert_eq!(
                 model_ctx_window, expected_window,
                 "model_provider_context_window_opt({provider_alias}) must return {expected_window:?}"
@@ -3149,16 +3296,16 @@ data: {\"type\":\"message_stop\"}\n\n",
                 ..Config::default()
             };
 
-            let model_ctx_window = cfg
-                .model_provider_context_window_opt(live_provider_ref, "glm-5.2")
-                .map(|v| v as u64);
+            let limits =
+                cfg.resolved_context_limits_for_route("coder", live_provider_ref, "glm-5.2");
+            let model_ctx_window = limits.configured_model_context_window().map(|v| v as u64);
             assert_eq!(
                 model_ctx_window,
                 Some(1_000_000),
                 "resolver must return B's window for {label}, not A's"
             );
 
-            let max_ctx = cfg.effective_max_context_tokens("coder") as u64;
+            let max_ctx = limits.context_token_budget as u64;
             let meta = DoneFrameMeta {
                 full_response: "ok",
                 input_tokens: Some(100),
@@ -3265,15 +3412,14 @@ data: {\"type\":\"message_stop\"}\n\n",
 
         let effective_model = fold.last_model.as_deref().unwrap_or("model-a");
         let provider_ref = fold.last_provider_ref.as_deref().unwrap();
-        let model_ctx_window = cfg
-            .model_provider_context_window_opt(provider_ref, effective_model)
-            .map(|v| v as u64);
+        let limits = cfg.resolved_context_limits_for_route("coder", provider_ref, effective_model);
+        let model_ctx_window = limits.configured_model_context_window().map(|v| v as u64);
         assert!(
             model_ctx_window.is_none(),
             "gateway must omit window when served model differs from configured primary"
         );
 
-        let max_ctx = cfg.effective_max_context_tokens("coder") as u64;
+        let max_ctx = limits.context_token_budget as u64;
         let meta = DoneFrameMeta {
             full_response: "ok",
             input_tokens: Some(1000),
@@ -3295,7 +3441,7 @@ data: {\"type\":\"message_stop\"}\n\n",
             v.get("model_context_window").is_none(),
             "done-frame must omit model_context_window on same-profile fallback"
         );
-        assert_eq!(v["max_context_tokens"], 800_000);
+        assert_eq!(v["max_context_tokens"], 32_000);
         assert_eq!(v["last_serving_model"], "model-b");
     }
 
@@ -3359,6 +3505,8 @@ data: {\"type\":\"message_stop\"}\n\n",
             cached_input_tokens,
             output_tokens,
             cost_usd,
+            context_token_budget: None,
+            model_context_window: None,
             provider_ref: provider_ref.to_string(),
             model: model.to_string(),
             accepted,
