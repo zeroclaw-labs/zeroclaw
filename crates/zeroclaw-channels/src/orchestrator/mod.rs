@@ -14719,6 +14719,7 @@ pub async fn start_channels_with_plugin_webhooks(
             true,
             config.channels.show_tool_calls,
             runtime.shell_profile().as_ref(),
+            true,
         );
         if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
@@ -22856,6 +22857,7 @@ BTC is currently around $65,000 based on latest tool output."#
             true,
             false,
             None,
+            true,
         );
         let callable = prompt
             .split_once("<callable_tools")
@@ -29174,6 +29176,7 @@ BTC is currently around $65,000 based on latest tool output."#
             false,
             false,
             None,
+            true,
         );
         if expose_text_protocol {
             let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
@@ -29238,6 +29241,7 @@ BTC is currently around $65,000 based on latest tool output."#
             false,
             false,
             None,
+            true,
         );
 
         assert!(!prompt.contains("<callable_tools"));
@@ -29730,6 +29734,7 @@ BTC is currently around $65,000 based on latest tool output."#
             false,
             false,
             None,
+            true,
         );
 
         assert!(
@@ -29764,6 +29769,7 @@ BTC is currently around $65,000 based on latest tool output."#
             false,
             false,
             None,
+            true,
         );
 
         assert!(
