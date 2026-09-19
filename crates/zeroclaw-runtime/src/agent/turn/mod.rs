@@ -1682,6 +1682,16 @@ fn sop_step_excluded_tools(
 #[derive(Clone, Copy)]
 pub struct SopStepReassembly<'a> {
     pub config: &'a zeroclaw_config::schema::Config,
+    /// The per-run caller ceiling in force for the loop that owns this handle,
+    /// forwarded so a re-assembled step agent cannot recover tools the caller
+    /// was never granted. Carrying it here — rather than re-deriving it from
+    /// the step agent's own config — is what makes the bound descend
+    /// monotonically: each nested assembly is capped by what the level above
+    /// actually received, not by what the step agent's profile would allow on
+    /// its own. `Some` only on the `run` path, the one entry point that has a
+    /// caller allowlist; every other construction site has no caller ceiling to
+    /// forward and passes `None`.
+    pub caller_allowed: Option<&'a [String]>,
 }
 
 /// The re-assembly gate: a step needs its own agent context re-assembled when
@@ -1756,6 +1766,7 @@ pub(crate) async fn assemble_owned_execution(
     sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
     sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
     parent_approval: Option<&crate::approval::ApprovalManager>,
+    caller_allowed: Option<&[String]>,
 ) -> Result<OwnedAgentExecution> {
     let security = Arc::new(crate::security::SecurityPolicy::for_agent(config, alias)?);
     // The one canonical per-agent runtime-knob surface: identity plus every
@@ -1819,6 +1830,17 @@ pub(crate) async fn assemble_owned_execution(
         Some(sop_engine),
         sop_audit,
         None,
+        // The step agent's scheduler tools need the ceiling's VALUE, not just
+        // membership in it: `caller_allowed` decides which tools this step is
+        // offered, but a job it stores outlives the step entirely. Without this
+        // the step agent would hold a `cron_add` that persists the step agent's
+        // own registry — the same escape, one hop further out.
+        caller_allowed.map(|list| {
+            let handle: crate::tools::caller_ceiling::CallerCeiling =
+                Arc::new(std::sync::OnceLock::new());
+            let _ = handle.set(list.to_vec());
+            handle
+        }),
     );
     let skills = crate::skills::load_skills_for_agent_from_config(config, alias);
     // Capture before `runtime` is moved into `ScopedAssembly` below.
@@ -1836,7 +1858,12 @@ pub(crate) async fn assemble_owned_execution(
             built,
             skills: &skills,
             runtime,
-            caller_allowed: None,
+            // The caller ceiling reaches BOTH the built-in filter and the MCP
+            // tool-access policy through this one field, so forwarding it here
+            // also caps eager MCP registration and the runtime `tool_search`
+            // activation channel — the surfaces a step agent would otherwise
+            // use to grow back into capabilities its caller never had.
+            caller_allowed,
             connect_mcp: true,
             // A nested SOP step re-assembly is per turn (memoized per alias);
             // it has no cross-turn reuse contract, so the per-call
@@ -2058,6 +2085,7 @@ async fn drive_live_sop_actions(
                                     Arc::clone(&queued.engine),
                                     queued.audit.clone(),
                                     approval,
+                                    reassembly.caller_allowed,
                                 )
                                 .await
                                 {
@@ -2895,12 +2923,14 @@ mod sop_step_reassembly_tests {
             SopConfig::default(),
         )));
 
-        let reader = assemble_owned_execution(&config, "reader", Arc::clone(&engine), None, None)
-            .await
-            .expect("reader assembles");
-        let writer = assemble_owned_execution(&config, "writer", Arc::clone(&engine), None, None)
-            .await
-            .expect("writer assembles");
+        let reader =
+            assemble_owned_execution(&config, "reader", Arc::clone(&engine), None, None, None)
+                .await
+                .expect("reader assembles");
+        let writer =
+            assemble_owned_execution(&config, "writer", Arc::clone(&engine), None, None, None)
+                .await
+                .expect("writer assembles");
         let reader_names = tool_names(&reader.tools_registry);
         let writer_names = tool_names(&writer.tools_registry);
 
@@ -2983,6 +3013,7 @@ mod sop_step_reassembly_tests {
             Arc::clone(&engine),
             None,
             Some(&parent),
+            None,
         )
         .await
         .expect("restricted assembles");
@@ -3451,7 +3482,10 @@ mod sop_step_reassembly_tests {
     async fn cross_agent_step_never_sends_parent_history_to_child_provider() {
         let (engine, run_id, action) = start_single_cross_agent_step("stepper");
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            caller_allowed: None,
+        };
 
         let requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3548,7 +3582,10 @@ mod sop_step_reassembly_tests {
 
         let (engine, run_id, action) = start_single_cross_agent_step("stepper");
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            caller_allowed: None,
+        };
 
         let requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3641,7 +3678,10 @@ mod sop_step_reassembly_tests {
     async fn cross_agent_step_stamps_effective_identity_with_parent_correlation() {
         let (engine, run_id, action) = start_single_cross_agent_step("stepper");
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            caller_allowed: None,
+        };
 
         let requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3700,7 +3740,10 @@ mod sop_step_reassembly_tests {
     async fn same_agent_step_keeps_shared_history_and_identity() {
         let (engine, run_id, action) = start_single_cross_agent_step("outer");
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            caller_allowed: None,
+        };
 
         let observer = IdentityCapture::default();
         let parent_provider = TextProvider;
@@ -3751,7 +3794,10 @@ mod sop_step_reassembly_tests {
     async fn same_agent_step_output_reaches_parent_capture_once() {
         let (engine, _run_id, action) = start_single_cross_agent_step("outer");
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            caller_allowed: None,
+        };
 
         let observer = IdentityCapture::default();
         let parent_provider = TextProvider;
@@ -3803,7 +3849,10 @@ mod sop_step_reassembly_tests {
         let (engine, run_id, action) = start_single_cross_agent_step("stepper");
         // Bare config: no "stepper" agent exists, so assembly must fail.
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            caller_allowed: None,
+        };
 
         let shell_calls = Arc::new(AtomicUsize::new(0));
         let parent_tools =
@@ -3999,7 +4048,10 @@ mod sop_step_reassembly_tests {
     async fn cross_agent_step_model_switch_never_leaks_into_parent_loop() {
         let (engine, run_id, action) = start_single_cross_agent_step("stepper");
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            caller_allowed: None,
+        };
 
         let mut exec_cache = std::collections::HashMap::new();
         let mut stepper_agent = zeroclaw_config::schema::AliasedAgentConfig::default();

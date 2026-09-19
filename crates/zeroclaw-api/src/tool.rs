@@ -367,6 +367,19 @@ pub fn invocation_trigger_matches(haystack_lower: &str, trigger_lower: &str) -> 
 
 #[async_trait]
 pub trait Tool: Send + Sync + crate::attribution::Attributable {
+    /// Downcast hook for the rare caller that must reason about a concrete
+    /// tool type instead of the trait object.
+    ///
+    /// Defaults to `None`, so no implementation is forced to opt in and the
+    /// absence of an override is a refusal rather than a gap. The bounded
+    /// delegation rebuild uses it to ask an MCP tool which server owns it,
+    /// resolved against the registry the instance itself carries - the only
+    /// authoritative answer, since a prefixed name cannot be parsed back into
+    /// a server whose own name may contain the separator.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+
     /// Tool name (used in LLM function calling)
     fn name(&self) -> &str;
 

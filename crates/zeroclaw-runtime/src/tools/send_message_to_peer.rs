@@ -22,6 +22,16 @@ pub struct SendMessageToPeerTool {
     config: Arc<Config>,
     sender_alias: String,
     description: String,
+    /// Tool names the RECIPIENT's turn may be offered, published by whoever
+    /// built this instance for a bounded delegate target.
+    ///
+    /// `None` is a top-level caller: there is no ceiling to carry, and the
+    /// recipient is assembled from its own configuration as before. `Some` is
+    /// a bounded target, and the cell is filled once the caller's registry
+    /// has actually been sealed. A `Some` that is still empty when the tool
+    /// runs is a wiring failure, and refusing is the only safe reading — same
+    /// contract as `SpawnSubagentTool::caller_ceiling`.
+    caller_ceiling: Option<crate::tools::caller_ceiling::CallerCeiling>,
 }
 
 impl SendMessageToPeerTool {
@@ -32,7 +42,19 @@ impl SendMessageToPeerTool {
             config,
             sender_alias,
             description,
+            caller_ceiling: None,
         }
+    }
+
+    /// Bind the ceiling a bounded sender's relayed peer turn must stay
+    /// within.
+    #[must_use]
+    pub fn with_caller_ceiling(
+        mut self,
+        ceiling: Option<crate::tools::caller_ceiling::CallerCeiling>,
+    ) -> Self {
+        self.caller_ceiling = ceiling;
+        self
     }
 }
 
@@ -187,6 +209,31 @@ impl Tool for SendMessageToPeerTool {
                 .cloned()
                 .unwrap_or_else(|| target.clone());
 
+            // Carry the sender's own ceiling into the recipient's assembly.
+            // `process_message` threads this into `ScopedAssembly::caller_allowed`
+            // the same way `agent::run` already does for `spawn_subagent`'s
+            // child — without it, the recipient is rebuilt from its own full
+            // risk profile and recovers whatever the sender's bounded turn was
+            // supposed to have taken away.
+            let allowed_tools = match self.caller_ceiling.as_ref() {
+                None => None,
+                Some(cell) => match cell.get() {
+                    Some(names) => Some(names.clone()),
+                    None => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: ToolOutput::default(),
+                            error: Some(
+                                "send_message_to_peer: refused — a delegated caller \
+                                 ceiling was declared but never published, so the \
+                                 recipient's turn cannot be bounded"
+                                    .into(),
+                            ),
+                        });
+                    }
+                },
+            };
+
             let cfg = (*self.config).clone();
             let sender = self.sender_alias.clone();
             let recipient_alias = canonical.clone();
@@ -207,6 +254,7 @@ impl Tool for SendMessageToPeerTool {
                     &recipient_alias,
                     &body,
                     None,
+                    allowed_tools,
                     zeroclaw_api::ingress::TurnOrigin::AgentDirect,
                 ));
                 if let Err(e) = deliver_peer_turn_with_cost_scope(cost_ctx, turn_usage, turn).await
@@ -892,9 +940,51 @@ mod tests {
     /// A local Ollama-shaped HTTP server stands in for the network so the
     /// recipient's turn completes deterministically without a real model
     /// provider dependency.
-    #[tokio::test]
-    async fn peer_turn_cost_scope_through_execute_boundary_attributes_recipient_and_shares_budget()
-    {
+    ///
+    /// Driven on a runtime with an enlarged worker stack, same pattern and
+    /// same size already used by the `bounded_delegate_*` integration tests
+    /// for the same class of issue: this call graph (`execute()` -> detached
+    /// spawn -> `process_message` -> full registry assembly -> agent turn
+    /// loop) is deep enough to overflow the harness's default per-thread
+    /// stack, but only under load — it always passed run in isolation, and
+    /// only failed running inside the full `--lib` suite alongside
+    /// thousands of other tests (confirmed on Linux, both in CI and in a
+    /// local reproduction outside CI; `RUST_MIN_STACK=64MiB` made the same
+    /// full-suite run pass clean). Not a regression in this test's own
+    /// logic — the accumulated size of the registry-assembly/agent-turn
+    /// call graph crossed the harness's default margin.
+    #[test]
+    fn peer_turn_cost_scope_through_execute_boundary_attributes_recipient_and_shares_budget() {
+        // `worker_threads(1)`: the inner body's completion-polling loop
+        // (`tokio::task::yield_now()` in a bounded loop) depends on the
+        // single-worker cooperative scheduling `#[tokio::test]`'s default
+        // `current_thread` flavor gave it — the mock server task, the
+        // recipient's detached turn, and the polling loop take turns on
+        // ONE worker rather than running as true parallel racers. A plain
+        // multi-thread runtime (several real workers) does still resolve
+        // the stack overflow, but exposes a genuine race the single-worker
+        // scheduling was masking: the polling loop can exhaust its 20 000
+        // yields before the recipient's turn, now scheduled independently
+        // on another worker, gets to run at all. One worker keeps the
+        // original scheduling semantics; only the per-worker stack grows.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .thread_stack_size(64 * 1024 * 1024)
+            .build()
+            .expect("test runtime builds");
+        runtime.block_on(async {
+            zeroclaw_spawn::spawn!(
+                peer_turn_cost_scope_through_execute_boundary_attributes_recipient_and_shares_budget_inner(
+                )
+            )
+            .await
+            .expect("chain task joins")
+        });
+    }
+
+    async fn peer_turn_cost_scope_through_execute_boundary_attributes_recipient_and_shares_budget_inner()
+     {
         use crate::agent::turn::provider_call::enforce_tool_loop_budget;
         use crate::cost::CostTracker;
         use axum::{Json, Router, extract::State, routing::post};

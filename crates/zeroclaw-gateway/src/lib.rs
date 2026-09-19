@@ -1067,6 +1067,10 @@ pub async fn run_gateway_with_plugin_webhooks(
                 sop_engine.clone(),
                 sop_audit.clone(),
                 None,
+                // The gateway builds an agent's own registry — the assembly just
+                // below passes `caller_allowed: None` for the same reason — so
+                // there is no inherited ceiling to cap stored jobs by.
+                None,
             );
             let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
                 config: &config,
@@ -1200,6 +1204,9 @@ pub async fn run_gateway_with_plugin_webhooks(
             None,
             sop_engine.clone(),
             sop_audit.clone(),
+            None,
+            // Listing-only registry for an agent's own tools: no inherited
+            // ceiling, matching the `caller_allowed: None` of its assembly.
             None,
         );
         // Same gated seam as the dashboard seed above, so this listing shows
@@ -2889,6 +2896,7 @@ pub(crate) async fn run_gateway_chat_with_tools(
                     &agent_alias,
                     message,
                     session_id,
+                    None,
                     zeroclaw_api::ingress::TurnOrigin::Interactive,
                 ),
             ),

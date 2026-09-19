@@ -1367,6 +1367,17 @@ pub async fn run(
             sop_engine,
             sop_audit,
             None,
+            // `run` is the entry point that carries a per-run allowlist, so it is
+            // also the one that can hand the scheduler tools the ceiling's value.
+            // Pre-sealed: unlike the bounded delegate assembly — which builds its
+            // tools before the sealed set exists — the list is already known
+            // here, so the handle is filled on construction.
+            allowed_tools.as_deref().map(|list| {
+                let handle: crate::tools::caller_ceiling::CallerCeiling =
+                    std::sync::Arc::new(std::sync::OnceLock::new());
+                let _ = handle.set(list.to_vec());
+                handle
+            }),
         );
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         // Route the per-agent tool registry through the one gated seam
@@ -2002,6 +2013,13 @@ pub async fn run(
                                 turn_id: &turn_id,
                                 sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                     config: &config,
+                                    // Forwarding this turn's own per-run
+                                    // allowlist keeps a re-assembled step
+                                    // agent inside the set this loop
+                                    // received. `process_message`'s own
+                                    // `SopStepReassembly` construction below
+                                    // does the same with its `allowed_tools`.
+                                    caller_allowed: allowed_tools.as_deref(),
                                 }),
                             }),
                         ),
@@ -2562,6 +2580,11 @@ pub async fn run(
                                     turn_id: &turn_id,
                                     sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                         config: &config,
+                                        // Same `run` ceiling as the sibling
+                                        // construction above; both frames of this
+                                        // entry point must forward it or the bound
+                                        // holds on only one of them.
+                                        caller_allowed: allowed_tools.as_deref(),
                                     }),
                                 }),
                             ),
@@ -2843,6 +2866,7 @@ pub async fn process_message(
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
+    allowed_tools: Option<Vec<String>>,
     origin: TurnOrigin,
 ) -> Result<String> {
     use ::zeroclaw_log::Instrument;
@@ -2981,6 +3005,15 @@ pub async fn process_message(
             sop_engine,
             sop_audit,
             None,
+            // `process_message` now carries a per-run allowlist when its
+            // caller has one (`send_message_to_peer`'s bounded relay), the
+            // same pre-sealed-handle shape `run()` already builds above.
+            allowed_tools.as_deref().map(|list| {
+                let handle: crate::tools::caller_ceiling::CallerCeiling =
+                    std::sync::Arc::new(std::sync::OnceLock::new());
+                let _ = handle.set(list.to_vec());
+                handle
+            }),
         );
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
@@ -2990,7 +3023,9 @@ pub async fn process_message(
             built: all_tools_result_pm,
             skills: &skills,
             runtime: runtime.clone(),
-            caller_allowed: None,
+            // Most callers have no per-run allowlist (`None`, unchanged); a
+            // bounded `send_message_to_peer` relay is the one caller that does.
+            caller_allowed: allowed_tools.as_deref(),
             connect_mcp: true,
             connect_peripherals: true,
             exclude_memory: false,
@@ -3398,7 +3433,18 @@ pub async fn process_message(
                     }),
                     Some(agent_alias),
                     Some(&turn_id),
-                    Some(SopStepReassembly { config: &config }),
+                    // `process_message` carries a per-run allowlist when its
+                    // caller has one (the same `allowed_tools` value the
+                    // assembly call above in this function already uses) —
+                    // forwarding it here keeps a cross-agent re-assembled
+                    // step agent inside the set this turn received, instead
+                    // of rebuilding it from the step agent's own full policy
+                    // one hop further out. Same reasoning as `run()`'s own
+                    // `SopStepReassembly` construction.
+                    Some(SopStepReassembly {
+                        config: &config,
+                        caller_allowed: allowed_tools.as_deref(),
+                    }),
                 ),
             )
             .await
@@ -17075,6 +17121,7 @@ Let me check the result."#;
             "entrypoint-profile-agent",
             "hello",
             Some("session"),
+            None,
             TurnOrigin::SubTurn,
         )
         .await;
@@ -17151,6 +17198,7 @@ Let me check the result."#;
             "process-message-reassembly-agent",
             "hello",
             Some("session"),
+            None,
             TurnOrigin::SubTurn,
         )
         .await;

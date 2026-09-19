@@ -84,9 +84,18 @@ pub struct ScopedAssembly<'a> {
     /// Skills loaded by the caller's (single) loader; registered under the same gate.
     pub skills: &'a [Skill],
     pub runtime: Arc<dyn RuntimeAdapter>,
-    /// Documented divergence: a per-run caller allowlist. It only NARROWS, and is
-    /// threaded into BOTH the built-in filter and the MCP tool-access policy. `None`
-    /// on every path except `run`.
+    /// A per-run caller allowlist. It only NARROWS, and is threaded into BOTH the
+    /// built-in filter and the MCP tool-access policy — so it also caps eager MCP
+    /// registration and the runtime `tool_search` activation channel, not just the
+    /// static set.
+    ///
+    /// `Some` on `run`, which is the entry point that carries one, and on the SOP
+    /// step re-assembly reached from it, which forwards it so a step agent cannot
+    /// recover what the caller never had. `None` on the remaining paths because
+    /// they have no caller above them — NOT because the ceiling is optional there.
+    ///
+    /// Any new path that assembles a registry for a caller that HAS a ceiling must
+    /// forward it; passing `None` restores the target's own profile in full.
     pub caller_allowed: Option<&'a [String]>,
     /// Documented divergence: ACP `session/new` must return promptly, so it does not
     /// connect MCP servers - they are neither resolved nor connected; nothing is
@@ -603,6 +612,16 @@ impl ScopedToolRegistry {
             nat64_prefixes.as_deref(),
         );
 
+        // The per-run ceiling must survive registrations that happen AFTER the
+        // built-in filter. Skills are registered just above, so a ceiling
+        // applied only at the filter step would be complete for built-ins and
+        // empty for exactly the surface an agent can grow into during its own
+        // assembly - which is where a delegated child would otherwise recover
+        // capabilities its caller never had.
+        if let Some(allowed) = caller_allowed {
+            tools_registry.retain(|tool| allowed.iter().any(|name| name == tool.name()));
+        }
+
         // Skills and deferred MCP helpers are registered after the built-in filter,
         // so the explicit denylist must subtract once more at the final boundary.
         if let Some(excluded) = security.excluded_tools.as_deref() {
@@ -614,6 +633,35 @@ impl ScopedToolRegistry {
             if excluded.iter().any(|ex| ex == "tool_search") {
                 deferred_section.clear();
             }
+        }
+
+        // Narrow the delegate parent set by the same ceiling, so that whatever this
+        // assembly refuses to hand the model it also refuses to hand the model's
+        // delegates.
+        //
+        // Consistency, not a repair of a reachable escape — stated plainly because
+        // the distinction matters. A bounded delegation computes its target's
+        // ceiling from `parent_tools` filtered by the CALLER'S POLICY (see the
+        // bounded assembly in `tools/delegate.rs`), never from the caller's sealed
+        // registry. A policy is per-agent and `caller_allowed` is per-run, so the
+        // policy-filtered parent set is the wider of the two, and a run that holds
+        // both a per-run allowlist and `delegate` would delegate from the wide set.
+        //
+        // No such run exists today: `delegate` is stripped from a bounded target's
+        // registry, so it cannot reach the sealed set, cannot reach a job's stored
+        // `allowed_tools`, and cannot reach a spawned child. Verified by
+        // `bounded_delegate_cron_job_inherits_ceiling`, which pins that a job
+        // scheduled from a bounded target stores no `delegate`.
+        //
+        // It stops being hypothetical the moment that stripping changes, which is
+        // exactly what the in-flight work to honour `delegation_policy` for bounded
+        // targets does. One line here is cheaper than re-deriving this later.
+        if let Some(allowed) = caller_allowed
+            && let Some(handle) = delegate_handle.as_ref()
+        {
+            handle
+                .write()
+                .retain(|tool| allowed.iter().any(|name| name == tool.name()));
         }
 
         ScopedAssembled {
@@ -944,6 +992,112 @@ mod tests {
 
         assert!(!result.success);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// The ceiling must narrow the delegate parent set, not only the registry
+    /// this function returns.
+    ///
+    /// Tested at the function's own contract rather than through a delegation
+    /// chain, and deliberately so: no reachable chain exercises it today,
+    /// because `delegate` is stripped from a bounded target's registry and so
+    /// cannot reach a per-run allowlist (see
+    /// `bounded_delegate_cron_job_inherits_ceiling`). Testing the behaviour
+    /// where it is defined is what makes the narrowing verifiable now instead of
+    /// only after that stripping changes.
+    ///
+    /// THIS TEST MUST FAIL if the `caller_allowed` retain over `delegate_handle`
+    /// is removed: `out_of_ceiling` reappears in the parent set while the
+    /// returned registry still looks correct.
+    #[tokio::test]
+    async fn caller_ceiling_narrows_the_delegate_parent_set() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let config = Config::default();
+        let security = Arc::new(SecurityPolicy::default());
+
+        let mut built =
+            built_with_counting_tools(Arc::clone(&calls), &["in_ceiling", "out_of_ceiling"]);
+        // The set a bounded delegation would later read to compute its target's
+        // ceiling. It starts wider than the per-run allowlist, which is the
+        // whole point.
+        let handle: DelegateParentToolsHandle =
+            Arc::new(parking_lot::RwLock::new(built.unfiltered_tool_arcs.clone()));
+        built.delegate_handle = Some(Arc::clone(&handle));
+
+        let allowed = vec!["in_ceiling".to_string()];
+        let _assembled = ScopedToolRegistry::assemble(ScopedAssembly {
+            config: &config,
+            agent_alias: "default",
+            security: &security,
+            built,
+            skills: &[],
+            runtime: Arc::new(crate::platform::NativeRuntime::new()),
+            caller_allowed: Some(&allowed),
+            connect_mcp: false,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery: false,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: None,
+        })
+        .await;
+
+        let names: Vec<String> = handle
+            .read()
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        // Positive half: without it, a retain that emptied the set entirely
+        // would satisfy the negative half for the wrong reason.
+        assert!(
+            names.iter().any(|n| n == "in_ceiling"),
+            "the admitted tool must survive in the delegate parent set; got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "out_of_ceiling"),
+            "a tool outside the caller ceiling stayed in the delegate parent set, so a \
+             bounded delegation would compute its target's ceiling from it; got {names:?}"
+        );
+    }
+
+    /// Control for the test above: with no ceiling in force the parent set is
+    /// left alone, so the narrowing cannot be mistaken for an unconditional
+    /// prune.
+    #[tokio::test]
+    async fn no_caller_ceiling_leaves_the_delegate_parent_set_untouched() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let config = Config::default();
+        let security = Arc::new(SecurityPolicy::default());
+
+        let mut built =
+            built_with_counting_tools(Arc::clone(&calls), &["in_ceiling", "out_of_ceiling"]);
+        let handle: DelegateParentToolsHandle =
+            Arc::new(parking_lot::RwLock::new(built.unfiltered_tool_arcs.clone()));
+        built.delegate_handle = Some(Arc::clone(&handle));
+
+        let _assembled = ScopedToolRegistry::assemble(ScopedAssembly {
+            config: &config,
+            agent_alias: "default",
+            security: &security,
+            built,
+            skills: &[],
+            runtime: Arc::new(crate::platform::NativeRuntime::new()),
+            caller_allowed: None,
+            connect_mcp: false,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery: false,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: None,
+        })
+        .await;
+
+        assert_eq!(
+            handle.read().len(),
+            2,
+            "an unbounded assembly must not prune the delegate parent set"
+        );
     }
 
     async fn assert_pipeline_context_prevalidates_excluded_tool(
@@ -1834,5 +1988,158 @@ mod tests {
                 "the allowed tool must be activated after a select, not just schema-rendered"
             );
         }
+    }
+}
+
+/// A per-run ceiling must also bound MCP tools that are activated AFTER the
+/// registry is assembled.
+///
+/// Deferred MCP tools are not in the registry when it is sealed: the model
+/// reaches them later by calling `tool_search`, which activates matching stubs
+/// and pushes them into the live set. A ceiling applied only at assembly time
+/// would therefore be complete for built-ins and empty for exactly the surface
+/// an agent can grow into during its own turn.
+///
+/// The narrowing happens twice: the stub set handed to `tool_search` is
+/// pre-filtered by the tool-access policy, and the search tool also carries
+/// that policy as defense-in-depth. Asserting on what `tool_search` reports
+/// covers both, which is what matters - a fix that moved the ceiling from one
+/// to the other would keep this green, and should.
+///
+/// What this covers and what it does NOT: it verifies that, GIVEN a ceiling at
+/// an assembly, runtime activation respects it. It does not verify that a
+/// nested assembly receives a ceiling at all - that is a different property,
+/// covered where the nesting happens. Both are needed; neither implies the
+/// other.
+#[cfg(test)]
+mod deferred_mcp_activation_respects_the_caller_ceiling {
+    use super::*;
+    use crate::tools::AllToolsResult;
+
+    const SERVER: &str = "srv";
+    /// Named by the ceiling: must stay reachable through `tool_search`.
+    const IN_CEILING: &str = "srv__allowed_probe";
+    /// Not named by the ceiling: must not become reachable by activating it.
+    const OUT_OF_CEILING: &str = "srv__denied_probe";
+
+    /// Assembles with `caller_allowed`, then drives `tool_search` and returns
+    /// what it reported back.
+    async fn tool_search_output_under_ceiling(ceiling: Option<&[String]>) -> String {
+        let mut config = Config::default();
+        // Deferred loading is what makes these tools reachable only through
+        // `tool_search` instead of being registered eagerly.
+        config.mcp.deferred_loading = true;
+        // The whole MCP branch of `assemble` is gated on the agent holding at
+        // least one granted server, so the grant has to exist even though the
+        // registry itself is supplied ready-made.
+        config.mcp.enabled = true;
+        config
+            .mcp
+            .servers
+            .push(zeroclaw_config::schema::McpServerConfig {
+                name: SERVER.to_string(),
+                ..zeroclaw_config::schema::McpServerConfig::default()
+            });
+        config.mcp_bundles.insert(
+            "probe_bundle".to_string(),
+            zeroclaw_config::schema::McpBundleConfig {
+                servers: vec![SERVER.to_string()],
+                ..zeroclaw_config::schema::McpBundleConfig::default()
+            },
+        );
+        config.agents.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                mcp_bundles: vec!["probe_bundle".to_string()],
+                ..zeroclaw_config::schema::AliasedAgentConfig::default()
+            },
+        );
+        assert!(
+            !config.mcp_servers_for_agent("default").is_empty(),
+            "fixture: the agent must hold a granted server or the MCP branch never runs"
+        );
+
+        let registry = Arc::new(
+            zeroclaw_tools::mcp_client::McpRegistry::for_test_with_scripted_tools(
+                SERVER,
+                &["allowed_probe", "denied_probe"],
+                serde_json::json!({"content": [{"type": "text", "text": "ok"}]}),
+            ),
+        );
+
+        let security = Arc::new(SecurityPolicy::default());
+        let assembled = ScopedToolRegistry::assemble(ScopedAssembly {
+            config: &config,
+            agent_alias: "default",
+            security: &security,
+            built: AllToolsResult::from_prebuilt_tools(Vec::new()),
+            skills: &[],
+            runtime: Arc::new(crate::platform::NativeRuntime::new()),
+            caller_allowed: ceiling,
+            connect_mcp: true,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery: false,
+            // `true` would activate every stub eagerly and register it as an
+            // ordinary tool, which is the opposite of the deferred mode under
+            // test - and it also suppresses `tool_search` entirely.
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: Some(registry),
+        })
+        .await;
+
+        let tool_search = assembled
+            .registry
+            .iter()
+            .find(|tool| tool.name() == "tool_search")
+            .expect("deferred loading must register `tool_search`");
+
+        let result = tool_search
+            .execute(serde_json::json!({"query": "probe"}))
+            .await
+            .expect("tool_search executes");
+        format!("{}", result.output)
+    }
+
+    #[tokio::test]
+    async fn a_deferred_tool_outside_the_ceiling_cannot_be_activated() {
+        // MUST FAIL if the `tool_search` built for this assembly is constructed
+        // without the access policy, or with a policy built from the security
+        // profile alone - the ceiling is the only thing separating these two
+        // names, since both belong to the same granted server.
+        // `tool_search` is itself a tool, so a ceiling that does not name it now
+        // removes it along with everything else - correct, but it would prove
+        // the denial by deleting the MECHANISM rather than by refusing the
+        // tool. Naming it keeps the search path alive so the assertion is
+        // about which stub it will activate.
+        let ceiling = vec![IN_CEILING.to_string(), "tool_search".to_string()];
+        let output = tool_search_output_under_ceiling(Some(&ceiling)).await;
+
+        assert!(
+            output.contains(IN_CEILING),
+            "the tool NAMED by the ceiling was not activated, so this case proves nothing \
+             about narrowing; output {output}"
+        );
+        assert!(
+            !output.contains(OUT_OF_CEILING),
+            "a deferred tool outside the ceiling was activated at runtime; output {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_ceiling_both_deferred_tools_remain_reachable() {
+        // The other half of the pair, and the guard against a vacuous pass: if
+        // deferred activation were broken outright, the assertion above would
+        // hold for the wrong reason. With no ceiling the server grant alone
+        // admits both, which is the behaviour a ceiling then narrows.
+        let output = tool_search_output_under_ceiling(None).await;
+
+        assert!(
+            output.contains(IN_CEILING) && output.contains(OUT_OF_CEILING),
+            "deferred activation is not working at all, so the narrowing case above is \
+             untrustworthy; output {output}"
+        );
     }
 }
