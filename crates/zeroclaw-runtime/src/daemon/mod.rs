@@ -783,9 +783,9 @@ pub async fn run(
             };
 
         let hooks: Option<std::sync::Arc<crate::hooks::HookRunner>> = if config.hooks.enabled {
-            Some(std::sync::Arc::new(crate::hooks::HookRunner::from_config(
-                &config.hooks,
-            )))
+            Some(std::sync::Arc::new(
+                crate::hooks::HookRunner::from_root_config(&config),
+            ))
         } else {
             None
         };
