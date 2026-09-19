@@ -5219,6 +5219,20 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
 
     #[cfg(feature = "agent-runtime")]
     if let Commands::Service {
+        service_command: ServiceCommands::RunWindowsDaemon,
+        ..
+    } = &cli.command
+    {
+        let config_dir = cli
+            .config_dir
+            .as_deref()
+            .map(std::path::Path::new)
+            .context("Windows task runner requires --config-dir")?;
+        return service::run_windows_daemon(config_dir).await;
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    if let Commands::Service {
         service_command: ServiceCommands::RunDesktopDaemon { port },
         ..
     } = &cli.command
@@ -12120,6 +12134,36 @@ mod tests {
 
         let help = Cli::command().render_help().to_string();
         assert!(!help.contains("run-desktop-daemon"));
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn windows_daemon_cli_requires_config_dir_and_stays_hidden() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "--config-dir",
+            "C:\\Users\\agent\\Zero Claw",
+            "service",
+            "run-windows-daemon",
+        ])
+        .expect("internal Windows task runner should parse");
+        assert_eq!(
+            cli.config_dir.as_deref(),
+            Some("C:\\Users\\agent\\Zero Claw")
+        );
+        assert!(matches!(
+            cli.command,
+            Commands::Service {
+                service_command: ServiceCommands::RunWindowsDaemon,
+                ..
+            }
+        ));
+        assert!(
+            !Cli::command()
+                .render_help()
+                .to_string()
+                .contains("run-windows-daemon")
+        );
     }
 
     #[test]

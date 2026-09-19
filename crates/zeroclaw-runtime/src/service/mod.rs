@@ -11,6 +11,12 @@ use std::process::Command;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use std::process::Stdio;
 use std::str::FromStr;
+#[cfg(any(windows, test))]
+use std::sync::mpsc;
+#[cfg(windows)]
+use std::sync::mpsc::Receiver;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+use std::sync::mpsc::SyncSender;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use std::sync::{Arc, Condvar, Mutex};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
@@ -873,6 +879,7 @@ struct ServiceLogWriters {
     stdout: ServiceLogSink,
     stderr: ServiceLogSink,
     tasks: Vec<JoinHandle<()>>,
+    failure_sender: Option<SyncSender<String>>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
@@ -882,23 +889,56 @@ impl ServiceLogWriters {
         let stdout_log = BoundedServiceLog::open(stdout_path)?;
         let stderr_log = BoundedServiceLog::open(stderr_path)?;
         let (stdout, stdout_task) =
-            spawn_service_log_writer(stdout_path.to_path_buf(), stdout_log, "launchd");
+            spawn_service_log_writer(stdout_path.to_path_buf(), stdout_log, "launchd", None);
         let (stderr, stderr_task) =
-            spawn_service_log_writer(stderr_path.to_path_buf(), stderr_log, "launchd");
+            spawn_service_log_writer(stderr_path.to_path_buf(), stderr_log, "launchd", None);
         Ok(Self {
             stdout,
             stderr,
             tasks: vec![stdout_task, stderr_task],
+            failure_sender: None,
         })
+    }
+
+    #[cfg(windows)]
+    fn open_windows_split(
+        stdout_path: &Path,
+        stderr_path: &Path,
+    ) -> Result<(Self, Receiver<String>)> {
+        let stdout_log = BoundedServiceLog::open_desktop(stdout_path)?;
+        let stderr_log = BoundedServiceLog::open_desktop(stderr_path)?;
+        let (failure_sender, failures) = mpsc::sync_channel(1);
+        let (stdout, stdout_task) = spawn_service_log_writer(
+            stdout_path.to_path_buf(),
+            stdout_log,
+            "Windows service",
+            Some(failure_sender.clone()),
+        );
+        let (stderr, stderr_task) = spawn_service_log_writer(
+            stderr_path.to_path_buf(),
+            stderr_log,
+            "Windows service",
+            Some(failure_sender.clone()),
+        );
+        Ok((
+            Self {
+                stdout,
+                stderr,
+                tasks: vec![stdout_task, stderr_task],
+                failure_sender: Some(failure_sender),
+            },
+            failures,
+        ))
     }
 
     fn open_combined(path: &Path) -> Result<Self> {
         let log = BoundedServiceLog::open_desktop(path)?;
-        let (sink, task) = spawn_service_log_writer(path.to_path_buf(), log, "desktop");
+        let (sink, task) = spawn_service_log_writer(path.to_path_buf(), log, "desktop", None);
         Ok(Self {
             stdout: sink.clone(),
             stderr: sink,
             tasks: vec![task],
+            failure_sender: None,
         })
     }
 
@@ -911,7 +951,17 @@ impl ServiceLogWriters {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             if task.is_finished() {
-                let _ = task.join();
+                if task.join().is_err() {
+                    report_service_capture_failure(
+                        &self.failure_sender,
+                        "service log writer panicked".into(),
+                    );
+                }
+            } else {
+                report_service_capture_failure(
+                    &self.failure_sender,
+                    "service log writer timed out".into(),
+                );
             }
         }
     }
@@ -930,6 +980,7 @@ fn spawn_service_log_writer(
     path: PathBuf,
     mut log: BoundedServiceLog,
     failure_label: &'static str,
+    failure_sender: Option<SyncSender<String>>,
 ) -> (ServiceLogSink, JoinHandle<()>) {
     let inner = Arc::new(ServiceLogSinkInner {
         pending: Mutex::new(PendingServiceLog {
@@ -960,6 +1011,13 @@ fn spawn_service_log_writer(
                 continue;
             };
             if writable && let Err(error) = log.write_chunk(&chunk) {
+                report_service_capture_failure(
+                    &failure_sender,
+                    format!(
+                        "{failure_label} log write failed for {}: {error:#}",
+                        path.display()
+                    ),
+                );
                 eprintln!(
                     "{failure_label} log write failed for {}; continuing without capture: {error:#}",
                     path.display()
@@ -972,8 +1030,19 @@ fn spawn_service_log_writer(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
-async fn drain_service_pipe<R>(mut pipe: R, sink: ServiceLogSink, failure_label: &'static str)
-where
+fn report_service_capture_failure(sender: &Option<SyncSender<String>>, error: String) {
+    if let Some(sender) = sender {
+        let _ = sender.try_send(error);
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+async fn drain_service_pipe<R>(
+    mut pipe: R,
+    sink: ServiceLogSink,
+    failure_label: &'static str,
+    failure_sender: Option<SyncSender<String>>,
+) where
     R: AsyncRead + Unpin,
 {
     let mut buffer = vec![0; 16 * 1024];
@@ -982,6 +1051,10 @@ where
             Ok(0) => break,
             Ok(read) => sink.push(buffer[..read].to_vec()),
             Err(error) => {
+                report_service_capture_failure(
+                    &failure_sender,
+                    format!("{failure_label} log pipe read failed: {error}"),
+                );
                 sink.push(format!("{failure_label} log pipe read failed: {error}\n").into_bytes());
                 break;
             }
@@ -994,7 +1067,7 @@ async fn drain_launchd_pipe<R>(pipe: R, sink: ServiceLogSink)
 where
     R: AsyncRead + Unpin,
 {
-    drain_service_pipe(pipe, sink, "launchd").await;
+    drain_service_pipe(pipe, sink, "launchd", None).await;
 }
 
 pub async fn run_launchd_daemon(config_dir: &Path) -> Result<()> {
@@ -1015,6 +1088,184 @@ pub async fn run_launchd_daemon(config_dir: &Path) -> Result<()> {
             Ok(command)
         })
         .await
+    }
+}
+
+#[cfg(windows)]
+struct WindowsServiceJob(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl WindowsServiceJob {
+    fn attach_current() -> Result<Self> {
+        use windows::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+        use windows::Win32::System::Threading::GetCurrentProcess;
+
+        // A null security attribute makes this unnamed handle non-inheritable.
+        let job = Self(
+            unsafe { CreateJobObjectW(None, None) }
+                .context("Failed to create the Windows service containment job")?,
+        );
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        unsafe {
+            SetInformationJobObject(
+                job.0,
+                JobObjectExtendedLimitInformation,
+                (&raw const limits).cast(),
+                std::mem::size_of_val(&limits) as u32,
+            )
+            .context("Failed to enable Windows service kill-on-close containment")?;
+            AssignProcessToJobObject(job.0, GetCurrentProcess())
+                .context("Failed to place the Windows service runner in its containment job")?;
+        }
+        Ok(job)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsServiceJob {
+    fn drop(&mut self) {
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+/// Run the per-user Task Scheduler action with bounded stdout and stderr capture.
+pub async fn run_windows_daemon(config_dir: &Path) -> Result<()> {
+    #[cfg(not(windows))]
+    {
+        let _ = config_dir;
+        bail!("the Windows task runner is only supported on Windows")
+    }
+
+    #[cfg(windows)]
+    {
+        let config_dir = normalize_desktop_config_dir(config_dir.to_path_buf())?;
+        let logs_dir = config_dir.join("logs");
+        let stdout_path = logs_dir.join("daemon.stdout.log");
+        let stderr_path = logs_dir.join("daemon.stderr.log");
+        let (writers, mut failures) =
+            ServiceLogWriters::open_windows_split(&stdout_path, &stderr_path)?;
+        let containment = match WindowsServiceJob::attach_current() {
+            Ok(job) => job,
+            Err(error) => {
+                writers
+                    .stderr
+                    .push(format!("Windows service capture failed: {error:#}\n").into_bytes());
+                writers.finish().await;
+                return Err(error);
+            }
+        };
+        let result = async {
+            let executable = std::env::current_exe()
+                .context("Failed to resolve the Windows service daemon executable")?;
+            let mut command = TokioCommand::new(executable);
+            command.arg("--config-dir").arg(&config_dir).arg("daemon");
+            supervise_windows_service_child(command, &writers, &mut failures).await
+        }
+        .await;
+        if let Err(error) = &result {
+            let diagnostic = format!("Windows service capture failed: {error:#}\n").into_bytes();
+            writers.stdout.push(diagnostic.clone());
+            writers.stderr.push(diagnostic);
+        }
+        writers.finish().await;
+        let result = match (result, failures.try_recv()) {
+            (Ok(()), Ok(error)) => Err(anyhow::anyhow!("Windows service capture failed: {error}")),
+            (result, _) => result,
+        };
+        // Closing a kill-on-close job while its runner is still executing would
+        // terminate this process before its exit status reaches Task Scheduler.
+        // Keep the handle until process teardown; Windows closes it on exit.
+        std::mem::forget(containment);
+        result
+    }
+}
+
+#[cfg(windows)]
+async fn supervise_windows_service_child(
+    mut command: TokioCommand,
+    writers: &ServiceLogWriters,
+    failures: &mut Receiver<String>,
+) -> Result<()> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut command = CommandWrap::from(command);
+    command
+        .wrap(KillOnDrop)
+        .wrap(WindowsSpawnFailureGuard)
+        .wrap(JobObject);
+    let mut child = command
+        .spawn()
+        .context("Failed to start the Windows service daemon child")?;
+    let stdout = child
+        .stdout()
+        .take()
+        .context("Windows service daemon stdout pipe unavailable")?;
+    let stderr = child
+        .stderr()
+        .take()
+        .context("Windows service daemon stderr pipe unavailable")?;
+    let stdout_sink = writers.stdout.clone();
+    let stderr_sink = writers.stderr.clone();
+    let stdout_failure_sender = writers.failure_sender.clone();
+    let stderr_failure_sender = writers.failure_sender.clone();
+    let stdout_task = zeroclaw_spawn::spawn!(drain_service_pipe(
+        stdout,
+        stdout_sink,
+        "Windows service",
+        stdout_failure_sender
+    ));
+    let stderr_task = zeroclaw_spawn::spawn!(drain_service_pipe(
+        stderr,
+        stderr_sink,
+        "Windows service",
+        stderr_failure_sender
+    ));
+    let outcome = loop {
+        if let Ok(error) = failures.try_recv() {
+            break Err(anyhow::anyhow!("Windows service capture failed: {error}"));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {}
+            Err(error) => {
+                break Err(error).context("Failed to poll the Windows service daemon child");
+            }
+        }
+        if writers.tasks.iter().any(JoinHandle::is_finished) {
+            break Err(anyhow::anyhow!(
+                "Windows service log writer stopped unexpectedly"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    // process-wrap's wait() includes descendants. Terminate the inner job
+    // before waiting for pipe EOF, including on a capture failure.
+    let kill_result = child
+        .start_kill()
+        .context("Failed to terminate Windows service daemon descendants");
+    let reap_result = tokio::time::timeout(DESKTOP_PIPE_DRAIN_TIMEOUT, child.wait())
+        .await
+        .context("Timed out reaping Windows service daemon descendants")
+        .and_then(|result| result.context("Failed to reap Windows service daemon descendants"));
+    finish_service_pipes(stdout_task, stderr_task, DESKTOP_PIPE_DRAIN_TIMEOUT).await;
+    let status = outcome?;
+    kill_result?;
+    reap_result?;
+    if let Ok(error) = failures.try_recv() {
+        bail!("Windows service capture failed: {error}");
+    }
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("Windows service daemon child exited with status {status}")
     }
 }
 
@@ -1241,9 +1492,9 @@ async fn supervise_desktop_child(
         let stdout_sink = writers.stdout.clone();
         let stderr_sink = writers.stderr.clone();
         let stdout_task =
-            zeroclaw_spawn::spawn!(drain_service_pipe(stdout, stdout_sink, "desktop"));
+            zeroclaw_spawn::spawn!(drain_service_pipe(stdout, stdout_sink, "desktop", None));
         let stderr_task =
-            zeroclaw_spawn::spawn!(drain_service_pipe(stderr, stderr_sink, "desktop"));
+            zeroclaw_spawn::spawn!(drain_service_pipe(stderr, stderr_sink, "desktop", None));
         if first_generation {
             emit_desktop_handshake("READY", None);
             first_generation = false;
@@ -1804,11 +2055,8 @@ pub fn status(config: &Config, init_system: InitSystem) -> Result<()> {
     if cfg!(target_os = "windows") {
         let _ = config;
         let task_name = windows_task_name();
-        let out =
-            run_capture(Command::new("schtasks").args(["/Query", "/TN", task_name, "/FO", "LIST"]));
-        match out {
-            Ok(text) => {
-                let running = text.contains("Running");
+        match windows_task_running(task_name) {
+            Ok(Some(running)) => {
                 println!(
                     "Service: {}",
                     if running {
@@ -1819,9 +2067,10 @@ pub fn status(config: &Config, init_system: InitSystem) -> Result<()> {
                 );
                 println!("Task: {}", task_name);
             }
-            Err(_) => {
+            Ok(None) => {
                 println!("Service: ❌ not installed");
             }
+            Err(error) => return Err(error),
         }
         return Ok(());
     }
@@ -1979,7 +2228,7 @@ fn logs_windows(config: &Config, lines: usize, follow: bool) -> Result<()> {
 fn get_content_command(path: &Path, lines: usize, follow: bool) -> String {
     let quoted = path.display().to_string().replace('\'', "''");
     let wait = if follow { " -Wait" } else { "" };
-    format!("Get-Content -LiteralPath '{quoted}' -Tail {lines}{wait}")
+    format!("Get-Content -LiteralPath '{quoted}' -Encoding UTF8 -Tail {lines}{wait}")
 }
 
 fn run_get_content(path: &Path, lines: usize, follow: bool) -> Result<()> {
@@ -1991,6 +2240,39 @@ fn run_get_content(path: &Path, lines: usize, follow: bool) -> Result<()> {
         bail!("PowerShell Get-Content exited with non-zero status");
     }
     Ok(())
+}
+
+fn windows_task_state_command(task_name: &str) -> String {
+    let quoted = task_name.replace('\'', "''");
+    format!(
+        "$task = Get-ScheduledTask -TaskName '{quoted}' -ErrorAction SilentlyContinue; \
+         if ($null -eq $task) {{ exit 2 }}; \
+         if ([int]$task.State -eq 4) {{ exit 0 }}; \
+         exit 1"
+    )
+}
+
+fn windows_task_state_from_exit_code(code: Option<i32>) -> Result<Option<bool>> {
+    match code {
+        Some(0) => Ok(Some(true)),
+        Some(1) => Ok(Some(false)),
+        Some(2) => Ok(None),
+        Some(code) => bail!("PowerShell task-state query exited with status {code}"),
+        None => bail!("PowerShell task-state query terminated without an exit code"),
+    }
+}
+
+fn windows_task_running(task_name: &str) -> Result<Option<bool>> {
+    let status = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &windows_task_state_command(task_name),
+        ])
+        .status()
+        .context("Failed to query the Windows scheduled task state")?;
+    windows_task_state_from_exit_code(status.code())
 }
 
 fn service_log_targets(primary: &Path, secondary: &Path) -> Vec<PathBuf> {
@@ -2954,50 +3236,44 @@ fn install_windows(config: &Config) -> Result<()> {
         .config_path
         .parent()
         .map_or_else(|| PathBuf::from("."), PathBuf::from);
+    let base_dir = normalize_desktop_config_dir(base_dir)?;
     let logs_dir = base_dir.join("logs");
-    fs::create_dir_all(&logs_dir)?;
-
-    // The launch wrapper is an install artifact, not log output — keep it in
-    // the config dir root so the logs dir holds only `.log` files. (Previously
-    // it landed in logs/, where a `.cmd` next to the daemon's log files reads
-    // as misplaced.)
-    let wrapper = base_dir.join("zeroclaw-daemon.cmd");
-    let stdout_log = logs_dir.join("daemon.stdout.log");
-    let stderr_log = logs_dir.join("daemon.stderr.log");
-
-    let wrapper_content = format!(
-        "@echo off\r\n\"{}\" daemon >>\"{}\" 2>>\"{}\"",
-        exe.display().to_string(),
-        stdout_log.display().to_string(),
-        stderr_log.display()
-    );
-    fs::write(&wrapper, &wrapper_content)?;
-
+    let action = windows_task_action(&exe, &base_dir)?;
     let task_name = windows_task_name();
-
-    // Remove any existing task first (ignore errors if it doesn't exist)
-    let _ = Command::new("schtasks")
-        .args(["/Delete", "/TN", task_name, "/F"])
-        .output();
-
     run_checked(Command::new("schtasks").args([
-        "/Create",
-        "/TN",
-        task_name,
-        "/SC",
-        "ONLOGON",
-        "/TR",
-        &format!("\"{}\"", wrapper.display().to_string()),
-        "/RL",
-        "LIMITED",
-        "/F",
+        "/Create", "/TN", task_name, "/SC", "ONLOGON", "/TR", &action, "/RL", "LIMITED", "/F",
     ]))?;
 
     println!("✅ Installed Windows scheduled task: {}", task_name);
-    println!("   Wrapper: {}", wrapper.display().to_string());
+    println!("   Action: {}", action);
     println!("   Logs: {}", logs_dir.display().to_string());
     println!("   Start with: zeroclaw service start");
     Ok(())
+}
+
+fn windows_task_action(exe: &Path, config_dir: &Path) -> Result<String> {
+    let exe = exe
+        .to_str()
+        .context("Windows service executable path is not Unicode")?;
+    let config_dir = config_dir
+        .to_str()
+        .context("Windows service config path is not Unicode")?;
+    if exe.contains('"')
+        || exe.contains('%')
+        || config_dir.contains('"')
+        || config_dir.contains('%')
+    {
+        bail!(
+            "Windows service paths cannot contain quotes or percent signs in a scheduled-task action"
+        );
+    }
+    let action = format!("\"{exe}\" --config-dir \"{config_dir}\" service run-windows-daemon");
+    if action.encode_utf16().count() > 262 {
+        bail!(
+            "Windows service scheduled-task action exceeds the 262-character Task Scheduler limit"
+        );
+    }
+    Ok(action)
 }
 
 fn macos_service_file() -> Result<PathBuf> {
@@ -3474,6 +3750,27 @@ mod bounded_service_log_tests {
             .expect_err("writes to /dev/full must fail");
 
         assert_eq!(input.position(), bytes.len() as u64);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn service_log_writer_reports_a_write_failure() {
+        let log = BoundedServiceLog::open(Path::new("/dev/full")).expect("open full device");
+        let (sender, failures) = mpsc::sync_channel(1);
+        let (sink, task) = spawn_service_log_writer(
+            PathBuf::from("/dev/full"),
+            log,
+            "test service",
+            Some(sender),
+        );
+        sink.push(b"captured output".to_vec());
+
+        let error = failures
+            .recv_timeout(Duration::from_secs(2))
+            .expect("write failure must reach the supervisor");
+        assert!(error.contains("log write failed"), "{error}");
+        sink.close();
+        task.join().expect("writer exits after closing the sink");
     }
 
     #[test]
@@ -4013,6 +4310,58 @@ mod service_helper_tests {
         assert_eq!(windows_task_name(), "ZeroClaw Daemon");
     }
 
+    #[test]
+    fn windows_task_state_probe_uses_invariant_numeric_state_and_exit_codes() {
+        assert_eq!(
+            windows_task_state_command("ZeroClaw Daemon"),
+            "$task = Get-ScheduledTask -TaskName 'ZeroClaw Daemon' -ErrorAction SilentlyContinue; if ($null -eq $task) { exit 2 }; if ([int]$task.State -eq 4) { exit 0 }; exit 1"
+        );
+        assert_eq!(
+            windows_task_state_from_exit_code(Some(0)).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            windows_task_state_from_exit_code(Some(1)).unwrap(),
+            Some(false)
+        );
+        assert_eq!(windows_task_state_from_exit_code(Some(2)).unwrap(), None);
+        assert!(windows_task_state_from_exit_code(Some(17)).is_err());
+        assert!(windows_task_state_from_exit_code(None).is_err());
+    }
+
+    #[test]
+    fn windows_task_action_binds_the_config_directory_without_cmd_redirection() {
+        let action = windows_task_action(
+            Path::new(r"C:\Program Files\ZeroClaw\zeroclaw.exe"),
+            Path::new(r"C:\Users\agent\Zero Claw"),
+        )
+        .expect("Windows action");
+        assert_eq!(
+            action,
+            r#""C:\Program Files\ZeroClaw\zeroclaw.exe" --config-dir "C:\Users\agent\Zero Claw" service run-windows-daemon"#
+        );
+        assert!(!action.contains(".cmd"));
+        assert!(!action.contains(">>"));
+    }
+
+    #[test]
+    fn windows_task_action_rejects_environment_expansion_and_oversized_actions() {
+        assert!(
+            windows_task_action(
+                Path::new(r"C:\%USERPROFILE%\zeroclaw.exe"),
+                Path::new(r"C:\Users\agent\.zeroclaw")
+            )
+            .is_err()
+        );
+        assert!(
+            windows_task_action(
+                Path::new(r"C:\zeroclaw.exe"),
+                Path::new(&format!(r"C:\{}", "x".repeat(270)))
+            )
+            .is_err()
+        );
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn run_capture_reads_stdout_windows() {
@@ -4300,7 +4649,7 @@ mod service_helper_tests {
         let command = get_content_command(Path::new("C:\\logs\\o'brien[1].log"), 25, true);
         assert_eq!(
             command,
-            "Get-Content -LiteralPath 'C:\\logs\\o''brien[1].log' -Tail 25 -Wait"
+            "Get-Content -LiteralPath 'C:\\logs\\o''brien[1].log' -Encoding UTF8 -Tail 25 -Wait"
         );
     }
 
@@ -4309,7 +4658,7 @@ mod service_helper_tests {
         let command = get_content_command(Path::new("C:\\logs\\daemon.stdout.log"), 50, false);
         assert_eq!(
             command,
-            "Get-Content -LiteralPath 'C:\\logs\\daemon.stdout.log' -Tail 50"
+            "Get-Content -LiteralPath 'C:\\logs\\daemon.stdout.log' -Encoding UTF8 -Tail 50"
         );
     }
 

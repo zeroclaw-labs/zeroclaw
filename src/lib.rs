@@ -220,6 +220,9 @@ pub enum ServiceCommands {
         #[arg(long, hide = true)]
         port: u16,
     },
+    /// Internal Windows task runner that owns bounded daemon output capture
+    #[command(hide = true)]
+    RunWindowsDaemon,
     /// Internal OpenRC logger that drains one daemon stream into bounded storage
     #[command(hide = true)]
     RunOpenrcLogWriter {

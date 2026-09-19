@@ -351,6 +351,92 @@ jobs:
         env:
           RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
 
+  windows-service-smoke-changes:
+    name: Detect Windows Service Smoke changes
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.changed.outputs.run }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Detect Windows service smoke changes
+        id: changed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          changed_files="$(mktemp)"
+          case "${{ github.event_name }}" in
+            pull_request)
+              git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD > "$changed_files"
+              ;;
+            push|merge_group)
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+            *)
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          if grep -Eq '^(src/main\.rs|crates/zeroclaw-runtime/(src/service/mod\.rs|examples/windows_service_smoke_fixture\.rs)|scripts/ci/windows_service_smoke\.ps1|\.github/workflows/ci\.yml)$' "$changed_files"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  windows-service-smoke:
+    name: Windows Service Smoke
+    needs: [windows-service-smoke-changes]
+    if: needs.windows-service-smoke-changes.outputs.run == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.98.0
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Build controlled Windows service fixture
+        shell: bash
+        run: >-
+          cargo build --profile ci --locked -p zeroclaw-runtime
+          --example windows_service_smoke_fixture
+          --target x86_64-pc-windows-msvc
+      - name: Exercise installed Windows service lifecycle
+        shell: pwsh
+        timeout-minutes: 15
+        run: |
+          ./scripts/ci/windows_service_smoke.ps1 `
+            -FixturePath "target/x86_64-pc-windows-msvc/ci/examples/windows_service_smoke_fixture.exe" `
+            -ConfigDir "$env:USERPROFILE/zeroclaw service smoke 界" `
+            -EvidenceDir "$env:RUNNER_TEMP/windows-service-smoke-evidence"
+      - name: Clean up Windows service smoke
+        if: always()
+        shell: pwsh
+        timeout-minutes: 3
+        run: |
+          ./scripts/ci/windows_service_smoke.ps1 `
+            -FixturePath "target/x86_64-pc-windows-msvc/ci/examples/windows_service_smoke_fixture.exe" `
+            -ConfigDir "$env:USERPROFILE/zeroclaw service smoke 界" `
+            -EvidenceDir "$env:RUNNER_TEMP/windows-service-smoke-evidence" `
+            -CleanupOnly
+      - name: Upload Windows service smoke evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-service-smoke-evidence
+          path: ${{ runner.temp }}/windows-service-smoke-evidence
+          if-no-files-found: warn
+          retention-days: 7
+
   # ── Build + check fan-out ─────────────────────────────────────────────────
 
   build:
@@ -1496,7 +1582,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, msrv, check-32bit, bench, test, test-channel-features, memory-postgres-test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
+    needs: [fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, windows-service-smoke-changes, windows-service-smoke, build, check, check-plugin-backends, msrv, check-32bit, bench, test, test-channel-features, memory-postgres-test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Check results

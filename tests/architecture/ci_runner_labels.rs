@@ -33,7 +33,7 @@ const HOUSEKEEPING_LABEL: &str = "blacksmith-4vcpu-ubuntu-2404";
 /// Every housekeeping job on the Blacksmith 4-vCPU class. Same contract as
 /// `COMPILE_JOBS`: this list is the reviewable inventory the workflow is
 /// checked against.
-const HOUSEKEEPING_JOBS: [&str; 16] = [
+const HOUSEKEEPING_JOBS: [&str; 17] = [
     "fmt",
     "gate",
     "history-guard",
@@ -44,6 +44,7 @@ const HOUSEKEEPING_JOBS: [&str; 16] = [
     "path-changes",
     "relay-container-smoke-changes",
     "windows-clippy-tools-changes",
+    "windows-service-smoke-changes",
     "nix-eval",
     "nix-hash-drift",
     "relay-container-smoke",

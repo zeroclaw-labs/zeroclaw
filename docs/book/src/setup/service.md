@@ -176,11 +176,11 @@ Don't mix `zeroclaw service` CLI commands with `brew services`, pick one. Both e
 
 - Trigger: at logon (`/SC ONLOGON`)
 - Run level: `LIMITED` (runs as the current user, not elevated)
-- Action: runs the install wrapper `zeroclaw-daemon.cmd`, which launches `zeroclaw daemon`
+- Action: runs `zeroclaw.exe --config-dir <config-dir> service run-windows-daemon` directly; the hidden runner owns the daemon child and its output capture
 
 Verify in Task Scheduler GUI (`taskschd.msc`) under Task Scheduler Library → ZeroClaw Daemon.
 
-Logs go to `<config-dir>\logs\` as `daemon.stdout.log` and `daemon.stderr.log` (for a default install, `%USERPROFILE%\.zeroclaw\logs\`). `zeroclaw service logs` prints whichever of the two files hold output, and `--follow` shows the others first and then streams `daemon.stdout.log`, or `daemon.stderr.log` when only that file holds output, because `Get-Content -Wait` tracks a single path. To read one directly:
+Logs go to `<config-dir>\logs\` as `daemon.stdout.log` and `daemon.stderr.log` (for a default install, `%USERPROFILE%\.zeroclaw\logs\`). Each file retains recent output within an 8 MiB bound. Reinstall the task after upgrading from the older `.cmd` wrapper; the old file may remain but is no longer the task action. The runner requires the config root and capture files to belong to the task account and rejects reparse-point paths while restricting their ACLs. Task Scheduler action paths containing literal `%` signs are not supported. `zeroclaw service logs` prints whichever of the two files hold output, and `--follow` shows the others first and then streams `daemon.stdout.log`, or `daemon.stderr.log` when only that file holds output, because `Get-Content -Wait` tracks a single path. To read one directly:
 
 <div class="os-tabs-src">
 
