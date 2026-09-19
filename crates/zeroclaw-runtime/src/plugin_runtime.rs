@@ -8,7 +8,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use parking_lot::RwLock;
 use zeroclaw_api::channel::Channel;
 use zeroclaw_api::webhook::PluginWebhookRegistryLease;
 use zeroclaw_config::schema::Config;
@@ -273,7 +272,7 @@ fn plugin_sender_allowed(config: &Config, alias: &str, sender: &str) -> bool {
 #[cfg(feature = "plugins-wasm")]
 fn channel_sender_authorizer(
     config: Arc<Config>,
-    live_config: Option<Arc<RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     alias: String,
 ) -> zeroclaw_plugins::wasm_channel::SenderAuthorizer {
     match live_config {
@@ -470,7 +469,7 @@ async fn finalize_plugin_webhooks(
 /// must not stop the daemon from starting its remaining channels.
 pub async fn configured_plugin_channels(
     config: Arc<Config>,
-    live_config: Option<Arc<RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
 ) -> Vec<Arc<dyn Channel>> {
     Box::pin(configured_plugin_channels_with_webhooks(
         config,
@@ -484,7 +483,7 @@ pub async fn configured_plugin_channels(
 /// claims into one daemon-generation registry.
 pub async fn configured_plugin_channels_with_webhooks(
     config: Arc<Config>,
-    live_config: Option<Arc<RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     webhook_registry: Option<&PluginWebhookRegistryLease>,
 ) -> Vec<Arc<dyn Channel>> {
     #[cfg(not(feature = "plugins-wasm"))]
@@ -662,30 +661,40 @@ mod tests {
         use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
         use zeroclaw_config::providers::ChannelRef;
 
-        let live = Arc::new(RwLock::new(Config::default()));
+        let live = zeroclaw_config::live::LiveConfig::new(Config::default());
         let authorizer = channel_sender_authorizer(
             Arc::new(Config::default()),
-            Some(Arc::clone(&live)),
+            Some(live.handle()),
             "operations".to_string(),
         );
         assert!(!authorizer("alice"), "empty peer groups deny by default");
 
-        live.write().peer_groups.insert(
-            "operators".to_string(),
-            PeerGroupConfig {
-                channel: ChannelRef::new("plugin.operations"),
-                external_peers: vec![PeerUsername::new("alice")],
-                ..PeerGroupConfig::default()
-            },
-        );
+        let publish = |mutating: &dyn Fn(&mut zeroclaw_config::schema::Config)| {
+            let mut next = live.snapshot();
+            mutating(&mut next);
+            let revision = live.next_revision().unwrap();
+            live.publish(revision, next).unwrap();
+        };
+        publish(&|config| {
+            config.peer_groups.insert(
+                "operators".to_string(),
+                PeerGroupConfig {
+                    channel: ChannelRef::new("plugin.operations"),
+                    external_peers: vec![PeerUsername::new("alice")],
+                    ..PeerGroupConfig::default()
+                },
+            );
+        });
         assert!(authorizer("alice"));
         assert!(!authorizer("Alice"), "plugin sender identity is exact");
 
-        live.write()
-            .peer_groups
-            .get_mut("operators")
-            .expect("operator peer group")
-            .external_peers = vec![PeerUsername::new("*")];
+        publish(&|config| {
+            config
+                .peer_groups
+                .get_mut("operators")
+                .expect("operator peer group")
+                .external_peers = vec![PeerUsername::new("*")];
+        });
         assert!(
             authorizer("anyone"),
             "wildcard uses native channel semantics"

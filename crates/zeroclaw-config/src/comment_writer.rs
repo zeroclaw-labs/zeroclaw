@@ -13,6 +13,8 @@ pub async fn apply_comments(
         return Ok(());
     }
     let raw = tokio::fs::read_to_string(config_path).await?;
+    #[cfg(any(test, feature = "test-helpers"))]
+    test_post_read_pause::pause(config_path).await;
     let mut doc: toml_edit::DocumentMut = match raw.parse() {
         Ok(d) => d,
         Err(_) => return Ok(()), // unparseable; bail without touching file
@@ -21,6 +23,80 @@ pub async fn apply_comments(
         decorate_key(doc.as_table_mut(), path, comment);
     }
     tokio::fs::write(config_path, doc.to_string()).await
+}
+
+/// Path-scoped coordination for whole-file annotation overlap regressions.
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod test_post_read_pause {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use tokio::sync::oneshot;
+
+    struct Entry {
+        path: PathBuf,
+        reached: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    }
+
+    static GATES: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
+
+    pub struct Gate {
+        path: PathBuf,
+        reached: oneshot::Receiver<()>,
+        release: Option<oneshot::Sender<()>>,
+    }
+
+    impl Gate {
+        pub async fn wait_paused(&mut self) {
+            (&mut self.reached).await.expect("annotation reaches read");
+        }
+
+        pub fn release(mut self) {
+            let _ = self.release.take().unwrap().send(());
+        }
+    }
+
+    impl Drop for Gate {
+        fn drop(&mut self) {
+            GATES
+                .lock()
+                .unwrap()
+                .retain(|entry| entry.path != self.path);
+            // Dropping the sender also releases a paused writer after a test failure.
+            self.release.take();
+        }
+    }
+
+    pub fn arm(path: PathBuf) -> Gate {
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let mut gates = GATES.lock().unwrap();
+        assert!(!gates.iter().any(|entry| entry.path == path));
+        gates.push(Entry {
+            path: path.clone(),
+            reached: reached_tx,
+            release: release_rx,
+        });
+        Gate {
+            path,
+            reached: reached_rx,
+            release: Some(release_tx),
+        }
+    }
+
+    pub(super) async fn pause(path: &Path) {
+        let entry = {
+            let mut gates = GATES.lock().unwrap();
+            gates
+                .iter()
+                .position(|entry| entry.path == path)
+                .map(|index| gates.remove(index))
+        };
+        if let Some(entry) = entry {
+            let _ = entry.reached.send(());
+            let _ = entry.release.await;
+        }
+    }
 }
 
 /// Walk to the leaf key for `dotted` and decorate it with `# {comment}\n`,

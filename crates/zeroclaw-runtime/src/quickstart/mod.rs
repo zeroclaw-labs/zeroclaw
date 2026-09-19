@@ -225,18 +225,70 @@ pub fn validate_only_with_surface(
     if ok { Ok(()) } else { Err(errors) }
 }
 
+/// Terminal outcome of one quickstart application.
+#[derive(Debug)]
+pub enum QuickstartApplyOutcome {
+    /// Config persisted (and published, when the caller completed the
+    /// staged apply as a config commit) and every personality file moved
+    /// into place.
+    Applied(AppliedAgent),
+    /// Config persisted and published, but a post-commit side effect
+    /// (personality-file installation) failed. The committed config is
+    /// NOT rolled back — the agent is valid without the files — and the
+    /// errors are reported truthfully so the operator can repair the
+    /// files.
+    CommittedWithSideEffectErrors {
+        agent: AppliedAgent,
+        errors: Vec<QuickstartError>,
+    },
+}
+
+/// One staged quickstart application: a validated, mutated working config
+/// plus its personality temp files, ready for the irreversible
+/// persist-and-publish phase. Created by [`stage_apply`]; completed either
+/// as a one-shot ([`complete_staged_apply`], for private-config callers
+/// like the CLI) or as an admitted config commit
+/// ([`complete_staged_apply_as_commit`], for the supervised transports).
+pub struct StagedQuickstartApply {
+    working: Box<Config>,
+    staged_files: Vec<StagedPersonalityWrite>,
+    applied: AppliedAgent,
+    surface: Surface,
+    started: std::time::Instant,
+}
+
 pub async fn apply(
     submission: BuilderSubmission,
     config: &mut Config,
-) -> Result<AppliedAgent, Vec<QuickstartError>> {
+) -> Result<QuickstartApplyOutcome, Vec<QuickstartError>> {
     apply_with_surface(submission, config, Surface::Web).await
 }
 
+/// One-shot quickstart application for callers that own a private
+/// `Config` with no supervised publication domain (the CLI). Persists the
+/// staged config and installs the personality files; there is no live
+/// publication to make, so a post-commit side-effect failure is reported
+/// without any publication semantics.
 pub async fn apply_with_surface(
     submission: BuilderSubmission,
     config: &mut Config,
     surface: Surface,
-) -> Result<AppliedAgent, Vec<QuickstartError>> {
+) -> Result<QuickstartApplyOutcome, Vec<QuickstartError>> {
+    let staged = stage_apply(submission, config, surface)?;
+    complete_staged_apply(staged).await
+}
+
+/// Validate one submission and stage it onto a working config clone:
+/// every mutation (provider, presets, channels, peer groups, agent,
+/// completion flag) plus personality-file staging to tempfiles. No
+/// irreversible work happens here — a rejected submission returns with
+/// nothing on disk changed, and dropping the returned staging (or never
+/// completing it) cleans up its temp files.
+pub fn stage_apply(
+    submission: BuilderSubmission,
+    config: &mut Config,
+    surface: Surface,
+) -> Result<StagedQuickstartApply, Vec<QuickstartError>> {
     let ctx = RunCtx::new(surface);
     let started = std::time::Instant::now();
 
@@ -309,7 +361,70 @@ pub async fn apply_with_surface(
         "quickstart: completion flag flipped"
     );
 
-    let dirty_count = config.dirty_paths.len();
+    // The caller's config stays mutated exactly as the historical
+    // one-shot path left it; the staging carries its own copy into the
+    // irreversible phase.
+    Ok(StagedQuickstartApply {
+        working: Box::new(config.clone()),
+        staged_files,
+        applied,
+        surface,
+        started,
+    })
+}
+
+/// Persist one staged quickstart and install its personality files
+/// without a publication domain. A persistence failure returns with
+/// nothing committed; a personality failure returns
+/// [`QuickstartApplyOutcome::CommittedWithSideEffectErrors`] because the
+/// config is already on disk.
+pub async fn complete_staged_apply(
+    mut staged: StagedQuickstartApply,
+) -> Result<QuickstartApplyOutcome, Vec<QuickstartError>> {
+    let ctx = RunCtx::new(staged.surface);
+    persist_staged_config(&mut staged, &ctx).await?;
+    finish_staged_apply(staged, &ctx).await
+}
+
+/// Complete one staged quickstart as an admitted, serialized config
+/// commit: persist the staged config, publish it under `revision` (the
+/// caller allocated it before any irreversible I/O), then move the
+/// staged personality files into place.
+///
+/// A pre-commit persistence failure returns `Err` with the previously
+/// published pair untouched. After the committed publication, a
+/// personality failure is reported through
+/// [`QuickstartApplyOutcome::CommittedWithSideEffectErrors`] — the
+/// publication stands, the error is truthful — which is exactly the
+/// boundary the supervised transports must answer for.
+pub async fn complete_staged_apply_as_commit(
+    mut staged: StagedQuickstartApply,
+    commit: &crate::live_config_authority::ConfigCommit,
+    revision: zeroclaw_config::live::ConfigRevision,
+) -> Result<QuickstartApplyOutcome, Vec<QuickstartError>> {
+    let ctx = RunCtx::new(staged.surface);
+    persist_staged_config(&mut staged, &ctx).await?;
+    let published = staged.working.clone();
+    if let Err(error) = commit.publish(revision, *published) {
+        return Err(vec![QuickstartError::for_surface(
+            Some(&ctx),
+            QuickstartStep::Agent,
+            "",
+            format!("failed to publish quickstart config: {error}"),
+            "cli-quickstart-error-publish-config",
+            &[("err", &error.to_string())],
+        )]);
+    }
+    finish_staged_apply(staged, &ctx).await
+}
+
+/// Persist the staged working config. Shared by the one-shot and
+/// commit-completion paths; logs the persist window on both.
+async fn persist_staged_config(
+    staged: &mut StagedQuickstartApply,
+    ctx: &RunCtx,
+) -> Result<(), Vec<QuickstartError>> {
+    let dirty_count = staged.working.dirty_paths.len();
     let write_started = std::time::Instant::now();
     ::zeroclaw_log::record!(
         DEBUG,
@@ -321,7 +436,7 @@ pub async fn apply_with_surface(
         ),
         "quickstart: persist start"
     );
-    let write_result = config.save_dirty().await;
+    let write_result = staged.working.save_dirty().await;
     let write_ms = write_started.elapsed().as_millis() as u64;
     match &write_result {
         Ok(_) => ::zeroclaw_log::record!(
@@ -354,24 +469,42 @@ pub async fn apply_with_surface(
     }
     write_result.map_err(|err| {
         vec![QuickstartError::for_surface(
-            Some(&ctx),
+            Some(ctx),
             QuickstartStep::Agent,
             "",
             format!("failed to persist config: {err}"),
             "cli-quickstart-error-persist-config",
             &[("err", &err.to_string())],
         )]
-    })?;
+    })
+}
 
-    // Config landed atomically — now move the staged personality files
-    // into place. Any failure here is reported but does not unwind the
-    // already-persisted config; the agent is valid without them.
+/// Move the staged personality files into place and produce the terminal
+/// outcome. Any failure here is reported but does not unwind the
+/// already-committed config; the agent is valid without the files.
+async fn finish_staged_apply(
+    staged: StagedQuickstartApply,
+    ctx: &RunCtx,
+) -> Result<QuickstartApplyOutcome, Vec<QuickstartError>> {
+    let StagedQuickstartApply {
+        working: _,
+        mut staged_files,
+        applied,
+        surface: _,
+        started,
+    } = staged;
     let mut commit_errors = Vec::new();
-    commit_personality_files(staged_files, &mut commit_errors, Some(&ctx));
+    commit_personality_files(
+        std::mem::take(&mut staged_files),
+        &mut commit_errors,
+        Some(ctx),
+    );
     if !commit_errors.is_empty() {
-        return Err(commit_errors);
+        return Ok(QuickstartApplyOutcome::CommittedWithSideEffectErrors {
+            agent: applied,
+            errors: commit_errors,
+        });
     }
-
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
@@ -386,7 +519,7 @@ pub async fn apply_with_surface(
             )),
         "quickstart: apply complete"
     );
-    Ok(applied)
+    Ok(QuickstartApplyOutcome::Applied(applied))
 }
 
 pub fn record_dismissed(run_id: &str, surface: Surface, last_step: Option<QuickstartStep>) {
@@ -2271,7 +2404,7 @@ mod tests {
     use super::*;
     use zeroclaw_config::presets::{
         AgentIdentity, BuilderSubmission, ChannelQuickStart, MemoryChoice, ModelProviderChoice,
-        SelectorChoice,
+        QuickstartPersonalityFile, SelectorChoice,
     };
     use zeroclaw_config::schema::Config;
 
@@ -3704,5 +3837,109 @@ mod tests {
         let result = fetch_quickstart_context_window("groq", &provider_config).await;
 
         assert_eq!(result, None, "slow enrichment should degrade to fallback");
+    }
+
+    /// Post-commit personality failure must not strand the committed
+    /// quickstart: the staged apply publishes the persisted config first,
+    /// then installs the personality files. When the install fails (the
+    /// destination exists as a directory, so the staged tempfile cannot
+    /// persist onto it), the outcome is
+    /// [`QuickstartApplyOutcome::CommittedWithSideEffectErrors`] — the
+    /// publication stands (pair revision advanced, agent live, config on
+    /// disk) and the personality error is reported truthfully. Nothing is
+    /// rolled back to restore the files.
+    #[tokio::test]
+    async fn committed_quickstart_publishes_despite_personality_install_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let config = Config {
+            config_path: config_path.clone(),
+            data_dir: tmp.path().join("data"),
+            ..Config::default()
+        };
+        let authority = crate::LiveConfigAuthority::new(config);
+        let published_before = authority.published_revision();
+
+        let commit = authority.begin_config_commit().await.unwrap();
+        let mut working = commit.current_config();
+
+        // Force the post-commit install to fail: the destination file
+        // exists as a directory, so `tempfile.persist` cannot land the
+        // staged personality write onto it.
+        let workspace = working.agent_workspace_dir("pfail");
+        std::fs::create_dir_all(workspace.join("IDENTITY.md"))
+            .expect("seed the personality-destination blocker");
+
+        let submission = BuilderSubmission {
+            model_provider: SelectorChoice::Fresh(ModelProviderChoice {
+                provider_type: "anthropic".into(),
+                alias: "primary".into(),
+                model: "claude-sonnet-4-5".into(),
+                fields: std::collections::HashMap::from([(
+                    "api_key".to_string(),
+                    "sk-test".to_string(),
+                )]),
+            }),
+            risk_profile: SelectorChoice::Fresh("balanced".into()),
+            runtime_profile: SelectorChoice::Fresh("balanced".into()),
+            memory: SelectorChoice::Fresh(MemoryChoice::Sqlite),
+            channels: vec![],
+            peer_groups: vec![],
+            agent: AgentIdentity {
+                name: "pfail".into(),
+                system_prompt: "You are a test assistant.".into(),
+                personality_file: None,
+                personality_files: vec![QuickstartPersonalityFile {
+                    filename: "IDENTITY.md".into(),
+                    content: "identity body".into(),
+                }],
+            },
+        };
+
+        // Staging is pure preparation: nothing on disk changes, so the
+        // destination blocker above survives into the commit phase.
+        let staged = stage_apply(submission, &mut working, Surface::Tui)
+            .expect("a valid submission must stage cleanly");
+        let revision = commit
+            .next_revision()
+            .expect("a fresh epoch must allocate a revision");
+
+        let outcome = complete_staged_apply_as_commit(staged, &commit, revision).await;
+        let (agent, errors) = match outcome {
+            Ok(QuickstartApplyOutcome::CommittedWithSideEffectErrors { agent, errors }) => {
+                (agent, errors)
+            }
+            other => panic!(
+                "a personality failure after the committed publication must be \
+                 reported as CommittedWithSideEffectErrors, got {other:?}"
+            ),
+        };
+        assert_eq!(agent.alias, "pfail");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.field == "personality_files"),
+            "the personality install failure must be reported truthfully: {errors:?}"
+        );
+
+        // The committed config is PUBLISHED despite the side-effect
+        // failure: the pair advanced and the agent is live.
+        let handle = authority.live_handle();
+        let (published, revision_after) = handle.snapshot_with_revision();
+        assert!(
+            revision_after.succeeds_within_epoch(&published_before),
+            "the publication must stand — the pair revision advanced"
+        );
+        assert!(
+            published.agents.contains_key("pfail"),
+            "the committed agent must be live in the published pair"
+        );
+        // ...and the committed config is on disk.
+        let raw =
+            std::fs::read_to_string(&config_path).expect("the committed config must be persisted");
+        assert!(
+            raw.contains("pfail"),
+            "the persisted config must carry the committed agent"
+        );
     }
 }

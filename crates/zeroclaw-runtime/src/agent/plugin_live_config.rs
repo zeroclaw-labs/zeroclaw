@@ -24,9 +24,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
-use parking_lot::RwLock;
 use tempfile::TempDir;
 use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
 use zeroclaw_config::schema::{
@@ -251,11 +250,11 @@ async fn live_agent_plugin_tool_observes_config_reload_after_construction() {
     let instance_key = install_fixture_plugin(&plugins_root);
     let config = live_agent_config(&tmp, &plugins_root, &instance_key);
 
-    // The daemon's canonical handle. Everything after this point goes through
-    // the production live-Agent constructor.
-    let live = Arc::new(RwLock::new(config));
+    // The daemon-shaped canonical handle. Everything after this point goes
+    // through the production live-Agent constructor.
+    let live = zeroclaw_config::live::LiveConfig::new(config);
     let agent = Agent::from_live_config_with_tui_env(
-        Arc::clone(&live),
+        live.handle(),
         "plugin-agent",
         None,
         // No MCP: this test is about plugin config, and connecting MCP servers
@@ -291,14 +290,16 @@ async fn live_agent_plugin_tool_observes_config_reload_after_construction() {
 
     // A reload / credential rotation: the canonical instance entry changes in
     // the shared handle, with no Agent rebuild and no new tool registry.
-    live.write()
-        .plugins
+    let mut next = live.snapshot();
+    next.plugins
         .entries
         .iter_mut()
         .find(|entry| entry.name == instance_key)
         .expect("the canonical instance entry is present in the live config")
         .config
         .insert("label".to_string(), "after-reload".to_string());
+    let revision = live.next_revision().unwrap();
+    live.publish(revision, next).unwrap();
 
     let after = tool
         .execute(serde_json::json!({"text": "hello world"}))
@@ -339,9 +340,9 @@ async fn live_delegated_plugin_tool_observes_config_reload_after_construction() 
     let instance_key = install_fixture_plugin(&plugins_root);
     let config = live_delegating_agent_config(&tmp, &plugins_root, &instance_key);
 
-    let live = Arc::new(RwLock::new(config));
+    let live = zeroclaw_config::live::LiveConfig::new(config);
     let agent = Agent::from_live_config_with_tui_env(
-        Arc::clone(&live),
+        live.handle(),
         "plugin-agent",
         None,
         false,
@@ -393,14 +394,16 @@ async fn live_delegated_plugin_tool_observes_config_reload_after_construction() 
 
     // A reload / credential rotation, with no parent rebuild, no new DelegateTool,
     // and no new delegated registry.
-    live.write()
-        .plugins
+    let mut next = live.snapshot();
+    next.plugins
         .entries
         .iter_mut()
         .find(|entry| entry.name == instance_key)
         .expect("the canonical instance entry is present in the live config")
         .config
         .insert("label".to_string(), "after-reload".to_string());
+    let revision = live.next_revision().unwrap();
+    live.publish(revision, next).unwrap();
 
     let after = tool
         .execute(serde_json::json!({"text": "hello world"}))

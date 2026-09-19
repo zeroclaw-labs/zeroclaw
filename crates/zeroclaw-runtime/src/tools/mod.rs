@@ -122,6 +122,8 @@ pub use zeroclaw_tools::web_fetch::WebFetchTool;
 pub use zeroclaw_tools::web_search_tool::WebSearchTool;
 pub use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
 
+use crate::live_config_authority::AgentExecutionCapability;
+
 // Traits from zeroclaw-api
 pub use zeroclaw_api::schema::{CleaningStrategy, SchemaCleanr};
 pub use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, ToolSpec};
@@ -767,7 +769,7 @@ fn plugin_egress_policy(
 #[cfg(feature = "plugins-wasm")]
 pub(crate) fn plugin_egress_service(
     config: Arc<Config>,
-    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
 ) -> zeroclaw_plugins::egress::EgressHostService {
     zeroclaw_plugins::egress::EgressHostService::new(
         zeroclaw_plugins::egress::EgressPolicyResolver::new(move |scope| {
@@ -803,7 +805,7 @@ fn plugin_config_values(
 pub(crate) fn plugin_host_services(
     host: Arc<zeroclaw_plugins::host::PluginHost>,
     config: Arc<Config>,
-    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
 ) -> zeroclaw_plugins::services::PluginHostServices {
     // A live daemon handle and a fallback snapshot are mutually exclusive in
     // the long-lived service, so the resolver never retains two config sources.
@@ -862,7 +864,10 @@ pub fn all_tools_with_runtime(
     tui_env: Option<HashMap<String, String>>,
     sop_engine: Option<Arc<Mutex<SopEngine>>>,
     sop_audit: Option<Arc<SopAuditLogger>>,
-    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    // Live config handle for `send_via` peer-group authority. `Some` from the
+    // channel daemon (so reloads take effect); `None` for one-shot / non-channel
+    // callers, which fall back to a snapshot of `root_config`.
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
 ) -> AllToolsResult {
     all_tools_with_runtime_and_acp_sessions(
         config,
@@ -920,7 +925,123 @@ pub fn all_tools_with_runtime_and_acp_sessions(
     // Live config handle for `send_via` peer-group authority. `Some` from the
     // channel daemon (so reloads take effect); `None` for one-shot / non-channel
     // callers, which fall back to a snapshot of `root_config`.
-    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
+    acp_sessions: Option<AcpSessionReadView>,
+) -> AllToolsResult {
+    all_tools_with_runtime_context(
+        config,
+        security,
+        risk_profile,
+        agent_alias,
+        runtime,
+        memory,
+        composio_key,
+        composio_entity_id,
+        browser_config,
+        http_config,
+        web_fetch_config,
+        workspace_dir,
+        agents,
+        fallback_api_key,
+        root_config,
+        canvas_store,
+        is_subagent_caller,
+        tui_env,
+        sop_engine,
+        sop_audit,
+        live_config,
+        None,
+        acp_sessions,
+    )
+}
+
+/// Create the managed registry while carrying the authority-backed execution
+/// capability into tools that can start work for another target alias.
+#[allow(
+    clippy::implicit_hasher,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+pub fn all_tools_with_runtime_and_execution_capability(
+    config: Arc<Config>,
+    security: &Arc<SecurityPolicy>,
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+    agent_alias: &str,
+    runtime: Arc<dyn RuntimeAdapter>,
+    memory: Arc<dyn Memory>,
+    composio_key: Option<&str>,
+    composio_entity_id: Option<&str>,
+    browser_config: &zeroclaw_config::schema::BrowserConfig,
+    http_config: &zeroclaw_config::schema::HttpRequestConfig,
+    web_fetch_config: &zeroclaw_config::schema::WebFetchConfig,
+    workspace_dir: &std::path::Path,
+    agents: &HashMap<String, AliasedAgentConfig>,
+    fallback_api_key: Option<&str>,
+    root_config: &zeroclaw_config::schema::Config,
+    canvas_store: Option<CanvasStore>,
+    is_subagent_caller: bool,
+    tui_env: Option<HashMap<String, String>>,
+    sop_engine: Option<Arc<Mutex<SopEngine>>>,
+    sop_audit: Option<Arc<SopAuditLogger>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
+    execution_capability: Option<AgentExecutionCapability>,
+) -> AllToolsResult {
+    all_tools_with_runtime_context(
+        config,
+        security,
+        risk_profile,
+        agent_alias,
+        runtime,
+        memory,
+        composio_key,
+        composio_entity_id,
+        browser_config,
+        http_config,
+        web_fetch_config,
+        workspace_dir,
+        agents,
+        fallback_api_key,
+        root_config,
+        canvas_store,
+        is_subagent_caller,
+        tui_env,
+        sop_engine,
+        sop_audit,
+        live_config,
+        execution_capability,
+        None,
+    )
+}
+
+/// Assemble tools with both lifecycle admission and an owned ACP session view.
+#[allow(
+    clippy::implicit_hasher,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+pub(crate) fn all_tools_with_runtime_context(
+    config: Arc<Config>,
+    security: &Arc<SecurityPolicy>,
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+    agent_alias: &str,
+    runtime: Arc<dyn RuntimeAdapter>,
+    memory: Arc<dyn Memory>,
+    composio_key: Option<&str>,
+    composio_entity_id: Option<&str>,
+    browser_config: &zeroclaw_config::schema::BrowserConfig,
+    http_config: &zeroclaw_config::schema::HttpRequestConfig,
+    web_fetch_config: &zeroclaw_config::schema::WebFetchConfig,
+    workspace_dir: &std::path::Path,
+    agents: &HashMap<String, AliasedAgentConfig>,
+    fallback_api_key: Option<&str>,
+    root_config: &zeroclaw_config::schema::Config,
+    canvas_store: Option<CanvasStore>,
+    is_subagent_caller: bool,
+    tui_env: Option<HashMap<String, String>>,
+    sop_engine: Option<Arc<Mutex<SopEngine>>>,
+    sop_audit: Option<Arc<SopAuditLogger>>,
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
+    execution_capability: Option<AgentExecutionCapability>,
     acp_sessions: Option<AcpSessionReadView>,
 ) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
@@ -1006,11 +1127,12 @@ pub fn all_tools_with_runtime_and_acp_sessions(
             agent_alias,
             runtime.clone(),
         )),
-        Arc::new(CronRunTool::new_with_runtime(
+        Arc::new(CronRunTool::new_with_runtime_and_capability(
             config.clone(),
             security.clone(),
             agent_alias,
             runtime.clone(),
+            execution_capability.clone(),
         )),
         Arc::new(CronRunsTool::new(config.clone(), agent_alias)),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
@@ -1030,11 +1152,13 @@ pub fn all_tools_with_runtime_and_acp_sessions(
                 agent_alias,
                 security.clone(),
             )
-            .with_subagent_caller(is_subagent_caller),
+            .with_subagent_caller(is_subagent_caller)
+            .with_execution_capability(execution_capability.clone()),
         ),
-        Arc::new(SendMessageToPeerTool::new(
+        Arc::new(SendMessageToPeerTool::new_with_capability(
             Arc::clone(&root_config_shared),
             agent_alias,
+            execution_capability.clone(),
         )),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
@@ -1256,9 +1380,9 @@ pub fn all_tools_with_runtime_and_acp_sessions(
     // The four a2a_* tools share one client holding the live config handle, so
     // peer/credential/security resolution happens at call time (no stored peer Vec).
     if root_config.a2a.client.enabled {
-        let live = live_config
-            .clone()
-            .unwrap_or_else(|| Arc::new(parking_lot::RwLock::new(root_config.clone())));
+        let live = live_config.clone().unwrap_or_else(|| {
+            zeroclaw_config::live::LiveConfig::new(root_config.clone()).handle()
+        });
         // The zeroclaw dir (config file parent) + secrets.encrypt enable
         // decrypting encrypted peer tokens via the canonical SecretStore,
         // the same path http_request uses for its auth_secret values.
@@ -1985,6 +2109,7 @@ pub fn all_tools_with_runtime_and_acp_sessions(
         // resolve against that snapshot forever. Same contract as the
         // `live_config` argument this function received.
         .with_live_config(live_config.clone())
+        .with_execution_capability(execution_capability.clone())
         .with_caller_alias(agent_alias);
         let delegate_tool = Arc::new(delegate_tool);
         #[cfg(test)]
@@ -2374,20 +2499,18 @@ const = true
             entry(&instance_key, "true"),
             entry(&backup_instance_key, "false"),
         ];
-        let live = Arc::new(parking_lot::RwLock::new(current));
-        let services = plugin_host_services(
-            Arc::clone(&host),
-            Arc::new(snapshot),
-            Some(Arc::clone(&live)),
-        );
+        let live = zeroclaw_config::live::LiveConfig::new(current);
+        let services =
+            plugin_host_services(Arc::clone(&host), Arc::new(snapshot), Some(live.handle()));
 
         assert!(services.resolve_config(&scope).is_ok());
         assert!(
             services.resolve_config(&backup_scope).is_err(),
             "backup must use its invalid canonical entry, not a valid raw-name decoy"
         );
+        let mut updated = live.snapshot();
         for (key, enabled) in [(&instance_key, "false"), (&backup_instance_key, "true")] {
-            live.write()
+            updated
                 .plugins
                 .entries
                 .iter_mut()
@@ -2396,6 +2519,8 @@ const = true
                 .config
                 .insert("enabled".to_string(), enabled.to_string());
         }
+        live.publish(live.next_revision().unwrap(), updated)
+            .unwrap();
         assert!(
             services.resolve_config(&scope).is_err(),
             "work must observe its own canonical key's live update"

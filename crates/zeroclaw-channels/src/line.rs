@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
-use zeroclaw_config::schema::{Config, LineDmPolicy, LineGroupPolicy};
+#[cfg(test)]
+use zeroclaw_config::schema::Config;
+use zeroclaw_config::schema::{LineDmPolicy, LineGroupPolicy};
 use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::security::pairing::PairingGuard;
 
@@ -20,6 +22,8 @@ const MAX_LINE_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
 const LINE_SENDER_NAME_MAX_CHARS: usize = 20;
 
 pub struct LineChannel {
+    #[cfg(test)]
+    persistence_waiting: Option<Arc<tokio::sync::Notify>>,
     /// Long-lived channel access token — used for both Reply and Push APIs.
     channel_access_token: String,
     /// Channel secret — used to verify the `X-Line-Signature` header.
@@ -34,7 +38,7 @@ pub struct LineChannel {
     /// Resolves inbound external peers from canonical state at message-time.
     /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
-    persist: Option<Arc<parking_lot::RwLock<Config>>>,
+    persist: Option<zeroclaw_runtime::LiveConfigAuthority>,
     /// Pairing guard — `Some` when `dm_policy = Pairing`.
     pairing: Option<Arc<PairingGuard>>,
     /// TCP port the embedded webhook server listens on.
@@ -73,6 +77,9 @@ struct BotInfo {
 // ---------------------------------------------------------------------------
 
 struct LineState {
+    #[cfg(test)]
+    persistence_waiting: Option<Arc<tokio::sync::Notify>>,
+    persistence_cancel: tokio_util::sync::CancellationToken,
     tx: tokio::sync::mpsc::Sender<ChannelMessage>,
     channel_secret: String,
     bot_user_id: String,
@@ -83,8 +90,8 @@ struct LineState {
     /// Resolves the configured peer allowlist at message-time. Reads
     /// canonical state, no cache.
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
-    /// Optional pairing-persist handle for the `/bind` flow.
-    persist: Option<Arc<parking_lot::RwLock<Config>>>,
+    /// Optional pairing-persist authority for the `/bind` flow.
+    persist: Option<zeroclaw_runtime::LiveConfigAuthority>,
     pairing: Option<Arc<PairingGuard>>,
     pending_tokens: Arc<RwLock<HashMap<String, String>>>,
     /// HTTP client and credentials for downloading audio content.
@@ -232,11 +239,7 @@ fn is_line_user_allowed(state: &LineState, user_id: &str) -> bool {
 /// via the shared Config handle. Mirrors telegram/wechat's `persist_allowed_identity`.
 /// No-op-with-warn when `state.persist` is unset (test fixtures).
 async fn persist_line_paired_identity(state: &LineState, user_id: &str) -> anyhow::Result<()> {
-    use anyhow::Context;
-    use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
-    use zeroclaw_config::providers::ChannelRef;
-
-    let Some(config) = &state.persist else {
+    let Some(authority) = &state.persist else {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -250,35 +253,27 @@ async fn persist_line_paired_identity(state: &LineState, user_id: &str) -> anyho
     if normalized.is_empty() {
         anyhow::bail!("Cannot persist empty LINE userId");
     }
-    let group_name = format!("line_{}", state.alias);
-    let channel_ref = ChannelRef::new(format!("line.{}", state.alias));
-    let snapshot = {
-        let mut cfg = config.write();
-        if !cfg.channels.line.contains_key(&state.alias) {
-            anyhow::bail!("Missing [channels.line.{}] section", state.alias);
-        }
-        let group = cfg
-            .peer_groups
-            .entry(group_name)
-            .or_insert_with(|| PeerGroupConfig {
-                channel: channel_ref,
-                ..PeerGroupConfig::default()
-            });
-        if group
-            .external_peers
-            .iter()
-            .any(|p| p.as_str() == normalized)
-        {
-            return Ok(());
-        }
-        group.external_peers.push(PeerUsername::new(normalized));
-        cfg.clone()
-    };
-    snapshot
-        .save()
-        .await
-        .context("Failed to persist LINE paired userId to config.toml")?;
-    Ok(())
+    let persistence = crate::identity_persist::persist_external_peer_with_cancellation(
+        Some(authority),
+        "line",
+        &state.alias,
+        &normalized,
+        Some(&state.persistence_cancel),
+    );
+    #[cfg(test)]
+    if let Some(waiting) = &state.persistence_waiting {
+        use std::future::Future;
+        tokio::pin!(persistence);
+        return std::future::poll_fn(|cx| {
+            let result = persistence.as_mut().poll(cx);
+            if result.is_pending() {
+                waiting.notify_one();
+            }
+            result
+        })
+        .await;
+    }
+    persistence.await
 }
 
 async fn handle_webhook(
@@ -523,10 +518,11 @@ async fn handle_webhook(
                             if let Some(ref guard) = state.pairing {
                                 match guard.try_pair(code, user_id).await {
                                     Ok(Some(_)) => {
-                                        if let Err(e) =
+                                        let reply_key = if let Err(e) =
                                             persist_line_paired_identity(&*state, user_id).await
                                         {
                                             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"user_id": user_id, "e": e.to_string()})), "paired userId= but persist failed");
+                                            "channel-line-bind-persist-failed"
                                         } else {
                                             ::zeroclaw_log::record!(
                                                 INFO,
@@ -539,16 +535,15 @@ async fn handle_webhook(
                                                 ),
                                                 "paired userId="
                                             );
-                                        }
+                                            "channel-line-bind-success"
+                                        };
                                         if let Some(ref token) = bind_reply_token {
                                             send_bind_reply(
                                                 &state.client,
                                                 &state.channel_access_token,
                                                 &state.api_base_url,
                                                 token,
-                                                &i18n::get_required_cli_string(
-                                                    "channel-line-bind-success",
-                                                ),
+                                                &i18n::get_required_cli_string(reply_key),
                                                 bind_sender.clone(),
                                             )
                                             .await;
@@ -758,6 +753,8 @@ impl LineChannel {
         };
 
         Self {
+            #[cfg(test)]
+            persistence_waiting: None,
             channel_access_token: token,
             channel_secret: secret,
             dm_policy,
@@ -777,12 +774,12 @@ impl LineChannel {
         }
     }
 
-    /// Wire the shared `Config` handle so `persist_line_paired_identity`
-    /// can write a newly-paired userId into `peer_groups.line_<alias>.external_peers`
-    /// and save. Long-running daemon sets this from the orchestrator; tests
-    /// and one-shot callers leave it unset (pairing then doesn't survive).
-    pub fn with_persistence(mut self, config: Arc<parking_lot::RwLock<Config>>) -> Self {
-        self.persist = Some(config);
+    /// Wire the daemon generation's live-config authority for pairing writes.
+    pub fn with_persistence_authority(
+        mut self,
+        authority: zeroclaw_runtime::LiveConfigAuthority,
+    ) -> Self {
+        self.persist = Some(authority);
         self
     }
 
@@ -1080,7 +1077,13 @@ impl LineChannel {
         bot_user_id: String,
         tx: tokio::sync::mpsc::Sender<ChannelMessage>,
     ) -> anyhow::Result<()> {
+        // Axum requests can outlive the listener during graceful shutdown.
+        let persistence_cancel = tokio_util::sync::CancellationToken::new();
+        let _persistence_guard = persistence_cancel.clone().drop_guard();
         let state = Arc::new(LineState {
+            #[cfg(test)]
+            persistence_waiting: self.persistence_waiting.clone(),
+            persistence_cancel,
             tx,
             channel_secret: self.channel_secret.clone(),
             bot_user_id,
@@ -1231,6 +1234,66 @@ mod tests {
             empty_resolver(),
             8444,
         )
+    }
+
+    #[test]
+    fn authority_persistence_preserves_live_handle_identity() {
+        let authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
+        let channel = make_channel().with_persistence_authority(authority.clone());
+        let stored = channel.persist.as_ref().expect("authority is stored");
+
+        assert!(authority.live_handle().same_storage(&stored.live_handle()));
+        assert_eq!(authority.config_epoch(), stored.config_epoch());
+    }
+
+    #[tokio::test]
+    async fn paired_identity_save_failure_does_not_publish_line_peer() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let blocked_parent = temp.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, "file").unwrap();
+        let mut config = Config::default();
+        config
+            .channels
+            .line
+            .insert("line_test_alias".to_string(), Default::default());
+        config.config_path = blocked_parent.join("config.toml");
+        config.data_dir = temp.path().join("data");
+        let authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        let channel = make_channel().with_persistence_authority(authority.clone());
+        let (tx, _rx) = mpsc::channel(1);
+        let state = LineState {
+            persistence_waiting: None,
+            persistence_cancel: tokio_util::sync::CancellationToken::new(),
+            tx,
+            channel_secret: channel.channel_secret.clone(),
+            bot_user_id: "bot-user".to_string(),
+            dm_policy: channel.dm_policy.clone(),
+            group_policy: channel.group_policy.clone(),
+            alias: channel.alias.clone(),
+            peer_resolver: Arc::clone(&channel.peer_resolver),
+            persist: channel.persist.clone(),
+            pairing: channel.pairing.clone(),
+            pending_tokens: Arc::clone(&channel.pending_tokens),
+            client: channel.client.clone(),
+            channel_access_token: channel.channel_access_token.clone(),
+            api_base_url: channel.api_base_url.clone(),
+            content_api_base_url: channel.content_api_base_url.clone(),
+            sender_name_resolver: Arc::clone(&channel.sender_name_resolver),
+            sender_icon: Arc::clone(&channel.sender_icon),
+            transcription_manager: channel.transcription_manager.clone(),
+        };
+
+        persist_line_paired_identity(&state, "line-user")
+            .await
+            .expect_err("save failure must reject paired identity");
+
+        assert!(
+            authority
+                .live_handle()
+                .read()
+                .channel_external_peers("line", "line_test_alias")
+                .is_empty()
+        );
     }
 
     /// Compute a valid `X-Line-Signature` for `body` signed with `secret`.
@@ -2555,6 +2618,106 @@ mod tests {
     }
 
     // ---- Bind Reply Feedback ------------------------------------------------
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retired_listener_rejects_in_flight_webhook_pairing() {
+        use std::time::Duration;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let api_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/bot/message/reply"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&api_server)
+            .await;
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config
+            .channels
+            .line
+            .insert("line_test_alias".into(), Default::default());
+        config.config_path = temp.path().join("config.toml");
+        config.data_dir = temp.path().join("data");
+        let authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        let mut channel = LineChannel::new(
+            "tok".into(),
+            "secret".into(),
+            LineDmPolicy::Pairing,
+            LineGroupPolicy::Open,
+            "line_test_alias",
+            empty_resolver(),
+            0,
+        )
+        .with_api_base_url(&api_server.uri())
+        .with_persistence_authority(authority.clone());
+        let code = channel.pairing.as_ref().unwrap().pairing_code().unwrap();
+        let waiting = Arc::new(tokio::sync::Notify::new());
+        channel.persistence_waiting = Some(Arc::clone(&waiting));
+        let guard = authority.begin_config_commit().await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, _rx) = mpsc::channel(1);
+        let server = zeroclaw_spawn::spawn!(async move {
+            channel
+                .listen_with_listener(listener, "bot".into(), tx)
+                .await
+        });
+        let request = zeroclaw_spawn::spawn!(async move {
+            post_signed(
+                port,
+                "secret",
+                &dm_event("line-user", &format!("/bind {code}"), "rt-retired"),
+            )
+            .await
+        });
+
+        let pending = tokio::time::timeout(Duration::from_secs(5), waiting.notified()).await;
+        server.abort();
+        let _ = server.await;
+        if pending.is_err() {
+            request.abort();
+            panic!("webhook did not reach pairing persistence");
+        }
+        let mut request = request;
+        let settled = tokio::time::timeout(Duration::from_secs(5), &mut request).await;
+        if settled.is_err() {
+            request.abort();
+            let _ = request.await;
+        }
+        assert_eq!(
+            settled
+                .expect("retired request must settle while lock remains held")
+                .unwrap(),
+            200
+        );
+        drop(guard);
+        assert!(
+            authority
+                .live_handle()
+                .read()
+                .channel_external_peers("line", "line_test_alias")
+                .is_empty()
+        );
+        assert!(!temp.path().join("config.toml").exists());
+        let requests = api_server.received_requests().await.unwrap();
+        let reply = requests
+            .iter()
+            .find(|request| request.url.path() == "/v2/bot/message/reply")
+            .expect("persistence rejection must send a failure reply");
+        let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["replyToken"], "rt-retired");
+        assert_eq!(
+            body["messages"][0]["text"],
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-line-bind-persist-failed")
+        );
+        assert_ne!(
+            body["messages"][0]["text"],
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-line-bind-success")
+        );
+        api_server.verify().await;
+    }
 
     #[tokio::test]
     async fn webhook_bind_success_sends_paired_reply() {

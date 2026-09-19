@@ -95,7 +95,6 @@ pub use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
 pub use zeroclaw_infra::stall_watchdog::StallWatchdog;
 
 use anyhow::{Context, Result};
-use parking_lot::RwLock;
 use portable_atomic::{AtomicU64, AtomicUsize, Ordering};
 use pulldown_cmark::{Event, Options as MarkdownOptions, Parser as MarkdownParser, Tag};
 
@@ -146,6 +145,12 @@ type CronChannelRegistry = Arc<HashMap<String, Arc<dyn Channel>>>;
 /// Replaced wholesale by the active channel task and cleared when that task ends.
 static CRON_CHANNEL_REGISTRY: std::sync::RwLock<Option<CronChannelRegistry>> =
     std::sync::RwLock::new(None);
+
+pub fn prepare_live_channel_registry(expect_channels: bool) {
+    *CRON_CHANNEL_REGISTRY
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = expect_channels.then(|| Arc::new(HashMap::new()));
+}
 
 /// Owns one published registry generation for the lifetime of its channel task.
 /// A stale task must not clear a newer task's replacement when it finally exits.
@@ -714,6 +719,7 @@ impl ModelPickerDispatchOwnership {
 /// A turn waiting for its conversation lane.
 struct PendingTurn {
     ctx: Arc<ChannelRuntimeContext>,
+    agent_generation: u64,
     msg: zeroclaw_api::channel::ChannelMessage,
     /// Immutable queue-ingress id used by picker delivery bookkeeping even
     /// when a modifying hook replaces `msg.id` before final lane admission.
@@ -929,6 +935,7 @@ impl Drop for IngressOrderRegistration {
 struct IngressTaskTracker {
     active: AtomicUsize,
     drained: tokio::sync::Notify,
+    force_stop: CancellationToken,
 }
 
 impl IngressTaskTracker {
@@ -936,6 +943,7 @@ impl IngressTaskTracker {
         Arc::new(Self {
             active: AtomicUsize::new(0),
             drained: tokio::sync::Notify::new(),
+            force_stop: CancellationToken::new(),
         })
     }
 
@@ -944,6 +952,26 @@ impl IngressTaskTracker {
         IngressTaskRegistration {
             tracker: Arc::clone(self),
         }
+    }
+
+    fn spawn(
+        self: &Arc<Self>,
+        future: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> tokio::task::JoinHandle<()> {
+        let tracked = self.track();
+        let force_stop = self.force_stop.clone();
+        zeroclaw_spawn::spawn!(async move {
+            let _tracked = tracked;
+            tokio::select! {
+                biased;
+                _ = force_stop.cancelled() => {}
+                _ = future => {}
+            }
+        })
+    }
+
+    fn force_stop(&self) {
+        self.force_stop.cancel();
     }
 
     async fn wait_drained(&self) {
@@ -1002,6 +1030,9 @@ struct ConversationLaneRegistry {
     lanes: std::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<Box<PendingTurn>>>>,
     drained: tokio::sync::Notify,
     semaphore: Arc<tokio::sync::Semaphore>,
+    agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
+    cancel: CancellationToken,
+    tasks: Arc<IngressTaskTracker>,
 }
 
 /// Maximum queued turns per conversation lane, excluding the one being
@@ -1074,11 +1105,18 @@ enum LaneAdmission {
 }
 
 impl ConversationLaneRegistry {
-    fn new(semaphore: Arc<tokio::sync::Semaphore>) -> Arc<Self> {
+    fn new(
+        semaphore: Arc<tokio::sync::Semaphore>,
+        agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
+        cancel: CancellationToken,
+    ) -> Arc<Self> {
         Arc::new(Self {
             lanes: std::sync::Mutex::new(HashMap::new()),
             drained: tokio::sync::Notify::new(),
             semaphore,
+            agent_lifecycle,
+            cancel,
+            tasks: IngressTaskTracker::new(),
         })
     }
 
@@ -1105,10 +1143,11 @@ impl ConversationLaneRegistry {
         // *behind* a successor that waits on its completion at the head of
         // the same lane — the completion could then only be marked by a queue
         // position that never drains: a permanently wedged lane.
-        if turn
-            .registration
-            .as_ref()
-            .is_some_and(|registration| registration.cancellation.is_cancelled())
+        if self.cancel.is_cancelled()
+            || turn
+                .registration
+                .as_ref()
+                .is_some_and(|registration| registration.cancellation.is_cancelled())
         {
             return LaneAdmission::Canceled(turn);
         }
@@ -1130,7 +1169,7 @@ impl ConversationLaneRegistry {
         lanes.insert(key.to_string(), tx.clone());
         let registry = Arc::clone(self);
         let lane_key = key.to_string();
-        zeroclaw_spawn::spawn!(registry.run_lane(lane_key, rx));
+        self.tasks.spawn(registry.run_lane(lane_key, rx));
 
         // Re-send after the lane exists. A runner cannot retire while this
         // lock is held, so the only way this fails is a runtime already
@@ -1167,7 +1206,7 @@ impl ConversationLaneRegistry {
             // `next_slot`, instead of dying with its registration stuck in the
             // registry and `wait_drained` hanging on shutdown.
             let registry = Arc::clone(&self);
-            let worker = zeroclaw_spawn::spawn!(registry.process_turn(turn));
+            let worker = self.tasks.spawn(registry.process_turn(turn));
             log_worker_join_result(worker.await);
         }
     }
@@ -1178,10 +1217,11 @@ impl ConversationLaneRegistry {
         // `/stop` or a superseding message may have cancelled this turn
         // while it waited in the queue; drop it before it waits for a
         // predecessor or takes an execution permit.
-        if turn
-            .registration
-            .as_ref()
-            .is_some_and(|registration| registration.cancellation.is_cancelled())
+        if self.cancel.is_cancelled()
+            || turn
+                .registration
+                .as_ref()
+                .is_some_and(|registration| registration.cancellation.is_cancelled())
         {
             return;
         }
@@ -1218,24 +1258,38 @@ impl ConversationLaneRegistry {
             }
         };
 
-        let PendingTurn {
-            ctx,
-            msg,
-            delivery_message_id,
-            dispatch_ownership,
-            registration,
-            pending_work,
-        } = *turn;
-        run_conversation_turn(
-            ctx,
-            msg,
-            delivery_message_id,
-            dispatch_ownership,
-            registration,
-            permit,
-            pending_work,
-        )
-        .await;
+        let Some(_turn_lease) =
+            self.reserve_turn(turn.ctx.agent_alias.as_str(), turn.agent_generation)
+        else {
+            return;
+        };
+        run_conversation_turn(*turn, permit, self.cancel.clone()).await;
+    }
+
+    fn reserve_turn(
+        &self,
+        alias: &str,
+        generation: u64,
+    ) -> Option<zeroclaw_runtime::live_config_authority::AgentTurnLease> {
+        if self.cancel.is_cancelled() {
+            return None;
+        }
+        match self.agent_lifecycle.reserve_turn_at(alias, generation) {
+            Ok(lease) => Some(lease),
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "agent": alias,
+                            "error": error.to_string(),
+                        })),
+                    "dropping inbound message: agent lifecycle unavailable"
+                );
+                None
+            }
+        }
     }
 
     /// Take the next queued slot, retiring the lane when the queue is empty.
@@ -1324,8 +1378,7 @@ fn send_conversation_busy(
             zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-conversation-busy");
         let reply_target = msg.reply_target.clone();
         let thread_ts = msg.thread_ts.clone();
-        let tracked_task = busy_notice_tasks.track();
-        zeroclaw_spawn::spawn!(async move {
+        busy_notice_tasks.spawn(async move {
             let _notice_permit = notice_permit;
             send_notice_with_timeout(
                 channel,
@@ -1333,7 +1386,6 @@ fn send_conversation_busy(
                 "busy_notice",
             )
             .await;
-            drop(tracked_task);
         });
     }
 }
@@ -1367,7 +1419,16 @@ async fn route_inbound_slot(
     }
 
     let ctx = Arc::clone(&turn.ctx);
-    let Some(hooked) = run_inbound_message_hook(&ctx, turn.msg).await else {
+    // Hooks can execute agent-scoped work, but waiting for debounce or a lane
+    // must not pin a lifecycle lease. Revalidate again at model execution.
+    let hooked = {
+        let Some(_lease) = lanes.reserve_turn(ctx.agent_alias.as_str(), turn.agent_generation)
+        else {
+            return;
+        };
+        run_inbound_message_hook(&ctx, turn.msg).await
+    };
+    let Some(hooked) = hooked else {
         return;
     };
     turn.msg = hooked;
@@ -1407,11 +1468,11 @@ fn spawn_inbound_routing(
     slot: InboundSlot,
 ) {
     let tracked_task = tracker.track();
-    let worker = zeroclaw_spawn::spawn!(route_inbound_slot(
+    let worker = tracker.spawn(route_inbound_slot(
         lanes,
         busy_notice_budget,
         busy_notice_tasks,
-        slot
+        slot,
     ));
     zeroclaw_spawn::spawn!(async move {
         log_worker_join_result(worker.await);
@@ -1466,6 +1527,7 @@ async fn retire_owned_bucket(
 
 fn spawn_debounce_forwarder(
     first: tokio::sync::oneshot::Receiver<String>,
+    tracker: &Arc<IngressTaskTracker>,
 ) -> (
     tokio::sync::oneshot::Receiver<String>,
     tokio::sync::mpsc::UnboundedSender<DebounceBucketExtension>,
@@ -1473,7 +1535,7 @@ fn spawn_debounce_forwarder(
     let (slot_tx, slot_rx) = tokio::sync::oneshot::channel();
     let (updates_tx, mut updates_rx) = tokio::sync::mpsc::unbounded_channel();
 
-    zeroclaw_spawn::spawn!(async move {
+    tracker.spawn(async move {
         let mut pending = first;
         // Admission permits of every follow-up retained in this bucket. They
         // are held until the bucket resolves either way — delivery (the
@@ -9529,6 +9591,7 @@ async fn register_inbound_turn(
     msg: &zeroclaw_api::channel::ChannelMessage,
     in_flight: &Arc<Mutex<HashMap<String, Vec<InFlightSenderTaskState>>>>,
     task_sequence: &Arc<AtomicU64>,
+    generation_cancel: &CancellationToken,
 ) -> Option<TurnRegistration> {
     if msg.channel == "cli" || msg.passive_context {
         return None;
@@ -9542,7 +9605,7 @@ async fn register_inbound_turn(
     // keys a different history.
     let debounce_key =
         message_debounce_key(runtime_conversation_history_key(ctx.as_ref(), msg), msg);
-    let cancellation = CancellationToken::new();
+    let cancellation = generation_cancel.child_token();
     let completion = Arc::new(InFlightTaskCompletion::new());
     let task_id = task_sequence.fetch_add(1, Ordering::Relaxed);
 
@@ -9644,24 +9707,24 @@ impl Drop for TurnRegistration {
 /// Run one turn to completion. The caller owns the execution permit and the
 /// conversation lane, so everything here is already exclusive for this history.
 async fn run_conversation_turn(
-    ctx: Arc<ChannelRuntimeContext>,
-    msg: zeroclaw_api::channel::ChannelMessage,
-    delivery_message_id: String,
-    dispatch_ownership: ModelPickerDispatchOwnership,
-    registration: Option<TurnRegistration>,
+    turn: PendingTurn,
     permit: tokio::sync::OwnedSemaphorePermit,
-    pending_work: tokio::sync::OwnedSemaphorePermit,
+    generation_cancel: CancellationToken,
 ) {
+    let PendingTurn {
+        ctx,
+        msg,
+        delivery_message_id,
+        dispatch_ownership,
+        registration,
+        pending_work,
+        ..
+    } = turn;
     let execution_permit = permit;
 
     let Some(registration) = registration else {
-        process_channel_message_with_delivery_id(
-            ctx,
-            msg,
-            CancellationToken::new(),
-            delivery_message_id,
-        )
-        .await;
+        process_channel_message_with_delivery_id(ctx, msg, generation_cancel, delivery_message_id)
+            .await;
         drop(dispatch_ownership);
         drop(execution_permit);
         drop(pending_work);
@@ -9698,6 +9761,9 @@ struct AgentRouter {
     single_ctx: Option<Arc<ChannelRuntimeContext>>,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
+    execution_capability: Option<zeroclaw_runtime::live_config_authority::AgentExecutionCapability>,
+    turn_generations: Arc<HashMap<String, u64>>,
 }
 
 impl AgentRouter {
@@ -9709,6 +9775,9 @@ impl AgentRouter {
             single_ctx: Some(ctx),
             sop_engine: None,
             sop_audit: None,
+            agent_lifecycle: Default::default(),
+            execution_capability: None,
+            turn_generations: Arc::new(HashMap::new()),
         }
     }
 
@@ -9724,7 +9793,33 @@ impl AgentRouter {
             single_ctx: None,
             sop_engine,
             sop_audit,
+            agent_lifecycle: Default::default(),
+            execution_capability: None,
+            turn_generations: Arc::new(HashMap::new()),
         }
+    }
+
+    fn with_agent_lifecycle(
+        mut self,
+        agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
+    ) -> Self {
+        self.turn_generations = Arc::new(
+            self.by_agent
+                .keys()
+                .chain(self.single_ctx.iter().map(|ctx| ctx.agent_alias.as_ref()))
+                .map(|alias| (alias.clone(), agent_lifecycle.alias_generation(alias)))
+                .collect(),
+        );
+        self.agent_lifecycle = agent_lifecycle;
+        self
+    }
+
+    fn with_execution_capability(
+        mut self,
+        execution_capability: zeroclaw_runtime::live_config_authority::AgentExecutionCapability,
+    ) -> Self {
+        self.execution_capability = Some(execution_capability);
+        self
     }
 
     fn resolve(
@@ -10066,11 +10161,12 @@ async fn dispatch_channel_sop_gate(
     };
     match outcome {
         Ok(outcome) => {
-            zeroclaw_runtime::sop::drive_resumed_broker_action(
+            zeroclaw_runtime::sop::drive_resumed_broker_action_with_capability(
                 config,
                 Arc::clone(engine),
                 router.sop_audit.clone(),
                 &outcome,
+                router.execution_capability.clone(),
             );
             ::zeroclaw_log::record!(
                 INFO,
@@ -10220,10 +10316,26 @@ impl Drop for ModelPickerAckCleanupGuard {
     }
 }
 
+#[cfg(test)]
 async fn run_message_dispatch_loop(
+    rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
+    router: AgentRouter,
+    max_in_flight_messages: usize,
+) {
+    run_message_dispatch_loop_with_cancel(
+        rx,
+        router,
+        max_in_flight_messages,
+        CancellationToken::new(),
+    )
+    .await;
+}
+
+async fn run_message_dispatch_loop_with_cancel(
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
     router: AgentRouter,
     max_in_flight_messages: usize,
+    cancel: CancellationToken,
 ) {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages));
     let pending_budget = Arc::new(tokio::sync::Semaphore::new(GLOBAL_PENDING_TURN_LIMIT));
@@ -10238,7 +10350,11 @@ async fn run_message_dispatch_loop(
     let task_sequence = Arc::new(AtomicU64::new(1));
     let ingress_order = IngressOrderRegistry::new();
     let ingress_tasks = IngressTaskTracker::new();
-    let lanes = ConversationLaneRegistry::new(Arc::clone(&semaphore));
+    let lanes = ConversationLaneRegistry::new(
+        Arc::clone(&semaphore),
+        router.agent_lifecycle.clone(),
+        cancel.clone(),
+    );
     // Open debounce buckets, keyed by debounce key: the channel that feeds the
     // lane position reserved by the bucket's first message.
     let mut debounce_buckets: HashMap<
@@ -10253,7 +10369,11 @@ async fn run_message_dispatch_loop(
     // bucket another, still-live turn is waiting in.
     let mut debounce_bucket_owners: HashMap<String, u64> = HashMap::new();
 
-    while let Some(msg) = rx.recv().await {
+    while let Some(msg) = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        msg = rx.recv() => msg,
+    } {
         // Acquire picker-delivery ownership at the first definitive queue
         // consumption boundary. Every `continue`, semaphore shutdown, debounce
         // cancellation, worker abort, and normal completion below then settles
@@ -10426,11 +10546,9 @@ async fn run_message_dispatch_loop(
                 match Arc::clone(&stop_reply_budget).try_acquire_owned() {
                     Ok(reply_permit) => {
                         let send_msg = stop_reply_message(&msg, reply);
-                        let tracked_task = notice_tasks.track();
-                        zeroclaw_spawn::spawn!(async move {
+                        notice_tasks.spawn(async move {
                             let _reply_permit = reply_permit;
                             send_notice_with_timeout(channel, send_msg, "stop_ack").await;
-                            drop(tracked_task);
                         });
                     }
                     Err(_) => {
@@ -10499,11 +10617,12 @@ async fn run_message_dispatch_loop(
                 &ctx.prompt_config.channels.telegram,
             );
 
-            match ctx
-                .debouncer
-                .debounce_with_window(&debounce_key, &msg.content, debounce_window)
-                .await
-            {
+            let debounce_result = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                result = ctx.debouncer.debounce_with_window(&debounce_key, &msg.content, debounce_window) => result,
+            };
+            match debounce_result {
                 zeroclaw_infra::debounce::DebounceResult::Pending { rx, extended } => {
                     // A follow-up that extended an open bucket hands the
                     // debouncer's replacement receiver to the lane position
@@ -10544,13 +10663,18 @@ async fn run_message_dispatch_loop(
                         _ => (rx, pending_work),
                     };
 
-                    let (content, bucket) = spawn_debounce_forwarder(rx);
+                    let (content, bucket) = spawn_debounce_forwarder(rx, &ingress_tasks);
                     debounce_buckets.retain(|_, open| !open.is_closed());
                     debounce_bucket_owners.retain(|key, _| debounce_buckets.contains_key(key));
                     debounce_buckets.insert(debounce_key.clone(), bucket);
-                    let registration =
-                        register_inbound_turn(&ctx, &msg, &in_flight_by_sender, &task_sequence)
-                            .await;
+                    let registration = register_inbound_turn(
+                        &ctx,
+                        &msg,
+                        &in_flight_by_sender,
+                        &task_sequence,
+                        &cancel,
+                    )
+                    .await;
                     // This turn owns the bucket it just opened: the reserved
                     // slot, and the queued position behind it, are its own, so
                     // only its own cancellation may retire the bucket.
@@ -10576,6 +10700,15 @@ async fn run_message_dispatch_loop(
                     let source_key = conversation_history_key(&msg);
                     let inbound = InboundTurn {
                         turn: Box::new(PendingTurn {
+                            agent_generation: router
+                                .turn_generations
+                                .get(ctx.agent_alias.as_str())
+                                .copied()
+                                .unwrap_or_else(|| {
+                                    router
+                                        .agent_lifecycle
+                                        .alias_generation(ctx.agent_alias.as_str())
+                                }),
                             ctx: Arc::clone(&ctx),
                             msg,
                             delivery_message_id,
@@ -10610,7 +10743,7 @@ async fn run_message_dispatch_loop(
         // Hook execution and final routing are detached and globally bounded,
         // so the loop remains free to receive `/stop` and interruptions.
         let registration =
-            register_inbound_turn(&ctx, &msg, &in_flight_by_sender, &task_sequence).await;
+            register_inbound_turn(&ctx, &msg, &in_flight_by_sender, &task_sequence, &cancel).await;
         // Registering with interruption enabled cancels the turn this one
         // supersedes. A message that bypasses debounce (a runtime command such
         // as `/new`, or a channel with no window) can supersede a turn that is
@@ -10639,6 +10772,15 @@ async fn run_message_dispatch_loop(
             Arc::clone(&notice_tasks),
             InboundSlot::Ready(InboundTurn {
                 turn: Box::new(PendingTurn {
+                    agent_generation: router
+                        .turn_generations
+                        .get(ctx.agent_alias.as_str())
+                        .copied()
+                        .unwrap_or_else(|| {
+                            router
+                                .agent_lifecycle
+                                .alias_generation(ctx.agent_alias.as_str())
+                        }),
                     ctx: Arc::clone(&ctx),
                     msg,
                     delivery_message_id,
@@ -10651,9 +10793,26 @@ async fn run_message_dispatch_loop(
         );
     }
 
-    ingress_tasks.wait_drained().await;
-    lanes.wait_drained().await;
-    notice_tasks.wait_drained().await;
+    drop(debounce_buckets);
+    let drain = async {
+        ingress_tasks.wait_drained().await;
+        lanes.wait_drained().await;
+        lanes.tasks.wait_drained().await;
+        notice_tasks.wait_drained().await;
+    };
+    if tokio::time::timeout(Duration::from_secs(5), drain)
+        .await
+        .is_err()
+    {
+        ingress_tasks.force_stop();
+        lanes.tasks.force_stop();
+        notice_tasks.force_stop();
+        // Wait for dropped futures to release their leases and registrations
+        // before permitting the next runtime generation to start.
+        ingress_tasks.wait_drained().await;
+        lanes.tasks.wait_drained().await;
+        notice_tasks.wait_drained().await;
+    }
 }
 
 fn normalize_telegram_identity(value: &str) -> String {
@@ -10907,10 +11066,10 @@ fn one_shot_channel_workspace_dir(config: &Config, channel_type: &str, alias: &s
 
 #[cfg(feature = "channel-slack")]
 fn slack_thread_context_max_messages_resolver(
-    config_arc: &Arc<RwLock<Config>>,
+    config_arc: &zeroclaw_config::live::LiveConfigHandle,
     alias: &str,
 ) -> Arc<dyn Fn() -> usize + Send + Sync> {
-    let cfg_arc = Arc::clone(config_arc);
+    let cfg_arc = config_arc.clone();
     let alias = alias.to_string();
     Arc::new(move || {
         cfg_arc
@@ -10947,9 +11106,21 @@ impl std::error::Error for UnknownChannelId {}
 
 /// Build a single channel instance by config section name (e.g. "telegram").
 fn build_channel_by_id(
-    config_arc: &Arc<RwLock<Config>>,
+    config_arc: &zeroclaw_config::live::LiveConfigHandle,
     channel_id: &str,
 ) -> Result<Arc<dyn Channel>> {
+    // One-shot construction: a private, unsupervised authority seeded from
+    // the caller's own one-shot handle, matching that handle's semantics —
+    // a pairing write here would persist to disk but publish only into
+    // this throwaway storage, never entering a supervised publication
+    // domain (one-shot senders never pair).
+    #[cfg(any(
+        feature = "channel-telegram",
+        feature = "whatsapp-web",
+        feature = "channel-wechat",
+        feature = "channel-line"
+    ))]
+    let authority = zeroclaw_runtime::LiveConfigAuthority::new(config_arc.snapshot());
     #[allow(unused_variables)]
     let config = config_arc.read();
     match channel_id {
@@ -10981,7 +11152,7 @@ fn build_channel_by_id(
                     tg.mention_only,
                 )
                 .with_voice_peer_resolver(voice_peer_resolver)
-                .with_persistence(config_arc.clone())
+                .with_persistence_authority(authority.clone())
                 .with_api_base(tg.api_base_url.clone())
                 .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
@@ -11174,9 +11345,9 @@ fn build_channel_by_id(
                 };
                 let ack = mx.ack_reactions.unwrap_or(config.channels.ack_reactions);
                 let workspace_dir = one_shot_channel_workspace_dir(&config, "matrix", &alias);
-                let transcription_config_arc = Arc::clone(config_arc);
+                let transcription_config_arc = config_arc.clone();
                 let transcription_channel_key = format!("matrix.{alias}");
-                let tts_config_arc = Arc::clone(config_arc);
+                let tts_config_arc = config_arc.clone();
                 let tts_channel_key = format!("matrix.{alias}");
                 let voice_peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
                     let cfg_arc = config_arc.clone();
@@ -11254,7 +11425,7 @@ fn build_channel_by_id(
                 let workspace_dir = one_shot_channel_workspace_dir(&config, "whatsapp", &alias);
                 Ok(Arc::new(
                     WhatsAppWebChannel::new(wa, alias, peer_resolver, allowed_groups_resolver)
-                        .with_persistence(config_arc.clone())
+                        .with_persistence_authority(authority.clone())
                         .with_workspace_dir(workspace_dir),
                 ))
             }
@@ -11439,7 +11610,7 @@ fn build_channel_by_id(
                     wc.cdn_base_url.clone(),
                     Some(WeChatChannel::resolve_state_dir(wc.state_dir.as_deref())),
                 )?
-                .with_persistence(config_arc.clone())
+                .with_persistence_authority(authority.clone())
                 .with_workspace_dir(workspace_dir),
             ))
         }
@@ -11752,7 +11923,7 @@ fn build_channel_by_id(
                 };
                 Ok(Arc::new(
                     LineChannel::from_config(ln, alias, peer_resolver, sender_name_resolver)
-                        .with_persistence(config_arc.clone()),
+                        .with_persistence_authority(authority.clone()),
                 ))
             }
             #[cfg(not(feature = "channel-line"))]
@@ -11787,9 +11958,10 @@ pub async fn send_channel_message(
     recipient: &str,
     message: &str,
 ) -> Result<()> {
-    // Wrap into the canonical shared handle for the builder; this is a
-    // one-shot path so the snapshot is dropped immediately after send.
-    let config_arc = Arc::new(RwLock::new(config.clone()));
+    // Wrap into a private one-shot storage for the builder; the snapshot
+    // is dropped immediately after send and never enters a supervised
+    // publication domain.
+    let config_arc = zeroclaw_config::live::LiveConfig::new(config.clone()).handle();
     // The builder gets first refusal so families it already resolves natively
     // (notably `linq.<alias>`) keep their established route and their own
     // configuration errors. Only a dotted id the builder does not claim at all
@@ -12088,9 +12260,97 @@ impl ActiveChannelAliases {
 pub fn build_channel_map(
     config: &Config,
 ) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
-    let config_arc = Arc::new(RwLock::new(config.clone()));
+    let config_arc = zeroclaw_config::live::LiveConfig::new(config.clone()).handle();
     let configured = collect_configured_channels(&config_arc, "", &[], None, None);
     configured_channel_map(&configured)
+}
+
+fn channel_map_for_agent(
+    config: &Config,
+    agent_alias: &str,
+    available: &HashMap<String, Arc<dyn Channel>>,
+) -> HashMap<String, Arc<dyn Channel>> {
+    let Some(agent) = config.agents.get(agent_alias).filter(|agent| agent.enabled) else {
+        return HashMap::new();
+    };
+    if config
+        .agents
+        .values()
+        .all(|agent| agent.channels.is_empty())
+    {
+        return available.clone();
+    }
+
+    let mut selected = HashMap::new();
+    for binding in &agent.channels {
+        let binding = binding.as_str();
+        for (key, channel) in available {
+            let matches = key == binding
+                || (!binding.contains('.')
+                    && key
+                        .strip_prefix(binding)
+                        .is_some_and(|suffix| suffix.starts_with('.')));
+            if matches {
+                selected.insert(key.clone(), Arc::clone(channel));
+            }
+        }
+    }
+
+    let mut singleton_by_type: HashMap<String, Option<Arc<dyn Channel>>> = HashMap::new();
+    for (key, channel) in &selected {
+        let Some((channel_type, _)) = key.split_once('.') else {
+            continue;
+        };
+        singleton_by_type
+            .entry(channel_type.to_string())
+            .and_modify(|singleton| *singleton = None)
+            .or_insert_with(|| Some(Arc::clone(channel)));
+    }
+    for (channel_type, channel) in singleton_by_type {
+        if let Some(channel) = channel {
+            selected.entry(channel_type).or_insert(channel);
+        }
+    }
+    selected
+}
+
+pub fn build_channel_map_for_agent(
+    config: &Config,
+    agent_alias: &str,
+) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
+    let available = build_channel_map(config);
+    channel_map_for_agent(config, agent_alias, &available)
+}
+
+pub fn live_channel_map_for_agent(
+    config: &Config,
+    agent_alias: &str,
+) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
+    CRON_CHANNEL_REGISTRY
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_deref()
+        .map(|available| channel_map_for_agent(config, agent_alias, available))
+        .unwrap_or_default()
+}
+
+pub fn live_channel_map() -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
+    CRON_CHANNEL_REGISTRY
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_deref()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Return the daemon-owned live channels visible to one trusted local RPC
+/// session. This clones channel `Arc`s and never constructs duplicate clients.
+pub fn build_local_rpc_session_channels(
+    config: zeroclaw_config::live::LiveConfigHandle,
+    agent_alias: String,
+) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
+    let snapshot = config.read().clone();
+    live_channel_map_for_agent(&snapshot, &agent_alias)
 }
 
 pub fn register_channels_for_tools(
@@ -12101,7 +12361,7 @@ pub fn register_channels_for_tools(
     poll_handle: &Option<tools::PerToolChannelHandle>,
     escalate_handle: &Option<tools::PerToolChannelHandle>,
 ) -> Vec<String> {
-    let config_arc = Arc::new(RwLock::new(config.clone()));
+    let config_arc = zeroclaw_config::live::LiveConfig::new(config.clone()).handle();
     let configured = collect_configured_channels(&config_arc, "", &[], None, None);
 
     let handles = [
@@ -12211,7 +12471,7 @@ fn configure_discord_transcription(
 
 #[cfg(feature = "channel-discord")]
 fn build_configured_discord_channel(
-    config_arc: &Arc<RwLock<Config>>,
+    config_arc: &zeroclaw_config::live::LiveConfigHandle,
     config: &Config,
     alias: &str,
     dc: &zeroclaw_config::schema::DiscordConfig,
@@ -12292,7 +12552,7 @@ fn matrix_state_dir(config_path: &std::path::Path, alias: &str) -> std::path::Pa
 /// credential pair; the caller logs and skips the alias on `Err`.
 #[cfg(feature = "channel-matrix")]
 pub(crate) fn build_configured_matrix_channel(
-    config_arc: &Arc<RwLock<Config>>,
+    config_arc: &zeroclaw_config::live::LiveConfigHandle,
     config: &Config,
     alias: &str,
     mx: &zeroclaw_config::schema::MatrixConfig,
@@ -12304,9 +12564,9 @@ pub(crate) fn build_configured_matrix_channel(
         Arc::new(move || cfg_arc.read().channel_external_peers("matrix", &alias))
     };
     let ack = mx.ack_reactions.unwrap_or(config.channels.ack_reactions);
-    let transcription_config_arc = Arc::clone(config_arc);
+    let transcription_config_arc = config_arc.clone();
     let transcription_channel_key = format!("matrix.{alias}");
-    let tts_config_arc = Arc::clone(config_arc);
+    let tts_config_arc = config_arc.clone();
     let tts_channel_key = format!("matrix.{alias}");
     let voice_peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
         let cfg_arc = config_arc.clone();
@@ -12343,7 +12603,29 @@ pub(crate) fn build_configured_matrix_channel(
 }
 
 fn collect_configured_channels(
-    config_arc: &Arc<RwLock<Config>>,
+    config_arc: &zeroclaw_config::live::LiveConfigHandle,
+    matrix_skip_context: &str,
+    tool_specs: &[(String, String)],
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+) -> Vec<ConfiguredChannel> {
+    // One-shot construction from a static snapshot: a private,
+    // unsupervised storage that never enters a supervised publication
+    // domain (no supervised storage is ever exposed as a raw Arc).
+    let authority = zeroclaw_runtime::LiveConfigAuthority::new(config_arc.snapshot());
+    collect_configured_channels_with_authority(
+        config_arc,
+        &authority,
+        matrix_skip_context,
+        tool_specs,
+        sop_engine,
+        sop_audit,
+    )
+}
+
+fn collect_configured_channels_with_authority(
+    config_arc: &zeroclaw_config::live::LiveConfigHandle,
+    authority: &zeroclaw_runtime::LiveConfigAuthority,
     matrix_skip_context: &str,
     tool_specs: &[(String, String)],
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
@@ -12351,6 +12633,13 @@ fn collect_configured_channels(
 ) -> Vec<ConfiguredChannel> {
     let _ = matrix_skip_context;
     let _ = tool_specs;
+    #[cfg(not(any(
+        feature = "channel-telegram",
+        feature = "whatsapp-web",
+        feature = "channel-wechat",
+        feature = "channel-line"
+    )))]
+    let _ = authority;
     #[cfg(not(feature = "channel-amqp"))]
     let _ = (&sop_engine, &sop_audit);
     #[allow(unused_mut)]
@@ -12408,7 +12697,7 @@ fn collect_configured_channels(
                         tg.mention_only,
                     )
                     .with_voice_peer_resolver(voice_peer_resolver)
-                    .with_persistence(config_arc.clone())
+                    .with_persistence_authority(authority.clone())
                     .with_api_base(tg.api_base_url.clone())
                     .with_ack_reactions(ack)
                     .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
@@ -12872,7 +13161,7 @@ fn collect_configured_channels(
                                     peer_resolver,
                                     allowed_groups_resolver,
                                 )
-                                .with_persistence(config_arc.clone())
+                                .with_persistence_authority(authority.clone())
                                 .with_transcription_manager(
                                     config.transcription.clone(),
                                     resolved_transcription_manager(
@@ -13290,7 +13579,7 @@ fn collect_configured_channels(
             alias: Some(alias.clone()),
             channel: Arc::new(
                 LineChannel::from_config(ln, alias.clone(), peer_resolver, sender_name_resolver)
-                    .with_persistence(config_arc.clone())
+                    .with_persistence_authority(authority.clone())
                     .with_transcription_manager(
                         config.transcription.clone(),
                         resolved_transcription_manager(&config, &format!("line.{alias}")),
@@ -13635,7 +13924,7 @@ fn collect_configured_channels(
                     alias: Some(alias.clone()),
                     channel: Arc::new(
                         channel
-                            .with_persistence(config_arc.clone())
+                            .with_persistence_authority(authority.clone())
                             .with_workspace_dir(
                                 config.channel_workspace_dir(&format!("wechat.{alias}")),
                             ),
@@ -13801,7 +14090,7 @@ fn collect_configured_channels(
             continue;
         }
         let channel_key = format!("voice_wake.{alias}");
-        let transcription_config_arc = Arc::clone(config_arc);
+        let transcription_config_arc = config_arc.clone();
         let transcription_channel_key = channel_key.clone();
         channels.push(ConfiguredChannel {
             display_name: "VoiceWake",
@@ -13951,7 +14240,7 @@ fn peer_group_dangling_warning_lines(config: &Config) -> Vec<String> {
 
 /// Run health checks for configured channels.
 pub async fn doctor_channels(config: Config) -> Result<()> {
-    let config_arc = Arc::new(RwLock::new(config));
+    let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
     #[allow(unused_mut)]
     let mut channels = collect_configured_channels(&config_arc, "health check", &[], None, None);
 
@@ -13960,7 +14249,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     let plugin_config = Arc::new(config_arc.read().clone());
     let plugin_channels = zeroclaw_runtime::plugin_runtime::configured_plugin_channels(
         plugin_config,
-        Some(Arc::clone(&config_arc)),
+        Some(config_arc.clone()),
     )
     .await;
     append_configured_plugin_channels(&mut channels, plugin_channels);
@@ -14346,8 +14635,22 @@ pub async fn start_channels(
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 ) -> Result<()> {
-    Box::pin(start_channels_with_plugin_webhooks(
-        config,
+    let authority = zeroclaw_runtime::LiveConfigAuthority::new_owned(config)?;
+    start_channels_with_authority(authority, canvas_store, cancel, sop_engine, sop_audit).await
+}
+
+/// Start all configured channels with the live config authority owned by the
+/// current daemon generation.
+#[allow(clippy::too_many_lines)]
+pub async fn start_channels_with_authority(
+    authority: zeroclaw_runtime::LiveConfigAuthority,
+    canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
+    cancel: tokio_util::sync::CancellationToken,
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+) -> Result<()> {
+    Box::pin(start_channels_with_authority_and_plugin_webhooks(
+        authority,
         canvas_store,
         cancel,
         sop_engine,
@@ -14357,9 +14660,8 @@ pub async fn start_channels(
     .await
 }
 
-/// Start supervised channels with the daemon generation's plugin-webhook route
-/// registry. Standalone channel runs use [`start_channels`] because no gateway
-/// shares their lifecycle.
+/// Start supervised channels with an owned config snapshot and the daemon
+/// generation's plugin-webhook route registry.
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels_with_plugin_webhooks(
     config: Config,
@@ -14369,10 +14671,33 @@ pub async fn start_channels_with_plugin_webhooks(
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     plugin_webhooks: Option<Arc<zeroclaw_api::webhook::PluginWebhookRegistry>>,
 ) -> Result<()> {
+    let authority = zeroclaw_runtime::LiveConfigAuthority::new_owned(config)?;
+    start_channels_with_authority_and_plugin_webhooks(
+        authority,
+        canvas_store,
+        cancel,
+        sop_engine,
+        sop_audit,
+        plugin_webhooks,
+    )
+    .await
+}
+
+/// Start supervised channels with the shared live-config authority and the
+/// daemon generation's plugin-webhook route registry.
+#[allow(clippy::too_many_lines)]
+pub async fn start_channels_with_authority_and_plugin_webhooks(
+    authority: zeroclaw_runtime::LiveConfigAuthority,
+    canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
+    cancel: tokio_util::sync::CancellationToken,
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    plugin_webhooks: Option<Arc<zeroclaw_api::webhook::PluginWebhookRegistry>>,
+) -> Result<()> {
     let plugin_webhook_registry_lease = plugin_webhooks
         .as_ref()
         .map(|registry| registry.start_generation());
-    let config_arc = Arc::new(RwLock::new(config));
+    let config_arc = authority.live_handle();
     let config: Config = config_arc.read().clone();
     let any_agent_provider_resolves = config
         .agents
@@ -14532,7 +14857,7 @@ pub async fn start_channels_with_plugin_webhooks(
         let skills =
             zeroclaw_runtime::skills::load_skills_for_agent(&workspace, &config, agent_alias);
 
-        let all_tools_result_ch = tools::all_tools_with_runtime(
+        let all_tools_result_ch = tools::all_tools_with_runtime_and_execution_capability(
             Arc::new(config.clone()),
             &security,
             &risk_profile,
@@ -14553,7 +14878,8 @@ pub async fn start_channels_with_plugin_webhooks(
             None,
             sop_engine.clone(),
             sop_audit.clone(),
-            Some(Arc::clone(&config_arc)),
+            Some(config_arc.clone()),
+            Some(authority.execution_capability()),
         );
         // Route the per-agent tool registry through the one gated seam - see
         // `assemble_channel_agent_tools` for the knobs and why. `mut` because the
@@ -14748,13 +15074,15 @@ pub async fn start_channels_with_plugin_webhooks(
             }
 
             #[allow(unused_mut)]
-            let mut configured_channels: Vec<ConfiguredChannel> = collect_configured_channels(
-                &config_arc,
-                "runtime startup",
-                &tool_specs,
-                sop_engine.clone(),
-                sop_audit.clone(),
-            );
+            let mut configured_channels: Vec<ConfiguredChannel> =
+                collect_configured_channels_with_authority(
+                    &config_arc,
+                    &authority,
+                    "runtime startup",
+                    &tool_specs,
+                    sop_engine.clone(),
+                    sop_audit.clone(),
+                );
 
             #[cfg(feature = "channel-nostr")]
             {
@@ -14833,7 +15161,7 @@ pub async fn start_channels_with_plugin_webhooks(
             let plugin_channels =
                 zeroclaw_runtime::plugin_runtime::configured_plugin_channels_with_webhooks(
                     Arc::new(config.clone()),
-                    Some(Arc::clone(&config_arc)),
+                    Some(config_arc.clone()),
                     plugin_webhook_registry_lease.as_ref(),
                 )
                 .await;
@@ -15133,7 +15461,9 @@ pub async fn start_channels_with_plugin_webhooks(
         }
     }
 
-    let router = AgentRouter::multi(agent_ctxs, owner_by_channel_key, sop_engine, sop_audit);
+    let router = AgentRouter::multi(agent_ctxs, owner_by_channel_key, sop_engine, sop_audit)
+        .with_agent_lifecycle(authority.agent_lifecycle())
+        .with_execution_capability(authority.execution_capability());
 
     let rx = rx_holder.expect("rx initialized by first agent's channel setup");
     let max_in_flight =
@@ -15143,7 +15473,7 @@ pub async fn start_channels_with_plugin_webhooks(
     // picker ack registrations are reclaimed.
     #[cfg(feature = "channel-telegram")]
     let _picker_ack_cleanup = ModelPickerAckCleanupGuard;
-    run_message_dispatch_loop(rx, router, max_in_flight).await;
+    run_message_dispatch_loop_with_cancel(rx, router, max_in_flight, cancel.clone()).await;
 
     for h in listener_handles {
         let _ = h.await;
@@ -25547,6 +25877,14 @@ BTC is currently around $65,000 based on latest tool output."#
         peak_in_flight: Arc<AtomicUsize>,
     }
 
+    struct InFlightGuard(Arc<AtomicUsize>);
+
+    impl Drop for InFlightGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
     #[async_trait::async_trait]
     impl ModelProvider for ConcurrencyTrackingProvider {
         async fn chat_with_system(
@@ -25557,9 +25895,9 @@ BTC is currently around $65,000 based on latest tool output."#
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
             let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            let _in_flight = InFlightGuard(Arc::clone(&self.in_flight));
             self.peak_in_flight.fetch_max(current, Ordering::SeqCst);
             tokio::time::sleep(self.delay).await;
-            self.in_flight.fetch_sub(1, Ordering::SeqCst);
             Ok(format!("echo: {message}"))
         }
     }
@@ -26679,8 +27017,7 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
-    #[tokio::test]
-    async fn message_dispatch_processes_messages_in_parallel() {
+    async fn run_parallel_message_dispatch(cancel_generation: bool) {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -26807,9 +27144,46 @@ BTC is currently around $65,000 based on latest tool output."#
         })
         .await
         .unwrap();
-        drop(tx);
-
-        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 2).await;
+        let agent_lifecycle =
+            zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator::default();
+        if cancel_generation {
+            let cancel = CancellationToken::new();
+            let dispatch_cancel = cancel.clone();
+            let router =
+                AgentRouter::single(runtime_ctx).with_agent_lifecycle(agent_lifecycle.clone());
+            let dispatch = ::zeroclaw_spawn::spawn!(run_message_dispatch_loop_with_cancel(
+                rx,
+                router,
+                2,
+                dispatch_cancel,
+            ));
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while peak_in_flight.load(Ordering::SeqCst) < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("both channel workers should enter the provider");
+            assert!(matches!(
+                agent_lifecycle.begin_delete("test-agent"),
+                Err(
+                    zeroclaw_runtime::live_config_authority::AgentDeleteBlocker::ActiveTurns {
+                        count: 2,
+                        ..
+                    }
+                )
+            ));
+            cancel.cancel();
+            drop(tx);
+            tokio::time::timeout(Duration::from_secs(1), dispatch)
+                .await
+                .expect("generation cancellation should drain channel workers promptly")
+                .expect("dispatch task should join cleanly");
+            assert_eq!(agent_lifecycle.active_turn_count("test-agent"), 0);
+        } else {
+            drop(tx);
+            run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 2).await;
+        }
 
         let peak = peak_in_flight.load(Ordering::SeqCst);
         assert!(
@@ -26824,7 +27198,24 @@ BTC is currently around $65,000 based on latest tool output."#
         );
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 2);
+        if cancel_generation {
+            assert!(
+                sent_messages.is_empty(),
+                "cancelled generation workers must not publish old-channel replies"
+            );
+        } else {
+            assert_eq!(sent_messages.len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_processes_messages_in_parallel() {
+        run_parallel_message_dispatch(false).await;
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_generation_cancel_drains_turns_and_drops_replies() {
+        run_parallel_message_dispatch(true).await;
     }
 
     #[tokio::test]
@@ -31206,7 +31597,11 @@ BTC is currently around $65,000 based on latest tool output."#
             "test-provider",
             None,
         );
-        let lanes = ConversationLaneRegistry::new(Arc::new(tokio::sync::Semaphore::new(4)));
+        let lanes = ConversationLaneRegistry::new(
+            Arc::new(tokio::sync::Semaphore::new(4)),
+            Default::default(),
+            CancellationToken::new(),
+        );
         let budget = Arc::new(tokio::sync::Semaphore::new(4));
         let pending_work = Arc::clone(&budget).try_acquire_owned().unwrap();
 
@@ -31225,6 +31620,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let delivery_message_id = msg.id.clone();
         let turn = Box::new(PendingTurn {
             ctx,
+            agent_generation: 0,
             msg,
             dispatch_ownership: ModelPickerDispatchOwnership::hold(&delivery_message_id),
             delivery_message_id,
@@ -31249,6 +31645,115 @@ BTC is currently around $65,000 based on latest tool output."#
             4,
             "the canceled turn's admission permit must return to the budget"
         );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(feature = "channel-telegram", allow(clippy::await_holding_lock))]
+    async fn queued_channel_turn_rejects_reused_alias_generation() {
+        #[cfg(feature = "channel-telegram")]
+        let _registry_guard = crate::model_picker_delivery::registry_test_lock();
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel_impl.clone(),
+            Arc::new(GatedModelProvider {
+                gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            }),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let lifecycle =
+            zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator::default();
+        let router = AgentRouter::single(Arc::clone(&ctx)).with_agent_lifecycle(lifecycle.clone());
+        let generation = router.turn_generations[ctx.agent_alias.as_str()];
+        let execution = Arc::new(tokio::sync::Semaphore::new(0));
+        let lanes = ConversationLaneRegistry::new(
+            Arc::clone(&execution),
+            lifecycle.clone(),
+            CancellationToken::new(),
+        );
+        let budget = Arc::new(tokio::sync::Semaphore::new(1));
+        let msg = shared_topic_message("alice", "stale", "must not run");
+        let delivery_message_id = msg.id.clone();
+        #[cfg(feature = "channel-telegram")]
+        let mut delivery_ack = {
+            let mut ack = crate::model_picker_delivery::register(&delivery_message_id);
+            ack.mark_enqueued();
+            ack
+        };
+        let turn = Box::new(PendingTurn {
+            ctx: Arc::clone(&ctx),
+            agent_generation: generation,
+            msg,
+            dispatch_ownership: ModelPickerDispatchOwnership::hold(&delivery_message_id),
+            delivery_message_id,
+            registration: None,
+            pending_work: Arc::clone(&budget).try_acquire_owned().unwrap(),
+        });
+        assert!(matches!(
+            lanes.enqueue("conversation", turn),
+            LaneAdmission::Enqueued
+        ));
+        assert_eq!(lifecycle.active_turn_count(ctx.agent_alias.as_str()), 0);
+        let mut deletion = lifecycle.begin_delete(ctx.agent_alias.as_str()).unwrap();
+        deletion.commit_destructive_mutation();
+        drop(deletion);
+        assert_ne!(
+            lifecycle.alias_generation(ctx.agent_alias.as_str()),
+            generation
+        );
+        execution.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            lanes.wait_drained().await;
+            lanes.tasks.wait_drained().await;
+        })
+        .await
+        .expect("stale queued work must retire without calling the gated provider");
+        assert_eq!(budget.available_permits(), 1);
+        assert_eq!(execution.available_permits(), 1);
+        assert_eq!(lifecycle.active_turn_count(ctx.agent_alias.as_str()), 0);
+        assert!(channel_impl.sent_messages.lock().await.is_empty());
+        assert!(ctx.route_overrides.lock().unwrap().is_empty());
+        #[cfg(feature = "channel-telegram")]
+        {
+            let result = tokio::time::timeout(Duration::from_secs(1), delivery_ack.wait()).await;
+            assert!(
+                matches!(result, Ok(Err(_))),
+                "stale-generation rejection must settle the delivery without confirming it"
+            );
+            assert!(matches!(
+                crate::model_picker_delivery::revoke("stale"),
+                crate::model_picker_delivery::RevokeOutcome::Won
+            ));
+            assert!(!crate::model_picker_delivery::is_registered("stale"));
+        }
+    }
+
+    #[tokio::test]
+    async fn forced_dispatch_task_retirement_releases_lifecycle_and_admission() {
+        let tracker = IngressTaskTracker::new();
+        let lifecycle =
+            zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator::default();
+        let lease = lifecycle.reserve_turn("test-agent").unwrap();
+        let budget = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::clone(&budget).try_acquire_owned().unwrap();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let worker = tracker.spawn(async move {
+            let _lease = lease;
+            let _permit = permit;
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        });
+        ready.await.unwrap();
+        assert_eq!(lifecycle.active_turn_count("test-agent"), 1);
+        tracker.force_stop();
+        tokio::time::timeout(Duration::from_secs(1), tracker.wait_drained())
+            .await
+            .unwrap();
+        worker.await.unwrap();
+        assert_eq!(lifecycle.active_turn_count("test-agent"), 0);
+        assert_eq!(budget.available_permits(), 1);
     }
 
     /// Refusing a flood must not turn into an unbounded detached outbound
@@ -34211,13 +34716,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         tx.send(selection.clone()).await.unwrap();
         drop(tx);
-        let router = AgentRouter {
-            by_agent: Arc::new(HashMap::new()),
-            owner_by_channel_key: Arc::new(HashMap::new()),
-            single_ctx: None,
-            sop_engine: None,
-            sop_audit: None,
-        };
+        let router = AgentRouter::multi(HashMap::new(), HashMap::new(), None, None);
         run_message_dispatch_loop(rx, router, 1).await;
 
         assert!(
@@ -34376,13 +34875,18 @@ BTC is currently around $65,000 based on latest tool output."#
         let delivery_message_id = selection.id.clone();
         let turn = Box::new(PendingTurn {
             ctx: Arc::clone(&runtime_ctx),
+            agent_generation: 0,
             msg: selection.clone(),
             dispatch_ownership: ModelPickerDispatchOwnership::hold(&delivery_message_id),
             delivery_message_id,
             registration: Some(registration),
             pending_work,
         });
-        let lanes = ConversationLaneRegistry::new(Arc::new(tokio::sync::Semaphore::new(1)));
+        let lanes = ConversationLaneRegistry::new(
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator::default(),
+            CancellationToken::new(),
+        );
         let worker = zeroclaw_spawn::spawn!(Arc::clone(&lanes).process_turn(turn));
 
         // A newer message interrupts this turn while its predecessor is still
@@ -34733,7 +35237,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 Arc::new(|| vec!["123".into()]),
                 false,
             )
-            .with_persistence(Arc::new(RwLock::new(picker_config)))
+            .with_persistence_authority(zeroclaw_runtime::LiveConfigAuthority::new(picker_config))
             .with_api_base(server.uri()),
         );
         let picker_request = zeroclaw_api::channel::ChannelModelPickerRequest {
@@ -37834,7 +38338,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
 
         assert!(
@@ -37886,7 +38390,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
 
         assert!(
@@ -37922,7 +38426,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
 
         assert!(
@@ -37953,7 +38457,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
 
         assert!(
@@ -38003,7 +38507,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
 
         let discord_channels: Vec<_> = channels
@@ -38060,7 +38564,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config.clone()));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config.clone()).handle();
         let configured = collect_configured_channels(&config_arc, "test", &[], None, None);
         let channel_map = configured_channel_map(&configured);
         assert!(
@@ -38127,7 +38631,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let configured = collect_configured_channels(&config_arc, "test", &[], None, None);
         let channel_map = configured_channel_map(&configured);
         assert!(channel_map.contains_key("discord.ops"));
@@ -38291,7 +38795,7 @@ This is an example JSON object for profile settings."#;
             zeroclaw_config::scattered_types::EmailConfig::default(),
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Email"),
@@ -38308,7 +38812,7 @@ This is an example JSON object for profile settings."#;
             zeroclaw_config::scattered_types::VoiceCallConfig::default(),
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
         assert!(
             !channels
@@ -38337,7 +38841,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Signal"),
@@ -38359,7 +38863,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
         assert!(
             channels.iter().any(|entry| entry.display_name == "Signal"),
@@ -38382,7 +38886,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
         assert!(
             channels
@@ -38407,7 +38911,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
         assert!(
             !channels
@@ -38496,7 +39000,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channel = {
             let config = config_arc.read();
             build_configured_discord_channel(
@@ -38891,7 +39395,7 @@ This is an example JSON object for profile settings."#;
             },
         );
 
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
         let entry = channels
             .iter()
@@ -39221,6 +39725,115 @@ This is an example JSON object for profile settings."#;
             !map.contains_key("plugin"),
             "two instances must not collapse into a bare singleton key"
         );
+    }
+
+    #[cfg(any(
+        feature = "channel-telegram",
+        feature = "channel-line",
+        feature = "channel-wechat",
+        feature = "whatsapp-web"
+    ))]
+    #[tokio::test]
+    async fn supervised_listener_cancels_identity_persistence_waiting_for_config_lock() {
+        use std::future::{Future, poll_fn};
+
+        struct PersistingChannel {
+            authority: zeroclaw_runtime::LiveConfigAuthority,
+            waiting: tokio::sync::Notify,
+            dropped: AtomicBool,
+        }
+
+        struct PersistenceDrop<'a>(&'a AtomicBool);
+
+        impl Drop for PersistenceDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        impl zeroclaw_api::attribution::Attributable for PersistingChannel {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Channel(
+                    zeroclaw_api::attribution::ChannelKind::Plugin,
+                )
+            }
+
+            fn alias(&self) -> &str {
+                "identity-persistence-cancel"
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl Channel for PersistingChannel {
+            fn name(&self) -> &str {
+                "test-identity-persistence-cancel"
+            }
+
+            async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                let _drop = PersistenceDrop(&self.dropped);
+                let persistence = crate::identity_persist::persist_external_peer(
+                    Some(&self.authority),
+                    "wechat",
+                    "test",
+                    "test-peer",
+                );
+                tokio::pin!(persistence);
+                // Signal only after the real persistence future has parked on
+                // the lock, not merely when the listener starts running.
+                poll_fn(|cx| {
+                    let result = persistence.as_mut().poll(cx);
+                    if result.is_pending() {
+                        self.waiting.notify_one();
+                    }
+                    result
+                })
+                .await
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Config::default()
+        };
+        let authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        let guard = authority.begin_config_commit().await.unwrap();
+        let channel = Arc::new(PersistingChannel {
+            authority: authority.clone(),
+            waiting: tokio::sync::Notify::new(),
+            dropped: AtomicBool::new(false),
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut handle = spawn_supervised_listener(channel.clone(), None, tx, 1, 1, cancel.clone());
+
+        let waiting =
+            tokio::time::timeout(Duration::from_secs(5), channel.waiting.notified()).await;
+        cancel.cancel();
+        let joined = tokio::time::timeout(Duration::from_secs(5), &mut handle).await;
+        if joined.is_err() {
+            handle.abort();
+            let _ = handle.await;
+        }
+        assert!(
+            waiting.is_ok(),
+            "identity persistence must reach the held lock"
+        );
+        joined
+            .expect("listener must exit while the config write guard is still held")
+            .expect("listener must join without panicking");
+        assert!(channel.dropped.load(Ordering::SeqCst));
+        assert!(authority.snapshot_config().peer_groups.is_empty());
+        assert!(!tmp.path().join("config.toml").exists());
+        drop(guard);
     }
 
     #[tokio::test]
@@ -40987,7 +41600,7 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn build_channel_by_id_unknown_channel_returns_error() {
         let config = Config::default();
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         match build_channel_by_id(&config_arc, "nonexistent") {
             Err(e) => {
                 let err_msg = e.to_string();
@@ -41002,7 +41615,7 @@ This is an example JSON object for profile settings."#;
 
     #[test]
     fn compiled_channel_keys_have_intentional_one_shot_builder_support() {
-        let config_arc = Arc::new(RwLock::new(Config::default()));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(Config::default()).handle();
         let intentionally_unsupported = HashSet::from([
             "nextcloud",
             "feishu",
@@ -41081,17 +41694,19 @@ This is an example JSON object for profile settings."#;
                 ..Default::default()
             },
         );
-        let config_arc = Arc::new(RwLock::new(config));
-        let resolver = slack_thread_context_max_messages_resolver(&config_arc, "default");
+        let live = zeroclaw_config::live::LiveConfig::new(config);
+        let resolver = slack_thread_context_max_messages_resolver(&live.handle(), "default");
 
         assert_eq!(resolver(), 3);
-        config_arc
-            .write()
+        let mut updated = live.snapshot();
+        updated
             .channels
             .slack
             .get_mut("default")
             .unwrap()
             .thread_context_max_messages = Some(8);
+        live.publish(live.next_revision().unwrap(), updated)
+            .unwrap();
         assert_eq!(resolver(), 8);
     }
 
@@ -41728,7 +42343,7 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn build_channel_by_id_unconfigured_telegram_returns_error() {
         let config = Config::default();
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         match build_channel_by_id(&config_arc, "telegram") {
             Err(e) => {
                 let err_msg = e.to_string();
@@ -41765,7 +42380,7 @@ This is an example JSON object for profile settings."#;
                 debounce_ms: None,
             },
         );
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         match build_channel_by_id(&config_arc, "telegram") {
             Ok(channel) => assert_eq!(channel.name(), "telegram"),
             Err(e) => panic!("should succeed when telegram is configured: {e}"),
@@ -41931,7 +42546,7 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn build_channel_by_id_unconfigured_voice_call_returns_error() {
         let config = Config::default();
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         match build_channel_by_id(&config_arc, "voice-call") {
             Err(e) => {
                 let err_msg = e.to_string();
@@ -41965,7 +42580,7 @@ This is an example JSON object for profile settings."#;
                 excluded_tools: vec![],
             },
         );
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         match build_channel_by_id(&config_arc, "voice-call") {
             Ok(channel) => assert_eq!(channel.name(), "voice_call"),
             Err(e) => panic!("should succeed when voice-call is configured: {e}"),
@@ -44460,6 +45075,9 @@ Done."#;
             single_ctx: None,
             sop_engine: None,
             sop_audit: None,
+            agent_lifecycle: Default::default(),
+            execution_capability: None,
+            turn_generations: Arc::new(HashMap::new()),
         }
     }
 
@@ -44563,6 +45181,9 @@ Done."#;
             single_ctx: None,
             sop_engine: Some(Arc::clone(&engine)),
             sop_audit: None,
+            agent_lifecycle: Default::default(),
+            execution_capability: None,
+            turn_generations: Arc::new(HashMap::new()),
         };
         (router, engine, run_id)
     }
@@ -45166,7 +45787,7 @@ mod omitted_feature_tests {
                 ..Default::default()
             },
         );
-        let config_arc = Arc::new(RwLock::new(config));
+        let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
         let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
         assert!(
             channels.iter().all(|c| c.display_name != "Telegram"),

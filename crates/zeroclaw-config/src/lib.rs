@@ -15,6 +15,7 @@ pub mod domain_matcher;
 pub mod env_overrides;
 pub mod field_visibility;
 pub mod helpers;
+pub mod live;
 pub mod migration;
 pub mod multi_agent;
 pub mod pairing;

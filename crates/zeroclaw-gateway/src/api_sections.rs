@@ -16,7 +16,7 @@ use zeroclaw_runtime::rpc::types::{
 
 use super::AppState;
 use super::api::require_auth;
-use super::api_config::{persist_and_swap, try_compute_drift};
+use super::api_config::{persist_and_publish, try_compute_drift};
 
 /// `GET /api/config/catalog` — list every model provider the CLI wizard knows
 /// about. The dashboard shows these in the "+ Add model provider" picker so
@@ -858,12 +858,24 @@ pub async fn handle_section_select(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "default".to_string());
 
-    // Held through the swap at the end of this handler so a concurrent
-    // config writer can't land between this read and the save below.
-    let _cfg_guard = std::sync::Arc::clone(&state.config_write_lock)
-        .lock_owned()
-        .await;
-    let mut working = state.config.read().clone();
+    // Admit one serialized config commit: held from this read through the
+    // save-and-publish at the end of this handler so a concurrent config
+    // writer can't land between them. The save runs retained on the
+    // commit, so a dropped request cannot abandon a dispatched save
+    // without its publication.
+    let commit = match state.begin_config_commit().await {
+        Ok(commit) => commit,
+        Err(e) => {
+            return error_response(
+                ConfigApiError::new(
+                    ConfigApiCode::ReloadFailed,
+                    format!("config commit refused without any change: {e}"),
+                )
+                .with_path(section.as_str()),
+            );
+        }
+    };
+    let mut working = commit.current_config();
 
     use zeroclaw_config::sections::Section;
     let Some(section_enum) = Section::from_key(&section) else {
@@ -1119,7 +1131,7 @@ pub async fn handle_section_select(
         .into_response();
     }
 
-    if let Err(e) = persist_and_swap(&state, working, &_cfg_guard).await {
+    if let Err(e) = persist_and_publish(&state, commit, working).await {
         return error_response(e);
     }
 
@@ -1419,9 +1431,11 @@ mod tests {
     fn section_test_state(config: zeroclaw_config::schema::Config) -> AppState {
         let memory: std::sync::Arc<dyn zeroclaw_api::memory_traits::Memory> =
             std::sync::Arc::new(zeroclaw_memory::NoneMemory::new("none"));
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         AppState {
-            config: std::sync::Arc::new(parking_lot::RwLock::new(config)),
-            config_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider: std::sync::Arc::new(crate::UnconfiguredModelProvider),
             model: "test-model".to_string(),
             temperature: None,

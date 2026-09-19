@@ -21,9 +21,9 @@ For the build order, tracked-output rules, and drift checks that turn the typed 
 | Bootstrap location | `ZEROCLAW_CONFIG_DIR`, `ZEROCLAW_DATA_DIR`, deprecated `ZEROCLAW_WORKSPACE` | Environment only | Before `Config` exists |
 | Schema-mirror overrides | `ZEROCLAW_<lowercase_path>` with `__` for dots | In-memory only | Each `Config::load_or_init()` |
 | CLI config writes | `zeroclaw config set`, `config patch`, aliases, model helpers | `save_dirty()` to `config.toml` | Next load/reload unless the current command uses the new in-memory value |
-| RPC and TUI config writes | `config/*` RPC methods used by zerocode | `save_dirty()` to `config.toml` | RPC context updates immediately; daemon-owned subsystems need reload |
-| Quickstart apply | Shared web, CLI, and zerocode apply path | `save_dirty()` to `config.toml` | Web and RPC can signal daemon reload; standalone CLI applies on next load/reload |
-| Gateway config writes | Config API handlers and `persist_and_swap()` | `save_dirty()` to `config.toml` | Gateway-visible state updates immediately; daemon subsystems apply after reload |
+| RPC and TUI config writes | `config/*` RPC methods used by zerocode | Admitted config commit: `save_dirty()` then publish | Published pair updates immediately; daemon-owned subsystems need reload |
+| Quickstart apply | Shared web, CLI, and zerocode apply path | Staged apply completed as a config commit (supervised surfaces) | Web and RPC can signal daemon reload; standalone CLI applies on next load/reload |
+| Gateway config writes | Config API handlers through `persist_and_publish()` | Admitted config commit: `save_dirty()` then publish | Published pair updates immediately; daemon subsystems apply after reload |
 | Daemon reload | `/admin/reload`, RPC `config/reload`, or the in-process reload channel | Re-reads `config.toml` | Recreates daemon subsystems in the same PID |
 
 Do not hand-edit the generated config reference. If a field, enum, alias
@@ -106,15 +106,22 @@ and cost wiring. `POST /admin/reload` signals the daemon loop, which re-reads
 `config.toml` and re-instantiates those subsystems in the same process. The PID
 stays the same, but listeners briefly rebind.
 
-Gateway config writes call `persist_and_swap()`: save to disk, then replace the
-gateway-visible in-memory config and set `pending_reload`. This makes the config
-editor reflect the write immediately, while the reload banner tells the operator
-that channels, providers, scheduler, or other daemon-owned components may still
-be running from the previous subsystem instance.
+Gateway config writes call `persist_and_publish()`: save to disk inside an admitted, serialized config commit, then publish the saved config as the new published pair and set `pending_reload`. This makes the config editor reflect the write immediately, while the reload banner tells the operator that channels, providers, scheduler, or other daemon-owned components may still be running from the previous subsystem instance.
 
 Standalone `zeroclaw gateway start` has no daemon supervisor. Its reload
 endpoint returns a restart-required response because there is no outer daemon
 loop to signal.
+
+## Published pair and writer serialization
+
+The supervised process keeps one canonical published pair: the `Config` together with its revision, an opaque authority epoch plus a checked sequence. Readers receive a read-only live handle (`zeroclaw_config::live::LiveConfigHandle`) and observe the config and its revision as one unit; there is no writable handle and no second cache.
+
+Every participating HTTP, RPC, TUI, Quickstart, pairing, and channel-identity writer admits through the daemon generation's `LiveConfigAuthority` (`begin_config_commit`): the commit owns the daemon-wide writer serialization and a config-work lifecycle lease from admission through publication. The irreversible phase (persist, then publish under a revision allocated before any disk I/O) runs retained, so a cancelled request cannot abandon a dispatched commit between the atomic file replacement and its publication. Commits fail closed once the generation is closing; a full reload starts a fresh authority with a fresh epoch (sequences compare only within one epoch).
+
+Two boundaries worth naming:
+
+- A committed publication is not rolled back when a later side effect fails. Quickstart publishes the committed config even when installing personality files subsequently fails, and reports those errors truthfully; the config migrate endpoint prepares a fully hydrated candidate (secrets decrypted, env overrides applied, strict validation) *before* replacing the file, so a candidate that cannot hydrate or validate is refused with the original file untouched.
+- This publication foundation does not itself apply config to running subsystems: daemon-owned components still apply after `/admin/reload`, and per-target apply results remain future work proposed in [ADR-012](./decisions/ADR-012-generation-scoped-live-config-apply.md).
 
 ## Reload access
 
@@ -137,7 +144,7 @@ Config writes use an atomic temp-file replacement and owner-only permissions.
 When replacing an existing file, the writer creates a same-directory
 `config.toml.bak` during the replace and removes it after a successful write.
 Gateway writes also snapshot the pre-write file and best-effort restore it if
-persistence fails before swapping in-memory state.
+persistence fails before publishing the new pair.
 
 There is no general transactional rollback for a valid but undesired config
 change after it has been saved and applied. Restore the previous `config.toml`
@@ -178,6 +185,8 @@ For config-schema, env-var, default, or reload changes, ask:
 ## Source pointers
 
 - Config schema and persistence: `crates/zeroclaw-config/src/schema.rs`
+- Published pair storage and read-only handle: `crates/zeroclaw-config/src/live.rs`
+- Live-config authority, commits, and lifecycle: `crates/zeroclaw-runtime/src/live_config_authority.rs`
 - Env override grammar: `crates/zeroclaw-config/src/env_overrides.rs`
 - Config CLI commands: `src/main.rs`
 - RPC and TUI config methods: `crates/zeroclaw-runtime/src/rpc/dispatch.rs`

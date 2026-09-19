@@ -9,6 +9,7 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
+use zeroclaw_config::live::LiveConfigHandle;
 use zeroclaw_config::schema::Config;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -87,7 +88,7 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 static LIVE_PRICES: LazyLock<RwLock<Arc<PriceSnapshot>>> =
     LazyLock::new(|| RwLock::new(Arc::new(HashMap::new())));
 
-static CONFIG_HANDLE: LazyLock<RwLock<Option<Arc<RwLock<Config>>>>> =
+static CONFIG_HANDLE: LazyLock<RwLock<Option<LiveConfigHandle>>> =
     LazyLock::new(|| RwLock::new(None));
 
 /// Guards against spawning more than one refresher when both the channels
@@ -153,22 +154,23 @@ fn any_live_pricing(config: &Config) -> bool {
 ///
 /// Every call re-binds `CONFIG_HANDLE` before anything else, and the running
 /// task re-resolves it each cycle, so a daemon reload (which re-instantiates
-/// the config `Arc` and re-runs both call sites) re-points the refresher at
-/// the current config, and toggling `live_pricing` on a provider (or changing
-/// its model/endpoint) is honored on the next refresh without a restart. Each
-/// cycle rebuilds the per-gateway poll set via the normal factory path
-/// (reusing each provider's configured `base_url`, credentials, and options),
-/// fetches one `/models` per gateway, and fills only the flagged models,
-/// falling back to the models.dev catalog for models a gateway doesn't price
-/// (or providers with no HTTP listing, e.g. the `kilocli` subprocess gateway).
-/// A fetch error for one source keeps the previous snapshot rather than
-/// regressing good prices to empty; disabling `live_pricing` on the last
-/// flagged provider instead clears the snapshot on the next cycle, so stale
-/// prices stop filling after an opt-out.
-pub fn spawn_refresher(config: Arc<RwLock<Config>>) {
+/// the authority — and its read-only handle — and re-runs both call sites)
+/// re-points the refresher at the current published config, and toggling
+/// `live_pricing` on a provider (or changing its model/endpoint) is honored
+/// on the next refresh without a restart. Each cycle rebuilds the
+/// per-gateway poll set via the normal factory path (reusing each
+/// provider's configured `base_url`, credentials, and options), fetches one
+/// `/models` per gateway, and fills only the flagged models, falling back to
+/// the models.dev catalog for models a gateway doesn't price (or providers
+/// with no HTTP listing, e.g. the `kilocli` subprocess gateway). A fetch
+/// error for one source keeps the previous snapshot rather than regressing
+/// good prices to empty; disabling `live_pricing` on the last flagged
+/// provider instead clears the snapshot on the next cycle, so stale prices
+/// stop filling after an opt-out.
+pub fn spawn_refresher(config: LiveConfigHandle) {
     // Re-bind before the enabled pre-check so even a "nothing enabled yet"
     // call leaves the freshest handle for a refresher started later.
-    *CONFIG_HANDLE.write() = Some(Arc::clone(&config));
+    *CONFIG_HANDLE.write() = Some(config.clone());
     if !any_live_pricing(&config.read()) {
         return;
     }
@@ -179,14 +181,14 @@ pub fn spawn_refresher(config: Arc<RwLock<Config>>) {
     ::zeroclaw_spawn::spawn!(async {
         loop {
             // Re-resolve the handle (re-bound across daemon reloads), then
-            // clone the config under the lock and build/poll without holding
-            // it. The handle is bound above before this task can exist, and
-            // never unbound, so the `expect` cannot fire.
+            // clone the published config and build/poll without holding any
+            // guard. The handle is bound above before this task can exist,
+            // and never unbound, so the `expect` cannot fire.
             let handle = CONFIG_HANDLE
                 .read()
                 .clone()
                 .expect("config handle is bound before the refresher is spawned");
-            let cfg = handle.read().clone();
+            let cfg = handle.snapshot();
             let (groups, total_aliases_per_family) = enabled_pricing_groups(&cfg);
             if groups.is_empty() {
                 if !current_snapshot().is_empty() {

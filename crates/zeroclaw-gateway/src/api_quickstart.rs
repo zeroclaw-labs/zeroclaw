@@ -9,7 +9,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use zeroclaw_config::presets::BuilderSubmission;
 use zeroclaw_runtime::quickstart::{
-    AppliedAgent, QuickstartError, QuickstartStep, Surface, apply_with_surface, record_dismissed,
+    AppliedAgent, QuickstartError, QuickstartStep, Surface, record_dismissed, stage_apply,
     validate_only_with_surface,
 };
 
@@ -115,17 +115,82 @@ pub async fn handle_apply(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-    // Held through the swap below (and across `apply_with_surface`'s own
-    // save, which runs while this guard is held) so a concurrent config
-    // writer can't land between this read and the swap.
-    let _cfg_guard = std::sync::Arc::clone(&state.config_write_lock)
-        .lock_owned()
-        .await;
-    let mut working = state.config.read().clone();
-    let result = apply_with_surface(submission, &mut working, Surface::Web).await;
+    // Admit one serialized config commit for the whole
+    // stage-persist-publish sequence, so the install can't race a
+    // concurrent config write.
+    let commit = match state.begin_config_commit().await {
+        Ok(commit) => commit,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApplyResult::Errors {
+                    errors: vec![QuickstartError {
+                        step: QuickstartStep::Agent,
+                        field: String::new(),
+                        message: format!(
+                            "daemon generation is closing; config write refused without any change: {e}"
+                        ),
+                    }],
+                }),
+            )
+                .into_response();
+        }
+    };
+    let mut working = commit.current_config();
+    // Stage the submission (validation, mutation, personality tempfiles) —
+    // cancellable preparation with nothing on disk. A rejected submission
+    // returns with the published pair untouched.
+    let staged = match stage_apply(submission, &mut working, Surface::Web) {
+        Ok(staged) => staged,
+        Err(errors) => {
+            return (StatusCode::OK, Json(ApplyResult::Errors { errors })).into_response();
+        }
+    };
+    // Allocate the checked revision before the irreversible save.
+    let revision = match commit.next_revision() {
+        Ok(revision) => revision,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApplyResult::Errors {
+                    errors: vec![QuickstartError {
+                        step: QuickstartStep::Agent,
+                        field: String::new(),
+                        message: format!("config revision unavailable: {e}"),
+                    }],
+                }),
+            )
+                .into_response();
+        }
+    };
+    // The completion (save, publish, personality install) runs retained:
+    // the task owns the commit, so a cancelled requester cannot strand a
+    // committed config without its publication, and a post-commit
+    // personality failure still publishes the committed config while the
+    // truthful errors reach the caller below.
+    let task =
+        zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
+            zeroclaw_runtime::quickstart::complete_staged_apply_as_commit(staged, &commit, revision)
+                .await
+        }));
+    let result = match task.await {
+        Ok(result) => result,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApplyResult::Errors {
+                    errors: vec![QuickstartError {
+                        step: QuickstartStep::Agent,
+                        field: String::new(),
+                        message: format!("quickstart commit task failed: {e}"),
+                    }],
+                }),
+            )
+                .into_response();
+        }
+    };
     let body = match result {
-        Ok(agent) => {
-            *state.config.write() = working;
+        Ok(zeroclaw_runtime::quickstart::QuickstartApplyOutcome::Applied(agent)) => {
             state
                 .pending_reload
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -134,6 +199,21 @@ pub async fn handle_apply(
                 agent,
                 daemon_restarted: reload_signalled,
             }
+        }
+        Ok(
+            zeroclaw_runtime::quickstart::QuickstartApplyOutcome::CommittedWithSideEffectErrors {
+                errors,
+                ..
+            },
+        ) => {
+            // The config is committed AND published; mark the reload
+            // pending and signal it exactly like a fully successful apply,
+            // and return the truthful personality errors.
+            state
+                .pending_reload
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = signal_daemon_reload(&state);
+            ApplyResult::Errors { errors }
         }
         Err(errors) => ApplyResult::Errors { errors },
     };
