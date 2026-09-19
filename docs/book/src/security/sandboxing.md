@@ -70,14 +70,19 @@ Per-tool wall-time timeouts live on the tool's own config block (`[shell_tool].t
 
 ### Shell binary
 
-By default, the native runtime invokes commands via `/bin/sh`. Set `[runtime].shell` to use a different shell:
+When `[runtime].shell` is unset, the native runtime detects a platform default.
+Windows tries `pwsh`, then `powershell`, then `cmd.exe`. macOS first uses the
+current user's passwd login shell, then tries `zsh`, `bash`, and `/bin/sh`.
+Linux first uses the passwd login shell, then tries `bash`, `zsh`, and
+`/bin/sh`. Android remains pinned to `/system/bin/sh`. Set `[runtime].shell`
+to choose an interpreter explicitly:
 
 ```toml
 [runtime]
 shell = "bash"      # resolves through PATH, or use an absolute path
 ```
 
-On Unix, POSIX-compatible shells are called as `<shell> -c "<command>"`. `powershell`/`pwsh` select PowerShell syntax and policy on every supported desktop host and run as `<interpreter> -NoProfile -NonInteractive -Command <command>`, so profile scripts cannot redefine commands behind policy's back and prompts cannot block execution. The value must be either a bare command name found on `PATH` (e.g. `"bash"` or `"pwsh"`) or an absolute path to an executable (e.g. `"/bin/bash"`); relative paths with separators (e.g. `"./sh"`, `"bin/sh"`) are rejected. It is validated when the runtime starts, so an empty, missing, non-executable, or malformed shell fails fast with a clear error instead of breaking the first command. Defaults to `"sh"` when unset.
+On Unix, POSIX-compatible shells are called as `<shell> -c "<command>"`. `powershell`/`pwsh` select PowerShell syntax and policy on every supported desktop host and run as `<interpreter> -NoProfile -NonInteractive -Command <command>`, so profile scripts cannot redefine commands behind policy's back and prompts cannot block execution. The value must be either a bare command name found on `PATH` (e.g. `"bash"` or `"pwsh"`) or an absolute path to an executable (e.g. `"/bin/bash"`); relative paths with separators (e.g. `"./sh"`, `"bin/sh"`) are rejected. It is validated when the runtime starts, so an empty, missing, non-executable, or malformed shell fails fast with a clear error instead of breaking the first command. Explicit configuration always takes precedence over detection. Unix login-shell lookup uses `getpwuid_r`; if it fails or names an unavailable executable, the platform fallback order is used.
 
 On **Windows**, the value selects the interpreter family by its file name:
 
@@ -85,10 +90,10 @@ On **Windows**, the value selects the interpreter family by its file name:
 [runtime]
 shell = "pwsh"        # PowerShell 7+   -> pwsh -NoProfile -NonInteractive -Command <cmd>
 # shell = "powershell"  # Windows PowerShell 5.x
-# shell = "cmd"         # or leave unset -> cmd.exe /C "<cmd>"   (default)
+# shell = "cmd"         # explicit cmd.exe /C "<cmd>"
 ```
 
-`powershell` and `pwsh` (as a bare name resolved via `PATH`, or an absolute path such as `"C:\\Program Files\\PowerShell\\7\\pwsh.exe"`) run through PowerShell; any other value (including the default `sh` and an explicit `cmd`) runs through `cmd.exe /C`, matching the historical behaviour. Only an empty/whitespace value is rejected; the interpreter is located at spawn time.
+`powershell` and `pwsh` (as a bare name resolved via `PATH`, or an absolute path such as `"C:\\Program Files\\PowerShell\\7\\pwsh.exe"`) run through PowerShell; any other explicit value runs through `cmd.exe /C`, matching the historical behaviour. Only an empty/whitespace value is rejected on Windows; the interpreter is located at spawn time.
 
 The shell tool, shell-backed skill tools, and cron/schedule shell jobs all use this runtime selection. The runtime also reports the shell dialect to security policy, so policy validates the same language that will execute the command.
 

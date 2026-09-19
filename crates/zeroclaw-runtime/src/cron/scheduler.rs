@@ -2994,8 +2994,12 @@ mod tests {
         let workspace = std::env::temp_dir();
         let cmd = build_configured_shell_command(&config, "echo cron-test", &workspace).unwrap();
         let debug = format!("{cmd:?}");
+        let expected = zeroclaw_config::platform::native::default_shell();
         assert!(debug.contains("echo cron-test"));
-        assert!(debug.contains("\"sh\""), "should use sh: {debug}");
+        assert!(
+            debug.contains(&format!("\"{expected}\"")),
+            "should use platform default {expected:?}: {debug}"
+        );
         // Must NOT use login shell (-l) — login shells load full profile
         // and are slow/unpredictable for cron jobs.
         assert!(
