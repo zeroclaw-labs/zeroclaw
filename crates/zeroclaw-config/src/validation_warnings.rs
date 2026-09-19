@@ -42,6 +42,9 @@ pub const SERVER_FALLBACK_MODEL_DUPLICATES_PRIMARY: &str =
 ///   argument remains allowed.
 /// - `memory_semantic_search_without_embedder`: `memory.search_mode` requests
 ///   vector search on sqlite memory, but no effective embedder is configured.
+/// - `cron_job_contested_claim`: a cron job id is listed in the `cron_jobs` of
+///   more than one enabled agent; without a stored owner the job is refused
+///   rather than run under an arbitrary claimant.
 /// - `whatsapp_chat_policy_inert`: a WhatsApp Web `self_chat_mode` is set but
 ///   the transport only consults it under `mode = "personal"`, so it currently
 ///   has no effect. `dm_policy` and `group_policy` apply under both modes and
