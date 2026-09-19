@@ -20,7 +20,7 @@ zeroclaw-api.workspace = true
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 tempfile = "3"
-similar = { version = "2", default-features = false, features = ["text"] }
+similar = { version = "3", default-features = false, features = ["text"] }
 inkjet = { version = "0.11", default-features = false, features = [
     "language-rust", "language-python", "language-javascript", "language-typescript",
     "language-json", "language-toml", "language-yaml", "language-go", "language-c",
