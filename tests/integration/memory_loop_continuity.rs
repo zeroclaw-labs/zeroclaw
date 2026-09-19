@@ -397,6 +397,7 @@ async fn consolidation_extracts_facts_to_memory() {
         &MemoryConfig::default(),
         "The project deadline is April 15th 2026",
         "Got it, I'll remember the deadline is April 15th.",
+        zeroclaw_api::ingress::TurnOrigin::Interactive,
     )
     .await;
 
@@ -429,6 +430,7 @@ async fn memory_survives_rapid_consolidation() {
             &MemoryConfig::default(),
             &format!("User message {i}"),
             &format!("Assistant response {i}"),
+            zeroclaw_api::ingress::TurnOrigin::Interactive,
         )
         .await;
     }
