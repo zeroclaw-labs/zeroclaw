@@ -70,17 +70,217 @@ pub fn windows_tokio_cmd_shell_command(command: &str) -> tokio::process::Command
 ///
 /// `-NoProfile` skips user/host profile scripts for a predictable, faster
 /// startup; `-NonInteractive` prevents the shell from blocking on prompts; and
-/// `-Command` consumes the final argument as script text. Ordinary `arg`
-/// handling keeps the entire script in one process argument and preserves its
-/// internal PowerShell quoting.
+/// `-Command` consumes the final argument as script text. The script first
+/// attempts to configure UTF-8 output. That setup is deliberately isolated in
+/// an empty `try`/`catch`, so an unsupported setting never prevents the user
+/// command from running. PowerShell declarations and `#requires` directives
+/// remain at the beginning of the original top-level script, before the setup.
+/// Ordinary `arg` handling keeps the entire script in one process argument and
+/// preserves its parsing, quoting, scope, and exit behavior.
 fn tokio_powershell_command(interpreter: &str, command: &str) -> tokio::process::Command {
+    let script = powershell_script_with_utf8_setup(command);
     let mut process = tokio::process::Command::new(interpreter);
     process
         .arg("-NoProfile")
         .arg("-NonInteractive")
         .arg("-Command")
-        .arg(command);
+        .arg(script);
     process
+}
+
+const POWERSHELL_UTF8_SETUP: &str = "try {\n    $utf8 = [System.Text.UTF8Encoding]::new($false)\n    [Console]::OutputEncoding = $utf8\n    $OutputEncoding = $utf8\n} catch {\n}";
+
+fn powershell_script_with_utf8_setup(command: &str) -> String {
+    let declaration_end = powershell_declaration_end(command);
+    if declaration_end == 0 {
+        format!("{POWERSHELL_UTF8_SETUP}\n{command}")
+    } else {
+        format!(
+            "{}\n{POWERSHELL_UTF8_SETUP}\n{}",
+            &command[..declaration_end],
+            &command[declaration_end..]
+        )
+    }
+}
+
+/// Return the byte boundary after the declaration-only prefix PowerShell
+/// requires to precede executable statements.
+fn powershell_declaration_end(command: &str) -> usize {
+    let mut cursor = 0;
+    let mut found_declaration = false;
+
+    loop {
+        cursor = powershell_skip_leading_trivia(command, cursor);
+        if powershell_requires_at(command, cursor)
+            || powershell_keyword_at(command, cursor, "using")
+        {
+            cursor = powershell_statement_end(command, cursor);
+            found_declaration = true;
+        } else if powershell_keyword_at(command, cursor, "param") {
+            let Some(end) = powershell_param_end(command, cursor) else {
+                break;
+            };
+            cursor = end;
+            found_declaration = true;
+        } else {
+            break;
+        }
+    }
+
+    if found_declaration { cursor } else { 0 }
+}
+
+fn powershell_skip_leading_trivia(command: &str, mut cursor: usize) -> usize {
+    let bytes = command.as_bytes();
+    loop {
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) == Some(&b'#') && !powershell_requires_at(command, cursor) {
+            while cursor < bytes.len() && bytes[cursor] != b'\n' {
+                cursor += 1;
+            }
+            continue;
+        }
+        if bytes.get(cursor..cursor + 2) == Some(b"<#") {
+            cursor = command[cursor + 2..]
+                .find("#>")
+                .map_or(bytes.len(), |end| cursor + 2 + end + 2);
+            continue;
+        }
+        return cursor;
+    }
+}
+
+fn powershell_requires_at(command: &str, cursor: usize) -> bool {
+    let Some(candidate) = command.get(cursor..cursor + "#requires".len()) else {
+        return false;
+    };
+    candidate.eq_ignore_ascii_case("#requires")
+        && command
+            .as_bytes()
+            .get(cursor + "#requires".len())
+            .is_none_or(|byte| byte.is_ascii_whitespace())
+}
+
+fn powershell_keyword_at(command: &str, cursor: usize, keyword: &str) -> bool {
+    let Some(candidate) = command.get(cursor..cursor + keyword.len()) else {
+        return false;
+    };
+    candidate.eq_ignore_ascii_case(keyword)
+        && command
+            .as_bytes()
+            .get(cursor + keyword.len())
+            .is_none_or(|byte| byte.is_ascii_whitespace() || *byte == b'(')
+}
+
+fn powershell_statement_end(command: &str, cursor: usize) -> usize {
+    let bytes = command.as_bytes();
+    let mut quote = None;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    let mut index = cursor;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if line_comment {
+            if byte == b'\n' || byte == b'\r' {
+                return index + 1;
+            }
+        } else if block_comment {
+            if bytes.get(index..index + 2) == Some(b"#>") {
+                block_comment = false;
+                index += 2;
+                continue;
+            }
+        } else if let Some(active_quote) = quote {
+            if byte == active_quote {
+                if active_quote == b'\'' && bytes.get(index + 1) == Some(&b'\'') {
+                    index += 2;
+                    continue;
+                }
+                quote = None;
+            } else if active_quote == b'"' && byte == b'`' {
+                index += 1;
+            }
+        } else if bytes.get(index..index + 2) == Some(b"<#") {
+            block_comment = true;
+            index += 2;
+            continue;
+        } else if byte == b'#' {
+            line_comment = true;
+        } else if byte == b'\'' || byte == b'"' {
+            quote = Some(byte);
+        } else if byte == b'`' {
+            index += 1;
+        } else if byte == b';' || byte == b'\n' || byte == b'\r' {
+            return index + 1;
+        }
+        index += 1;
+    }
+    bytes.len()
+}
+
+fn powershell_param_end(command: &str, cursor: usize) -> Option<usize> {
+    let bytes = command.as_bytes();
+    let mut index = cursor + "param".len();
+    while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b'(') {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if line_comment {
+            if byte == b'\n' || byte == b'\r' {
+                line_comment = false;
+            }
+        } else if block_comment {
+            if bytes.get(index..index + 2) == Some(b"#>") {
+                block_comment = false;
+                index += 2;
+                continue;
+            }
+        } else if let Some(active_quote) = quote {
+            if byte == active_quote {
+                if active_quote == b'\'' && bytes.get(index + 1) == Some(&b'\'') {
+                    index += 2;
+                    continue;
+                }
+                quote = None;
+            } else if active_quote == b'"' && byte == b'`' {
+                index += 1;
+            }
+        } else if bytes.get(index..index + 2) == Some(b"<#") {
+            block_comment = true;
+            index += 2;
+            continue;
+        } else if byte == b'#' {
+            line_comment = true;
+        } else if byte == b'\'' || byte == b'"' {
+            quote = Some(byte);
+        } else if byte == b'`' {
+            index += 1;
+        } else if byte == b'(' {
+            depth += 1;
+        } else if byte == b')' {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                index += 1;
+                if bytes.get(index) == Some(&b';') {
+                    index += 1;
+                }
+                return Some(index);
+            }
+        }
+        index += 1;
+    }
+    None
 }
 
 #[cfg(target_os = "windows")]
@@ -408,9 +608,68 @@ mod tests {
             OsStr::new("-NoProfile"),
             OsStr::new("-NonInteractive"),
             OsStr::new("-Command"),
-            OsStr::new(script),
         ];
-        assert_eq!(args.as_slice(), expected.as_slice());
+        assert_eq!(&args[..3], expected.as_slice());
+        let script_arg = args[3].to_string_lossy();
+        assert!(script_arg.starts_with("try {"));
+        assert!(script_arg.contains("[Console]::OutputEncoding = $utf8"));
+        assert!(script_arg.contains("$OutputEncoding = $utf8"));
+        assert!(script_arg.contains("} catch {\n}"));
+        assert!(script_arg.ends_with(script));
+    }
+
+    #[test]
+    fn powershell_utf8_setup_follows_required_declarations() {
+        let command = "# comment\n#requires -Version 5.1 # keep; this comment\nusing namespace System.Text # keep; this comment too\nparam(\n    [string]$Value # the comment may contain )\n)\nWrite-Output $Value";
+        let cwd = std::env::temp_dir();
+        let process = NativeRuntime::with_shell("pwsh".into())
+            .build_shell_command(command, &cwd)
+            .unwrap();
+        let process = process.as_std();
+        let script = process.get_args().nth(3).unwrap().to_string_lossy();
+
+        let setup = script.find(POWERSHELL_UTF8_SETUP).unwrap();
+        assert!(setup > script.find("\n)\n").unwrap());
+        assert!(script[..setup].contains("#requires -Version 5.1"));
+        assert!(script[..setup].contains("using namespace System.Text"));
+        assert!(script.ends_with("Write-Output $Value"));
+    }
+
+    #[tokio::test]
+    async fn powershell_declaration_script_executes_with_utf8_setup() {
+        let Some(interpreter) = ["pwsh", "powershell"].into_iter().find(|candidate| {
+            std::process::Command::new(candidate)
+                .arg("-NoProfile")
+                .arg("-Command")
+                .arg("exit 0")
+                .output()
+                .is_ok()
+        }) else {
+            return;
+        };
+
+        for (command, expected) in [
+            (
+                "#requires -Version 5.1 # keep; this comment\nusing namespace System.Text # keep; this comment too\n[Console]::Write('声明-ok')",
+                "声明-ok",
+            ),
+            (
+                "param(\n    [string]$Name = '参数-ok' # the comment may contain )\n)\n[Console]::Write($Name)",
+                "参数-ok",
+            ),
+        ] {
+            let output = tokio_powershell_command(interpreter, command)
+                .output()
+                .await
+                .unwrap();
+
+            assert!(
+                output.status.success(),
+                "stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+        }
     }
 
     #[test]
