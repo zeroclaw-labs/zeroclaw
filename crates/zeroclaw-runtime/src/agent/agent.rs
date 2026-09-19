@@ -9066,6 +9066,12 @@ mod tests {
 
         let mut selected = None;
         let mut candidates = Vec::new();
+        // `Empty` means "not published yet", not "never coming". The hook is fed
+        // synchronously, but on a loaded runner this drain can still reach the
+        // channel first, and breaking on the first `Empty` then reports zero
+        // candidates for an event that was about to arrive. Wait for it instead,
+        // and stop as soon as the wanted event lands.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             match log_rx.try_recv() {
                 Ok(value)
@@ -9080,7 +9086,12 @@ mod tests {
                     candidates.push(value);
                 }
                 Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
-                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    if selected.is_some() || std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
                 Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
             }
         }
