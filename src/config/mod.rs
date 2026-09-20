@@ -110,6 +110,7 @@ mod tests {
             interrupt_on_new_message: false,
             mention_only: false,
             per_user_session: true,
+            passive_group_context: false,
             ack_reactions: None,
             proxy_url: None,
             approval_timeout_secs: 120,
