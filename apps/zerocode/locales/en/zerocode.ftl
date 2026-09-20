@@ -635,6 +635,26 @@ zc-config-field-edit-hint = { $keys } → press to edit
 
 zc-doctor-log-path = log: { $path }
 
+## Manual context compaction (native Code pane only). The operation
+## summarizes older completed turns into one bounded, inspectable summary
+## while the daemon keeps the original transcript; restore deactivates the
+## checkpoint and returns to originals plus later turns.
+zc-compaction-wrong-pane = Context compaction is only available in the Code pane.
+zc-compaction-busy-local = A turn is in flight; try again when the session is idle.
+zc-compact-context-started = Compacting older context… (one bounded summarization request on this session's model; the original transcript is kept)
+zc-restore-context-started = Restoring context from retained originals…
+zc-compact-context-done = Context compacted: covered { $turns } turns ({ $rows } message rows), ~{ $before } → ~{ $after } estimated tokens.
+zc-compact-context-already = This compaction is already committed; the current projection is unchanged.
+zc-compact-context-superseded = This compaction was superseded by a later restore or compaction; nothing changed.
+zc-compact-context-uninstalled = Committed durably. The live view will be rebuilt from the committed checkpoint on the next prompt.
+zc-compact-context-usage = Summarization usage: { $input } in / { $output } out (as reported).
+zc-compact-context-usage-input = Summarization input usage: { $input } (as reported).
+zc-compact-context-summary-heading = Continuity summary (lossy historical record of lower trust):
+zc-restore-context-done = Context restored from retained originals ({ $turns } turns were covered). Later turns are kept; files and tool effects are not undone.
+zc-restore-context-already = This restore is already completed.
+zc-restore-context-none = No active context compaction to restore.
+zc-compaction-failed = Context operation failed: { $error }
+
 ## Config registry metadata. Stable identifiers are used for lookup while the
 ## RPC-provided English display strings remain compatibility fallbacks.
 zc-config-group-foundation = Foundation

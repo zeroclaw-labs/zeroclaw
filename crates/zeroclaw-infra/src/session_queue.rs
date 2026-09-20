@@ -136,6 +136,79 @@ impl SessionActorQueue {
         }
     }
 
+    /// Fail-fast, idle-only admission for manual session operations.
+    ///
+    /// Admits only when the session is currently idle AND no other request is
+    /// registered (holding or waiting) for it. Returns `None` when busy;
+    /// this never queues the caller
+    /// behind a running turn, and never barges ahead of a waiter that already
+    /// registered on the semaphore.
+    ///
+    /// The registration happens while holding the slot-map lock, exactly like
+    /// [`Self::acquire`], so idle eviction cannot remove the slot between
+    /// registration and acquisition and the pending-count check cannot miss a
+    /// concurrent registration. `pending == 1` (only this registration) means
+    /// no holder and no waiter: the semaphore permit is then taken with
+    /// `try_acquire_owned` under the same lock, so a request that registers
+    /// afterwards queues behind this admission instead of racing it.
+    pub async fn try_acquire_idle(&self, session_id: &str) -> Option<SessionGuard> {
+        let mut slots = self.slots.lock().await;
+        let slot = slots
+            .entry(session_id.to_string())
+            .or_insert_with(|| {
+                Arc::new(SessionSlot {
+                    semaphore: Arc::new(Semaphore::new(1)),
+                    last_active: Mutex::new(Instant::now()),
+                    pending: AtomicUsize::new(0),
+                })
+            })
+            .clone();
+
+        #[cfg(test)]
+        {
+            // Scoped like `acquire`'s hook block: the std MutexGuard must not
+            // live across the `last_active` await below, or this future
+            // becomes non-Send in test builds.
+            let registration_hook = match self.registration_hook.lock() {
+                Ok(hook) => hook,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some(hook) = registration_hook.as_ref() {
+                hook();
+            }
+        }
+
+        // Register first (eviction protection + non-barging check), then
+        // inspect the count that existed before this registration. Any other
+        // registration means a holder or a waiter: fail fast without queueing.
+        // Dropping the registration decrements the count on this path.
+        let registration = PendingRegistration { slot: slot.clone() };
+        let current = slot.pending.fetch_add(1, Ordering::Relaxed);
+        if current > 0 {
+            drop(registration);
+            return None;
+        }
+
+        // current == 0: no other registration exists. The permit can still be
+        // momentarily unavailable while a just-dropped guard releases its
+        // permit before its registration (guard field order), so treat a
+        // failed try-acquire as busy rather than waiting.
+        match Arc::clone(&slot.semaphore).try_acquire_owned() {
+            Ok(permit) => {
+                *slot.last_active.lock().await = Instant::now();
+                drop(slots);
+                Some(SessionGuard {
+                    _permit: permit,
+                    _registration: registration,
+                })
+            }
+            Err(_) => {
+                drop(registration);
+                None
+            }
+        }
+    }
+
     #[cfg(test)]
     fn set_registration_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
         *self.registration_hook.lock().unwrap() = Some(hook);
@@ -305,5 +378,94 @@ mod tests {
 
         drop(guard);
         assert_eq!(queue.queue_depth("s1").await, 0);
+    }
+
+    #[tokio::test]
+    async fn try_acquire_idle_admits_idle_session() {
+        let queue = SessionActorQueue::new(8, 30, 600);
+        let guard = queue.try_acquire_idle("s1").await.unwrap();
+        assert_eq!(queue.queue_depth("s1").await, 1);
+        drop(guard);
+        assert_eq!(queue.queue_depth("s1").await, 0);
+    }
+
+    #[tokio::test]
+    async fn try_acquire_idle_fails_fast_while_session_is_held() {
+        let queue = Arc::new(SessionActorQueue::new(8, 30, 600));
+        let guard = queue.acquire("s1").await.unwrap();
+
+        let result = queue.try_acquire_idle("s1").await;
+        assert!(result.is_none());
+        // Fail-fast must not leave a phantom registration behind.
+        assert_eq!(queue.queue_depth("s1").await, 1);
+
+        drop(guard);
+        let guard = queue.try_acquire_idle("s1").await.unwrap();
+        drop(guard);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn try_acquire_idle_does_not_barge_ahead_of_a_registered_waiter() {
+        let queue = Arc::new(SessionActorQueue::new(8, 30, 600));
+        let guard = queue.acquire("s1").await.unwrap();
+
+        // A prompt registers and waits for the session.
+        let waiter_queue = Arc::clone(&queue);
+        let waiter = zeroclaw_spawn::spawn!(async move { waiter_queue.acquire("s1").await });
+        while queue.queue_depth("s1").await < 2 {
+            tokio::task::yield_now().await;
+        }
+
+        // Idle-only admission must refuse while a waiter is registered.
+        assert!(queue.try_acquire_idle("s1").await.is_none());
+
+        // Releasing the holder hands the session to the registered waiter,
+        // not to the refused admission.
+        drop(guard);
+        let admitted = waiter.await.unwrap().unwrap();
+        drop(admitted);
+
+        // With everything drained, idle admission succeeds again.
+        queue.try_acquire_idle("s1").await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn try_acquire_idle_registration_blocks_idle_eviction() {
+        // Idle eviction must not remove a slot whose idle-only admission is
+        // still between registration and acquisition — same atomicity
+        // contract as the waiting acquire.
+        let queue = Arc::new(SessionActorQueue::new(8, 5, 0));
+        let selected = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        let hook_selected = selected.clone();
+        let hook_resume = resume.clone();
+        queue.set_registration_hook(Arc::new(move || {
+            hook_selected.wait();
+            hook_resume.wait();
+        }));
+
+        let acquire_queue = Arc::clone(&queue);
+        let admission =
+            zeroclaw_spawn::spawn!(async move { acquire_queue.try_acquire_idle("s1").await });
+        tokio::task::spawn_blocking(move || selected.wait())
+            .await
+            .unwrap();
+
+        let evict_queue = Arc::clone(&queue);
+        let mut eviction = zeroclaw_spawn::spawn!(async move { evict_queue.evict_idle().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut eviction)
+                .await
+                .is_err(),
+            "eviction must wait for the idle admission registration to release the slot map"
+        );
+        tokio::task::spawn_blocking(move || resume.wait())
+            .await
+            .unwrap();
+
+        let guard = admission.await.unwrap().unwrap();
+        assert_eq!(eviction.await.unwrap(), 0);
+        drop(guard);
+        assert_eq!(queue.evict_idle().await, 1);
     }
 }

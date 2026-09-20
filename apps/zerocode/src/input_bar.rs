@@ -44,6 +44,8 @@ enum SlashCommandId {
     ModelProvider,
     RestartSession,
     ToggleThinking,
+    CompactContext,
+    RestoreContext,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -95,6 +97,16 @@ const LOCAL_COMMANDS: &[LocalCommandDescriptor] = &[
     LocalCommandDescriptor {
         id: SlashCommandId::ToggleThinking,
         name: "toggle-thinking",
+        aliases: &[],
+    },
+    LocalCommandDescriptor {
+        id: SlashCommandId::CompactContext,
+        name: "compact-context",
+        aliases: &[],
+    },
+    LocalCommandDescriptor {
+        id: SlashCommandId::RestoreContext,
+        name: "restore-context",
         aliases: &[],
     },
 ];
@@ -174,6 +186,8 @@ impl SlashCommandRegistry {
             }
             (SlashCommandId::RestartSession, None) => SlashCommand::RestartSession,
             (SlashCommandId::ToggleThinking, None) => SlashCommand::ToggleThinking,
+            (SlashCommandId::CompactContext, None) => SlashCommand::CompactContext,
+            (SlashCommandId::RestoreContext, None) => SlashCommand::RestoreContext,
             (SlashCommandId::Browse, None) => SlashCommand::EnterBrowseMode,
             (SlashCommandId::Help, None) => SlashCommand::OpenHelp,
             (SlashCommandId::ModelProvider, None | Some("")) => SlashCommand::ModelProviderPicker,
@@ -241,6 +255,12 @@ pub(crate) enum InputBarAction {
     /// User typed `/model-provider` with no argument — parent opens the
     /// two-stage model_provider picker modal.
     OpenModelProviderPicker,
+    /// User typed `/compact-context` — parent starts a manual, recoverable
+    /// context compaction on the active native Code session.
+    CompactContext,
+    /// User typed `/restore-context` — parent deactivates the active
+    /// context-compaction checkpoint.
+    RestoreContext,
     /// Key was not handled by the input bar — parent should handle it.
     NotHandled,
 }
@@ -267,6 +287,8 @@ enum SlashCommand<'a> {
     RestartSession,
     EnterBrowseMode,
     OpenHelp,
+    CompactContext,
+    RestoreContext,
     NotACommand,
 }
 
@@ -1651,6 +1673,8 @@ impl InputBarState {
                 SlashCommand::ToggleThinking => InputBarAction::ToggleThinking,
                 SlashCommand::EnterBrowseMode => InputBarAction::EnterBrowseMode,
                 SlashCommand::OpenHelp => InputBarAction::OpenHelp,
+                SlashCommand::CompactContext => InputBarAction::CompactContext,
+                SlashCommand::RestoreContext => InputBarAction::RestoreContext,
                 SlashCommand::Model(name) => InputBarAction::SetModel(name.to_string()),
                 SlashCommand::ModelPicker => InputBarAction::OpenModelPicker,
                 SlashCommand::ModelProvider(name) => {
@@ -3121,12 +3145,13 @@ mod tests {
     }
 
     #[test]
-    fn derived_slash_command_set_matches_expected_twelve_entries() {
+    fn derived_slash_command_set_matches_expected_entries() {
         let expected: Vec<&str> = vec![
             "/attach",
             "/attachments",
             "/browse",
             "/clear-queue",
+            "/compact-context",
             "/detach",
             "/help",
             "/model",
@@ -3134,6 +3159,7 @@ mod tests {
             "/new",
             "/new-session",
             "/restart-session",
+            "/restore-context",
             "/toggle-thinking",
         ];
         let registry = command_registry();

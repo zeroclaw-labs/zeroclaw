@@ -24,8 +24,8 @@ use crate::attachment::{
     CleanupReport, PendingAttachment, build_attachments_json, cleanup_attachment_temps,
 };
 use crate::client::{
-    ApprovalDecision, RpcClient, RpcNotification, SessionEntry, SessionUpdate, TurnEndOutcome,
-    method, parse_session_update,
+    ApprovalDecision, RpcClient, RpcNotification, SessionCompactContextResult, SessionEntry,
+    SessionRestoreContextResult, SessionUpdate, TurnEndOutcome, method, parse_session_update,
 };
 use crate::diff;
 use crate::file_explorer::{ExplorerAction, FileExplorerState};
@@ -278,6 +278,13 @@ pub(crate) struct Chat {
     /// from leaving the matching local turn stuck in flight.
     prompt_completion_tx: mpsc::Sender<PromptCompletion>,
     prompt_completion_rx: mpsc::Receiver<PromptCompletion>,
+    /// Manual context-compaction/restore completions, keyed by originating
+    /// (session id, operation id). A late reply after a session switch is
+    /// dropped rather than applied to a different session, and never
+    /// submits a prompt.
+    compaction_tx: mpsc::Sender<CompactionOpResult>,
+    compaction_rx: mpsc::Receiver<CompactionOpResult>,
+    compaction_pending: HashSet<(String, String)>,
     phase: ChatPhase,
     pane_kind: PaneKind,
     /// Live but unfocused sessions of this pane. Each keeps its full
@@ -510,6 +517,105 @@ struct PromptCompletion {
     transport_closed: bool,
 }
 
+/// Which manual context operation a background completion belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactionOpKind {
+    Compact,
+    Restore,
+}
+
+/// Client-local operation identity for manual compaction/restore. Opaque to
+/// the daemon; unique per client process by nanosecond timestamp plus a
+/// monotonic counter, so a retry can deliberately reuse the id and be
+/// recognized as committed.
+fn local_compaction_operation_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("zc-ctx-{nanos}-{sequence}")
+}
+
+/// Completion of one manual context-compaction/restore RPC, routed back to
+/// the originating session and operation only.
+struct CompactionOpResult {
+    session_id: String,
+    operation_id: String,
+    result: Result<CompactionOpPayload, String>,
+}
+
+enum CompactionOpPayload {
+    Compact(SessionCompactContextResult),
+    Restore(SessionRestoreContextResult),
+}
+
+/// Render a compact-context completion as an inspectable system message:
+/// covered range, size estimates, summarization usage when reported, the
+/// lower-trust summary text, and any live-install caveat.
+fn render_compact_result(result: &SessionCompactContextResult) -> String {
+    let headline = match result.status.as_str() {
+        "activated" => crate::i18n::t_args(
+            "zc-compact-context-done",
+            &[
+                ("turns", &result.covered_turns.to_string()),
+                ("rows", &result.covered_message_rows.to_string()),
+                ("before", &result.estimated_tokens_before.to_string()),
+                ("after", &result.estimated_tokens_after.to_string()),
+            ],
+        ),
+        "already_committed" => crate::i18n::t("zc-compact-context-already"),
+        "superseded" => crate::i18n::t("zc-compact-context-superseded"),
+        other => format!("{} ({other})", crate::i18n::t("zc-compact-context-already")),
+    };
+    let mut message = headline;
+    if let Some(usage) = result.usage.as_ref() {
+        let usage_text = match (usage.input_tokens, usage.output_tokens) {
+            (Some(input), Some(output)) => crate::i18n::t_args(
+                "zc-compact-context-usage",
+                &[
+                    ("input", &input.to_string()),
+                    ("output", &output.to_string()),
+                ],
+            ),
+            (Some(input), None) => crate::i18n::t_args(
+                "zc-compact-context-usage-input",
+                &[("input", &input.to_string())],
+            ),
+            _ => String::new(),
+        };
+        if !usage_text.is_empty() {
+            message.push('\n');
+            message.push_str(&usage_text);
+        }
+    }
+    if result.status == "activated" && !result.installed {
+        message.push('\n');
+        message.push_str(&crate::i18n::t("zc-compact-context-uninstalled"));
+    }
+    if !result.summary.is_empty() {
+        message.push_str("\n\n");
+        message.push_str(&crate::i18n::t("zc-compact-context-summary-heading"));
+        message.push_str("\n\n");
+        message.push_str(&result.summary);
+    }
+    message
+}
+
+/// Render a restore-context completion.
+fn render_restore_result(result: &SessionRestoreContextResult) -> String {
+    match result.status.as_str() {
+        "deactivated" => crate::i18n::t_args(
+            "zc-restore-context-done",
+            &[("turns", &result.covered_turns.unwrap_or(0).to_string())],
+        ),
+        "already_deactivated" => crate::i18n::t("zc-restore-context-already"),
+        _ => crate::i18n::t("zc-restore-context-none"),
+    }
+}
+
 fn should_retry_on_entry(phase: &ChatPhase) -> bool {
     matches!(phase, ChatPhase::Error(_) | ChatPhase::PickAgent { .. })
 }
@@ -523,7 +629,11 @@ impl Chat {
         let (session_resync_tx, session_resync_rx) = mpsc::channel(MAX_TRACKED_SESSIONS_PER_PANE);
         let (prompt_completion_tx, prompt_completion_rx) =
             mpsc::channel(MAX_TRACKED_SESSIONS_PER_PANE);
+        let (compaction_tx, compaction_rx) = mpsc::channel(4);
         Self {
+            compaction_tx,
+            compaction_rx,
+            compaction_pending: HashSet::new(),
             rpc: rpc.clone(),
             rpc_out: rpc.rpc.clone(),
             notif_rx: rpc.subscribe_notifications(),
@@ -2751,6 +2861,118 @@ impl Chat {
         }
     }
 
+    /// Start a manual context compaction or restore on the active session.
+    /// Native Code pane only: the operation is daemon-owned ACP work and is
+    /// refused elsewhere. The RPC runs on a spawned task so the draw loop
+    /// stays responsive; the completion is routed back over
+    /// `compaction_tx` and applied only to the originating session and
+    /// operation. Returns the (session, operation) pending key when the
+    /// operation started, so the caller can register it with `Chat` after
+    /// the state borrow ends (disjoint borrows, no ChatState clone).
+    fn begin_context_compaction(
+        rpc: &Arc<RpcClient>,
+        compaction_tx: &mpsc::Sender<CompactionOpResult>,
+        pane_kind: PaneKind,
+        state: &mut ChatState,
+        kind: CompactionOpKind,
+    ) -> Option<(String, String)> {
+        if pane_kind != PaneKind::Acp {
+            state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t(
+                "zc-compaction-wrong-pane",
+            )));
+            state.mark_dirty_full();
+            return None;
+        }
+        if state.turn_in_flight {
+            state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t(
+                "zc-compaction-busy-local",
+            )));
+            state.mark_dirty_full();
+            return None;
+        }
+        let session_id = state.session_id.clone();
+        let operation_id = local_compaction_operation_id();
+        let pending_key = (session_id.clone(), operation_id.clone());
+        let rpc = rpc.clone();
+        state
+            .entries
+            .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
+                if kind == CompactionOpKind::Compact {
+                    "zc-compact-context-started"
+                } else {
+                    "zc-restore-context-started"
+                },
+            ))));
+        state.mark_dirty_append();
+        let tx = compaction_tx.clone();
+        tokio::spawn(async move {
+            let result = match kind {
+                CompactionOpKind::Compact => rpc
+                    .session_compact_context(&session_id, &operation_id)
+                    .await
+                    .map(CompactionOpPayload::Compact),
+                CompactionOpKind::Restore => rpc
+                    .session_restore_context(&session_id, &operation_id)
+                    .await
+                    .map(CompactionOpPayload::Restore),
+            };
+            let result = result.map_err(|error| format!("{error}"));
+            let _ = tx
+                .send(CompactionOpResult {
+                    session_id,
+                    operation_id,
+                    result,
+                })
+                .await;
+        });
+        Some(pending_key)
+    }
+
+    /// Apply manual compaction/restore completions. The completion belongs
+    /// to the originating session AND operation: after a session switch a
+    /// late reply is dropped, never applied to a different session, and it
+    /// never submits a prompt or emits a turn completion.
+    fn drain_compaction_results(&mut self) {
+        while let Ok(update) = self.compaction_rx.try_recv() {
+            let key = (update.session_id.clone(), update.operation_id.clone());
+            if !self.compaction_pending.remove(&key) {
+                // Stale or duplicated completion for an operation this
+                // Chat instance no longer owns.
+                continue;
+            }
+            let ChatPhase::Active(state) = &mut self.phase else {
+                continue;
+            };
+            if state.session_id != update.session_id {
+                // The user switched sessions; the reply stays with its
+                // originating session.
+                continue;
+            }
+            match update.result {
+                Ok(CompactionOpPayload::Compact(result)) => {
+                    let message = render_compact_result(&result);
+                    state
+                        .entries
+                        .push(ChatEntry::SystemMessage(Arc::<str>::from(message)));
+                    state.mark_dirty_append();
+                }
+                Ok(CompactionOpPayload::Restore(result)) => {
+                    let message = render_restore_result(&result);
+                    state
+                        .entries
+                        .push(ChatEntry::SystemMessage(Arc::<str>::from(message)));
+                    state.mark_dirty_append();
+                }
+                Err(error) => {
+                    state.info_message = Some(crate::widgets::InfoMessage::error(
+                        crate::i18n::t_args("zc-compaction-failed", &[("error", &error)]),
+                    ));
+                    state.mark_dirty_full();
+                }
+            }
+        }
+    }
+
     fn apply_session_reattach_result(&mut self, update: SessionReattachResult) {
         self.session_reattach_in_flight.remove(&update.session_id);
         let Some(state) = self.state_for_session_mut(&update.session_id) else {
@@ -2837,6 +3059,7 @@ impl Chat {
         self.settle_stuck_cancel();
         self.drain_git_branch_results();
         self.drain_model_fetch_results();
+        self.drain_compaction_results();
         self.drain_session_reattach_results();
         self.maybe_refresh_git_branch();
     }
@@ -3443,6 +3666,30 @@ impl Chat {
                 InputBarAction::OpenModelProviderPicker => {
                     let rpc = self.rpc.clone();
                     Self::open_provider_picker(&rpc, state).await;
+                    return false;
+                }
+                InputBarAction::CompactContext => {
+                    if let Some(key) = Self::begin_context_compaction(
+                        &self.rpc,
+                        &self.compaction_tx,
+                        self.pane_kind,
+                        state,
+                        CompactionOpKind::Compact,
+                    ) {
+                        self.compaction_pending.insert(key);
+                    }
+                    return false;
+                }
+                InputBarAction::RestoreContext => {
+                    if let Some(key) = Self::begin_context_compaction(
+                        &self.rpc,
+                        &self.compaction_tx,
+                        self.pane_kind,
+                        state,
+                        CompactionOpKind::Restore,
+                    ) {
+                        self.compaction_pending.insert(key);
+                    }
                     return false;
                 }
                 InputBarAction::Consumed => {
@@ -21644,6 +21891,208 @@ mod tests {
         active.input_bar.insert_text("alpha beta");
         chat.phase = ChatPhase::Active(Box::new(active));
         chat
+    }
+
+    #[tokio::test]
+    async fn compaction_commands_round_trip_through_rpc_and_render_without_submitting() {
+        use crossterm::event::KeyCode;
+
+        let (mut chat, mut writer_rx) = test_chat();
+        chat.pane_kind = PaneKind::Acp;
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        active_state(&mut chat)
+            .enqueue_message("keep queued".to_string(), Vec::new())
+            .unwrap();
+        let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+            crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 120, 40)),
+            },
+        )
+        .unwrap();
+        let mut rendered =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        let mut previous_operation = String::new();
+
+        for (command, method, result, visible_reply) in [
+            (
+                "/compact-context",
+                method::SESSION_COMPACT_CONTEXT,
+                serde_json::json!({
+                    "status": "activated",
+                    "covered_turns": 2,
+                    "covered_message_rows": 4,
+                    "estimated_tokens_before": 900,
+                    "estimated_tokens_after": 120,
+                    "summary": "Decision kept; downstream migration unfinished.",
+                    "installed": true
+                }),
+                "Decision kept; downstream migration unfinished.",
+            ),
+            (
+                "/restore-context",
+                method::SESSION_RESTORE_CONTEXT,
+                serde_json::json!({"status": "deactivated", "covered_turns": 2}),
+                "Context restored from retained originals",
+            ),
+        ] {
+            active_state(&mut chat).input_bar.insert_text(command);
+            assert!(
+                !chat
+                    .handle_key(KeyEvent::from(KeyCode::Enter), &mut term)
+                    .await
+            );
+            let request = next_rpc_request(&mut writer_rx, command).await;
+            assert_eq!(request["method"], method);
+            assert_eq!(request["params"]["session_id"], "sess-1");
+            let operation = request["params"]["operation_id"].as_str().unwrap();
+            assert!(!operation.is_empty());
+            assert_ne!(operation, previous_operation);
+            previous_operation = operation.to_string();
+            respond_ok(&chat.rpc_out, &request, result);
+
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !chat.compaction_pending.is_empty() {
+                    tokio::task::yield_now().await;
+                    chat.drain_compaction_results();
+                }
+            })
+            .await
+            .expect("RPC completion should reach the active pane");
+            rendered
+                .draw(|frame| chat.draw(frame, frame.area()))
+                .unwrap();
+            let text: String = rendered
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains(visible_reply), "missing reply: {text}");
+            let active = active_state(&mut chat);
+            assert!(!active.turn_in_flight);
+            assert_eq!(
+                active.queue_len(),
+                1,
+                "commands must not drain queued input"
+            );
+            assert!(
+                !active
+                    .entries()
+                    .iter()
+                    .any(|entry| matches!(entry, ChatEntry::UserMessage { .. }))
+            );
+            assert!(writer_rx.try_recv().is_err(), "no session/prompt emitted");
+        }
+    }
+
+    /// Manual compaction completions apply only to the originating session
+    /// AND operation: mismatched sessions, operations this Chat no longer
+    /// owns, and late replies after a session switch are dropped — never
+    /// applied to a different session, never submitting a prompt.
+    #[tokio::test]
+    async fn compaction_completions_apply_only_to_originating_session_and_operation() {
+        let mut chat = chat_with_active_input(PaneKind::Acp);
+        assert_eq!(active_state(&mut chat).session_id, "sess-1");
+        chat.compaction_pending
+            .insert(("sess-1".to_string(), "op-tui-1".to_string()));
+
+        let system_message_count = |chat: &Chat| {
+            let ChatPhase::Active(active) = &chat.phase else {
+                unreachable!();
+            };
+            active
+                .entries()
+                .iter()
+                .filter(|entry| matches!(entry, ChatEntry::SystemMessage(_)))
+                .count()
+        };
+        let compact_result = |session_id: &str, operation_id: &str| CompactionOpResult {
+            session_id: session_id.to_string(),
+            operation_id: operation_id.to_string(),
+            result: Ok(CompactionOpPayload::Compact(SessionCompactContextResult {
+                status: "activated".to_string(),
+                covered_turns: 2,
+                covered_message_rows: 4,
+                estimated_tokens_before: 900,
+                estimated_tokens_after: 120,
+                summary: "Decision kept; downstream migration unfinished.".to_string(),
+                usage: None,
+                installed: true,
+            })),
+        };
+
+        // A completion for a different session must not apply here.
+        chat.compaction_tx
+            .send(compact_result("sess-2", "op-tui-1"))
+            .await
+            .unwrap();
+        chat.drain_compaction_results();
+        assert_eq!(system_message_count(&chat), 0);
+        assert!(
+            chat.compaction_pending
+                .contains(&("sess-1".to_string(), "op-tui-1".to_string())),
+            "the originating operation stays pending"
+        );
+
+        // A completion for an operation this Chat never started is stale.
+        chat.compaction_tx
+            .send(compact_result("sess-1", "op-never-started"))
+            .await
+            .unwrap();
+        chat.drain_compaction_results();
+        assert_eq!(system_message_count(&chat), 0);
+
+        // A late reply after a session switch cannot update the different
+        // session now in focus; the completion is consumed, not applied.
+        chat.phase = ChatPhase::Active(Box::new(ChatState::new(
+            "sess-9".to_string(),
+            "myagent".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        )));
+        chat.compaction_tx
+            .send(compact_result("sess-1", "op-tui-1"))
+            .await
+            .unwrap();
+        chat.drain_compaction_results();
+        assert_eq!(
+            system_message_count(&chat),
+            0,
+            "a late reply must not update the session switched into focus"
+        );
+        assert!(
+            !chat
+                .compaction_pending
+                .contains(&("sess-1".to_string(), "op-tui-1".to_string()))
+        );
+
+        // The matching session AND operation applies once focus is back on
+        // the originating session.
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        chat.compaction_pending
+            .insert(("sess-1".to_string(), "op-tui-2".to_string()));
+        chat.compaction_tx
+            .send(compact_result("sess-1", "op-tui-2"))
+            .await
+            .unwrap();
+        chat.drain_compaction_results();
+        let ChatPhase::Active(active) = &chat.phase else {
+            unreachable!();
+        };
+        assert!(
+            active.entries().iter().any(|entry| matches!(entry,
+                ChatEntry::SystemMessage(message)
+                    if message.contains("Decision kept; downstream migration unfinished."))),
+            "the matching completion must land as an inspectable system message"
+        );
+        assert!(
+            !active
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry, ChatEntry::UserMessage { .. })),
+            "a compaction completion must never submit a prompt"
+        );
     }
 
     fn active_state(chat: &mut Chat) -> &mut ChatState {
