@@ -2628,6 +2628,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 multimodal_config,
                 provider_name,
                 model,
+                dispatch_model,
             ) {
                 Ok(resolved) => resolved,
                 // A route-resolution failure must not abort the tool loop;
@@ -2652,10 +2653,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             let next_protocol_model = next_vision
                 .as_ref()
                 .map(|resolved| resolved.model.as_str())
-                .unwrap_or(model);
+                .unwrap_or(dispatch_model);
             let (next_schema_tokens, next_use_native_tools) = match build_iteration_tool_specs(
                 model_provider,
-                model,
+                dispatch_model,
                 tools_registry,
                 excluded_tools,
                 activated_tools,
