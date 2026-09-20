@@ -18542,48 +18542,105 @@ Let me check the result."#;
         );
     }
 
-    #[tokio::test]
-    async fn hook_selected_model_flip_sends_native_schemas_on_the_next_request() {
-        // A stateful hook that selects a native-tool-capable model between
-        // iterations must move the NEXT dispatched request to native schemas:
-        // the protocol/native-mode resolution follows the hook-selected model
-        // at each dispatch seam.
+    #[derive(Clone, Copy)]
+    enum HookBudgetScenario {
+        NativeToPlain,
+        NativeToPlainWithCalibration,
+        PlainToNativeTrim,
+        PlainToNativeFloor,
+        SameModelCalibrated,
+        SummaryTrim,
+        SummaryCalibrated,
+        SummaryFloor,
+    }
+
+    async fn assert_hook_selected_request_budget(scenario: HookBudgetScenario) {
+        use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
         use crate::agent::turn::{ToolProtocolPrompts, scope_tool_protocol_prompts};
         use crate::hooks::{HookHandler, HookResult, HookRunner};
 
-        struct FlipModelOnSecondCall(Arc<AtomicUsize>);
+        struct SelectNextModel {
+            calls: Arc<AtomicUsize>,
+            next_model: &'static str,
+        }
 
         #[async_trait]
-        impl HookHandler for FlipModelOnSecondCall {
+        impl HookHandler for SelectNextModel {
             fn name(&self) -> &str {
-                "flip-model"
+                "select-next-model"
             }
+
             async fn before_llm_call(
                 &self,
                 _messages: &mut Vec<ChatMessage>,
                 model: &mut String,
             ) -> HookResult<()> {
-                if self.0.fetch_add(1, Ordering::SeqCst) >= 1 {
-                    *model = "native-model".to_string();
+                if self.calls.fetch_add(1, Ordering::SeqCst) >= 1 {
+                    *model = self.next_model.to_string();
                 }
                 HookResult::Continue(())
             }
         }
 
-        #[derive(Default)]
-        struct CapabilityByModelProvider {
-            requests: Arc<Mutex<Vec<(bool, String)>>>,
+        struct LargeSchemaTool {
+            result_chars: usize,
         }
 
         #[async_trait]
-        impl ModelProvider for CapabilityByModelProvider {
+        impl crate::tools::Tool for LargeSchemaTool {
+            fn name(&self) -> &str {
+                "budget_tool"
+            }
+            fn description(&self) -> &str {
+                "Return a bounded result"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "value": {"type": "string", "description": "schema".repeat(1000)}
+                    }
+                })
+            }
+            async fn execute(
+                &self,
+                _args: serde_json::Value,
+            ) -> anyhow::Result<crate::tools::ToolResult> {
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: "r".repeat(self.result_chars).into(),
+                    error: None,
+                })
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for LargeSchemaTool {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+            }
+            fn alias(&self) -> &str {
+                "budget_tool"
+            }
+        }
+
+        struct RecordedRequest {
+            model: String,
+            messages: Vec<ChatMessage>,
+            schema_tokens: usize,
+        }
+
+        struct ReportingProvider {
+            requests: Arc<Mutex<Vec<RecordedRequest>>>,
+            usage_multiplier: u64,
+        }
+
+        #[async_trait]
+        impl ModelProvider for ReportingProvider {
             fn capabilities_for_model(&self, model: &str) -> ProviderCapabilities {
                 ProviderCapabilities {
-                    native_tool_calling: model.starts_with("native-"),
+                    native_tool_calling: model == "native-model",
                     ..ProviderCapabilities::default()
                 }
             }
-
             async fn chat_with_system(
                 &self,
                 _system_prompt: Option<&str>,
@@ -18591,93 +18648,163 @@ Let me check the result."#;
                 _model: &str,
                 _temperature: Option<f64>,
             ) -> anyhow::Result<String> {
-                anyhow::bail!("chat_with_system should not be used in this test");
+                anyhow::bail!("test must exercise chat requests")
             }
-
             async fn chat(
                 &self,
                 request: ChatRequest<'_>,
                 model: &str,
                 _temperature: Option<f64>,
             ) -> anyhow::Result<ChatResponse> {
-                let has_native_tools = request.tools.is_some();
-                self.requests
-                    .lock()
-                    .expect("requests lock should be valid")
-                    .push((has_native_tools, model.to_string()));
-                let text = if self.requests.lock().unwrap().len() == 1 {
-                    r#"<tool_call>
-{"name":"count_tool","arguments":{"value":"X"}}
-</tool_call>"#
-                } else {
-                    "done"
-                };
+                let schema_tokens = request
+                    .tools
+                    .map_or(0, crate::agent::history::estimate_tool_schema_tokens);
+                let estimated = estimate_history_tokens(request.messages) + schema_tokens;
+                let mut requests = self.requests.lock().unwrap();
+                let first = requests.is_empty();
+                requests.push(RecordedRequest {
+                    model: model.to_string(),
+                    messages: request.messages.to_vec(),
+                    schema_tokens,
+                });
+                let native_call = first && request.tools.is_some();
                 Ok(ChatResponse {
-                    text: Some(text.to_string()),
-                    tool_calls: Vec::new(),
-                    usage: None,
+                    text: if native_call {
+                        None
+                    } else if first {
+                        Some(
+                            r#"<tool_call>{"name":"budget_tool","arguments":{}}</tool_call>"#
+                                .to_string(),
+                        )
+                    } else {
+                        Some("done".to_string())
+                    },
+                    tool_calls: if native_call {
+                        vec![ToolCall {
+                            id: "budget-call".to_string(),
+                            name: "budget_tool".to_string(),
+                            arguments: "{}".to_string(),
+                            extra_content: None,
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    usage: first.then_some(zeroclaw_providers::traits::TokenUsage {
+                        input_tokens: Some(estimated as u64 * self.usage_multiplier),
+                        output_tokens: Some(10),
+                        cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
+                    }),
                     reasoning_content: None,
                 })
             }
         }
-        impl ::zeroclaw_api::attribution::Attributable for CapabilityByModelProvider {
-            fn role(&self) -> ::zeroclaw_api::attribution::Role {
-                ::zeroclaw_api::attribution::Role::Provider(
-                    ::zeroclaw_api::attribution::ProviderKind::Model(
-                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
-                    ),
-                )
+        impl zeroclaw_api::attribution::Attributable for ReportingProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::System
             }
             fn alias(&self) -> &str {
-                "CapabilityByModelProvider"
+                "budget-provider"
             }
         }
 
-        let hook_calls = Arc::new(AtomicUsize::new(0));
-        let mut hooks = HookRunner::new();
-        hooks.register(Box::new(FlipModelOnSecondCall(Arc::clone(&hook_calls))));
-
-        let provider = CapabilityByModelProvider::default();
-        let requests = Arc::clone(&provider.requests);
-        let observer = NoopObserver;
+        let (first_model, next_model, usage_multiplier) = match scenario {
+            HookBudgetScenario::NativeToPlain => ("native-model", "plain-model", 1),
+            HookBudgetScenario::NativeToPlainWithCalibration => ("native-model", "plain-model", 4),
+            HookBudgetScenario::PlainToNativeTrim | HookBudgetScenario::PlainToNativeFloor => {
+                ("plain-model", "native-model", 1)
+            }
+            HookBudgetScenario::SameModelCalibrated => ("plain-model", "plain-model", 2),
+            HookBudgetScenario::SummaryTrim | HookBudgetScenario::SummaryFloor => {
+                ("plain-model", "plain-model", 1)
+            }
+            HookBudgetScenario::SummaryCalibrated => ("plain-model", "plain-model", 2),
+        };
+        let summary = matches!(
+            scenario,
+            HookBudgetScenario::SummaryTrim
+                | HookBudgetScenario::SummaryCalibrated
+                | HookBudgetScenario::SummaryFloor
+        );
+        let calibrated = matches!(
+            scenario,
+            HookBudgetScenario::SameModelCalibrated | HookBudgetScenario::SummaryCalibrated
+        );
+        let native_prompt = format!("system\n{NATIVE_TOOLS_TASK_FRAMING}\n\n## Safety\nsafe");
+        let text_prompt =
+            format!("system\n{NO_TOOLS_TASK_FRAMING}\n\n## Tools\nbudget_tool\n\n## Safety\nsafe");
         let mut history = vec![
-            ChatMessage::system("system"),
+            ChatMessage::system(if first_model == "native-model" {
+                &native_prompt
+            } else {
+                &text_prompt
+            }),
+            ChatMessage::user(format!("retained older turn {}", "o".repeat(2400))),
+            ChatMessage::assistant("older answer"),
             ChatMessage::user("run the tool once"),
         ];
-        let mut test_crumb_present = false;
-        let tool_calls = Arc::new(AtomicUsize::new(0));
         let tools_registry =
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
-                CountingTool::new("count_tool", Arc::clone(&tool_calls)),
+                LargeSchemaTool {
+                    result_chars: if matches!(scenario, HookBudgetScenario::SummaryFloor) {
+                        4000
+                    } else {
+                        1600
+                    },
+                },
             )]);
+        let schema_tokens =
+            crate::agent::history::estimate_tool_schema_tokens(&[tools_registry[0].spec()]);
+        let initial_tokens = estimate_history_tokens(&history);
+        let result_tokens = estimate_history_tokens(&[ChatMessage::assistant("r".repeat(1600))]);
+        let budget = match scenario {
+            HookBudgetScenario::NativeToPlain
+            | HookBudgetScenario::NativeToPlainWithCalibration => {
+                initial_tokens + schema_tokens + 100
+            }
+            HookBudgetScenario::PlainToNativeTrim => schema_tokens + result_tokens + 200,
+            HookBudgetScenario::PlainToNativeFloor => schema_tokens - 1,
+            HookBudgetScenario::SameModelCalibrated => initial_tokens + result_tokens + 200,
+            HookBudgetScenario::SummaryTrim | HookBudgetScenario::SummaryFloor => {
+                initial_tokens + 50
+            }
+            HookBudgetScenario::SummaryCalibrated => initial_tokens + result_tokens + 300,
+        };
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let mut hooks = HookRunner::new();
+        hooks.register(Box::new(SelectNextModel {
+            calls: Arc::clone(&hook_calls),
+            next_model,
+        }));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = ReportingProvider {
+            requests: Arc::clone(&requests),
+            usage_multiplier,
+        };
+        let mut crumb_present = false;
         let (event_tx, mut event_rx) =
             tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
         let turn_id = uuid::Uuid::new_v4().to_string();
-        let prompts = Arc::new(ToolProtocolPrompts::new(
-            "native prompt".to_string(),
-            "text prompt".to_string(),
-        ));
-
-        scope_tool_protocol_prompts(
-            prompts,
+        let result = scope_tool_protocol_prompts(
+            Arc::new(ToolProtocolPrompts::new(native_prompt, text_prompt)),
             run_tool_call_loop(ToolLoop {
                 parent_agent_alias: None,
                 sop_reassembly: None,
                 exec: ResolvedAgentExecution {
                     model_access: ResolvedModelAccess {
                         model_provider: &provider,
-                        provider_name: "mock-provider",
-                        model: "plain-model",
-                        dispatch_model: "plain-model",
+                        provider_name: "budget-provider",
+                        model: first_model,
+                        dispatch_model: first_model,
                         temperature: Some(0.0),
                     },
                     tools_registry: &tools_registry,
-                    observer: &observer,
+                    observer: &NoopObserver,
                     silent: true,
                     approval: None,
                     multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
                     config: None,
-                    max_tool_iterations: 3,
+                    max_tool_iterations: if summary { 1 } else { 3 },
                     hooks: Some(&hooks),
                     excluded_tools: &[],
                     dedup_exempt_tools: &[],
@@ -18687,13 +18814,13 @@ Let me check the result."#;
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
-                    context_limits: test_context_limits(100_000),
+                    context_limits: test_context_limits(budget),
                     context_limits_resolver: None,
                     receipt_generator: None,
                     knobs: &LoopKnobs::default(),
                 },
                 history: &mut history,
-                history_has_trim_breadcrumb: &mut test_crumb_present,
+                history_has_trim_breadcrumb: &mut crumb_present,
                 injected_memory_preamble: &mut None,
                 channel_name: "test",
                 channel_reply_target: None,
@@ -18713,42 +18840,178 @@ Let me check the result."#;
                 served_route_sink: None,
             }),
         )
-        .await
-        .expect("tool loop should succeed");
+        .await;
 
-        let captured = requests.lock().unwrap().clone();
-        assert_eq!(
-            captured.len(),
-            2,
-            "two iterations must dispatch two requests"
+        let floor = matches!(
+            scenario,
+            HookBudgetScenario::PlainToNativeFloor | HookBudgetScenario::SummaryFloor
         );
+        let untrimmed = matches!(
+            scenario,
+            HookBudgetScenario::NativeToPlain | HookBudgetScenario::NativeToPlainWithCalibration
+        );
+        if floor {
+            assert!(result.is_err(), "an unsatisfiable request must fail");
+        } else {
+            let text = result.expect("request must fit");
+            if summary {
+                assert!(text.starts_with("done"));
+            } else {
+                assert_eq!(text, "done");
+            }
+        }
         assert_eq!(
             hook_calls.load(Ordering::SeqCst),
-            2,
-            "the flipping hook runs once per dispatched request"
+            if summary { 1 } else { 2 },
+            "one hook per preparation"
         );
-        assert_eq!(
-            captured[0].1, "plain-model",
-            "the first dispatch keeps the configured model"
-        );
-        assert_eq!(
-            captured[1].1, "native-model",
-            "the second dispatch follows the hook-selected model"
-        );
-        assert!(
-            !captured[0].0,
-            "the non-native first request must not carry native schemas"
-        );
-        assert!(
-            captured[1].0,
-            "the hook-flipped second request must carry native schemas"
-        );
-        while let Ok(event) = event_rx.try_recv() {
+        let captured = requests.lock().unwrap();
+        assert_eq!(captured.len(), if floor { 1 } else { 2 });
+        assert_eq!(captured[0].model, first_model);
+        for request in captured.iter() {
+            let tokens = estimate_history_tokens(&request.messages) + request.schema_tokens;
             assert!(
-                !matches!(event, zeroclaw_api::agent::TurnEvent::HistoryTrimmed { .. }),
-                "a comfortable budget must not emit trim events"
+                tokens <= budget,
+                "an oversized request reached the provider"
             );
         }
+        if !floor {
+            let next = &captured[1];
+            assert_eq!(next.model, next_model);
+            assert_eq!(next.schema_tokens > 0, next_model == "native-model");
+            assert_eq!(
+                next.messages
+                    .iter()
+                    .any(|m| m.content.starts_with("retained older turn")),
+                untrimmed,
+            );
+            let framing = if next_model == "native-model" {
+                NATIVE_TOOLS_TASK_FRAMING
+            } else {
+                NO_TOOLS_TASK_FRAMING
+            };
+            assert!(next.messages[0].content.contains(framing));
+            if calibrated {
+                assert!(
+                    (estimate_history_tokens(&next.messages) + next.schema_tokens) * 2 <= budget,
+                    "same-model usage must still constrain the next request"
+                );
+            }
+            if untrimmed {
+                assert!(
+                    estimate_history_tokens(&next.messages) + schema_tokens > budget,
+                    "the stale native-schema projection must exceed this test's budget"
+                );
+            }
+            if summary {
+                assert_eq!(next.schema_tokens, 0, "the summary is tools-free");
+                assert!(
+                    next.messages
+                        .last()
+                        .unwrap()
+                        .content
+                        .starts_with("You have reached")
+                );
+                assert!(
+                    next.messages
+                        .iter()
+                        .any(|m| m.content == "run the tool once")
+                );
+                assert!(
+                    next.messages
+                        .iter()
+                        .any(|m| m.content.contains(&"r".repeat(1600)))
+                );
+            }
+        }
+        assert!(
+            history.iter().any(|m| m.content == "run the tool once"),
+            "keep the newest real turn"
+        );
+        if summary && floor {
+            assert!(
+                history
+                    .iter()
+                    .any(|m| m.content.contains(&"r".repeat(4000)))
+            );
+            assert!(
+                !history
+                    .iter()
+                    .any(|m| m.content.starts_with("You have reached")),
+                "failed summary must not append a synthetic user turn"
+            );
+        }
+        assert_eq!(
+            history
+                .iter()
+                .any(|m| m.content.starts_with("retained older turn")),
+            untrimmed,
+        );
+        assert_eq!(crumb_present, !untrimmed);
+        let mut trims = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                tokens_after,
+                tokens_after_source,
+                unsatisfiable_floor,
+                ..
+            } = event
+            {
+                trims.push((tokens_after, tokens_after_source, unsatisfiable_floor));
+            }
+        }
+        assert_eq!(trims.len(), usize::from(!untrimmed));
+        if let Some((tokens_after, source, unsatisfiable)) = trims.first() {
+            assert_eq!(*unsatisfiable, floor.then_some(true));
+            assert_eq!(tokens_after.unwrap() > budget as u64, floor);
+            let expected_source = if calibrated {
+                zeroclaw_api::agent::TokenCountSource::Calibrated
+            } else {
+                zeroclaw_api::agent::TokenCountSource::Estimated
+            };
+            assert_eq!(*source, Some(expected_source));
+            if summary && !floor {
+                let actual =
+                    estimate_history_tokens(&captured[1].messages) as u64 * usage_multiplier;
+                assert_eq!(
+                    *tokens_after,
+                    Some(actual),
+                    "trim event must count the summary prompt too"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_native_to_plain_preserves_history_not_needed_for_schemas() {
+        assert_hook_selected_request_budget(HookBudgetScenario::NativeToPlain).await;
+        assert_hook_selected_request_budget(HookBudgetScenario::NativeToPlainWithCalibration).await;
+    }
+
+    #[tokio::test]
+    async fn hook_plain_to_native_trims_the_actual_next_request() {
+        assert_hook_selected_request_budget(HookBudgetScenario::PlainToNativeTrim).await;
+    }
+
+    #[tokio::test]
+    async fn hook_plain_to_native_floor_never_dispatches_oversized_request() {
+        assert_hook_selected_request_budget(HookBudgetScenario::PlainToNativeFloor).await;
+    }
+
+    #[tokio::test]
+    async fn next_request_keeps_same_model_reported_usage_calibration() {
+        assert_hook_selected_request_budget(HookBudgetScenario::SameModelCalibrated).await;
+    }
+
+    #[tokio::test]
+    async fn max_iteration_summary_trims_the_prepared_request() {
+        assert_hook_selected_request_budget(HookBudgetScenario::SummaryTrim).await;
+        assert_hook_selected_request_budget(HookBudgetScenario::SummaryCalibrated).await;
+    }
+
+    #[tokio::test]
+    async fn max_iteration_summary_floor_preserves_the_latest_real_turn() {
+        assert_hook_selected_request_budget(HookBudgetScenario::SummaryFloor).await;
     }
 
     #[tokio::test]
