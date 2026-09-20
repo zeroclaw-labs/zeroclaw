@@ -9,8 +9,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use zeroclaw_config::presets::BuilderSubmission;
 use zeroclaw_runtime::quickstart::{
-    AppliedAgent, QuickstartError, QuickstartStep, Surface, apply_with_surface, record_dismissed,
-    validate_only_with_surface,
+    AppliedAgent, QuickstartError, QuickstartStep, Surface, apply_with_surface_checked,
+    record_dismissed, validate_only_with_surface,
 };
 
 use super::AppState;
@@ -122,7 +122,13 @@ pub async fn handle_apply(
         .lock_owned()
         .await;
     let mut working = state.config.read().clone();
-    let result = apply_with_surface(submission, &mut working, Surface::Web).await;
+    // The staged policy is compiled BEFORE Quickstart's first write, so a
+    // rejected one cannot reach disk and then be reported as not saved.
+    let result = apply_with_surface_checked(submission, &mut working, Surface::Web, &|staged| {
+        zeroclaw_runtime::rpc::auth::validate_accepted_auth_config(staged)
+            .map_err(|e| e.to_string())
+    })
+    .await;
     let body = match result {
         Ok(agent) => {
             *state.config.write() = working;
