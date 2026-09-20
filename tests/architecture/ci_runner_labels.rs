@@ -30,10 +30,10 @@ const RUNNER_LABEL: &str = "blacksmith-8vcpu-ubuntu-2404";
 /// from the required gate's critical path entirely.
 const HOUSEKEEPING_LABEL: &str = "blacksmith-4vcpu-ubuntu-2404";
 
-/// Every housekeeping job on the Blacksmith 4-vCPU class. Same contract as
+/// Every Quality Gate housekeeping job on the Blacksmith 4-vCPU class. Same contract as
 /// `COMPILE_JOBS`: this list is the reviewable inventory the workflow is
 /// checked against.
-const HOUSEKEEPING_JOBS: [&str; 16] = [
+const HOUSEKEEPING_JOBS: [&str; 15] = [
     "fmt",
     "gate",
     "history-guard",
@@ -47,7 +47,6 @@ const HOUSEKEEPING_JOBS: [&str; 16] = [
     "nix-eval",
     "nix-hash-drift",
     "relay-container-smoke",
-    "windows-test-scope",
     "security",
     "web-permission-tests",
 ];
@@ -216,6 +215,19 @@ fn housekeeping_jobs_pin_the_four_vcpu_label() {
             "{name} must run on {HOUSEKEEPING_LABEL}"
         );
     }
+
+    // The advisory selector keeps its runner contract after moving workflows.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let advisory = fs::read_to_string(root.join(".github/workflows/windows-tests.yml"))
+        .expect("failed to read .github/workflows/windows-tests.yml");
+    let advisory_blocks = job_blocks(&advisory);
+    let selector = advisory_blocks
+        .get("windows-test-scope")
+        .expect("windows-tests.yml must define the advisory selector");
+    assert!(
+        selector.contains(&format!("    runs-on: {HOUSEKEEPING_LABEL}\n")),
+        "the advisory selector must run on {HOUSEKEEPING_LABEL}"
+    );
 }
 
 #[test]

@@ -89,6 +89,12 @@ fn process_state(pid: u32, expected_started_at: Option<u64>) -> ProcessState {
     if !sysinfo::IS_SUPPORTED_SYSTEM {
         return ProcessState::Unknown;
     }
+    // A retained Windows process object is not proof that its owner is alive.
+    // Only definite exit bypasses the existing identity and uncertainty checks.
+    #[cfg(windows)]
+    if pid_is_definitely_absent(pid) == Some(true) {
+        return ProcessState::AbsentOrReused;
+    }
     let pid = sysinfo::Pid::from_u32(pid);
     let mut system = sysinfo::System::new();
     system.refresh_processes_specifics(
@@ -318,6 +324,11 @@ mod tests {
 
         child.kill().expect("terminate Windows child");
         child.wait().expect("reap Windows child");
+        assert_eq!(
+            pid_is_definitely_absent(pid),
+            Some(true),
+            "Windows must report exit while the child handle remains open"
+        );
         assert!(is_authoritative(&live));
     }
 }

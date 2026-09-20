@@ -51,6 +51,19 @@ pub(crate) async fn gate_tool_approval(
                     position: Some(position),
                 };
                 let recipient = ctx.channel_reply_target.unwrap_or_default();
+                // Narration rides the async delta queue to the draft updater,
+                // while this approval call goes to the channel directly and
+                // can overtake it. A flush barrier waits until the updater
+                // consumed (and flushed) the turn's narration, so the user
+                // sees the pre-tool message before the approval prompt.
+                if ch.supports_turn_flush_narration()
+                    && let Some(tx) = ctx.on_delta
+                {
+                    let (barrier, ack) = StreamDelta::flush_barrier();
+                    if tx.send(barrier).await.is_ok() {
+                        let _ = ack.await;
+                    }
+                }
                 let response = if let Some(cancel) = ctx.cancellation_token {
                     tokio::select! {
                         biased;
