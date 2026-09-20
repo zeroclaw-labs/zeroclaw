@@ -16672,6 +16672,22 @@ fn test_channel_ctx_with_backend_channel_and_provider(
     let mut channels_by_name = HashMap::new();
     channels_by_name.insert(channel.name().to_string(), channel);
 
+    let mut prompt_config = zeroclaw_config::schema::Config::default();
+    prompt_config.runtime_profiles.insert(
+        "test".to_string(),
+        zeroclaw_config::schema::RuntimeProfileConfig {
+            max_context_tokens: Some(context_token_budget),
+            ..Default::default()
+        },
+    );
+    prompt_config.agents.insert(
+        "test".to_string(),
+        zeroclaw_config::schema::AliasedAgentConfig {
+            runtime_profile: zeroclaw_config::providers::RuntimeProfileRef::from("test"),
+            ..Default::default()
+        },
+    );
+
     Arc::new(ChannelRuntimeContext {
         channels_by_name: Arc::new(channels_by_name),
         model_provider,
@@ -16724,7 +16740,7 @@ fn test_channel_ctx_with_backend_channel_and_provider(
         hooks: None,
         provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
         workspace_dir: Arc::new(std::env::temp_dir()),
-        prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+        prompt_config: Arc::new(prompt_config),
         message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
         non_cli_excluded_tools: Arc::new(Vec::new()),
         autonomy_level: AutonomyLevel::default(),
