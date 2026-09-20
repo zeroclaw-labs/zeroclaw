@@ -363,6 +363,54 @@ struct PreDispatchTrimResult {
     kept_turns: usize,
 }
 
+fn record_dispatch_trim(
+    (provider_name, model): (&str, &str),
+    trim: &PreDispatchTrimResult,
+    dropped_turns: usize,
+    budget: usize,
+    tokens_before: u64,
+    tokens_after: u64,
+    token_source: zeroclaw_api::agent::TokenCountSource,
+) {
+    if trim.dropped_messages == 0 {
+        return;
+    }
+    // Keep this scope synchronous so route attribution cannot leak across awaits.
+    let span = ::zeroclaw_log::info_span!(
+        target: "zeroclaw_log_internal_scope",
+        "zeroclaw_scope",
+        model = %model,
+        model_provider = %provider_name,
+    );
+    let _guard = span.entered();
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Delete)
+            .with_category(::zeroclaw_log::EventCategory::Agent)
+            .with_attrs(::serde_json::json!({
+                "dropped_messages": trim.dropped_messages,
+                "dropped_turns": dropped_turns,
+                "kept_turns": trim.kept_turns,
+                "budget_tokens": budget,
+                "tokens_before": tokens_before,
+                "tokens_after": tokens_after,
+                "tokens_before_source": token_source,
+                "tokens_after_source": token_source,
+                "tokens_reclaimed": tokens_before.saturating_sub(tokens_after),
+                "budget_headroom": (budget as u64).saturating_sub(tokens_after),
+            })),
+        format!(
+            "History trimmed: dropped {} oldest turn(s) ({} msgs), {} -> {} tok (budget {}), reclaimed {} tok",
+            dropped_turns,
+            trim.dropped_messages,
+            tokens_before,
+            tokens_after,
+            budget,
+            tokens_before.saturating_sub(tokens_after)
+        )
+    );
+}
+
 /// Drop at most one whole turn, then let the caller rebuild and recount the
 /// actual prepared request. Raw-history estimates cannot decide how many
 /// prepared turns fit, especially after hooks or multimodal expansion.
@@ -1472,6 +1520,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             // estimate cannot predict the contribution of an image or hook
             // suffix, so it must not choose several drops ahead of this check.
             let mut total_dropped_messages = trim_result.dropped_messages;
+            let mut dropped_turns = usize::from(trim_result.dropped_messages > 0);
             let mut tokens_after_dispatch = tokens_before_dispatch;
             let mut genuine_floor = false;
             let max_iterations = crate::agent::history_trim::count_turns(turn_state.history) + 1;
@@ -1553,6 +1602,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 );
                 *history_has_trim_breadcrumb = turn_state.crumb_present;
                 total_dropped_messages += trim_result.dropped_messages;
+                dropped_turns += usize::from(trim_result.dropped_messages > 0);
                 let dropped_more = turn_state.history.len() != before_len
                     || turn_state.crumb_present != before_crumb;
                 if !dropped_more {
@@ -1561,6 +1611,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 }
             }
             trim_result.dropped_messages = total_dropped_messages;
+            record_dispatch_trim(
+                (active_model_provider_name, provider_request_model),
+                &trim_result,
+                dropped_turns,
+                context_token_budget,
+                tokens_before_dispatch,
+                tokens_after_dispatch,
+                dispatch_token_source,
+            );
             if let Some(tx) = event_tx.as_ref() {
                 let _ = tx
                     .send(TurnEvent::HistoryTrimmed {

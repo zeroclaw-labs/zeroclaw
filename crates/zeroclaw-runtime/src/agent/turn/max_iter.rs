@@ -130,6 +130,7 @@ pub(crate) async fn finish_after_max_iterations(
         && zeroclaw_providers::multimodal::count_image_markers(history) > 0;
     let mut tokens_before = None;
     let mut dropped_messages = 0;
+    let mut dropped_turns = 0;
     let request_messages = loop {
         let mut messages = super::prepare_messages_for_iteration(
             history,
@@ -144,7 +145,7 @@ pub(crate) async fn finish_after_max_iterations(
         messages.push(summary_prompt_mirror.clone());
         let tokens = token_counter.count(crate::agent::history::estimate_history_tokens(&messages));
         let before = *tokens_before.get_or_insert(tokens);
-        let trim = super::surface_oversized_dispatch_if_needed(
+        let mut trim = super::surface_oversized_dispatch_if_needed(
             history,
             crumb_present,
             tokens,
@@ -152,8 +153,19 @@ pub(crate) async fn finish_after_max_iterations(
         );
         dropped_messages += trim.dropped_messages;
         if trim.outcome == super::PreDispatchOutcome::Trimmed {
+            dropped_turns += 1;
             continue;
         }
+        trim.dropped_messages = dropped_messages;
+        super::record_dispatch_trim(
+            (provider_name, model),
+            &trim,
+            dropped_turns,
+            context_token_budget,
+            before,
+            tokens,
+            token_counter.source(),
+        );
         let floor = trim.outcome == super::PreDispatchOutcome::Floor;
         if dropped_messages > 0 || floor {
             let source = token_counter.source();
