@@ -440,6 +440,13 @@ pub struct ChannelMessage {
     /// Inbound email References chain (parent thread); used to build the
     /// reply's References header. Empty for non-email channels.
     pub references: Vec<String>,
+    /// Set by the receiving channel when the platform marked the inbound event
+    /// itself as a voice message (Matrix: an `m.audio` event carrying
+    /// `org.matrix.msc3245.voice`). This field creates that fact for the
+    /// runtime — nothing else on the inbound side records it. Never derived
+    /// from message text, a reply parent, or room state. `false` means text
+    /// or unknown.
+    pub voice_origin: bool,
 }
 
 /// Message to send through a channel

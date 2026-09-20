@@ -21086,22 +21086,24 @@ impl Config {
         out
     }
 
-    /// Voice-peer usernames for `<channel_type>.<alias>` that should always
-    /// receive TTS voice replies.
-    ///
-    /// A `[peer_groups.<name>]` contributes when its `channel` field matches
-    /// (type-wide or dotted) **and** `output_modality = "voice"`.
+    /// Peer usernames for `<channel_type>.<alias>` from every
+    /// `[peer_groups.<name>]` whose `channel` matches (type-wide or dotted)
+    /// **and** whose `output_modality` is `modality`. Deduped, in group
+    /// iteration order.
     ///
     /// This is the live-resolve counterpart of `channel_external_peers`,
-    /// filtered to voice-only peer groups. No cache — single source of truth
+    /// filtered to one output modality. No cache — single source of truth
     /// is `self.peer_groups`.
-    pub fn channel_voice_peers(&self, channel_type: &str, alias: &str) -> Vec<String> {
-        use crate::multi_agent::OutputModality;
-
+    pub fn channel_modality_peers(
+        &self,
+        channel_type: &str,
+        alias: &str,
+        modality: crate::multi_agent::OutputModality,
+    ) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for group in self.peer_groups.values() {
-            if group.output_modality != OutputModality::Voice {
+            if group.output_modality != modality {
                 continue;
             }
             let group_matches = match group.channel.split_once('.') {
@@ -21119,6 +21121,17 @@ impl Config {
             }
         }
         out
+    }
+
+    /// Voice-peer usernames for `<channel_type>.<alias>` that should always
+    /// receive TTS voice replies: the `channel_modality_peers` of
+    /// `output_modality = "voice"`.
+    pub fn channel_voice_peers(&self, channel_type: &str, alias: &str) -> Vec<String> {
+        self.channel_modality_peers(
+            channel_type,
+            alias,
+            crate::multi_agent::OutputModality::Voice,
+        )
     }
 
     /// Sender usernames authorized to issue `/model --agent <model>` on
@@ -43690,6 +43703,75 @@ allowed_users = []
         assert!(
             warnings_with_code(&config, PEER_GROUP_CHANNEL_DANGLING_WARNING).is_empty(),
             "a bare type-wide ref must never warn, even though it authorizes every alias"
+        );
+    }
+
+    /// Each modality resolves to its own groups' members only, and
+    /// `channel_voice_peers` — the resolver proactive delivery consults — sees
+    /// nothing but the `voice` group.
+    #[test]
+    async fn channel_modality_peers_filters_by_modality() {
+        use crate::multi_agent::{OutputModality, PeerGroupConfig, PeerUsername};
+
+        let mut config = Config::default();
+        config.peer_groups.insert(
+            "always_voice".to_string(),
+            PeerGroupConfig {
+                channel: "matrix.default".into(),
+                external_peers: vec![PeerUsername::new("@alice:server")],
+                output_modality: OutputModality::Voice,
+                ..PeerGroupConfig::default()
+            },
+        );
+        config.peer_groups.insert(
+            "always_text".to_string(),
+            PeerGroupConfig {
+                channel: "matrix.default".into(),
+                external_peers: vec![PeerUsername::new("@bob:server")],
+                output_modality: OutputModality::Text,
+                ..PeerGroupConfig::default()
+            },
+        );
+        // No explicit modality: the default is `mirror`.
+        config.peer_groups.insert(
+            "family".to_string(),
+            PeerGroupConfig {
+                channel: "matrix".into(),
+                external_peers: vec![PeerUsername::new("@carol:server")],
+                ..PeerGroupConfig::default()
+            },
+        );
+
+        assert_eq!(
+            config.channel_modality_peers("matrix", "default", OutputModality::Voice),
+            vec!["@alice:server".to_string()],
+            "voice resolves the voice group only"
+        );
+        assert_eq!(
+            config.channel_modality_peers("matrix", "default", OutputModality::Text),
+            vec!["@bob:server".to_string()],
+            "text resolves the text group only"
+        );
+        assert_eq!(
+            config.channel_modality_peers("matrix", "default", OutputModality::Mirror),
+            vec!["@carol:server".to_string()],
+            "mirror resolves the group without an explicit modality"
+        );
+        assert_eq!(
+            config.channel_voice_peers("matrix", "default"),
+            vec!["@alice:server".to_string()],
+            "the voice resolver never names a text or mirror member"
+        );
+        assert!(
+            config
+                .channel_modality_peers("matrix", "other", OutputModality::Voice)
+                .is_empty(),
+            "a dotted group does not apply to another alias"
+        );
+        assert_eq!(
+            config.channel_modality_peers("matrix", "other", OutputModality::Mirror),
+            vec!["@carol:server".to_string()],
+            "a type-wide group applies to every alias"
         );
     }
 
