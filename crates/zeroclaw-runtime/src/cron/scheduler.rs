@@ -1236,8 +1236,8 @@ async fn run_job_command_with_runtime_and_timeout(
 
     match time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(output)) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = crate::tools::shell_output::decode_shell_output(&output.stdout);
+            let stderr = crate::tools::shell_output::decode_shell_output(&output.stderr);
             let combined = match output_format {
                 // Raw mode on success returns bare stdout, by design — the
                 // point is to hand back exactly what a direct shell run

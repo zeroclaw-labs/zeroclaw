@@ -205,6 +205,7 @@ impl SkillCreator {
             model_provider,
             provider_name,
             model,
+            dispatch_model: model,
             temperature: None,
         };
         // Skill reflection is not part of any gateway turn ledger, so its

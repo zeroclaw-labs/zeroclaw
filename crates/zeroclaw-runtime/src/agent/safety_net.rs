@@ -577,12 +577,14 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
     let turn_id = uuid::Uuid::new_v4().to_string();
     let result = crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
         parent_agent_alias: None,
+        served_route_sink: None,
         sop_reassembly: None,
         exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
             crate::agent::loop_::ResolvedModelAccess {
                 model_provider: &provider,
                 provider_name: "mock",
                 model: "mock-model",
+                dispatch_model: "mock-model",
                 temperature: None,
             },
             crate::agent::loop_::ResolvedIo {
@@ -605,7 +607,13 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 30_000,
-                context_token_budget: 100_000,
+                context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                    model_context_window: 100_000,
+                    context_token_budget: 100_000,
+                    model_context_window_source:
+                        zeroclaw_config::schema::ModelContextWindowSource::Configured,
+                },
+                context_limits_resolver: None,
                 knobs: &crate::agent::loop_::LoopKnobs::default(),
             },
         ),
@@ -783,7 +791,8 @@ async fn safety_net_streaming_approval_deny_with_edit_round_trip() {
         _workspace: workspace,
     };
 
-    let handle: tools::PerToolChannelHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+    let handle: tools::PerToolChannelHandle =
+        Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
     agent.channel_handles.ask_user = Some(Arc::clone(&handle));
     agent.channel_handles().register_channel(
         "edit-channel",
@@ -981,12 +990,14 @@ async fn safety_net_task_locals_probe_per_entry_path() {
         crate::agent::loop_::scope_session_key(Some("session-1".into()), async {
             crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
                 parent_agent_alias: None,
+                served_route_sink: None,
                 sop_reassembly: None,
                 exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                     crate::agent::loop_::ResolvedModelAccess {
                         model_provider: &provider,
                         provider_name: "mock",
                         model: "mock-model",
+                        dispatch_model: "mock-model",
                         temperature: None,
                     },
                     crate::agent::loop_::ResolvedIo {
@@ -1009,7 +1020,13 @@ async fn safety_net_task_locals_probe_per_entry_path() {
                         strict_tool_parsing: false,
                         parallel_tools: false,
                         max_tool_result_chars: 30_000,
-                        context_token_budget: 100_000,
+                        context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                            model_context_window: 100_000,
+                            context_token_budget: 100_000,
+                            model_context_window_source:
+                                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+                        },
+                        context_limits_resolver: None,
                         knobs: &crate::agent::loop_::LoopKnobs::default(),
                     },
                 ),
@@ -1282,7 +1299,8 @@ async fn safety_net_turn_survives_in_loop_history_pruning() {
     let filler = "x".repeat(400);
     let runtime = zeroclaw_config::schema::ResolvedRuntime {
         // ~40 seeded messages × (100 tokens content + 4 framing) ≫ 500.
-        max_context_tokens: 500,
+        // Explicit absolute budget keeps proactive trimming at 500.
+        max_context_tokens: Some(500),
         ..zeroclaw_config::schema::ResolvedRuntime::default()
     };
 
@@ -1981,7 +1999,7 @@ fn approval_agent(
     let mut agent = builder.build().expect("agent builder should succeed");
     if let Some(ch) = channel {
         let handle: tools::PerToolChannelHandle =
-            Arc::new(parking_lot::RwLock::new(HashMap::new()));
+            Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
         agent.channel_handles.ask_user = Some(handle);
         agent.channel_handles().register_channel("acp", ch);
     }
@@ -2302,6 +2320,7 @@ async fn usage_event_coherent_tuple_vision_route() {
         let cfg_arc = Arc::new(cfg.clone());
         let switch_cfg = ProviderSwitchConfig {
             config: Some(cfg_arc.clone()),
+            live: None,
         };
         let mut base_resp = text_response("base response");
         base_resp.usage = Some(token_usage(1, 1));
@@ -2496,6 +2515,7 @@ async fn usage_event_coherent_tuple_in_turn_model_switch() {
         let cfg_arc = Arc::new(cfg.clone());
         let switch_cfg = ProviderSwitchConfig {
             config: Some(cfg_arc.clone()),
+            live: None,
         };
 
         // The ScriptedProvider returns a tool_call on its first (and only)
@@ -2677,6 +2697,7 @@ async fn usage_by_provider_breakdown_after_in_turn_model_switch() {
     let cfg_arc = Arc::new(cfg.clone());
     let switch_cfg = ProviderSwitchConfig {
         config: Some(cfg_arc),
+        live: None,
     };
 
     // Provider A: ScriptedProvider returns tool_call WITH usage data.
@@ -3207,6 +3228,7 @@ async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
                 model_provider: &provider,
                 provider_name: "mock",
                 model: "mock-model",
+                dispatch_model: "mock-model",
                 temperature: None,
             },
             ResolvedIo {
@@ -3229,7 +3251,10 @@ async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 30_000,
-                context_token_budget: 100_000,
+                context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(
+                    100_000,
+                ),
+                context_limits_resolver: None,
                 knobs: &LoopKnobs::default(),
             },
         ),
@@ -3251,6 +3276,7 @@ async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
         memory: None,
         agent_alias: None,
         turn_id: &turn_id,
+        served_route_sink: None,
     })
     .await;
 

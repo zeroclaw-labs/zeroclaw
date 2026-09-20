@@ -332,6 +332,18 @@ struct ChannelRouteSelection {
     api_key: Option<String>,
 }
 
+fn resolve_channel_context_limits(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+    route: &ChannelRouteSelection,
+    legacy_budget: usize,
+) -> zeroclaw_config::schema::ResolvedContextLimits {
+    if agent_alias.is_empty() {
+        return zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(legacy_budget);
+    }
+    config.resolved_context_limits_for_route(agent_alias, &route.model_provider, &route.model)
+}
+
 /// Selectable scope for a session-only `/model` override. The absence of any
 /// stored entry is the implicit "default" (config) tier, so it is not a variant.
 /// Precedence at resolution time is `User > Agent` (above the per-sender
@@ -8411,6 +8423,13 @@ async fn process_channel_message_body(
         };
     }
 
+    let mut context_limits = resolve_channel_context_limits(
+        runtime_defaults.config.as_ref(),
+        ctx.agent_alias.as_str(),
+        &route,
+        ctx.context_token_budget,
+    );
+
     let mut active_model_provider = match get_or_create_provider(
         ctx.as_ref(),
         &route.model_provider,
@@ -9202,6 +9221,7 @@ async fn process_channel_message_body(
                         model_provider: active_model_provider.as_ref(),
                         provider_name: route.model_provider.as_str(),
                         model: route.model.as_str(),
+                        dispatch_model: route.model.as_str(),
                         temperature: thinking.effective_temperature,
                     },
                     ResolvedIo {
@@ -9228,7 +9248,8 @@ async fn process_channel_message_body(
                         strict_tool_parsing: ctx.agent_cfg.resolved.strict_tool_parsing,
                         parallel_tools: ctx.agent_cfg.resolved.parallel_tools,
                         max_tool_result_chars: ctx.max_tool_result_chars,
-                        context_token_budget: ctx.context_token_budget,
+                        context_limits,
+                        context_limits_resolver: None,
                         knobs: &loop_knobs,
                     },
                 ),
@@ -9275,6 +9296,7 @@ async fn process_channel_message_body(
                 // agent when it delegates to a different agent, so the step runs
                 // with that agent's own gated tools/policy/MCP scope rather than
                 // this turn's.
+                served_route_sink: None,
                 sop_reassembly: Some(zeroclaw_runtime::agent::loop_::SopStepReassembly {
                     config: ctx.prompt_config.as_ref(),
                 }),
@@ -9358,6 +9380,12 @@ async fn process_channel_message_body(
                         route.model_provider = resolved_model_provider;
                         route.model = new_model;
                         route.api_key = resolved_api_key;
+                        context_limits = resolve_channel_context_limits(
+                            runtime_defaults.config.as_ref(),
+                            ctx.agent_alias.as_str(),
+                            &route,
+                            ctx.context_token_budget,
+                        );
                         // Persist the route override so subsequent messages
                         // from this sender continue using the switched model.
                         set_route_selection(
@@ -15365,7 +15393,7 @@ pub async fn start_channels_with_plugin_webhooks(
             sop_engine.clone(),
             sop_audit.clone(),
             Some(Arc::clone(&config_arc)),
-        );
+        )?;
         // Route the per-agent tool registry through the one gated seam - see
         // `assemble_channel_agent_tools` for the knobs and why. `mut` because the
         // text-tool prompt policy below may clear `deferred_section` for a
@@ -15840,7 +15868,7 @@ pub async fn start_channels_with_plugin_webhooks(
             }),
             pacing: config.pacing.clone(),
             max_tool_result_chars: agent.resolved.max_tool_result_chars,
-            context_token_budget: agent.resolved.max_context_tokens,
+            context_token_budget: agent.resolved.effective_context_budget(),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::from_millis(config.channels.debounce_ms),
             )),
@@ -18388,7 +18416,8 @@ pub(crate) mod tests {
             None,
             false,
             None,
-        );
+        )
+        .expect("tool registry builds");
         let schemas: HashMap<String, Arc<serde_json::Value>> = registry
             .tools
             .iter()
@@ -36438,6 +36467,77 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(
             get_route_selection(&ctx, &msg, &sender_key, &snapshot).model,
             "user-model"
+        );
+    }
+
+    #[test]
+    fn channel_route_switch_re_resolves_context_limits() {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig,
+            RuntimeProfileConfig,
+        };
+
+        let mut cfg = Config::default();
+        for (alias, model, context_window) in [
+            ("large", "large-model", 200_000),
+            ("small", "small-model", 8_000),
+        ] {
+            cfg.providers.models.custom.insert(
+                alias.to_string(),
+                CustomModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some(model.to_string()),
+                        context_window: Some(context_window),
+                        ..ModelProviderConfig::default()
+                    },
+                },
+            );
+        }
+        cfg.runtime_profiles.insert(
+            "ratio".to_string(),
+            RuntimeProfileConfig {
+                context_compact_ratio: Some(0.9),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        cfg.agents.insert(
+            "router".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: zeroclaw_config::providers::ModelProviderRef::new("custom.large"),
+                runtime_profile: "ratio".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let large = resolve_channel_context_limits(
+            &cfg,
+            "router",
+            &ChannelRouteSelection {
+                model_provider: "custom.large".to_string(),
+                model: "large-model".to_string(),
+                api_key: None,
+            },
+            0,
+        );
+        let small = resolve_channel_context_limits(
+            &cfg,
+            "router",
+            &ChannelRouteSelection {
+                model_provider: "custom.small".to_string(),
+                model: "small-model".to_string(),
+                api_key: None,
+            },
+            0,
+        );
+
+        assert_eq!(
+            (large.model_context_window, large.context_token_budget),
+            (200_000, 180_000)
+        );
+        assert_eq!(
+            (small.model_context_window, small.context_token_budget),
+            (8_000, 7_200)
         );
     }
 

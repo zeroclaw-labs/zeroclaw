@@ -106,6 +106,7 @@ jobs:
           HISTORY_CHECK_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         run: bash scripts/ci/common_ancestor_guard.sh origin/master "$HISTORY_CHECK_SHA"
 
+  # Guards the approved submodule layout introduced in PR #8516; see the bespoke gate registry in README.md.
   repo-structure:
     name: Repository Structure
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -1358,6 +1359,7 @@ jobs:
       - name: Evaluate Nix module assertions
         run: sudo nix --extra-experimental-features "nix-command flakes" build .#checks.x86_64-linux.nixos-module-eval --no-link
 
+  # Guards Nix Git-dependency hashes against Cargo.lock drift from PR #8336; see the bespoke gate registry in README.md.
   nix-hash-drift:
     name: Nix Hash Drift
     needs: [path-changes]
@@ -1397,6 +1399,7 @@ jobs:
       - name: Docs link checker unit tests
         run: python3 scripts/ci/check_internal_docs_links_test.py
 
+  # Guards Zerocode's RPC-only dependency boundary established in PR #7850; see the bespoke gate registry in README.md.
   zerocode-rpc-boundary:
     name: Zerocode RPC Boundary
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -1422,6 +1425,7 @@ jobs:
         if: steps.changed.outputs.run == 'true'
         run: bash scripts/ci/zerocode_no_zeroclaw_dep_gate.sh
 
+  # Guards generated installation surfaces against canonical-spec drift from PR #7558; see the bespoke gate registry in README.md.
   installer-drift:
     name: Installer Drift
     runs-on: blacksmith-8vcpu-ubuntu-2404

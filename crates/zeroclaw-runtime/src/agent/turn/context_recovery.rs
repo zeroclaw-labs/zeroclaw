@@ -63,7 +63,7 @@ pub(crate) async fn try_recover_context_overflow(
     event_tx: Option<&tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
     on_delta: Option<&tokio::sync::mpsc::Sender<super::events::DraftEvent>>,
     observer: &dyn Observer,
-    context_token_budget: usize,
+    context_limits: zeroclaw_config::schema::ResolvedContextLimits,
     // Owner-tracked breadcrumb provenance for `history` (see
     // `history_trim::insert_breadcrumb_deduped`); set when this recovery
     // inserts a fresh crumb so classification never depends on text.
@@ -93,6 +93,7 @@ pub(crate) async fn try_recover_context_overflow(
         // retry-sizing limitation itself predates this token-accounting
         // feature.
         let tokens_now = estimate_history_tokens(history);
+        // Preserve the established reactive policy after a context overflow.
         let budget = tokens_now.saturating_mul(2) / 3;
         let owned = std::mem::take(history);
         let result = trim_to_recent_turns_with_crumb(owned, budget, *crumb_present);
@@ -140,8 +141,8 @@ pub(crate) async fn try_recover_context_overflow(
             // actually set, so a disabled-enforcement recovery does not claim
             // a nonsensical zero-token budget.
             let reason = crate::i18n::get_required_cli_string("history-trim-reason-recovery");
-            let reported_token_budget =
-                (context_token_budget > 0).then_some(context_token_budget as u64);
+            let reported_token_budget = (context_limits.context_token_budget > 0)
+                .then_some(context_limits.context_token_budget as u64);
             if let Some(tx) = event_tx {
                 let _ = tx
                     .send(zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
@@ -177,7 +178,7 @@ pub(crate) async fn try_recover_context_overflow(
         }
 
         let system_floor = crate::agent::history::estimate_system_floor_tokens(history);
-        if system_floor >= context_token_budget {
+        if system_floor >= context_limits.context_token_budget {
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -185,12 +186,12 @@ pub(crate) async fn try_recover_context_overflow(
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "system_floor": system_floor,
-                        "budget": context_token_budget,
+                        "budget": context_limits.context_token_budget,
                         "error_key": "context_floor_exceeds_budget",
                     })),
                 crate::agent::history::context_floor_remediation(
                     system_floor,
-                    context_token_budget,
+                    context_limits.context_token_budget,
                 )
             );
         } else {
@@ -222,6 +223,15 @@ mod tests {
         h
     }
 
+    fn limits(context_token_budget: usize) -> zeroclaw_config::schema::ResolvedContextLimits {
+        zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: context_token_budget.max(32_000),
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            context_token_budget,
+        }
+    }
+
     /// The `CompactingContext` lifecycle state is only reachable through this
     /// recovery path, so it must be exercised with a live draft channel rather
     /// than the `None` sender the other cases use — otherwise the state is
@@ -240,7 +250,7 @@ mod tests {
             None,
             Some(&delta_tx),
             &observer,
-            32_000,
+            limits(32_000),
             &mut false,
         )
         .await;
@@ -273,7 +283,7 @@ mod tests {
             None,
             Some(&delta_tx),
             &observer,
-            32_000,
+            limits(32_000),
             &mut false,
         )
         .await;
@@ -309,7 +319,7 @@ mod tests {
             None,
             Some(&delta_tx),
             &observer,
-            32_000,
+            limits(32_000),
             &mut false,
         )
         .await;
@@ -343,7 +353,7 @@ mod tests {
             Some(&tx),
             None,
             &observer,
-            32_000,
+            limits(32_000),
             &mut false,
         )
         .await;
@@ -426,7 +436,7 @@ mod tests {
             Some(&tx),
             None,
             &observer,
-            configured_budget,
+            limits(configured_budget),
             &mut false,
         )
         .await;
@@ -473,7 +483,7 @@ mod tests {
             Some(&tx),
             None,
             &observer,
-            0,
+            limits(0),
             &mut false,
         )
         .await;
@@ -514,7 +524,7 @@ mod tests {
             Some(&tx),
             None,
             &observer,
-            100,
+            limits(100),
             &mut false,
         )
         .await;
@@ -550,7 +560,7 @@ mod tests {
             Some(&tx),
             None,
             &observer,
-            32_000,
+            limits(32_000),
             &mut false,
         )
         .await;
@@ -591,7 +601,7 @@ mod tests {
             None,
             None,
             &observer,
-            budget,
+            limits(budget),
             &mut false,
         )
         .await;

@@ -121,62 +121,12 @@ impl ShellTool {
     }
 }
 
-#[cfg(target_os = "windows")]
 fn decode_output(bytes: &[u8]) -> String {
-    use windows::Win32::Globalization::GetACP;
-    use windows::Win32::System::Console::GetConsoleOutputCP;
-
-    // SAFETY: both Win32 functions are parameter-free code-page queries. A
-    // zero console code page selects the documented system ANSI fallback.
-    let cp = unsafe {
-        let console_cp = GetConsoleOutputCP();
-        if console_cp == 0 {
-            GetACP()
-        } else {
-            console_cp
-        }
-    };
-
-    decode_output_with_code_page(bytes, cp)
+    super::shell_output::decode_shell_output(bytes)
 }
 
-#[cfg(any(target_os = "windows", test))]
-fn decode_output_with_code_page(bytes: &[u8], cp: u32) -> String {
-    let encoding = windows_code_page_to_encoding(cp);
-    if std::ptr::eq(encoding, encoding_rs::UTF_8) {
-        String::from_utf8_lossy(bytes).into_owned()
-    } else {
-        let (cow, _enc_used, _had_errors) = encoding.decode(bytes);
-        cow.into_owned()
-    }
-}
-
-/// Map a Windows code page identifier to an `encoding_rs` `Encoding`.
-/// Falls back to UTF-8 (lossy) for unknown code pages.
-#[cfg(any(target_os = "windows", test))]
-fn windows_code_page_to_encoding(cp: u32) -> &'static encoding_rs::Encoding {
-    match cp {
-        932 => encoding_rs::SHIFT_JIS,
-        936 | 54936 => encoding_rs::GBK,
-        949 => encoding_rs::EUC_KR,
-        950 => encoding_rs::BIG5,
-        1250 => encoding_rs::WINDOWS_1250,
-        1251 => encoding_rs::WINDOWS_1251,
-        1252 => encoding_rs::WINDOWS_1252,
-        1253 => encoding_rs::WINDOWS_1253,
-        1254 => encoding_rs::WINDOWS_1254,
-        1255 => encoding_rs::WINDOWS_1255,
-        1256 => encoding_rs::WINDOWS_1256,
-        1257 => encoding_rs::WINDOWS_1257,
-        1258 => encoding_rs::WINDOWS_1258,
-        20127 | 65001 => encoding_rs::UTF_8,
-        _ => encoding_rs::UTF_8,
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn decode_output(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
+fn decode_truncated_output(bytes: &[u8]) -> String {
+    super::shell_output::decode_truncated_shell_output(bytes)
 }
 
 fn is_valid_env_var_name(name: &str) -> bool {
@@ -405,8 +355,8 @@ impl Tool for ShellTool {
                     let (stdout_capture, stderr_capture) =
                         tokio::join!(finish_drain(stdout_drain), finish_drain(stderr_drain));
 
-                    let mut stdout = decode_output(&stdout_capture.bytes);
-                    let mut stderr = decode_output(&stderr_capture.bytes);
+                    let mut stdout = decode_capture(&stdout_capture);
+                    let mut stderr = decode_capture(&stderr_capture);
 
                     if stdout_capture.truncated || stdout.len() > MAX_OUTPUT_BYTES {
                         append_truncation_marker(&mut stdout, "\n... [output truncated at 1MB]");
@@ -470,6 +420,15 @@ struct DrainHandle {
 struct DrainOutput {
     bytes: Vec<u8>,
     truncated: bool,
+    complete: bool,
+}
+
+fn decode_capture(capture: &DrainOutput) -> String {
+    if capture.truncated || !capture.complete {
+        decode_truncated_output(&capture.bytes)
+    } else {
+        decode_output(&capture.bytes)
+    }
 }
 
 fn spawn_drain<R>(reader: Option<R>, cap: usize) -> DrainHandle
@@ -514,12 +473,20 @@ async fn drain_capped_into<R>(
 {
     use tokio::io::AsyncReadExt;
     let Some(mut reader) = reader else {
+        if let Ok(mut capture) = output.lock() {
+            capture.complete = true;
+        }
         return;
     };
     let mut chunk = [0u8; 8192];
     loop {
         match reader.read(&mut chunk).await {
-            Ok(0) => break,
+            Ok(0) => {
+                if let Ok(mut capture) = output.lock() {
+                    capture.complete = true;
+                }
+                break;
+            }
             Ok(n) => {
                 let Ok(mut capture) = output.lock() else {
                     break;
@@ -562,6 +529,51 @@ fn android_child_path(tui_path: Option<&str>, ambient_path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct ErrorAfterBytes {
+        bytes: Option<Vec<u8>>,
+    }
+
+    impl tokio::io::AsyncRead for ErrorAfterBytes {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if let Some(bytes) = self.bytes.take() {
+                buf.put_slice(&bytes);
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Ready(Err(std::io::Error::other("injected read failure")))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_drain_preserves_utf8_prefix_below_capture_limit() {
+        let mut bytes = "€".repeat(12).into_bytes();
+        bytes.push(0xe2);
+        let output = Arc::new(std::sync::Mutex::new(DrainOutput::default()));
+
+        drain_capped_into(
+            Some(ErrorAfterBytes { bytes: Some(bytes) }),
+            MAX_OUTPUT_BYTES,
+            Arc::clone(&output),
+        )
+        .await;
+
+        let capture = output.lock().unwrap().clone();
+        assert!(!capture.complete);
+        assert!(!capture.truncated);
+        let decoded = decode_capture(&capture);
+        assert!(
+            decoded.starts_with(&"€".repeat(12)),
+            "decoded text: {decoded:?}"
+        );
+        assert!(decoded.ends_with('\u{fffd}'), "decoded text: {decoded:?}");
+    }
 
     #[test]
     fn android_child_path_prefixes_platform_dirs_with_tui_path_winning() {
@@ -1773,11 +1785,11 @@ mod tests {
     }
 
     #[test]
-    fn decode_output_invalid_utf8_uses_replacement_chars() {
-        // 0xFF is not valid UTF-8
+    fn decode_output_invalid_utf8_is_safe() {
+        // 0xFF is not valid UTF-8. Detection may select a legacy encoding,
+        // but the output must remain usable and must never panic.
         let input = b"hello\xFF world";
         let result = super::decode_output(input);
-        // Must not panic; non-UTF-8 bytes become replacement characters on non-Windows
         assert!(result.contains("hello"));
         assert!(result.contains("world"));
     }
@@ -1785,37 +1797,6 @@ mod tests {
     #[test]
     fn decode_output_empty_bytes_returns_empty_string() {
         assert_eq!(super::decode_output(b""), "");
-    }
-
-    #[test]
-    fn windows_code_page_mapping_covers_cjk() {
-        use super::windows_code_page_to_encoding;
-        assert_eq!(windows_code_page_to_encoding(936), encoding_rs::GBK);
-        assert_eq!(windows_code_page_to_encoding(932), encoding_rs::SHIFT_JIS);
-        assert_eq!(windows_code_page_to_encoding(949), encoding_rs::EUC_KR);
-        assert_eq!(windows_code_page_to_encoding(950), encoding_rs::BIG5);
-    }
-
-    #[test]
-    fn windows_code_page_mapping_utf8_variants() {
-        use super::windows_code_page_to_encoding;
-        assert_eq!(windows_code_page_to_encoding(65001), encoding_rs::UTF_8);
-        assert_eq!(windows_code_page_to_encoding(20127), encoding_rs::UTF_8);
-    }
-
-    #[test]
-    fn windows_code_page_mapping_unknown_falls_back_to_utf8() {
-        use super::windows_code_page_to_encoding;
-        assert_eq!(windows_code_page_to_encoding(99999), encoding_rs::UTF_8);
-    }
-
-    #[test]
-    fn decode_output_with_cp936_gbk_bytes_transcodes_to_utf8() {
-        // GBK encoding of "你好" is [0xC4, 0xE3, 0xBA, 0xC3]
-        let gbk_bytes: &[u8] = &[0xC4, 0xE3, 0xBA, 0xC3];
-        let decoded = super::decode_output_with_code_page(gbk_bytes, 936);
-        assert_eq!(decoded, "你好");
-        assert!(!decoded.contains('\u{FFFD}'));
     }
 
     #[tokio::test]

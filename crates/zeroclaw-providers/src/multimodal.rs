@@ -513,6 +513,19 @@ const MEDIA_MARKER_KINDS: &[&str] = &[
 /// document and file delivery.
 const AUDIO_MARKER_KINDS: &[&str] = &["VOICE", "AUDIO"];
 
+/// Force-compile this module's lazy regexes on the caller's thread.
+///
+/// A cold `regex` compile descends through dozens of `regex_automata` NFA
+/// compiler frames; `strip_media_markers` and the audio-marker checks run
+/// deep inside turn processing, so the registry builder warms both here —
+/// on its own dedicated thread — before any turn stack exists.
+pub fn warm_lazy_regexes() {
+    // Force the fn-local media-marker regex by running one strip; the
+    // result is unused, only the initialization matters.
+    let _ = strip_media_markers("");
+    std::sync::LazyLock::force(&AUDIO_MARKER_RE);
+}
+
 /// Text a degraded media marker is replaced with before the history reaches
 /// a model that cannot consume the payload. The model may echo it verbatim
 /// into a reply, so it is plain prose rather than bracket syntax: it must

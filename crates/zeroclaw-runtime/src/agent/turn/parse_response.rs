@@ -407,6 +407,11 @@ pub(crate) async fn record_accepted_chat_response(
                 cached_input_tokens: usage.and_then(|u| u.cached_input_tokens),
                 output_tokens,
                 cost_usd,
+                context_token_budget: Some(ctx.context_limits.context_token_budget as u64),
+                model_context_window: ctx
+                    .context_limits
+                    .configured_model_context_window()
+                    .map(|tokens| tokens as u64),
                 provider_ref: effective_provider.to_string(),
                 model: effective_model.to_string(),
                 accepted: true,
@@ -556,6 +561,7 @@ mod argument_preservation_tests {
             observer: &crate::observability::NoopObserver,
             provider_name: "test.provider",
             model: "test-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
             temperature: None,
             approval: None,
             channel_name: "",
@@ -797,6 +803,12 @@ mod cost_usd_regression_tests {
             observer: &crate::observability::NoopObserver,
             provider_name: provider,
             model,
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                model_context_window: 32_000,
+                context_token_budget: 32_000,
+                model_context_window_source:
+                    zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            },
             temperature: None,
             approval: None,
             channel_name: "",
@@ -941,6 +953,7 @@ mod cost_usd_regression_tests {
             observer: &crate::observability::NoopObserver,
             provider_name: "requested.provider",
             model: "requested-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
             temperature: None,
             approval: None,
             channel_name: "",
