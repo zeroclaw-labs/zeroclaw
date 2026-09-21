@@ -7,7 +7,9 @@
 unmaintained = "all"
 # yanked: deny | warn | allow
 yanked = "deny"
-# Ignore known unmaintained transitive deps we cannot easily replace
+# Advisories we cannot act on from this repository: unmaintained transitive
+# deps we cannot easily replace, and vulnerabilities whose fix is published
+# but unreachable because an intermediate crate pins the vulnerable major.
 ignore = [
     # rustls-pemfile -- unmaintained, functionality moved to rustls-pki-types;
     # transitive dep, upstream migration tracked
@@ -21,6 +23,15 @@ ignore = [
     # matrix-org/matrix-rust-sdk#6859 asks matrix-sdk to move off the imbl stack;
     # drop this entry once a matrix-sdk release no longer pulls bitmaps.
     { id = "RUSTSEC-2026-0247", reason = "bitmaps unmaintained; transitive via matrix-sdk -> eyeball-im -> imbl; no safe upgrade; upstream matrix-org/matrix-rust-sdk#6859" },
+    # imbl-sized-chunks -- double free / use-after-free if an element's Drop
+    # panics while a Chunk or InlineArray removal is in progress. Fixed in
+    # 0.2.0, but imbl 6.1.0 requires ^0.1.3, so `cargo update` cannot reach the
+    # fix; it has to come from an imbl release and then a matrix-sdk bump.
+    # Reached only transitively: matrix-sdk -> imbl -> imbl-sized-chunks, the
+    # same stack as RUSTSEC-2026-0247 above, tracked by the same upstream issue
+    # matrix-org/matrix-rust-sdk#6859. Drop this entry once the graph resolves
+    # imbl-sized-chunks 0.2 or later.
+    { id = "RUSTSEC-2026-0292", reason = "imbl-sized-chunks double free if an element's Drop panics; transitive via matrix-sdk -> imbl; the 0.2.0 fix is unreachable because imbl 6.1.0 requires ^0.1.3; upstream matrix-org/matrix-rust-sdk#6859" },
 ]
 
 [licenses]
