@@ -550,7 +550,13 @@ pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportErr
     if let Some(profile) = config.runtime_profiles.get(runtime_alias) {
         model_provider_refs.push(profile.context_compression.summary_provider.trim());
     }
-    carry_model_provider_closure(&mut out, &masked_root, config, &model_provider_refs);
+    carry_model_provider_closure(
+        &mut out,
+        &masked_root,
+        config,
+        &model_provider_refs,
+        &mut dropped,
+    );
 
     let provider_refs = [
         ("providers.tts", agent.tts_provider.trim()),
@@ -1243,6 +1249,7 @@ fn carry_model_provider_closure(
     masked_root: &toml::Table,
     config: &Config,
     roots: &[&str],
+    dropped: &mut Vec<DroppedRef>,
 ) {
     let mut carried = BTreeSet::new();
     for root in roots {
@@ -1255,6 +1262,7 @@ fn carry_model_provider_closure(
             0,
             &mut visited,
             &mut carried,
+            dropped,
         );
     }
 }
@@ -1267,6 +1275,7 @@ fn carry_model_provider(
     depth: usize,
     visited: &mut Vec<String>,
     carried: &mut BTreeSet<String>,
+    dropped: &mut Vec<DroppedRef>,
 ) {
     if depth > crate::providers::MAX_FALLBACK_DEPTH {
         return;
@@ -1287,6 +1296,7 @@ fn carry_model_provider(
             &["providers", "models", family, &entry],
             &toml::Table::new(),
         );
+        remove_unresolved_provider_fallbacks(out, config, family, &entry, provider, dropped);
     }
 
     visited.push(resolved);
@@ -1299,9 +1309,70 @@ fn carry_model_provider(
             depth + 1,
             visited,
             carried,
+            dropped,
         );
     }
     visited.pop();
+}
+
+/// Remove fallback edges that the source runtime cannot resolve.
+///
+/// Leaving one in the fragment would let a same-named provider that exists
+/// only on the receiving install become reachable after a manual merge,
+/// changing the exported agent's endpoint and credential binding.
+fn remove_unresolved_provider_fallbacks(
+    out: &mut toml::Table,
+    config: &Config,
+    family: &str,
+    entry: &str,
+    provider: &crate::schema::ModelProviderConfig,
+    dropped: &mut Vec<DroppedRef>,
+) {
+    let mut unresolved = Vec::new();
+    let retained = provider
+        .fallback
+        .iter()
+        .enumerate()
+        .filter_map(|(index, fallback)| {
+            let reference = fallback.as_str();
+            if reference.trim().is_empty()
+                || config
+                    .providers
+                    .models
+                    .find_by_name(reference.trim())
+                    .is_some()
+            {
+                Some(toml::Value::String(reference.to_string()))
+            } else {
+                unresolved.push((index, reference.to_string()));
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if unresolved.is_empty() {
+        return;
+    }
+
+    if let Some(table) = table_at_mut(out, &["providers", "models", family, entry]) {
+        if retained.is_empty() {
+            table.remove("fallback");
+        } else {
+            table.insert("fallback".to_string(), toml::Value::Array(retained));
+        }
+    }
+
+    for (index, reference) in unresolved {
+        dropped.push(DroppedRef {
+            path: format!("providers.models.{family}.{entry}.fallback[{index}]"),
+            reason: DropReason::SourceMissing,
+            detail: format!(
+                "fallback {reference:?} does not resolve on the exporting install, so the edge \
+                 is removed rather than allowing a same-named target-local provider to change \
+                 the imported agent's endpoint or credentials"
+            ),
+        });
+    }
 }
 
 /// The masked table for one MCP server, matched by natural key.
@@ -2242,6 +2313,61 @@ mod tests {
         assert!(
             imported.providers.models.find("openai", "backup").is_some(),
             "fallback resolves after import"
+        );
+    }
+
+    #[test]
+    fn unresolved_model_provider_fallback_cannot_bind_to_a_target_local_provider() {
+        let mut config = fixture();
+        config
+            .providers
+            .models
+            .anthropic
+            .get_mut("main")
+            .unwrap()
+            .base
+            .fallback = vec![crate::providers::ModelProviderRef::new(
+            "openai.destination_only",
+        )];
+
+        let plan = plan_export(&config, "researcher").unwrap();
+        assert!(
+            plan.dropped.iter().any(|dropped| {
+                dropped.path == "providers.models.anthropic.main.fallback[0]"
+                    && dropped.reason == DropReason::SourceMissing
+            }),
+            "the unresolved source edge must be reported: {:?}",
+            plan.dropped
+        );
+
+        let rendered = render_config_toml(&plan).unwrap();
+        let mut imported: Config = toml::from_str(&rendered).unwrap();
+        imported.providers.models.openai.insert(
+            "destination_only".to_string(),
+            crate::schema::OpenAIModelProviderConfig {
+                base: crate::schema::ModelProviderConfig {
+                    api_key: Some("target-key-not-real".to_string()),
+                    uri: Some("https://target.invalid/v1".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let primary = imported
+            .providers
+            .models
+            .find("anthropic", "main")
+            .expect("primary provider survives");
+        assert!(
+            primary.fallback.is_empty(),
+            "a provider that exists only on the destination must not become reachable"
+        );
+        assert!(
+            imported
+                .collect_warnings()
+                .iter()
+                .all(|warning| warning.code != "dangling_fallback_ref"),
+            "the exported provider must not retain the unresolved edge"
         );
     }
 
