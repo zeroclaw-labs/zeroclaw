@@ -12,7 +12,7 @@ use zeroclaw_api::model_provider::{
     StreamResult,
 };
 
-mod accounting;
+pub(crate) mod accounting;
 
 /// Why a provider supplied usage observation cannot be billed as complete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -397,6 +397,12 @@ impl AccountedChatScope {
         crate::reliable::mark_stream_recovery_semantic_empty();
     }
 
+    /// Preserve a stream failure's safe classification if recovery exhausts
+    /// later candidates without replaying the failed stream entry.
+    pub fn record_stream_recovery_failure(&self, error: &anyhow::Error) {
+        crate::reliable::record_stream_recovery_failure(error);
+    }
+
     /// Clear a provisional route before an in-scope recovery replaces it.
     ///
     /// This has no presentation effect until [`commit_accepted_provider_route`]
@@ -623,6 +629,22 @@ impl ProviderDispatch {
             response,
             rejected_attempt_usage,
         })
+    }
+
+    /// Recover a pre-output streamed refusal without replaying the candidate
+    /// that already refused and reported usage.
+    pub async fn chat_after_stream_refusal(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        refusal: crate::AnthropicRefusalError,
+    ) -> anyhow::Result<ChatResponse> {
+        crate::reliable::scope_stream_refusal_recovery(
+            refusal,
+            self.chat(request, model, temperature),
+        )
+        .await
     }
 
     pub fn stream_chat(
@@ -934,6 +956,22 @@ impl<'a> ProviderDispatchRef<'a> {
             }),
             accounting,
         }
+    }
+
+    /// Recover a pre-output streamed refusal without replaying the candidate
+    /// that already refused and reported usage.
+    pub async fn chat_after_stream_refusal(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        refusal: crate::AnthropicRefusalError,
+    ) -> anyhow::Result<ChatResponse> {
+        crate::reliable::scope_stream_refusal_recovery(
+            refusal,
+            self.chat(request, model, temperature),
+        )
+        .await
     }
 
     pub fn stream_chat(
@@ -1388,6 +1426,7 @@ mod tests {
                     input_tokens: Some(3),
                     output_tokens: Some(2),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 "complete",
             ),
@@ -1396,6 +1435,7 @@ mod tests {
                     input_tokens: Some(0),
                     output_tokens: Some(0),
                     cached_input_tokens: Some(0),
+                    cache_creation_input_tokens: None,
                 }),
                 "zero",
             ),
@@ -1404,6 +1444,7 @@ mod tests {
                     input_tokens: None,
                     output_tokens: Some(2),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 "invalid",
             ),

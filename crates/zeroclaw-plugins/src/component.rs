@@ -2,7 +2,6 @@
 
 use anyhow::Result;
 use std::collections::VecDeque;
-use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use wasmtime::component::{Component, ResourceTable};
@@ -12,9 +11,12 @@ use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
 use crate::config::ResolvedPluginConfig;
+use crate::egress::EgressHostService;
 use crate::error::PluginError;
+use crate::host::AdmittedComponent;
 use crate::instance::PluginInstanceScope;
 use crate::services::{ConfigLookupError, PluginHostServices, SecretLookupError};
+use crate::wasi_http::PluginEgressHooks;
 use crate::{PluginCapability, PluginPermission};
 
 /// Hard safety ceiling for ZeroClaw-owned WIT imports in one service frame.
@@ -104,6 +106,7 @@ pub(crate) struct PluginStoreSpec {
     limits: PluginLimits,
     inbound: InboundQueue,
     http: bool,
+    egress: Option<EgressHostService>,
 }
 
 impl PluginStoreSpec {
@@ -120,6 +123,7 @@ impl PluginStoreSpec {
             limits,
             inbound: InboundQueue::default(),
             http: false,
+            egress: None,
         }
     }
 
@@ -128,9 +132,28 @@ impl PluginStoreSpec {
     /// Adapters opt into the surface explicitly. This prevents adding a grant
     /// to a scope from silently widening an adapter that has not implemented
     /// and tested the corresponding component boundary.
+    ///
+    /// This grants the *surface*, never the *reach*. Without a service from
+    /// [`Self::with_egress_policy`] the store still links `wasi:http` and still
+    /// answers `http_enabled()`, but every request the guest issues is denied
+    /// Keeping the linker attached rather than dropping it is what
+    /// keeps store construction and the store/linker coherence check stable
+    /// while the answer to "may this instance reach the network" moves to the
+    /// host-owned egress boundary.
     #[must_use]
     pub(crate) fn with_granted_http(mut self) -> Self {
         self.http = self.scope.grants().allows(PluginPermission::HttpClient);
+        self
+    }
+
+    /// Attach the host-owned egress authority for this instance.
+    ///
+    /// `None` (the default) means deny-by-default: no destination is reachable.
+    /// The service is shared, not per-store — cloning it into several stores is
+    /// what makes one connection budget span every store of one instance.
+    #[must_use]
+    pub(crate) fn with_egress_policy(mut self, egress: Option<EgressHostService>) -> Self {
+        self.egress = egress;
         self
     }
 
@@ -146,7 +169,7 @@ pub mod bindings {
     pub mod tool {
         wasmtime::component::bindgen!({
             world: "tool-plugin",
-            path: "../../wit/v0",
+            path: "wit/v0",
             imports: { default: async },
             exports: { default: async },
         });
@@ -154,7 +177,7 @@ pub mod bindings {
     pub mod channel {
         wasmtime::component::bindgen!({
             world: "channel-plugin",
-            path: "../../wit/v0",
+            path: "wit/v0",
             imports: { default: async },
             exports: { default: async },
         });
@@ -162,7 +185,7 @@ pub mod bindings {
     pub mod memory {
         wasmtime::component::bindgen!({
             world: "memory-plugin",
-            path: "../../wit/v0",
+            path: "wit/v0",
             imports: { default: async },
             exports: { default: async },
         });
@@ -176,11 +199,20 @@ pub struct PluginState {
     host_calls_remaining: u64,
     wasi: WasiCtx,
     table: ResourceTable,
-    http: Option<WasiHttpCtx>,
+    http: Option<HttpSurface>,
     inbound: InboundQueue,
     limits: StoreLimits,
     fuel_per_call: u64,
     call_timeout: Duration,
+}
+
+/// The outbound-HTTP half of a store: wasmtime's per-store context paired with
+/// ZeroClaw's policy hooks. They are one field because `WasiHttpCtxView` needs
+/// both, and because a context without hooks would be the unmediated `wasi:http`
+/// the host-owned egress boundary exists to remove.
+struct HttpSurface {
+    ctx: WasiHttpCtx,
+    hooks: PluginEgressHooks,
 }
 
 /// The host-dispatched service frame that is currently active.
@@ -229,7 +261,10 @@ impl PluginState {
     /// linked. Other grants are consumed by adapters or host services where
     /// implemented and do not widen ambient WASI.
     pub(crate) fn new(spec: PluginStoreSpec) -> Self {
-        let http = spec.http.then(WasiHttpCtx::new);
+        let http = spec.http.then(|| HttpSurface {
+            ctx: WasiHttpCtx::new(),
+            hooks: PluginEgressHooks::new(spec.scope.clone(), spec.egress.clone()),
+        });
         Self {
             scope: spec.scope,
             services: spec.services,
@@ -379,15 +414,19 @@ impl WasiView for PluginState {
 }
 
 impl WasiHttpView for PluginState {
+    /// Hand `wasi:http` ZeroClaw's policy hooks instead of
+    /// `wasmtime_wasi_http::p2::default_hooks()`. The default hooks send every
+    /// request the guest asks for; these submit it to the host-owned egress
+    /// boundary first and own the connect (see [`crate::wasi_http`]).
     fn http(&mut self) -> WasiHttpCtxView<'_> {
-        let ctx = self
+        let surface = self
             .http
             .as_mut()
             .expect("wasi:http called on a plugin without the HttpClient permission");
         WasiHttpCtxView {
-            ctx,
+            ctx: &mut surface.ctx,
             table: &mut self.table,
-            hooks: wasmtime_wasi_http::p2::default_hooks(),
+            hooks: &mut surface.hooks,
         }
     }
 }
@@ -538,23 +577,21 @@ pub fn wt_instantiate<T>(r: wasmtime::Result<T>, ctx: &'static str) -> Result<T>
     r.map_err(|e| anyhow::Error::msg(format!("{ctx}: {e:#} (hint: {WIT_DRIFT_HINT})")))
 }
 
-/// Compile a component from a WASM file. With a JIT backend present a `.wasm`
-/// component is compiled on load; in runtime-only builds the file is a
-/// precompiled `.cwasm` deserialized directly.
-pub fn load_component(wasm_path: &Path) -> Result<Component> {
-    wt(load_inner(wasm_path), "failed to load WASM component")
+/// Compile or deserialize the exact component bytes retained by admission.
+pub fn load_component(component: &AdmittedComponent) -> Result<Component> {
+    wt(load_inner(component), "failed to load WASM component")
 }
 
 #[cfg(feature = "plugins-wasm-cranelift")]
-fn load_inner(wasm_path: &Path) -> wasmtime::Result<Component> {
-    Component::from_file(engine(), wasm_path)
+fn load_inner(component: &AdmittedComponent) -> wasmtime::Result<Component> {
+    Component::new(engine(), component.bytes())
 }
 
 #[cfg(not(feature = "plugins-wasm-cranelift"))]
-fn load_inner(wasm_path: &Path) -> wasmtime::Result<Component> {
+fn load_inner(component: &AdmittedComponent) -> wasmtime::Result<Component> {
     // SAFETY: the file is a wasmtime-produced `.cwasm` for this engine; a
     // mismatched artifact is rejected by deserialize's version check.
-    unsafe { Component::deserialize_file(engine(), wasm_path) }
+    unsafe { Component::deserialize(engine(), component.bytes()) }
 }
 
 /// Run one warm guest export inside its host-service frame, bounded by the
@@ -706,6 +743,7 @@ mod tests {
             description: None,
             author: None,
             wasm_path: Some("fixture.wasm".to_string()),
+            wasm_sha256: None,
             capabilities: vec![capability],
             permissions: vec![PluginPermission::ConfigRead],
             config_schema: Some(serde_json::json!({
@@ -720,6 +758,7 @@ mod tests {
             })),
             signature: None,
             publisher_key: None,
+            egress: Default::default(),
         }
     }
 

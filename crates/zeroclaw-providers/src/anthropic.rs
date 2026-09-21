@@ -5,16 +5,22 @@ use crate::traits::{
 };
 use anyhow::Context;
 use async_trait::async_trait;
+#[cfg(test)]
 use base64::Engine as _;
 use futures_util::stream::{self, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+pub use zeroclaw_api::model_provider::ModelRefusalError as AnthropicRefusalError;
+use zeroclaw_api::model_provider::ThinkingDisplay;
 use zeroclaw_api::tool::ToolSpec;
 
 /// Anthropic's API documentation lists 1.0 as the default sampling temperature.
 const TEMPERATURE_DEFAULT: f64 = 1.0;
 /// Anthropic's public API endpoint. Overrideable via `model_providers.<name>.base_url`.
 pub(crate) const BASE_URL: &str = "https://api.anthropic.com";
+use crate::safeguard_notice::{
+    SafeguardFallbackKind, SafeguardFallbackNotice, commit_safeguard_fallback,
+};
 /// Anthropic's documented per-image ceiling for the direct API: 10 MB
 /// **base64-encoded**. Measured on the encoded payload length, unlike the
 /// multimodal config's `max_image_size_mb`, which bounds decoded bytes. MB is
@@ -83,6 +89,11 @@ pub struct AnthropicModelProvider {
     base_url: String,
     max_tokens: u32,
     timeout_secs: u64,
+    /// Opt-in Anthropic server-side fallback targets, sent as the native
+    /// `fallbacks` parameter (plus the server-side-fallback beta) on
+    /// non-streaming requests only. Empty means requests are byte-identical to
+    /// the pre-opt-in wire format.
+    server_fallback_models: Vec<String>,
     /// Memoized cleaned tool schemas: each registered schema is cleaned once
     /// per provider instance (not once per request) and the byte-stable
     /// result keeps the `cache_control` tools block identical across
@@ -143,17 +154,127 @@ struct NativeChatRequest {
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<NativeThinkingConfig>,
+    /// Opt-in Anthropic server-side fallback targets. Non-streaming requests
+    /// only; `None` (the default) keeps the request byte-identical to today.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fallbacks: Option<Vec<NativeFallbackEntry>>,
 }
+
+/// One entry in the native `fallbacks` array: a model Anthropic may serve
+/// server-side when the requested model refuses.
+#[derive(Debug, Serialize)]
+struct NativeFallbackEntry {
+    model: String,
+}
+
+/// Beta value that opts a request into Anthropic's server-side fallback
+/// behavior. Rides in the `anthropic-beta` header only when `fallbacks` is set.
+const ANTHROPIC_SERVER_FALLBACK_BETA: &str = "server-side-fallback-2026-06-01";
 
 #[derive(Debug, Serialize)]
 struct NativeThinkingConfig {
     #[serde(rename = "type")]
     kind: &'static str,
-    budget_tokens: u32,
+    /// Fixed token budget for `enabled` thinking. Absent for `adaptive`
+    /// thinking, which lets the model pace itself — adaptive-only models
+    /// (Opus 4.7, Fable 5.1) reject `enabled` with HTTP 400.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budget_tokens: Option<u32>,
+    /// Anthropic's `thinking.display` beta field. `None` leaves the key out
+    /// of the request body entirely, matching pre-beta requests byte-for-byte.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display: Option<ThinkingDisplay>,
 }
 
-fn anthropic_model_supports_native_thinking(model: &str) -> bool {
-    !model.contains("claude-opus-4-7")
+/// Beta features carried by OAuth (Claude Code setup) tokens.
+const ANTHROPIC_OAUTH_BETA_FEATURES: &str =
+    "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14";
+
+/// Beta feature enabling the `thinking.display` request field
+/// (`thinking.display` controls omitted/updates/summarized thinking blocks).
+const ANTHROPIC_THINKING_DISPLAY_BETA: &str = "thinking-display-updates-2026-08-18";
+
+/// Flush an in-flight streaming thinking block as a durable reasoning chunk.
+///
+/// Emits the accumulated `{"thinking":..,"signature":..}` JSON object in the
+/// exact newline-joined representation the non-streaming `reasoning_content`
+/// contract uses (subsequent blocks are '\n'-prefixed so the consumer's raw
+/// concatenation round-trips). Returns `false` when the receiver is gone and
+/// the caller should stop pumping the stream.
+async fn flush_streaming_thinking_block(
+    thinking_text: &mut String,
+    thinking_signature: &mut String,
+    thinking_block_active: &mut bool,
+    reasoning_block_emitted: &mut bool,
+    tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+) -> bool {
+    if !*thinking_block_active {
+        return true;
+    }
+    let thinking = std::mem::take(thinking_text);
+    let signature = std::mem::take(thinking_signature);
+    *thinking_block_active = false;
+    // `omitted` display and some `updates` blocks legitimately carry an
+    // empty `thinking` field with a required signature; the signature alone
+    // must reach replay or tool-use continuation breaks.
+    if thinking.is_empty() && signature.is_empty() {
+        return true;
+    }
+    let mut payload = String::new();
+    if *reasoning_block_emitted {
+        payload.push('\n');
+    }
+    payload
+        .push_str(&serde_json::json!({ "thinking": thinking, "signature": signature }).to_string());
+    *reasoning_block_emitted = true;
+    tx.send(Ok(StreamEvent::ReasoningFinalized(payload)))
+        .await
+        .is_ok()
+}
+
+/// Value for the `anthropic-beta` header, if one should be sent. OAuth tokens
+/// always carry the Claude Code beta set; the thinking-display beta is appended
+/// whenever the request body carries `thinking.display`.
+/// Comma-joined `anthropic-beta` value for a request, or `None` when nothing
+/// opts in. A request carries **at most one** `anthropic-beta` header line, so
+/// the OAuth features, the thinking-display beta, and any per-request
+/// `extra_betas` are merged into a single value here rather than emitted as
+/// separate headers.
+fn anthropic_beta_features(
+    is_oauth: bool,
+    thinking_display_beta: bool,
+    extra_betas: &[&str],
+) -> Option<String> {
+    let mut features: Vec<&str> = Vec::new();
+    if is_oauth {
+        features.push(ANTHROPIC_OAUTH_BETA_FEATURES);
+    }
+    if thinking_display_beta {
+        features.push(ANTHROPIC_THINKING_DISPLAY_BETA);
+    }
+    features.extend_from_slice(extra_betas);
+    if features.is_empty() {
+        None
+    } else {
+        Some(features.join(","))
+    }
+}
+
+/// Anthropic thinking request styles. Adaptive-only models (Opus 4.7,
+/// Fable 5.1) reject the fixed-budget `enabled` shape with HTTP 400 and
+/// require `adaptive`; budget-based models require `enabled`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnthropicThinkingStyle {
+    Budget,
+    Adaptive,
+}
+
+fn anthropic_thinking_style(model: &str) -> AnthropicThinkingStyle {
+    if model.contains("claude-opus-4-7") || model.contains("claude-fable-5-1") {
+        AnthropicThinkingStyle::Adaptive
+    } else {
+        AnthropicThinkingStyle::Budget
+    }
 }
 
 /// Characters legal between `data:` and `;base64,` in a data URI header: the
@@ -350,13 +471,13 @@ struct NativeToolSpec {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct CacheControl {
+pub(crate) struct CacheControl {
     #[serde(rename = "type")]
     cache_type: String,
 }
 
 impl CacheControl {
-    fn ephemeral() -> Self {
+    pub(crate) fn ephemeral() -> Self {
         Self {
             cache_type: "ephemeral".to_string(),
         }
@@ -384,10 +505,29 @@ struct NativeChatResponse {
     #[serde(default)]
     content: Vec<NativeContentIn>,
     #[serde(default)]
+    usage: Option<AnthropicUsage>,
+    #[serde(default)]
     stop_reason: Option<String>,
     #[serde(default)]
-    usage: Option<AnthropicUsage>,
+    stop_details: Option<NativeStopDetails>,
+    /// Model that actually served this turn. On a server-side-fallback
+    /// response this may differ from the requested model — the primary signal
+    /// read by [`AnthropicModelProvider::server_fallback_notice`].
+    #[serde(default)]
+    model: Option<String>,
 }
+
+/// `stop_details` on a refusal response. `explanation` is deliberately not
+/// deserialized: it is unstable and may describe flagged content.
+#[derive(Debug, Deserialize)]
+struct NativeStopDetails {
+    #[serde(default)]
+    category: Option<String>,
+}
+
+#[cfg(test)]
+const ANTHROPIC_REFUSAL_MESSAGE: &str =
+    "anthropic refusal: model declined this request (safety classifiers)";
 
 #[derive(Debug, Deserialize)]
 struct AnthropicUsage {
@@ -405,6 +545,21 @@ struct AnthropicUsage {
     /// Disjoint from `cache_read_input_tokens` and `input_tokens`.
     #[serde(default)]
     cache_creation_input_tokens: Option<u64>,
+    /// Per-attempt breakdown on a server-side-fallback response. Absent on a
+    /// normal turn; read by [`AnthropicModelProvider::server_fallback_notice`]
+    /// to tell whether a fallback attempt actually served the turn.
+    #[serde(default)]
+    iterations: Option<Vec<AnthropicUsageIteration>>,
+}
+
+/// One attempt inside a server-side-fallback response. Tolerant by design:
+/// unknown `type` values and extra fields mean "not a fallback attempt".
+#[derive(Debug, Deserialize)]
+struct AnthropicUsageIteration {
+    /// Attempt type (JSON `type`); `fallback_message` marks the attempt that
+    /// a server-side fallback model served. Any other/absent value is ignored.
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -439,6 +594,7 @@ pub struct AnthropicBuilder {
     base_url: Option<String>,
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
+    server_fallback_models: Vec<String>,
 }
 
 impl AnthropicBuilder {
@@ -474,6 +630,14 @@ impl AnthropicBuilder {
         self
     }
 
+    /// Opt-in Anthropic server-side fallback targets, threaded through to the
+    /// native `fallbacks` request parameter on non-streaming calls. Defaults to
+    /// an empty vec, which leaves requests byte-identical to today.
+    pub fn server_fallback_models(mut self, models: Vec<String>) -> Self {
+        self.server_fallback_models = models;
+        self
+    }
+
     pub fn build(self) -> AnthropicModelProvider {
         AnthropicModelProvider {
             alias: self.alias,
@@ -485,6 +649,7 @@ impl AnthropicBuilder {
             timeout_secs: self
                 .timeout_secs
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
+            server_fallback_models: self.server_fallback_models,
             schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
         }
     }
@@ -500,6 +665,7 @@ impl AnthropicModelProvider {
             base_url: None,
             max_tokens: None,
             timeout_secs: None,
+            server_fallback_models: Vec::new(),
         }
     }
 
@@ -507,24 +673,72 @@ impl AnthropicModelProvider {
         token.starts_with("sk-ant-oat01-")
     }
 
+    /// Apply the credential headers plus any `extra_betas` opt-in beta values.
+    ///
+    /// A request carries **at most one** `anthropic-beta` header line: the
+    /// OAuth auth path already manages a comma-joined value, so `extra_betas`
+    /// are comma-appended to it rather than emitted as a second header. On the
+    /// x-api-key path (no auth beta) the extras become the sole `anthropic-beta`
+    /// value when present, and no header at all when `extra_betas` is empty.
     fn apply_auth(
         &self,
         request: reqwest::RequestBuilder,
         credential: &str,
+        thinking_display_beta: bool,
+        extra_betas: &[&str],
     ) -> reqwest::RequestBuilder {
         let is_setup = Self::is_setup_token(credential);
         let len = credential.len();
         ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"header": if is_setup { "Authorization" } else { "x-api-key" }, "credential_len": len})), "Anthropic auth header applied");
-        if is_setup {
+        let request = if is_setup {
             request
                 .header("Authorization", format!("Bearer {credential}"))
-                .header(
-                    "anthropic-beta",
-                    "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14",
-                )
                 .header("anthropic-dangerous-direct-browser-access", "true")
         } else {
             request.header("x-api-key", credential)
+        };
+        match anthropic_beta_features(is_setup, thinking_display_beta, extra_betas) {
+            Some(beta_features) => request.header("anthropic-beta", beta_features),
+            None => request,
+        }
+    }
+
+    /// Native `fallbacks` value for a non-streaming request to `model`, or
+    /// `None` when nothing opts in. Belt-and-braces over the config warnings:
+    /// blank/whitespace entries and entries equal to the requested model are
+    /// dropped (both are warned about and a model can never be its own
+    /// server-side fallback target), matching the `empty_server_fallback_model`
+    /// / `server_fallback_model_duplicates_primary` warnings' promise that such
+    /// entries are dropped before the request is sent. `None` keeps the request
+    /// byte-identical to the pre-opt-in wire format. Streaming requests never
+    /// call this.
+    ///
+    /// `thinking` carries the resolved native-thinking config for the request.
+    /// Server-side fallback is never combined with native thinking: a fallback
+    /// target need not support the requested thinking budget, so the pairing is
+    /// excluded on every request shape rather than only on the streaming path.
+    /// Gating here rather than at each call site keeps the `fallbacks` param
+    /// and the opt-in beta header from diverging across entrypoints.
+    fn server_fallbacks_for(
+        &self,
+        model: &str,
+        thinking: Option<&NativeThinkingConfig>,
+    ) -> Option<Vec<NativeFallbackEntry>> {
+        if thinking.is_some() {
+            return None;
+        }
+        let filtered: Vec<NativeFallbackEntry> = self
+            .server_fallback_models
+            .iter()
+            .filter(|entry| !entry.trim().is_empty() && entry.as_str() != model)
+            .map(|entry| NativeFallbackEntry {
+                model: entry.clone(),
+            })
+            .collect();
+        if filtered.is_empty() {
+            None
+        } else {
+            Some(filtered)
         }
     }
 
@@ -1207,31 +1421,15 @@ impl AnthropicModelProvider {
                                     continue;
                                 }
                             }
-                        } else if std::path::Path::new(img_ref.trim()).exists() {
-                            // Local file path
-                            match std::fs::read(img_ref.trim()) {
-                                Ok(bytes) => {
-                                    let b64 =
-                                        base64::engine::general_purpose::STANDARD.encode(&bytes);
-                                    let ext = std::path::Path::new(img_ref.trim())
-                                        .extension()
-                                        .and_then(|e| e.to_str())
-                                        .unwrap_or("jpg");
-                                    let mime = match ext {
-                                        "png" => "image/png",
-                                        "gif" => "image/gif",
-                                        "webp" => "image/webp",
-                                        _ => "image/jpeg",
-                                    }
-                                    .to_string();
-                                    (mime, b64)
-                                }
-                                Err(_) => {
-                                    omitted += 1;
-                                    continue;
-                                }
-                            }
                         } else {
+                            // Counted exactly like the tool-result arm. The
+                            // multimodal normalizer is the only component that
+                            // may turn a file reference into inline image
+                            // content, and it has already run by the time a
+                            // message reaches this adapter; reading the path
+                            // here (extension-inferred MIME, no size or
+                            // content validation) would reopen the hole the
+                            // normalizer exists to close.
                             omitted += 1;
                             continue;
                         };
@@ -1739,6 +1937,26 @@ impl AnthropicModelProvider {
         }
     }
 
+    fn normalize_usage(usage: Option<&AnthropicUsage>) -> Option<TokenUsage> {
+        usage.map(|usage| {
+            let uncached = usage.input_tokens.unwrap_or(0);
+            let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
+            let cache_create = usage.cache_creation_input_tokens.unwrap_or(0);
+            let total = uncached
+                .saturating_add(cache_read)
+                .saturating_add(cache_create);
+            let any_reported = usage.input_tokens.is_some()
+                || usage.cache_read_input_tokens.is_some()
+                || usage.cache_creation_input_tokens.is_some();
+            TokenUsage {
+                input_tokens: if any_reported { Some(total) } else { None },
+                output_tokens: usage.output_tokens,
+                cached_input_tokens: usage.cache_read_input_tokens,
+                cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            }
+        })
+    }
+
     fn parse_native_response(response: NativeChatResponse) -> ProviderChatResponse {
         let stop_reason = response.stop_reason.as_deref().unwrap_or("unknown");
         let content_block_count = response.content.len();
@@ -1747,22 +1965,7 @@ impl AnthropicModelProvider {
         let mut thinking_parts = Vec::new();
         let mut tool_calls = Vec::new();
 
-        let usage = response.usage.map(|u| {
-            let uncached = u.input_tokens.unwrap_or(0);
-            let cache_read = u.cache_read_input_tokens.unwrap_or(0);
-            let cache_create = u.cache_creation_input_tokens.unwrap_or(0);
-            let total = uncached
-                .saturating_add(cache_read)
-                .saturating_add(cache_create);
-            let any_reported = u.input_tokens.is_some()
-                || u.cache_read_input_tokens.is_some()
-                || u.cache_creation_input_tokens.is_some();
-            TokenUsage {
-                input_tokens: if any_reported { Some(total) } else { None },
-                output_tokens: u.output_tokens,
-                cached_input_tokens: u.cache_read_input_tokens,
-            }
-        });
+        let usage = Self::normalize_usage(response.usage.as_ref());
 
         for block in response.content {
             let kind = block.kind;
@@ -1775,12 +1978,18 @@ impl AnthropicModelProvider {
                     }
                 }
                 "thinking" => {
-                    if let Some(thinking) = block.thinking.as_deref().or(block.text.as_deref())
-                        && !thinking.is_empty()
-                    {
+                    // Signature-only blocks (empty `thinking`, e.g. under
+                    // the `omitted` display) must reach replay too.
+                    let thinking = block
+                        .thinking
+                        .as_deref()
+                        .or(block.text.as_deref())
+                        .unwrap_or("");
+                    let signature = block.signature.as_deref().unwrap_or("");
+                    if !thinking.is_empty() || !signature.is_empty() {
                         let json_block = serde_json::json!({
                             "thinking": thinking,
-                            "signature": block.signature.as_deref().unwrap_or(""),
+                            "signature": signature,
                         });
                         thinking_parts.push(json_block.to_string());
                     }
@@ -1862,6 +2071,114 @@ impl AnthropicModelProvider {
         })
     }
 
+    /// Detect a native Anthropic safety-classifier refusal. Returns `Err` iff
+    /// the API set `stop_reason: "refusal"`, capturing the optional category
+    /// token. The category is retained for structured logs and reliability
+    /// handling but omitted from the error's `Display` output; the unstable
+    /// `explanation` is never deserialized. Must run before
+    /// `parse_native_response` so a refusal carrying partial `content` still
+    /// errors.
+    fn check_refusal(
+        response: &NativeChatResponse,
+        requested_model: &str,
+    ) -> Result<(), AnthropicRefusalError> {
+        if response.stop_reason.as_deref() != Some("refusal") {
+            return Ok(());
+        }
+        let category = response
+            .stop_details
+            .as_ref()
+            .and_then(|details| details.category.clone());
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_category(::zeroclaw_log::EventCategory::Provider)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "model": requested_model,
+                    "category": category,
+                })),
+            "anthropic_refusal: model declined request"
+        );
+        Err(AnthropicRefusalError {
+            requested_model: requested_model.to_string(),
+            category,
+            usage: Self::normalize_usage(response.usage.as_ref()).map(Box::new),
+            attempted_candidate: None,
+            attempted_candidate_index: None,
+        })
+    }
+
+    /// Detect a server-side fallback: Anthropic declined the requested model
+    /// and served the turn with one of the opt-in `fallbacks` targets. Must run
+    /// AFTER `check_refusal` passes (a whole-chain refusal is a refusal, not a
+    /// fallback success) and BEFORE `parse_native_response` consumes the
+    /// response.
+    ///
+    /// Detection keys only on `usage.iterations` (a `fallback_message` attempt
+    /// ran) plus the top-level `model` (who actually served) — never on the
+    /// `fallback` content block, which sticky-routed turns omit. Returns one
+    /// `ServerSide` notice only when the served model is present AND
+    /// differs from the requested one, so a notice never names the requested
+    /// model as its own rescue. The notice's `category` is always `None`: the
+    /// serving response carries no refusal category.
+    fn server_fallback_notice(
+        response: &NativeChatResponse,
+        requested_model: &str,
+    ) -> Option<SafeguardFallbackNotice> {
+        let fallback_ran = response
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.iterations.as_ref())
+            .is_some_and(|iterations| {
+                iterations
+                    .iter()
+                    .any(|iteration| iteration.kind.as_deref() == Some("fallback_message"))
+            });
+        if !fallback_ran {
+            return None;
+        }
+
+        match response.model.as_deref() {
+            Some(served) if served != requested_model => {
+                let notice = SafeguardFallbackNotice {
+                    kind: SafeguardFallbackKind::ServerSide,
+                    requested_model: requested_model.to_string(),
+                    served_model: served.to_string(),
+                    category: None,
+                };
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Provider)
+                        .with_attrs(::serde_json::json!({
+                            "requested_model": requested_model,
+                            "served_model": served,
+                        })),
+                    "anthropic server-side fallback: turn served by a fallback model"
+                );
+                Some(notice)
+            }
+            _ => {
+                // A fallback attempt ran but the served model is absent or
+                // self-referential (== requested). Record no notice — it would
+                // name the requested model as its own rescue — but still log so
+                // ops see that a fallback ran.
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Provider)
+                        .with_attrs(::serde_json::json!({
+                            "requested_model": requested_model,
+                            "served_model": response.model,
+                        })),
+                    "anthropic server-side fallback ran but served model is absent or self-referential"
+                );
+                None
+            }
+        }
+    }
+
     /// Resolve thinking parameters for an API request. Returns the effective
     /// temperature (forced to 1.0 when thinking is active), the thinking
     /// config for the request body, and the effective max_tokens (raised to
@@ -1873,37 +2190,44 @@ impl AnthropicModelProvider {
         model: &str,
     ) -> (Option<f64>, Option<NativeThinkingConfig>, u32) {
         match thinking {
-            Some(params) if anthropic_model_supports_native_thinking(model) => {
+            Some(params) => {
+                let style = anthropic_thinking_style(model);
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"budget_tokens": params.budget_tokens})),
+                        .with_attrs(::serde_json::json!({
+                            "model": model,
+                            "style": match style {
+                                AnthropicThinkingStyle::Budget => "enabled",
+                                AnthropicThinkingStyle::Adaptive => "adaptive",
+                            },
+                        })),
                     "Native extended thinking enabled; forcing temperature=1.0"
                 );
-                // API requires max_tokens > budget_tokens (strictly greater).
-                let min_required = params.budget_tokens + 1;
-                let max_tokens = self.max_tokens.max(min_required);
-                (
-                    Some(1.0),
-                    Some(NativeThinkingConfig {
-                        kind: "enabled",
-                        budget_tokens: params.budget_tokens,
-                    }),
-                    max_tokens,
-                )
-            }
-            Some(_) => {
-                // Caller asked for native thinking but the model rejects the
-                // fixed-budget request shape. Drop to prompt-based reasoning
-                // (the agent loop's prefix already injected) and keep the
-                // caller-supplied temperature so per-model guards still apply.
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"model": model})),
-                    "Native extended thinking requested but model only supports adaptive thinking; falling back to prompt-based reasoning"
-                );
-                (temperature, None, self.max_tokens)
+                // Thinking mode requires temperature 1.0 regardless of style.
+                let (config, max_tokens) = match style {
+                    AnthropicThinkingStyle::Budget => {
+                        // API requires max_tokens > budget_tokens (strictly greater).
+                        let min_required = params.budget_tokens + 1;
+                        (
+                            NativeThinkingConfig {
+                                kind: "enabled",
+                                budget_tokens: Some(params.budget_tokens),
+                                display: params.display,
+                            },
+                            self.max_tokens.max(min_required),
+                        )
+                    }
+                    AnthropicThinkingStyle::Adaptive => (
+                        NativeThinkingConfig {
+                            kind: "adaptive",
+                            budget_tokens: None,
+                            display: params.display,
+                        },
+                        self.max_tokens,
+                    ),
+                };
+                (Some(1.0), Some(config), max_tokens)
             }
             None => (temperature, None, self.max_tokens),
         }
@@ -1943,6 +2267,7 @@ impl AnthropicModelProvider {
     async fn parse_anthropic_sse(
         response: reqwest::Response,
         tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+        requested_model: &str,
     ) {
         use tokio_util::io::StreamReader;
 
@@ -1950,7 +2275,7 @@ impl AnthropicModelProvider {
             .bytes_stream()
             .map(|result| result.map_err(std::io::Error::other));
         let reader = StreamReader::new(byte_stream);
-        Self::parse_anthropic_sse_from_reader(reader, tx).await;
+        Self::parse_anthropic_sse_from_reader(reader, tx, requested_model).await;
     }
 
     /// Inner loop split out of `parse_anthropic_sse` so unit tests can feed a
@@ -1958,6 +2283,7 @@ impl AnthropicModelProvider {
     async fn parse_anthropic_sse_from_reader<R>(
         reader: R,
         tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+        requested_model: &str,
     ) where
         R: tokio::io::AsyncBufRead + Unpin,
     {
@@ -1968,6 +2294,16 @@ impl AnthropicModelProvider {
         let mut tool_id: Option<String> = None;
         let mut tool_name: Option<String> = None;
         let mut tool_input_json = String::new();
+
+        // Extended-thinking block accumulation. Thinking deltas and their
+        // signatures arrive separately (`thinking_delta` / `signature_delta`)
+        // and are assembled into one JSON object per block at
+        // `content_block_stop`, matching the non-streaming `reasoning_content`
+        // shape exactly (newline-joined `{"thinking":..,"signature":..}`).
+        let mut thinking_text = String::new();
+        let mut thinking_signature = String::new();
+        let mut thinking_block_active = false;
+        let mut reasoning_block_emitted = false;
 
         let mut input_tokens: Option<u64> = None;
         let mut output_tokens: Option<u64> = None;
@@ -2058,6 +2394,24 @@ impl AnthropicModelProvider {
                                 .entry(block_type.to_string())
                                 .or_default() += 1;
                         }
+                        // Defensive flush: a block start without a prior stop
+                        // means the previous thinking block never closed.
+                        if !flush_streaming_thinking_block(
+                            &mut thinking_text,
+                            &mut thinking_signature,
+                            &mut thinking_block_active,
+                            &mut reasoning_block_emitted,
+                            tx,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        if block_type == "thinking" {
+                            thinking_block_active = true;
+                            thinking_text.clear();
+                            thinking_signature.clear();
+                        }
                         if block_type == "tool_use" {
                             if let Some(id) = tool_id.take() {
                                 let name = tool_name.take().unwrap_or_default();
@@ -2110,14 +2464,44 @@ impl AnthropicModelProvider {
                                     tool_input_json.push_str(json);
                                 }
                             }
-                            // TODO: handle "thinking_delta" events for streaming
-                            // extended thinking content. Currently thinking blocks
-                            // are only captured in non-streaming parse_native_response().
+                            "thinking_delta" => {
+                                if let Some(text) = delta.get("thinking").and_then(|t| t.as_str()) {
+                                    // Transient, human-readable progress: goes
+                                    // to the UI immediately, never persisted.
+                                    if !text.is_empty()
+                                        && tx
+                                            .send(Ok(StreamEvent::ThinkingDelta(text.to_string())))
+                                            .await
+                                            .is_err()
+                                    {
+                                        return;
+                                    }
+                                    thinking_text.push_str(text);
+                                }
+                            }
+                            "signature_delta" => {
+                                if let Some(signature) =
+                                    delta.get("signature").and_then(|s| s.as_str())
+                                {
+                                    thinking_signature.push_str(signature);
+                                }
+                            }
                             _ => {}
                         }
                     }
                 }
                 "content_block_stop" => {
+                    if !flush_streaming_thinking_block(
+                        &mut thinking_text,
+                        &mut thinking_signature,
+                        &mut thinking_block_active,
+                        &mut reasoning_block_emitted,
+                        tx,
+                    )
+                    .await
+                    {
+                        return;
+                    }
                     if let Some(id) = tool_id.take() {
                         let name = tool_name.take().unwrap_or_default();
                         let input = std::mem::take(&mut tool_input_json);
@@ -2149,6 +2533,48 @@ impl AnthropicModelProvider {
                     if let Some(v) = observed_output {
                         output_tokens = Some(v);
                     }
+                    if stop_reason == "refusal" {
+                        // Carry billed partial tokens on the typed cause. The
+                        // recovery owner accounts them once and can skip the
+                        // already-refused candidate instead of replaying it.
+                        let usage = if input_tokens.is_some()
+                            || output_tokens.is_some()
+                            || cached_input_tokens.is_some()
+                            || cache_creation_input_tokens.is_some()
+                        {
+                            let uncached = input_tokens.unwrap_or(0);
+                            let cache_read = cached_input_tokens.unwrap_or(0);
+                            let cache_create = cache_creation_input_tokens.unwrap_or(0);
+                            let normalized_input = Some(
+                                uncached
+                                    .saturating_add(cache_read)
+                                    .saturating_add(cache_create),
+                            );
+                            Some(TokenUsage {
+                                input_tokens: normalized_input,
+                                output_tokens,
+                                cached_input_tokens,
+                                cache_creation_input_tokens,
+                            })
+                        } else {
+                            None
+                        };
+                        if let Some(usage) = usage.clone() {
+                            let _ = tx.send(Ok(StreamEvent::Usage(usage))).await;
+                        }
+                        let _ = tx
+                            .send(Err(StreamError::ModelRefusal(Box::new(
+                                AnthropicRefusalError {
+                                    requested_model: requested_model.to_string(),
+                                    category: None,
+                                    usage: usage.map(Box::new),
+                                    attempted_candidate: None,
+                                    attempted_candidate_index: None,
+                                },
+                            ))))
+                            .await;
+                        return;
+                    }
                     if stop_reason == "max_tokens" {
                         ::zeroclaw_log::record!(
                             WARN,
@@ -2165,6 +2591,20 @@ impl AnthropicModelProvider {
                     }
                 }
                 "message_stop" => {
+                    // A thinking block still active at message_stop never got
+                    // its content_block_stop; flush it rather than silently
+                    // dropping the accumulated reasoning.
+                    if !flush_streaming_thinking_block(
+                        &mut thinking_text,
+                        &mut thinking_signature,
+                        &mut thinking_block_active,
+                        &mut reasoning_block_emitted,
+                        tx,
+                    )
+                    .await
+                    {
+                        return;
+                    }
                     if collect_debug_metadata {
                         ::zeroclaw_log::record!(
                             DEBUG,
@@ -2198,6 +2638,7 @@ impl AnthropicModelProvider {
                                 input_tokens: normalized_input,
                                 output_tokens,
                                 cached_input_tokens,
+                                cache_creation_input_tokens,
                             })))
                             .await;
                     }
@@ -2240,6 +2681,7 @@ impl ModelProvider for AnthropicModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        commit_safeguard_fallback(None);
         let credential = self.credential.as_ref().ok_or_else(|| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -2266,6 +2708,14 @@ impl ModelProvider for AnthropicModelProvider {
                 .with_attrs(::serde_json::json!({"max_tokens": self.max_tokens, "model": model})),
             "API request"
         );
+        // Non-streaming: opt into server-side fallback when configured.
+        // This entrypoint never enables native thinking, so nothing to gate.
+        let fallbacks = self.server_fallbacks_for(model, None);
+        let extra_betas: &[&str] = if fallbacks.is_some() {
+            &[ANTHROPIC_SERVER_FALLBACK_BETA]
+        } else {
+            &[]
+        };
         let request = NativeChatRequest {
             model: model.to_string(),
             max_tokens: self.max_tokens,
@@ -2282,6 +2732,7 @@ impl ModelProvider for AnthropicModelProvider {
             tool_choice: None,
             stream: None,
             thinking: None,
+            fallbacks,
         };
 
         let mut request = self
@@ -2291,7 +2742,7 @@ impl ModelProvider for AnthropicModelProvider {
             .header("content-type", "application/json")
             .json(&request);
 
-        request = self.apply_auth(request, credential);
+        request = self.apply_auth(request, credential, false, extra_betas);
 
         let response = request.send().await?;
 
@@ -2300,8 +2751,15 @@ impl ModelProvider for AnthropicModelProvider {
         }
 
         let chat_response: NativeChatResponse = response.json().await?;
+        commit_safeguard_fallback(None);
+        Self::check_refusal(&chat_response, model)?;
+        let safeguard_notice = Self::server_fallback_notice(&chat_response, model);
         let parsed = Self::parse_native_response(chat_response);
-        Self::require_terminal_text(parsed)
+        let result = Self::require_terminal_text(parsed);
+        if result.is_ok() {
+            commit_safeguard_fallback(safeguard_notice);
+        }
+        result
     }
 
     async fn chat(
@@ -2310,6 +2768,11 @@ impl ModelProvider for AnthropicModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        commit_safeguard_fallback(None);
+        if let Some(refusal) = crate::reliable::take_stream_refusal_recovery() {
+            crate::dispatch::accounting::suppress_current_attempt();
+            return Err(anyhow::Error::new(refusal));
+        }
         let credential = self.credential.as_ref().ok_or_else(|| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -2353,6 +2816,9 @@ impl ModelProvider for AnthropicModelProvider {
 
         let (effective_temperature, thinking_config, effective_max_tokens) =
             self.resolve_thinking(request.thinking, temperature, model);
+        let thinking_display_beta = thinking_config
+            .as_ref()
+            .is_some_and(|config| config.display.is_some());
 
         if ::zeroclaw_log::debug_enabled() {
             ::zeroclaw_log::record!(
@@ -2372,6 +2838,14 @@ impl ModelProvider for AnthropicModelProvider {
                 "anthropic provider request prepared"
             );
         }
+        // Non-streaming: opt into server-side fallback when configured, unless
+        // native thinking is active on this request.
+        let fallbacks = self.server_fallbacks_for(model, thinking_config.as_ref());
+        let extra_betas: &[&str] = if fallbacks.is_some() {
+            &[ANTHROPIC_SERVER_FALLBACK_BETA]
+        } else {
+            &[]
+        };
         let native_request = NativeChatRequest {
             model: model.to_string(),
             max_tokens: effective_max_tokens,
@@ -2382,6 +2856,7 @@ impl ModelProvider for AnthropicModelProvider {
             tool_choice,
             stream: None,
             thinking: thinking_config,
+            fallbacks,
         };
 
         let req = self
@@ -2391,13 +2866,23 @@ impl ModelProvider for AnthropicModelProvider {
             .header("content-type", "application/json")
             .json(&native_request);
 
-        let response = self.apply_auth(req, credential).send().await?;
+        let response = self
+            .apply_auth(req, credential, thinking_display_beta, extra_betas)
+            .send()
+            .await?;
         if !response.status().is_success() {
             return Err(super::api_error("Anthropic", response).await);
         }
 
         let native_response: NativeChatResponse = response.json().await?;
-        Ok(Self::parse_native_response(native_response))
+        commit_safeguard_fallback(None);
+        Self::check_refusal(&native_response, model)?;
+        let safeguard_notice = Self::server_fallback_notice(&native_response, model);
+        let parsed = Self::parse_native_response(native_response);
+        if !parsed.is_semantically_empty_terminal() {
+            commit_safeguard_fallback(safeguard_notice);
+        }
+        Ok(parsed)
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -2475,7 +2960,7 @@ impl ModelProvider for AnthropicModelProvider {
                 .http_client()
                 .post(format!("{}/v1/messages", self.base_url))
                 .header("anthropic-version", "2023-06-01");
-            request = self.apply_auth(request, credential);
+            request = self.apply_auth(request, credential, false, &[]);
             // Send a minimal request; the goal is TLS + HTTP/2 setup, not a valid response.
             // Anthropic has no lightweight GET endpoint, so we accept any non-network error.
             let _ = request.send().await?;
@@ -2504,6 +2989,7 @@ impl ModelProvider for AnthropicModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        commit_safeguard_fallback(None);
         if !options.enabled {
             return stream::once(async { Ok(StreamEvent::Final) }).boxed();
         }
@@ -2546,8 +3032,11 @@ impl ModelProvider for AnthropicModelProvider {
 
         let (effective_temperature, thinking_config, effective_max_tokens) =
             self.resolve_thinking(request.thinking, temperature, model);
+        let thinking_display_beta = thinking_config
+            .as_ref()
+            .is_some_and(|config| config.display.is_some());
 
-        if thinking_config.is_some() {
+        if thinking_config.is_some() && !thinking_display_beta {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -2560,7 +3049,7 @@ impl ModelProvider for AnthropicModelProvider {
                         "tools_count": tools_count,
                         "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
                     })),
-                "native thinking enabled; using non-streaming fallback to preserve signed thinking blocks"
+                "native thinking without display beta; using non-streaming fallback to preserve signed thinking blocks"
             );
             let native_request = NativeChatRequest {
                 model: model.to_string(),
@@ -2572,6 +3061,9 @@ impl ModelProvider for AnthropicModelProvider {
                 tool_choice,
                 stream: None,
                 thinking: thinking_config,
+                // Streaming path (incl. this thinking `stream: None` request):
+                // never opts into server-side fallback.
+                fallbacks: None,
             };
             // Serialize eagerly so the request body is owned and `'static`
             // across the async boundary.
@@ -2580,6 +3072,9 @@ impl ModelProvider for AnthropicModelProvider {
             let client = self.http_client();
             let url = format!("{}/v1/messages", self.base_url);
             let is_oauth = Self::is_setup_token(&credential);
+            // Owned copy of the requested model moved into the `'static` block
+            // so a refusal can name it without borrowing `model`.
+            let requested_model = model.to_string();
 
             return stream::once(async move {
                 let mut req = client
@@ -2590,13 +3085,14 @@ impl ModelProvider for AnthropicModelProvider {
                 if is_oauth {
                     req = req
                         .header("Authorization", format!("Bearer {credential}"))
-                        .header(
-                            "anthropic-beta",
-                            "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14",
-                        )
                         .header("anthropic-dangerous-direct-browser-access", "true");
                 } else {
                     req = req.header("x-api-key", &credential);
+                }
+                if let Some(beta_features) =
+                    anthropic_beta_features(is_oauth, thinking_display_beta, &[])
+                {
+                    req = req.header("anthropic-beta", beta_features);
                 }
                 let response = req
                     .send()
@@ -2614,18 +3110,32 @@ impl ModelProvider for AnthropicModelProvider {
                     .json()
                     .await
                     .map_err(|e| StreamError::ModelProvider(format!("response decode: {e}")))?;
-                Ok(Self::parse_native_response(parsed))
+                commit_safeguard_fallback(None);
+                Self::check_refusal(&parsed, &requested_model)
+                    .map_err(|refusal| StreamError::ModelRefusal(Box::new(refusal)))?;
+                let safeguard_notice = Self::server_fallback_notice(&parsed, &requested_model);
+                let response = Self::parse_native_response(parsed);
+                if !response.is_semantically_empty_terminal() {
+                    commit_safeguard_fallback(safeguard_notice);
+                }
+                Ok(response)
             })
             .flat_map(|result| match result {
                 Ok(resp) => {
                     let mut events: Vec<StreamResult<StreamEvent>> = Vec::new();
                     if let Some(rc) = resp.reasoning_content {
-                        events.push(Ok(StreamEvent::TextDelta(StreamChunk {
-                            delta: String::new(),
-                            reasoning: Some(rc),
-                            is_final: false,
-                            token_count: 0,
-                        })));
+                        // Readable thinking progress (transient): the raw
+                        // text without the signed JSON envelope. Visible
+                        // thinking must never carry the signature payload.
+                        for part in rc.split('\n') {
+                            if let Ok(block) = serde_json::from_str::<serde_json::Value>(part)
+                                && let Some(text) = block.get("thinking").and_then(|t| t.as_str())
+                                && !text.is_empty()
+                            {
+                                events.push(Ok(StreamEvent::ThinkingDelta(text.to_string())));
+                            }
+                        }
+                        events.push(Ok(StreamEvent::ReasoningFinalized(rc)));
                     }
                     if let Some(text) = resp.text.filter(|t| !t.is_empty()) {
                         events.push(Ok(StreamEvent::TextDelta(StreamChunk::delta(text))));
@@ -2657,7 +3167,8 @@ impl ModelProvider for AnthropicModelProvider {
                         "max_tokens": effective_max_tokens,
                         "tools_count": tools_count,
                         "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
-                        "thinking_enabled": false,
+                        "thinking_enabled": thinking_config.is_some(),
+                        "thinking_display_beta": thinking_display_beta,
                     })),
                 "anthropic streaming provider request prepared"
             );
@@ -2672,6 +3183,8 @@ impl ModelProvider for AnthropicModelProvider {
             tool_choice,
             stream: Some(true),
             thinking: thinking_config,
+            // Streaming never opts into server-side fallback.
+            fallbacks: None,
         };
 
         let body = match Self::build_streaming_request(&native_request) {
@@ -2694,6 +3207,7 @@ impl ModelProvider for AnthropicModelProvider {
         let url = format!("{}/v1/messages", self.base_url);
         let is_oauth = Self::is_setup_token(&credential);
         let phase_timeout = std::time::Duration::from_secs(self.timeout_secs);
+        let requested_model = model.to_string();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
 
@@ -2718,13 +3232,14 @@ impl ModelProvider for AnthropicModelProvider {
             if is_oauth {
                 req = req
                     .header("Authorization", format!("Bearer {credential}"))
-                    .header(
-                        "anthropic-beta",
-                        "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14",
-                    )
                     .header("anthropic-dangerous-direct-browser-access", "true");
             } else {
                 req = req.header("x-api-key", &credential);
+            }
+            if let Some(beta_features) =
+                anthropic_beta_features(is_oauth, thinking_display_beta, &[])
+            {
+                req = req.header("anthropic-beta", beta_features);
             }
 
             let response = match tokio::time::timeout(phase_timeout, req.send()).await {
@@ -2764,7 +3279,7 @@ impl ModelProvider for AnthropicModelProvider {
                 return;
             }
 
-            Self::parse_anthropic_sse(response, &tx).await;
+            Self::parse_anthropic_sse(response, &tx, &requested_model).await;
         });
 
         // The guard travels inside the unfold state so it is dropped at the
@@ -2796,6 +3311,7 @@ impl ::zeroclaw_api::attribution::Attributable for AnthropicModelProvider {
 mod tests {
     use super::*;
     use crate::auth::anthropic_token::{AnthropicAuthKind, detect_auth_kind};
+    use crate::safeguard_notice::{scope_safeguard_fallback, take_last_safeguard_fallback};
 
     /// Canonical base64 for a 1x1 PNG: 68 characters, a multiple of four,
     /// standard alphabet, no padding. Anything shorter that merely looks like a
@@ -3077,7 +3593,8 @@ data: {\"type\":\"message_stop\"}\n\n"
         let bytes = fake_anthropic_sse();
         let reader = tokio::io::BufReader::new(Cursor::new(bytes));
         let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
-        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, "claude-sonnet-4-6")
+            .await;
 
         let mut events = Vec::new();
         while let Ok(Some(ev)) =
@@ -3090,6 +3607,8 @@ data: {\"type\":\"message_stop\"}\n\n"
             .iter()
             .map(|e| match e.as_ref() {
                 Ok(StreamEvent::TextDelta(_)) => "text",
+                Ok(StreamEvent::ThinkingDelta(_)) => "thinking",
+                Ok(StreamEvent::ReasoningFinalized(_)) => "reasoning_final",
                 Ok(StreamEvent::ToolCall(_)) => "tool_call",
                 Ok(StreamEvent::PreExecutedToolCall { .. }) => "pre_tool_call",
                 Ok(StreamEvent::PreExecutedToolResult { .. }) => "pre_tool_result",
@@ -3193,7 +3712,12 @@ data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"
         let (tx, _rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
 
         let handle = ::zeroclaw_spawn::spawn!(async move {
-            AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+            AnthropicModelProvider::parse_anthropic_sse_from_reader(
+                reader,
+                &tx,
+                "claude-sonnet-4-6",
+            )
+            .await;
         });
         let probe = handle.abort_handle();
         let guard = AbortOnDrop::new(handle.abort_handle());
@@ -3301,7 +3825,8 @@ event: message_delta\n\
 data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n";
         let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
         let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
-        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, "claude-sonnet-4-6")
+            .await;
 
         let mut saw_final = false;
         let mut last_err = None;
@@ -3339,7 +3864,8 @@ event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n\n";
         let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
         let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
-        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, "claude-sonnet-4-6")
+            .await;
 
         let mut saw_usage = false;
         while let Ok(Some(ev)) =
@@ -3487,6 +4013,8 @@ data: {\"type\":\"message_stop\"}\n\n";
                     .http_client()
                     .get("https://api.anthropic.com/v1/models"),
                 "sk-ant-oat01-test-token",
+                false,
+                &[],
             )
             .build()
             .expect("request should build");
@@ -3524,6 +4052,8 @@ data: {\"type\":\"message_stop\"}\n\n";
                     .http_client()
                     .get("https://api.anthropic.com/v1/models"),
                 "sk-ant-api-key",
+                false,
+                &[],
             )
             .build()
             .expect("request should build");
@@ -3558,6 +4088,8 @@ data: {\"type\":\"message_stop\"}\n\n";
                         .http_client()
                         .get("https://api.anthropic.com/v1/models"),
                     credential,
+                    false,
+                    &[],
                 )
                 .build()
                 .expect("request should build");
@@ -3725,40 +4257,77 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
-    fn anthropic_model_supports_native_thinking_excludes_opus_4_7() {
+    fn anthropic_thinking_style_matrix() {
+        // Adaptive-only families: fixed-budget `enabled` returns 400.
+        assert_eq!(
+            anthropic_thinking_style("claude-opus-4-7"),
+            AnthropicThinkingStyle::Adaptive
+        );
+        assert_eq!(
+            anthropic_thinking_style("claude-opus-4-7-20260101"),
+            AnthropicThinkingStyle::Adaptive
+        );
+        assert_eq!(
+            anthropic_thinking_style("claude-fable-5-1"),
+            AnthropicThinkingStyle::Adaptive
+        );
+        assert_eq!(
+            anthropic_thinking_style("claude-fable-5-1-20260815"),
+            AnthropicThinkingStyle::Adaptive
+        );
+        // Budget-based families keep the `enabled` shape.
+        assert_eq!(
+            anthropic_thinking_style("claude-opus-4-6"),
+            AnthropicThinkingStyle::Budget
+        );
+        assert_eq!(
+            anthropic_thinking_style("claude-sonnet-4-6"),
+            AnthropicThinkingStyle::Budget
+        );
+        assert_eq!(
+            anthropic_thinking_style("claude-haiku-4-5"),
+            AnthropicThinkingStyle::Budget
+        );
+    }
+
+    #[test]
+    fn resolve_thinking_uses_adaptive_for_opus_4_7() {
         // Opus 4.7 only supports adaptive thinking; fixed-budget returns 400.
-        assert!(!anthropic_model_supports_native_thinking("claude-opus-4-7"));
-        assert!(!anthropic_model_supports_native_thinking(
-            "claude-opus-4-7-20260101"
-        ));
-    }
-
-    #[test]
-    fn anthropic_model_supports_native_thinking_allows_other_models() {
-        assert!(anthropic_model_supports_native_thinking("claude-opus-4-6"));
-        assert!(anthropic_model_supports_native_thinking(
-            "claude-sonnet-4-6"
-        ));
-        assert!(anthropic_model_supports_native_thinking("claude-haiku-4-5"));
-    }
-
-    #[test]
-    fn resolve_thinking_drops_native_for_opus_4_7() {
+        // Native thinking is now sent in adaptive form instead of being
+        // dropped to prompt-based reasoning.
         let provider = AnthropicModelProvider::builder("test")
             .credential(Some("test-key"))
             .build();
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
             budget_tokens: 10_000,
+            display: None,
         };
         let (temp, config, max_tokens) =
             provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-opus-4-7");
-        assert!(
-            config.is_none(),
-            "native thinking should be gated off for opus-4-7"
-        );
-        // Caller-supplied temperature is preserved (so per-model omit guard
-        // can still take effect downstream).
-        assert!((temp.unwrap() - 0.7_f64).abs() < f64::EPSILON);
+        let config = config.expect("adaptive thinking config for opus-4-7");
+        assert_eq!(config.kind, "adaptive");
+        assert_eq!(config.budget_tokens, None);
+        assert_eq!(config.display, None);
+        assert_eq!(temp, Some(1.0));
+        assert_eq!(max_tokens, provider.max_tokens);
+    }
+
+    #[test]
+    fn resolve_thinking_uses_adaptive_for_fable_5_1_and_propagates_display() {
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 10_000,
+            display: Some(ThinkingDisplay::Updates),
+        };
+        let (temp, config, max_tokens) =
+            provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-fable-5-1-20260815");
+        let config = config.expect("adaptive thinking config for fable-5-1");
+        assert_eq!(config.kind, "adaptive");
+        assert_eq!(config.budget_tokens, None);
+        assert_eq!(config.display, Some(ThinkingDisplay::Updates));
+        assert_eq!(temp, Some(1.0));
         assert_eq!(max_tokens, provider.max_tokens);
     }
 
@@ -3769,6 +4338,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             .build();
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
             budget_tokens: 10_000,
+            display: None,
         };
         let (temp, config, _) =
             provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-sonnet-4-6");
@@ -3792,6 +4362,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             tool_choice: None,
             stream: None,
             thinking: None,
+            fallbacks: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("max_tokens"));
@@ -3813,6 +4384,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             tool_choice: None,
             stream: None,
             thinking: None,
+            fallbacks: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(
@@ -4293,6 +4865,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             tool_choice: None,
             stream: None,
             thinking: None,
+            fallbacks: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -4321,6 +4894,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             tool_choice: None,
             stream: None,
             thinking: None,
+            fallbacks: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -4406,14 +4980,12 @@ data: {\"type\":\"message_stop\"}\n\n";
         });
 
         // Create model_provider pointing at mock server
-        let model_provider = AnthropicModelProvider {
-            alias: "test".to_string(),
-            credential: Some("test-key".to_string()),
-            base_url: format!("http://{addr}"),
-            max_tokens: 4096,
-            timeout_secs: 120,
-            schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
-        };
+        let model_provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .base_url(&format!("http://{addr}"))
+            .max_tokens(4096)
+            .timeout_secs(120)
+            .build();
 
         // Multi-turn conversation: system → user (Go code) → assistant (code response) → user (follow-up)
         let messages = vec![
@@ -4615,7 +5187,9 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
-    fn native_response_drops_empty_thinking_blocks() {
+    fn native_response_keeps_signature_only_blocks() {
+        // `omitted` display yields empty `thinking` with a required
+        // signature; dropping the block would break tool-use replay.
         let json = r#"{
             "content": [
                 {"type": "thinking", "thinking": "", "signature": "sig_xyz"},
@@ -4624,7 +5198,13 @@ data: {\"type\":\"message_stop\"}\n\n";
         }"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let result = AnthropicModelProvider::parse_native_response(resp);
-        assert!(result.reasoning_content.is_none());
+        let reasoning = result
+            .reasoning_content
+            .expect("signature-only block must reach replay");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&reasoning).expect("replay line must be a JSON object");
+        assert_eq!(parsed["thinking"], "");
+        assert_eq!(parsed["signature"], "sig_xyz");
     }
 
     #[test]
@@ -5196,14 +5776,12 @@ data: {\"type\":\"message_stop\"}\n\n";
             axum::serve(listener, app).await.expect("serve");
         });
 
-        let model_provider = AnthropicModelProvider {
-            alias: "test".to_string(),
-            credential: Some("test-key".to_string()),
-            base_url: format!("http://{addr}"),
-            max_tokens: 4096,
-            timeout_secs: 120,
-            schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
-        };
+        let model_provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .base_url(&format!("http://{addr}"))
+            .max_tokens(4096)
+            .timeout_secs(120)
+            .build();
 
         let messages = history_with_tool_result(&format!(
             "saved screenshot [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
@@ -7270,6 +7848,50 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert!(has_image, "user-message images must still be delivered");
     }
 
+    /// A user-message image marker pointing at a real file on disk must not
+    /// be read: the reference is counted as omitted exactly like the
+    /// tool-result arm, no `Image` block is built, and the omission note says
+    /// so. The file carries a genuine PNG signature, so under the old
+    /// raw-path branch this exact input was read from disk and forwarded with
+    /// an extension-inferred MIME type and no size or content validation; the
+    /// note's count of one is the proof no read happened.
+    #[test]
+    fn user_message_path_image_marker_is_omitted_not_read() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let image_path = temp.path().join("photo.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .expect("write png");
+
+        let messages = vec![ChatMessage::user(format!(
+            "what is this [IMAGE:{}]",
+            image_path.display()
+        ))];
+
+        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let blocks = last_user_blocks(&native_msgs);
+
+        assert!(
+            !blocks.iter().any(|block| block["type"] == "image"),
+            "a filesystem path must not become an image block: {blocks:?}"
+        );
+        let text = blocks
+            .iter()
+            .find(|block| block["type"] == "text")
+            .and_then(|block| block["text"].as_str())
+            .unwrap_or_else(|| panic!("expected a text block: {blocks:?}"));
+        assert!(
+            text.contains(OMISSION_NOTE_ONE),
+            "the dropped path must be surfaced as an omission note: {text}"
+        );
+        assert!(
+            !text.contains(&image_path.display().to_string()),
+            "the raw path must not reach the wire as text either: {text}"
+        );
+    }
+
     /// The wire-shape pin for the two-shape content: an image-free tool result
     /// must still serialize `content` as a bare JSON string, byte-identically
     /// to before nested blocks existed.
@@ -7326,5 +7948,1722 @@ data: {\"type\":\"message_stop\"}\n\n";
             !tool_result.to_string().contains("image(s) omitted"),
             "a placeholder is prose and must not be counted: {tool_result}"
         );
+    }
+    // ----- Native Anthropic refusal detection (§1) ---------------------
+
+    /// Spin up a mock `/v1/messages` server that always answers with `body`.
+    async fn spawn_messages_server(
+        body: serde_json::Value,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use axum::{Json, Router, routing::post};
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move |Json(_req): Json<serde_json::Value>| {
+                let body = body.clone();
+                async move { Json(body) }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (addr, handle)
+    }
+
+    /// Spin up a mock `/v1/messages` server that streams raw SSE events.
+    async fn spawn_messages_sse_server(
+        body: &'static str,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use axum::{Router, http::header, response::Response, routing::post};
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move || async move {
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(axum::body::Body::from(body))
+                    .unwrap()
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (addr, handle)
+    }
+
+    /// Guard against the `E0063` drift class that took this crate's entire
+    /// lib-test target down (CI `Lint` + `Test` + `CI Required Gate` all red
+    /// at head `59273cd1`): a `#[cfg(test)]` struct literal of
+    /// `AnthropicModelProvider` names every field explicitly, so adding a
+    /// private field to the struct — as the tool-schema memoization work did
+    /// with `schema_cache` — is a hard compile break in test-only code that
+    /// `cargo build` cannot see.
+    ///
+    /// A runtime assertion cannot catch a compile error, so this inspects the
+    /// source instead: no test-module code may hand-roll the provider. The
+    /// builder supplies every optional field, so `builder(..).build()` is
+    /// immune to future field additions.
+    #[test]
+    fn test_module_never_hand_rolls_provider_struct_literal() {
+        // Assembled at runtime so this test's own source cannot match it.
+        let needle = format!("{}{}", "AnthropicModelProvider", " {");
+        let source = include_str!("anthropic.rs");
+
+        let tests_start = source
+            .find("\nmod tests {")
+            .expect("anthropic.rs must have a `mod tests` block");
+
+        let offenders: Vec<usize> = source[tests_start..]
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let trimmed = line.trim_start();
+                trimmed.contains(&needle)
+                    && !trimmed.starts_with("///")
+                    && !trimmed.starts_with("//")
+                    // `fn f() -> AnthropicModelProvider {` and `impl … {` open
+                    // a block, they do not construct anything.
+                    && !trimmed.contains("->")
+                    && !trimmed.starts_with("impl")
+            })
+            .map(|(idx, _)| source[..tests_start].lines().count() + idx)
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "test code must construct the provider via \
+             `AnthropicModelProvider::builder(..).build()`, not a struct \
+             literal — a literal names every field and breaks to compile \
+             (E0063) the moment a private field is added. Offending \
+             anthropic.rs line(s): {offenders:?}"
+        );
+    }
+
+    fn refusal_test_provider(addr: std::net::SocketAddr) -> AnthropicModelProvider {
+        AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .base_url(&format!("http://{addr}"))
+            .max_tokens(4096)
+            .timeout_secs(120)
+            .build()
+    }
+
+    /// Shared slot the capturing mock server writes the first request's
+    /// headers and JSON body into.
+    type CapturedRequest =
+        std::sync::Arc<std::sync::Mutex<Option<(axum::http::HeaderMap, serde_json::Value)>>>;
+
+    /// Spawn a mock `/v1/messages` server that captures BOTH the request
+    /// headers and JSON body of the request it receives, returning a minimal
+    /// valid Anthropic response so non-streaming calls succeed.
+    async fn spawn_capturing_server() -> (
+        std::net::SocketAddr,
+        CapturedRequest,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{Json, Router, http::HeaderMap, routing::post};
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let captured: Arc<Mutex<Option<(HeaderMap, serde_json::Value)>>> =
+            Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+        let app = Router::new().route(
+            "/v1/messages",
+            // `HeaderMap` (FromRequestParts) must precede the body-consuming
+            // `Json` extractor.
+            post(
+                move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+                    let cap = captured_clone.clone();
+                    async move {
+                        *cap.lock().unwrap() = Some((headers, body));
+                        Json(serde_json::json!({
+                            "id": "msg_test",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "ok"}],
+                            "model": "claude-opus-4-8",
+                            "stop_reason": "end_turn",
+                            "usage": {"input_tokens": 1, "output_tokens": 1}
+                        }))
+                    }
+                },
+            ),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (addr, captured, handle)
+    }
+
+    /// True when any `anthropic-beta` header line carries the server-side
+    /// fallback opt-in beta.
+    fn carries_server_fallback_beta(headers: &axum::http::HeaderMap) -> bool {
+        headers.get_all("anthropic-beta").iter().any(|v| {
+            v.to_str()
+                .map(|s| s.contains("server-side-fallback"))
+                .unwrap_or(false)
+        })
+    }
+
+    #[tokio::test]
+    async fn server_fallback_config_adds_param_and_beta_header() {
+        let (addr, captured, server) = spawn_capturing_server().await;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("sk-ant-api-key"))
+            .base_url(&format!("http://{addr}"))
+            .server_fallback_models(vec!["claude-opus-4-8".to_string()])
+            .build();
+
+        let result = provider
+            .chat_with_system(Some("be helpful"), "hello", "claude-fable-5", None)
+            .await;
+        server.abort();
+        assert!(result.is_ok(), "chat failed: {:?}", result.err());
+
+        let (headers, body) = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("no request captured");
+        assert_eq!(
+            body["fallbacks"],
+            serde_json::json!([{"model": "claude-opus-4-8"}]),
+            "fallbacks param missing or wrong: {body}"
+        );
+        let betas: Vec<_> = headers.get_all("anthropic-beta").iter().collect();
+        assert_eq!(
+            betas.len(),
+            1,
+            "expected exactly one anthropic-beta header line"
+        );
+        assert_eq!(
+            betas[0].to_str().unwrap(),
+            "server-side-fallback-2026-06-01"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_credential_merges_beta_values_into_one_header() {
+        let (addr, captured, server) = spawn_capturing_server().await;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("sk-ant-oat01-test-token"))
+            .base_url(&format!("http://{addr}"))
+            .server_fallback_models(vec!["claude-opus-4-8".to_string()])
+            .build();
+
+        let result = provider
+            .chat_with_system(Some("be helpful"), "hello", "claude-fable-5", None)
+            .await;
+        server.abort();
+        assert!(result.is_ok(), "chat failed: {:?}", result.err());
+
+        let (headers, _body) = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("no request captured");
+        let betas: Vec<_> = headers.get_all("anthropic-beta").iter().collect();
+        assert_eq!(
+            betas.len(),
+            1,
+            "OAuth auth beta and server-fallback beta must merge into one header line"
+        );
+        let value = betas[0].to_str().unwrap();
+        assert!(
+            value.contains("claude-code-20250219") && value.contains("oauth-2025-04-20"),
+            "existing auth betas missing: {value}"
+        );
+        assert!(
+            value.contains("server-side-fallback-2026-06-01"),
+            "server-side fallback beta missing: {value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_server_fallback_config_sends_neither() {
+        let (addr, captured, server) = spawn_capturing_server().await;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("sk-ant-api-key"))
+            .base_url(&format!("http://{addr}"))
+            .build();
+
+        let result = provider
+            .chat_with_system(Some("be helpful"), "hello", "claude-fable-5", None)
+            .await;
+        server.abort();
+        assert!(result.is_ok(), "chat failed: {:?}", result.err());
+
+        let (headers, body) = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("no request captured");
+        assert!(
+            body.get("fallbacks").is_none(),
+            "default build must not send a fallbacks param: {body}"
+        );
+        assert!(
+            headers.get("anthropic-beta").is_none(),
+            "default api-key build must not send any anthropic-beta header"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_fallback_entry_equal_to_model_is_filtered() {
+        let (addr, captured, server) = spawn_capturing_server().await;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("sk-ant-api-key"))
+            .base_url(&format!("http://{addr}"))
+            .server_fallback_models(vec!["claude-fable-5".to_string()])
+            .build();
+
+        let result = provider
+            .chat_with_system(Some("be helpful"), "hello", "claude-fable-5", None)
+            .await;
+        server.abort();
+        assert!(result.is_ok(), "chat failed: {:?}", result.err());
+
+        let (headers, body) = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("no request captured");
+        assert!(
+            body.get("fallbacks").is_none(),
+            "an entry equal to the requested model must be filtered out: {body}"
+        );
+        assert!(
+            headers.get("anthropic-beta").is_none(),
+            "no beta when filtering empties the fallback list"
+        );
+    }
+
+    #[tokio::test]
+    async fn blank_server_fallback_entries_are_dropped_but_valid_kept() {
+        // The `empty_server_fallback_model` warning promises blank entries are
+        // "dropped before the request is sent"; the request builder must honor
+        // that so a stray "" does not get the whole call 400'd by the API.
+        let (addr, captured, server) = spawn_capturing_server().await;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("sk-ant-api-key"))
+            .base_url(&format!("http://{addr}"))
+            .server_fallback_models(vec![
+                "".to_string(),
+                "claude-opus-4-8".to_string(),
+                "  ".to_string(),
+            ])
+            .build();
+
+        let result = provider
+            .chat_with_system(Some("be helpful"), "hello", "claude-fable-5", None)
+            .await;
+        server.abort();
+        assert!(result.is_ok(), "chat failed: {:?}", result.err());
+
+        let (headers, body) = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("no request captured");
+        assert_eq!(
+            body["fallbacks"],
+            serde_json::json!([{"model": "claude-opus-4-8"}]),
+            "blank entries must be dropped, valid entry kept: {body}"
+        );
+        let betas: Vec<_> = headers.get_all("anthropic-beta").iter().collect();
+        assert_eq!(betas.len(), 1, "expected exactly one anthropic-beta header");
+        assert_eq!(
+            betas[0].to_str().unwrap(),
+            "server-side-fallback-2026-06-01"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_blank_server_fallback_entries_send_neither() {
+        let (addr, captured, server) = spawn_capturing_server().await;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("sk-ant-api-key"))
+            .base_url(&format!("http://{addr}"))
+            .server_fallback_models(vec!["".to_string(), "  ".to_string()])
+            .build();
+
+        let result = provider
+            .chat_with_system(Some("be helpful"), "hello", "claude-fable-5", None)
+            .await;
+        server.abort();
+        assert!(result.is_ok(), "chat failed: {:?}", result.err());
+
+        let (headers, body) = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("no request captured");
+        assert!(
+            body.get("fallbacks").is_none(),
+            "an all-blank list must send no fallbacks param: {body}"
+        );
+        assert!(
+            headers.get("anthropic-beta").is_none(),
+            "no beta when every entry is blank"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_and_thinking_requests_never_carry_fallbacks() {
+        // Plain streaming request.
+        {
+            let (addr, captured, server) = spawn_capturing_server().await;
+            let provider = AnthropicModelProvider::builder("test")
+                .credential(Some("sk-ant-api-key"))
+                .base_url(&format!("http://{addr}"))
+                .server_fallback_models(vec!["claude-opus-4-8".to_string()])
+                .build();
+
+            let messages = vec![ChatMessage::user("hello")];
+            let request = ProviderChatRequest {
+                messages: messages.as_slice(),
+                tools: None,
+                thinking: None,
+            };
+            let stream =
+                provider.stream_chat(request, "claude-fable-5", None, StreamOptions::new(true));
+            let _events: Vec<StreamResult<StreamEvent>> = stream.collect().await;
+            server.abort();
+
+            let (headers, body) = captured
+                .lock()
+                .unwrap()
+                .take()
+                .expect("no streaming request captured");
+            assert!(
+                body.get("fallbacks").is_none(),
+                "streaming request must not carry a fallbacks param: {body}"
+            );
+            assert!(
+                !carries_server_fallback_beta(&headers),
+                "streaming request must not carry the server-side-fallback beta"
+            );
+        }
+
+        // Thinking-enabled request (built inside stream_chat with stream: None).
+        {
+            let (addr, captured, server) = spawn_capturing_server().await;
+            let provider = AnthropicModelProvider::builder("test")
+                .credential(Some("sk-ant-api-key"))
+                .base_url(&format!("http://{addr}"))
+                .server_fallback_models(vec!["claude-opus-4-8".to_string()])
+                .build();
+
+            let messages = vec![ChatMessage::user("hello")];
+            let request = ProviderChatRequest {
+                messages: messages.as_slice(),
+                tools: None,
+                thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
+                    budget_tokens: 1024,
+                    display: None,
+                }),
+            };
+            let stream =
+                provider.stream_chat(request, "claude-fable-5", None, StreamOptions::new(true));
+            let _events: Vec<StreamResult<StreamEvent>> = stream.collect().await;
+            server.abort();
+
+            let (headers, body) = captured
+                .lock()
+                .unwrap()
+                .take()
+                .expect("no thinking request captured");
+            assert!(
+                body.get("fallbacks").is_none(),
+                "thinking request must not carry a fallbacks param: {body}"
+            );
+            assert!(
+                !carries_server_fallback_beta(&headers),
+                "thinking request must not carry the server-side-fallback beta"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_chat_thinking_request_never_carries_fallbacks() {
+        // Production reaches non-streaming `chat` with thinking active through
+        // explicit non-streaming calls, pre-output stream recovery, and the
+        // graceful-summary call. That path must exclude server-side fallback
+        // exactly like `stream_chat` does.
+        let (addr, captured, server) = spawn_capturing_server().await;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("sk-ant-api-key"))
+            .base_url(&format!("http://{addr}"))
+            .server_fallback_models(vec!["claude-opus-4-8".to_string()])
+            .build();
+
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
+                budget_tokens: 1024,
+                display: None,
+            }),
+        };
+        let _ = provider.chat(request, "claude-sonnet-4-6", None).await;
+        server.abort();
+
+        let (headers, body) = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("no direct chat request captured");
+        assert!(
+            body.get("thinking").is_some(),
+            "the request under test must actually have native thinking active: {body}"
+        );
+        assert!(
+            body.get("fallbacks").is_none(),
+            "a thinking direct-chat request must not carry a fallbacks param: {body}"
+        );
+        assert!(
+            !carries_server_fallback_beta(&headers),
+            "a thinking direct-chat request must not carry the server-side-fallback beta"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_chat_without_thinking_still_carries_fallbacks() {
+        // The gate must be scoped to thinking requests only; a plain
+        // non-streaming chat keeps the configured opt-in.
+        let (addr, captured, server) = spawn_capturing_server().await;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("sk-ant-api-key"))
+            .base_url(&format!("http://{addr}"))
+            .server_fallback_models(vec!["claude-opus-4-8".to_string()])
+            .build();
+
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        let _ = provider.chat(request, "claude-sonnet-4-6", None).await;
+        server.abort();
+
+        let (headers, body) = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("no direct chat request captured");
+        assert!(
+            body.get("fallbacks").is_some(),
+            "a non-thinking direct-chat request must keep the configured fallbacks: {body}"
+        );
+        assert!(
+            carries_server_fallback_beta(&headers),
+            "a non-thinking direct-chat request must keep the server-side-fallback beta"
+        );
+    }
+
+    #[tokio::test]
+    async fn refusal_response_maps_to_typed_error() {
+        let body = serde_json::json!({
+            "content": [],
+            "stop_reason": "refusal",
+            "stop_details": {"type": "refusal", "category": "cyber"},
+            "usage": {"input_tokens": 412, "output_tokens": 0}
+        });
+        let (addr, server) = spawn_messages_server(body).await;
+        let provider = refusal_test_provider(addr);
+
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        let result = provider.chat(request, "claude-sonnet-4-6", Some(0.7)).await;
+        server.abort();
+
+        let err = result.expect_err("a refusal must surface as an error");
+        let typed = err
+            .downcast_ref::<AnthropicRefusalError>()
+            .expect("error must downcast to AnthropicRefusalError");
+        assert_eq!(typed.category.as_deref(), Some("cyber"));
+    }
+
+    #[tokio::test]
+    async fn refusal_without_stop_details_still_errors() {
+        let body = serde_json::json!({
+            "content": [],
+            "stop_reason": "refusal",
+            "usage": {"input_tokens": 412, "output_tokens": 0}
+        });
+        let (addr, server) = spawn_messages_server(body).await;
+        let provider = refusal_test_provider(addr);
+
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        let result = provider.chat(request, "claude-sonnet-4-6", None).await;
+        server.abort();
+
+        let err = result.expect_err("a refusal must surface as an error even without stop_details");
+        let typed = err
+            .downcast_ref::<AnthropicRefusalError>()
+            .expect("error must downcast to AnthropicRefusalError");
+        assert_eq!(typed.category, None);
+    }
+
+    #[tokio::test]
+    async fn refusal_error_display_never_contains_explanation() {
+        let body = serde_json::json!({
+            "content": [],
+            "stop_reason": "refusal",
+            "stop_details": {
+                "type": "refusal",
+                "category": "CATEGORY_SENTINEL",
+                "explanation": "SENTINEL_TEXT"
+            },
+            "usage": {"input_tokens": 10, "output_tokens": 0}
+        });
+        let (addr, server) = spawn_messages_server(body).await;
+        let provider = refusal_test_provider(addr);
+
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        let result = provider.chat(request, "claude-sonnet-4-6", None).await;
+        server.abort();
+
+        let err = result.expect_err("a refusal must surface as an error");
+        let typed = err
+            .downcast_ref::<AnthropicRefusalError>()
+            .expect("error must downcast to AnthropicRefusalError");
+        assert_eq!(typed.category.as_deref(), Some("CATEGORY_SENTINEL"));
+        assert_eq!(format!("{err}"), ANTHROPIC_REFUSAL_MESSAGE);
+        assert_eq!(format!("{typed}"), ANTHROPIC_REFUSAL_MESSAGE);
+        assert!(!format!("{err}").contains("CATEGORY_SENTINEL"));
+        assert!(!format!("{typed}").contains("CATEGORY_SENTINEL"));
+        for rendered in [
+            format!("{err}"),
+            format!("{err:?}"),
+            format!("{typed}"),
+            format!("{typed:?}"),
+        ] {
+            assert!(
+                !rendered.contains("SENTINEL_TEXT"),
+                "refusal error leaked explanation text: {rendered}"
+            );
+        }
+    }
+
+    /// Category token used to prove the refusal category never reaches a
+    /// rendered string. Deliberately unlike any real native category so a
+    /// match can only come from interpolating `category` itself.
+    const CATEGORY_SENTINEL: &str = "zc-category-sentinel";
+
+    /// Build the typed refusal error the way the provider does, carrying
+    /// [`CATEGORY_SENTINEL`] as the native refusal category.
+    fn refusal_error_with_sentinel_category() -> AnthropicRefusalError {
+        let json = format!(
+            r#"{{
+                "content": [],
+                "stop_reason": "refusal",
+                "stop_details": {{"type": "refusal", "category": "{CATEGORY_SENTINEL}"}},
+                "usage": {{"input_tokens": 10, "output_tokens": 0}}
+            }}"#
+        );
+        let resp: NativeChatResponse = serde_json::from_str(&json).unwrap();
+        AnthropicModelProvider::check_refusal(&resp, "claude-sonnet-4-6")
+            .expect_err("stop_reason=refusal must produce a typed refusal error")
+    }
+
+    /// The orchestrator's actual user-facing call shape is
+    /// `sanitize_api_error(&e.to_string())` (crates/zeroclaw-channels/src/
+    /// orchestrator/mod.rs). Pin the end-to-end boundary, not just `Display`:
+    /// the sanitizer only scrubs secrets and truncates, so anything `Display`
+    /// emits reaches the user intact.
+    #[test]
+    fn sanitized_refusal_reply_omits_category() {
+        let err = refusal_error_with_sentinel_category();
+
+        let user_facing = crate::sanitize_api_error(&err.to_string());
+        assert!(
+            !user_facing.contains(CATEGORY_SENTINEL),
+            "refusal category leaked into the user-facing reply: {user_facing}"
+        );
+        assert_eq!(user_facing, ANTHROPIC_REFUSAL_MESSAGE);
+
+        // Same boundary for the thinking-stream mapping, which the
+        // orchestrator renders through the identical sanitizer.
+        let stream_err =
+            StreamError::ModelRefusal(Box::new(refusal_error_with_sentinel_category()));
+        let stream_text = crate::sanitize_api_error(&stream_err.to_string());
+        assert!(
+            !stream_text.contains(CATEGORY_SENTINEL),
+            "refusal category leaked into the streamed reply: {stream_text}"
+        );
+    }
+
+    /// `reliable.rs::compact_error_detail` renders provider errors with the
+    /// anyhow alternate formatter (`{err:#}`), which walks the source chain.
+    /// A category-bearing `Display` — or a category-bearing source — would
+    /// leak there too, so pin that rendering as well.
+    #[test]
+    fn refusal_error_alternate_format_omits_category() {
+        let err = anyhow::Error::new(refusal_error_with_sentinel_category());
+        for rendered in [format!("{err}"), format!("{err:#}"), format!("{err:?}")] {
+            assert!(
+                !rendered.contains(CATEGORY_SENTINEL),
+                "refusal category leaked into an error rendering: {rendered}"
+            );
+        }
+    }
+
+    /// The fix removes the category from rendered text only — it must not
+    /// silently drop the structured-logging / reliability signal.
+    #[test]
+    fn refusal_error_retains_category_for_logging() {
+        let err = refusal_error_with_sentinel_category();
+        assert_eq!(
+            err.category.as_deref(),
+            Some(CATEGORY_SENTINEL),
+            "category must stay on the typed error for structured logs"
+        );
+        assert_eq!(err.requested_model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn end_turn_response_unaffected_by_new_fields() {
+        let json = r#"{
+            "content": [{"type": "text", "text": "Hello there"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 300, "output_tokens": 75}
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        // The new fields must not cause a normal completion to be flagged.
+        AnthropicModelProvider::check_refusal(&resp, "claude-sonnet-4-6")
+            .expect("end_turn must not be treated as a refusal");
+        let result = AnthropicModelProvider::parse_native_response(resp);
+        assert_eq!(result.text.as_deref(), Some("Hello there"));
+        let usage = result.usage.expect("usage should be present");
+        assert_eq!(usage.input_tokens, Some(300));
+        assert_eq!(usage.output_tokens, Some(75));
+    }
+
+    #[tokio::test]
+    async fn chat_with_system_detects_refusal() {
+        let body = serde_json::json!({
+            "content": [],
+            "stop_reason": "refusal",
+            "stop_details": {"type": "refusal", "category": "frontier_llm"},
+            "usage": {"input_tokens": 5, "output_tokens": 0}
+        });
+        let (addr, server) = spawn_messages_server(body).await;
+        let provider = refusal_test_provider(addr);
+
+        let result = provider
+            .chat_with_system(Some("be helpful"), "hello", "claude-sonnet-4-6", None)
+            .await;
+        server.abort();
+
+        let err = result.expect_err("a refusal must surface as an error");
+        let typed = err
+            .downcast_ref::<AnthropicRefusalError>()
+            .expect("error must downcast to AnthropicRefusalError");
+        assert_eq!(typed.category.as_deref(), Some("frontier_llm"));
+        assert_eq!(
+            typed.usage.as_ref().and_then(|usage| usage.input_tokens),
+            Some(5)
+        );
+    }
+
+    #[tokio::test]
+    async fn thinking_fallback_branch_detects_refusal() {
+        let body = serde_json::json!({
+            "content": [],
+            "stop_reason": "refusal",
+            "stop_details": {"type": "refusal", "category": "CATEGORY_SENTINEL"},
+            "usage": {"input_tokens": 5, "output_tokens": 0}
+        });
+        let (addr, server) = spawn_messages_server(body).await;
+        let provider = refusal_test_provider(addr);
+
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
+                budget_tokens: 10_000,
+                display: None,
+            }),
+        };
+        let stream =
+            provider.stream_chat(request, "claude-sonnet-4-6", None, StreamOptions::new(true));
+        let events: Vec<StreamResult<StreamEvent>> = stream.collect().await;
+        server.abort();
+
+        assert!(
+            !events.iter().any(|e| matches!(e, Ok(StreamEvent::Final))),
+            "a refusal must not emit a Final event"
+        );
+        let refusal = events
+            .iter()
+            .find_map(|e| match e {
+                Err(StreamError::ModelRefusal(refusal)) => Some(refusal),
+                _ => None,
+            })
+            .expect("stream must yield a typed refusal");
+        assert_eq!(refusal.category.as_deref(), Some("CATEGORY_SENTINEL"));
+        assert_eq!(
+            refusal.usage.as_ref().and_then(|usage| usage.input_tokens),
+            Some(5)
+        );
+        assert_eq!(refusal.to_string(), ANTHROPIC_REFUSAL_MESSAGE);
+        assert!(!refusal.to_string().contains("CATEGORY_SENTINEL"));
+    }
+
+    // ----- Server-side fallback detection (§4) -------------------------
+
+    #[tokio::test]
+    async fn served_by_fallback_records_server_side_notice() {
+        // Anthropic declined `claude-fable-5` and served the turn with the
+        // opt-in fallback `claude-opus-4-8`. The response also carries a
+        // `{"type":"fallback",...}` content block, which `parse_native_response`
+        // must skip (unknown block types fall through its `_ => {}` arm).
+        let body = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "content": [
+                {"type": "text", "text": "hi"},
+                {
+                    "type": "fallback",
+                    "from": {"type": "model", "model": "claude-fable-5"},
+                    "to": {"type": "model", "model": "claude-opus-4-8"}
+                }
+            ],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "iterations": [{"type": "message"}, {"type": "fallback_message"}]
+            }
+        });
+        let (addr, server) = spawn_messages_server(body).await;
+        let provider = refusal_test_provider(addr);
+
+        scope_safeguard_fallback(async {
+            let result = provider
+                .chat_with_system(None, "hello", "claude-fable-5", None)
+                .await;
+            // Unknown `fallback` content block is skipped; only text survives.
+            assert_eq!(
+                result.expect("a server-rescued turn still returns Ok"),
+                "hi"
+            );
+
+            let notice = take_last_safeguard_fallback()
+                .expect("a server-side fallback must record a notice");
+            assert_eq!(notice.kind, SafeguardFallbackKind::ServerSide);
+            assert_eq!(notice.requested_model, "claude-fable-5");
+            assert_eq!(notice.served_model, "claude-opus-4-8");
+            assert_eq!(notice.category, None);
+            assert!(
+                take_last_safeguard_fallback().is_none(),
+                "at most one safeguard notice per call"
+            );
+        })
+        .await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn sticky_turn_without_fallback_block_still_detected() {
+        // Sticky routing: subsequent turns carry `fallback_message` in
+        // `usage.iterations` but omit the `fallback` content block. Detection
+        // keys on iterations + top-level model, never the content block.
+        let body = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "iterations": [{"type": "fallback_message"}]
+            }
+        });
+        let (addr, server) = spawn_messages_server(body).await;
+        let provider = refusal_test_provider(addr);
+
+        scope_safeguard_fallback(async {
+            let result = provider
+                .chat_with_system(None, "hello", "claude-fable-5", None)
+                .await;
+            assert_eq!(result.expect("sticky fallback turn still returns Ok"), "hi");
+
+            let notice = take_last_safeguard_fallback()
+                .expect("a sticky fallback turn must still record a notice");
+            assert_eq!(notice.kind, SafeguardFallbackKind::ServerSide);
+            assert_eq!(notice.requested_model, "claude-fable-5");
+            assert_eq!(notice.served_model, "claude-opus-4-8");
+            assert_eq!(notice.category, None);
+        })
+        .await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn whole_chain_refusal_is_still_a_refusal() {
+        // A `fallback_message` iteration may be present while the final
+        // `stop_reason` is still `refusal` — the whole chain refused. That is a
+        // refusal (typed error), never a fallback success: `check_refusal` runs
+        // first and errors before `detect_server_fallback` is reached.
+        let body = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "content": [],
+            "stop_reason": "refusal",
+            "stop_details": {"type": "refusal", "category": "cyber"},
+            "usage": {
+                "input_tokens": 5,
+                "output_tokens": 0,
+                "iterations": [{"type": "message"}, {"type": "fallback_message"}]
+            }
+        });
+        let (addr, server) = spawn_messages_server(body).await;
+        let provider = refusal_test_provider(addr);
+
+        scope_safeguard_fallback(async {
+            let result = provider
+                .chat_with_system(None, "hello", "claude-fable-5", None)
+                .await;
+            let err = result.expect_err("a whole-chain refusal must surface as an error");
+            err.downcast_ref::<AnthropicRefusalError>()
+                .expect("error must downcast to AnthropicRefusalError");
+            assert!(
+                take_last_safeguard_fallback().is_none(),
+                "a refusal must NOT record a server-side fallback notice"
+            );
+        })
+        .await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn iterations_absent_or_unknown_types_mean_no_fallback() {
+        // Absent, empty, and unknown-`type` iterations all mean "no fallback
+        // ran" — tolerant parsing, no notice, no error. `model` differs from
+        // the requested one to prove it is the iterations (not the model) that
+        // gate detection.
+        let usage_variants = vec![
+            serde_json::json!({"input_tokens": 10, "output_tokens": 5}),
+            serde_json::json!({"input_tokens": 10, "output_tokens": 5, "iterations": []}),
+            serde_json::json!({
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "iterations": [{"type": "weird"}]
+            }),
+        ];
+        for usage in usage_variants {
+            let body = serde_json::json!({
+                "model": "claude-opus-4-8",
+                "content": [{"type": "text", "text": "hi"}],
+                "stop_reason": "end_turn",
+                "usage": usage,
+            });
+            let (addr, server) = spawn_messages_server(body).await;
+            let provider = refusal_test_provider(addr);
+
+            scope_safeguard_fallback(async {
+                let result = provider
+                    .chat_with_system(None, "hello", "claude-fable-5", None)
+                    .await;
+                assert_eq!(result.expect("no fallback ran → Ok"), "hi");
+                assert!(
+                    take_last_safeguard_fallback().is_none(),
+                    "absent/empty/unknown iterations must record no notice"
+                );
+            })
+            .await;
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn served_model_equal_to_requested_records_no_notice() {
+        // A fallback attempt ran, but the served model equals the requested one
+        // (self-referential / malformed). Record no notice — it must never name
+        // the requested model as its own rescue — while the call still succeeds.
+        let body = serde_json::json!({
+            "model": "claude-fable-5",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "iterations": [{"type": "fallback_message"}]
+            }
+        });
+        let (addr, server) = spawn_messages_server(body).await;
+        let provider = refusal_test_provider(addr);
+
+        scope_safeguard_fallback(async {
+            let result = provider
+                .chat_with_system(None, "hello", "claude-fable-5", None)
+                .await;
+            assert_eq!(
+                result.expect("self-referential served model still Ok"),
+                "hi"
+            );
+            assert!(
+                take_last_safeguard_fallback().is_none(),
+                "served == requested must record no notice"
+            );
+        })
+        .await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn streaming_refusal_terminates_stream_with_error() {
+        use std::io::Cursor;
+
+        // Non-zero cache_read + cache_creation tokens so the refusal arm's
+        // normalization (input = uncached + cache_read + cache_create) is
+        // actually exercised — a regression that dropped either term from the
+        // billed-token sum must fail this test.
+        let sse: &[u8] = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":412,\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":50}}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usage\":{\"output_tokens\":0}}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(sse));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, "claude-sonnet-4-6")
+            .await;
+
+        let mut events = Vec::new();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            events.push(ev);
+        }
+
+        assert!(
+            !events.iter().any(|e| matches!(e, Ok(StreamEvent::Final))),
+            "a refusal must not emit a Final event"
+        );
+
+        // Billed partial tokens travel on the typed cause, so a recovery
+        // cannot separate or double-count them while skipping this candidate.
+        let refusal = events
+            .iter()
+            .find_map(|event| match event {
+                Err(StreamError::ModelRefusal(refusal)) => Some(refusal),
+                _ => None,
+            })
+            .expect("stream must yield a typed refusal");
+        let usage = refusal.usage.as_ref().expect("refusal usage");
+        assert_eq!(usage.input_tokens, Some(562), "normalized input tokens");
+        assert_eq!(usage.output_tokens, Some(0), "output tokens");
+        assert_eq!(usage.cached_input_tokens, Some(100), "cache_read tokens");
+        assert_eq!(refusal.to_string(), ANTHROPIC_REFUSAL_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn unwrapped_anthropic_refusal_recovery_bills_exactly_one_attempt() {
+        use futures_util::StreamExt;
+
+        const SSE: &str = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":412,\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":50}}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usage\":{\"output_tokens\":0}}\n\n"
+        );
+        let (addr, server) = spawn_messages_sse_server(SSE).await;
+        let provider = refusal_test_provider(addr);
+        let messages = vec![ChatMessage::user("hello")];
+        let scope = crate::dispatch::AccountedChatScope::new();
+
+        let err = scope
+            .scope(async {
+                let dispatcher = crate::dispatch::ProviderDispatch::from_ref(&provider);
+                let mut stream = dispatcher.stream_chat(
+                    ProviderChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "claude-sonnet-4-6",
+                    None,
+                    StreamOptions::new(true),
+                );
+                let mut refusal = None;
+                while let Some(event) = stream.next().await {
+                    match event {
+                        Ok(_) => {}
+                        Err(StreamError::ModelRefusal(r)) => {
+                            refusal = Some(*r);
+                            break;
+                        }
+                        Err(other) => panic!("unexpected error: {other:?}"),
+                    }
+                }
+                let refusal = refusal.expect("stream refusal event");
+                scope.record_stream_interruption_usage(
+                    refusal.usage.as_deref().expect("refusal usage").clone(),
+                );
+                dispatcher
+                    .chat_after_stream_refusal(
+                        ProviderChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "claude-sonnet-4-6",
+                        None,
+                        refusal,
+                    )
+                    .await
+                    .expect_err(
+                        "unwrapped anthropic provider must propagate refusal without replaying",
+                    )
+            })
+            .await;
+        server.abort();
+
+        assert!(
+            err.downcast_ref::<AnthropicRefusalError>().is_some(),
+            "returned error must be the typed refusal: {err}"
+        );
+        let report = scope.take();
+        assert_eq!(
+            report.attempts().len(),
+            1,
+            "unwrapped refusal recovery must bill exactly one physical attempt"
+        );
+        assert_eq!(report.attempts()[0].provider_ref(), "test");
+        assert!(matches!(
+            report.attempts()[0].outcome(),
+            crate::dispatch::AttemptUsageOutcome::OutcomeUnknown {
+                observed: Some(TokenUsage {
+                    input_tokens: Some(562),
+                    output_tokens: Some(0),
+                    cached_input_tokens: Some(100),
+                    cache_creation_input_tokens: Some(50),
+                })
+            }
+        ));
+    }
+
+    #[test]
+    fn beta_features_matrix_matches_oauth_and_display_flags() {
+        assert_eq!(anthropic_beta_features(false, false, &[]), None);
+        assert_eq!(
+            anthropic_beta_features(true, false, &[]).as_deref(),
+            Some(ANTHROPIC_OAUTH_BETA_FEATURES)
+        );
+        assert_eq!(
+            anthropic_beta_features(false, true, &[]).as_deref(),
+            Some(ANTHROPIC_THINKING_DISPLAY_BETA)
+        );
+        assert_eq!(
+            anthropic_beta_features(false, false, &["extra-beta-1"]).as_deref(),
+            Some("extra-beta-1"),
+            "an extra beta alone becomes the whole header value"
+        );
+        assert_eq!(
+            anthropic_beta_features(true, true, &["extra-beta-1", "extra-beta-2"]).as_deref(),
+            Some(concat!(
+                "claude-code-20250219,oauth-2025-04-20,",
+                "interleaved-thinking-2025-05-14,",
+                "thinking-display-updates-2026-08-18,",
+                "extra-beta-1,extra-beta-2"
+            )),
+            "oauth, display and extras merge into one comma-joined header"
+        );
+        assert_eq!(
+            anthropic_beta_features(true, true, &[]).as_deref(),
+            Some(concat!(
+                "claude-code-20250219,oauth-2025-04-20,",
+                "interleaved-thinking-2025-05-14,",
+                "thinking-display-updates-2026-08-18"
+            ))
+        );
+    }
+
+    #[test]
+    fn apply_auth_adds_display_beta_for_regular_tokens() {
+        let model_provider = AnthropicModelProvider::builder("test").build();
+        let request = model_provider
+            .apply_auth(
+                model_provider
+                    .http_client()
+                    .get("https://api.anthropic.com/v1/models"),
+                "sk-ant-api-key",
+                true,
+                &[],
+            )
+            .build()
+            .expect("request should build");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("anthropic-beta")
+                .and_then(|v| v.to_str().ok()),
+            Some(ANTHROPIC_THINKING_DISPLAY_BETA)
+        );
+        assert!(request.headers().get("authorization").is_none());
+    }
+
+    #[test]
+    fn apply_auth_appends_display_beta_for_setup_tokens() {
+        let model_provider = AnthropicModelProvider::builder("test").build();
+        let request = model_provider
+            .apply_auth(
+                model_provider
+                    .http_client()
+                    .get("https://api.anthropic.com/v1/models"),
+                "sk-ant-oat01-test-token",
+                true,
+                &[],
+            )
+            .build()
+            .expect("request should build");
+
+        let beta = request
+            .headers()
+            .get("anthropic-beta")
+            .and_then(|v| v.to_str().ok())
+            .expect("setup-token requests must carry the Claude Code beta set");
+        assert!(beta.starts_with(ANTHROPIC_OAUTH_BETA_FEATURES));
+        assert!(beta.ends_with(ANTHROPIC_THINKING_DISPLAY_BETA));
+        // Exactly one header line: comma-joined, never duplicated.
+        assert_eq!(
+            request.headers().get_all("anthropic-beta").iter().count(),
+            1
+        );
+    }
+
+    #[test]
+    fn resolve_thinking_propagates_display() {
+        let model_provider = AnthropicModelProvider::builder("test").build();
+
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 10_000,
+            display: Some(ThinkingDisplay::Updates),
+        };
+        let (_, config, _) =
+            model_provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-sonnet-4-6");
+        let config = config.expect("thinking config for supported model");
+        assert_eq!(config.display, Some(ThinkingDisplay::Updates));
+
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 10_000,
+            display: None,
+        };
+        let (_, config, _) =
+            model_provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-sonnet-4-6");
+        let config = config.expect("thinking config for supported model");
+        assert_eq!(config.display, None);
+    }
+
+    #[test]
+    fn request_body_carries_display_only_when_set() {
+        let message = NativeMessage {
+            role: "user".to_string(),
+            content: vec![NativeContentOut::Text {
+                text: "hi".to_string(),
+                cache_control: None,
+            }],
+        };
+        let request = NativeChatRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 1_024,
+            system: None,
+            messages: vec![message],
+            temperature: None,
+            tools: None,
+            tool_choice: None,
+            stream: None,
+            thinking: Some(NativeThinkingConfig {
+                kind: "enabled",
+                budget_tokens: Some(1_024),
+                display: Some(ThinkingDisplay::Updates),
+            }),
+            fallbacks: None,
+        };
+
+        let body = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(body["thinking"]["display"], serde_json::json!("updates"));
+
+        let request = NativeChatRequest {
+            thinking: Some(NativeThinkingConfig {
+                kind: "enabled",
+                budget_tokens: Some(1_024),
+                display: None,
+            }),
+            ..request
+        };
+        let body = serde_json::to_value(&request).expect("serialize");
+        assert!(
+            body["thinking"].get("display").is_none(),
+            "display must stay off the wire when unset: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_thinking_blocks_surface_as_reasoning_chunks() {
+        use std::io::Cursor;
+
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\"}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"weigh the options\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sigA\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, "claude-sonnet-4-6")
+            .await;
+
+        let mut reasoning_payloads = Vec::new();
+        let mut thinking_deltas = Vec::new();
+        let mut text = String::new();
+        let mut saw_final = false;
+        let mut first_thinking_pos = None;
+        let mut finalized_pos = None;
+        let mut position = 0usize;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match ev {
+                Ok(StreamEvent::ThinkingDelta(delta)) => {
+                    first_thinking_pos.get_or_insert(position);
+                    thinking_deltas.push(delta);
+                }
+                Ok(StreamEvent::ReasoningFinalized(payload)) => {
+                    finalized_pos.get_or_insert(position);
+                    reasoning_payloads.push(payload);
+                }
+                Ok(StreamEvent::TextDelta(chunk)) => text.push_str(&chunk.delta),
+                Ok(StreamEvent::Final) => saw_final = true,
+                Ok(_) => {}
+                Err(e) => panic!("stream must not error: {e:?}"),
+            }
+            position += 1;
+        }
+
+        // Property 1: readable thinking updates arrive BEFORE the finalized
+        // replay block and before completion.
+        let first_thinking = first_thinking_pos.expect("transient thinking deltas must fire");
+        let finalized = finalized_pos.expect("finalized reasoning payload must be emitted");
+        assert!(
+            first_thinking < finalized,
+            "readable progress must precede the finalized replay block"
+        );
+        assert_eq!(
+            thinking_deltas,
+            vec!["weigh the options"],
+            "one readable delta per thinking_delta frame"
+        );
+
+        // Property 2: the signature payload exists only in the durable
+        // replay channel, never in visible events.
+        let visible: String = thinking_deltas.concat();
+        assert!(
+            !visible.contains("sigA") && !visible.contains("signature"),
+            "visible thinking must not carry the signature: {visible:?}"
+        );
+        assert_eq!(reasoning_payloads.len(), 1, "one thinking block, one chunk");
+        let parsed: serde_json::Value = serde_json::from_str(&reasoning_payloads[0])
+            .expect("reasoning payload must be a JSON object");
+        assert_eq!(parsed["thinking"], "weigh the options");
+        assert_eq!(parsed["signature"], "sigA");
+
+        assert_eq!(text, "answer");
+        assert!(saw_final);
+    }
+
+    #[tokio::test]
+    async fn streaming_multiple_thinking_blocks_join_with_newline() {
+        use std::io::Cursor;
+
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\"}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"one\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig1\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"two\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig2\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, "claude-sonnet-4-6")
+            .await;
+
+        let mut reasoning_payloads = Vec::new();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            if let Ok(StreamEvent::ReasoningFinalized(payload)) = ev {
+                reasoning_payloads.push(payload);
+            }
+        }
+
+        assert_eq!(reasoning_payloads.len(), 2);
+        assert!(
+            !reasoning_payloads[0].starts_with('\n'),
+            "first block must not carry a separator"
+        );
+        assert!(
+            reasoning_payloads[1].starts_with('\n'),
+            "subsequent blocks must be newline-separated for the consumer's raw concatenation"
+        );
+
+        // Round-trip invariant: the concatenation must parse as one JSON
+        // object per line, exactly like non-streaming reasoning_content.
+        let joined: String = reasoning_payloads.concat();
+        for line in joined.split('\n') {
+            let parsed: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("line must be a JSON object: {line:?} ({e})"));
+            assert!(parsed.get("thinking").is_some());
+            assert!(parsed.get("signature").is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn message_stop_flushes_unclosed_thinking_block() {
+        use std::io::Cursor;
+
+        // No content_block_stop for the thinking block: the accumulated
+        // reasoning must still be flushed at message_stop, not dropped.
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\"}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"orphan\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sigX\"}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, "claude-sonnet-4-6")
+            .await;
+
+        let mut finalized = None;
+        let mut saw_final = false;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match ev {
+                Ok(StreamEvent::ReasoningFinalized(payload)) => finalized = Some(payload),
+                Ok(StreamEvent::Final) => saw_final = true,
+                Ok(_) => {}
+                Err(e) => panic!("stream must not error: {e:?}"),
+            }
+        }
+
+        let payload = finalized.expect("unclosed thinking block must be flushed");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("flushed payload must be a JSON object");
+        assert_eq!(parsed["thinking"], "orphan");
+        assert_eq!(parsed["signature"], "sigX");
+        assert!(saw_final);
+    }
+
+    #[tokio::test]
+    async fn display_enabled_thinking_uses_streaming_production_path() {
+        use axum::{Router, response::IntoResponse, routing::post};
+        use futures_util::StreamExt as _;
+        use zeroclaw_api::model_provider::NativeThinkingParams;
+
+        // The reviewer's core blocker: `display = "updates"` must construct a
+        // real streaming request, not detour through the non-streaming
+        // fallback. Capture the request body the provider actually sends.
+        let captured: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_route = captured.clone();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move |body: axum::body::Bytes| {
+                let captured = captured_for_route.clone();
+                async move {
+                    if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&body) {
+                        *captured.lock().unwrap() = Some(parsed);
+                    }
+                    let sse = "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\"}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"live\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+                    axum::body::Body::from_stream(futures_util::stream::once(async move {
+                        Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(sse))
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Anthropic SSE test server");
+        let addr = listener.local_addr().expect("Anthropic SSE test address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Anthropic SSE test");
+        });
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .base_url(&format!("http://{addr}"))
+            .build();
+        let messages = vec![ChatMessage::user("hi")];
+        let mut stream = provider.stream_chat(
+            ProviderChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: Some(NativeThinkingParams {
+                    budget_tokens: 2_048,
+                    display: Some(ThinkingDisplay::Updates),
+                }),
+            },
+            "claude-sonnet-4-6",
+            None,
+            StreamOptions {
+                enabled: true,
+                count_tokens: false,
+            },
+        );
+
+        let mut saw_thinking_delta = false;
+        while let Some(event) = stream.next().await {
+            match event.expect("display-enabled stream must not fail") {
+                StreamEvent::ThinkingDelta(delta) => {
+                    saw_thinking_delta = true;
+                    assert_eq!(delta, "live");
+                }
+                StreamEvent::Final => break,
+                _ => {}
+            }
+        }
+        server.abort();
+
+        assert!(
+            saw_thinking_delta,
+            "display-enabled requests must produce live thinking deltas from the SSE path"
+        );
+        let body = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("streaming request body must be captured");
+        assert_eq!(body["stream"], serde_json::json!(true));
+        assert_eq!(body["thinking"]["display"], serde_json::json!("updates"));
+        assert_eq!(body["thinking"]["budget_tokens"], serde_json::json!(2_048));
+    }
+
+    #[test]
+    fn request_body_omits_budget_tokens_for_adaptive_models() {
+        let message = NativeMessage {
+            role: "user".to_string(),
+            content: vec![NativeContentOut::Text {
+                text: "hi".to_string(),
+                cache_control: None,
+            }],
+        };
+        let request = NativeChatRequest {
+            model: "claude-fable-5-1".to_string(),
+            max_tokens: 1_024,
+            system: None,
+            messages: vec![message],
+            temperature: Some(1.0),
+            tools: None,
+            tool_choice: None,
+            stream: None,
+            thinking: Some(NativeThinkingConfig {
+                kind: "adaptive",
+                budget_tokens: None,
+                display: Some(ThinkingDisplay::Updates),
+            }),
+            fallbacks: None,
+        };
+
+        let body = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(body["thinking"]["type"], serde_json::json!("adaptive"));
+        assert!(
+            body["thinking"].get("budget_tokens").is_none(),
+            "adaptive thinking must not carry a budget: {body}"
+        );
+        assert_eq!(body["thinking"]["display"], serde_json::json!("updates"));
+    }
+
+    #[tokio::test]
+    async fn streaming_signature_only_omitted_block_reaches_replay() {
+        // `omitted` display returns signature-only blocks: empty `thinking`
+        // plus a required signature. Dropping them breaks tool-use replay.
+        use std::io::Cursor;
+
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\"}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sigO\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, "claude-sonnet-4-6")
+            .await;
+
+        let mut reasoning_payloads = Vec::new();
+        let mut thinking_deltas = Vec::new();
+        let mut text = String::new();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match ev {
+                Ok(StreamEvent::ThinkingDelta(delta)) => thinking_deltas.push(delta),
+                Ok(StreamEvent::ReasoningFinalized(payload)) => reasoning_payloads.push(payload),
+                Ok(StreamEvent::TextDelta(chunk)) => text.push_str(&chunk.delta),
+                Ok(_) => {}
+                Err(e) => panic!("stream must not error: {e:?}"),
+            }
+        }
+
+        assert!(
+            thinking_deltas.is_empty(),
+            "signature-only block must not produce visible deltas: {thinking_deltas:?}"
+        );
+        assert_eq!(reasoning_payloads.len(), 1, "block must reach replay");
+        let parsed: serde_json::Value = serde_json::from_str(&reasoning_payloads[0])
+            .expect("reasoning payload must be a JSON object");
+        assert_eq!(parsed["thinking"], "");
+        assert_eq!(parsed["signature"], "sigO");
+        assert_eq!(text, "answer");
+    }
+
+    #[tokio::test]
+    async fn streaming_mixed_updates_blocks_emit_deltas_and_full_replay() {
+        use std::io::Cursor;
+
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\"}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"step one\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sigA\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sigB\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, "claude-sonnet-4-6")
+            .await;
+
+        let mut reasoning_payloads = Vec::new();
+        let mut thinking_deltas = Vec::new();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match ev {
+                Ok(StreamEvent::ThinkingDelta(delta)) => thinking_deltas.push(delta),
+                Ok(StreamEvent::ReasoningFinalized(payload)) => reasoning_payloads.push(payload),
+                Ok(_) => {}
+                Err(e) => panic!("stream must not error: {e:?}"),
+            }
+        }
+
+        assert_eq!(
+            thinking_deltas,
+            vec!["step one".to_string()],
+            "only the text-bearing block produces visible deltas"
+        );
+        assert_eq!(reasoning_payloads.len(), 2, "both blocks reach replay");
+        let second: serde_json::Value =
+            serde_json::from_str(reasoning_payloads[1].trim_start_matches('\n'))
+                .expect("second payload must be a JSON object");
+        assert_eq!(second["thinking"], "");
+        assert_eq!(second["signature"], "sigB");
+    }
+
+    #[test]
+    fn non_streaming_signature_only_block_reaches_replay() {
+        let json = r#"{
+            "content": [
+                {"type": "thinking", "thinking": "", "signature": "sigX"},
+                {"type": "text", "text": "done"}
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let result = AnthropicModelProvider::parse_native_response(resp);
+        let reasoning = result
+            .reasoning_content
+            .expect("signature-only block must reach replay");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&reasoning).expect("reasoning_content line must be a JSON object");
+        assert_eq!(parsed["thinking"], "");
+        assert_eq!(parsed["signature"], "sigX");
     }
 }

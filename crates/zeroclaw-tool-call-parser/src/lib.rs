@@ -25,13 +25,12 @@ pub enum ToolProtocolEnvelopeKind {
 }
 
 fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
-    let initial = match raw {
+    match raw {
         Some(serde_json::Value::String(s)) => serde_json::from_str::<serde_json::Value>(s)
             .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
         Some(value) => value.clone(),
         None => serde_json::Value::Object(serde_json::Map::new()),
-    };
-    unwrap_nested_json_strings(initial)
+    }
 }
 
 /// Canonical vocabulary of terminal markers emitted by providers that must be
@@ -90,37 +89,6 @@ pub fn strip_trailing_terminal_markers(text: &str) -> String {
     }
 
     result
-}
-
-/// Recursively unwrap stringified JSON objects/arrays nested inside tool arguments.
-/// Why: Gemini (and some other model_providers) sometimes double-encode nested object/array
-/// parameters as JSON strings inside the outer arguments payload, which breaks tools
-/// that expect `Value::Object` / `Value::Array` at those positions.
-fn unwrap_nested_json_strings(value: serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut out = serde_json::Map::with_capacity(map.len());
-            for (k, v) in map {
-                out.insert(k, unwrap_nested_json_strings(v));
-            }
-            serde_json::Value::Object(out)
-        }
-        serde_json::Value::Array(items) => {
-            serde_json::Value::Array(items.into_iter().map(unwrap_nested_json_strings).collect())
-        }
-        serde_json::Value::String(s) => {
-            let trimmed = s.trim_start();
-            if trimmed.starts_with('{') || trimmed.starts_with('[') {
-                match serde_json::from_str::<serde_json::Value>(&s) {
-                    Ok(parsed) => unwrap_nested_json_strings(parsed),
-                    Err(_) => serde_json::Value::String(s),
-                }
-            } else {
-                serde_json::Value::String(s)
-            }
-        }
-        other => other,
-    }
 }
 
 fn parse_tool_call_id(
@@ -3399,21 +3367,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_arguments_value_unwraps_nested_object_string() {
+    fn parse_arguments_value_preserves_nested_object_string() {
         let raw = serde_json::json!({
             "service": "gmail",
             "params": "{\"maxResults\":3}"
         });
         let out = parse_arguments_value(Some(&raw));
         assert_eq!(out["service"], serde_json::json!("gmail"));
-        assert_eq!(out["params"], serde_json::json!({"maxResults": 3}));
+        assert_eq!(out["params"], raw["params"]);
     }
 
     #[test]
-    fn parse_arguments_value_unwraps_nested_array_string() {
+    fn parse_arguments_value_preserves_nested_array_string() {
         let raw = serde_json::json!({ "items": "[1,2,3]" });
         let out = parse_arguments_value(Some(&raw));
-        assert_eq!(out["items"], serde_json::json!([1, 2, 3]));
+        assert_eq!(out["items"], raw["items"]);
     }
 
     #[test]
@@ -3436,7 +3404,7 @@ mod tests {
         let inner = r#"{"params":"{\"maxResults\":3}"}"#;
         let raw = serde_json::Value::String(inner.to_string());
         let out = parse_arguments_value(Some(&raw));
-        assert_eq!(out["params"], serde_json::json!({"maxResults": 3}));
+        assert_eq!(out["params"], r#"{"maxResults":3}"#);
     }
 
     #[test]
@@ -3452,7 +3420,7 @@ mod tests {
         assert_eq!(parsed.name, "google_workspace");
         assert_eq!(
             parsed.arguments["params"],
-            serde_json::json!({"maxResults": 3})
+            serde_json::json!(r#"{"maxResults":3}"#)
         );
         assert_eq!(
             parsed.arguments["sub_resource"],

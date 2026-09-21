@@ -62,7 +62,7 @@ zeroclaw quickstart --model-provider openrouter --model openrouter/auto \
 - `--api-key <key>` — API key (omit for local providers like ollama)
 - `--agent <alias>` — agent alias (defaults to a sanitized provider name)
 
-Creates `~/.zeroclaw/config.toml` with `0600` permissions. Quickstart is idempotent — re-running it on a configured install leaves the existing config alone. To change one field afterward, use `zeroclaw config set <key>=<value>`; to reconfigure channels, use `zeroclaw config set channels.<name>.<field>=<value>` (per-channel guides live under [Channels → Overview](../../docs/book/src/channels/overview.md)).
+Creates `~/.zeroclaw/config.toml` with `0600` permissions. Quickstart is idempotent: re-running it on a configured install leaves the existing config alone. To change one field afterward, use `zeroclaw config set <path> <value>`; to reconfigure channels, use `zeroclaw config set channels.<type>.<alias>.<field> <value>`. For secret fields, omit the value to use the masked input prompt, for example `zeroclaw config set channels.telegram.default.bot-token`. Per-channel guides live under [Channels → Overview](../../../../docs/book/src/channels/overview.md).
 
 ---
 
@@ -176,11 +176,11 @@ zeroclaw service uninstall   # Remove the service
 
 ## Channels
 
-Channels use alias-keyed entries under `[channels.<kind>.<alias>]`. Availability depends on the installed build's feature set; consult the current channel guide and generated config reference before editing `config.toml`.
+Channels use alias-keyed entries under `[channels.<type>.<alias>]`. Availability depends on the installed build's feature set; consult the current channel guide and generated config reference before configuring a channel.
 
 ```bash
 zeroclaw channels list       # List configured channels
-zeroclaw channels doctor     # Check channel health
+zeroclaw channel doctor      # Check channel health
 ```
 
 ---

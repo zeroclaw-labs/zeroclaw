@@ -329,6 +329,25 @@ pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportErr
             &["risk_profiles", risk_alias],
             &to_table(&RiskProfileConfig::default())?,
         );
+        if config
+            .risk_profiles
+            .get(risk_alias)
+            .is_some_and(|profile| profile.approval_route.is_some())
+        {
+            if let Some(profile) = table_at_mut(&mut out, &["risk_profiles", risk_alias]) {
+                profile.remove("approval_route");
+            }
+            dropped.push(DroppedRef {
+                path: format!("risk_profiles.{risk_alias}.approval_route"),
+                reason: DropReason::HostSpecific,
+                detail: "the approval route names a source-install channel and approver; it is \
+                         removed so a same-named target channel cannot silently receive this \
+                         agent's approvals. Removing it also removes the source profile's \
+                         distinct-approver policy, so rebind one on the target before enabling \
+                         the agent when that separation is required"
+                    .to_string(),
+            });
+        }
     }
     let runtime_alias = agent.runtime_profile.trim();
     if !runtime_alias.is_empty() {
@@ -513,31 +532,33 @@ pub fn plan_export(config: &Config, alias: &str) -> Result<ExportPlan, ExportErr
 
     // ── provider entries, carried keyless ────────────────────────────────
     //
-    // Every provider reference the agent names is carried, not just
-    // `model_provider`: `Config::validate()` fails loud on any dangling
-    // provider ref, so a bundle that carried only some of them would not
-    // import. Credentials are scrubbed below, leaving keyless entries for the
-    // operator to fill in.
-    let mut provider_refs: Vec<(&str, &str)> = vec![
-        ("providers.models", agent.model_provider.trim()),
-        ("providers.models", agent.classifier_provider.trim()),
-        ("providers.models", agent.summary_provider.trim()),
-        ("providers.tts", agent.tts_provider.trim()),
-        (
-            "providers.transcription",
-            agent.transcription_provider.trim(),
-        ),
+    // Every provider reference the agent names is carried, together with the
+    // model-provider fallback graph the runtime can reach. `Config::validate()`
+    // fails loud on ordinary dangling provider refs, while fallback refs are
+    // warning-and-skip edges; following both here preserves the source route.
+    // Credentials are scrubbed below, leaving keyless entries for the operator
+    // to fill in.
+    let mut model_provider_refs = vec![
+        agent.model_provider.trim(),
+        agent.classifier_provider.trim(),
+        agent.summary_provider.trim(),
     ];
     // A carried runtime profile can name a summarizer provider of its own,
     // independently of the agent. `Config::validate()` checks that reference
     // per profile, so a closure carrying the profile without the provider
     // fails on the target even though the agent never named it.
     if let Some(profile) = config.runtime_profiles.get(runtime_alias) {
-        provider_refs.push((
-            "providers.models",
-            profile.context_compression.summary_provider.trim(),
-        ));
+        model_provider_refs.push(profile.context_compression.summary_provider.trim());
     }
+    carry_model_provider_closure(&mut out, &masked_root, config, &model_provider_refs);
+
+    let provider_refs = [
+        ("providers.tts", agent.tts_provider.trim()),
+        (
+            "providers.transcription",
+            agent.transcription_provider.trim(),
+        ),
+    ];
     let mut carried_providers: BTreeSet<String> = BTreeSet::new();
     for (section, reference) in provider_refs {
         let Some((family, entry)) = split_provider_ref(reference) else {
@@ -1210,6 +1231,79 @@ fn carry(out: &mut toml::Table, masked_root: &toml::Table, path: &[&str], defaul
     insert_at(out, path, toml::Value::Table(pruned));
 }
 
+/// Carry the model-provider graph that runtime fallback can actually reach.
+///
+/// Runtime starts fallback links at depth one, caps the walk at
+/// [`crate::providers::MAX_FALLBACK_DEPTH`], skips unresolved aliases, and
+/// prunes cycles on the current path. Mirroring those rules keeps the bundle's
+/// credential and endpoint surface no broader than the source runtime's while
+/// ensuring every reachable fallback entry is available on the target.
+fn carry_model_provider_closure(
+    out: &mut toml::Table,
+    masked_root: &toml::Table,
+    config: &Config,
+    roots: &[&str],
+) {
+    let mut carried = BTreeSet::new();
+    for root in roots {
+        let mut visited = Vec::new();
+        carry_model_provider(
+            out,
+            masked_root,
+            config,
+            root,
+            0,
+            &mut visited,
+            &mut carried,
+        );
+    }
+}
+
+fn carry_model_provider(
+    out: &mut toml::Table,
+    masked_root: &toml::Table,
+    config: &Config,
+    reference: &str,
+    depth: usize,
+    visited: &mut Vec<String>,
+    carried: &mut BTreeSet<String>,
+) {
+    if depth > crate::providers::MAX_FALLBACK_DEPTH {
+        return;
+    }
+    let Some((family, entry, provider)) = config.providers.models.find_by_name(reference.trim())
+    else {
+        return;
+    };
+    let resolved = format!("{family}.{entry}");
+    if visited.iter().any(|seen| seen == &resolved) {
+        return;
+    }
+
+    if carried.insert(resolved.clone()) {
+        carry(
+            out,
+            masked_root,
+            &["providers", "models", family, &entry],
+            &toml::Table::new(),
+        );
+    }
+
+    visited.push(resolved);
+    for fallback in &provider.fallback {
+        carry_model_provider(
+            out,
+            masked_root,
+            config,
+            fallback.as_str(),
+            depth + 1,
+            visited,
+            carried,
+        );
+    }
+    visited.pop();
+}
+
 /// The masked table for one MCP server, matched by natural key.
 ///
 /// Falls back to serializing the resolved entry when the masked array has no
@@ -1675,6 +1769,7 @@ mod tests {
                     model: Some("claude-opus-5".to_string()),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
 
@@ -1823,7 +1918,9 @@ mod tests {
                 access: [("beta".to_string().into(), AccessMode::Read)]
                     .into_iter()
                     .collect(),
-                read_memory_from: vec!["beta".to_string().into()],
+                read_memory_from: vec![crate::multi_agent::MemoryGrant::Agent(
+                    crate::multi_agent::AgentAlias::new("beta"),
+                )],
                 unrestricted_filesystem: false,
             };
         }
@@ -1903,6 +2000,43 @@ mod tests {
         assert!(workspace_entry_included(Path::new(
             "notes/MEMORY_SNAPSHOT.md"
         )));
+    }
+
+    #[test]
+    fn source_local_approval_route_is_removed_and_reported() {
+        let mut config = fixture();
+        config
+            .risk_profiles
+            .get_mut("guarded")
+            .unwrap()
+            .approval_route = Some(crate::autonomy::ApprovalRoute {
+            approver_channel: "telegram.ops".to_string(),
+            ..Default::default()
+        });
+
+        let plan = plan_export(&config, "researcher").unwrap();
+        let profile = lookup(&plan.config, &["risk_profiles", "guarded"])
+            .and_then(toml::Value::as_table)
+            .expect("risk profile travels");
+        assert!(
+            !profile.contains_key("approval_route"),
+            "a target-local channel must not inherit source approval authority"
+        );
+        assert!(
+            plan.dropped.iter().any(|dropped| {
+                dropped.path == "risk_profiles.guarded.approval_route"
+                    && dropped.reason == DropReason::HostSpecific
+            }),
+            "{:?}",
+            plan.dropped
+        );
+
+        let rendered = render_config_toml(&plan).unwrap();
+        let imported: Config = toml::from_str(&rendered).unwrap();
+        assert!(
+            imported.risk_profiles["guarded"].approval_route.is_none(),
+            "a same-named target channel cannot become the imported approver"
+        );
     }
 
     #[test]
@@ -2049,6 +2183,65 @@ mod tests {
         assert!(
             lookup(&plan.config, &["providers", "models", "anthropic", "main"]).is_some(),
             "model provider carried"
+        );
+    }
+
+    #[test]
+    fn reachable_model_provider_fallback_is_carried_keyless_and_round_trips() {
+        let mut config = fixture();
+        config
+            .providers
+            .models
+            .anthropic
+            .get_mut("main")
+            .unwrap()
+            .base
+            .fallback = vec![crate::providers::ModelProviderRef::new("openai.backup")];
+        config.providers.models.openai.insert(
+            "backup".to_string(),
+            crate::schema::OpenAIModelProviderConfig {
+                base: crate::schema::ModelProviderConfig {
+                    api_key: Some("backup-key-not-real".to_string()),
+                    model: Some("gpt-backup".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let plan = plan_export(&config, "researcher").unwrap();
+        assert!(
+            lookup(&plan.config, &["providers", "models", "openai", "backup"]).is_some(),
+            "the runtime-reachable fallback provider must travel"
+        );
+        assert!(
+            plan.required_secrets
+                .contains(&"providers.models.openai.backup.api_key".to_string()),
+            "{:?}",
+            plan.required_secrets
+        );
+
+        let rendered = render_config_toml(&plan).unwrap();
+        assert!(!rendered.contains("backup-key-not-real"), "{rendered}");
+        let imported: Config = toml::from_str(&rendered).unwrap();
+        imported
+            .validate()
+            .expect("closure validates on a clean install");
+        let primary = imported
+            .providers
+            .models
+            .find("anthropic", "main")
+            .expect("primary provider survives");
+        assert_eq!(
+            primary
+                .fallback
+                .iter()
+                .map(crate::providers::ModelProviderRef::as_str)
+                .collect::<Vec<_>>(),
+            vec!["openai.backup"]
+        );
+        assert!(
+            imported.providers.models.find("openai", "backup").is_some(),
+            "fallback resolves after import"
         );
     }
 

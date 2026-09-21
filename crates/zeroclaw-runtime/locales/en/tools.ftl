@@ -90,8 +90,11 @@ tool-file-read = Read file contents with line numbers. Supports partial reading 
 
 tool-file-write = Write contents to a file in the workspace
 
-tool-git-operations = Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash). Provides parsed JSON output and integrates with security policy for autonomy controls.
+tool-git-operations = Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash, worktree). Provides parsed JSON output and integrates with security policy for autonomy controls.
 tool-git-operations-error-not-in-repo = Not in a Git repository at '{ $path }'. Choose a path inside a Git worktree, pass 'path' for a repository subdirectory, or initialize a repository before running git_operations.
+tool-git-operations-error-repository-outside-authorized-roots = No Git repository is reachable within the authorized roots for '{ $path }'. Choose a path inside a repository covered by the applicable allowed root, or initialize a repository before running git_operations.
+tool-git-operations-error-repository-not-authorized = Git repository metadata at '{ $path }' is not authorized for this operation. Choose a repository covered by the applicable allowed root.
+tool-git-operations-error-path-not-authorized = Git path '{ $path }' is not authorized for this operation. Choose a path covered by the applicable allowed root.
 
 tool-git-forge-error-requires-field = { $resource }.{ $action } requires '{ $field }'.
 tool-git-forge-error-requires-number = { $resource }.{ $action } requires 'number'.
@@ -148,6 +151,10 @@ tool-pushover = Send a Pushover notification to your device. Requires PUSHOVER_T
 
 tool-schedule = Manage scheduled shell-only tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. WARNING: This tool creates shell jobs whose output is only logged, NOT delivered to any channel. To send a scheduled message to Discord/Telegram/Slack/Matrix, use the cron_add tool with job_type='agent' and a delivery config like {"{"}"mode":"announce","channel":"discord","to":"<channel_id>"{"}"}.
 
+tool-sessions-history-header = Session '{ $session_id }': showing { $shown }/{ $total } messages
+tool-sessions-send-error-acp-unsupported = { $tool } does not support { $channel } sessions because durable transcript writes do not deliver messages to the live { $product } session.
+tool-sessions-current-channel = Channel: { $channel }
+
 tool-screenshot = Capture a screenshot of the current screen. Returns the file path and base64-encoded PNG data.
 tool-browser-screenshot-error-path-not-allowed = Screenshot path '{ $path }' is not in the workspace allowlist
 tool-browser-screenshot-error-parent-not-exist = Screenshot path '{ $path }' parent directory '{ $parent }' does not exist
@@ -190,3 +197,22 @@ tool-web-search-tool-note-truncated-results = (further results omitted)
 tool-workspace = Manage multi-client workspaces. Subcommands: list, switch, create, info, export. Each workspace provides isolated memory, audit, secrets, and tool restrictions.
 
 tool-weather = Get current weather conditions and forecast for any location worldwide. Supports city names (in any language or script), IATA airport codes (e.g. 'LAX'), GPS coordinates (e.g. '51.5,-0.1'), postal/zip codes, and domain-based geolocation. Returns temperature, feels-like, humidity, wind speed/direction, precipitation, visibility, pressure, UV index, and cloud cover. Optional 0-3 day forecast with hourly breakdown. Units default to metric (°C, km/h, mm) but can be set to imperial (°F, mph, inches) per request. No API key required.
+
+tool-a2a-discover = List available remote A2A peer agents and their advertised capabilities. Call with no peer to list all configured peers, or a specific peer to fetch its Agent Card (name, description, skills). Use before a2a_send to find the right peer and agent for a task.
+tool-a2a-discover-desc-peer = Peer name to fetch the Agent Card for. Omit to list all configured peers.
+tool-a2a-discover-desc-filter-tags = Optional tags to filter peers by (e.g. ["production"]).
+tool-a2a-send = Delegate a task to a remote A2A peer agent and wait for the result. Returns a Task with a task_id, state, and artifacts (the peer's reply, fenced as untrusted-external). If the state is non-terminal (working/input-required), poll with a2a_get_task or cancel with a2a_cancel. The message is sent as-is. This is an Act operation that requires approval by default (not in auto_approve) unless the operator explicitly opts in via risk_profiles.<name>.auto_approve.
+tool-a2a-send-desc-peer = Configured peer name to send the task to.
+tool-a2a-send-desc-agent = Target route identity on the peer: the agent alias ({"{"}alias{"}"} in /a2a/{"{"}alias{"}"}) or, when the card shares a URL across tenants, the tenant of the interface to reach.
+tool-a2a-send-desc-message = The task prompt to send to the peer agent.
+tool-a2a-send-desc-return-immediately = Default false (block for a terminal state). Set true to return immediately with a non-terminal (working/input-required) task for polling.
+tool-a2a-send-desc-context-id = Optional context ID for multi-turn continuation (from a prior send's response).
+tool-a2a-send-desc-task-id = Optional task ID for continuing an existing task (e.g. after INPUT_REQUIRED).
+tool-a2a-get-task = Retrieve the current state and artifacts of an in-flight A2A task on a peer. Use to poll a task that a2a_send returned in a non-terminal state (working/input-required).
+tool-a2a-get-task-desc-peer = Configured peer name hosting the task.
+tool-a2a-get-task-desc-task-id = The task id returned by a2a_send.
+tool-a2a-get-task-desc-agent = Optional agent alias or tenant that created the task (from a2a_send). Helps route the poll to the correct interface when discovery is re-run (the cached route is used first).
+tool-a2a-cancel = Cancel an in-flight A2A task on a peer. Returns the updated Task (typically state=canceled, though the spec does not guarantee it).
+tool-a2a-cancel-desc-peer = Configured peer name hosting the task.
+tool-a2a-cancel-desc-task-id = The task id to cancel.
+tool-a2a-cancel-desc-agent = Optional agent alias or tenant that created the task (from a2a_send). Helps route the cancel to the correct interface when discovery is re-run (the cached route is used first).

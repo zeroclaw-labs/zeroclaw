@@ -27,6 +27,13 @@ impl ToolEventKind {
     }
 }
 
+/// Canonical breadcrumb text, duplicated from
+/// `zeroclaw_runtime::agent::history::HISTORY_TRIM_BREADCRUMB_CANONICAL`.
+/// This crate sits below `zeroclaw-runtime` in the dependency graph and
+/// cannot import it; used only for one-time legacy-row migration below.
+/// Keep in sync with the runtime constant.
+const HISTORY_TRIM_BREADCRUMB_CANONICAL: &str = "[earlier turns omitted to fit the context window]";
+
 pub struct AcpSessionStore {
     conn: Mutex<Connection>,
 }
@@ -35,16 +42,33 @@ pub struct AcpSessionData {
     pub session_uuid: String,
     pub agent_alias: String,
     pub workspace_dir: String,
+    pub interaction_surface: Option<String>,
     pub token_count: u64,
     pub created_at: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
     pub messages: Vec<ConversationMessage>,
+    /// Whether `messages`' first non-system entry is the synthetic
+    /// history-trim breadcrumb. Rows written after the `trim_breadcrumb`
+    /// column was added carry this as recorded by the owning turn loop,
+    /// never inferred from text. A row from before that column existed has
+    /// no recorded value (`NULL`); for that one-time legacy case only, it is
+    /// inferred from the first non-system message's text, matching the
+    /// interactive-session JSONL migration contract (see
+    /// `zeroclaw_runtime::agent::history::load_interactive_session_history_with_crumb`).
+    pub trim_breadcrumb: bool,
 }
 
 pub enum AcpSessionRestore {
     Missing,
     Killed,
     Restorable(AcpSessionData),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcpSessionAccess {
+    Owned,
+    Foreign,
+    Missing,
 }
 
 /// Lightweight summary for the ACP session picker. Avoids loading the full
@@ -85,6 +109,7 @@ impl AcpSessionStore {
                  session_uuid  TEXT NOT NULL UNIQUE,
                  agent_alias   TEXT NOT NULL,
                  workspace_dir TEXT NOT NULL,
+                 interaction_surface TEXT,
                  token_count   INTEGER NOT NULL DEFAULT 0,
                  killed_at     TEXT,
                  created_at    TEXT NOT NULL,
@@ -133,6 +158,12 @@ impl AcpSessionStore {
 
         Self::ensure_plan_json_column(&conn)
             .context("Failed to migrate ACP session plan column")?;
+
+        Self::ensure_interaction_surface_column(&conn)
+            .context("Failed to migrate ACP session interaction surface")?;
+
+        Self::ensure_trim_breadcrumb_column(&conn)
+            .context("Failed to migrate ACP session trim breadcrumb column")?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -207,6 +238,133 @@ impl AcpSessionStore {
         }
     }
 
+    /// Idempotent migration for the host-validated interaction surface bound
+    /// to the session. NULL identifies sessions created before the field was
+    /// introduced or by ACP entry points that do not declare a UI surface.
+    fn ensure_interaction_surface_column(conn: &Connection) -> Result<()> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(acp_sessions)")
+            .context("Failed to inspect ACP session schema")?;
+        let mut rows = stmt
+            .query([])
+            .context("Failed to read ACP session schema")?;
+        while let Some(row) = rows
+            .next()
+            .context("Failed to read ACP session schema row")?
+        {
+            let column: String = row
+                .get(1)
+                .context("Failed to read ACP session column name")?;
+            if column == "interaction_surface" {
+                return Ok(());
+            }
+        }
+        drop(rows);
+        drop(stmt);
+
+        match conn.execute(
+            "ALTER TABLE acp_sessions ADD COLUMN interaction_surface TEXT",
+            [],
+        ) {
+            Ok(_) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                if msg.contains("duplicate column name") =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e).context("Failed to add ACP session interaction surface"),
+        }
+    }
+
+    /// Idempotent migration adding the `trim_breadcrumb` column: whether the
+    /// persisted transcript's first non-system message is the synthetic
+    /// history-trim marker. Stored as one canonical fact alongside the
+    /// transcript so a restore never has to infer provenance from message
+    /// text (a genuine user turn that happens to equal the localized
+    /// breadcrumb string must keep its turn-boundary role).
+    fn ensure_trim_breadcrumb_column(conn: &Connection) -> Result<()> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(acp_sessions)")
+            .context("Failed to inspect ACP session schema")?;
+        let mut rows = stmt
+            .query([])
+            .context("Failed to read ACP session schema")?;
+        while let Some(row) = rows
+            .next()
+            .context("Failed to read ACP session schema row")?
+        {
+            let column: String = row
+                .get(1)
+                .context("Failed to read ACP session column name")?;
+            if column == "trim_breadcrumb" {
+                return Ok(());
+            }
+        }
+        drop(rows);
+        drop(stmt);
+
+        // No `NOT NULL DEFAULT 0`: a `0` default would be indistinguishable
+        // from an explicit "no breadcrumb" recorded by the owning turn loop.
+        // Existing rows get `NULL` (unknown/legacy) and are migrated by
+        // text inference on load; every row written after this migration
+        // gets an explicit 0 or 1.
+        match conn.execute(
+            "ALTER TABLE acp_sessions ADD COLUMN trim_breadcrumb INTEGER",
+            [],
+        ) {
+            Ok(_) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                if msg.contains("duplicate column name") =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e).context("Failed to add ACP session trim breadcrumb column"),
+        }
+    }
+
+    /// One-time legacy migration for rows written before the
+    /// `trim_breadcrumb` column existed (`NULL`): infer provenance from
+    /// whether the first non-system message is exactly the canonical
+    /// breadcrumb text. A genuine user turn that happens to equal that text
+    /// is misclassified on this one-time migration only; callers must
+    /// persist the result via `record_inferred_trim_breadcrumb` so the
+    /// column stops being `NULL` and later restores read the recorded fact
+    /// instead of re-inferring it from message text on every load. This
+    /// mirrors the JSONL interactive-session migration in
+    /// `zeroclaw_runtime::agent::history::load_interactive_session_history_with_crumb`,
+    /// restricted to the locale-independent canonical string because this
+    /// crate sits below the runtime i18n layer.
+    fn infer_legacy_trim_breadcrumb(messages: &[ConversationMessage]) -> bool {
+        messages
+            .iter()
+            .find_map(|m| match m {
+                ConversationMessage::Chat(chat) if chat.role != "system" => Some(chat),
+                _ => None,
+            })
+            .is_some_and(|first| {
+                first.role == "user" && first.content == HISTORY_TRIM_BREADCRUMB_CANONICAL
+            })
+    }
+
+    /// Write the one-time `infer_legacy_trim_breadcrumb` result back to the
+    /// still-`NULL` column, using the connection the caller already holds
+    /// (avoids re-locking `self.conn`, which the caller's `load_session*`
+    /// query has open). After this, the column is no longer `NULL` for this
+    /// session, so the next restore reads the recorded fact rather than
+    /// inferring it again from user-controlled text.
+    fn record_inferred_trim_breadcrumb(
+        conn: &Connection,
+        session_uuid: &str,
+        inferred: bool,
+    ) -> Result<()> {
+        conn.execute(
+            "UPDATE acp_sessions SET trim_breadcrumb = ?1 WHERE session_uuid = ?2",
+            params![i64::from(inferred), session_uuid],
+        )
+        .context("Failed to record inferred legacy trim_breadcrumb")?;
+        Ok(())
+    }
+
     /// Record a new session. Returns the integer `id` assigned by SQLite.
     pub fn create_session(
         &self,
@@ -214,16 +372,57 @@ impl AcpSessionStore {
         agent_alias: &str,
         workspace_dir: &str,
     ) -> Result<i64> {
+        self.create_session_with_interaction_surface(session_uuid, agent_alias, workspace_dir, None)
+    }
+
+    /// Record a session with an optional host-validated interaction surface.
+    pub fn create_session_with_interaction_surface(
+        &self,
+        session_uuid: &str,
+        agent_alias: &str,
+        workspace_dir: &str,
+        interaction_surface: Option<&str>,
+    ) -> Result<i64> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO acp_sessions
-               (session_uuid, agent_alias, workspace_dir, token_count, created_at, last_activity)
-             VALUES (?1, ?2, ?3, 0, ?4, ?4)",
-            params![session_uuid, agent_alias, workspace_dir, now],
+               (session_uuid, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, trim_breadcrumb)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5, 0)",
+            params![
+                session_uuid,
+                agent_alias,
+                workspace_dir,
+                interaction_surface,
+                now
+            ],
         )
         .context("Failed to create ACP session")?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// Bind an unlabelled legacy session to a validated surface exactly once.
+    /// Returns the durable value after the update so the caller can reject a
+    /// concurrent or pre-existing mismatch.
+    pub fn bind_interaction_surface_if_unset(
+        &self,
+        session_uuid: &str,
+        interaction_surface: &str,
+    ) -> Result<String> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE acp_sessions
+             SET interaction_surface = ?1
+             WHERE session_uuid = ?2 AND interaction_surface IS NULL",
+            params![interaction_surface, session_uuid],
+        )
+        .context("Failed to bind ACP session interaction surface")?;
+        conn.query_row(
+            "SELECT interaction_surface FROM acp_sessions WHERE session_uuid = ?1",
+            params![session_uuid],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("unknown session_uuid: {session_uuid}"))
     }
 
     /// Load session metadata and full message history for restore.
@@ -232,7 +431,7 @@ impl AcpSessionStore {
         let conn = self.conn.lock();
 
         let row = conn.query_row(
-            "SELECT id, agent_alias, workspace_dir, token_count, created_at, last_activity
+            "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, trim_breadcrumb
              FROM acp_sessions WHERE session_uuid = ?1",
             params![session_uuid],
             |row| {
@@ -240,34 +439,179 @@ impl AcpSessionStore {
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
                     row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
                 ))
             },
         );
 
-        let (session_id, agent_alias, workspace_dir, token_count, created_at_s, last_activity_s) =
-            match row {
-                Ok(r) => r,
-                Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
-                Err(e) => return Err(e).context("Failed to query ACP session"),
-            };
+        let (
+            session_id,
+            agent_alias,
+            workspace_dir,
+            interaction_surface,
+            token_count,
+            created_at_s,
+            last_activity_s,
+            trim_breadcrumb_raw,
+        ) = match row {
+            Ok(r) => r,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(e).context("Failed to query ACP session"),
+        };
 
         let created_at = parse_ts(&created_at_s, "created_at", session_uuid);
         let last_activity = parse_ts(&last_activity_s, "last_activity", session_uuid);
 
         let messages = Self::load_messages(&conn, session_id)?;
+        let trim_breadcrumb = match trim_breadcrumb_raw {
+            Some(v) => v != 0,
+            None => {
+                let inferred = Self::infer_legacy_trim_breadcrumb(&messages);
+                Self::record_inferred_trim_breadcrumb(&conn, session_uuid, inferred)?;
+                inferred
+            }
+        };
 
         Ok(Some(AcpSessionData {
             session_uuid: session_uuid.to_string(),
             agent_alias,
             workspace_dir,
+            interaction_surface,
             token_count: token_count.max(0) as u64,
             created_at,
             last_activity,
             messages,
+            trim_breadcrumb,
         }))
+    }
+
+    /// Load a durable ACP transcript only when both its UUID and owning agent
+    /// match. Keeping the alias predicate in SQL makes an unknown UUID and a
+    /// UUID owned by another agent indistinguishable to callers.
+    /// Killed sessions remain readable as history; killing prevents runtime
+    /// rehydration, not access to retained transcripts by their owner.
+    pub fn load_session_for_agent(
+        &self,
+        session_uuid: &str,
+        agent_alias: &str,
+    ) -> Result<Option<AcpSessionData>> {
+        let conn = self.conn.lock();
+
+        let row = conn
+            .query_row(
+                "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, trim_breadcrumb
+                 FROM acp_sessions
+                 WHERE session_uuid = ?1 AND agent_alias = ?2",
+                params![session_uuid, agent_alias],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                    ))
+                },
+            )
+            .optional()
+            .context("Failed to query ACP session for agent")?;
+
+        let Some((
+            session_id,
+            owner_alias,
+            workspace_dir,
+            interaction_surface,
+            token_count,
+            created_at_s,
+            last_activity_s,
+            trim_breadcrumb_raw,
+        )) = row
+        else {
+            return Ok(None);
+        };
+
+        let created_at = parse_ts(&created_at_s, "created_at", session_uuid);
+        let last_activity = parse_ts(&last_activity_s, "last_activity", session_uuid);
+        let messages = Self::load_messages(&conn, session_id)?;
+        let trim_breadcrumb = match trim_breadcrumb_raw {
+            Some(v) => v != 0,
+            None => {
+                let inferred = Self::infer_legacy_trim_breadcrumb(&messages);
+                Self::record_inferred_trim_breadcrumb(&conn, session_uuid, inferred)?;
+                inferred
+            }
+        };
+
+        Ok(Some(AcpSessionData {
+            session_uuid: session_uuid.to_string(),
+            agent_alias: owner_alias,
+            workspace_dir,
+            interaction_surface,
+            token_count: token_count.max(0) as u64,
+            created_at,
+            last_activity,
+            messages,
+            trim_breadcrumb,
+        }))
+    }
+
+    /// Classify an exact ACP session key without exposing the foreign owner.
+    /// Callers use `Foreign` and `Missing` to make the same fail-closed response
+    /// while still avoiding an unsafe fallback to another session backend.
+    pub fn classify_session_for_agent(
+        &self,
+        session_uuid: &str,
+        agent_alias: &str,
+    ) -> Result<AcpSessionAccess> {
+        let conn = self.conn.lock();
+        let owner = conn
+            .query_row(
+                "SELECT agent_alias FROM acp_sessions WHERE session_uuid = ?1",
+                params![session_uuid],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .context("Failed to classify ACP session owner")?;
+        Ok(match owner {
+            Some(owner) if owner == agent_alias => AcpSessionAccess::Owned,
+            Some(_) => AcpSessionAccess::Foreign,
+            None => AcpSessionAccess::Missing,
+        })
+    }
+
+    /// Whether `session_uuid` is a live ACP session owned by `agent_alias`.
+    pub fn is_live_session_for_agent(&self, session_uuid: &str, agent_alias: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM acp_sessions
+                 WHERE session_uuid = ?1 AND agent_alias = ?2 AND killed_at IS NULL
+             )",
+            params![session_uuid, agent_alias],
+            |row| row.get::<_, bool>(0),
+        )
+        .context("Failed to check live ACP session ownership")
+    }
+
+    /// Every durable ACP session key, used only to fail closed when a Chat key
+    /// collides with the separate ACP namespace.
+    pub fn list_session_ids(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT session_uuid FROM acp_sessions")
+            .context("Failed to prepare ACP session key query")?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .context("Failed to query ACP session keys")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("Failed to read ACP session keys")
     }
 
     /// Load only durable ACP rows that are allowed to become live sessions.
@@ -277,7 +621,7 @@ impl AcpSessionStore {
         let conn = self.conn.lock();
 
         let row = conn.query_row(
-            "SELECT id, agent_alias, workspace_dir, token_count, created_at, last_activity, killed_at
+            "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, killed_at, trim_breadcrumb
              FROM acp_sessions WHERE session_uuid = ?1",
             params![session_uuid],
             |row| {
@@ -285,10 +629,12 @@ impl AcpSessionStore {
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
                     row.get::<_, String>(5)?,
-                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
                 ))
             },
         );
@@ -297,10 +643,12 @@ impl AcpSessionStore {
             session_id,
             agent_alias,
             workspace_dir,
+            interaction_surface,
             token_count,
             created_at_s,
             last_activity_s,
             killed_at,
+            trim_breadcrumb_raw,
         ) = match row {
             Ok(r) => r,
             Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(AcpSessionRestore::Missing),
@@ -314,15 +662,25 @@ impl AcpSessionStore {
         let created_at = parse_ts(&created_at_s, "created_at", session_uuid);
         let last_activity = parse_ts(&last_activity_s, "last_activity", session_uuid);
         let messages = Self::load_messages(&conn, session_id)?;
+        let trim_breadcrumb = match trim_breadcrumb_raw {
+            Some(v) => v != 0,
+            None => {
+                let inferred = Self::infer_legacy_trim_breadcrumb(&messages);
+                Self::record_inferred_trim_breadcrumb(&conn, session_uuid, inferred)?;
+                inferred
+            }
+        };
 
         Ok(AcpSessionRestore::Restorable(AcpSessionData {
             session_uuid: session_uuid.to_string(),
             agent_alias,
             workspace_dir,
+            interaction_surface,
             token_count: token_count.max(0) as u64,
             created_at,
             last_activity,
             messages,
+            trim_breadcrumb,
         }))
     }
 
@@ -385,12 +743,77 @@ impl AcpSessionStore {
         Ok(out)
     }
 
+    /// List live ACP sessions owned by `agent_alias`, ordered by most recent
+    /// activity. Killed rows are omitted from live discovery, but their retained
+    /// transcripts remain readable through `load_session_for_agent` and they
+    /// remain available to export through `list_sessions_by_agent`.
+    pub fn list_live_sessions_by_agent(&self, agent_alias: &str) -> Result<Vec<AcpSessionSummary>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.session_uuid,
+                        s.agent_alias,
+                        s.workspace_dir,
+                        s.token_count,
+                        s.created_at,
+                        s.last_activity,
+                        (SELECT COUNT(*) FROM acp_messages m WHERE m.session_id = s.id) AS message_count
+                 FROM acp_sessions s
+                 WHERE s.agent_alias = ?1 AND s.killed_at IS NULL
+                 ORDER BY s.last_activity DESC",
+            )
+            .context("Failed to prepare live ACP session query for agent")?;
+
+        let rows = stmt
+            .query_map(params![agent_alias], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })
+            .context("Failed to query live ACP sessions for agent")?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (
+                session_uuid,
+                owner_alias,
+                workspace_dir,
+                token_count,
+                created_s,
+                activity_s,
+                msg_count,
+            ) = row.context("Failed to read live ACP session row")?;
+            out.push(AcpSessionSummary {
+                created_at: parse_ts(&created_s, "created_at", &session_uuid),
+                last_activity: parse_ts(&activity_s, "last_activity", &session_uuid),
+                session_uuid,
+                agent_alias: owner_alias,
+                workspace_dir,
+                token_count: token_count.max(0) as u64,
+                message_count: msg_count.max(0) as usize,
+            });
+        }
+        Ok(out)
+    }
+
     fn load_messages(conn: &Connection, session_id: i64) -> Result<Vec<ConversationMessage>> {
-        // Pull all message rows.
+        // Pull all message rows, excluding any `system` row. `insert_messages`
+        // has never written one since the write-path filter that keeps the
+        // Agent's system prompt out of authoritative replacements, but a
+        // database created before that fix can still have one on disk;
+        // filtering here is defense in depth so a restored session or a
+        // `session/messages` read can't re-expose it even if a write path
+        // regresses or an old row survives a partial migration.
         let mut msg_stmt = conn
             .prepare(
                 "SELECT id, role, content, reasoning_content
-                 FROM acp_messages WHERE session_id = ?1 ORDER BY id ASC",
+                 FROM acp_messages WHERE session_id = ?1 AND role != 'system' ORDER BY id ASC",
             )
             .context("Failed to prepare message query")?;
 
@@ -519,13 +942,128 @@ impl AcpSessionStore {
         let tx = conn
             .transaction()
             .context("Failed to begin append_turn transaction")?;
+        Self::insert_messages(&tx, session_id, messages, &now)?;
 
+        tx.execute(
+            "UPDATE acp_sessions SET last_activity = ?1 WHERE id = ?2",
+            params![now, session_id],
+        )
+        .context("Failed to update last_activity")?;
+
+        tx.commit().context("Failed to commit append_turn")?;
+        Ok(())
+    }
+
+    /// Replace a session's entire durable message transcript with the
+    /// agent's own authoritative post-turn history, in one transaction.
+    /// Deleting `acp_messages` cascades to `acp_tool_calls` via their FK
+    /// (`foreign_keys = ON`). Used by callers that own a trimmed in-memory
+    /// history so the store never resurrects turns the live agent already
+    /// dropped by appending on top of a stale transcript.
+    pub fn replace_messages(
+        &self,
+        session_uuid: &str,
+        messages: &[ConversationMessage],
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock();
+
+        let session_id: i64 = conn
+            .query_row(
+                "SELECT id FROM acp_sessions WHERE session_uuid = ?1",
+                params![session_uuid],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("unknown session_uuid: {session_uuid}"))?;
+
+        let tx = conn
+            .transaction()
+            .context("Failed to begin replace_messages transaction")?;
+        tx.execute(
+            "DELETE FROM acp_messages WHERE session_id = ?1",
+            params![session_id],
+        )
+        .context("Failed to clear prior messages")?;
+        Self::insert_messages(&tx, session_id, messages, &now)?;
+
+        tx.execute(
+            "UPDATE acp_sessions SET last_activity = ?1 WHERE id = ?2",
+            params![now, session_id],
+        )
+        .context("Failed to update last_activity")?;
+
+        tx.commit().context("Failed to commit replace_messages")?;
+        Ok(())
+    }
+
+    /// Replace a session's message transcript and its breadcrumb provenance
+    /// together in one transaction. `replace_messages` and
+    /// `set_trim_breadcrumb` each commit on their own; calling them back to
+    /// back (as the ACP restore/turn-completion callers used to) leaves a
+    /// window where a crash between the two commits can desynchronize the
+    /// transcript and the flag. Callers that own both values at once should
+    /// use this instead.
+    pub fn replace_messages_and_breadcrumb(
+        &self,
+        session_uuid: &str,
+        messages: &[ConversationMessage],
+        breadcrumb_present: bool,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock();
+
+        let session_id: i64 = conn
+            .query_row(
+                "SELECT id FROM acp_sessions WHERE session_uuid = ?1",
+                params![session_uuid],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("unknown session_uuid: {session_uuid}"))?;
+
+        let tx = conn
+            .transaction()
+            .context("Failed to begin replace_messages_and_breadcrumb transaction")?;
+        tx.execute(
+            "DELETE FROM acp_messages WHERE session_id = ?1",
+            params![session_id],
+        )
+        .context("Failed to clear prior messages")?;
+        Self::insert_messages(&tx, session_id, messages, &now)?;
+        tx.execute(
+            "UPDATE acp_sessions SET last_activity = ?1, trim_breadcrumb = ?2 WHERE id = ?3",
+            params![now, i64::from(breadcrumb_present), session_id],
+        )
+        .context("Failed to update last_activity and trim_breadcrumb")?;
+
+        tx.commit()
+            .context("Failed to commit replace_messages_and_breadcrumb")?;
+        Ok(())
+    }
+
+    /// Insert `messages` into `acp_messages`/`acp_tool_calls`, decomposing
+    /// `AssistantToolCalls`/`ToolResults` variants. Shared by `append_turn`
+    /// (adds to the existing transcript) and `replace_messages` (called
+    /// after clearing it) so both write the same row shapes.
+    ///
+    /// A `Chat` message with `role == "system"` is never written: the system
+    /// prompt is runtime/operator-owned context, not a conversation turn, and
+    /// `session/messages` has no restore-side filter for it. Enforcing this
+    /// here (the one write path both callers share) means a caller that
+    /// persists an agent's full `history()` — which always starts with the
+    /// system prompt — can't leak it into durable ACP transcript rows.
+    fn insert_messages(
+        tx: &rusqlite::Transaction<'_>,
+        session_id: i64,
+        messages: &[ConversationMessage],
+        now: &str,
+    ) -> Result<()> {
         // Track the most recent assistant message_id so a following
         // ToolResults variant can attach its 'out' rows back to it.
         let mut last_assistant_msg_id: Option<i64> = None;
 
         for msg in messages {
             match msg {
+                ConversationMessage::Chat(chat) if chat.role == "system" => continue,
                 ConversationMessage::Chat(chat) => {
                     tx.execute(
                         "INSERT INTO acp_messages
@@ -587,7 +1125,7 @@ impl AcpSessionStore {
                                 )
                                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                                 .with_attrs(::serde_json::json!({
-                                    "session_uuid": session_uuid,
+                                    "session_id": session_id,
                                 })),
                                 "ToolResults without preceding AssistantToolCalls"
                             );
@@ -627,13 +1165,6 @@ impl AcpSessionStore {
             }
         }
 
-        tx.execute(
-            "UPDATE acp_sessions SET last_activity = ?1 WHERE id = ?2",
-            params![now, session_id],
-        )
-        .context("Failed to update last_activity")?;
-
-        tx.commit().context("Failed to commit append_turn")?;
         Ok(())
     }
 
@@ -650,6 +1181,63 @@ impl AcpSessionStore {
                 "set_token_count: no session with uuid {session_uuid}"
             )));
         }
+        Ok(())
+    }
+
+    /// Clear the durable token snapshot back to the schema's unknown
+    /// representation (0). Used when an accepted turn attempt serves a route
+    /// without token usage: the prior snapshot must not survive, mirroring
+    /// the client-side meter which clears on accepted usage-less events.
+    pub fn clear_token_count(&self, session_uuid: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        let rows = conn
+            .execute(
+                "UPDATE acp_sessions SET token_count = 0 WHERE session_uuid = ?1",
+                params![session_uuid],
+            )
+            .context("Failed to clear token_count")?;
+        if rows == 0 {
+            return Err(anyhow::Error::msg(format!(
+                "clear_token_count: no session with uuid {session_uuid}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Apply a `TurnEvent::Usage` to the durable token snapshot. Accepted
+    /// events with usage overwrite it; accepted usage-less events clear it
+    /// back to unknown (0) so a resumed session never replays a stale
+    /// route's count; rejected billing telemetry never touches the store.
+    /// Both durable consumers (ACP server, RPC dispatch) route through here
+    /// so the accepted-gate cannot drift between paths.
+    pub fn persist_usage_snapshot(
+        &self,
+        session_uuid: &str,
+        input_tokens: Option<u64>,
+        accepted: bool,
+    ) -> Result<()> {
+        if !accepted {
+            return Ok(());
+        }
+        match input_tokens {
+            Some(v) => self.set_token_count(session_uuid, v),
+            None => self.clear_token_count(session_uuid),
+        }
+    }
+
+    /// Record whether this session's persisted transcript currently starts
+    /// with the synthetic trim breadcrumb, as one canonical fact alongside
+    /// the transcript. Silently no-ops for an unknown session (matching
+    /// `append_turn`'s tolerance for a session removed mid-turn) rather than
+    /// erroring like `set_token_count`, since this is best-effort bookkeeping
+    /// that must never fail a turn.
+    pub fn set_trim_breadcrumb(&self, session_uuid: &str, present: bool) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE acp_sessions SET trim_breadcrumb = ?1 WHERE session_uuid = ?2",
+            params![i64::from(present), session_uuid],
+        )
+        .context("Failed to set trim_breadcrumb")?;
         Ok(())
     }
 
@@ -916,6 +1504,21 @@ mod tests {
         (tmp, store)
     }
 
+    /// Read the raw `trim_breadcrumb` column, bypassing the inference
+    /// fallback, so a test can tell `NULL` (never recorded) apart from an
+    /// explicit `0`/`1`.
+    fn raw_trim_breadcrumb_column(store: &AcpSessionStore, session_uuid: &str) -> Option<i64> {
+        store
+            .conn
+            .lock()
+            .query_row(
+                "SELECT trim_breadcrumb FROM acp_sessions WHERE session_uuid = ?1",
+                params![session_uuid],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
     #[test]
     fn new_creates_all_four_tables() {
         let (_tmp, store) = open_store();
@@ -958,8 +1561,48 @@ mod tests {
         assert_eq!(data.session_uuid, "sess-abc");
         assert_eq!(data.agent_alias, "personal_code");
         assert_eq!(data.workspace_dir, "/home/user/project");
+        assert_eq!(data.interaction_surface, None);
         assert_eq!(data.token_count, 0);
         assert!(data.messages.is_empty());
+    }
+
+    #[test]
+    fn interaction_surface_round_trips_and_legacy_binding_is_one_way() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session_with_interaction_surface(
+                "sess-surface",
+                "alpha",
+                "/tmp/proj",
+                Some("zerocode_code"),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .load_session("sess-surface")
+                .unwrap()
+                .unwrap()
+                .interaction_surface
+                .as_deref(),
+            Some("zerocode_code")
+        );
+
+        store
+            .create_session("sess-legacy", "alpha", "/tmp/proj")
+            .unwrap();
+        assert_eq!(
+            store
+                .bind_interaction_surface_if_unset("sess-legacy", "zerocode_code")
+                .unwrap(),
+            "zerocode_code"
+        );
+        assert_eq!(
+            store
+                .bind_interaction_surface_if_unset("sess-legacy", "different_surface")
+                .unwrap(),
+            "zerocode_code",
+            "a later caller must not relabel an already-bound session"
+        );
     }
 
     #[test]
@@ -1036,6 +1679,209 @@ mod tests {
             &data.messages[1],
             ConversationMessage::Chat(m) if m.role == "assistant" && m.content == "hi"
         ));
+    }
+
+    #[test]
+    fn replace_messages_drops_prior_rows_and_cascades_to_tool_calls() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-replace", "alpha", "/tmp/proj")
+            .unwrap();
+
+        // An existing turn with a tool call, to prove the old row (and its
+        // cascaded acp_tool_calls row) is fully gone after replace, not left
+        // behind alongside the new transcript.
+        let old = vec![
+            ConversationMessage::AssistantToolCalls {
+                text: Some(String::new()),
+                tool_calls: vec![zeroclaw_api::model_provider::ToolCall {
+                    id: "call-1".into(),
+                    name: "old_tool".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![
+                zeroclaw_api::model_provider::ToolResultMessage {
+                    tool_call_id: "call-1".into(),
+                    content: "old result".into(),
+                    tool_name: "old_tool".into(),
+                },
+            ]),
+        ];
+        store.append_turn("sess-replace", &old).unwrap();
+        assert_eq!(
+            store
+                .load_session("sess-replace")
+                .unwrap()
+                .unwrap()
+                .messages
+                .len(),
+            2
+        );
+
+        let new = vec![
+            ConversationMessage::Chat(ChatMessage::user("hello")),
+            ConversationMessage::Chat(ChatMessage::assistant("hi")),
+        ];
+        store.replace_messages("sess-replace", &new).unwrap();
+
+        let data = store.load_session("sess-replace").unwrap().unwrap();
+        assert_eq!(
+            data.messages.len(),
+            2,
+            "replace must not leave the prior turn's rows behind"
+        );
+        assert!(matches!(
+            &data.messages[0],
+            ConversationMessage::Chat(m) if m.role == "user" && m.content == "hello"
+        ));
+        assert!(matches!(
+            &data.messages[1],
+            ConversationMessage::Chat(m) if m.role == "assistant" && m.content == "hi"
+        ));
+
+        // A fresh call, unrelated to the replaced-away "call-1", must not
+        // resolve tool_name off the deleted (cascaded) tool_calls row.
+        store
+            .append_turn(
+                "sess-replace",
+                &[
+                    ConversationMessage::AssistantToolCalls {
+                        text: Some(String::new()),
+                        tool_calls: vec![zeroclaw_api::model_provider::ToolCall {
+                            id: "call-2".into(),
+                            name: "new_tool".into(),
+                            arguments: "{}".into(),
+                            extra_content: None,
+                        }],
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::ToolResults(vec![
+                        zeroclaw_api::model_provider::ToolResultMessage {
+                            tool_call_id: "call-2".into(),
+                            content: "new result".into(),
+                            tool_name: "new_tool".into(),
+                        },
+                    ]),
+                ],
+            )
+            .unwrap();
+        let data = store.load_session("sess-replace").unwrap().unwrap();
+        assert_eq!(data.messages.len(), 4);
+    }
+
+    #[test]
+    fn insert_messages_never_persists_a_system_row() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-system", "alpha", "/tmp/proj")
+            .unwrap();
+
+        // An agent's authoritative `history()` always leads with the system
+        // prompt. Both write paths must drop it, since durable ACP rows
+        // become `session/messages` API output with no restore-side filter.
+        let full_history = vec![
+            ConversationMessage::Chat(ChatMessage::system("you are a helpful agent")),
+            ConversationMessage::Chat(ChatMessage::user("hello")),
+            ConversationMessage::Chat(ChatMessage::assistant("hi")),
+        ];
+        store
+            .replace_messages_and_breadcrumb("sess-system", &full_history, false)
+            .unwrap();
+
+        let data = store.load_session("sess-system").unwrap().unwrap();
+        assert_eq!(
+            data.messages.len(),
+            2,
+            "the system row must not be persisted"
+        );
+        assert!(
+            data.messages
+                .iter()
+                .all(|m| !matches!(m, ConversationMessage::Chat(c) if c.role == "system")),
+        );
+
+        // append_turn shares the same insertion path.
+        store
+            .append_turn(
+                "sess-system",
+                &[ConversationMessage::Chat(ChatMessage::system(
+                    "a later system message",
+                ))],
+            )
+            .unwrap();
+        let data = store.load_session("sess-system").unwrap().unwrap();
+        assert_eq!(
+            data.messages.len(),
+            2,
+            "append_turn must skip system rows too"
+        );
+    }
+
+    #[test]
+    fn load_session_filters_a_legacy_system_row_written_before_the_write_path_fix() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-legacy-system", "alpha", "/tmp/proj")
+            .unwrap();
+        store
+            .append_turn(
+                "sess-legacy-system",
+                &[ConversationMessage::Chat(ChatMessage::user("hello"))],
+            )
+            .unwrap();
+
+        // Simulate a row written before `insert_messages` filtered system
+        // rows: insert one directly, bypassing every write path.
+        {
+            let conn = store.conn.lock();
+            let session_id: i64 = conn
+                .query_row(
+                    "SELECT id FROM acp_sessions WHERE session_uuid = ?1",
+                    params!["sess-legacy-system"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "INSERT INTO acp_messages (session_id, role, content, created_at)
+                 VALUES (?1, 'system', 'legacy stored prompt', '2020-01-01T00:00:00Z')",
+                params![session_id],
+            )
+            .unwrap();
+        }
+
+        let data = store.load_session("sess-legacy-system").unwrap().unwrap();
+        assert!(
+            data.messages
+                .iter()
+                .all(|m| !matches!(m, ConversationMessage::Chat(c) if c.role == "system")),
+            "a legacy system row must not reach session/messages output even though \
+             it predates the write-path filter: {:?}",
+            data.messages
+        );
+
+        let restored = store
+            .load_session_for_restore("sess-legacy-system")
+            .unwrap();
+        let AcpSessionRestore::Restorable(restored) = restored else {
+            panic!("expected a restorable session");
+        };
+        assert!(
+            restored
+                .messages
+                .iter()
+                .all(|m| !matches!(m, ConversationMessage::Chat(c) if c.role == "system")),
+            "restore must not resurrect a legacy system row into the Agent's history either"
+        );
+    }
+
+    #[test]
+    fn replace_messages_unknown_session_errors() {
+        let (_tmp, store) = open_store();
+        let msgs = vec![ConversationMessage::Chat(ChatMessage::user("hi"))];
+        assert!(store.replace_messages("no-such-session", &msgs).is_err());
     }
 
     #[test]
@@ -1342,6 +2188,78 @@ mod tests {
     }
 
     #[test]
+    fn clear_token_count_resets_snapshot_to_unknown() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-clr", "alpha", "/tmp/proj")
+            .unwrap();
+        store.set_token_count("sess-clr", 152_306).unwrap();
+        store.clear_token_count("sess-clr").unwrap();
+        assert_eq!(
+            store.load_session("sess-clr").unwrap().unwrap().token_count,
+            0,
+            "accepted usage-less call must clear the durable snapshot"
+        );
+    }
+
+    #[test]
+    fn clear_token_count_errors_on_unknown_session() {
+        let (_tmp, store) = open_store();
+        let err = store.clear_token_count("nonexistent").unwrap_err();
+        assert!(
+            err.to_string().contains("nonexistent"),
+            "error must name the missing session_uuid; got: {err}"
+        );
+    }
+
+    #[test]
+    fn persist_usage_snapshot_accepted_sequence_clears_on_missing() {
+        // Accepted A with usage, then accepted B without: the durable
+        // snapshot must clear, not retain A's count.
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-seq", "alpha", "/tmp/proj")
+            .unwrap();
+        store
+            .persist_usage_snapshot("sess-seq", Some(1000), true)
+            .unwrap();
+        assert_eq!(
+            store.load_session("sess-seq").unwrap().unwrap().token_count,
+            1000
+        );
+        store
+            .persist_usage_snapshot("sess-seq", None, true)
+            .unwrap();
+        assert_eq!(
+            store.load_session("sess-seq").unwrap().unwrap().token_count,
+            0,
+            "accepted usage-less call must clear the durable snapshot"
+        );
+    }
+
+    #[test]
+    fn persist_usage_snapshot_rejected_never_touches_store() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-rej", "alpha", "/tmp/proj")
+            .unwrap();
+        store
+            .persist_usage_snapshot("sess-rej", Some(1000), true)
+            .unwrap();
+        store
+            .persist_usage_snapshot("sess-rej", Some(5000), false)
+            .unwrap();
+        store
+            .persist_usage_snapshot("sess-rej", None, false)
+            .unwrap();
+        assert_eq!(
+            store.load_session("sess-rej").unwrap().unwrap().token_count,
+            1000,
+            "rejected billing telemetry is billing-only"
+        );
+    }
+
+    #[test]
     fn append_event_writes_action_outcome_payload() {
         let (_tmp, store) = open_store();
         store
@@ -1420,6 +2338,143 @@ mod tests {
     }
 
     #[test]
+    fn list_live_sessions_by_agent_filters_owner_and_killed_rows() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("alpha-old", "alpha", "/ws/old")
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        store
+            .create_session("alpha-new", "alpha", "/ws/new")
+            .unwrap();
+        store
+            .append_turn(
+                "alpha-new",
+                &[ConversationMessage::Chat(ChatMessage::user("hello"))],
+            )
+            .unwrap();
+        store
+            .create_session("alpha-killed", "alpha", "/ws/killed")
+            .unwrap();
+        store.mark_session_killed("alpha-killed").unwrap();
+        store
+            .create_session("beta-live", "beta", "/ws/beta")
+            .unwrap();
+
+        let list = store.list_live_sessions_by_agent("alpha").unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].session_uuid, "alpha-new");
+        assert_eq!(list[0].message_count, 1);
+        assert_eq!(list[1].session_uuid, "alpha-old");
+        assert!(list.iter().all(|summary| summary.agent_alias == "alpha"));
+        assert!(
+            store
+                .list_live_sessions_by_agent("missing")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn load_session_for_agent_authorizes_uuid_and_preserves_projection() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session_with_interaction_surface(
+                "owned",
+                "alpha",
+                "/ws/alpha",
+                Some("zerocode_code"),
+            )
+            .unwrap();
+        store
+            .append_turn(
+                "owned",
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("hello")),
+                    ConversationMessage::AssistantToolCalls {
+                        text: Some("calling".into()),
+                        tool_calls: vec![ToolCall {
+                            id: "tc-1".into(),
+                            name: "shell".into(),
+                            arguments: "{}".into(),
+                            extra_content: None,
+                        }],
+                        reasoning_content: Some("thinking".into()),
+                    },
+                    ConversationMessage::ToolResults(vec![ToolResultMessage {
+                        tool_call_id: "tc-1".into(),
+                        content: "done".into(),
+                        tool_name: String::new(),
+                    }]),
+                ],
+            )
+            .unwrap();
+
+        let data = store
+            .load_session_for_agent("owned", "alpha")
+            .unwrap()
+            .expect("matching owner should load");
+        assert_eq!(data.agent_alias, "alpha");
+        assert_eq!(data.interaction_surface.as_deref(), Some("zerocode_code"));
+        assert_eq!(data.messages.len(), 3);
+        assert!(matches!(
+            &data.messages[0],
+            ConversationMessage::Chat(message)
+                if message.role == "user" && message.content == "hello"
+        ));
+        assert!(matches!(
+            &data.messages[1],
+            ConversationMessage::AssistantToolCalls {
+                text: Some(text),
+                tool_calls,
+                reasoning_content: Some(reasoning),
+            }
+                if text == "calling"
+                    && tool_calls.len() == 1
+                    && tool_calls[0].id == "tc-1"
+                    && reasoning == "thinking"
+        ));
+        assert!(matches!(
+            &data.messages[2],
+            ConversationMessage::ToolResults(results)
+                if results.len() == 1
+                    && results[0].tool_call_id == "tc-1"
+                    && results[0].content == "done"
+        ));
+
+        // SQL-level authorization deliberately gives the same result for a
+        // foreign owner and a UUID that does not exist.
+        assert!(
+            store
+                .load_session_for_agent("owned", "beta")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .load_session_for_agent("unknown", "alpha")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.classify_session_for_agent("owned", "alpha").unwrap(),
+            AcpSessionAccess::Owned
+        );
+        assert_eq!(
+            store.classify_session_for_agent("owned", "beta").unwrap(),
+            AcpSessionAccess::Foreign
+        );
+        assert_eq!(
+            store
+                .classify_session_for_agent("unknown", "alpha")
+                .unwrap(),
+            AcpSessionAccess::Missing
+        );
+        assert!(store.is_live_session_for_agent("owned", "alpha").unwrap());
+        assert_eq!(store.list_session_ids().unwrap(), vec!["owned"]);
+    }
+
+    #[test]
     fn per_agent_cascade_counts_live_and_deletes_only_that_agent() {
         let (_tmp, store) = open_store();
         store.create_session("a-live", "alpha", "/ws/a1").unwrap();
@@ -1460,5 +2515,182 @@ mod tests {
         assert_eq!(store.list_sessions_by_agent("beta").unwrap().len(), 1);
         // unknown source → 0
         assert_eq!(store.rename_sessions_by_agent("ghost", "x").unwrap(), 0);
+    }
+
+    #[test]
+    fn trim_breadcrumb_provenance_is_a_canonical_column_not_inferred_from_text() {
+        // Regression: restore call sites used to infer breadcrumb ownership by
+        // comparing the first stored message's text against the localized
+        // breadcrumb string. A genuine user turn that happens to contain that
+        // exact text must NOT be misclassified as a synthetic breadcrumb, and
+        // a session that never trimmed must restore with `trim_breadcrumb ==
+        // false` regardless of message content.
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-genuine-text", "alpha", "/tmp/proj")
+            .unwrap();
+        // A real user message that happens to equal a breadcrumb-shaped string.
+        store
+            .append_turn(
+                "sess-genuine-text",
+                &[ConversationMessage::Chat(ChatMessage::user(
+                    "(earlier history was trimmed)",
+                ))],
+            )
+            .unwrap();
+
+        let restored = match store.load_session_for_restore("sess-genuine-text").unwrap() {
+            AcpSessionRestore::Restorable(data) => data,
+            AcpSessionRestore::Missing => panic!("expected a restorable session, got Missing"),
+            AcpSessionRestore::Killed => panic!("expected a restorable session, got Killed"),
+        };
+        assert!(
+            !restored.trim_breadcrumb,
+            "a genuine user message with breadcrumb-shaped text must not be \
+             classified as a synthetic breadcrumb absent an explicit flag"
+        );
+    }
+
+    #[test]
+    fn legacy_null_trim_breadcrumb_is_inferred_once_then_recorded() {
+        // Simulate a row written before the `trim_breadcrumb` column
+        // existed: the column is `NULL`, not `0`. Restore must infer
+        // provenance from the leading synthetic marker on this one-time
+        // migration, not treat `NULL` the same as an explicit "no
+        // breadcrumb" and drop/miscount the marker.
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-legacy-marker", "alpha", "/tmp/proj")
+            .unwrap();
+        store
+            .append_turn(
+                "sess-legacy-marker",
+                &[
+                    ConversationMessage::Chat(ChatMessage::user(HISTORY_TRIM_BREADCRUMB_CANONICAL)),
+                    ConversationMessage::Chat(ChatMessage::user("real turn")),
+                ],
+            )
+            .unwrap();
+        // Force the column back to NULL to simulate a pre-migration row.
+        store
+            .conn
+            .lock()
+            .execute(
+                "UPDATE acp_sessions SET trim_breadcrumb = NULL WHERE session_uuid = ?1",
+                params!["sess-legacy-marker"],
+            )
+            .unwrap();
+
+        let restored = match store
+            .load_session_for_restore("sess-legacy-marker")
+            .unwrap()
+        {
+            AcpSessionRestore::Restorable(data) => data,
+            AcpSessionRestore::Missing => panic!("expected a restorable session, got Missing"),
+            AcpSessionRestore::Killed => panic!("expected a restorable session, got Killed"),
+        };
+        assert!(
+            restored.trim_breadcrumb,
+            "a NULL (legacy) row with a leading canonical marker must be \
+             inferred as carrying the breadcrumb"
+        );
+        assert_eq!(
+            raw_trim_breadcrumb_column(&store, "sess-legacy-marker"),
+            Some(1),
+            "the one-time inference must be recorded back to the column, \
+             not re-inferred from text on every restore"
+        );
+
+        // A genuine colliding user turn (no synthetic marker at all) must
+        // NOT be misclassified when the column is legacy-NULL either.
+        store
+            .create_session("sess-legacy-no-marker", "alpha", "/tmp/proj")
+            .unwrap();
+        store
+            .append_turn(
+                "sess-legacy-no-marker",
+                &[ConversationMessage::Chat(ChatMessage::user("hello"))],
+            )
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .execute(
+                "UPDATE acp_sessions SET trim_breadcrumb = NULL WHERE session_uuid = ?1",
+                params!["sess-legacy-no-marker"],
+            )
+            .unwrap();
+        let restored_clean = match store
+            .load_session_for_restore("sess-legacy-no-marker")
+            .unwrap()
+        {
+            AcpSessionRestore::Restorable(data) => data,
+            AcpSessionRestore::Missing => panic!("expected a restorable session, got Missing"),
+            AcpSessionRestore::Killed => panic!("expected a restorable session, got Killed"),
+        };
+        assert!(
+            !restored_clean.trim_breadcrumb,
+            "a legacy-NULL row with no marker-shaped text must not be inferred as true"
+        );
+        assert_eq!(
+            raw_trim_breadcrumb_column(&store, "sess-legacy-no-marker"),
+            Some(0),
+            "the one-time inference must be recorded back to the column even \
+             when it infers false, not left NULL to be re-inferred later"
+        );
+    }
+
+    #[test]
+    fn trim_breadcrumb_survives_restore_and_a_second_trim() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-trimmed", "alpha", "/tmp/proj")
+            .unwrap();
+        store
+            .append_turn(
+                "sess-trimmed",
+                &[ConversationMessage::Chat(ChatMessage::user(
+                    "most recent turn",
+                ))],
+            )
+            .unwrap();
+
+        // First trim: mark the session as carrying a synthetic breadcrumb.
+        store.set_trim_breadcrumb("sess-trimmed", true).unwrap();
+        let restored = match store.load_session_for_restore("sess-trimmed").unwrap() {
+            AcpSessionRestore::Restorable(data) => data,
+            AcpSessionRestore::Missing => panic!("expected a restorable session, got Missing"),
+            AcpSessionRestore::Killed => panic!("expected a restorable session, got Killed"),
+        };
+        assert!(
+            restored.trim_breadcrumb,
+            "the flag must be readable immediately after being set, as a \
+             restart would read it"
+        );
+
+        // A second trim on the same session (e.g. the next turn overflows
+        // again) must leave the flag true, not toggle or duplicate it.
+        store.set_trim_breadcrumb("sess-trimmed", true).unwrap();
+        let restored_again = match store.load_session_for_restore("sess-trimmed").unwrap() {
+            AcpSessionRestore::Restorable(data) => data,
+            AcpSessionRestore::Missing => panic!("expected a restorable session, got Missing"),
+            AcpSessionRestore::Killed => panic!("expected a restorable session, got Killed"),
+        };
+        assert!(
+            restored_again.trim_breadcrumb,
+            "the breadcrumb flag must remain true across a second trim"
+        );
+
+        // Clearing it (e.g. `clear_history`) must be independently observable.
+        store.set_trim_breadcrumb("sess-trimmed", false).unwrap();
+        let restored_cleared = match store.load_session_for_restore("sess-trimmed").unwrap() {
+            AcpSessionRestore::Restorable(data) => data,
+            AcpSessionRestore::Missing => panic!("expected a restorable session, got Missing"),
+            AcpSessionRestore::Killed => panic!("expected a restorable session, got Killed"),
+        };
+        assert!(
+            !restored_cleared.trim_breadcrumb,
+            "the flag must be explicitly clearable and not re-inferred from history text"
+        );
     }
 }

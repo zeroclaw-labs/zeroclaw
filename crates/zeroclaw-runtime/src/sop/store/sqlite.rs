@@ -840,6 +840,55 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_run_is_skipped_on_rehydration_and_releases_claim() {
+        let s = SqliteRunStore::open_in_memory().unwrap();
+        let mut r1 = run("r1", SopRunStatus::Running, "1");
+        r1.revision = 1;
+        s.save_run(&r1).unwrap();
+        s.try_claim_run("r1", "deploy", 1, 1).unwrap().unwrap();
+        assert_eq!(s.load_active_runs().unwrap().len(), 1);
+
+        // A terminal run is never re-claimable (`claim_single_winner_cap_and_terminal`),
+        // so the release is proven through the per-sop cap instead: a second run
+        // cannot claim while r1 holds the sole slot.
+        s.save_run(&run("r2", SopRunStatus::Running, "1")).unwrap();
+        assert!(
+            s.try_claim_run("r2", "deploy", 1, 1).unwrap().is_none(),
+            "the cap of 1 is exhausted while r1 holds its claim"
+        );
+
+        // Cancellation persists terminal state and its audit event atomically,
+        // the same store call an operator cancel endpoint uses.
+        let mut cancelled = run("r1", SopRunStatus::Cancelled, "2");
+        cancelled.revision = 2;
+        s.finish_run_with_event("r1", &cancelled, &ev("r1", "run_cancelled"))
+            .unwrap();
+
+        let active_ids: Vec<String> = s
+            .load_active_runs()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.run.run_id)
+            .collect();
+        assert_eq!(
+            active_ids,
+            vec!["r2".to_string()],
+            "a cancelled run must be skipped on restart rehydration; r2 stays active"
+        );
+        assert!(
+            s.try_claim_run("r2", "deploy", 1, 1).unwrap().is_some(),
+            "cancellation must release r1's claim, freeing the per-sop cap slot for r2"
+        );
+        assert!(
+            s.list_events("r1")
+                .unwrap()
+                .iter()
+                .any(|e| e.kind == "run_cancelled"),
+            "the cancellation audit event must be durable"
+        );
+    }
+
+    #[test]
     fn failed_run_reason_survives_file_backed_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("runs.db");

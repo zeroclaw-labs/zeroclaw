@@ -282,6 +282,7 @@ impl Tool for CronUpdateTool {
             &self.config,
             self.runtime.as_ref(),
             &self.security,
+            Some(self.agent_alias.as_str()),
             job_id,
             patch,
             approved,
@@ -1001,5 +1002,46 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("no_such_job"),);
+    }
+
+    /// A job owned by someone else. An agent job needs no risk profile for its
+    /// owner, which keeps the fixture to the ownership boundary.
+    fn other_agents_job(cfg: &Config) -> crate::cron::CronJob {
+        cron::add_agent_job(
+            cfg,
+            "other-agent",
+            Some("secret_job".into()),
+            crate::cron::Schedule::Cron {
+                expr: "0 8 * * *".into(),
+                tz: None,
+            },
+            "read the other agent's inbox",
+            crate::cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cannot_update_another_agents_job_by_id() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let theirs = other_agents_job(&cfg);
+
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+        let result = tool
+            .execute(json!({"job_id": theirs.id, "patch": {"enabled": false}}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            cron::get_job(&cfg, &theirs.id).unwrap().enabled,
+            "other agent's job must be untouched"
+        );
     }
 }

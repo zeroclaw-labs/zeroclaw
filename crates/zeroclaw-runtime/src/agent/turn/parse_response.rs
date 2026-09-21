@@ -50,19 +50,22 @@ pub(crate) fn build_native_assistant_history(
         serde_json::Value::String(text.trim().to_string())
     };
 
-    let mut obj = serde_json::json!({
-        "content": content,
-        "tool_calls": calls_json,
-    });
+    let mut obj = serde_json::Map::from_iter([
+        ("content".to_string(), content),
+        (
+            "tool_calls".to_string(),
+            serde_json::Value::Array(calls_json),
+        ),
+    ]);
 
     if let Some(rc) = reasoning_content {
-        obj.as_object_mut().unwrap().insert(
+        obj.insert(
             "reasoning_content".to_string(),
             serde_json::Value::String(rc.to_string()),
         );
     }
 
-    obj.to_string()
+    serde_json::Value::Object(obj).to_string()
 }
 
 pub(crate) fn resolve_display_text(
@@ -121,6 +124,70 @@ pub(crate) struct InterpretedResponse {
     pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
 }
 
+/// Recover double-encoded structured arguments without interpreting free text.
+/// This is intentionally not a schema validator: opaque or composed schemas
+/// leave the value unchanged for the tool's normal validation path.
+fn recover_structured_arguments(
+    value: &mut serde_json::Value,
+    schema: &serde_json::Value,
+    depth: usize,
+) {
+    use serde_json::Value;
+
+    if depth >= 64
+        || [
+            "$ref",
+            "$dynamicRef",
+            "allOf",
+            "anyOf",
+            "oneOf",
+            "not",
+            "if",
+            "then",
+            "else",
+        ]
+        .iter()
+        .any(|key| schema.get(*key).is_some())
+    {
+        return;
+    }
+    let Some(kind @ ("object" | "array")) = schema.get("type").and_then(Value::as_str) else {
+        return;
+    };
+    // Tuple schemas do not describe every position with the same item schema.
+    if kind == "array" && schema.get("prefixItems").is_some() {
+        return;
+    }
+    if let Value::String(text) = value {
+        let Ok(parsed) = serde_json::from_str::<Value>(text) else {
+            return;
+        };
+        if (kind == "object" && !parsed.is_object()) || (kind == "array" && !parsed.is_array()) {
+            return;
+        }
+        *value = parsed;
+    }
+    match (kind, value) {
+        ("object", Value::Object(fields)) => {
+            if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+                for (name, field) in fields {
+                    if let Some(property) = properties.get(name) {
+                        recover_structured_arguments(field, property, depth + 1);
+                    }
+                }
+            }
+        }
+        ("array", Value::Array(items)) => {
+            if let Some(item_schema) = schema.get("items").filter(|item| item.is_object()) {
+                for item in items {
+                    recover_structured_arguments(item, item_schema, depth + 1);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Interpret a successful chat response. Takes the response by value and
 /// holds no borrows of `ctx` past the call (RUN_SHEET `turn.parse_response`).
 pub(crate) async fn interpret_chat_response(
@@ -134,7 +201,7 @@ pub(crate) async fn interpret_chat_response(
     iteration: usize,
     detect_protocol_without_tools: bool,
 ) -> InterpretedResponse {
-    let resp_input_tokens = resp.usage.as_ref().and_then(|usage| usage.input_tokens);
+    let resp_input_tokens = resp.usage.as_ref().and_then(|u| u.input_tokens);
 
     let response_text = strip_think_tags(resp.text_or_empty());
     // Strip trailing terminal markers (`<eom>`, `<|eom|>`) from non-streaming responses.
@@ -171,6 +238,12 @@ pub(crate) async fn interpret_chat_response(
                 specs
                     .known_tool_names
                     .contains(&call.name.to_ascii_lowercase())
+            })
+            .map(|mut call| {
+                if let Some(spec) = specs.tool_specs.iter().find(|spec| spec.name == call.name) {
+                    recover_structured_arguments(&mut call.arguments, &spec.parameters, 0);
+                }
+                call
             })
             .collect();
         if !fallback_text.is_empty() && !filtered_calls.is_empty() {
@@ -261,9 +334,12 @@ pub(crate) async fn interpret_chat_response(
     }
 }
 
+use zeroclaw_providers::dispatch::AcceptedRoute;
+
 /// Emit effects which are valid only after the turn loop accepts the parsed
 /// response. Keeping this separate from interpretation prevents a malformed
 /// transport success from advancing accepted accounting or success telemetry.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn record_accepted_chat_response(
     ctx: &TurnCtx<'_>,
     served_provider: &str,
@@ -275,12 +351,37 @@ pub(crate) async fn record_accepted_chat_response(
     history: &[ChatMessage],
     llm_started_at: Instant,
     iteration: usize,
+    accepted_route: Option<&AcceptedRoute>,
 ) {
+    // The accepted_route tuple is the canonical identity when Reliable wrapping
+    // produced an AcceptedRoute. When no AcceptedRoute exists (direct/vision
+    // routing without Reliable), fall back to ctx.serving_* overrides.
+    let (effective_provider, effective_model) = match accepted_route {
+        Some(route) => (route.provider_ref(), route.model()),
+        None => {
+            // Vision routing without Reliable: use ctx.serving_* overrides when
+            // they differ from the base provider.
+            let prov = if let Some(ref vision_provider) = ctx.serving_provider_name
+                && vision_provider != ctx.provider_name
+            {
+                vision_provider.as_str()
+            } else {
+                served_provider
+            };
+            let mdl = if ctx.serving_model.as_deref().is_some_and(|m| m != model) {
+                ctx.serving_model.as_deref().unwrap_or(model)
+            } else {
+                model
+            };
+            (prov, mdl)
+        }
+    };
+
     let input_tokens = usage.and_then(|usage| usage.input_tokens);
     let output_tokens = usage.and_then(|usage| usage.output_tokens);
     ctx.observer.record_event(&ObserverEvent::LlmResponse {
-        model_provider: served_provider.to_string(),
-        model: model.to_string(),
+        model_provider: effective_provider.to_string(),
+        model: effective_model.to_string(),
         duration: llm_started_at.elapsed(),
         success: true,
         error_message: None,
@@ -293,17 +394,27 @@ pub(crate) async fn record_accepted_chat_response(
         messages: capture_llm_messages(history, Some(response_text), native_tool_calls),
     });
     let cost_usd = usage
-        .and_then(|usage| record_tool_loop_cost_usage(served_provider, model, usage))
+        .and_then(|usage| record_tool_loop_cost_usage(effective_provider, effective_model, usage))
         .map(|(_total_tokens, cost_usd)| cost_usd);
-    if let Some(tx) = ctx.event_tx
-        && let Some(usage) = usage
-    {
+    // Exactly-one per accepted response, even when the provider returned no
+    // usage data, so terminal identity and context-window accounting always
+    // describe the accepted serving provider/model. The caller settles
+    // rejected physical attempts separately and never reaches this point.
+    if let Some(tx) = ctx.event_tx {
         let _ = tx
             .send(TurnEvent::Usage {
-                input_tokens: usage.input_tokens,
-                cached_input_tokens: usage.cached_input_tokens,
-                output_tokens: usage.output_tokens,
+                input_tokens,
+                cached_input_tokens: usage.and_then(|u| u.cached_input_tokens),
+                output_tokens,
                 cost_usd,
+                context_token_budget: Some(ctx.context_limits.context_token_budget as u64),
+                model_context_window: ctx
+                    .context_limits
+                    .configured_model_context_window()
+                    .map(|tokens| tokens as u64),
+                provider_ref: effective_provider.to_string(),
+                model: effective_model.to_string(),
+                accepted: true,
             })
             .await;
     }
@@ -314,7 +425,7 @@ pub(crate) async fn record_accepted_chat_response(
             .with_outcome(::zeroclaw_log::EventOutcome::Success)
             .with_duration(u64::try_from(llm_started_at.elapsed().as_millis()).unwrap_or(u64::MAX))
             .with_attrs(::serde_json::json!({
-                "model": model,
+                "model": effective_model,
                 "iteration": iteration + 1,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
@@ -431,6 +542,217 @@ mod tests {
 }
 
 #[cfg(test)]
+mod argument_preservation_tests {
+    use super::*;
+    use crate::tools::{FileWriteTool, Tool, ToolSpec};
+    use serde_json::{Value, json};
+    use std::{collections::HashSet, sync::Arc};
+    use zeroclaw_config::{autonomy::AutonomyLevel, policy::SecurityPolicy};
+
+    async fn interpret(
+        spec: ToolSpec,
+        arguments: Value,
+        native: bool,
+        use_native_tools: bool,
+    ) -> InterpretedResponse {
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let ctx = TurnCtx {
+            parent_agent_alias: None,
+            observer: &crate::observability::NoopObserver,
+            provider_name: "test.provider",
+            model: "test-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+            temperature: None,
+            approval: None,
+            channel_name: "",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            agent_alias: None,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
+            turn_id: "argument-preservation",
+            serving_provider_name: None,
+            serving_model: None,
+        };
+        let name = spec.name.clone();
+        let specs = IterationToolSpecs {
+            known_tool_names: HashSet::from([name.clone()]),
+            tool_specs: vec![spec],
+            use_native_tools,
+        };
+        let resp = if native {
+            ChatResponse {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "call-test".into(),
+                    name,
+                    arguments: arguments.to_string(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            }
+        } else {
+            ChatResponse {
+                text: Some(format!(
+                    "<tool_call>{}</tool_call>",
+                    json!({"id": "call-test", "name": name, "arguments": arguments})
+                )),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            }
+        };
+        interpret_chat_response(
+            &ctx,
+            "test.provider",
+            "test-model",
+            resp,
+            &[],
+            &specs,
+            false,
+            0,
+            false,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn json_document_reaches_file_write_unchanged() {
+        let workspace = tempfile::tempdir().unwrap();
+        let tool = FileWriteTool::new(Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.path().to_owned(),
+            ..SecurityPolicy::default()
+        }));
+        let document = "{\n  \"message\": \"你好\", \"nested\": \"[1,2]\"\n}\n";
+        let interpreted = interpret(
+            tool.spec(),
+            json!({"path": "document.json", "content": document}),
+            false,
+            false,
+        )
+        .await;
+        assert!(!interpreted.parse_issue_detected);
+        assert_eq!(interpreted.tool_calls.len(), 1);
+        let call = &interpreted.tool_calls[0];
+        assert_eq!(call.name, "file_write");
+        assert_eq!(call.arguments["content"], document);
+        let result = tool.execute(call.arguments.clone()).await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            std::fs::read(workspace.path().join("document.json")).unwrap(),
+            document.as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_recovers_structured_fields_but_native_calls_are_unchanged() {
+        let schema = json!({"type":"object", "properties":{
+            "params":{"type":"object"},
+            "items":{"type":"array", "items":{"type":"string"}},
+            "content":{"type":"string"}
+        }});
+        let args = json!({"params":"{\"maxResults\":3}", "items":"[\"{\\\"id\\\":1}\"]", "content":"[1,2]"});
+        for use_native_tools in [false, true] {
+            let fallback = interpret(
+                ToolSpec::new("test_tool", "test", schema.clone()),
+                args.clone(),
+                false,
+                use_native_tools,
+            )
+            .await;
+            assert!(!fallback.parse_issue_detected);
+            let recovered = &fallback.tool_calls[0].arguments;
+            assert_eq!(recovered["params"], json!({"maxResults":3}));
+            assert_eq!(recovered["items"], json!(["{\"id\":1}"]));
+            assert_eq!(recovered["content"], "[1,2]");
+            if use_native_tools {
+                let history: Value =
+                    serde_json::from_str(&fallback.assistant_history_content).unwrap();
+                let history_args: Value =
+                    serde_json::from_str(history["tool_calls"][0]["arguments"].as_str().unwrap())
+                        .unwrap();
+                assert_eq!(&history_args, recovered);
+            } else {
+                // Prompt-guided providers retain their original textual transcript.
+                assert_eq!(fallback.assistant_history_content, fallback.response_text);
+            }
+        }
+        let native = interpret(
+            ToolSpec::new("test_tool", "test", schema),
+            args.clone(),
+            true,
+            true,
+        )
+        .await;
+        assert_eq!(native.tool_calls[0].arguments, args);
+    }
+
+    #[test]
+    fn recovery_follows_declared_children_not_json_looking_data() {
+        let schema = json!({"type":"object", "properties":{
+            "rows":{"type":"array", "items":{"type":"object", "properties":{
+                "structured":{"type":"object"}, "text":{"type":"string"}
+            }}},
+            "opaque":{"type":"object"}
+        }});
+        let mut value = json!({
+            "rows":[{"structured":"{\"x\":1}", "text":"{\"x\":1}", "unknown":"[1]"}],
+            "opaque":{"unknown":"{\"x\":1}"}, "unknown":"[1]"
+        });
+        recover_structured_arguments(&mut value, &schema, 0);
+        assert_eq!(value["rows"][0]["structured"], json!({"x":1}));
+        assert_eq!(value["rows"][0]["text"], "{\"x\":1}");
+        assert_eq!(value["rows"][0]["unknown"], "[1]");
+        assert_eq!(value["opaque"]["unknown"], "{\"x\":1}");
+        assert_eq!(value["unknown"], "[1]");
+    }
+
+    #[test]
+    fn ambiguous_invalid_and_mismatched_values_are_untouched() {
+        for (schema, input) in [
+            (json!({}), json!("{}")),
+            (json!({"type":"string"}), json!("{}")),
+            (json!({"type":["object","string"]}), json!("{}")),
+            (
+                json!({"type":"object", "$ref":"#/$defs/thing"}),
+                json!("{}"),
+            ),
+            (json!({"type":"object", "anyOf":[{}]}), json!("{}")),
+            (json!({"type":"array", "prefixItems":[{}]}), json!("[]")),
+            (json!({"type":"object"}), json!("{bad")),
+            (json!({"type":"object"}), json!("[]")),
+            (json!({"type":"array"}), json!("{}")),
+            (json!({"type":"object"}), json!(null)),
+        ] {
+            let mut value = input.clone();
+            recover_structured_arguments(&mut value, &schema, 0);
+            assert_eq!(value, input, "schema: {schema}");
+        }
+    }
+
+    #[test]
+    fn recovery_depth_limit_keeps_deeper_values_untouched() {
+        let mut schema = json!({"type":"object"});
+        let mut value = json!("{}");
+        for _ in 0..64 {
+            schema = json!({"type":"object", "properties":{"child":schema}});
+            value = json!({"child":value});
+        }
+        let original = value.clone();
+        recover_structured_arguments(&mut value, &schema, 0);
+        assert_eq!(value, original);
+    }
+}
+
+#[cfg(test)]
 mod cost_usd_regression_tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
@@ -481,6 +803,12 @@ mod cost_usd_regression_tests {
             observer: &crate::observability::NoopObserver,
             provider_name: provider,
             model,
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                model_context_window: 32_000,
+                context_token_budget: 32_000,
+                model_context_window_source:
+                    zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            },
             temperature: None,
             approval: None,
             channel_name: "",
@@ -496,6 +824,8 @@ mod cost_usd_regression_tests {
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
             agent_alias: None,
             turn_id: "turn-cost-regression",
+            serving_provider_name: None,
+            serving_model: None,
         };
 
         let specs = IterationToolSpecs {
@@ -511,6 +841,7 @@ mod cost_usd_regression_tests {
                 input_tokens: Some(input_tokens),
                 output_tokens: Some(output_tokens),
                 cached_input_tokens: Some(0),
+                cache_creation_input_tokens: None,
             }),
             reasoning_content: None,
         };
@@ -524,7 +855,7 @@ mod cost_usd_regression_tests {
         let mut log_rx = zeroclaw_log::subscribe_or_install();
         while log_rx.try_recv().is_ok() {}
 
-        // Run interpret_chat_response inside the cost scope so
+        // Parse, then record the accepted response inside the cost scope so
         // record_tool_loop_cost_usage sees the pricing map.
         let now = std::time::Instant::now();
         crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
@@ -552,6 +883,7 @@ mod cost_usd_regression_tests {
                     &[],
                     now,
                     0,
+                    None,
                 )
                 .await;
             })
@@ -560,7 +892,7 @@ mod cost_usd_regression_tests {
         // (a) The Usage event must carry the cost.
         let event = rx
             .try_recv()
-            .expect("interpret_chat_response should emit a TurnEvent::Usage");
+            .expect("record_accepted_chat_response should emit a TurnEvent::Usage");
         match event {
             TurnEvent::Usage { cost_usd, .. } => {
                 let c = cost_usd.expect("Usage event must carry cost_usd, got None");
@@ -621,6 +953,7 @@ mod cost_usd_regression_tests {
             observer: &crate::observability::NoopObserver,
             provider_name: "requested.provider",
             model: "requested-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
             temperature: None,
             approval: None,
             channel_name: "",
@@ -636,6 +969,8 @@ mod cost_usd_regression_tests {
             agent_alias: None,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
             turn_id: "malformed-protocol-usage",
+            serving_provider_name: None,
+            serving_model: None,
         };
         let specs = IterationToolSpecs {
             tool_specs: vec![crate::tools::ToolSpec::new(
@@ -650,6 +985,7 @@ mod cost_usd_regression_tests {
             input_tokens: Some(10),
             output_tokens: Some(5),
             cached_input_tokens: None,
+            cache_creation_input_tokens: None,
         };
         let interpreted = interpret_chat_response(
             &ctx,

@@ -22,6 +22,13 @@ group = "example"
 table = true
 
 [[var]]
+path = "providers.models.crusoe.default.api_key"
+comment = "Inject a Crusoe Managed Inference alias credential"
+value = "cr_..."
+group = "example"
+table = true
+
+[[var]]
 path = "providers.models.openrouter.prod_v2.model"
 comment = "Set a model on a non-default OpenRouter alias (alias with underscore is fine)"
 value = "anthropic/claude-sonnet-4-6"
@@ -139,6 +146,12 @@ prefix = "export "
 [[var]]
 path = "providers.models.nearai.tee.api_key"
 value = "\"$NEARAI_API_KEY\""
+group = "bridge_sh"
+prefix = "export "
+
+[[var]]
+path = "providers.models.zerorouter.gateway.api_key"
+value = "\"$ZEROROUTER_API_KEY\""
 group = "bridge_sh"
 prefix = "export "
 

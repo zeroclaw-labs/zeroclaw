@@ -22,8 +22,8 @@ Last verified against the `v0.8.2` release cycle.
 6. [Verify the release exists and assets are downloadable](#step-6-verify-the-release)
 7. [Versioned documentation deployment](#step-7-versioned-documentation-deployment)
 
-That is the entire process. Everything else (Docker, website redeploy, Scoop,
-AUR, Discord, tweet) runs automatically as downstream jobs. Homebrew Core
+That is the entire process. Everything else (crates.io, Docker, website
+redeploy, Scoop, AUR, Discord, tweet) runs automatically as downstream jobs. Homebrew Core
 detects the stable GitHub release through its own autobump service. You do not
 need to do anything for those unless a job explicitly fails or Homebrew's
 external bump remains stale.
@@ -43,6 +43,23 @@ PR (step 2), or open it as a separate preceding PR if the diff is large.
 If `CHANGELOG-next.md` already exists from a previous aborted release cycle,
 review it for accuracy before reusing it.
 
+The file must carry an `## In brief` section directly after the preamble: two
+short paragraphs, at most 255 characters together, that say what the release
+is. The X and Discord announcement workflows publish that section, followed by
+the commit and contributor counts from the preamble and a link to the website's
+release post (or the GitHub release when no post exists yet). Without it they
+fall back to the first Highlights bullets, and without those to the raw commit
+list. The skill's `SKILL.md` has the style rules and a reference example.
+
+Preview the announcement text for any published tag without posting:
+
+```bash
+gh workflow run tweet-release.yml -f release_tag=vX.Y.Z -f dry_run=true
+gh workflow run discord-release.yml -f release_tag=vX.Y.Z -f dry_run=true
+```
+
+The composed text appears in the run's job summary.
+
 ---
 
 ## Step 2: Bump and merge the version PR
@@ -54,7 +71,7 @@ Bump `workspace.package.version` in the workspace `Cargo.toml`, then run the two
 #### sh
 
 ```sh
-./scripts/release/bump-version.sh    # version from Cargo.toml
+./scripts/release/bump-version.sh --release    # version from Cargo.toml
 ```
 
 </div>
@@ -73,6 +90,19 @@ in step automatically, so never hand-edit a generated region. Live release
 availability remains hand-authored and is not inferred by the generator. This
 script also refreshes the Nix git dependency hashes (`nix/hashes.json`) via
 `scripts/dev/refresh-nix-hashes.sh`.
+
+Release mode requires `cargo`, `jq`, `nix-prefetch-git`, `perl`, `sha256sum`,
+Python 3.11+ with `tomllib`, Bash 4+ on `PATH`, the lockfile, and the Nix
+refresh script before it edits files. On macOS, install a modern Bash and put
+it ahead of `/bin/bash` on `PATH` for the Nix refresher. It stops if
+lockfile resolution, Nix hashes, or installer generation fails. A failure can
+leave earlier edits in the worktree: inspect them and rerun after fixing the
+reported prerequisite. Do not commit an incomplete bump. Without `--release`,
+the script retains its best-effort behavior for local preparation.
+
+The tag-cut helper, `scripts/release/cut_release_tag.sh`, also uses release
+mode. A preparation failure stops it before committing, fetching, tagging,
+or pushing; the ordinary local mode is not a tag-cut fallback.
 
 ### Refresh and pin translations
 
@@ -122,15 +152,11 @@ chore: bump version to vX.Y.Z
 
 If the PR also changes `[workspace.package] rust-version` or pinned Rust toolchains, treat it as a compatibility change, not just release plumbing. The PR should name the new MSRV, explain the source-build upgrade path, and show that CI, Docker, installer, and generated surfaces agree on the new floor before merge.
 
-Open a PR. Label it `type:ci`, `size:XS`, and any path labels the PR labeler
-adds. If the PR raises a toolchain floor, also apply `risk:high` and route it
-through lane D. Get one maintainer review. Merge when CI is green. The **Installer Drift**
-gate in CI fails the PR if a generated surface is out of sync with the spec, so
-a missed regeneration cannot land. The
-**Validate Translations Pin** gate resolves the submodule at the pinned commit
-and validates catalogue format and msgid parity, so a bad pin cannot land
-either. See [Docs & Translations](../maintainers/docs-and-translations.md#filling-doc-translations-gettext)
-for translation pipeline details.
+Open a PR. Label it `type:ci`, `size:XS`, and any path labels the PR labeler adds. If the PR raises a toolchain floor, also apply `risk:high` and route it through lane D.
+
+Two independent Core Team approvals are the default. Toolchain-floor and release changes may be considered under the [expedited second-review lane](./pr-workflow.md#expedited-second-review-lane) only with its complete evidence and an explicit justification for this normally two-review category. A timeout never clears an unresolved compatibility or release-safety concern. Merge only when required CI is green.
+
+The **Installer Drift** gate in CI fails the PR if a generated surface is out of sync with the spec, so a missed regeneration cannot land. The **Validate Translations Pin** gate resolves the submodule at the pinned commit and validates catalogue format and msgid parity, so a bad pin cannot land either. See [Docs & Translations](../maintainers/docs-and-translations.md#filling-doc-translations-gettext) for translation pipeline details.
 
 **Confirm the merge landed correctly:**
 
@@ -319,6 +345,7 @@ Everything else is skipped with a logged reason:
 ```
 ==> skip release-stable-manual:publish (not on dry-run-safe allowlist)
 ==> skip release-stable-manual:docker (not on dry-run-safe allowlist)
+==> skip release-stable-manual:crates (not on dry-run-safe allowlist)
 ==> skip release-stable-manual:redeploy-website (not on dry-run-safe allowlist)
 ==> skip docs-deploy:deploy (not on dry-run-safe allowlist)
 ==> skip daily-audit:advisories (not on dry-run-safe allowlist)
@@ -351,7 +378,7 @@ not real defects:
 
 - Jobs that depend on a real release tag (`publish` creating a GitHub
   Release).
-- Environment-gated jobs (`publish`, `docker`): the
+- Environment-gated jobs (`publish`, `docker`, and the crates publisher): the
   approval UI doesn't exist locally.
 - OIDC-based federated identity tokens.
 
@@ -385,15 +412,17 @@ re-trigger. Do not try to work around it.
 
 ## Step 5: Approve the environment gates
 
-Two jobs are gated by GitHub environment protection rules. When each becomes
+Three jobs are gated by GitHub environment protection rules. When each becomes
 pending you will see a **"Waiting for review"** banner in the workflow run.
 
-Approve both when they appear:
+Approve all three when they appear. Approve `crates-io` only after its tokenless
+package preflight is green:
 
 | Environment | Job | What it does |
 |---|---|---|
 | `github-releases` | `publish` | Creates the GitHub Release and uploads assets |
 | `docker` | `docker` | Pushes images to GHCR |
+| `crates-io` | `crates / Publish to crates.io` | Publishes the verified 23-crate workspace in dependency order |
 
 If you miss the approval window and a job times out, re-run only the failed
 job from the workflow run page; you do not need to restart from scratch.
@@ -424,7 +453,7 @@ inside the stable release workflow. You do not need a separate Docker check if
 all release jobs are green. If a maintainer instead starts the release by
 pushing a `vX.Y.Z` tag, Docker Publish starts as a separate tag-triggered run;
 confirm that sibling run is green before treating container publication as
-complete. Scoop and AUR need separate attention only when their jobs show red.
+complete. crates.io, Scoop, and AUR need separate attention only when their jobs show red.
 Homebrew Core is external to this workflow; its
 [autobump service](https://docs.brew.sh/Autobump) checks eligible formulae on
 its own schedule.
@@ -530,6 +559,14 @@ failed distribution job does not invalidate the release itself. For Scoop
 credential failures, use Scoop Bucket Canary instead of treating a generic dry
 run as credential proof; the canary enables the fail-closed
 `credential_canary` path.
+
+**The crates.io publisher stopped after uploading some crates:** Do not bump the
+version or start a second release. crates.io versions cannot be replaced or
+deleted. Fix the failing crate at the same release commit, then re-run
+`Pub crates.io` for the same tag with `dry_run: false`; the publisher queries
+every `<crate>@<version>` first and skips versions that already landed. Read the
+Publish step for the last successful crate. If preflight failed, no upload was
+attempted and the problem is still reversible.
 
 **The `scoop` job failed with `remote: Permission ... denied to <account>` (403):**
 A permissions problem, not a manifest problem: the bucket token is dead or

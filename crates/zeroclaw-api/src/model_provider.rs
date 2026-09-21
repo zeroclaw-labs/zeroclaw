@@ -12,9 +12,37 @@ pub const MAX_BUDGET_TOKENS: u32 = 128_000;
 pub const MIN_BUDGET_TOKENS: u32 = 1_024;
 
 /// Parameters for native extended thinking support.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeThinkingParams {
     pub budget_tokens: u32,
+    /// Requests Anthropic's `thinking.display` beta
+    /// (`thinking-display-updates-2026-08-18`), which controls whether
+    /// thinking blocks come back omitted, as progress updates, or
+    /// summarized. `None` leaves the field out of the request entirely,
+    /// matching pre-beta behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<ThinkingDisplay>,
+}
+
+/// Anthropic's `thinking.display` request field (beta
+/// `thinking-display-updates-2026-08-18`), controlling whether thinking
+/// blocks come back omitted, as progress updates, or summarized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingDisplay {
+    Omitted,
+    Updates,
+    Summarized,
+}
+
+impl ThinkingDisplay {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Omitted => "omitted",
+            Self::Updates => "updates",
+            Self::Summarized => "summarized",
+        }
+    }
 }
 
 /// A single message in a conversation.
@@ -131,13 +159,20 @@ pub struct ToolCall {
 
 #[derive(Debug, Clone, Default)]
 pub struct TokenUsage {
-    /// Total prompt size: uncached + cached input tokens.
+    /// Total prompt size: uncached + cached input tokens (including the
+    /// cache-write subset when the provider reports it separately).
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     /// Subset of `input_tokens` that was served from the model_provider's
     /// prompt cache (Anthropic `cache_read_input_tokens`,
     /// OpenAI `prompt_tokens_details.cached_tokens`).
     pub cached_input_tokens: Option<u64>,
+    /// Subset of `input_tokens` that the model_provider wrote into its
+    /// prompt cache on this request (Anthropic
+    /// `cache_creation_input_tokens`, OpenAI-compatible
+    /// `prompt_tokens_details.cache_creation_input_tokens`). Providers
+    /// bill these at a premium over the plain input rate.
+    pub cache_creation_input_tokens: Option<u64>,
 }
 
 /// An LLM response that may contain text, tool calls, or both.
@@ -256,6 +291,27 @@ pub enum ConversationMessage {
     ToolResults(Vec<ToolResultMessage>),
 }
 
+/// Project a full agent conversation history down to the flat `ChatMessage`
+/// shape durable session backends store: user/assistant chat turns only,
+/// system prompt excluded (the backend restores against the caller's own
+/// system prompt, not a persisted one). `AssistantToolCalls` and
+/// `ToolResults` are tool-loop plumbing that durable session transcripts have
+/// never persisted; only the visible chat turns are kept.
+///
+/// Callers that own the agent's authoritative post-turn history (after
+/// budget-enforcement trimming) should use this to replace a durable
+/// transcript wholesale rather than appending the turn's delta on top of a
+/// transcript the agent may have already trimmed underneath it.
+pub fn durable_chat_messages(history: &[ConversationMessage]) -> Vec<ChatMessage> {
+    history
+        .iter()
+        .filter_map(|message| match message {
+            ConversationMessage::Chat(chat) if chat.role != "system" => Some(chat.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// A chunk of content from a streaming response.
 #[derive(Debug, Clone)]
 pub struct StreamChunk {
@@ -324,6 +380,15 @@ impl StreamChunk {
 pub enum StreamEvent {
     /// Text delta from the assistant.
     TextDelta(StreamChunk),
+    /// Transient, human-readable thinking progress. Surfaced to the user
+    /// (gated by the runtime visibility policy) and never persisted into
+    /// reasoning_content.
+    ThinkingDelta(String),
+    /// Durable, replay-only finalized reasoning payload (signed thinking
+    /// blocks in the provider's history-replay representation). Appended to
+    /// `ChatResponse::reasoning_content` for the next provider request and
+    /// never surfaced as user-visible progress.
+    ReasoningFinalized(String),
     /// Structured tool call emitted during streaming.
     ToolCall(ToolCall),
     /// A tool call that was already executed by the model_provider (e.g. Claude Code proxy).
@@ -376,6 +441,35 @@ impl StreamOptions {
 /// Result type for streaming operations.
 pub type StreamResult<T> = std::result::Result<T, StreamError>;
 
+/// A provider safety refusal that completed at the transport layer but cannot
+/// be accepted as an assistant response.
+///
+/// The optional usage belongs to the refusing attempt. It is carried on the
+/// typed cause so reliability and turn accounting can bill that work without
+/// treating it as accepted-response context usage. `category` is diagnostic
+/// metadata only and must not be rendered to users.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("anthropic refusal: model declined this request (safety classifiers)")]
+pub struct ModelRefusalError {
+    /// Model requested on the refusing attempt.
+    pub requested_model: String,
+    /// Refusal category token, when the provider supplied one.
+    pub category: Option<String>,
+    /// Normalized usage billed by the refusing attempt.
+    pub usage: Option<Box<TokenUsage>>,
+    /// Exact reliability candidate that emitted a streamed refusal.
+    ///
+    /// Leaf providers leave this unset. Composite providers fill it while
+    /// forwarding a stream so a non-streaming recovery can skip exactly the
+    /// already-billed candidate.
+    pub attempted_candidate: Option<String>,
+    /// Position of that candidate in the active reliability domain.
+    ///
+    /// This disambiguates same-profile fallback models, which intentionally
+    /// share one configured candidate/cooldown identity.
+    pub attempted_candidate_index: Option<usize>,
+}
+
 /// Errors that can occur during streaming.
 #[derive(Debug, thiserror::Error)]
 pub enum StreamError {
@@ -390,6 +484,9 @@ pub enum StreamError {
 
     #[error("ModelProvider error: {0}")]
     ModelProvider(String),
+
+    #[error(transparent)]
+    ModelRefusal(#[from] Box<ModelRefusalError>),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -521,6 +618,15 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
         capabilities.native_tool_calling = self.supports_native_tools();
         capabilities.vision = self.supports_vision();
         capabilities
+    }
+
+    /// Name the entry that forced `vision` to `false` on this provider's
+    /// [`Self::capabilities_for_model`], for providers that aggregate several
+    /// named entries (e.g. a primary plus configured fallbacks) into one
+    /// capability set. Returns `None` when this provider is not such an
+    /// aggregate, or when nothing about it limits vision for `model`.
+    fn vision_limited_by(&self, _model: &str) -> Option<String> {
+        None
     }
 
     /// Whether the selected request can reach both native-tool and text-only
@@ -805,6 +911,10 @@ impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
 
     fn capabilities_for_model(&self, model: &str) -> ProviderCapabilities {
         self.as_ref().capabilities_for_model(model)
+    }
+
+    fn vision_limited_by(&self, model: &str) -> Option<String> {
+        self.as_ref().vision_limited_by(model)
     }
 
     fn has_mixed_native_tool_support_for_model(&self, model: &str) -> bool {
@@ -1143,5 +1253,41 @@ mod turn_order_tests {
         let mut msgs: Vec<ChatMessage> = vec![];
         ChatMessage::sanitize_leading_turn_order(&mut msgs);
         assert!(msgs.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod thinking_display_tests {
+    use super::{NativeThinkingParams, ThinkingDisplay};
+
+    #[test]
+    fn as_str_maps_updates_variant() {
+        assert_eq!(ThinkingDisplay::Updates.as_str(), "updates");
+    }
+
+    #[test]
+    fn serialization_includes_display_when_present() {
+        let params = NativeThinkingParams {
+            budget_tokens: 1_024,
+            display: Some(ThinkingDisplay::Updates),
+        };
+        let json = serde_json::to_string(&params).expect("serialization should succeed");
+        assert!(
+            json.contains("\"display\":\"updates\""),
+            "expected display field in serialized params, got: {json}"
+        );
+    }
+
+    #[test]
+    fn serialization_omits_display_when_absent() {
+        let params = NativeThinkingParams {
+            budget_tokens: 1_024,
+            display: None,
+        };
+        let json = serde_json::to_string(&params).expect("serialization should succeed");
+        assert!(
+            !json.contains("display"),
+            "expected display field to be omitted, got: {json}"
+        );
     }
 }

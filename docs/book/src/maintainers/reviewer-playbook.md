@@ -13,22 +13,24 @@ Use [PR lanes](./pr-workflow.md#pr-lanes) for routing expectations; use this pla
 | Situation | Action | Section |
 |---|---|---|
 | Intake fails in the first 5 minutes | Leave one actionable checklist comment, stop deep review | [Five-minute intake](#five-minute-intake) |
-| Risk is high or unclear | Treat as `risk:high` until proven otherwise | [Review depth matrix](#review-depth-matrix) |
+| Risk or security-boundary classification is unclear | Classify upward and resolve it with a maintainer before merge | [Review depth matrix](#review-depth-matrix) |
 | Diff adds a parallel interpretive surface | Verify it is derived from, or explicitly points to, the canonical source | [Drift-surface review](#drift-surface-review) |
 | Automation output is wrong or noisy | Apply the override protocol | [Automation override](#automation-override) |
 | Need to hand off to another maintainer | Use the handoff template | [Handoff](#handoff) |
 
 ## Review depth matrix
 
-| Risk label | Typical paths | Minimum depth | Required evidence |
+| Trigger | Typical work | Minimum depth | Required evidence |
 |---|---|---|---|
-| `risk:low` | Docs, tests, chore, isolated non-runtime | 1 reviewer + CI gate | Coherent validation evidence, no behavior ambiguity |
-| `risk:medium` | `crates/zeroclaw-providers/`, `crates/zeroclaw-channels/`, `crates/zeroclaw-memory/`, `crates/zeroclaw-config/` | 1 subsystem-aware reviewer + behavior verification | Focused scenario proof, explicit side effects |
-| `risk:high` | The [canonical high-risk path set](./labels.md#risk-labels) (runtime, gateway, tools, security, `.github/workflows/`) | Fast triage + deep review + rollback readiness | Security and failure-mode checks, rollback clarity |
+| `risk:low` | Documentation, localization, fixtures, generated references, or mechanical metadata with no production, compatibility, build, release, or governance effect | 1 reviewer + CI gate | Coherent validation evidence, no behavior ambiguity |
+| `risk:medium` | Ordinary behavioral runtime, gateway, provider, channel, tool, config, application, and CI work | 1 subsystem-aware reviewer + behavior verification | Focused scenario proof, explicit side effects |
+| `risk:high` or `domain:security` | A concrete trust, credential, compatibility, governance, release-authority, or cross-cutting security boundary | Fast triage + deep review + rollback readiness + two independent Core Team approvals by default | Security and failure-mode checks, rollback clarity; only the [expedited second-review lane](./pr-workflow.md#expedited-second-review-lane) provides a standing exception |
 
-When uncertain, treat as higher risk.
+`domain:security` remains independent from `risk:*`: use it for an effective security or trust boundary, not simply because the changed component is security-shaped. Either label triggers deep review and defaults to two independent Core Team approvals; only the [expedited second-review lane](./pr-workflow.md#expedited-second-review-lane) provides a standing exception. Automated review does not count as a Core Team approval.
 
-Risk labels are currently manual. If future risk automation is restored, follow the [labels automation contract](./labels.md#automation-contract): apply `risk:manual` when a maintainer correction should not be overwritten on the next pushed update.
+When uncertain, classify upward and ask a maintainer to resolve the boundary before merge.
+
+Risk labels are currently manual. #9345 keeps any future risk classifier report-only until maintainers separately enable mutation. Follow the [labels automation contract](./labels.md#automation-contract): `risk:manual` freezes automated risk replacement when a maintainer correction should persist, but it never lowers the review or approval requirement.
 
 Labels are maintainer metadata. If the correct label is obvious and you have permission, fix it yourself before finalizing the review. Ask the author only when the right label choice is ambiguous or nobody with label permissions is available.
 
@@ -43,7 +45,7 @@ For every new PR, before reading any code:
 3. Confirm `CI Required Gate` signal status.
 4. Confirm scope is one concern. Mixed-feature mega-PRs go back for a split unless the mix is explicitly justified.
 5. Confirm privacy / data-hygiene rules. See [Privacy](../contributing/privacy.md) for the full rulebook.
-6. If the PR changes visual presentation, confirm the author exercised the actual supported interface and supplied privacy-safe screenshots at representative dimensions. A statement that the smoke was not performed records the gap but does not satisfy it.
+6. If the PR changes presentation-sensitive visual behavior, confirm the author exercised the actual supported interface and supplied privacy-safe screenshots at representative terminal or viewport dimensions with enough surrounding context to judge the result. Require numerical dimensions only when needed to reproduce or assess a concrete presentation concern, such as wrapping, clipping, or responsive layout. For a semantic-only rendered-interface change that cannot affect presentation or interaction behavior, exact-head automated evidence is sufficient only when it observes the final supported-interface output through the real renderer; pre-render composition and helper-level assertions do not qualify. A concrete presentation concern restores the screenshot requirement. For a qualifying plain-text change that makes no presentation-sensitive claim and has no concrete presentation concern identified by a reviewer, exact output from the supported interface on an identifiable revision is sufficient. Treat `N/A` as valid only when no user-visible interface state changed. A statement that the applicable evidence was not produced records the gap but does not satisfy it.
 
 If any intake check fails, leave one actionable checklist comment and stop. Don't deep-review a PR that hasn't passed intake: the back-and-forth is cheaper at this layer than after the diff has been reasoned about.
 
@@ -54,8 +56,10 @@ If any intake check fails, leave one actionable checklist comment and stop. Don'
 - PR-body provenance is true. Cited RFCs, audits, issues, PRs, paths, generated artifacts, or follow-up findings exist and support the claim.
 - Validation evidence names the checks being relied on and why they cover the changed behavior.
 - Directly user-observable claims identify the user boundary and provide the smallest credible evidence that reaches it; use [User-boundary proof](../contributing/user-boundary-proof.md) when unit, mocked, compile, or generic CI evidence stops short.
-- Visual presentation changes include actual-interface evidence from an identifiable revision plus screenshots with enough surrounding layout to assess the result. String assertions, component-only snapshots, and helper-level renderer tests cannot replace this proof. Interaction and transition claims also name the user action and observed result.
-- Duplicate local Cargo is not required when fresh required CI covers the same head, target, and feature set. Ask for extra validation only when it maps to a named gap in the required gate, such as macOS/Windows tests, cross-platform Clippy, desktop coverage, release target builds, stale CI, or unavailable CI.
+- Presentation-sensitive visual changes include actual-interface evidence from an identifiable revision plus screenshots at representative terminal or viewport dimensions with enough surrounding layout to assess the result. Require numerical dimensions only when needed to reproduce or assess a concrete presentation concern. A semantic-only rendered-interface change may instead use exact-head automated evidence from the final supported-interface output when it cannot affect layout, styling, clipping, wrapping, focus, selection, or interaction behavior. That evidence must exercise the real interface through its final renderer, observe the output users receive, and identify the changed state and observed result; source inspection, pre-render composition, component-only snapshots, and helper-level assertions do not qualify. A concrete presentation concern restores the screenshot requirement. A noninteractive, unstyled, deterministic plain-text CLI, stdout, stderr, or log change may use exact output from the supported interface when it makes no presentation-sensitive claim and no reviewer has identified a concrete presentation concern. Record relevant output-shaping context such as locale and terminal width. Interaction and transition claims also name the user action and observed result.
+<!-- >>> generated:review-ci-evidence-playbook by `cargo generate review-docs` - do not edit <<< -->
+- Duplicate local Cargo is not required when fresh required CI covers the same head, target, and feature set. Ask for extra validation only when it maps to a named gap in the required gate, such as macOS/Windows tests, cross-platform Clippy, desktop coverage, release target builds, stale CI beyond the [base-drift-only review case](../contributing/pr-review-protocol.md#ci-freshness-and-base-drift), or unavailable CI.
+<!-- >>> end generated:review-ci-evidence-playbook <<< -->
 - User-facing behavior changes are documented.
 - Author demonstrates understanding of behavior and blast radius (especially for AI-assisted PRs).
 - Rollback path is concrete; "revert" is not concrete.
@@ -108,7 +112,7 @@ drives downstream coverage.
 
 ### Deep-review checklist (high-risk only)
 
-For `risk:high` PRs, verify a concrete example in each category. One concrete instance beats five generic claims.
+For PRs carrying `risk:high` or `domain:security`, verify a concrete example in each category. One concrete instance beats five generic claims.
 
 - **Security boundaries**: deny-by-default behavior preserved, no accidental scope broadening.
 - **Failure modes**: error handling explicit, degrades safely.
@@ -177,6 +181,14 @@ If Discussions are not being reviewed on the documented cadence, do not present 
 
 ### PR backlog pruning
 
+Use the report-only queue snapshot when selecting the next review pass:
+
+```bash
+python3 scripts/github/pr_review_queue.py --queue all --older-than-days 7 --format table
+```
+
+The command is an on-demand view of live GitHub state, not a durable queue or a source of merge authority. This `all` snapshot runs the shared lanes independently, so one PR can appear in more than one lane; add `--author LOGIN` to include `mine`. Use `--queue near-ready` to start with maintainer-routed PRs whose GitHub search status is successful; this prioritizes candidates that may be closer to merge without claiming that they are mergeable or sufficiently approved. Use `--format json` for inspection or downstream reporting and `--format links` for GitHub search links. GitHub search supplies the candidate lists; the script reads timelines only for author-action age and reviews only for current-head second-Core routing. Missing or ambiguous detail remains unknown. Confirm mergeability, checks, and approval applicability during the actual review. Prioritize and review `Depends on #...` parents before children; when a parent is not reviewable, defer deep child review unless a bounded independent slice benefits from early review, then refresh and revalidate the child after the parent lands. Stacked PRs remain a separate report lane and do not become review-ready merely because they are old.
+
 When review demand exceeds capacity:
 
 1. Keep active bug and security PRs (`size:XS` or `size:S`) at the top of the queue.
@@ -196,7 +208,7 @@ If the underlying bug or feature is still valid, preserve it in an issue, tracke
 
 Use this when automation output creates review side effects:
 
-1. **Incorrect risk label**: set the intended `risk:*` label. If future risk automation is active, also follow the [labels automation contract](./labels.md#automation-contract) for `risk:manual`.
+1. **Incorrect risk label**: set the intended `risk:*` label. If future risk automation is active, also follow the [labels automation contract](./labels.md#automation-contract) for `risk:manual`; the override does not bypass the `risk:high OR domain:security` approval rule.
 2. **Incorrect auto-close on issue triage**: reopen, remove the route label, leave one clarifying comment.
 3. **Label spam or noise**: keep one canonical maintainer comment, remove redundant route labels.
 4. **Ambiguous PR scope**: request a split before deep review; don't try to review across two concerns at once.
@@ -212,6 +224,8 @@ When passing review to another maintainer or agent mid-flight, include:
 5. **Suggested next action.**
 
 This keeps context loss low and avoids the next reviewer redoing the same fetches you already did.
+
+Core reviewers aim to review pull requests in their area within five business days, as defined by [FND-003](../foundations/fnd-003-governance.md). If a required second Core review remains unanswered through the qualifying five-business-date window, evaluate the [expedited second-review lane](./pr-workflow.md#expedited-second-review-lane). Elapsed time is not approval and never clears an objection, hold, changes-requested review, unresolved thread, security concern, or other finding. If the PR is not eligible, keep the required human review routed and use the handoff above when another qualified reviewer takes it.
 
 ## Weekly queue hygiene
 

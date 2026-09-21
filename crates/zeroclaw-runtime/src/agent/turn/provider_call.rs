@@ -152,7 +152,9 @@ pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
 pub(crate) async fn call_provider(
     ctx: &TurnCtx<'_>,
     active_model_provider: &dyn ModelProvider,
+    active_model_provider_name: &str,
     active_model: &str,
+    active_dispatch_model: &str,
     prepared_messages: &[ChatMessage],
     request_tools: Option<&[ToolSpec]>,
     should_consume_provider_stream: bool,
@@ -173,7 +175,7 @@ pub(crate) async fn call_provider(
                         active_model_provider,
                         prepared_messages,
                         request_tools,
-                        active_model,
+                        active_dispatch_model,
                         ctx.temperature,
                         ctx.cancellation_token,
                         ctx.on_delta,
@@ -231,7 +233,29 @@ pub(crate) async fn call_provider(
                             (Err(stream_err), false, false, String::new())
                         }
                         Err(stream_err) => {
-                            if let Some(usage) = stream_err
+                            let streamed_refusal = stream_err
+                                .downcast_ref::<StreamErrorWithUsage>()
+                                .and_then(|error| match &error.source {
+                                    zeroclaw_api::model_provider::StreamError::ModelRefusal(
+                                        refusal,
+                                    ) => Some((**refusal).clone()),
+                                    _ => None,
+                                })
+                                .or_else(|| {
+                                    stream_err.chain().find_map(|cause| {
+                                        cause
+                                            .downcast_ref::<
+                                                zeroclaw_api::model_provider::ModelRefusalError,
+                                            >()
+                                            .cloned()
+                                    })
+                                });
+                            if let Some(usage) = streamed_refusal
+                                .as_ref()
+                                .and_then(|refusal| refusal.usage.as_deref().cloned())
+                            {
+                                scope.record_stream_interruption_usage(usage);
+                            } else if let Some(usage) = stream_err
                                 .downcast_ref::<StreamSemanticEmptyCompletion>()
                                 .and_then(|error| error.usage.clone())
                             {
@@ -248,6 +272,7 @@ pub(crate) async fn call_provider(
                             {
                                 scope.mark_stream_recovery_semantic_empty();
                             }
+                            scope.record_stream_recovery_failure(&stream_err);
                             ::zeroclaw_log::record!(
                                 WARN,
                                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -263,27 +288,42 @@ pub(crate) async fn call_provider(
                             );
                             scope.clear_provisional_provider_route();
                             let dispatcher = ProviderDispatch::from_ref(active_model_provider);
+                            let request = ChatRequest {
+                                messages: prepared_messages,
+                                tools: request_tools,
+                                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                                    .try_with(Clone::clone)
+                                    .ok()
+                                    .flatten(),
+                            };
                             let recovery = with_exact_dispatch_route(
-                                ctx.provider_name.to_string(),
+                                active_model_provider_name.to_string(),
                                 active_model.to_string(),
-                                dispatcher.chat(
-                                ChatRequest {
-                                    messages: prepared_messages,
-                                    tools: request_tools,
-                                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                                        .try_with(Clone::clone)
-                                        .ok()
-                                        .flatten(),
+                                async {
+                                    match streamed_refusal {
+                                        Some(refusal) => {
+                                            dispatcher
+                                                .chat_after_stream_refusal(
+                                                    request,
+                                                    active_dispatch_model,
+                                                    ctx.temperature,
+                                                    refusal,
+                                                )
+                                                .await
+                                        }
+                                        None => {
+                                            dispatcher
+                                                .chat(request, active_dispatch_model, ctx.temperature)
+                                                .await
+                                        }
+                                    }
                                 },
-                                active_model,
-                                ctx.temperature,
-                                ),
                             );
                             let result = if let Some(token) = ctx.cancellation_token {
                                 tokio::select! {
                                     biased;
-                                    result = recovery => result,
                                     () = token.cancelled() => Err(ToolLoopCancelled.into()),
+                                    result = recovery => result,
                                 }
                             } else {
                                 recovery.await
@@ -307,7 +347,7 @@ pub(crate) async fn call_provider(
         let dispatcher = ProviderDispatch::from_ref(active_model_provider);
         let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
         let chat_future = scope.scope(Box::pin(with_exact_dispatch_route(
-            ctx.provider_name.to_string(),
+            active_model_provider_name.to_string(),
             active_model.to_string(),
             dispatcher.chat(
                 ChatRequest {
@@ -318,7 +358,7 @@ pub(crate) async fn call_provider(
                         .ok()
                         .flatten(),
                 },
-                active_model,
+                active_dispatch_model,
                 ctx.temperature,
             ),
         )));
@@ -429,6 +469,12 @@ mod payload_capture_tests {
             observer,
             provider_name: "stub",
             model: "stub-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                model_context_window: 32_000,
+                context_token_budget: 32_000,
+                model_context_window_source:
+                    zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            },
             temperature: None,
             approval: None,
             channel_name: "test",
@@ -444,6 +490,8 @@ mod payload_capture_tests {
             draft_reasoning,
             agent_alias: None,
             turn_id: "trace-req-test",
+            serving_provider_name: None,
+            serving_model: None,
         }
     }
 
@@ -623,17 +671,26 @@ mod streaming_fallback_tests {
     };
     use crate::observability::NoopObserver;
     use async_trait::async_trait;
+    use axum::{Router, http::StatusCode, routing::post};
+    use futures_util::StreamExt;
     use futures_util::stream::BoxStream;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::TcpListener;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
-    use zeroclaw_api::model_provider::StreamEvent;
+    use zeroclaw_api::model_provider::{ModelRefusalError, StreamError, StreamEvent};
     use zeroclaw_config::schema::PacingConfig;
-    use zeroclaw_providers::ModelProvider;
+    use zeroclaw_providers::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
     use zeroclaw_providers::reliable::ReliableModelProvider;
     use zeroclaw_providers::traits::{StreamOptions, StreamResult, TokenUsage};
+    use zeroclaw_providers::{
+        ModelProvider, ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
+    };
 
     struct EmptyStreamThenTextProvider {
-        non_stream_calls: AtomicUsize,
+        stream_calls: Arc<AtomicUsize>,
+        non_stream_calls: Arc<AtomicUsize>,
+        cancel_on_final: Option<tokio_util::sync::CancellationToken>,
     }
 
     struct PreExecutedToolThenEmptyProvider {
@@ -642,6 +699,23 @@ mod streaming_fallback_tests {
 
     struct EmptyThenPendingProvider {
         calls: AtomicUsize,
+    }
+
+    struct StreamRefusalProvider {
+        stream_calls: std::sync::Arc<AtomicUsize>,
+        non_stream_calls: std::sync::Arc<AtomicUsize>,
+    }
+
+    struct RefusalRescueProvider {
+        non_stream_calls: std::sync::Arc<AtomicUsize>,
+    }
+
+    struct StreamFailureNoReplayProvider {
+        non_stream_calls: Arc<AtomicUsize>,
+    }
+
+    struct VisibleThenServerStreamFailureProvider {
+        non_stream_calls: Arc<AtomicUsize>,
     }
 
     impl Attributable for EmptyStreamThenTextProvider {
@@ -674,6 +748,46 @@ mod streaming_fallback_tests {
         }
     }
 
+    impl Attributable for StreamRefusalProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "StreamRefusalProvider"
+        }
+    }
+
+    impl Attributable for RefusalRescueProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "RefusalRescueProvider"
+        }
+    }
+
+    impl Attributable for StreamFailureNoReplayProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "StreamFailureNoReplayProvider"
+        }
+    }
+
+    impl Attributable for VisibleThenServerStreamFailureProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "VisibleThenServerStreamFailureProvider"
+        }
+    }
+
     #[async_trait]
     impl ModelProvider for EmptyStreamThenTextProvider {
         async fn chat_with_system(
@@ -696,7 +810,12 @@ mod streaming_fallback_tests {
             Ok(ChatResponse {
                 text: Some("fallback response".to_string()),
                 tool_calls: Vec::new(),
-                usage: None,
+                usage: Some(TokenUsage {
+                    input_tokens: Some(20),
+                    output_tokens: Some(7),
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                }),
                 reasoning_content: None,
             })
         }
@@ -712,14 +831,29 @@ mod streaming_fallback_tests {
             _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> BoxStream<'static, StreamResult<StreamEvent>> {
-            Box::pin(futures_util::stream::iter(vec![
-                Ok(StreamEvent::Usage(TokenUsage {
-                    input_tokens: Some(10),
-                    output_tokens: Some(5),
-                    cached_input_tokens: None,
-                })),
-                Ok(StreamEvent::Final),
-            ]))
+            self.stream_calls.fetch_add(1, Ordering::Relaxed);
+            let cancel_on_final = self.cancel_on_final.clone();
+            Box::pin(
+                futures_util::stream::iter(vec![
+                    Ok(StreamEvent::Usage(TokenUsage {
+                        input_tokens: Some(10),
+                        output_tokens: Some(5),
+                        cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
+                    })),
+                    Ok(StreamEvent::TextDelta(
+                        zeroclaw_api::model_provider::StreamChunk::reasoning("private reasoning"),
+                    )),
+                    Ok(StreamEvent::Final),
+                ])
+                .inspect(move |event| {
+                    if matches!(event, Ok(StreamEvent::Final))
+                        && let Some(token) = &cancel_on_final
+                    {
+                        token.cancel();
+                    }
+                }),
+            )
         }
     }
 
@@ -801,6 +935,7 @@ mod streaming_fallback_tests {
                         input_tokens: Some(10),
                         output_tokens: Some(5),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                     }),
                     reasoning_content: None,
                 });
@@ -809,19 +944,333 @@ mod streaming_fallback_tests {
         }
     }
 
+    #[async_trait]
+    impl ModelProvider for StreamRefusalProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            self.non_stream_calls.fetch_add(1, Ordering::Relaxed);
+            Ok("must not replay".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            self.non_stream_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(ChatResponse {
+                text: Some("must not replay".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            self.stream_calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(futures_util::stream::iter(vec![Err(
+                StreamError::ModelRefusal(Box::new(ModelRefusalError {
+                    requested_model: model.to_string(),
+                    category: Some("private-safety-category".to_string()),
+                    usage: Some(Box::new(TokenUsage {
+                        input_tokens: Some(7),
+                        output_tokens: Some(3),
+                        cached_input_tokens: Some(1),
+                        cache_creation_input_tokens: None,
+                    })),
+                    attempted_candidate: None,
+                    attempted_candidate_index: None,
+                })),
+            )]))
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for RefusalRescueProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("rescued".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            self.non_stream_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(ChatResponse {
+                text: Some("rescued".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(TokenUsage {
+                    input_tokens: Some(11),
+                    output_tokens: Some(4),
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for StreamFailureNoReplayProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            self.non_stream_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(ChatResponse {
+                text: Some("must not replay".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![Err(
+                zeroclaw_providers::traits::StreamError::ModelProvider(
+                    "error sending request for url (http://127.0.0.1:9/v1/messages): \
+                     client error (Connect): connection refused"
+                        .to_string(),
+                ),
+            )]))
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for VisibleThenServerStreamFailureProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            self.non_stream_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(ChatResponse {
+                text: Some("must not replay".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::TextDelta(
+                    zeroclaw_api::model_provider::StreamChunk::delta("visible"),
+                )),
+                Err(zeroclaw_providers::traits::StreamError::ModelProvider(
+                    "503 Service Unavailable".to_string(),
+                )),
+            ]))
+        }
+    }
+
     #[tokio::test]
     async fn completed_empty_stream_uses_one_non_streaming_fallback() {
+        check_empty_stream_recovery(false).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_empty_stream_does_not_start_recovery() {
+        check_empty_stream_recovery(true).await;
+    }
+
+    async fn check_empty_stream_recovery(cancel_on_final: bool) {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let non_stream_calls = Arc::new(AtomicUsize::new(0));
+        let token = tokio_util::sync::CancellationToken::new();
         let provider = EmptyStreamThenTextProvider {
-            non_stream_calls: AtomicUsize::new(0),
+            stream_calls: Arc::clone(&stream_calls),
+            non_stream_calls: Arc::clone(&non_stream_calls),
+            cancel_on_final: cancel_on_final.then(|| token.clone()),
         };
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".to_string(),
+                Box::new(provider) as Box<dyn ModelProvider>,
+            )],
+            1,
+            1,
+        );
         let observer = NoopObserver;
         let pacing = PacingConfig::default();
         let cost_context = ToolLoopCostTrackingContext::usage_only();
         let turn_usage = std::sync::Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
         let ctx = TurnCtx {
             observer: &observer,
             provider_name: "test-provider",
             model: "test-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: Some(&token),
+            on_delta: None,
+            event_tx: Some(&event_tx),
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+            serving_provider_name: None,
+            serving_model: None,
+        };
+
+        let outcome = TOOL_LOOP_TURN_USAGE
+            .scope(
+                Some(std::sync::Arc::clone(&turn_usage)),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    Some(cost_context),
+                    call_provider(
+                        &ctx,
+                        &provider,
+                        "test-provider",
+                        "test-model",
+                        "test-model",
+                        &[ChatMessage::user("go")],
+                        None,
+                        true,
+                        0,
+                    ),
+                ),
+            )
+            .await
+            .expect("provider call returns its terminal outcome");
+
+        assert_eq!(stream_calls.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            event_rx
+                .try_recv()
+                .expect("reasoning event must be forwarded once"),
+            zeroclaw_api::agent::TurnEvent::Thinking { delta }
+                if delta == "private reasoning"
+        ));
+        assert!(
+            event_rx.try_recv().is_err(),
+            "reasoning must be forwarded once"
+        );
+        let recorded = *turn_usage.lock();
+        assert_eq!(recorded.input_tokens, 0);
+        assert_eq!(recorded.output_tokens, 0);
+        assert_eq!(outcome.attempts[0].provider_ref(), "primary");
+        assert!(matches!(
+            outcome.attempts[0].outcome(),
+            zeroclaw_providers::dispatch::AttemptUsageOutcome::OutcomeUnknown {
+                observed: Some(usage),
+            } if usage.input_tokens == Some(10) && usage.output_tokens == Some(5)
+        ));
+        if cancel_on_final {
+            assert!(outcome.chat_result.unwrap_err().is::<ToolLoopCancelled>());
+            assert_eq!(non_stream_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(outcome.attempts.len(), 1);
+            return;
+        }
+        let response = outcome.chat_result.expect("fallback response succeeds");
+        assert_eq!(response.text.as_deref(), Some("fallback response"));
+        assert_eq!(non_stream_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(outcome.attempts.len(), 2);
+        assert_eq!(outcome.attempts[1].provider_ref(), "primary");
+        assert!(matches!(
+            outcome.attempts[1].outcome(),
+            zeroclaw_providers::dispatch::AttemptUsageOutcome::Complete(usage)
+                if usage.input_tokens == Some(20) && usage.output_tokens == Some(7)
+        ));
+    }
+
+    #[tokio::test]
+    async fn stream_failure_without_fallback_recovers_via_non_streaming() {
+        let non_stream_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".to_string(),
+                Box::new(StreamFailureNoReplayProvider {
+                    non_stream_calls: Arc::clone(&non_stream_calls),
+                }) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
             temperature: Some(0.0),
             approval: None,
             channel_name: "test",
@@ -838,40 +1287,354 @@ mod streaming_fallback_tests {
             turn_id: "test-turn",
             agent_alias: None,
             parent_agent_alias: None,
+            serving_provider_name: None,
+            serving_model: None,
         };
 
-        let outcome = TOOL_LOOP_TURN_USAGE
-            .scope(
-                Some(std::sync::Arc::clone(&turn_usage)),
-                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
-                    Some(cost_context),
-                    call_provider(
-                        &ctx,
-                        &provider,
-                        "test-model",
-                        &[ChatMessage::user("go")],
-                        None,
-                        true,
-                        0,
-                    ),
-                ),
+        let outcome = call_provider(
+            &ctx,
+            &provider,
+            "test-provider",
+            "test-model",
+            "test-model",
+            &[ChatMessage::user("go")],
+            None,
+            true,
+            0,
+        )
+        .await
+        .expect("stream fallback remains a provider-call outcome");
+
+        let response = outcome.chat_result.expect("fallback response succeeds");
+        assert_eq!(response.text.as_deref(), Some("must not replay"));
+        assert_eq!(non_stream_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(outcome.attempts.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn visible_stream_failure_preserves_partial_text_and_typed_server_cause_without_replay() {
+        let non_stream_calls = Arc::new(AtomicUsize::new(0));
+        let provider = VisibleThenServerStreamFailureProvider {
+            non_stream_calls: Arc::clone(&non_stream_calls),
+        };
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: Some(&event_tx),
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+            serving_provider_name: None,
+            serving_model: None,
+        };
+
+        let error = call_provider(
+            &ctx,
+            &provider,
+            "test-provider",
+            "test-model",
+            "test-model",
+            &[ChatMessage::user("go")],
+            None,
+            true,
+            0,
+        )
+        .await
+        .expect("stream interruption remains a provider-call outcome")
+        .chat_result
+        .expect_err("visible stream failure must remain terminal");
+
+        match event_rx
+            .recv()
+            .await
+            .expect("visible chunk must be delivered")
+        {
+            zeroclaw_api::agent::TurnEvent::Chunk { delta } => assert_eq!(delta, "visible"),
+            other => panic!("expected visible chunk, got {other:?}"),
+        }
+        let interrupted = error
+            .downcast_ref::<StreamInterruptedAfterOutput>()
+            .expect("visible output must preserve its typed interruption outcome");
+        assert_eq!(interrupted.partial_text, "visible");
+        assert_eq!(
+            interrupted.to_string(),
+            "model_provider stream error: ModelProvider error: 503 Service Unavailable"
+        );
+
+        let terminal = error
+            .chain()
+            .find_map(|source| source.downcast_ref::<ReliableProviderTerminalFailure>())
+            .expect("stream interruption must expose its typed provider cause");
+        assert_eq!(
+            terminal.kind(),
+            ReliableProviderTerminalFailureKind::ProviderServer
+        );
+        assert_eq!(
+            crate::agent::terminal_completion_error_message(&error, None),
+            Some(crate::i18n::get_required_cli_string(
+                "cli-agent-error-provider-server"
+            ))
+        );
+        assert_eq!(non_stream_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn compatible_stream_failures_recover_to_typed_terminal_kinds_without_replay() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let cases = [
+            (
+                StatusCode::UNAUTHORIZED,
+                ReliableProviderTerminalFailureKind::Authentication,
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                ReliableProviderTerminalFailureKind::ModelNotFound,
+            ),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                ReliableProviderTerminalFailureKind::RateLimited,
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ReliableProviderTerminalFailureKind::ProviderServer,
+            ),
+        ];
+
+        for (status, expected_kind) in cases {
+            let request_count = Arc::new(AtomicUsize::new(0));
+            let request_count_for_route = Arc::clone(&request_count);
+            let app = Router::new().route(
+                "/chat/completions",
+                post(move || {
+                    let request_count = Arc::clone(&request_count_for_route);
+                    async move {
+                        request_count.fetch_add(1, Ordering::Relaxed);
+                        (status, "upstream failure")
+                    }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind compatible test server");
+            let addr = listener.local_addr().expect("read compatible test address");
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("serve compatible test response");
+            });
+            let compatible = OpenAiCompatibleModelProvider::builder("test")
+                .display_name("Test Compatible")
+                .base_url(&format!("http://{addr}"))
+                .credential(None)
+                .auth_style(AuthStyle::Bearer)
+                .build();
+            let provider = ReliableModelProvider::new(
+                "test",
+                vec![(
+                    "primary".to_string(),
+                    Box::new(compatible) as Box<dyn ModelProvider>,
+                )],
+                0,
+                1,
+            );
+            let ctx = TurnCtx {
+                observer: &observer,
+                provider_name: "test-provider",
+                model: "test-model",
+                context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+                temperature: Some(0.0),
+                approval: None,
+                channel_name: "test",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                event_tx: None,
+                hooks: None,
+                dedup_exempt_tools: &[],
+                pacing: &pacing,
+                strict_tool_parsing: false,
+                channel: None,
+                draft_reasoning: StreamReasoningMode::Status,
+                turn_id: "test-turn",
+                agent_alias: None,
+                parent_agent_alias: None,
+                serving_provider_name: None,
+                serving_model: None,
+            };
+
+            let outcome = call_provider(
+                &ctx,
+                &provider,
+                "test-provider",
+                "test-model",
+                "test-model",
+                &[ChatMessage::user("go")],
+                None,
+                true,
+                0,
             )
             .await
-            .expect("stream failure is recovered by one non-streaming request");
-        let response = outcome.chat_result.expect("fallback response succeeds");
+            .expect("stream failure is returned as a provider-call outcome");
+            let error = outcome
+                .chat_result
+                .expect_err("the compatible stream failure must remain terminal");
+            let terminal = error
+                .chain()
+                .find_map(|source| source.downcast_ref::<ReliableProviderTerminalFailure>())
+                .expect("recovery error must preserve a typed terminal cause");
 
-        assert_eq!(response.text.as_deref(), Some("fallback response"));
-        assert_eq!(provider.non_stream_calls.load(Ordering::Relaxed), 1);
-        let recorded = *turn_usage.lock();
-        assert_eq!(recorded.input_tokens, 0);
-        assert_eq!(recorded.output_tokens, 0);
+            assert_eq!(
+                terminal.kind(),
+                expected_kind,
+                "{status} must retain its compatible streaming classification"
+            );
+            // With the fix, both stream and non-stream attempts are made
+            assert_eq!(request_count.load(Ordering::Relaxed), 2, "{status}");
+            assert_eq!(outcome.attempts.len(), 2);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_refusal_recovers_without_replay_and_preserves_attempt_usage() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let refused_non_stream_calls = Arc::new(AtomicUsize::new(0));
+        let rescue_non_stream_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "refusing".to_string(),
+                    Box::new(StreamRefusalProvider {
+                        stream_calls: Arc::clone(&stream_calls),
+                        non_stream_calls: Arc::clone(&refused_non_stream_calls),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "rescue".to_string(),
+                    Box::new(RefusalRescueProvider {
+                        non_stream_calls: Arc::clone(&rescue_non_stream_calls),
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            0,
+        );
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "requested-provider",
+            model: "requested-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+            serving_provider_name: None,
+            serving_model: None,
+        };
+
+        let (outcome, notice) = zeroclaw_providers::scope_safeguard_fallback(async {
+            let outcome = call_provider(
+                &ctx,
+                &provider,
+                "requested-provider",
+                "requested-model",
+                "requested-model",
+                &[ChatMessage::user("go")],
+                None,
+                true,
+                0,
+            )
+            .await
+            .expect("pre-output refusal is recovered by the next candidate");
+            (outcome, zeroclaw_providers::take_last_safeguard_fallback())
+        })
+        .await;
+
+        assert_eq!(
+            outcome.chat_result.unwrap().text.as_deref(),
+            Some("rescued")
+        );
+        assert_eq!(stream_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            refused_non_stream_calls.load(Ordering::Relaxed),
+            0,
+            "the refusing candidate must not receive a replay"
+        );
+        assert_eq!(rescue_non_stream_calls.load(Ordering::Relaxed), 1);
         assert_eq!(outcome.attempts.len(), 2);
+        assert!(
+            matches!(
+                outcome.attempts[0].outcome(),
+                zeroclaw_providers::dispatch::AttemptUsageOutcome::OutcomeUnknown {
+                    observed: Some(usage),
+                } if usage.input_tokens == Some(7)
+                    && usage.output_tokens == Some(3)
+                    && usage.cached_input_tokens == Some(1)
+            ),
+            "attempts: {:#?}",
+            outcome.attempts
+        );
         assert!(matches!(
-            outcome.attempts[0].outcome(),
-            zeroclaw_providers::dispatch::AttemptUsageOutcome::OutcomeUnknown {
-                observed: Some(usage),
-            } if usage.input_tokens == Some(10) && usage.output_tokens == Some(5)
+            outcome.attempts[1].outcome(),
+            zeroclaw_providers::dispatch::AttemptUsageOutcome::Complete(usage)
+                if usage.input_tokens == Some(11) && usage.output_tokens == Some(4)
         ));
+        assert_eq!(
+            outcome
+                .attempts
+                .iter()
+                .filter(|attempt| matches!(
+                    attempt.outcome(),
+                    zeroclaw_providers::dispatch::AttemptUsageOutcome::OutcomeUnknown {
+                        observed: Some(usage),
+                    } if usage.input_tokens == Some(7) && usage.output_tokens == Some(3)
+                ))
+                .count(),
+            1,
+            "refusal usage must be attached to exactly one physical attempt"
+        );
+
+        let notice = notice.expect("successful refusal recovery notice");
+        assert_eq!(
+            notice.kind,
+            zeroclaw_providers::SafeguardFallbackKind::ClientSide
+        );
+        assert_eq!(notice.requested_model, "requested-model");
+        assert_eq!(notice.served_model, "requested-model");
+        assert_eq!(notice.category.as_deref(), Some("private-safety-category"));
     }
 
     #[tokio::test]
@@ -885,6 +1648,7 @@ mod streaming_fallback_tests {
             observer: &observer,
             provider_name: "test-provider",
             model: "test-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
             temperature: Some(0.0),
             approval: None,
             channel_name: "test",
@@ -901,11 +1665,15 @@ mod streaming_fallback_tests {
             turn_id: "test-turn",
             agent_alias: None,
             parent_agent_alias: None,
+            serving_provider_name: None,
+            serving_model: None,
         };
 
         let error = call_provider(
             &ctx,
             &provider,
+            "test-provider",
+            "test-model",
             "test-model",
             &[ChatMessage::user("go")],
             None,
@@ -950,6 +1718,7 @@ mod streaming_fallback_tests {
             observer: &observer,
             provider_name: "requested-provider",
             model: "requested-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
             temperature: Some(0.0),
             approval: None,
             channel_name: "test",
@@ -966,11 +1735,15 @@ mod streaming_fallback_tests {
             turn_id: "test-turn",
             agent_alias: None,
             parent_agent_alias: None,
+            serving_provider_name: None,
+            serving_model: None,
         };
 
         let outcome = call_provider(
             &ctx,
             &provider,
+            "requested-provider",
+            "requested-model",
             "requested-model",
             &[ChatMessage::user("go")],
             None,
@@ -1016,6 +1789,7 @@ mod streaming_fallback_tests {
             observer: &observer,
             provider_name: "requested-provider",
             model: "requested-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
             temperature: Some(0.0),
             approval: None,
             channel_name: "test",
@@ -1032,11 +1806,15 @@ mod streaming_fallback_tests {
             turn_id: "test-turn",
             agent_alias: None,
             parent_agent_alias: None,
+            serving_provider_name: None,
+            serving_model: None,
         };
 
         let outcome = call_provider(
             &ctx,
             &provider,
+            "requested-provider",
+            "requested-model",
             "requested-model",
             &[ChatMessage::user("go")],
             None,

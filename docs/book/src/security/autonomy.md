@@ -36,13 +36,13 @@ Risk classification:
 
 ### `full`
 
-No approval gates; all tool calls flagged low/medium/high run without asking. `workspace_only` is implicitly disabled (the agent can access paths outside the workspace); `forbidden_paths` still blocks; the OS-level sandbox (`sandbox_enabled` + `sandbox_backend`) still applies.
+Uncovered tool calls flagged low/medium/high run without asking. `always_ask` still prompts even under Full: an exact name or `"*"` returns an approval prompt on the CLI, routes a request through a channel back-channel, or fails closed on a non-interactive surface with no approver. `workspace_only` is implicitly disabled (the agent can access paths outside the workspace); `forbidden_paths` still blocks; the OS-level sandbox (`sandbox_enabled` + `sandbox_backend`) still applies.
 
-This is appropriate for trusted local dev, CI, or SOPs that need to run end-to-end without a human in the loop. If you need `full` + no workspace constraints + no sandboxing, see [YOLO mode](../getting-started/yolo.md).
+This is appropriate for trusted local dev, CI, or SOPs that need to run end-to-end without a human in the loop. Keep sensitive tools in `always_ask` if you need Full for everything else but still want a prompt (or a fail-closed deny) for those tools. If you need `full` + no workspace constraints + no sandboxing, see [YOLO mode](../getting-started/yolo.md).
 
 ## Per-tool overrides
 
-`auto_approve`, `always_ask`, and `excluded_tools` live as flat lists of tool names on the risk profile (not nested tables). `excluded_tools` is also available per-channel (`channels.<type>.<alias>.excluded_tools`) to hide tools from specific surfaces without changing the profile.
+`auto_approve`, `always_ask`, and `excluded_tools` live as flat lists of tool names on the risk profile (not nested tables). `always_ask` outranks Full autonomy, `auto_approve`, and a session-level "Always" grant: a listed tool (or `"*"`) still prompts. `excluded_tools` is also available per-channel (`channels.<type>.<alias>.excluded_tools`) to hide tools from specific surfaces without changing the profile.
 
 ## Cross-channel approval routing
 
@@ -71,7 +71,18 @@ For the shell tool specifically: if `allowed_commands` is non-empty, it's strict
 
 ## Path rules
 
-`workspace_only = true` restricts reads and writes to `<workspace>/**`. `forbidden_paths` always blocks regardless of workspace setting (covers the cases where `workspace_only` is off).
+`workspace_only = true` restricts reads and writes to `<workspace>/**`, plus any
+configured `allowed_roots` for the requested access mode. Absolute workspace,
+allow-root, and `forbidden_paths` entries use path-component prefixes. When
+more than one entry matches, the most specific prefix wins; a forbidden entry
+wins an equal-depth tie. A forbidden subtree can therefore block part of the
+workspace or an allowed root, while a narrow operator allow can remain usable
+beneath a broad default forbidden root such as `/home` or `/tmp`.
+
+Resolved file checks compare all matching entries after resolving filesystem
+aliases, so spelling a forbidden subtree through a symlink does not bypass the
+deny. These are absolute-prefix rules: they do not provide glob matching or
+workspace-relative ignore-pattern semantics.
 
 ## Sandbox
 

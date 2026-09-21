@@ -62,6 +62,20 @@ pub(crate) struct SopPane {
     /// Poll freshness is independent from action errors. A failed refresh
     /// retains the last successful map and marks it stale until recovery.
     runs_poll_stale: bool,
+    /// Background SOP-name refresh. This is intentionally separate from the
+    /// run-status receiver so list refreshes cannot affect poll freshness or
+    /// later run-control conflict resolution.
+    list_refresh_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Result<Vec<String>, String>>>,
+    list_refresh_task: Option<tokio::task::JoinHandle<()>>,
+    /// A successful mutation projects locally first, then asks for one
+    /// authoritative replacement after any older list response is discarded.
+    list_refresh_follow_up: bool,
+    /// A request that spans a focus generation is no longer authoritative for
+    /// the pane the user re-entered. Queue one replacement after it settles.
+    list_refresh_stale_on_refocus: bool,
+    /// List-refresh failures retain the projected names and do not overwrite
+    /// the action error shown for create/save/delete/graph operations.
+    list_refresh_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -493,6 +507,17 @@ impl RunOverlayView {
     }
 }
 
+fn parse_sop_names(value: serde_json::Value) -> Result<Vec<String>, String> {
+    #[derive(serde::Deserialize)]
+    struct Named {
+        name: String,
+    }
+
+    serde_json::from_value::<Vec<Named>>(value)
+        .map(|entries| entries.into_iter().map(|entry| entry.name).collect())
+        .map_err(|error| format!("parse SOP list: {error}"))
+}
+
 impl SopPane {
     pub(crate) fn new(rpc: Arc<RpcClient>) -> Self {
         Self {
@@ -526,6 +551,11 @@ impl SopPane {
             read_only: true,
             runs_poll_rx: None,
             runs_poll_stale: false,
+            list_refresh_rx: None,
+            list_refresh_task: None,
+            list_refresh_follow_up: false,
+            list_refresh_stale_on_refocus: false,
+            list_refresh_error: None,
         }
     }
 
@@ -574,6 +604,7 @@ impl SopPane {
     /// unfiltered request covers every row, and the request runs outside the
     /// event loop so a slow daemon cannot block terminal input or rendering.
     pub(crate) fn tick(&mut self) {
+        self.drain_list_refresh();
         self.drain_runs_poll();
         if self.runs_poll_rx.is_some() {
             return;
@@ -628,22 +659,117 @@ impl SopPane {
         self.runs_poll_stale = false;
     }
 
-    pub(crate) async fn refresh(&mut self) {
-        match self.rpc.sops_list().await {
-            Ok(value) => {
-                #[derive(serde::Deserialize)]
-                struct Named {
-                    name: String,
-                }
-                self.names = serde_json::from_value::<Vec<Named>>(value)
-                    .map(|v| v.into_iter().map(|n| n.name).collect())
-                    .unwrap_or_default();
-                self.error = None;
-                if self.list_state.selected().is_none() && !self.names.is_empty() {
-                    self.list_state.select(Some(0));
-                }
+    pub(crate) fn refresh(&mut self) {
+        if std::mem::take(&mut self.list_refresh_stale_on_refocus) && self.list_refresh_rx.is_some()
+        {
+            self.list_refresh_follow_up = true;
+        }
+        self.request_list_refresh(false);
+    }
+
+    pub(crate) fn on_pane_blur(&mut self) {
+        if self.list_refresh_rx.is_some() {
+            self.list_refresh_stale_on_refocus = true;
+        }
+    }
+
+    fn request_list_refresh(&mut self, reconcile_after_mutation: bool) {
+        if self.list_refresh_rx.is_some() {
+            if reconcile_after_mutation {
+                self.list_refresh_follow_up = true;
             }
-            Err(e) => self.error = Some(e.to_string()),
+            return;
+        }
+        self.start_list_refresh();
+    }
+
+    fn start_list_refresh(&mut self) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.list_refresh_rx = Some(rx);
+        let rpc = Arc::clone(&self.rpc);
+        self.list_refresh_task = Some(tokio::spawn(async move {
+            let result = rpc
+                .sops_list()
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(parse_sop_names);
+            let _ = tx.send(result);
+        }));
+    }
+
+    fn drain_list_refresh(&mut self) {
+        let Some(rx) = self.list_refresh_rx.as_mut() else {
+            return;
+        };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                Err("SOP list refresh ended without a response".to_string())
+            }
+        };
+
+        self.list_refresh_rx = None;
+        self.reap_list_refresh_task();
+        if self.list_refresh_follow_up {
+            self.list_refresh_follow_up = false;
+            self.start_list_refresh();
+            return;
+        }
+
+        match result {
+            Ok(names) => {
+                self.replace_names(names);
+                self.list_refresh_error = None;
+            }
+            Err(error) => self.list_refresh_error = Some(error),
+        }
+    }
+
+    fn replace_names(&mut self, names: Vec<String>) {
+        let previous_selected_name = self.selected_name().map(String::from);
+        let selected_index = self.list_state.selected();
+        self.names = names;
+        let selected = previous_selected_name
+            .as_ref()
+            .and_then(|name| self.names.iter().position(|candidate| candidate == name))
+            .or_else(|| {
+                (!self.names.is_empty())
+                    .then(|| selected_index.unwrap_or(0).min(self.names.len() - 1))
+            });
+        self.list_state.select(selected);
+        if previous_selected_name.as_deref() != self.selected_name() {
+            self.clear_selected_sop_state();
+        }
+    }
+
+    fn clear_selected_sop_state(&mut self) {
+        self.graph = SopGraphView::default();
+        self.overlay = None;
+        self.current_run_id = None;
+        self.run_input = None;
+        self.run_payload_input = None;
+    }
+
+    fn project_saved_name(&mut self, name: &str) {
+        if !self.names.iter().any(|candidate| candidate == name) {
+            self.names.push(name.to_string());
+            self.names.sort_unstable();
+        }
+        self.list_state
+            .select(self.names.iter().position(|candidate| candidate == name));
+    }
+
+    fn project_deleted_name(&mut self, name: &str) {
+        self.names.retain(|candidate| candidate != name);
+        self.list_state
+            .select((!self.names.is_empty()).then_some(0));
+        self.clear_selected_sop_state();
+    }
+
+    fn reap_list_refresh_task(&mut self) {
+        if let Some(task) = self.list_refresh_task.take() {
+            task.abort();
         }
     }
 
@@ -1027,8 +1153,8 @@ impl SopPane {
             Ok(_) => {
                 self.status = Some(format!("deleted {name}"));
                 self.overlay = None;
-                self.list_state.select(None);
-                self.refresh().await;
+                self.project_deleted_name(&name);
+                self.request_list_refresh(true);
             }
             Err(e) => self.error = Some(e.to_string()),
         }
@@ -1411,11 +1537,9 @@ impl SopPane {
                 self.editor = None;
                 self.status = Some(format!("saved {name}"));
                 self.error = None;
-                self.refresh().await;
-                if let Some(i) = self.names.iter().position(|n| n == &name) {
-                    self.list_state.select(Some(i));
-                    self.load_selected_graph().await;
-                }
+                self.project_saved_name(&name);
+                self.request_list_refresh(true);
+                self.load_selected_graph().await;
             }
             Err(e) => self.error = Some(e.to_string()),
         }
@@ -1585,15 +1709,17 @@ impl SopPane {
     }
 
     fn visible_error(&self) -> Option<String> {
-        let stale = self
-            .runs_poll_stale
-            .then(|| crate::i18n::t("zc-sop-runs-stale"));
-        match (&self.error, stale) {
-            (Some(action), Some(poll)) => Some(format!("{action}\n{poll}")),
-            (Some(action), None) => Some(action.clone()),
-            (None, Some(poll)) => Some(poll),
-            (None, None) => None,
+        let mut errors = Vec::new();
+        if let Some(action) = &self.error {
+            errors.push(action.clone());
         }
+        if let Some(list) = &self.list_refresh_error {
+            errors.push(list.clone());
+        }
+        if self.runs_poll_stale {
+            errors.push(crate::i18n::t("zc-sop-runs-stale"));
+        }
+        (!errors.is_empty()).then(|| errors.join("\n"))
     }
 
     fn right_title(&self) -> String {
@@ -2057,6 +2183,14 @@ impl SopPane {
             String::new()
         } else {
             format!(" {}", parts.join(" "))
+        }
+    }
+}
+
+impl Drop for SopPane {
+    fn drop(&mut self) {
+        if let Some(task) = self.list_refresh_task.take() {
+            task.abort();
         }
     }
 }
@@ -2624,6 +2758,265 @@ mod tests {
             vec!["webhook", "manual", "channel"],
             "with no backend `sources` (old/failed response) the picker \
              reconstructs from bound + channel so it still works"
+        );
+    }
+}
+
+#[cfg(test)]
+mod list_refresh_tests {
+    use super::SopPane;
+    use crate::client::{GraphNode, NodeKind, RpcClient};
+    use crate::jsonrpc::{JsonRpcError, RpcOutbound};
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    fn list_pane() -> (SopPane, Arc<RpcOutbound>, mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::channel(8);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        (SopPane::new(rpc), outbound, rx)
+    }
+
+    async fn receive_list_request(rx: &mut mpsc::Receiver<String>) -> String {
+        let raw = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("SOP list request should be sent")
+            .expect("RPC writer should remain connected");
+        let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(request["method"], crate::client::method::SOPS_LIST);
+        request["id"].as_str().unwrap().to_string()
+    }
+
+    async fn drain_list_response(pane: &mut SopPane) {
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            pane.drain_list_refresh();
+            if pane.list_refresh_rx.is_none() {
+                return;
+            }
+        }
+        panic!("completed SOP list refresh was not drained");
+    }
+
+    #[tokio::test]
+    async fn ordinary_refresh_requests_coalesce_while_one_is_in_flight() {
+        let (mut pane, outbound, mut rx) = list_pane();
+
+        pane.refresh();
+        pane.refresh();
+        let request_id = receive_list_request(&mut rx).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "coalesced refreshes must not send a second list request"
+        );
+
+        outbound.dispatch_response(&request_id, Some(json!([{ "name": "deploy" }])), None);
+        drain_list_response(&mut pane).await;
+        assert_eq!(pane.names, vec!["deploy".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn dropping_pane_aborts_pending_list_refresh() {
+        let (mut pane, outbound, mut rx) = list_pane();
+
+        pane.refresh();
+        let _request_id = receive_list_request(&mut rx).await;
+        assert_eq!(outbound.pending_count(), 1);
+
+        drop(pane);
+        for _ in 0..100 {
+            if outbound.pending_count() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            outbound.pending_count(),
+            0,
+            "dropping SopPane must cancel its pending list refresh RPC"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_retains_names_and_does_not_clobber_action_error() {
+        let (mut pane, outbound, mut rx) = list_pane();
+        pane.names = vec!["deploy".to_string()];
+        pane.list_state.select(Some(0));
+        pane.error = Some("save failed".to_string());
+
+        pane.refresh();
+        let request_id = receive_list_request(&mut rx).await;
+        outbound.dispatch_response(
+            &request_id,
+            None,
+            Some(JsonRpcError {
+                code: -32000,
+                message: "list unavailable".to_string(),
+                data: None,
+            }),
+        );
+        drain_list_response(&mut pane).await;
+
+        assert_eq!(pane.names, vec!["deploy".to_string()]);
+        assert_eq!(pane.error.as_deref(), Some("save failed"));
+        assert_eq!(
+            pane.list_refresh_error.as_deref(),
+            Some("RPC sops/list: list unavailable (-32000)")
+        );
+        let visible = pane.visible_error().expect("both errors should be visible");
+        assert!(visible.contains("save failed"));
+        assert!(visible.contains("list unavailable"));
+    }
+
+    #[tokio::test]
+    async fn authoritative_refresh_clears_state_when_selected_sop_is_replaced() {
+        let (mut pane, outbound, mut rx) = list_pane();
+        pane.names = vec!["alpha".to_string(), "beta".to_string()];
+        pane.list_state.select(Some(0));
+        pane.graph.nodes.push(GraphNode {
+            step: 1,
+            title: "alpha step".to_string(),
+            kind: NodeKind::default(),
+            subtitle: None,
+            trigger_index: None,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        });
+        pane.overlay = Some(Default::default());
+        pane.current_run_id = Some("run-alpha".to_string());
+        pane.run_input = Some("run-alpha".to_string());
+        pane.run_payload_input = Some(r#"{"source":"alpha"}"#.to_string());
+
+        pane.refresh();
+        let request_id = receive_list_request(&mut rx).await;
+        outbound.dispatch_response(&request_id, Some(json!([{ "name": "beta" }])), None);
+        drain_list_response(&mut pane).await;
+
+        assert_eq!(pane.names, vec!["beta".to_string()]);
+        assert_eq!(pane.selected_name(), Some("beta"));
+        assert!(pane.graph.nodes.is_empty());
+        assert!(pane.overlay.is_none());
+        assert!(pane.current_run_id.is_none());
+        assert!(pane.run_input.is_none());
+        assert!(pane.run_payload_input.is_none());
+
+        let mut submit_stale_prompt = Box::pin(async {
+            if pane.run_input.is_some() {
+                pane.submit_run_input().await;
+            }
+        });
+        tokio::select! {
+            _ = &mut submit_stale_prompt => {}
+            raw = rx.recv() => {
+                let raw = raw.expect("RPC writer should remain connected");
+                let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                panic!("stale alpha prompt issued an RPC for beta: {request}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mutation_reconciliation_discards_old_response_and_starts_one_follow_up() {
+        let (mut pane, outbound, mut rx) = list_pane();
+        pane.names = vec!["old".to_string()];
+        pane.list_state.select(Some(0));
+
+        pane.refresh();
+        let old_request_id = receive_list_request(&mut rx).await;
+        pane.project_saved_name("new");
+        pane.request_list_refresh(true);
+
+        outbound.dispatch_response(&old_request_id, Some(json!([{ "name": "old" }])), None);
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            pane.drain_list_refresh();
+            if !pane.list_refresh_follow_up && pane.list_refresh_rx.is_some() {
+                break;
+            }
+        }
+        assert_eq!(pane.names, vec!["new".to_string(), "old".to_string()]);
+        let follow_up_id = receive_list_request(&mut rx).await;
+        assert_ne!(follow_up_id, old_request_id);
+
+        outbound.dispatch_response(
+            &follow_up_id,
+            Some(json!([{ "name": "new" }, { "name": "old" }])),
+            None,
+        );
+        drain_list_response(&mut pane).await;
+        assert_eq!(pane.names, vec!["new".to_string(), "old".to_string()]);
+        assert_eq!(pane.selected_name(), Some("new"));
+        assert!(rx.try_recv().is_err(), "only one follow-up may be launched");
+    }
+
+    #[tokio::test]
+    async fn delayed_delete_projects_first_row_before_authoritative_replacement() {
+        let (mut pane, outbound, mut rx) = list_pane();
+        pane.names = vec!["alpha".to_string(), "beta".to_string()];
+        pane.list_state.select(Some(1));
+
+        let mut delete = Box::pin(pane.delete_selected());
+        let raw = tokio::time::timeout(Duration::from_millis(200), async {
+            tokio::select! {
+                raw = rx.recv() => raw.expect("RPC writer should remain connected"),
+                _ = &mut delete => panic!("delete must wait for its RPC response"),
+            }
+        })
+        .await
+        .expect("delete should send an RPC request");
+        let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(request["method"], crate::client::method::SOPS_DELETE);
+        let delete_id = request["id"].as_str().unwrap().to_string();
+        outbound.dispatch_response(&delete_id, Some(json!({})), None);
+        delete.await;
+
+        assert_eq!(pane.names, vec!["alpha".to_string()]);
+        assert_eq!(pane.selected_name(), Some("alpha"));
+
+        let list_id = receive_list_request(&mut rx).await;
+        outbound.dispatch_response(&list_id, Some(json!([{ "name": "alpha" }])), None);
+        drain_list_response(&mut pane).await;
+        assert_eq!(pane.names, vec!["alpha".to_string()]);
+        assert_eq!(pane.selected_name(), Some("alpha"));
+    }
+
+    #[tokio::test]
+    async fn mutation_projections_update_membership_and_selection_deterministically() {
+        let (mut pane, _outbound, _rx) = list_pane();
+        pane.names = vec!["alpha".to_string(), "beta".to_string()];
+        pane.list_state.select(Some(1));
+
+        pane.project_saved_name("gamma");
+        assert_eq!(
+            pane.names,
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
+        );
+        assert_eq!(pane.selected_name(), Some("gamma"));
+
+        pane.project_saved_name("alpha");
+        assert_eq!(
+            pane.names,
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
+        );
+        assert_eq!(pane.selected_name(), Some("alpha"));
+
+        pane.graph.nodes.push(GraphNode {
+            step: 1,
+            title: "deleted alpha".to_string(),
+            kind: NodeKind::default(),
+            subtitle: None,
+            trigger_index: None,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        });
+        pane.project_deleted_name("alpha");
+        assert_eq!(pane.names, vec!["beta".to_string(), "gamma".to_string()]);
+        assert_eq!(pane.selected_name(), Some("beta"));
+        assert!(
+            pane.graph.nodes.is_empty(),
+            "delete projection must not render the deleted SOP graph for the new selection"
         );
     }
 }

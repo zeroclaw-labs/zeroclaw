@@ -11,6 +11,15 @@ use zeroclaw_api::plan::PlanEntry;
 use zeroclaw_infra::session_queue::SessionActorQueue;
 use zeroclaw_providers::ModelProvider;
 
+/// Error returned by [`SessionStore::lock_model_provider_update_with_timeout`].
+#[derive(Debug)]
+pub(crate) enum WaitForProviderUpdateError {
+    /// The session no longer exists.
+    SessionNotFound,
+    /// The update lock was not released within the requested timeout.
+    Timeout,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CancelCause {
@@ -23,6 +32,10 @@ pub enum CancelCause {
     AdminKill,
     /// The session was explicitly removed/torn down while a turn was live.
     SessionRemoved,
+    /// The RPC connection generation that accepted the turn was closed.
+    /// This includes EOF and daemon reload cancellation. The turn must not
+    /// outlive the outbound channel that owns its notifications.
+    ConnectionClosed,
 }
 
 impl CancelCause {
@@ -31,6 +44,7 @@ impl CancelCause {
             CancelCause::ClientRpc => "client_rpc",
             CancelCause::AdminKill => "admin_kill",
             CancelCause::SessionRemoved => "session_removed",
+            CancelCause::ConnectionClosed => "connection_closed",
         }
     }
 }
@@ -67,6 +81,38 @@ pub struct RpcSession {
     pub plan: Vec<PlanEntry>,
     pub chat_mode: crate::rpc::types::ChatMode,
     pub owner_tui_id: Option<String>,
+    /// Monotonic generation counter stamped by `SessionStore::insert`.
+    /// Provider-refresh callers capture this before building a provider box
+    /// and pass it to `SessionStore::apply_model_provider` so stale work
+    /// cannot mutate a successor installed under the same session ID.
+    pub generation: u64,
+    /// Set when this session was published with a provider/resolver binding
+    /// whose config generation is not yet confirmed — today, an ACP
+    /// rehydration that lost the race for `config_write_lock` and was
+    /// therefore excluded from an in-flight refresh transaction's
+    /// `list_ids()` snapshot.
+    ///
+    /// Between insertion and reconciliation the session is live but its
+    /// binding is provisional: dispatch would use the construction-time
+    /// provider while canonical config has already moved on. Consumers that
+    /// must observe one coherent generation (`session/prompt`,
+    /// `session/configure`) await this before proceeding; reconciliation or a
+    /// later ordinary refresh clears it and wakes them only after publishing
+    /// the committed binding.
+    ///
+    /// `None` is the steady state — a session inserted with a confirmed
+    /// binding never carries one, so the common path costs one `Option`
+    /// check.
+    pending_generation: Option<Arc<tokio::sync::Notify>>,
+}
+
+/// Canonical live-session data returned when `session/new` reattaches to an
+/// ID that is already present in the process-local session store.
+pub struct ResumedRpcSession {
+    pub agent: Arc<Mutex<Agent>>,
+    pub agent_alias: String,
+    pub workspace_dir: String,
+    pub message_count: usize,
 }
 
 impl RpcSession {
@@ -88,7 +134,18 @@ impl RpcSession {
             plan: Vec::new(),
             chat_mode,
             owner_tui_id: None,
+            generation: 0,
+            pending_generation: None,
         }
+    }
+
+    /// Mark this session as published with a provisional binding. The
+    /// returned notifier is handed to the reconciliation and refresh paths,
+    /// which call `SessionStore::clear_pending_generation` only after a
+    /// committed binding has been published for this session generation.
+    pub fn with_pending_generation(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
+        self.pending_generation = Some(notify);
+        self
     }
 
     /// Bind this session to a TUI owner.
@@ -97,6 +154,19 @@ impl RpcSession {
         self
     }
 }
+
+#[cfg(test)]
+type GatedOpPause = (
+    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>,
+);
+
+#[cfg(test)]
+type PromptRegistrationPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+
+#[cfg(test)]
+type RehydrateSeedPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 
 pub struct SessionStore {
     sessions: Mutex<HashMap<String, RpcSession>>,
@@ -107,6 +177,58 @@ pub struct SessionStore {
     cancel_causes: std::sync::Mutex<HashMap<String, CancelCause>>,
     max_sessions: usize,
     pub session_queue: Arc<SessionActorQueue>,
+    /// Monotonic counter incremented on every `insert` that installs or
+    /// replaces a session entry. Captured by provider-refresh callers so
+    /// `apply_model_provider` can reject work from a stale instance.
+    session_generation: std::sync::atomic::AtomicU64,
+    /// Test-only gate: when set, `set_overrides_gated` and
+    /// `apply_model_provider` signal `entered` on entry, wait on
+    /// `release`, then signal `done` on exit, letting a regression test
+    /// atomically replace the session and wait for completion.
+    #[cfg(test)]
+    test_gated_op_pause: std::sync::Mutex<Option<GatedOpPause>>,
+    /// Test-only pause immediately after a prompt registers its cancellation
+    /// token. Removal-race tests use this to issue close/kill/delete while the
+    /// prompt owns admission but before any fallible setup or provider work.
+    #[cfg(test)]
+    test_prompt_registration_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
+    /// Test-only pause between a rehydration's publication and its history
+    /// restore, letting a regression drive another RPC deterministically
+    /// inside the window where the successor is live but unseeded.
+    #[cfg(test)]
+    test_rehydrate_seed_pause: std::sync::Mutex<Option<RehydrateSeedPause>>,
+}
+
+/// Generation-owned handle for the canonical cancellation-token registration.
+///
+/// The token map in [`SessionStore`] remains the source of truth. This handle
+/// only guarantees that the exact generation installed by one admitted prompt
+/// is removed on every exit path, including setup failures before provider
+/// execution starts.
+pub(crate) struct CancelTokenRegistration<'a> {
+    store: &'a SessionStore,
+    session_id: &'a str,
+    generation: Option<u64>,
+}
+
+impl CancelTokenRegistration<'_> {
+    /// Drain the turn's cancellation attribution before unregistering the
+    /// token. `remove_cancel_token` intentionally clears any leftover cause.
+    pub(crate) fn finish(mut self) -> Option<CancelCause> {
+        let cause = self.store.take_cancel_cause(self.session_id);
+        if let Some(generation) = self.generation.take() {
+            self.store.remove_cancel_token(self.session_id, generation);
+        }
+        cause
+    }
+}
+
+impl Drop for CancelTokenRegistration<'_> {
+    fn drop(&mut self) {
+        if let Some(generation) = self.generation.take() {
+            self.store.remove_cancel_token(self.session_id, generation);
+        }
+    }
 }
 
 impl SessionStore {
@@ -120,16 +242,189 @@ impl SessionStore {
             cancel_causes: std::sync::Mutex::new(HashMap::new()),
             max_sessions,
             session_queue,
+            session_generation: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            test_gated_op_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_prompt_registration_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_rehydrate_seed_pause: std::sync::Mutex::new(None),
         }
     }
 
-    pub async fn insert(&self, id: String, session: RpcSession) -> Result<(), &'static str> {
+    pub async fn insert(&self, id: String, session: RpcSession) -> Result<u64, &'static str> {
+        // Replacement is part of the session actor lifecycle. Serialize it
+        // with prompts so a same-ID successor cannot be published midway
+        // through a turn admitted for the predecessor.
+        let _session_guard = self
+            .session_queue
+            .acquire(&id)
+            .await
+            .map_err(|_| "session busy")?;
+        self.publish_session(&id, session).await
+    }
+
+    /// Publish a session while the caller already owns the session's
+    /// admission permit. `handle_session_new` drives the whole incarnation —
+    /// predecessor wait, transcript load, build, publish, history restore —
+    /// under ONE permit acquisition: the transcript is only read after the
+    /// predecessor turn has fully finalized, and no prompt can be admitted
+    /// against the successor until the caller drops its guard after the
+    /// history restore. Re-acquiring the permit internally (as
+    /// [`SessionStore::insert`](Self::insert) does) would deadlock against
+    /// the caller's guard.
+    ///
+    /// This REPLACES any live incarnation already present under `id`:
+    /// rehydration legitimately swaps a same-ID successor for the published
+    /// session while holding the permit, so absence is not required here.
+    /// The `session/new` external boundary, which must never overwrite a
+    /// concurrent incarnation, uses
+    /// [`SessionStore::insert_admitted_if_absent`](Self::insert_admitted_if_absent)
+    /// instead.
+    ///
+    /// The caller must hold `admission` for exactly `id` (debug-asserted)
+    /// and must keep it alive until the published session is fully restored.
+    pub async fn insert_admitted(
+        &self,
+        admission: &zeroclaw_infra::session_queue::SessionGuard,
+        id: String,
+        session: RpcSession,
+    ) -> Result<u64, &'static str> {
+        debug_assert_eq!(
+            admission.session_id(),
+            id,
+            "insert_admitted requires the admission permit for the session being published"
+        );
+        self.publish_session(&id, session).await
+    }
+
+    /// Absence-safe variant of [`SessionStore::insert_admitted`](Self::insert_admitted)
+    /// for the `session/new` external boundary, combining the admission
+    /// permit contract with
+    /// [`SessionStore::insert_if_absent`](Self::insert_if_absent)'s refusal
+    /// to overwrite a live incarnation: under the caller's permit the slot
+    /// was cleared (or never occupied) before the rebuild began, so a live
+    /// entry here means a concurrent resume won the race. Two concurrent
+    /// resume requests therefore cannot silently replace one another.
+    ///
+    /// The caller must hold `admission` for exactly `id` (debug-asserted)
+    /// and must keep it alive until the published session is fully restored.
+    pub async fn insert_admitted_if_absent(
+        &self,
+        admission: &zeroclaw_infra::session_queue::SessionGuard,
+        id: String,
+        session: RpcSession,
+    ) -> Result<u64, &'static str> {
+        debug_assert_eq!(
+            admission.session_id(),
+            id,
+            "insert_admitted_if_absent requires the admission permit for the session being published"
+        );
+        if self.sessions.lock().await.contains_key(&id) {
+            return Err("session already exists");
+        }
+        self.publish_session(&id, session).await
+    }
+
+    /// Map-write half shared by [`SessionStore::insert`](Self::insert) and
+    /// [`insert_admitted`](Self::insert_admitted): stamp the
+    /// incarnation generation and publish. Callers own the admission
+    /// boundary.
+    async fn publish_session(
+        &self,
+        id: &str,
+        mut session: RpcSession,
+    ) -> Result<u64, &'static str> {
         let mut sessions = self.sessions.lock().await;
         if sessions.len() >= self.max_sessions {
             return Err("session limit reached");
         }
+        let generation = self
+            .session_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .wrapping_add(1);
+        session.generation = generation;
+        sessions.insert(id.to_string(), session);
+        Ok(generation)
+    }
+
+    /// Publish a newly constructed session only when no live incarnation is
+    /// already present. `session/new` uses this at the external boundary so
+    /// two concurrent resume requests cannot replace one another.
+    pub async fn insert_if_absent(
+        &self,
+        id: String,
+        session: RpcSession,
+    ) -> Result<(), &'static str> {
+        self.publish_prepared(id, session, None).await
+    }
+
+    /// Publish a fully prepared incarnation without exposing an empty slot.
+    /// The caller holds session admission; the generation check also protects
+    /// against removal or replacement by another store-level owner.
+    pub(crate) async fn publish_prepared(
+        &self,
+        id: String,
+        mut session: RpcSession,
+        expected_generation: Option<u64>,
+    ) -> Result<(), &'static str> {
+        let mut sessions = self.sessions.lock().await;
+        if sessions.get(&id).map(|s| s.generation) != expected_generation {
+            return Err(if expected_generation.is_some() {
+                "session changed during preparation"
+            } else {
+                "session already exists"
+            });
+        }
+        if expected_generation.is_none() && sessions.len() >= self.max_sessions {
+            return Err("session limit reached");
+        }
+        let generation = self
+            .session_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .wrapping_add(1);
+        session.generation = generation;
         sessions.insert(id, session);
         Ok(())
+    }
+
+    /// Rebind a caller to the canonical live session without replacing its
+    /// `Agent`. A supplied session ID is a resume selector: when the live
+    /// incarnation already exists, rebuilding it would fork provider history
+    /// from an in-flight predecessor turn.
+    pub async fn resume_existing(
+        &self,
+        id: &str,
+        agent_alias: &str,
+        chat_mode: &crate::rpc::types::ChatMode,
+        owner_tui_id: Option<String>,
+    ) -> Result<Option<ResumedRpcSession>, &'static str> {
+        let mut sessions = self.sessions.lock().await;
+        let Some(session) = sessions.get_mut(id) else {
+            return Ok(None);
+        };
+        if session.agent_alias != agent_alias {
+            return Err("session belongs to a different agent");
+        }
+        if &session.chat_mode != chat_mode {
+            return Err("session uses a different chat mode");
+        }
+
+        if owner_tui_id.is_some() {
+            session.owner_tui_id = owner_tui_id;
+        }
+        session.last_active = Instant::now();
+        let message_count = session
+            .agent
+            .try_lock()
+            .map(|agent| agent.history().len())
+            .unwrap_or_default();
+        Ok(Some(ResumedRpcSession {
+            agent: Arc::clone(&session.agent),
+            agent_alias: session.agent_alias.clone(),
+            workspace_dir: session.workspace_dir.clone(),
+            message_count,
+        }))
     }
 
     pub async fn get_agent(&self, id: &str) -> Option<Arc<Mutex<Agent>>> {
@@ -176,6 +471,243 @@ impl SessionStore {
         Arc::clone(&self.model_provider_update_waiting)
     }
 
+    /// Await confirmation of a session's provisional binding, waiting at most
+    /// `timeout`.
+    ///
+    /// Returns immediately for the steady state — a session with no pending
+    /// generation, which is every session except one being reconciled after a
+    /// contended ACP rehydration. Otherwise it parks on the notifier the
+    /// reconciliation task will fire, so the caller observes one coherent
+    /// provider/resolver/limits generation instead of dispatching through the
+    /// construction-time binding while canonical config has moved on.
+    ///
+    /// Returns the generation the wait resolved against. Callers holding a
+    /// cached `Agent` must compare it with the generation they captured and
+    /// re-look-up on a mismatch: waiting says nothing about WHICH instance now
+    /// answers to this ID.
+    ///
+    /// Keyed on `(id, generation)`, not `id` alone. A same-ID replacement
+    /// installs its own marker, so an ID-only re-check would observe the
+    /// successor's marker as "still pending" and then park on the predecessor's
+    /// notifier — which nobody fires again, stranding the waiter until timeout
+    /// even though the successor converged. On replacement this returns the new
+    /// generation immediately rather than waiting on an orphaned marker.
+    ///
+    /// A missing session is `Ok(None)`, not an error: absence is the caller's
+    /// own lookup to report, and every call site here already handles it.
+    /// `Err(Timeout)` should surface as a retryable busy error rather than
+    /// proceeding on the provisional binding.
+    pub(crate) async fn await_pending_generation(
+        &self,
+        id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Option<u64>, WaitForProviderUpdateError> {
+        let Some((pending, generation)) = self.sessions.lock().await.get(id).and_then(|session| {
+            session
+                .pending_generation
+                .as_ref()
+                .map(|p| (Arc::clone(p), session.generation))
+        }) else {
+            return Ok(None);
+        };
+        // Register interest BEFORE re-checking, so a reconciliation that
+        // completes between the lookup above and the wait below cannot leave
+        // this caller parked on a notifier nobody will fire again.
+        let notified = pending.notified();
+        tokio::pin!(notified);
+        // Re-check keyed on the SAME generation we cloned the marker from.
+        // An ID-only check would see a same-ID replacement's marker as "still
+        // pending" and then park on the predecessor's notifier, which nobody
+        // fires again. On replacement return the new generation immediately.
+        let current = self.sessions.lock().await;
+        match current.get(id) {
+            None => return Ok(None),
+            Some(session) if session.generation != generation => {
+                return Ok(Some(session.generation));
+            }
+            Some(session) if session.pending_generation.is_none() => return Ok(Some(generation)),
+            Some(_) => {}
+        }
+        drop(current);
+        tokio::time::timeout(timeout, notified)
+            .await
+            .map_err(|_| WaitForProviderUpdateError::Timeout)?;
+        // Return the generation we converged on, which may have changed again.
+        Ok(self
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .map(|session| session.generation))
+    }
+
+    /// Confirm a session's binding and wake everyone awaiting it.
+    ///
+    /// Called only after a committed binding is published. Failed repair keeps
+    /// the marker in place so prompt/configure callers cannot observe a mixed
+    /// provider/config generation; a later successful ordinary refresh clears
+    /// it for this exact session generation.
+    pub(crate) async fn clear_pending_generation(&self, id: &str, expected_generation: u64) {
+        let notify = {
+            let mut sessions = self.sessions.lock().await;
+            match sessions.get_mut(id) {
+                Some(session) if session.generation == expected_generation => {
+                    session.pending_generation.take()
+                }
+                None => None,
+                Some(_) => None,
+            }
+        };
+        if let Some(notify) = notify {
+            notify.notify_waiters();
+        }
+    }
+
+    /// Lock the provider generation for a prompt, waiting at most `timeout`.
+    ///
+    /// The caller must hold the returned guard through the turn boundary (and,
+    /// today, through the whole turn). That closes both sides of the ordering
+    /// race: a config transaction that already owns the lock finishes publishing
+    /// its provider/resolver/generation first, while a transaction that starts
+    /// after this call cannot publish a new live config between the prompt's
+    /// generation check and `sync_config_generation()`.
+    ///
+    /// Returns `Err` if the session no longer exists, or if the lock is not
+    /// released within `timeout`.  The caller should surface the timeout as a
+    /// retryable error rather than proceeding with a potentially stale resolver.
+    pub(crate) async fn lock_model_provider_update_with_timeout(
+        &self,
+        id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, WaitForProviderUpdateError> {
+        let lock = self
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .map(|session| Arc::clone(&session.model_provider_update))
+            .ok_or(WaitForProviderUpdateError::SessionNotFound)?;
+
+        #[cfg(test)]
+        let acquire = {
+            let waiting = Arc::clone(&self.model_provider_update_waiting);
+            let mut lock = Box::pin(lock.lock_owned());
+            let mut notified = false;
+            std::future::poll_fn(
+                move |cx| match std::future::Future::poll(lock.as_mut(), cx) {
+                    std::task::Poll::Pending => {
+                        if !notified {
+                            waiting.notify_one();
+                            notified = true;
+                        }
+                        std::task::Poll::Pending
+                    }
+                    std::task::Poll::Ready(guard) => std::task::Poll::Ready(guard),
+                },
+            )
+        };
+        #[cfg(not(test))]
+        let acquire = lock.lock_owned();
+
+        tokio::time::timeout(timeout, acquire)
+            .await
+            .map_err(|_| WaitForProviderUpdateError::Timeout)
+    }
+
+    /// Return the current generation for the session with `id`, or `None` if
+    /// the session is absent. Provider-refresh callers capture this value
+    /// before building a provider box and thread it through
+    /// `apply_model_provider` so stale work targeting a replaced session
+    /// becomes a no-op.
+    pub async fn get_generation(&self, id: &str) -> Option<u64> {
+        self.sessions.lock().await.get(id).map(|s| s.generation)
+    }
+
+    /// Await the test-only pause gate before validating generation in
+    /// `set_overrides_gated` and `apply_model_provider`. Returns the
+    /// `done` notifier which must be signalled after the generation check
+    /// (and any apply attempt) completes so tests don't observe the
+    /// successor before the stale work has run its course.
+    #[cfg(test)]
+    async fn wait_test_gate(&self) -> Option<Arc<tokio::sync::Notify>> {
+        let (entered, release, done) = {
+            let guard = self.test_gated_op_pause.lock().unwrap();
+            match &*guard {
+                Some((e, r, d)) => (e.clone(), r.clone(), d.clone()),
+                None => return None,
+            }
+        };
+        entered.notify_one();
+        release.notified().await;
+        Some(done)
+    }
+
+    /// Signal the `done` notifier returned by `wait_test_gate`.
+    #[cfg(test)]
+    fn signal_test_gate_done(&self, done: Option<Arc<tokio::sync::Notify>>) {
+        if let Some(d) = done {
+            d.notify_one();
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    async fn wait_test_gate(&self) {}
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn signal_test_gate_done(&self, _done: ()) {}
+
+    /// Install a test-only pause gate at the pre-commit boundary inside
+    /// `set_overrides_gated` and `apply_model_provider`. Returns
+    /// `(entered, release, done)`.
+    #[cfg(test)]
+    pub fn set_test_gated_op_pause(&self) -> GatedOpPause {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let done = Arc::new(tokio::sync::Notify::new());
+        *self.test_gated_op_pause.lock().unwrap() = Some((
+            Arc::clone(&entered),
+            Arc::clone(&release),
+            Arc::clone(&done),
+        ));
+        (entered, release, done)
+    }
+
+    #[cfg(test)]
+    pub fn clear_test_gated_op_pause(&self) {
+        *self.test_gated_op_pause.lock().unwrap() = None;
+    }
+
+    /// Install a test-only pause between a rehydration's publication and its
+    /// history restore. Returns `(arrived, release)`.
+    #[cfg(test)]
+    pub fn set_test_rehydrate_seed_pause(&self) -> RehydrateSeedPause {
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.test_rehydrate_seed_pause.lock().unwrap() =
+            Some((Arc::clone(&arrived), Arc::clone(&release)));
+        (arrived, release)
+    }
+
+    /// Pause point for [`Self::set_test_rehydrate_seed_pause`]: signals
+    /// `arrived` and parks on `release`. No-op unless the pause is armed.
+    #[cfg(test)]
+    pub(crate) async fn wait_test_rehydrate_seed_pause(&self) {
+        let (arrived, release) = {
+            let guard = self.test_rehydrate_seed_pause.lock().unwrap();
+            match &*guard {
+                Some((a, r)) => (a.clone(), r.clone()),
+                None => return,
+            }
+        };
+        arrived.notify_one();
+        release.notified().await;
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) async fn wait_test_rehydrate_seed_pause(&self) {}
+
     pub async fn touch(&self, id: &str) {
         if let Some(s) = self.sessions.lock().await.get_mut(id) {
             s.last_active = Instant::now();
@@ -202,6 +734,40 @@ impl SessionStore {
         if overrides.temperature.is_some() {
             guard.set_temperature(overrides.temperature);
         }
+        Some(overrides)
+    }
+
+    /// Like `set_overrides`, but validates `generation` before mutating the
+    /// session entry or its agent. Returns `None` if the session is absent
+    /// *or* if it was replaced under the same ID — both cases mean the caller
+    /// captured a stale generation and the work must be discarded.
+    pub async fn set_overrides_gated(
+        &self,
+        id: &str,
+        generation: u64,
+        patch: SessionOverrides,
+    ) -> Option<SessionOverrides> {
+        let done = self.wait_test_gate().await;
+        let merged = self.preview_overrides(id, &patch).await?;
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions.get_mut(id)?;
+        if session.generation != generation {
+            self.signal_test_gate_done(done);
+            return None;
+        }
+        session.overrides = merged.clone();
+        // Apply to agent immediately.
+        let overrides = session.overrides.clone();
+        let agent = session.agent.clone();
+        drop(sessions);
+        let mut guard = agent.lock().await;
+        if let Some(ref m) = overrides.model {
+            guard.set_model_name(m.clone());
+        }
+        if overrides.temperature.is_some() {
+            guard.set_temperature(overrides.temperature);
+        }
+        self.signal_test_gate_done(done);
         Some(overrides)
     }
 
@@ -235,27 +801,105 @@ impl SessionStore {
     /// Swap a freshly built `ModelProvider` box (and its name) onto the
     /// session's agent. Called by the dispatcher after it constructs the
     /// box from config, keeping model_provider-build logic out of the store.
+    /// The route resolver is installed in the SAME state transition as the
+    /// provider box: it holds the hint→route table bound to that provider set,
+    /// so leaving the old resolver would resolve routed hints through the
+    /// previous provider while the new box serves the call.
+    /// `config_generation` is the `Arc<Config>` the caller built this provider
+    /// box and resolver FROM. It is published onto the agent in the same state
+    /// transition, so a later explicit `model_switch` rebuilds dispatch from
+    /// that generation rather than the agent's construction-time snapshot, and
+    /// `context_limits_for_route` reports capacity and budget from it too.
+    /// Passing a generation the box was not built from reintroduces the
+    /// mixed-generation split this parameter exists to close.
+    ///
+    /// `generation` is the orthogonal SESSION-identity fence: it must match the
+    /// session's current generation (captured before the caller built the
+    /// provider box). If the session was replaced under the same ID — e.g. by
+    /// a cross-mode `session/new` replacement or ACP rehydration — while the
+    /// provider was being built, the generations won't match and this call
+    /// becomes a no-op (returns `false`). `config_generation` answers "which
+    /// config was this built from"; `generation` answers "is this still the
+    /// same session". Live same-ID `session/new` requests resume the existing
+    /// incarnation rather than replacing it.
+    ///
+    /// When `temperature` is `Some(v)`, the captured agent's temperature is
+    /// set to `v` (which may be `None`, clearing a prior profile temperature).
+    /// When `temperature` is `None`, the agent's temperature is left unchanged
+    /// — used by `session/configure` where temperature is already committed
+    /// via `set_overrides_gated`.
     pub async fn apply_model_provider(
         &self,
         id: &str,
+        generation: u64,
         model_provider: Box<dyn ModelProvider>,
         model_provider_name: String,
         model_name: String,
+        model_route_resolver: Arc<zeroclaw_providers::router::ModelRouteResolver>,
         tool_dispatcher: Box<dyn ToolDispatcher>,
+        config_generation: Arc<zeroclaw_config::schema::Config>,
+        temperature: Option<Option<f64>>,
     ) -> bool {
+        let done = self.wait_test_gate().await;
         let agent = {
             let sessions = self.sessions.lock().await;
             match sessions.get(id) {
-                Some(s) => s.agent.clone(),
-                None => return false,
+                Some(s) if s.generation == generation => s.agent.clone(),
+                Some(_) => {
+                    self.signal_test_gate_done(done);
+                    return false;
+                }
+                None => {
+                    self.signal_test_gate_done(done);
+                    return false;
+                }
             }
         };
         let mut guard = agent.lock().await;
         guard.set_model_provider(model_provider);
         guard.set_model_provider_name(model_provider_name);
         guard.set_model_name(model_name);
+        guard.set_model_route_resolver(model_route_resolver);
         guard.set_tool_dispatcher(tool_dispatcher);
+        guard.set_config_generation(config_generation);
+        if let Some(t) = temperature {
+            guard.set_temperature(t);
+        }
+        self.signal_test_gate_done(done);
         true
+    }
+
+    /// Rewrite a session's in-memory `model_provider` override to a new
+    /// reference. `SessionOverrides` is transient session state rather than
+    /// config, so a provider alias rename does not reach it through the
+    /// config cascade. Without this migration the override would keep naming
+    /// an alias that no longer exists, and the next resolution would fall
+    /// back to compatibility values or fail while rebuilding the old
+    /// reference. Called from the live-refresh publication step while that
+    /// session's `model_provider_update` guard is held.
+    ///
+    /// `generation` must match the session's current generation (same
+    /// contract as `apply_model_provider`). A same-ID successor inserted
+    /// by `session/new` or ACP rehydration while this refresh was in flight
+    /// would have a different generation, and the migration must be rejected
+    /// for it: the successor never requested an alias rename, and a stale
+    /// refresh must not write its override. Returns `true` when the migration
+    /// applied, `false` when the session was absent or its generation did not
+    /// match.
+    pub async fn migrate_model_provider_override(
+        &self,
+        id: &str,
+        generation: u64,
+        new_ref: String,
+    ) -> bool {
+        let mut sessions = self.sessions.lock().await;
+        match sessions.get_mut(id) {
+            Some(session) if session.generation == generation => {
+                session.overrides.model_provider = Some(new_ref);
+                true
+            }
+            _ => false,
+        }
     }
 
     pub async fn get_overrides(&self, id: &str) -> Option<SessionOverrides> {
@@ -306,6 +950,29 @@ impl SessionStore {
 
     pub async fn seed_history(&self, id: &str, msgs: &[zeroclaw_api::model_provider::ChatMessage]) {
         let _ = self.seed_history_with_event(id, msgs).await;
+    }
+
+    /// Whether the session's in-memory agent currently believes its history
+    /// starts with the synthetic trim breadcrumb. `None` if the session is
+    /// unknown. Callers persist this alongside the transcript so a later
+    /// restore never has to infer provenance from message text.
+    pub async fn history_has_trim_breadcrumb(&self, id: &str) -> Option<bool> {
+        if let Some(s) = self.sessions.lock().await.get(id) {
+            Some(s.agent.lock().await.history_has_trim_breadcrumb())
+        } else {
+            None
+        }
+    }
+
+    /// Restore the session's own canonical breadcrumb-provenance record onto
+    /// its in-memory agent. No-op if the session is unknown.
+    pub async fn set_history_has_trim_breadcrumb(&self, id: &str, present: bool) {
+        if let Some(s) = self.sessions.lock().await.get(id) {
+            s.agent
+                .lock()
+                .await
+                .set_history_has_trim_breadcrumb(present);
+        }
     }
 
     pub async fn seed_history_with_event(
@@ -394,7 +1061,16 @@ impl SessionStore {
             self.record_cancel_cause(id, CancelCause::SessionRemoved);
             token.cancel();
         }
-        self.sessions.lock().await.remove(id).is_some()
+        let (removed, pending) = self
+            .sessions
+            .lock()
+            .await
+            .remove(id)
+            .map_or((false, None), |session| (true, session.pending_generation));
+        if let Some(notify) = pending {
+            notify.notify_waiters();
+        }
+        removed
     }
 
     pub async fn evict_same_mode_sibling(
@@ -422,10 +1098,18 @@ impl SessionStore {
             .map(|(key, _)| key.clone())
             .collect();
         let mut evicted = Vec::with_capacity(victims.len());
+        let mut pending = Vec::new();
         for key in victims {
             if let Some(s) = sessions.remove(&key) {
+                if let Some(notify) = s.pending_generation {
+                    pending.push(notify);
+                }
                 evicted.push((key, s.agent_alias));
             }
+        }
+        drop(sessions);
+        for notify in pending {
+            notify.notify_waiters();
         }
         evicted
     }
@@ -462,6 +1146,44 @@ impl SessionStore {
         generation
     }
 
+    pub(crate) fn register_cancel_token_guard<'a>(
+        &'a self,
+        id: &'a str,
+        token: tokio_util::sync::CancellationToken,
+    ) -> CancelTokenRegistration<'a> {
+        CancelTokenRegistration {
+            store: self,
+            session_id: id,
+            generation: Some(self.register_cancel_token(id, token)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_test_prompt_registration_pause(&self) {
+        let (entered, release) = {
+            let guard = self.test_prompt_registration_pause.lock().unwrap();
+            match &*guard {
+                Some((entered, release)) => (Arc::clone(entered), Arc::clone(release)),
+                None => return,
+            }
+        };
+        entered.notify_one();
+        release.notified().await;
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) async fn wait_test_prompt_registration_pause(&self) {}
+
+    #[cfg(test)]
+    pub(crate) fn set_test_prompt_registration_pause(&self) -> PromptRegistrationPause {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.test_prompt_registration_pause.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&release)));
+        (entered, release)
+    }
+
     pub fn remove_cancel_token(&self, id: &str, generation: u64) {
         {
             let mut tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
@@ -479,13 +1201,29 @@ impl SessionStore {
     }
 
     pub fn cancel_session(&self, id: &str) -> bool {
-        self.record_cancel_cause(id, CancelCause::ClientRpc);
-        self.cancel_tokens
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        self.signal_cancellation(id, CancelCause::ClientRpc)
+    }
+
+    /// Signal an in-flight turn before a close/delete handler waits for the
+    /// session admission permit. The handler removes the session only after
+    /// the admitted prompt has finalized under its original incarnation.
+    pub fn signal_session_removal(&self, id: &str) -> bool {
+        self.signal_cancellation(id, CancelCause::SessionRemoved)
+    }
+
+    /// Signal an in-flight turn before an administrative kill waits for the
+    /// session admission permit.
+    pub fn signal_session_kill(&self, id: &str) -> bool {
+        self.signal_cancellation(id, CancelCause::AdminKill)
+    }
+
+    fn signal_cancellation(&self, id: &str, cause: CancelCause) -> bool {
+        let tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        tokens
             .get(id)
-            .map(|(_, t)| {
-                t.cancel();
+            .map(|(_, token)| {
+                self.record_cancel_cause(id, cause);
+                token.cancel();
                 true
             })
             .unwrap_or(false)
@@ -499,6 +1237,17 @@ impl SessionStore {
             .contains_key(id)
     }
 
+    /// Generation of the runtime-owned turn currently executing for a
+    /// session. This is the authoritative live-turn identity for RPC status;
+    /// persisted session metadata is not updated on every RPC turn.
+    pub fn inflight_turn_generation(&self, id: &str) -> Option<u64> {
+        self.cancel_tokens
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(id)
+            .map(|(generation, _)| *generation)
+    }
+
     pub async fn kill_session(&self, id: &str) -> bool {
         if let Some((_, token)) = self
             .cancel_tokens
@@ -509,7 +1258,16 @@ impl SessionStore {
             self.record_cancel_cause(id, CancelCause::AdminKill);
             token.cancel();
         }
-        self.sessions.lock().await.remove(id).is_some()
+        let (removed, pending) = self
+            .sessions
+            .lock()
+            .await
+            .remove(id)
+            .map_or((false, None), |session| (true, session.pending_generation));
+        if let Some(notify) = pending {
+            notify.notify_waiters();
+        }
+        removed
     }
 
     /// Record the cause for an imminent cancel-token fire. Call immediately
@@ -519,6 +1277,17 @@ impl SessionStore {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(id.to_string(), cause);
+    }
+
+    /// Record a fallback cause without overwriting a more specific cancel
+    /// that won the race (for example an explicit client cancel immediately
+    /// before the transport disconnects).
+    pub fn record_cancel_cause_if_absent(&self, id: &str, cause: CancelCause) {
+        self.cancel_causes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(id.to_string())
+            .or_insert(cause);
     }
 
     /// Drain the recorded cancel cause for a session. Returns `None` only
@@ -569,7 +1338,9 @@ mod tests {
 
         Agent::builder()
             .model_provider(Box::new(StubProvider))
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(mem)
             .observer(Arc::new(NoopObserver {}) as Arc<dyn crate::observability::Observer>)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -632,6 +1403,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn session_mode_replacement_publication_is_capacity_neutral_and_fenced() {
+        let store = make_store(1);
+        let candidate =
+            || RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat);
+        store
+            .insert_if_absent("s".into(), candidate())
+            .await
+            .unwrap();
+        let first = store.get_agent("s").await.unwrap();
+        let first_generation = store.get_generation("s").await.unwrap();
+        store
+            .publish_prepared("s".into(), candidate(), Some(first_generation))
+            .await
+            .unwrap();
+        let successor = store.get_agent("s").await.unwrap();
+        let successor_generation = store.get_generation("s").await.unwrap();
+        assert!(!Arc::ptr_eq(&first, &successor));
+        assert_eq!(successor_generation, first_generation + 1);
+        assert_eq!(store.count().await, 1);
+        assert_eq!(
+            store.insert_if_absent("other".into(), candidate()).await,
+            Err("session limit reached")
+        );
+
+        // A stale candidate must neither replace the successor nor advance its generation.
+        assert_eq!(
+            store
+                .publish_prepared("s".into(), candidate(), Some(first_generation))
+                .await,
+            Err("session changed during preparation")
+        );
+        assert!(Arc::ptr_eq(
+            &successor,
+            &store.get_agent("s").await.unwrap()
+        ));
+        assert_eq!(store.get_generation("s").await, Some(successor_generation));
+        assert_eq!(
+            store.insert_if_absent("s".into(), candidate()).await,
+            Err("session already exists")
+        );
+
+        store.remove("s").await;
+        assert_eq!(
+            store
+                .publish_prepared("s".into(), candidate(), Some(successor_generation))
+                .await,
+            Err("session changed during preparation")
+        );
+        assert_eq!(
+            store.count().await,
+            0,
+            "removed session must not be resurrected"
+        );
     }
 
     #[tokio::test]
@@ -1107,6 +1934,310 @@ mod tests {
             store.take_cancel_cause("s"),
             Some(CancelCause::AdminKill),
             "kill_session must preserve AdminKill cause for verdict-site attribution"
+        );
+    }
+
+    // ── generation-gated stale-refresh regression tests ──
+
+    use crate::agent::dispatcher::NativeToolDispatcher;
+
+    #[tokio::test]
+    async fn insert_stamps_monotonic_generation() {
+        let store = make_store(4);
+        store
+            .insert(
+                "a".into(),
+                RpcSession::new(make_agent(), "x", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        store
+            .insert(
+                "b".into(),
+                RpcSession::new(make_agent(), "x", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let g_a = store.get_generation("a").await.unwrap();
+        let g_b = store.get_generation("b").await.unwrap();
+        assert_ne!(g_a, g_b, "each insert must stamp a unique generation");
+
+        // Replace "a" — the successor must get a new generation.
+        store
+            .insert(
+                "a".into(),
+                RpcSession::new(make_agent(), "x", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let g_a2 = store.get_generation("a").await.unwrap();
+        assert_ne!(
+            g_a, g_a2,
+            "replacing a same-ID session must bump the generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_overrides_gated_rejects_stale_generation() {
+        let store = make_store(4);
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let captured_gen = store.get_generation("s").await.unwrap();
+
+        // Replace the session so generation advances.
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+
+        // Stale generation must be rejected — successor untouched.
+        let result = store
+            .set_overrides_gated(
+                "s",
+                captured_gen,
+                SessionOverrides {
+                    model: Some("intruder".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(result.is_none(), "stale generation must be rejected");
+
+        // Successor's overrides must remain default.
+        let overrides = store.get_overrides("s").await.unwrap();
+        assert_eq!(overrides.model, None, "successor model must be untouched");
+        assert_eq!(
+            overrides.temperature, None,
+            "successor temperature must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_overrides_gated_accepts_current_generation() {
+        let store = make_store(4);
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let captured_gen = store.get_generation("s").await.unwrap();
+
+        let result = store
+            .set_overrides_gated(
+                "s",
+                captured_gen,
+                SessionOverrides {
+                    model: Some("valid".into()),
+                    temperature: Some(0.7),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(result.is_some(), "current generation must be accepted");
+        let overrides = result.unwrap();
+        assert_eq!(overrides.model.as_deref(), Some("valid"));
+        assert_eq!(overrides.temperature, Some(0.7));
+    }
+
+    #[tokio::test]
+    async fn apply_model_provider_rejects_stale_generation() {
+        let store = make_store(4);
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let captured_gen = store.get_generation("s").await.unwrap();
+
+        // Replace the session so generation advances.
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+
+        let applied = store
+            .apply_model_provider(
+                "s",
+                captured_gen,
+                Box::new(StubProvider),
+                "stale-provider".into(),
+                "stale-model".into(),
+                Arc::new(zeroclaw_providers::router::ModelRouteResolver::new(
+                    Vec::new(),
+                    "stale-provider".into(),
+                    "stale-model".into(),
+                )),
+                Box::new(NativeToolDispatcher),
+                Arc::new(zeroclaw_config::schema::Config::default()),
+                Some(Some(0.99)),
+            )
+            .await;
+        assert!(
+            !applied,
+            "stale generation must be rejected by apply_model_provider"
+        );
+
+        // Successor must retain the default agent identity — the stale
+        // provider refresh must not have touched it.
+        let agent = store.get_agent("s").await.unwrap();
+        let (_, provider_name, model_name) = agent.lock().await.attribution_fields();
+        assert_eq!(
+            provider_name, "<unconfigured>",
+            "successor provider name untouched"
+        );
+        assert_eq!(model_name, "<unconfigured>", "successor model untouched");
+        assert_eq!(
+            agent.lock().await.temperature_for_test(),
+            None,
+            "successor temperature must not be overwritten by stale refresh"
+        );
+    }
+
+    /// A provider-alias rename refresh must not rewrite the transient
+    /// `model_provider` override of a session that replaced the one it
+    /// captured.
+    ///
+    /// `migrate_model_provider_override` runs BEFORE the generation-checked
+    /// `apply_model_provider` in the publication step. Without its own
+    /// generation check, a stale rename refresh would write the new alias onto
+    /// a same-ID successor (installed by `session/new` or ACP rehydration while
+    /// the refresh was in flight), and the follow-up `apply_model_provider`
+    /// would then correctly reject the stale provider tuple — leaving the
+    /// successor holding an override it never requested, naming an alias its
+    /// provider box was never built from.
+    #[tokio::test]
+    async fn migrate_model_provider_override_rejects_stale_generation() {
+        let store = make_store(4);
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let captured_gen = store.get_generation("s").await.unwrap();
+
+        // Pin an explicit override on the original session, the state a
+        // rename refresh would legitimately migrate.
+        store
+            .set_overrides(
+                "s",
+                SessionOverrides {
+                    model_provider: Some("openai.before".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("override applies to the original session");
+
+        // Replace the session under the same ID, as ACP rehydration does.
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let successor_gen = store.get_generation("s").await.unwrap();
+        assert_ne!(
+            captured_gen, successor_gen,
+            "harness invariant: the replacement must advance the generation, \
+             otherwise this test proves nothing"
+        );
+
+        let migrated = store
+            .migrate_model_provider_override("s", captured_gen, "openai.after".into())
+            .await;
+        assert!(
+            !migrated,
+            "a rename refresh holding the pre-replacement generation must be \
+             rejected rather than writing the successor's override"
+        );
+
+        assert_eq!(
+            store
+                .get_overrides("s")
+                .await
+                .and_then(|o| o.model_provider),
+            None,
+            "the successor must keep its own (unset) override; the stale rename \
+             must not leave it pointing at an alias it never requested"
+        );
+
+        // The same call with the successor's own generation is still accepted,
+        // so the fence rejects staleness rather than disabling migration.
+        let migrated_current = store
+            .migrate_model_provider_override("s", successor_gen, "openai.after".into())
+            .await;
+        assert!(
+            migrated_current,
+            "a refresh that captured the current generation must still migrate"
+        );
+        assert_eq!(
+            store
+                .get_overrides("s")
+                .await
+                .and_then(|o| o.model_provider)
+                .as_deref(),
+            Some("openai.after")
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_model_provider_applies_temperature_to_captured_agent() {
+        let store = make_store(4);
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let captured_gen = store.get_generation("s").await.unwrap();
+
+        let applied = store
+            .apply_model_provider(
+                "s",
+                captured_gen,
+                Box::new(StubProvider),
+                "new-provider".into(),
+                "new-model".into(),
+                Arc::new(zeroclaw_providers::router::ModelRouteResolver::new(
+                    Vec::new(),
+                    "new-provider".into(),
+                    "new-model".into(),
+                )),
+                Box::new(NativeToolDispatcher),
+                Arc::new(zeroclaw_config::schema::Config::default()),
+                Some(Some(0.42)),
+            )
+            .await;
+        assert!(applied, "current generation must be accepted");
+
+        let agent = store.get_agent("s").await.unwrap();
+        let guard = agent.lock().await;
+        let (_, provider_name, model_name) = guard.attribution_fields();
+        assert_eq!(provider_name, "new-provider");
+        assert_eq!(model_name, "new-model");
+        assert_eq!(
+            guard.temperature_for_test(),
+            Some(0.42),
+            "temperature must be set on the captured agent under the generation check"
         );
     }
 }

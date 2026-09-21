@@ -54,6 +54,34 @@ impl ToolArtifact {
     }
 }
 
+/// Provenance of a token count carried on a history-trim event. Lets clients
+/// distinguish provider-reported usage from a local estimate and from a mix of
+/// the two (the reported-budget trim path scales an estimate to a
+/// provider-reported figure).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenCountSource {
+    /// Count comes from provider-reported usage.
+    Provider,
+    /// Count is locally estimated.
+    #[serde(rename = "estimate")]
+    Estimated,
+    /// Count is calibrated from provider-reported usage and a local estimate.
+    Calibrated,
+}
+
+impl TokenCountSource {
+    /// Wire value used by the WS, SSE, RPC, and ACP surfaces.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TokenCountSource::Provider => "provider",
+            TokenCountSource::Estimated => "estimate",
+            TokenCountSource::Calibrated => "calibrated",
+        }
+    }
+}
+
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum TurnEvent {
     /// A text chunk from the LLM response (may arrive many times).
@@ -103,18 +131,65 @@ pub enum TurnEvent {
         dropped_messages: usize,
         kept_turns: usize,
         reason: String,
+        /// Configured context token budget in effect at trim time. `None` for
+        /// message-limit trims, which carry no token accounting.
+        token_budget: Option<u64>,
+        /// Token count before trimming.
+        tokens_before: Option<u64>,
+        /// Token count after trimming.
+        tokens_after: Option<u64>,
+        /// Provenance of `tokens_before`.
+        tokens_before_source: Option<TokenCountSource>,
+        /// Provenance of `tokens_after`.
+        tokens_after_source: Option<TokenCountSource>,
+        /// The retained provider-facing request cannot be brought under the
+        /// configured budget because only the protected newest turn (plus
+        /// tool schemas) remains. History MAY have been trimmed on the way to
+        /// that floor, so this flag — not `dropped_messages == 0` — is the
+        /// authoritative "unsatisfiable" signal. `None`/absent for ordinary
+        /// trims.
+        unsatisfiable_floor: Option<bool>,
     },
     /// Per-LLM-call token usage and cost; a turn may emit several, one per
     /// model call. `None` means "unavailable for this call", not zero.
+    /// The `provider_ref` and `model` identify the provider and model used
+    /// for cost attribution and context window resolution.
+    ///
+    /// For vision routing and reliable fallback, these carry the actual served
+    /// provider and model. For dynamic routing models (e.g. `openrouter/auto`)
+    /// where the provider selects the concrete model and the `ModelProvider`
+    /// trait cannot expose the response-reported model, `model` carries the
+    /// requested routing model (e.g. `openrouter/auto`) rather than the
+    /// upstream-selected concrete model. This is a known limitation of the
+    /// current provider trait.
     Usage {
         input_tokens: Option<u64>,
         /// Tokens served from the provider's prompt cache (e.g. Anthropic
-        /// `cache_read_input_tokens`, OpenAI `cached_tokens`). These count
-        /// toward the context window and must be added to `input_tokens` to
-        /// get the true total context size.
+        /// `cache_read_input_tokens`, OpenAI `cached_tokens`). Subset of
+        /// `input_tokens` — adding would double-count.
         cached_input_tokens: Option<u64>,
         output_tokens: Option<u64>,
         cost_usd: Option<f64>,
+        /// Proactive trim threshold resolved for the provider/model route that
+        /// produced this usage sample. Zero means proactive trimming is disabled.
+        context_token_budget: Option<u64>,
+        /// Configured full context capacity for that same provider/model route.
+        /// `None` means the runtime used the compatibility fallback because no
+        /// authoritative capacity was configured.
+        model_context_window: Option<u64>,
+        /// The `<type>.<alias>` config reference of the provider that served
+        /// this call. Used for accurate context window resolution and cost
+        /// attribution when vision routing or provider switches are active.
+        provider_ref: String,
+        /// The model that actually served this call. When vision routing or
+        /// a reliable fallback selects a different model, this carries the
+        /// served model — not the turn-start model.
+        model: String,
+        /// Whether this usage event corresponds to the semantically accepted
+        /// response (`true`) or a rejected physical attempt (`false`). Rejected
+        /// attempts are billing-only telemetry; they do not update the accepted
+        /// context snapshot (ACP session token count, context-meter ceiling).
+        accepted: bool,
     },
 }
 

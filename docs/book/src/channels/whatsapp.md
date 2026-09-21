@@ -53,7 +53,9 @@ For Web mode, `dm_policy` and `group_policy` apply under **both** modes. `self_c
 
 `self_chat_mode` stays personal-only because the self-chat affordance is scoped to the personal branch by design. `mode` selects ZeroClaw's policy posture, not a WhatsApp account type: both modes drive the same linked-device session.
 
-The fromMe guard also stays inside the personal branch, but not because business mode lacks an equivalent. Business mode is still a WhatsApp Web linked-device session, and WhatsApp mirrors the operator's own outbound messages to linked devices as `fromMe` in either mode. The linked account is persisted as an authorized peer, so under business mode that mirror can satisfy the allowlist and reach dispatch, which is the shape #6353 closed for personal mode. That behaviour predates this change and is not introduced here; it is called out rather than asserted away, and repairing it is tracked separately.
+WhatsApp mirrors the linked account's outbound messages as `fromMe` events in either mode. Business mode drops these echoes before approval-reply handling or user-message dispatch, so they cannot start another agent turn. Personal mode retains its intentional self-chat and explicit operator-trigger handling; this business-mode rule does not remove those exceptions.
+
+Admitted WhatsApp Web one-to-one messages, identified by the `@s.whatsapp.net` or `@lid` chat domain, bypass the reply-intent classifier even when precheck is enabled. Channel access policies still apply before dispatch, and bypassing this classifier does not guarantee a reply. Group and other chat domains do not receive this direct-message exemption; other existing bypass conditions, such as an explicit mention, remain unchanged. Business-mode `fromMe` echoes are dropped before they can receive the exemption.
 
 ### Compatibility note for `mode = "business"`
 
@@ -74,7 +76,7 @@ notice a business-mode deployment gets.
 
 ## Restricting which groups (`allowed_groups`)
 
-`allowed_groups` (Web mode) scopes the bot to a named set of group chats by JID. It is independent of `mode` - it applies in both business and personal mode, and runs before the chat-type policy. An empty list (the default) permits every group, so existing configs are unchanged. A non-empty list drops every group message whose chat JID matches no entry. **Direct messages always bypass this filter.**
+`allowed_groups` (Web mode) scopes the bot to a named set of group chats by JID. It is independent of `mode` - it applies in both business and personal mode, and runs before the chat-type policy. An empty list is **not** permission: what it means is decided by `group_policy`. Under `allowlist` (the default) or `ignore` an empty list admits no group, and under `all` it admits every group. A list that admits everything cannot be told apart from a list nobody configured, so open group access has to be asked for by name. A non-empty list drops every group message whose chat JID matches no entry, and keeps doing so under every policy including `all`, so `all` widens the empty-list default rather than overriding an explicit list. **Direct messages always bypass this filter.**
 
 Each entry matches either the full group JID (`123456789012345@g.us`) or the JID user part - the segment before `@` (`123456789012345`) - compared **exactly**, not as a string prefix (so `123` admits `123@g.us` but never `123999@g.us`). This gates group *identity*, which `group_policy` (chat type) and the sender allowlist (sender) do not.
 

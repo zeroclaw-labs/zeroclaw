@@ -167,6 +167,45 @@ pub struct RpcContext {
 
     /// Lifecycle hook runner. `None` when hooks are disabled in config.
     pub hooks: Option<Arc<crate::hooks::HookRunner>>,
+
+    /// The daemon's single certificate audit logger — the ONE writer of the
+    /// Merkle-chained audit file, shared by enrollment, in-band renewal and
+    /// the issued-cert ledger.
+    ///
+    /// This field is the source of truth for "which logger owns the audit
+    /// file". `AuditLogger` serializes writers with a mutex held inside the
+    /// instance, so a per-request logger only appears safe: two instances
+    /// recover the same chain tip and both claim it, and `verify_chain` then
+    /// rejects a file every individual write was correct against. Certificate
+    /// paths must clone this `Arc`, never call `AuditLogger::new`.
+    ///
+    /// `None` only when the logger could not be constructed (for example
+    /// `sign_events = true` with no usable `ZEROCLAW_AUDIT_SIGNING_KEY`).
+    /// Certificate paths fail closed on `None` rather than issuing
+    /// credentials with no trail.
+    pub cert_audit: Option<Arc<crate::security::audit::AuditLogger>>,
+
+    /// Test-only pause between the prepare and commit halves of
+    /// `commit_config_with_live_session_refresh`. See `ConfigCommitPause`.
+    #[cfg(test)]
+    pub config_commit_pause: Option<Arc<ConfigCommitPause>>,
+}
+
+/// Test-only pause point inside `commit_config_with_live_session_refresh`:
+/// fires `arrived` once the prepare phase has completed (so every per-session
+/// skip decision has already dropped the skipped sessions' ordering guards
+/// and the `list_ids()` snapshot has passed), then parks on `release` until
+/// the test fires it. Lets a regression drive other RPCs (`session/configure`,
+/// session rehydration) deterministically inside the prepared-and-skipped
+/// window — after the refresh snapshot has passed over a session but before
+/// the candidate config is saved and swapped.
+#[cfg(test)]
+#[derive(Default)]
+pub struct ConfigCommitPause {
+    /// Notified (once) when the commit reaches the pause.
+    pub arrived: tokio::sync::Notify,
+    /// The commit parks on this after `arrived`; the test releases it.
+    pub release: tokio::sync::Notify,
 }
 
 impl RpcContext {
@@ -177,6 +216,13 @@ impl RpcContext {
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| config.data_dir.clone());
         let data_dir = config.data_dir.clone();
+        // Mirrors the daemon: one shared certificate audit logger for the
+        // whole context, best-effort like the ACP store above.
+        let cert_audit = crate::security::audit::AuditLogger::open_shared(
+            config.security.audit.clone(),
+            data_dir.clone(),
+        )
+        .ok();
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -193,6 +239,9 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            config_commit_pause: None,
+            cert_audit,
         })
     }
 
@@ -214,6 +263,42 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            config_commit_pause: None,
+            cert_audit: None,
+        })
+    }
+
+    /// Like [`RpcContext::minimal`] but with the shared certificate audit
+    /// logger the daemon wires in production. Certificate-path tests must use
+    /// this: `minimal` leaves `cert_audit` unset, and those handlers fail
+    /// closed without it.
+    #[cfg(test)]
+    pub fn minimal_with_cert_audit(config: Config, sessions: Arc<SessionStore>) -> Arc<Self> {
+        let cert_audit = crate::security::audit::AuditLogger::open_shared(
+            config.security.audit.clone(),
+            config.data_dir.clone(),
+        )
+        .ok();
+        Arc::new(Self {
+            config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            sessions,
+            session_backend: None,
+            memory: None,
+            cost_tracker: None,
+            event_tx: None,
+            reload_tx: None,
+            gateway_shutdown_tx: None,
+            approval_pending: Arc::new(ApprovalPendingMap::default()),
+            tui_registry: Arc::new(TuiRegistry::new_unsigned()),
+            acp_session_store: None,
+            sop_engine: None,
+            sop_audit: None,
+            hooks: None,
+            #[cfg(test)]
+            config_commit_pause: None,
+            cert_audit,
         })
     }
 
@@ -239,6 +324,9 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            config_commit_pause: None,
+            cert_audit: None,
         })
     }
 
@@ -264,6 +352,9 @@ impl RpcContext {
             sop_engine: Some(sop_engine),
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            config_commit_pause: None,
+            cert_audit: None,
         })
     }
 
@@ -289,6 +380,9 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            config_commit_pause: None,
+            cert_audit: None,
         })
     }
 
@@ -314,6 +408,9 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            config_commit_pause: None,
+            cert_audit: None,
         })
     }
 
@@ -340,6 +437,9 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            config_commit_pause: None,
+            cert_audit: None,
         })
     }
 
@@ -366,6 +466,9 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
+            #[cfg(test)]
+            config_commit_pause: None,
+            cert_audit: None,
         })
     }
 }

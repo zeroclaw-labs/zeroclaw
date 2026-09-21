@@ -1,6 +1,7 @@
 use crate::platform::RuntimeAdapter;
 use crate::security::SecurityPolicy;
 use crate::security::traits::Sandbox;
+use crate::tools::shell_env::SAFE_SHELL_ENV_VARS;
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -56,34 +57,6 @@ impl Drop for ChildGroupGuard {
         }
     }
 }
-
-/// Environment variables safe to pass to shell commands.
-/// Only functional variables are included — never API keys or secrets.
-#[cfg(not(target_os = "windows"))]
-const SAFE_ENV_VARS: &[&str] = &[
-    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
-];
-
-/// Environment variables safe to pass to shell commands on Windows.
-/// Includes Windows-specific variables needed for cmd.exe and program resolution.
-#[cfg(target_os = "windows")]
-const SAFE_ENV_VARS: &[&str] = &[
-    "PATH",
-    "PATHEXT",
-    "HOME",
-    "USERPROFILE",
-    "HOMEDRIVE",
-    "HOMEPATH",
-    "SYSTEMROOT",
-    "SYSTEMDRIVE",
-    "WINDIR",
-    "COMSPEC",
-    "TEMP",
-    "TMP",
-    "TERM",
-    "LANG",
-    "USERNAME",
-];
 
 /// Shell command execution tool with sandboxing
 pub struct ShellTool {
@@ -148,62 +121,12 @@ impl ShellTool {
     }
 }
 
-#[cfg(target_os = "windows")]
 fn decode_output(bytes: &[u8]) -> String {
-    use windows::Win32::Globalization::GetACP;
-    use windows::Win32::System::Console::GetConsoleOutputCP;
-
-    // SAFETY: both Win32 functions are parameter-free code-page queries. A
-    // zero console code page selects the documented system ANSI fallback.
-    let cp = unsafe {
-        let console_cp = GetConsoleOutputCP();
-        if console_cp == 0 {
-            GetACP()
-        } else {
-            console_cp
-        }
-    };
-
-    decode_output_with_code_page(bytes, cp)
+    super::shell_output::decode_shell_output(bytes)
 }
 
-#[cfg(any(target_os = "windows", test))]
-fn decode_output_with_code_page(bytes: &[u8], cp: u32) -> String {
-    let encoding = windows_code_page_to_encoding(cp);
-    if std::ptr::eq(encoding, encoding_rs::UTF_8) {
-        String::from_utf8_lossy(bytes).into_owned()
-    } else {
-        let (cow, _enc_used, _had_errors) = encoding.decode(bytes);
-        cow.into_owned()
-    }
-}
-
-/// Map a Windows code page identifier to an `encoding_rs` `Encoding`.
-/// Falls back to UTF-8 (lossy) for unknown code pages.
-#[cfg(any(target_os = "windows", test))]
-fn windows_code_page_to_encoding(cp: u32) -> &'static encoding_rs::Encoding {
-    match cp {
-        932 => encoding_rs::SHIFT_JIS,
-        936 | 54936 => encoding_rs::GBK,
-        949 => encoding_rs::EUC_KR,
-        950 => encoding_rs::BIG5,
-        1250 => encoding_rs::WINDOWS_1250,
-        1251 => encoding_rs::WINDOWS_1251,
-        1252 => encoding_rs::WINDOWS_1252,
-        1253 => encoding_rs::WINDOWS_1253,
-        1254 => encoding_rs::WINDOWS_1254,
-        1255 => encoding_rs::WINDOWS_1255,
-        1256 => encoding_rs::WINDOWS_1256,
-        1257 => encoding_rs::WINDOWS_1257,
-        1258 => encoding_rs::WINDOWS_1258,
-        20127 | 65001 => encoding_rs::UTF_8,
-        _ => encoding_rs::UTF_8,
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn decode_output(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
+fn decode_truncated_output(bytes: &[u8]) -> String {
+    super::shell_output::decode_truncated_shell_output(bytes)
 }
 
 fn is_valid_env_var_name(name: &str) -> bool {
@@ -218,7 +141,7 @@ fn is_valid_env_var_name(name: &str) -> bool {
 fn collect_allowed_shell_env_vars(security: &SecurityPolicy) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    for key in SAFE_ENV_VARS
+    for key in SAFE_SHELL_ENV_VARS
         .iter()
         .copied()
         .chain(security.shell_env_passthrough.iter().map(|s| s.as_str()))
@@ -432,8 +355,8 @@ impl Tool for ShellTool {
                     let (stdout_capture, stderr_capture) =
                         tokio::join!(finish_drain(stdout_drain), finish_drain(stderr_drain));
 
-                    let mut stdout = decode_output(&stdout_capture.bytes);
-                    let mut stderr = decode_output(&stderr_capture.bytes);
+                    let mut stdout = decode_capture(&stdout_capture);
+                    let mut stderr = decode_capture(&stderr_capture);
 
                     if stdout_capture.truncated || stdout.len() > MAX_OUTPUT_BYTES {
                         append_truncation_marker(&mut stdout, "\n... [output truncated at 1MB]");
@@ -497,6 +420,15 @@ struct DrainHandle {
 struct DrainOutput {
     bytes: Vec<u8>,
     truncated: bool,
+    complete: bool,
+}
+
+fn decode_capture(capture: &DrainOutput) -> String {
+    if capture.truncated || !capture.complete {
+        decode_truncated_output(&capture.bytes)
+    } else {
+        decode_output(&capture.bytes)
+    }
 }
 
 fn spawn_drain<R>(reader: Option<R>, cap: usize) -> DrainHandle
@@ -541,12 +473,20 @@ async fn drain_capped_into<R>(
 {
     use tokio::io::AsyncReadExt;
     let Some(mut reader) = reader else {
+        if let Ok(mut capture) = output.lock() {
+            capture.complete = true;
+        }
         return;
     };
     let mut chunk = [0u8; 8192];
     loop {
         match reader.read(&mut chunk).await {
-            Ok(0) => break,
+            Ok(0) => {
+                if let Ok(mut capture) = output.lock() {
+                    capture.complete = true;
+                }
+                break;
+            }
             Ok(n) => {
                 let Ok(mut capture) = output.lock() else {
                     break;
@@ -589,6 +529,51 @@ fn android_child_path(tui_path: Option<&str>, ambient_path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct ErrorAfterBytes {
+        bytes: Option<Vec<u8>>,
+    }
+
+    impl tokio::io::AsyncRead for ErrorAfterBytes {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if let Some(bytes) = self.bytes.take() {
+                buf.put_slice(&bytes);
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Ready(Err(std::io::Error::other("injected read failure")))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_drain_preserves_utf8_prefix_below_capture_limit() {
+        let mut bytes = "€".repeat(12).into_bytes();
+        bytes.push(0xe2);
+        let output = Arc::new(std::sync::Mutex::new(DrainOutput::default()));
+
+        drain_capped_into(
+            Some(ErrorAfterBytes { bytes: Some(bytes) }),
+            MAX_OUTPUT_BYTES,
+            Arc::clone(&output),
+        )
+        .await;
+
+        let capture = output.lock().unwrap().clone();
+        assert!(!capture.complete);
+        assert!(!capture.truncated);
+        let decoded = decode_capture(&capture);
+        assert!(
+            decoded.starts_with(&"€".repeat(12)),
+            "decoded text: {decoded:?}"
+        );
+        assert!(decoded.ends_with('\u{fffd}'), "decoded text: {decoded:?}");
+    }
 
     #[test]
     fn android_child_path_prefixes_platform_dirs_with_tui_path_winning() {
@@ -984,7 +969,17 @@ mod tests {
             .expect("disallowed command execution should return a result");
         assert!(!result.success);
         let error = result.error.as_deref().unwrap_or("");
-        assert!(error.contains("not allowed") || error.contains("high-risk"));
+        // Which guard refuses first is dialect-dependent: on POSIX hosts the
+        // allowlist/high-risk checks fire, while under the Windows shell
+        // dialect the forbidden-path scan sees `/` (current-drive root) first
+        // and refuses with its own message. All three are the required
+        // refusal; none may be weakened into a pass.
+        assert!(
+            error.contains("not allowed")
+                || error.contains("high-risk")
+                || error.contains("forbidden path argument"),
+            "expected a refusal reason, got: {error:?}"
+        );
     }
 
     #[tokio::test]
@@ -1790,11 +1785,11 @@ mod tests {
     }
 
     #[test]
-    fn decode_output_invalid_utf8_uses_replacement_chars() {
-        // 0xFF is not valid UTF-8
+    fn decode_output_invalid_utf8_is_safe() {
+        // 0xFF is not valid UTF-8. Detection may select a legacy encoding,
+        // but the output must remain usable and must never panic.
         let input = b"hello\xFF world";
         let result = super::decode_output(input);
-        // Must not panic; non-UTF-8 bytes become replacement characters on non-Windows
         assert!(result.contains("hello"));
         assert!(result.contains("world"));
     }
@@ -1802,64 +1797,6 @@ mod tests {
     #[test]
     fn decode_output_empty_bytes_returns_empty_string() {
         assert_eq!(super::decode_output(b""), "");
-    }
-
-    #[test]
-    fn windows_code_page_mapping_covers_cjk() {
-        use super::windows_code_page_to_encoding;
-        assert_eq!(windows_code_page_to_encoding(936), encoding_rs::GBK);
-        assert_eq!(windows_code_page_to_encoding(932), encoding_rs::SHIFT_JIS);
-        assert_eq!(windows_code_page_to_encoding(949), encoding_rs::EUC_KR);
-        assert_eq!(windows_code_page_to_encoding(950), encoding_rs::BIG5);
-    }
-
-    #[test]
-    fn windows_code_page_mapping_utf8_variants() {
-        use super::windows_code_page_to_encoding;
-        assert_eq!(windows_code_page_to_encoding(65001), encoding_rs::UTF_8);
-        assert_eq!(windows_code_page_to_encoding(20127), encoding_rs::UTF_8);
-    }
-
-    #[test]
-    fn windows_code_page_mapping_unknown_falls_back_to_utf8() {
-        use super::windows_code_page_to_encoding;
-        assert_eq!(windows_code_page_to_encoding(99999), encoding_rs::UTF_8);
-    }
-
-    #[test]
-    fn decode_output_with_cp936_gbk_bytes_transcodes_to_utf8() {
-        // GBK encoding of "你好" is [0xC4, 0xE3, 0xBA, 0xC3]
-        let gbk_bytes: &[u8] = &[0xC4, 0xE3, 0xBA, 0xC3];
-        let decoded = super::decode_output_with_code_page(gbk_bytes, 936);
-        assert_eq!(decoded, "你好");
-        assert!(!decoded.contains('\u{FFFD}'));
-    }
-
-    #[test]
-    fn shell_safe_env_vars_excludes_secrets() {
-        for var in SAFE_ENV_VARS {
-            let lower = var.to_lowercase();
-            assert!(
-                !lower.contains("key") && !lower.contains("secret") && !lower.contains("token"),
-                "SAFE_ENV_VARS must not include sensitive variable: {var}"
-            );
-        }
-    }
-
-    #[test]
-    fn shell_safe_env_vars_includes_essentials() {
-        assert!(
-            SAFE_ENV_VARS.contains(&"PATH"),
-            "PATH must be in safe env vars"
-        );
-        assert!(
-            SAFE_ENV_VARS.contains(&"HOME") || SAFE_ENV_VARS.contains(&"USERPROFILE"),
-            "HOME or USERPROFILE must be in safe env vars"
-        );
-        assert!(
-            SAFE_ENV_VARS.contains(&"TERM"),
-            "TERM must be in safe env vars"
-        );
     }
 
     #[tokio::test]
@@ -1990,7 +1927,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn shell_tui_env_is_passed_to_subprocess() {
-        // A var that is NOT in SAFE_ENV_VARS and NOT in passthrough —
+        // A var that is NOT in SAFE_SHELL_ENV_VARS and NOT in passthrough —
         // it should only appear if tui_env injects it.
         let tool =
             ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(Some({
@@ -2031,7 +1968,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn shell_tui_env_overrides_safe_var() {
-        // tui_env wins over the process-level value for a var that is also in SAFE_ENV_VARS.
+        // tui_env wins over the process-level value for a var that is also in SAFE_SHELL_ENV_VARS.
         // This lets the TUI's PATH (e.g. with nix/brew) win over the daemon's PATH.
         let home_key = home_env_key();
         let _guard = EnvGuard::set(home_key, "daemon-home");
@@ -2068,7 +2005,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn shell_tui_env_none_behaves_like_existing() {
         // with_tui_env(None) must be identical to no tui_env at all —
-        // only SAFE_ENV_VARS + passthrough reach the subprocess.
+        // only SAFE_SHELL_ENV_VARS + passthrough reach the subprocess.
         let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(None);
 
         let result = tool
@@ -2087,7 +2024,7 @@ mod tests {
     async fn shell_tui_env_secrets_reach_subprocess_but_not_safe_list() {
         // The whole point: secrets from the TUI env (e.g. SSH_AUTH_SOCK)
         // DO reach the subprocess via tui_env even though they are not
-        // in SAFE_ENV_VARS.
+        // in SAFE_SHELL_ENV_VARS.
         let tool =
             ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(Some({
                 let mut m = std::collections::HashMap::new();
@@ -2097,8 +2034,8 @@ mod tests {
 
         // Confirm SSH_AUTH_SOCK is not in the safe list (would be a bug if it were)
         assert!(
-            !SAFE_ENV_VARS.contains(&"SSH_AUTH_SOCK"),
-            "SSH_AUTH_SOCK must not be in SAFE_ENV_VARS"
+            !SAFE_SHELL_ENV_VARS.contains(&"SSH_AUTH_SOCK"),
+            "SSH_AUTH_SOCK must not be in SAFE_SHELL_ENV_VARS"
         );
 
         let result = tool

@@ -6,11 +6,77 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::types::{FromSqlResult, ValueRef};
 use rusqlite::{Connection, OpenFlags, params};
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex, OnceLock};
 use uuid::Uuid;
 use zeroclaw_config::schema::{Config, CronShellOutputFormat};
 
 const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
 const TRUNCATED_OUTPUT_MARKER: &str = "\n...[truncated]";
+
+static CRON_PROCESS_LOCK_OWNER: OnceLock<String> = OnceLock::new();
+
+// A process-owned token is only safe to preserve during startup recovery while
+// its manual-run guard is still alive. The database cannot represent that
+// distinction, so keep the live set in process memory and fail closed for any
+// current-process token whose guard has terminated.
+static LIVE_AGENT_CLAIM_TOKENS: LazyLock<Mutex<HashSet<(std::path::PathBuf, String, String)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+#[cfg(test)]
+static FORCED_RELEASE_FAILURES: LazyLock<Mutex<HashSet<std::path::PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn cron_process_lock_owner() -> &'static str {
+    CRON_PROCESS_LOCK_OWNER.get_or_init(|| Uuid::new_v4().to_string())
+}
+
+fn new_agent_lock_token() -> String {
+    format!("{}:{}", cron_process_lock_owner(), Uuid::new_v4())
+}
+
+fn register_live_agent_claim(config: &Config, job_id: &str, lock_token: &str) {
+    let mut claims = LIVE_AGENT_CLAIM_TOKENS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    claims.insert((
+        cron_db_path(config),
+        job_id.to_string(),
+        lock_token.to_string(),
+    ));
+}
+
+pub(crate) fn finish_agent_claim(config: &Config, job_id: &str, lock_token: &str) {
+    let mut claims = LIVE_AGENT_CLAIM_TOKENS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    claims.remove(&(
+        cron_db_path(config),
+        job_id.to_string(),
+        lock_token.to_string(),
+    ));
+}
+
+#[cfg(test)]
+pub(crate) fn force_release_failure_for_tests(config: &Config, enabled: bool) {
+    let mut failures = FORCED_RELEASE_FAILURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let db_path = cron_db_path(config);
+    if enabled {
+        failures.insert(db_path);
+    } else {
+        failures.remove(&db_path);
+    }
+}
+
+#[cfg(test)]
+fn should_force_release_failure(config: &Config) -> bool {
+    FORCED_RELEASE_FAILURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&cron_db_path(config))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RunCompletionAction {
@@ -227,6 +293,33 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
     Ok(job)
 }
 
+/// Read a job only when `agent_alias` is its current owner. The ownership
+/// predicate belongs to this SELECT so an operator rename that commits before
+/// the read cannot leave the caller with a stale authorization.
+pub fn get_job_for_agent(config: &Config, job_id: &str, agent_alias: &str) -> Result<CronJob> {
+    let Some(mut job) = with_read_connection(config, |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
+                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+                     allowed_tools, source, uses_memory, agent_alias, shell_output_format
+             FROM cron_jobs WHERE id = ?1 AND agent_alias = ?2",
+        )?;
+
+        let mut rows = stmt.query(params![job_id, agent_alias])?;
+        if let Some(row) = rows.next()? {
+            map_cron_job_row(row).map_err(Into::into)
+        } else {
+            anyhow::bail!("Cron job '{job_id}' not found")
+        }
+    })?
+    else {
+        anyhow::bail!("Cron job '{job_id}' not found")
+    };
+
+    resolve_declarative_shell_output_format(config, &mut job);
+    Ok(job)
+}
+
 /// Raw DB row for a job, with no config overlay applied. `shell_output_format`
 /// on the returned job is exactly what's stored in the `cron_jobs` column —
 /// for a declarative job that is a stale/default value, not the canonical
@@ -260,8 +353,8 @@ pub fn resolve_job_id_or_name(
     id_or_name: &str,
     agent_alias: &str,
 ) -> Result<String> {
-    // Fast path: try exact ID lookup first.
-    if let Ok(job) = get_job(config, id_or_name) {
+    // Fast path: exact ID, scoped the same way the name fallback below is.
+    if let Ok(job) = get_job_for_agent(config, id_or_name, agent_alias) {
         return Ok(job.id);
     }
 
@@ -280,6 +373,38 @@ pub fn resolve_job_id_or_name(
             "Ambiguous name '{id_or_name}': matched {n} jobs — use the job ID instead"
         ),
     }
+}
+
+/// Delete a job only if `agent_alias` owns it, in one statement.
+///
+/// The agent-facing tools authorize with a scoped read and then write. Ownership
+/// can change without the job id changing — the operator's agent-rename cascade
+/// does exactly that — so a rename landing between the two lets the former owner
+/// still delete the job. Matching both columns in the `DELETE` closes that window.
+/// A row owned by someone else reports the same not-found error as a missing one,
+/// so the guard does not become an existence oracle.
+pub fn remove_job_for_agent(config: &Config, id: &str, agent_alias: &str) -> Result<()> {
+    let changed = with_initialized_connection(config, |conn| {
+        conn.execute(
+            "DELETE FROM cron_jobs WHERE id = ?1 AND agent_alias = ?2",
+            params![id, agent_alias],
+        )
+        .context("Failed to delete cron job")
+    })?;
+
+    if changed == 0 {
+        anyhow::bail!("Cron job '{id}' not found");
+    }
+
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Delete)
+            .with_category(::zeroclaw_log::EventCategory::Cron)
+            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+            .with_attrs(::serde_json::json!({"job_id": id, "agent_alias": agent_alias})),
+        "Removed cron job"
+    );
+    Ok(())
 }
 
 pub fn remove_job(config: &Config, id: &str) -> Result<()> {
@@ -464,6 +589,30 @@ pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJ
 }
 
 pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<CronJob> {
+    update_job_inner(config, job_id, None, patch)
+}
+
+/// Patch a job only if `agent_alias` owns it, with the ownership test carried
+/// into the `UPDATE` itself rather than performed as a separate read. See
+/// `remove_job_for_agent` for why the separate read is not enough.
+pub fn update_job_for_agent(
+    config: &Config,
+    job_id: &str,
+    agent_alias: &str,
+    patch: CronJobPatch,
+) -> Result<CronJob> {
+    // Read-side check first so an ordinary miss gets the usual error before any
+    // work happens; the WHERE guard below is what makes the write itself safe.
+    get_job_for_agent(config, job_id, agent_alias)?;
+    update_job_inner(config, job_id, Some(agent_alias), patch)
+}
+
+fn update_job_inner(
+    config: &Config,
+    job_id: &str,
+    owner: Option<&str>,
+    patch: CronJobPatch,
+) -> Result<CronJob> {
     // Start from the raw DB row, not the config-resolved `get_job()` view:
     // for a declarative job, `shell_output_format` isn't DB-owned, so an
     // unrelated patch (e.g. toggling `enabled`) must not re-persist the
@@ -565,13 +714,13 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
         // there (NULL, garbage, or a future value) with a value the DB doesn't
         // own. Omit the column from the UPDATE for declarative rows so the
         // non-owned shadow stays untouched.
-        if job.source == "declarative" {
+        let changed = if job.source == "declarative" {
             conn.execute(
                 "UPDATE cron_jobs
                  SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
                      session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
                      allowed_tools = ?12, next_run = ?13, uses_memory = ?14
-                 WHERE id = ?15",
+                 WHERE id = ?15 AND (?16 IS NULL OR agent_alias = ?16)",
                 params![
                     job.expression,
                     job.command,
@@ -588,6 +737,7 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
                     job.next_run.to_rfc3339(),
                     if job.uses_memory { 1 } else { 0 },
                     job.id,
+                    owner,
                 ],
             )
         } else {
@@ -596,7 +746,7 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
                  SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
                      session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
                      allowed_tools = ?12, next_run = ?13, uses_memory = ?14, shell_output_format = ?15
-                 WHERE id = ?16",
+                 WHERE id = ?16 AND (?17 IS NULL OR agent_alias = ?17)",
                 params![
                     job.expression,
                     job.command,
@@ -617,10 +767,17 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
                         CronShellOutputFormat::Raw => "raw",
                     },
                     job.id,
+                    owner,
                 ],
             )
         }
         .context("Failed to update cron job")?;
+
+        // Zero rows means the guard matched nothing: the job moved to another
+        // owner between the read above and this write.
+        if changed == 0 {
+            anyhow::bail!("Cron job '{job_id}' not found");
+        }
         Ok(())
     })?;
 
@@ -745,10 +902,93 @@ pub fn claim_job(config: &Config, job_id: &str, now: DateTime<Utc>) -> Result<bo
     })
 }
 
+/// Claim a job only while it is still owned by `agent_alias`.
+///
+/// The owner predicate is part of the atomic claim update. This is the
+/// linearization point for an agent-facing manual trigger: a rename that wins
+/// before this statement prevents the former owner from executing the job.
+pub fn claim_job_for_agent(
+    config: &Config,
+    job_id: &str,
+    agent_alias: &str,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let token = claim_job_for_agent_with_token(config, job_id, agent_alias, now)?;
+    if let Some(token) = token.as_deref() {
+        // This compatibility wrapper cannot own a guard, so it must not leave
+        // a token marked live beyond the claim operation itself.
+        finish_agent_claim(config, job_id, token);
+    }
+    Ok(token.is_some())
+}
+
+/// Claim an agent-owned job and return the opaque claim token.
+///
+/// The token identifies this specific execution. It lets cleanup release only
+/// the claim it acquired, so a cancelled run cannot clear a later execution's
+/// lock for the same job.
+pub fn claim_job_for_agent_with_token(
+    config: &Config,
+    job_id: &str,
+    agent_alias: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<String>> {
+    let lock_token = new_agent_lock_token();
+    register_live_agent_claim(config, job_id, &lock_token);
+    let result = with_initialized_connection(config, |conn| {
+        let claimed = conn
+            .execute(
+                "UPDATE cron_jobs
+                 SET locked_at = ?1, lock_token = ?2
+                 WHERE id = ?3 AND agent_alias = ?4 AND locked_at IS NULL",
+                params![now.to_rfc3339(), lock_token, job_id, agent_alias],
+            )
+            .context("Failed to claim agent-owned cron job for execution")?;
+        Ok(if claimed == 1 {
+            Some(lock_token.clone())
+        } else {
+            None
+        })
+    });
+    match result {
+        Ok(Some(token)) => Ok(Some(token)),
+        Ok(None) => {
+            finish_agent_claim(config, job_id, &lock_token);
+            Ok(None)
+        }
+        Err(error) => {
+            finish_agent_claim(config, job_id, &lock_token);
+            Err(error)
+        }
+    }
+}
+
+/// Release an agent claim only when it still owns the supplied token.
+pub fn release_job_for_token(config: &Config, job_id: &str, lock_token: &str) -> Result<bool> {
+    #[cfg(test)]
+    if should_force_release_failure(config) {
+        anyhow::bail!("forced cron lock release failure for test");
+    }
+
+    let changed = with_initialized_connection(config, |conn| {
+        conn.execute(
+            "UPDATE cron_jobs
+             SET locked_at = NULL, lock_token = NULL
+             WHERE id = ?1 AND lock_token = ?2",
+            params![job_id, lock_token],
+        )
+        .context("Failed to release cron job lock")
+    })?;
+    if changed == 1 {
+        finish_agent_claim(config, job_id, lock_token);
+    }
+    Ok(changed == 1)
+}
+
 pub fn release_job(config: &Config, job_id: &str) -> Result<()> {
     with_initialized_connection(config, |conn| {
         conn.execute(
-            "UPDATE cron_jobs SET locked_at = NULL WHERE id = ?1",
+            "UPDATE cron_jobs SET locked_at = NULL, lock_token = NULL WHERE id = ?1",
             params![job_id],
         )
         .context("Failed to release cron job lock")?;
@@ -756,15 +996,50 @@ pub fn release_job(config: &Config, job_id: &str) -> Result<()> {
     })
 }
 
-pub fn clear_stale_locks(config: &Config) -> Result<usize> {
+fn clear_stale_locks_inner(config: &Config, before_update: impl FnOnce()) -> Result<usize> {
+    // Keep the registry lock through the snapshot and the cleanup UPDATE. A
+    // new manual claim registers its token before writing the row; holding the
+    // same lock here makes that admission wait until recovery has finished, so
+    // recovery cannot clear a claim that was admitted during its stale-token
+    // snapshot.
+    let claims = LIVE_AGENT_CLAIM_TOKENS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let db_path = cron_db_path(config);
+    let live_tokens = claims
+        .iter()
+        .filter_map(|(path, _, token)| (path == &db_path).then_some(token.clone()))
+        .collect::<HashSet<_>>();
+
+    before_update();
+
     let cleared = with_read_connection(config, |conn| {
-        conn.execute(
-            "UPDATE cron_jobs SET locked_at = NULL WHERE locked_at IS NOT NULL",
-            [],
-        )
-        .context("Failed to clear stale cron job locks")
+        let changed = if live_tokens.is_empty() {
+            conn.execute(
+                "UPDATE cron_jobs
+                 SET locked_at = NULL, lock_token = NULL
+                 WHERE locked_at IS NOT NULL",
+                [],
+            )?
+        } else {
+            let placeholders = std::iter::repeat_n("?", live_tokens.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "UPDATE cron_jobs
+                 SET locked_at = NULL, lock_token = NULL
+                 WHERE locked_at IS NOT NULL
+                   AND (lock_token IS NULL OR lock_token NOT IN ({placeholders}))"
+            );
+            conn.execute(&sql, rusqlite::params_from_iter(live_tokens.iter()))?
+        };
+        Ok(changed)
     })?;
     Ok(cleared.unwrap_or(0))
+}
+
+pub fn clear_stale_locks(config: &Config) -> Result<usize> {
+    clear_stale_locks_inner(config, || {})
 }
 
 pub fn record_run(
@@ -986,6 +1261,55 @@ pub fn list_runs(config: &Config, job_id: &str, limit: usize) -> Result<Vec<Cron
         )?;
 
         let rows = stmt.query_map(params![job_id, lim], |row| {
+            Ok(CronRun {
+                id: row.get(0)?,
+                job_id: row.get(1)?,
+                started_at: parse_rfc3339(&row.get::<_, String>(2)?)
+                    .map_err(sql_conversion_error)?,
+                finished_at: parse_rfc3339(&row.get::<_, String>(3)?)
+                    .map_err(sql_conversion_error)?,
+                status: row.get(4)?,
+                output: row.get(5)?,
+                duration_ms: row.get(6)?,
+            })
+        })?;
+
+        let mut runs = Vec::new();
+        for row in rows {
+            runs.push(row?);
+        }
+        Ok(runs)
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+
+    Ok(runs)
+}
+
+/// List run history only while the job is owned by `agent_alias`.
+///
+/// Joining the owner row in the same SELECT keeps the authorization predicate
+/// at the history-read boundary. A rename committed before this statement
+/// therefore returns no history to the former owner.
+pub fn list_runs_for_agent(
+    config: &Config,
+    job_id: &str,
+    agent_alias: &str,
+    limit: usize,
+) -> Result<Vec<CronRun>> {
+    let Some(runs) = with_read_connection(config, |conn| {
+        let lim = i64::try_from(limit.max(1)).context("Run history limit overflow")?;
+        let mut stmt = conn.prepare(
+            "SELECT r.id, r.job_id, r.started_at, r.finished_at, r.status, r.output, r.duration_ms
+             FROM cron_runs AS r
+             INNER JOIN cron_jobs AS j ON j.id = r.job_id
+             WHERE r.job_id = ?1 AND j.agent_alias = ?2
+             ORDER BY r.started_at DESC, r.id DESC
+             LIMIT ?3",
+        )?;
+
+        let rows = stmt.query_map(params![job_id, agent_alias, lim], |row| {
             Ok(CronRun {
                 id: row.get(0)?,
                 job_id: row.get(1)?,
@@ -1550,7 +1874,7 @@ fn with_existing_initialized_connection<T>(
     f(&conn).map(Some)
 }
 
-fn with_initialized_connection<T>(
+pub(super) fn with_initialized_connection<T>(
     config: &Config,
     f: impl FnOnce(&Connection) -> Result<T>,
 ) -> Result<T> {
@@ -1706,11 +2030,18 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
     // runs longer than the poll interval cannot be launched again while still in
     // flight (see `claim_job`/`release_job` and
     add_column_if_missing(conn, "locked_at", "TEXT")?;
+    // Agent-triggered claims also carry an opaque per-execution token. Startup
+    // recovery preserves only tokens whose manual-run guards are still live in
+    // this process; all other locks are eligible for cleanup.
+    add_column_if_missing(conn, "lock_token", "TEXT")?;
     add_column_if_missing(
         conn,
         "shell_output_format",
         "TEXT NOT NULL DEFAULT 'wrapped'",
     )?;
+
+    #[cfg(feature = "plugins-wasm")]
+    super::outbox::initialize_schema(conn)?;
 
     Ok(())
 }
@@ -1730,6 +2061,190 @@ mod tests {
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
         config
+    }
+
+    #[test]
+    fn scoped_remove_refuses_a_job_owned_by_another_agent() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+
+        let refused = remove_job_for_agent(&config, &job.id, "other-agent");
+        assert!(refused.is_err(), "a foreign job must not be deletable");
+        assert!(
+            get_job(&config, &job.id).is_ok(),
+            "the job must survive a refused delete"
+        );
+
+        remove_job_for_agent(&config, &job.id, "owner-agent").unwrap();
+        assert!(
+            get_job(&config, &job.id).is_err(),
+            "the owner may delete it"
+        );
+    }
+
+    #[test]
+    fn scoped_remove_guarded_delete_refuses_a_stale_owner() {
+        // The race the separate read cannot cover: the caller was authorized, then
+        // the operator's rename cascade moved the job to another agent. Matching
+        // both columns in the DELETE means the stale authorization writes nothing.
+        //
+        // `remove_job_for_agent` has no preliminary read, so this reaches the
+        // guarded DELETE itself. It is a stale-owner write, not a deterministic
+        // interleaving: the rename lands before the call rather than between a
+        // successful read and the write.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+
+        // Stand-in for the rename landing between check and write.
+        rename_jobs_by_agent(&config, "owner-agent", "new-owner").unwrap();
+
+        let stale = remove_job_for_agent(&config, &job.id, "owner-agent");
+        assert!(
+            stale.is_err(),
+            "an authorization from before the rename must not delete the job"
+        );
+        assert_eq!(
+            get_job(&config, &job.id).unwrap().agent_alias,
+            "new-owner",
+            "the job must remain with its new owner"
+        );
+    }
+
+    #[test]
+    fn scoped_update_read_check_refuses_a_stale_owner() {
+        // This one stops at `update_job_for_agent`'s preliminary ownership read,
+        // so it never reaches the guarded UPDATE. The test below covers that
+        // statement directly.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+        assert!(job.enabled);
+
+        rename_jobs_by_agent(&config, "owner-agent", "new-owner").unwrap();
+
+        let stale = update_job_for_agent(
+            &config,
+            &job.id,
+            "owner-agent",
+            CronJobPatch {
+                enabled: Some(false),
+                ..CronJobPatch::default()
+            },
+        );
+        assert!(
+            stale.is_err(),
+            "an authorization from before the rename must not patch the job"
+        );
+        assert!(
+            get_job(&config, &job.id).unwrap().enabled,
+            "the job's state must be untouched by the refused patch"
+        );
+    }
+
+    #[test]
+    fn scoped_update_guarded_write_refuses_a_stale_owner() {
+        // Calls `update_job_inner` directly with the stale owner, which is what
+        // the guarded UPDATE sees once the preliminary read is out of the way.
+        // Without the `agent_alias` term in the WHERE clause this patch lands.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+        assert!(job.enabled);
+
+        rename_jobs_by_agent(&config, "owner-agent", "new-owner").unwrap();
+
+        let stale = update_job_inner(
+            &config,
+            &job.id,
+            Some("owner-agent"),
+            CronJobPatch {
+                enabled: Some(false),
+                ..CronJobPatch::default()
+            },
+        );
+        assert!(
+            stale.is_err(),
+            "the guarded UPDATE must match no row for the former owner"
+        );
+
+        let after = get_job(&config, &job.id).unwrap();
+        assert!(after.enabled, "the refused patch must not change the job");
+        assert_eq!(
+            after.agent_alias, "new-owner",
+            "the job must remain with its new owner"
+        );
+    }
+
+    #[test]
+    fn scoped_update_still_works_for_the_owner() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+
+        let updated = update_job_for_agent(
+            &config,
+            &job.id,
+            "owner-agent",
+            CronJobPatch {
+                enabled: Some(false),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+        assert!(!updated.enabled);
+        assert!(!get_job(&config, &job.id).unwrap().enabled);
+    }
+
+    #[test]
+    fn the_operator_shell_update_path_is_not_agent_scoped() {
+        // update_shell_job_with_approval is the gateway API's and the CLI's entry
+        // point. Its agent_alias names whose risk profile validates a command, NOT
+        // the job's owner — patching an agent-type job's prompt is not agent-gated
+        // and may name a different agent entirely. Scoping it once broke exactly
+        // that, so pin the behaviour here rather than only in the gateway crate.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+
+        crate::cron::update_shell_job_with_approval(
+            &config,
+            "some-other-agent",
+            &job.id,
+            CronJobPatch {
+                name: Some("renamed by the operator".into()),
+                ..CronJobPatch::default()
+            },
+            false,
+        )
+        .expect("an operator patch must not require owning the job");
+
+        let updated = get_job(&config, &job.id).unwrap();
+        assert_eq!(updated.name.as_deref(), Some("renamed by the operator"));
+        assert_eq!(updated.agent_alias, "owner-agent", "ownership is unchanged");
+    }
+
+    #[test]
+    fn unscoped_helpers_still_serve_operator_callers() {
+        // The gateway and scheduler call these with no agent in hand; scoping the
+        // agent-facing paths must not take that away.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+
+        update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                enabled: Some(false),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+        assert!(!get_job(&config, &job.id).unwrap().enabled);
+        remove_job(&config, &job.id).unwrap();
+        assert!(get_job(&config, &job.id).is_err());
     }
 
     fn cron_dir(config: &Config) -> std::path::PathBuf {
@@ -1840,6 +2355,139 @@ mod tests {
         assert!(
             claim_job(&config, &job.id, now).unwrap(),
             "claim should win again after release"
+        );
+    }
+
+    #[test]
+    fn agent_claim_rechecks_owner_at_the_claim_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+
+        // Simulate a successful scoped authorization followed by the operator's
+        // rename before the effect. The guarded UPDATE must reject the stale owner.
+        assert_eq!(
+            get_job_for_agent(&config, &job.id, "owner-agent")
+                .unwrap()
+                .agent_alias,
+            "owner-agent"
+        );
+        rename_jobs_by_agent(&config, "owner-agent", "new-owner").unwrap();
+
+        let now = Utc::now();
+        assert!(!claim_job_for_agent(&config, &job.id, "owner-agent", now).unwrap());
+        assert!(claim_job_for_agent(&config, &job.id, "new-owner", now).unwrap());
+        assert!(!claim_job_for_agent(&config, &job.id, "new-owner", now).unwrap());
+        release_job(&config, &job.id).unwrap();
+    }
+
+    #[test]
+    fn agent_claim_token_prevents_late_release_from_clearing_replacement() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+
+        let first = claim_job_for_agent_with_token(&config, &job.id, "owner-agent", now)
+            .unwrap()
+            .expect("first claim should win");
+        release_job_for_token(&config, &job.id, &first).unwrap();
+
+        let second = claim_job_for_agent_with_token(&config, &job.id, "owner-agent", now)
+            .unwrap()
+            .expect("replacement claim should win");
+        assert!(!release_job_for_token(&config, &job.id, &first).unwrap());
+        assert!(due_jobs(&config, now).unwrap().is_empty());
+        assert!(release_job_for_token(&config, &job.id, &second).unwrap());
+    }
+
+    #[test]
+    fn clear_stale_locks_preserves_current_process_agent_claim() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+
+        let token = claim_job_for_agent_with_token(&config, &job.id, "owner-agent", now)
+            .unwrap()
+            .expect("agent claim should win");
+        assert_eq!(clear_stale_locks(&config).unwrap(), 0);
+        assert!(due_jobs(&config, now).unwrap().is_empty());
+        assert!(release_job_for_token(&config, &job.id, &token).unwrap());
+    }
+
+    #[test]
+    fn clear_stale_locks_serializes_new_agent_claims() {
+        let tmp = TempDir::new().unwrap();
+        let config = std::sync::Arc::new(test_config(&tmp));
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+
+        // A legacy/scheduled claim has no token and is eligible for startup
+        // recovery. The concurrent agent claim must not be able to register
+        // and write its replacement while recovery is between its snapshot and
+        // cleanup UPDATE.
+        assert!(claim_job(&config, &job.id, now).unwrap());
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        let claim_config = config.clone();
+        let claim_job_id = job.id.clone();
+        let claim_thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            claim_job_for_agent_with_token(&claim_config, &claim_job_id, "owner-agent", Utc::now())
+        });
+
+        let cleared = clear_stale_locks_inner(&config, || {
+            started_rx.recv().unwrap();
+            go_tx.send(()).unwrap();
+
+            // `claim_job_for_agent_with_token` has been released to run, but
+            // its registration must wait for recovery's registry guard.
+            assert!(LIVE_AGENT_CLAIM_TOKENS.try_lock().is_err());
+        })
+        .unwrap();
+        assert_eq!(cleared, 1, "the pre-existing stale claim should be cleared");
+
+        let token = claim_thread
+            .join()
+            .unwrap()
+            .unwrap()
+            .expect("the new claim should win after recovery");
+        assert!(
+            !claim_job_for_agent(&config, &job.id, "owner-agent", Utc::now()).unwrap(),
+            "a second execution must remain blocked by the admitted claim"
+        );
+        assert!(release_job_for_token(&config, &job.id, &token).unwrap());
+    }
+
+    #[test]
+    fn agent_run_history_rechecks_owner_in_the_history_query() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+        record_run(&config, &job.id, now, now, "ok", Some("private output"), 0).unwrap();
+
+        assert_eq!(
+            list_runs_for_agent(&config, &job.id, "owner-agent", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        rename_jobs_by_agent(&config, "owner-agent", "new-owner").unwrap();
+
+        assert!(
+            list_runs_for_agent(&config, &job.id, "owner-agent", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            list_runs_for_agent(&config, &job.id, "new-owner", 10)
+                .unwrap()
+                .len(),
+            1
         );
     }
 
@@ -3512,6 +4160,52 @@ schedule = { kind = "every", every_ms = 300000 }
             resolved, mine.id,
             "name must resolve to the caller's own job, not the other agent's"
         );
+    }
+
+    #[test]
+    fn resolve_job_id_or_name_cannot_reach_another_agents_job_by_id() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let theirs = add_shell_job(
+            &config,
+            "agent-b",
+            Some("secret_job".into()),
+            Schedule::Cron {
+                expr: "0 8 * * *".into(),
+                tz: None,
+            },
+            "echo b",
+            None,
+        )
+        .unwrap();
+
+        let err = resolve_job_id_or_name(&config, &theirs.id, "agent-a").unwrap_err();
+        assert!(
+            err.to_string().contains("No cron job found"),
+            "another agent's job must be unreachable by ID, got: {err}"
+        );
+    }
+
+    #[test]
+    fn get_job_for_agent_reports_another_agents_job_as_missing() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let theirs = add_shell_job(
+            &config,
+            "agent-b",
+            None,
+            Schedule::Cron {
+                expr: "0 8 * * *".into(),
+                tz: None,
+            },
+            "echo b",
+            None,
+        )
+        .unwrap();
+
+        assert!(get_job_for_agent(&config, &theirs.id, "agent-b").is_ok());
+        let err = get_job_for_agent(&config, &theirs.id, "agent-a").unwrap_err();
+        assert!(err.to_string().contains("not found"), "got: {err}");
     }
 
     #[test]

@@ -4,13 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "HTTP/WebSocket gateway for ZeroClaw — REST API, web dashboard, webhooks."
-publish = false
+repository.workspace = true
+homepage.workspace = true
+publish = true
 
 [dependencies]
 # Internal workspace crates
 zeroclaw-api.workspace = true
 zeroclaw-spawn.workspace = true
 zeroclaw-config.workspace = true
+zeroclaw-tls.workspace = true
 zeroclaw-infra.workspace = true
 zeroclaw-log.workspace = true
 zeroclaw-memory.workspace = true
@@ -73,7 +76,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 parking_lot = "0.12"
 toml = "1.0"
 toml_edit = "0.25"
-rustls-pemfile = "2"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 
 # Unix-only: self-signal SIGTERM to trigger the daemon's graceful shutdown for
@@ -85,7 +87,7 @@ libc = "0.2"
 rand = "0.10"
 rcgen = "0.13"
 tempfile = "3.26"
-tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "test-util"] }
 # Real WebSocket client used to drive the `/acp` route end-to-end in
 # acp::tests (front-door proof for the gateway ACP surface). A plain
 # non-TLS loopback connection needs only the `connect` feature, no TLS.

@@ -398,6 +398,15 @@ coexist, each generating its own bindings. And waki emits `wasi:http@0.2.4`
 imports while the current toolchain baseline is `@0.2.6`; the host links
 both without issue. Neither requires action.
 
+One version fact that **is** breakage: the world you vendor must match the host's
+exported world exactly. `wit/v0` is experimental and can gain a variant under the
+same `@0.1.0` (for example, `memory-audit` is a case of the
+`zeroclaw:plugin/logging` `plugin-action` enum). A component built against an
+older copy may compile cleanly but fail during instantiation. The host preserves
+the Wasmtime error chain and adds a conditional WIT-drift hint; inspect that
+chain, then diff your vendored `wit/v0` against the WIT from the host revision
+you run.
+
 Remember the trust framing from the [overview](./index.md): `http_client` is
 all-or-nothing. The sandbox does not bound where a granted plugin sends
 data, so operators running `strict` signature policy are trusting your code,

@@ -11,7 +11,9 @@ pub use crate::doctor::{DiagResult, Severity as DoctorSeverity};
 pub use crate::rpc::session::SessionOverrides;
 pub use crate::skills::frontmatter::SkillFrontmatter;
 pub use zeroclaw_api::memory_traits::{MemoryCategory, MemoryEntry};
-pub use zeroclaw_api::runtime_status::RuntimeConfigKind;
+pub use zeroclaw_api::runtime_status::{
+    RuntimeConfigKind, RuntimeShellFamily, RuntimeShellProfile,
+};
 pub use zeroclaw_config::cost::types::CostSummary;
 pub use zeroclaw_config::traits::{ConfigFieldEntry, PropKind};
 
@@ -119,6 +121,8 @@ rpc_type! {
         pub config_kind: Option<RuntimeConfigKind>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub local_ipc_endpoint: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub shell_profile: Option<RuntimeShellProfile>,
     }
 }
 
@@ -194,6 +198,10 @@ rpc_type! {
         pub exclude_memory: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub chat_mode: Option<ChatMode>,
+        /// Closed user-facing harness identifier. The daemon validates this
+        /// value and resolves all descriptive claims from host-owned state.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub interaction_surface: Option<crate::agent::prompt::InteractionSurface>,
         /// When true, skip the same-mode idle-sibling eviction normally
         /// performed on `session/new` for the calling TUI. Sent by
         /// multi-session-aware clients that manage sibling session lifecycle
@@ -244,6 +252,10 @@ rpc_type! {
     pub struct SessionPromptParams {
         pub session_id: String,
         pub prompt: String,
+        /// Optional client-local turn identity echoed by `TurnComplete`.
+        /// Older clients omit this field and retain session-scoped behavior.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub client_turn_generation: Option<u64>,
         /// Inline file attachments. Processed identically to `file/attach`
         /// entries — markers are appended to the prompt before the turn runs.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -328,12 +340,12 @@ rpc_type! {
     pub struct SessionMessagesResult {
         pub session_id: String,
         pub messages: Vec<MessageEntry>,
-        /// Total messages persisted for this session. Lets the TUI
-        /// know how many pages remain before it reaches the head.
+        /// Total projected entries for this session. Lets the TUI know how
+        /// many pages remain before it reaches the head.
         #[serde(default)]
         pub total: usize,
-        /// Index of the first message in `messages` relative to the
-        /// full persisted history. Pair with `total` to compute
+        /// Index of the first entry in `messages` relative to the
+        /// full projected history. Pair with `total` to compute
         /// "page N of M" / "load older" affordances.
         #[serde(default)]
         pub start: usize,
@@ -350,10 +362,29 @@ rpc_type! {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageEntryKind {
+    #[default]
+    Message,
+    ToolCall,
+    ToolResult,
+}
+
 rpc_type! {
     pub struct MessageEntry {
         pub role: String,
         pub content: String,
+        #[serde(default)]
+        pub kind: MessageEntryKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tool_call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tool_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tool_input: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tool_output: Option<String>,
     }
 }
 
@@ -365,6 +396,10 @@ rpc_type! {
         pub turn_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub turn_started_at: Option<String>,
+        /// Authoritative live-session TodoWrite plan. Older/persisted
+        /// sessions omit this field because they have no runtime plan owner.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plan: Option<Vec<zeroclaw_api::plan::PlanEntry>>,
     }
 }
 
@@ -1115,6 +1150,9 @@ rpc_type! {
         /// Display group for the dashboard sidebar.
         #[serde(default)]
         pub group: String,
+        /// Stable locale-independent group identifier.
+        #[serde(default)]
+        pub group_key: String,
         /// `true` when this section is part of the canonical Quickstart list.
         #[serde(default)]
         pub is_quickstart: bool,
@@ -1206,6 +1244,9 @@ rpc_type! {
         pub data_b64: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub filename: Option<String>,
+        /// Advisory only, retained for wire compatibility. The image/document
+        /// marker decision is made from the filename and payload bytes via the
+        /// canonical provider-loadable contract, never from this field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub mime_type: Option<String>,
         #[serde(default)]
@@ -1304,6 +1345,9 @@ rpc_type! {
 rpc_type! {
     pub struct LogsQueryResult {
         pub events: Vec<serde_json::Value>,
+        /// Resolved path of the active installed persistence writer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub log_path: Option<String>,
         /// Legacy cursor. Deprecated since 0.8.0; tracked for removal in
         /// <https://github.com/zeroclaw-labs/zeroclaw/issues/8012>.
         #[deprecated(
@@ -1375,15 +1419,20 @@ pub enum SessionUpdateEvent {
         timeout_secs: u64,
     },
     /// Per-LLM-call token usage. `input_tokens` is the cumulative context size
-    /// for this turn; `max_context_tokens` is the runtime-profile context
-    /// budget (`[runtime_profiles.<name>] max_context_tokens`). Both may be
-    /// absent when the provider doesn't report usage.
+    /// for this turn. `max_context_tokens` is the preemptive-trim budget (the
+    /// resolved `effective_context_budget`), preserving its original meaning as
+    /// the value the meter fills toward. `model_context_window` is the model's
+    /// full context window (provider `context_window`), exposed distinctly so a
+    /// client can render capacity and budget separately. Any may be absent when
+    /// the provider doesn't report usage or the value can't be resolved.
     ContextUsage {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input_tokens: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_context_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_context_window: Option<u64>,
     },
     /// Emitted when the TodoWrite tool produces a plan. The `entries` array
     /// carries the normalized `PlanEntry` values (content, status, priority,
@@ -1400,6 +1449,14 @@ pub enum SessionUpdateEvent {
         /// Final assistant text (Completed) or partial accumulated text
         /// at cancel point (Cancelled).
         content: String,
+        /// Optional client-local turn identity, echoed from `session/prompt`.
+        /// Absent for legacy callers that do not send one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_turn_generation: Option<u64>,
+        /// Authoritative projected conversation-entry count after this turn.
+        /// Absent for legacy or missing-session terminal events.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_count: Option<usize>,
     },
     /// Emitted whenever older whole turns were dropped from structured history
     /// to fit a token budget or message cap. Surfaces a user-visible "context
@@ -1411,6 +1468,29 @@ pub enum SessionUpdateEvent {
         dropped_messages: usize,
         kept_turns: usize,
         reason: String,
+        /// Configured context token budget in effect at trim time. `None` for
+        /// message-limit trims, which carry no token accounting.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token_budget: Option<u64>,
+        /// Token count before trimming.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_before: Option<u64>,
+        /// Token count after trimming.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_after: Option<u64>,
+        /// Provenance of `tokens_before` ("provider", "estimate", "calibrated").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_before_source: Option<zeroclaw_api::agent::TokenCountSource>,
+        /// Provenance of `tokens_after` ("provider", "estimate", "calibrated").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_after_source: Option<zeroclaw_api::agent::TokenCountSource>,
+        /// The retained provider-facing request cannot be brought under the
+        /// configured budget (protected newest turn plus schemas). History MAY
+        /// have been trimmed on the way to that floor, so this flag — not
+        /// `dropped_messages == 0` — is the authoritative "unsatisfiable"
+        /// signal. Absent for ordinary trims.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unsatisfiable_floor: Option<bool>,
     },
 }
 
@@ -1574,12 +1654,72 @@ mod tests {
     }
 
     #[test]
+    fn status_result_shell_profile_round_trips_and_defaults_absent() {
+        let legacy: StatusResult = serde_json::from_value(json!({
+            "server_version": "0.8.4",
+            "protocol_version": 1,
+            "active_sessions": 0,
+            "session_ids": []
+        }))
+        .unwrap();
+
+        assert_eq!(legacy.shell_profile, None);
+        let legacy_wire = serde_json::to_value(&legacy).unwrap();
+        assert!(legacy_wire.get("shell_profile").is_none());
+
+        let status = StatusResult {
+            server_version: "0.8.4".into(),
+            protocol_version: 1,
+            active_sessions: 0,
+            session_ids: vec![],
+            config_dir: None,
+            config_file: None,
+            config_kind: None,
+            local_ipc_endpoint: None,
+            shell_profile: Some(RuntimeShellProfile {
+                name: "pwsh".into(),
+                family: RuntimeShellFamily::PowerShell,
+            }),
+        };
+
+        let wire = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            wire["shell_profile"],
+            json!({
+                "name": "pwsh",
+                "family": "powershell"
+            })
+        );
+
+        let round_trip: StatusResult = serde_json::from_value(wire).unwrap();
+        assert_eq!(round_trip.shell_profile, status.shell_profile);
+    }
+
+    #[test]
+    fn interaction_surface_is_closed_and_snake_case() {
+        use crate::agent::prompt::InteractionSurface;
+
+        assert_eq!(
+            serde_json::to_value(InteractionSurface::ZerocodeCode).unwrap(),
+            json!("zerocode_code")
+        );
+        assert_eq!(
+            serde_json::from_value::<InteractionSurface>(json!("zerocode_code")).unwrap(),
+            InteractionSurface::ZerocodeCode
+        );
+        assert!(
+            serde_json::from_value::<InteractionSurface>(json!("client_authored_claims")).is_err()
+        );
+    }
+
+    #[test]
     fn session_new_params_keep_siblings_round_trips_and_defaults_absent() {
         // Older clients omit the field entirely: it must parse as None and
         // serialize back out without a `keep_siblings` key.
         let legacy: SessionNewParams =
             serde_json::from_value(json!({ "agent_alias": "a" })).unwrap();
         assert_eq!(legacy.keep_siblings, None);
+        assert_eq!(legacy.interaction_surface, None);
         let wire = serde_json::to_value(&legacy).unwrap();
         assert!(wire.get("keep_siblings").is_none());
 
@@ -1593,6 +1733,34 @@ mod tests {
             let wire = serde_json::to_value(&params).unwrap();
             assert_eq!(wire["keep_siblings"], json!(keep));
         }
+    }
+
+    #[test]
+    fn session_prompt_turn_generation_is_optional_and_wire_stable() {
+        let legacy: SessionPromptParams = serde_json::from_value(json!({
+            "session_id": "s",
+            "prompt": "hello",
+        }))
+        .unwrap();
+        assert_eq!(legacy.client_turn_generation, None);
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("client_turn_generation")
+                .is_none()
+        );
+
+        let current: SessionPromptParams = serde_json::from_value(json!({
+            "session_id": "s",
+            "prompt": "hello",
+            "client_turn_generation": 9,
+        }))
+        .unwrap();
+        assert_eq!(current.client_turn_generation, Some(9));
+        assert_eq!(
+            serde_json::to_value(&current).unwrap()["client_turn_generation"],
+            json!(9)
+        );
     }
 
     #[test]
@@ -1658,6 +1826,18 @@ mod tests {
         let v = serde_json::to_value(evt).unwrap();
         assert_eq!(v["type"], json!("approval_request"));
         assert!(v.get("tool_name").is_some(), "got: {v}");
+
+        let evt = SessionUpdateEvent::TurnComplete {
+            session_id: "s".into(),
+            outcome: TurnCompletionOutcome::Cancelled,
+            content: "cancelled".into(),
+            client_turn_generation: Some(9),
+            message_count: Some(4),
+        };
+        let v = serde_json::to_value(evt).unwrap();
+        assert_eq!(v["type"], json!("turn_complete"));
+        assert_eq!(v["client_turn_generation"], json!(9));
+        assert_eq!(v["message_count"], json!(4));
     }
 
     #[test]
@@ -1705,6 +1885,37 @@ mod tests {
         // to `1` so the handshake succeeds without an explicit version.
         let p: InitializeParams = serde_json::from_value(json!({})).unwrap();
         assert_eq!(p.protocol_version, 1);
+    }
+
+    #[test]
+    fn config_section_group_key_is_additive_on_the_wire() {
+        let legacy: ConfigSectionEntry = serde_json::from_value(json!({
+            "key": "cron",
+            "label": "Cron",
+            "help": "Scheduled tasks",
+            "has_picker": true,
+            "completed": false,
+            "group": "Agent"
+        }))
+        .unwrap();
+        assert!(legacy.group_key.is_empty());
+
+        let current = ConfigSectionEntry {
+            key: "cron".into(),
+            label: "Cron".into(),
+            help: "Scheduled tasks".into(),
+            has_picker: true,
+            completed: false,
+            ready: false,
+            group: "Agent".into(),
+            group_key: "agent".into(),
+            is_quickstart: true,
+            shape: None,
+            cost_category: String::new(),
+        };
+        let value = serde_json::to_value(current).unwrap();
+        assert_eq!(value["group"], json!("Agent"));
+        assert_eq!(value["group_key"], json!("agent"));
     }
 
     #[test]
@@ -1815,5 +2026,23 @@ mod tests {
         assert_eq!(params.run_id, "r1");
         assert_eq!(params.surface, Surface::Tui);
         assert!(params.last_step.is_none());
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn logs_query_result_exposes_active_log_path_when_present() {
+        let result = LogsQueryResult {
+            events: Vec::new(),
+            log_path: Some("/var/lib/zeroclaw/runtime-trace.jsonl".into()),
+            next_cursor: None,
+            next_cursor_line_offset: None,
+            at_end: true,
+        };
+
+        let value = serde_json::to_value(result).expect("logs/query result");
+        assert_eq!(
+            value["log_path"],
+            json!("/var/lib/zeroclaw/runtime-trace.jsonl")
+        );
     }
 }

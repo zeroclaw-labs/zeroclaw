@@ -50,6 +50,7 @@ pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
             description: info.desc.to_string(),
             category: IntegrationCategory::Chat,
             status: bool_to_status(info.configured),
+            key: Some(info.config_key.to_string()),
         });
 
     let toggles = config.integration_descriptors().into_iter().map(|d| {
@@ -59,6 +60,7 @@ pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
             description: d.description.to_string(),
             category,
             status: bool_to_status(d.active),
+            key: None,
         }
     });
 
@@ -71,6 +73,7 @@ pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
                 description: String::new(),
                 category: IntegrationCategory::AiModel,
                 status,
+                key: Some(info.name.to_string()),
             }
         });
 
@@ -81,6 +84,7 @@ pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
             description: (*desc).to_string(),
             category: IntegrationCategory::ToolsAutomation,
             status: IntegrationStatus::Active,
+            key: None,
         });
 
     let platforms = PLATFORMS.iter().map(|(name, available)| IntegrationEntry {
@@ -88,6 +92,7 @@ pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
         description: String::new(),
         category: IntegrationCategory::Platform,
         status: bool_to_status(*available),
+        key: None,
     });
 
     channels
@@ -176,7 +181,75 @@ mod tests {
                 "channel {:?} missing description text",
                 info.name,
             );
+            assert_eq!(
+                entry.key.as_deref(),
+                Some(info.config_key),
+                "channel {:?} entry must carry its schema config map key",
+                info.name,
+            );
         }
+    }
+
+    #[test]
+    fn config_backed_entries_resolve_through_their_map_key_contract() {
+        let config = Config::default();
+        for entry in all_integrations(&config).iter().filter(|entry| {
+            matches!(
+                entry.category,
+                IntegrationCategory::Chat | IntegrationCategory::AiModel
+            )
+        }) {
+            let key = entry
+                .key
+                .as_deref()
+                .unwrap_or_else(|| panic!("config-backed entry {:?} has no key", entry.name));
+            let path = match entry.category {
+                IntegrationCategory::Chat => format!("channels.{key}"),
+                IntegrationCategory::AiModel => format!("providers.models.{key}"),
+                _ => unreachable!(),
+            };
+            assert!(
+                config.get_map_keys(&path).is_some(),
+                "config-backed entry {:?} must resolve through map path `{path}`",
+                entry.name,
+            );
+        }
+    }
+
+    #[test]
+    fn ai_model_entries_carry_provider_family_key() {
+        let config = Config::default();
+        let entries = all_integrations(&config);
+        for info in zeroclaw_providers::list_model_providers() {
+            let entry = entries
+                .iter()
+                .find(|e| e.category == IntegrationCategory::AiModel && e.name == info.display_name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "AI-model entry for {:?} (display {:?}) must exist",
+                        info.name, info.display_name,
+                    )
+                });
+            assert_eq!(
+                entry.key.as_deref(),
+                Some(info.name),
+                "AI-model entry {:?} must carry the provider family key, not a display-name slug",
+                info.display_name,
+            );
+        }
+    }
+
+    #[test]
+    fn zai_entry_key_survives_display_name_slug_mismatch() {
+        // Regression: the Z.AI display name slugifies to
+        // `z-ai`, but the config slot is `providers.models.zai`.
+        let config = Config::default();
+        let entries = all_integrations(&config);
+        let zai = entries
+            .iter()
+            .find(|e| e.category == IntegrationCategory::AiModel && e.key.as_deref() == Some("zai"))
+            .expect("Z.AI registry entry with family key `zai`");
+        assert_eq!(zai.name, "Z.AI");
     }
 
     #[test]
@@ -190,8 +263,11 @@ mod tests {
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: StreamMode::default(),
                 draft_update_interval_ms: 1000,
+                multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                per_user_session: true,
+                passive_group_context: false,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
@@ -304,11 +380,23 @@ mod tests {
         entry.status
     }
 
+    /// Build a config with an explicit `[browser]` flag pair so the four
+    /// combinations below never depend on which flag happens to default
+    /// to `true`.
+    fn browser_config(enabled: bool, automation_enabled: bool) -> Config {
+        let mut config = Config::default();
+        config.browser.enabled = enabled;
+        config.browser.automation_enabled = automation_enabled;
+        config
+    }
+
     #[test]
     fn browser_active_in_default_config() {
-        // BrowserConfig::default() has enabled=true, so the toggle
-        // should be Active in the unconfigured registry.
+        // BrowserConfig::default() has enabled=true, so `browser_open` is
+        // registered and the toggle is Active in the unconfigured registry
+        // even though full automation is off.
         let config = Config::default();
+        assert!(config.browser.enabled && !config.browser.automation_enabled);
         assert!(matches!(
             toggle_status(&config, |n| n == "Browser"),
             IntegrationStatus::Active
@@ -317,12 +405,58 @@ mod tests {
 
     #[test]
     fn browser_available_when_disabled() {
-        let mut config = Config::default();
-        config.browser.enabled = false;
+        // Both flags off: the runtime registers neither `browser_open` nor
+        // `browser`, so nothing about this section is live.
+        let config = browser_config(false, false);
         assert!(matches!(
             toggle_status(&config, |n| n == "Browser"),
             IntegrationStatus::Available
         ));
+    }
+
+    #[test]
+    fn browser_active_when_only_automation_enabled() {
+        // `browser_open` is off but the full automation tool is registered.
+        // Reporting Available here would hide a live Chrome/Chromium
+        // surface from the operator.
+        let config = browser_config(false, true);
+        assert!(matches!(
+            toggle_status(&config, |n| n == "Browser"),
+            IntegrationStatus::Active
+        ));
+    }
+
+    #[test]
+    fn browser_active_when_both_flags_enabled() {
+        let config = browser_config(true, true);
+        assert!(matches!(
+            toggle_status(&config, |n| n == "Browser"),
+            IntegrationStatus::Active
+        ));
+    }
+
+    /// The descriptor's status must track the same predicate the schema
+    /// exposes, across every flag combination — the registry reads
+    /// `integration_descriptor()`, so a drift between the two would show
+    /// operators a status the runtime does not honour.
+    #[test]
+    fn browser_status_matches_schema_predicate_for_all_flag_combinations() {
+        for (enabled, automation_enabled) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let config = browser_config(enabled, automation_enabled);
+            let expected = if config.browser.integration_active() {
+                IntegrationStatus::Active
+            } else {
+                IntegrationStatus::Available
+            };
+            let actual = toggle_status(&config, |n| n == "Browser");
+            assert_eq!(
+                actual, expected,
+                "browser status mismatch for enabled={enabled}, \
+                 automation_enabled={automation_enabled}"
+            );
+        }
     }
 
     #[test]

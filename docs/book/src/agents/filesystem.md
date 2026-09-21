@@ -68,7 +68,11 @@ in `data/memory/`. The backend is selected per agent:
 The backend defaults to SQLite for a new agent, and once the agent has written
 on-disk data the value is locked, so you cannot silently swap a backend out from
 under existing memory. Cross-agent memory sharing is opt-in through the
-workspace `read_memory_from` allowlist. For the memory model itself, see
+workspace `read_memory_from` allowlist. Legacy string entries grant all
+categories; structured entries can restrict a sibling to exact category
+names on backends that preserve per-row categories. Markdown memory rejects
+scoped grants because its files do not carry that attribution. For the memory
+model itself, see
 [Runtime internals](./internals.md). For a cross-system state map, see
 [Runtime state and persistence](../architecture/runtime-state-and-persistence.md).
 

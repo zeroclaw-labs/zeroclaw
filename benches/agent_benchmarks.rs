@@ -297,7 +297,11 @@ fn bench_agent_turn(c: &mut Criterion) {
                 let model_provider = Box::new(BenchModelProvider::text_only("benchmark response"));
                 let mut agent = Agent::builder()
                     .model_provider(model_provider)
-                    .tools(vec![Box::new(NoopTool) as Box<dyn Tool>])
+                    .tools(
+                        zeroclaw::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                            Box::new(NoopTool) as Box<dyn Tool>,
+                        ]),
+                    )
                     .memory(make_memory())
                     .observer(make_observer())
                     .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -315,7 +319,11 @@ fn bench_agent_turn(c: &mut Criterion) {
                 let model_provider = Box::new(BenchModelProvider::with_tool_then_text());
                 let mut agent = Agent::builder()
                     .model_provider(model_provider)
-                    .tools(vec![Box::new(NoopTool) as Box<dyn Tool>])
+                    .tools(
+                        zeroclaw::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                            Box::new(NoopTool) as Box<dyn Tool>,
+                        ]),
+                    )
                     .memory(make_memory())
                     .observer(make_observer())
                     .tool_dispatcher(Box::new(NativeToolDispatcher))

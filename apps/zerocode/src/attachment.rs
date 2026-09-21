@@ -1,6 +1,6 @@
 //! Client-side file attachment preparation.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
@@ -26,6 +26,38 @@ pub(crate) struct PendingAttachment {
     pub filename: String,
     pub size_bytes: u64,
     pub source: AttachmentSource,
+}
+
+/// Bounded result of best-effort clipboard temporary cleanup.
+///
+/// Cleanup deliberately reports only a count: temporary paths can contain
+/// user information and should not be copied into the info bar or logs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CleanupReport {
+    failed: usize,
+}
+
+impl CleanupReport {
+    pub(crate) fn failed_count(self) -> usize {
+        self.failed
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.failed = self.failed.saturating_add(other.failed);
+    }
+
+    pub(crate) fn notice(self) -> Option<String> {
+        (self.failed_count() > 0).then(|| {
+            crate::i18n::t_args(
+                "zc-input-clipboard-cleanup-error",
+                &[("count", &self.failed_count().to_string())],
+            )
+        })
+    }
+
+    fn failed_once() -> Self {
+        Self { failed: 1 }
+    }
 }
 
 impl PendingAttachment {
@@ -112,14 +144,27 @@ pub(crate) fn build_attachments_json(
     attachments.iter().map(|a| a.to_json(transport)).collect()
 }
 
+/// Remove one clipboard-owned temporary file and report a non-retryable
+/// cleanup failure. A missing path is already clean.
+pub(crate) fn remove_clipboard_temp(path: &Path) -> CleanupReport {
+    match std::fs::remove_file(path) {
+        Ok(()) => CleanupReport::default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => CleanupReport::default(),
+        Err(_) => CleanupReport::failed_once(),
+    }
+}
+
 /// Remove backing temp files for clipboard-sourced attachments. File-sourced
-/// attachments reference user files and are left untouched.
-pub(crate) fn cleanup_attachment_temps(attachments: &[PendingAttachment]) {
+/// attachments reference user files and are left untouched. The returned
+/// report makes residual owned files visible without retrying indefinitely.
+pub(crate) fn cleanup_attachment_temps(attachments: &[PendingAttachment]) -> CleanupReport {
+    let mut report = CleanupReport::default();
     for att in attachments {
         if att.source == AttachmentSource::Clipboard {
-            let _ = std::fs::remove_file(&att.path);
+            report.merge(remove_clipboard_temp(&att.path));
         }
     }
+    report
 }
 
 /// Detect MIME type from filename extension via `mime_guess`.
@@ -174,6 +219,38 @@ mod tests {
             source: AttachmentSource::File,
         };
         assert_eq!(att.label(), "photo.png (2.0 KB, image/png)");
+    }
+
+    #[test]
+    fn cleanup_reports_failed_clipboard_removal_without_touching_user_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let clipboard_path = dir.path().join("clipboard-temp");
+        std::fs::create_dir(&clipboard_path).expect("create forced-failure path");
+        let user_path = dir.path().join("user-file.png");
+        std::fs::write(&user_path, b"user data").expect("write user file");
+
+        let attachments = vec![
+            PendingAttachment {
+                path: clipboard_path.clone(),
+                mime_type: "image/png".into(),
+                filename: "clipboard.png".into(),
+                size_bytes: 0,
+                source: AttachmentSource::Clipboard,
+            },
+            PendingAttachment {
+                path: user_path.clone(),
+                mime_type: "image/png".into(),
+                filename: "user.png".into(),
+                size_bytes: 9,
+                source: AttachmentSource::File,
+            },
+        ];
+
+        let report = cleanup_attachment_temps(&attachments);
+
+        assert_eq!(report.failed_count(), 1);
+        assert!(clipboard_path.exists());
+        assert!(user_path.exists());
     }
 
     #[test]

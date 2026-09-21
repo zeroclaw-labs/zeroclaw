@@ -75,7 +75,7 @@ and backs off; a plugin whose poll keeps trapping reports unhealthy through
 `poll-message` is therefore visible, not fatal, but it makes your channel
 useless. Keep it simple: drain the queue, translate, return.
 
-## Capability flags: the 22 optional methods
+## Capability flags: the {{#include ../_snippets/plugin-channel-flag-count.md}} optional methods
 
 Everything else in the interface is gated by `channel-capabilities` flags.
 The pattern (identical to the memory world):
@@ -98,6 +98,7 @@ flags declaration, which is the source of truth. In summary, the groups:
 | Multi-message streaming | `supports-multi-message-streaming`, `multi-message-delay-ms` | Paragraph-by-paragraph delivery with a minimum inter-message delay (default 800ms, cached at load). |
 | Moderation | `add-reaction`, `remove-reaction`, `pin-message`, `unpin-message`, `redact-message` | Emoji reactions, pinning, message deletion. |
 | Interaction | `request-approval`, `request-choice`, `supports-free-form-ask` | Tool-call approval prompts and multiple-choice questions presented natively on the platform. |
+| Webhook ingress | `webhook-ingress` | Serve inbound webhooks: the gateway mounts your `webhook-path` segment under `/plugin/<segment>` and passes each request to `parse-webhook`, which verifies platform authenticity and returns messages or a challenge reply. Implement both exports together. |
 
 Start with the required {{#include ../_snippets/plugin-channel-required-count.md}} plus `health-check`, and add groups as the
 platform supports them. Advertising a flag you have not implemented is worse
@@ -243,8 +244,16 @@ config or credential cache.
 For a channel: `capabilities` containing `channel`, and almost certainly both
 `config_read` (no platform works without credentials) and `http_client`. The
 channel adapter implements outbound `wasi:http`, but links it only after that
-grant is validated; without both pieces, `send` has no network path to the
-platform.
+grant is validated, and the grant alone still reaches nothing: the host owns
+the egress policy, which is deny-by-default. The operator must list the
+platform's API hosts under `plugins.entries.<key>.egress_hosts` for that
+channel instance before `send` has a network path; any destination outside
+that list is refused before a packet leaves, and a granted host that resolves
+to a loopback, private, or link-local address is refused too unless it is also
+listed under `egress_allow_private`. Install-time seeding of that grant for channel instances is
+still manual (the grant ceremony is
+[#9584](https://github.com/zeroclaw-labs/zeroclaw/pull/9584)), so document the
+hosts your plugin needs in its README.
 
 Pair `config_read` with the schema consumed by `ChannelConfig`:
 

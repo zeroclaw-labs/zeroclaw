@@ -18,12 +18,13 @@ the rest of the document, and strips trailing empty lines
 self-embeddable: sign the manifest without those root fields, then add them;
 verification removes them before checking.
 
-Two consequences worth knowing:
+Consequences worth knowing:
 
-- The `.wasm` component itself is **not** covered by the signature. What the
-  signature attests is the manifest: the name, version, capabilities, and
-  permissions a publisher stands behind. Pair it with a registry `sha256`
-  digest (below) when the artifact integrity matters in transit.
+- Put the component's SHA-256 in the root `wasm_sha256` field before signing.
+  The signature then binds that digest to the manifest. The host verifies it
+  over the exact bytes it admits and compiles; strict mode rejects executable
+  manifests without it. The registry `sha256` below independently protects the
+  distribution archive in transit.
 - Nested fields with names such as `config_schema.properties.signature`, and
   similarly prefixed root fields such as `signature_algorithm`, remain signed.
   Reformatting or reordering retained content invalidates the signature. Sign
@@ -57,6 +58,8 @@ an unsigned manifest.
 ```toml
 name = "my-plugin"
 version = "0.1.0"
+wasm_path = "my-plugin.wasm"
+wasm_sha256 = "<64-hex-character-component-sha256>"
 signature = "<base64url-signature>"
 publisher_key = "<hex-public-key>"
 
@@ -97,7 +100,11 @@ The install path is the local plugin directory; a registry is only a JSON
 index consulted at command time (`zeroclaw plugin search` / `install`).
 Both commands exist only in binaries with the plugin host compiled in (see
 [build features](../developing/plugin-protocol.md#build-features)); the
-prebuilt release binaries ship without it. The
+prebuilt release binaries ship without it. Fetching an index through either
+command caches it locally. `zeroclaw plugin list` then combines installed
+packages with the cache without making a network request; it keeps installed
+and registry versions separate rather than guessing whether an arbitrary
+version string is newer. The
 default index is the `zeroclaw-labs/zeroclaw-plugins` repository's
 `registry.json`; private registries are a URL away
 (`--registry <url>` per command, or the `ZEROCLAW_PLUGIN_REGISTRY_URL`

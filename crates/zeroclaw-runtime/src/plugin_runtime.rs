@@ -4,10 +4,13 @@
 //! the admitted package host. It never stores operator config, authorization,
 //! or guest metadata, and building it never executes guest code.
 
+#[cfg(feature = "plugins-wasm")]
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
 use zeroclaw_api::channel::Channel;
+use zeroclaw_api::webhook::PluginWebhookRegistryLease;
 use zeroclaw_config::schema::Config;
 
 /// Whether this build can execute WASM plugins.
@@ -29,6 +32,14 @@ use zeroclaw_plugins::instance::PluginInstanceScope;
 struct ActivationCandidate {
     explicit: bool,
     scope: PluginInstanceScope,
+}
+
+#[cfg(feature = "plugins-wasm")]
+struct BuiltChannelCandidate {
+    package: String,
+    alias: String,
+    config_read: bool,
+    channel: zeroclaw_plugins::wasm_channel::WasmChannel,
 }
 
 /// One deterministic, guest-free admission decision across logical plugin
@@ -251,6 +262,209 @@ pub(crate) fn plugin_limits(config: &Config) -> zeroclaw_plugins::component::Plu
     }
 }
 
+/// Plugin grants are compared verbatim: a plugin names its senders exactly, with
+/// none of the per-platform identity rules the chat channels carry. Denies still
+/// have to be decoded and applied first, which is what the shared policy helper
+/// is for.
+#[cfg(feature = "plugins-wasm")]
+fn plugin_sender_allowed(config: &Config, alias: &str, sender: &str) -> bool {
+    zeroclaw_config::schema::peer_policy_admits(
+        &config.channel_external_peers("plugin", alias),
+        &[sender],
+        |entry, user| entry == user,
+    )
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn channel_sender_authorizer(
+    config: Arc<Config>,
+    live_config: Option<Arc<RwLock<Config>>>,
+    alias: String,
+) -> zeroclaw_plugins::wasm_channel::SenderAuthorizer {
+    match live_config {
+        Some(live_config) => {
+            Arc::new(move |sender| plugin_sender_allowed(&live_config.read(), &alias, sender))
+        }
+        None => Arc::new(move |sender| plugin_sender_allowed(&config, &alias, sender)),
+    }
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn valid_webhook_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    (1..=64).contains(&bytes.len())
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn bounded_plugin_log_value(value: impl AsRef<str>, max_chars: usize) -> String {
+    let value = value.as_ref();
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut bounded: String = value.chars().take(max_chars.saturating_sub(1)).collect();
+    bounded.push('…');
+    bounded
+}
+
+#[cfg(feature = "plugins-wasm")]
+async fn finalize_plugin_webhooks(
+    candidates: Vec<BuiltChannelCandidate>,
+    registry: Option<&PluginWebhookRegistryLease>,
+) -> Vec<Arc<dyn Channel>> {
+    let Some(registry) = registry else {
+        return candidates
+            .into_iter()
+            .map(|candidate| Arc::new(candidate.channel) as Arc<dyn Channel>)
+            .collect();
+    };
+
+    // Resolve every guest declaration before mutating the shared route map.
+    // Invalid or duplicate claims reject their entire channel instance so an
+    // advertised webhook channel can never run in a silently unreachable mode.
+    let mut paths = Vec::with_capacity(candidates.len());
+    let mut rejected = HashSet::new();
+    let mut claimants: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        if !candidate.channel.has_webhook_ingress() {
+            paths.push(None);
+            continue;
+        }
+        if !candidate.config_read {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "plugin": candidate.package,
+                        "channel_alias": candidate.alias,
+                        "error_key": "plugin_webhook_config_read_required",
+                    })),
+                "Webhook channel plugin requires config_read; rejecting channel instance"
+            );
+            rejected.insert(index);
+            paths.push(None);
+            continue;
+        }
+
+        match candidate.channel.webhook_path().await {
+            Ok(Some(path)) if valid_webhook_path(&path) => {
+                claimants.entry(path.clone()).or_default().push(index);
+                paths.push(Some(path));
+            }
+            Ok(Some(path)) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "plugin": candidate.package,
+                            "channel_alias": candidate.alias,
+                            "path": bounded_plugin_log_value(path, 128),
+                            "error_key": "plugin_webhook_path_invalid",
+                        })),
+                    "Webhook channel plugin declared an invalid route; rejecting channel instance"
+                );
+                rejected.insert(index);
+                paths.push(None);
+            }
+            Ok(None) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "plugin": candidate.package,
+                            "channel_alias": candidate.alias,
+                            "error_key": "plugin_webhook_path_missing",
+                        })),
+                    "Webhook channel plugin advertised ingress without a route; rejecting channel instance"
+                );
+                rejected.insert(index);
+                paths.push(None);
+            }
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "plugin": candidate.package,
+                            "channel_alias": candidate.alias,
+                            "error": bounded_plugin_log_value(format!("{error:#}"), 2_048),
+                            "error_key": "plugin_webhook_path_unavailable",
+                        })),
+                    "Webhook channel plugin route could not be resolved; rejecting channel instance"
+                );
+                rejected.insert(index);
+                paths.push(None);
+            }
+        }
+    }
+
+    let ambiguous: HashSet<usize> = claimants
+        .values()
+        .filter(|indices| indices.len() > 1)
+        .flat_map(|indices| indices.iter().copied())
+        .collect();
+    let mut routes = HashMap::new();
+    let mut channels = Vec::with_capacity(candidates.len());
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        if rejected.contains(&index) {
+            continue;
+        }
+        if ambiguous.contains(&index) {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "plugin": candidate.package,
+                        "channel_alias": candidate.alias,
+                        "path": paths[index],
+                        "error_key": "plugin_webhook_path_ambiguous",
+                    })),
+                "Multiple channel-plugin instances claimed one webhook route; rejecting every claimant"
+            );
+            continue;
+        }
+
+        if let Some(path) = paths[index].as_ref() {
+            let (sink, receiver) = tokio::sync::mpsc::channel(64);
+            candidate.channel.set_webhook_receiver(receiver);
+            routes.insert(path.clone(), sink);
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
+                    .with_attrs(::serde_json::json!({
+                        "plugin": candidate.package,
+                        "channel_alias": candidate.alias,
+                        "path": path,
+                    })),
+                "Registered channel-plugin webhook route"
+            );
+        }
+        channels.push(Arc::new(candidate.channel) as Arc<dyn Channel>);
+    }
+
+    if registry.replace(routes) {
+        channels
+    } else {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "error_key": "plugin_webhook_generation_stale",
+                })),
+            "A newer channel supervisor owns plugin webhook routes; rejecting stale plugin channels"
+        );
+        Vec::new()
+    }
+}
+
 /// Construct every admitted channel plugin from the package the host verified.
 ///
 /// The returned channels carry their canonical alias in their host-issued
@@ -263,9 +477,24 @@ pub async fn configured_plugin_channels(
     config: Arc<Config>,
     live_config: Option<Arc<RwLock<Config>>>,
 ) -> Vec<Arc<dyn Channel>> {
+    Box::pin(configured_plugin_channels_with_webhooks(
+        config,
+        live_config,
+        None,
+    ))
+    .await
+}
+
+/// Construct configured channel plugins and publish their validated webhook
+/// claims into one daemon-generation registry.
+pub async fn configured_plugin_channels_with_webhooks(
+    config: Arc<Config>,
+    live_config: Option<Arc<RwLock<Config>>>,
+    webhook_registry: Option<&PluginWebhookRegistryLease>,
+) -> Vec<Arc<dyn Channel>> {
     #[cfg(not(feature = "plugins-wasm"))]
     {
-        let _ = (config, live_config);
+        let _ = (config, live_config, webhook_registry);
         Vec::new()
     }
 
@@ -301,20 +530,31 @@ pub async fn configured_plugin_channels(
                 return Vec::new();
             }
         };
-        let host_services =
-            crate::tools::plugin_host_services(Arc::clone(&host), Arc::clone(&config), live_config);
+        // One host-owned egress authority for every channel in this plan. It is
+        // shared, not per-channel: each store carries its own instance scope, and
+        // the service resolves reach from canonical config against that scope's
+        // `config_entry_key()` at request time. The same live view is cloned
+        // into config reads and sender authorization, so each resolves the
+        // current canonical row independently rather than snapshotting it.
+        let egress_service =
+            crate::tools::plugin_egress_service(Arc::clone(&config), live_config.clone());
+        let host_services = crate::tools::plugin_host_services(
+            Arc::clone(&host),
+            Arc::clone(&config),
+            live_config.clone(),
+        );
         let limits = plugin_limits(&config);
         let details = host.channel_plugin_details();
         let scopes: Vec<_> = plan.scopes(PluginCapability::Channel).collect();
         let admitted_count = scopes.len();
-        let mut channels: Vec<Arc<dyn Channel>> = Vec::with_capacity(admitted_count);
+        let mut candidates = Vec::with_capacity(admitted_count);
 
         for scope in scopes {
             let package = scope.id().package().to_string();
-            let Some((_, wasm_path)) = details
+            let Some((manifest, component)) = details
                 .iter()
-                .copied()
                 .find(|(manifest, _)| manifest.name == package)
+                .map(|(manifest, component)| (*manifest, *component))
             else {
                 continue;
             };
@@ -339,15 +579,25 @@ pub async fn configured_plugin_channels(
                     }
                 };
             let alias = endpoint.alias().to_string();
+            let authorizer =
+                channel_sender_authorizer(Arc::clone(&config), live_config.clone(), alias.clone());
             match zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm(
                 endpoint,
-                wasm_path,
+                component,
                 &host_services,
                 limits,
+                Some(egress_service.clone()),
             )
             .await
             {
-                Ok(channel) => channels.push(Arc::new(channel)),
+                Ok(channel) => candidates.push(BuiltChannelCandidate {
+                    package: package.clone(),
+                    alias,
+                    config_read: manifest
+                        .permissions
+                        .contains(&zeroclaw_plugins::PluginPermission::ConfigRead),
+                    channel: channel.with_sender_authorizer(authorizer),
+                }),
                 Err(error) => {
                     ::zeroclaw_log::record!(
                         WARN,
@@ -369,12 +619,12 @@ pub async fn configured_plugin_channels(
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load).with_attrs(
                 ::serde_json::json!({
                     "admitted": admitted_count,
-                    "constructed": channels.len(),
+                    "constructed": candidates.len(),
                 })
             ),
             "Registered WASM channel plugins"
         );
-        channels
+        finalize_plugin_webhooks(candidates, webhook_registry).await
     }
 }
 
@@ -388,6 +638,106 @@ mod tests {
     use zeroclaw_config::schema::{AliasedAgentConfig, PluginChannelConfig};
 
     use super::*;
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn webhook_paths_use_the_bounded_single_segment_grammar() {
+        for path in ["a", "Fixture_01", "a-b", &"x".repeat(64)] {
+            assert!(valid_webhook_path(path), "expected valid path: {path:?}");
+        }
+        for path in [
+            "".to_string(),
+            "x".repeat(65),
+            "has.dot".to_string(),
+            "has/slash".to_string(),
+            "has space".to_string(),
+            "control\n".to_string(),
+            "unicode-λ".to_string(),
+        ] {
+            assert!(
+                !valid_webhook_path(&path),
+                "expected invalid path: {path:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn channel_sender_policy_resolves_plugin_peer_groups_live() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        let live = Arc::new(RwLock::new(Config::default()));
+        let authorizer = channel_sender_authorizer(
+            Arc::new(Config::default()),
+            Some(Arc::clone(&live)),
+            "operations".to_string(),
+        );
+        assert!(!authorizer("alice"), "empty peer groups deny by default");
+
+        live.write().peer_groups.insert(
+            "operators".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("plugin.operations"),
+                external_peers: vec![PeerUsername::new("alice")],
+                ..PeerGroupConfig::default()
+            },
+        );
+        assert!(authorizer("alice"));
+        assert!(!authorizer("Alice"), "plugin sender identity is exact");
+
+        live.write()
+            .peer_groups
+            .get_mut("operators")
+            .expect("operator peer group")
+            .external_peers = vec![PeerUsername::new("*")];
+        assert!(
+            authorizer("anyone"),
+            "wildcard uses native channel semantics"
+        );
+    }
+
+    /// `channel_external_peers` carries every `ignore` entry as an encoded deny
+    /// marker and applies none of them, so the ingress has to. Both plugin
+    /// delivery paths, polling and webhook, share this predicate.
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn channel_sender_policy_applies_denies_before_grants() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        let policy = |grants: &[&str], ignore: &[&str]| {
+            let live = Arc::new(RwLock::new(Config::default()));
+            live.write().peer_groups.insert(
+                "operators".to_string(),
+                PeerGroupConfig {
+                    channel: ChannelRef::new("plugin.operations"),
+                    external_peers: grants.iter().map(|p| PeerUsername::new(*p)).collect(),
+                    ignore: ignore.iter().map(|p| PeerUsername::new(*p)).collect(),
+                    ..PeerGroupConfig::default()
+                },
+            );
+            channel_sender_authorizer(
+                Arc::new(Config::default()),
+                Some(Arc::clone(&live)),
+                "operations".to_string(),
+            )
+        };
+
+        let wildcard = policy(&["*"], &["alice"]);
+        assert!(!wildcard("alice"), "an explicit deny outranks a wildcard");
+        assert!(wildcard("bob"), "the wildcard still admits everyone else");
+
+        let exact = policy(&["alice", "bob"], &["alice"]);
+        assert!(!exact("alice"), "an explicit deny outranks an exact grant");
+        assert!(exact("bob"), "the sibling grant is untouched");
+
+        let deny_all = policy(&["*"], &["*"]);
+        assert!(!deny_all("alice"), "`ignore = [\"*\"]` denies everyone");
+
+        let granted = policy(&["alice"], &[]);
+        assert!(granted("alice"), "control: no deny, the grant stands");
+    }
 
     fn write_executable_plugin(root: &Path, name: &str, capabilities: &[&str]) {
         let plugin_dir = root.join(name);

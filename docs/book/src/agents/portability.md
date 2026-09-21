@@ -56,30 +56,14 @@ directory beside the destination and swapped in once it is complete, so:
   bundle alike: an `--out` *inside* a source would have the copy consume its own
   output, and an `--out` that *contains* one would replace the tree being
   exported.
-- The names the bundle format controls, a skill-bundle alias and each
-  component of a retained identity path, are held to one grammar: what every
-  supported target can materialize, not what the exporting host accepts. That
-  rules out separators and control characters, and also the Windows names a
-  Unix host cannot see are special, such as `con`, `nul` or `lpt1` with or
-  without an extension, and names ending in a space or a dot. A reference that
-  breaks the rule is dropped with its reason rather than written into a bundle
-  that cannot be opened on the other side. Workspace and skill content travels
-  under whatever names it already has; this is about the names the format
-  itself chooses.
+- Retained identity-path components and skill-content directory names use a grammar that every supported target can materialize. That rules out separators and control characters, Windows-reserved names such as `con`, `nul`, or `lpt1` with or without an extension, and names ending in a space or dot. An unsafe identity path is removed. An unsafe skill alias remains in the config closure so the manual importer can rename or rebind it, but its content is not placed under `skills/<alias>/`; the manifest reports that omission. The root agent alias also remains unchanged in format 1, so rename a target-incompatible alias before copying the default workspace on that target.
 - The closure is proved before it is written. The rendered `config.toml` is
   parsed back and put through the same validation the importing install runs,
   on a config holding nothing else. A reference the source install could
   satisfy but the bundle cannot, such as a provider or bundle entry that was
   never configured, refuses the export and names the field, rather than
   producing a bundle that fails on arrival.
-- What `--force` admits is one directory, not one path. The whole copy sits
-  between the moment the destination is looked at and the moment the bundle is
-  swapped in, so the decision is carried forward as the identity of the object
-  it was made about. A destination that appears during that window, or one that
-  is replaced by another directory, is refused: it is not the thing the
-  operator was shown, and nothing is retired or deleted. The same binding
-  covers the parent directory, which is opened once and used for every step
-  that follows.
+- What `--force` admits is one directory, not merely a path string. The exporter retains the parent-directory handle and the admitted destination identity, then rechecks them before publication. A destination change observed by those checks is refused. These checks reduce substitution risk but are not an atomic compare-and-swap with the final remove or rename, so do not let another process mutate the destination directory while an export is publishing.
 
 ### If the export is killed partway
 
@@ -115,6 +99,7 @@ be reconstituted elsewhere:
 - the provider a carried runtime profile names in its own
   `context_compression.summary_provider`, which the agent never mentions but
   the target validates per profile;
+- every model-provider fallback reachable under the runtime's depth and cycle rules, also carried keyless;
 - the **content** of each referenced skill bundle, under `skills/<alias>/`.
   Skills live in the install-wide `<install>/shared/skills/` tree rather than
   the agent's workspace, so config alone would import an agent whose skills do
@@ -145,6 +130,7 @@ nothing disappears silently.
 | `workspace.path` | A source-host absolute path. |
 | `identity.aieos_path` | Kept only when it resolves to a file inside the exported workspace under the format's own path grammar: `/`-separated, no `..`, no backslashes, drive or UNC prefixes, or control characters, since the importing host may read those differently than the exporting one. A kept path is rewritten into that grammar (normalized, `/`-separated on every exporting platform), so the string in `config.toml` is the string that names the carried file. Paths into `memory/`, and paths whose file the copy did not carry, are dropped too. |
 | `delegate_same_risk_profile` | Set to `false`: same-profile auto-delegation would otherwise reach agents on the target this one has never been paired with. |
+| `risk_profiles.<alias>.approval_route` | Names a source-install channel and distinct approver. It is removed and reported so a same-named target channel cannot silently inherit approval authority. Removing it also removes the source profile's distinct-approver policy, so rebind one on the target before enabling the agent when that separation is required. |
 | `skill_bundles.<alias>.directory` | Dropped when absolute, since it names the source host, and the target resolves its default location for the alias. A directory outside `<install>/shared/`, the tree the skill-bundle contract owns, is dropped together with its content: the bundle's config travels, but its skills are not the install's to export. |
 | `a2a` | An outward-facing surface; the agent must be re-published deliberately. |
 | `cron_jobs` | Not carried by bundle format 1. |
@@ -241,6 +227,8 @@ the closure travels exactly as configured:
 The manifest repeats stdio server command lines verbatim in `risk_flags`, so a
 credential in `args` is in the manifest as well as the config fragment.
 
+Some carried fields depend on target-local state even though they are not secret values. `requires_openai_auth = true` requires the target's own OpenAI authentication store. Model-provider and MCP `tls_ca_cert_path` values name files on the exporting host and must be replaced with a target-local CA path. `allowed_roots` is carried and flagged as `extra_filesystem_roots`; review or remove each path before enabling the imported profile.
+
 Read those values before sharing a bundle. Two things need your eyes rather than
 the schema's: the strings described here, and the carried files described in
 [Bundle content is not scanned](#bundle-content-is-not-scanned).
@@ -257,6 +245,8 @@ listed elsewhere on this page: the [memory store and its
 snapshot](#memory-does-not-travel), [symlinks, special files, and hard
 links](#exporting), skills a bundle's `exclude` rejects, and loose state at a
 skill bundle's root.
+
+Loose files and special entries at a skill bundle's root are outside the skill-content tree. They are not copied or included in the recursive skipped-entry counts, so inspect the source bundle root separately if that distinction matters to your handoff.
 
 So a `.env` file in the workspace, an API token pasted into a note, a
 `.git/config` whose remote URL carries a credential, or a private document the
@@ -307,6 +297,8 @@ merge should follow:
   the incoming alias, or explicitly point the agent at a local one.
 - **The merged config must pass `Config::validate()` before it is saved.** A
   dangling reference is a failed import, not a broken next boot.
+
+Before materializing paths, rename any root agent or skill-bundle alias that the target cannot represent, then update the corresponding references in the fragment. This especially matters when a bundle produced on Unix is applied on Windows.
 
 ## Format version
 

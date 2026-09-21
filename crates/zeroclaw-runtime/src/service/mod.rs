@@ -1,40 +1,50 @@
 use anyhow::{Context, Result, bail};
-#[cfg(any(target_os = "macos", test))]
+#[cfg(windows)]
+use process_wrap::tokio::{ChildWrapper, CommandWrap, CommandWrapper, JobObject, KillOnDrop};
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use std::collections::VecDeque;
 use std::fs;
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use std::process::Stdio;
 use std::str::FromStr;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use std::sync::{Arc, Condvar, Mutex};
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use std::thread::JoinHandle;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use std::time::{Duration, Instant};
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use tokio::io::{AsyncRead, AsyncReadExt};
-#[cfg(any(target_os = "macos", test))]
-use tokio::process::{Child, Command as TokioCommand};
-use zeroclaw_config::schema::Config;
+#[cfg(any(target_os = "linux", target_os = "macos", all(test, not(unix))))]
+use tokio::process::Child;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+use tokio::process::Command as TokioCommand;
+use zeroclaw_config::schema::{Config, resolve_runtime_dirs};
 
 const SERVICE_LABEL: &str = "com.zeroclaw.daemon";
 const WINDOWS_TASK_NAME: &str = "ZeroClaw Daemon";
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 const SERVICE_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 const SERVICE_LOG_COMPACT_BYTES: u64 = 4 * 1024 * 1024;
 #[cfg(any(target_os = "linux", test))]
 const OPENRC_STDOUT_LOG: &str = "/var/log/zeroclaw/access.log";
 #[cfg(any(target_os = "linux", test))]
 const OPENRC_STDERR_LOG: &str = "/var/log/zeroclaw/error.log";
-#[cfg(any(target_os = "macos", test))]
-const LAUNCHD_LOG_PENDING_BYTES: usize = 1024 * 1024;
-#[cfg(any(target_os = "macos", all(test, unix)))]
-const LAUNCHD_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+const SERVICE_LOG_PENDING_BYTES: usize = 1024 * 1024;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+const SERVICE_LOG_WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+const DESKTOP_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+const DESKTOP_READINESS_FRAME_MAX_BYTES: usize = 4096;
+#[cfg(any(target_os = "linux", target_os = "macos", all(test, unix)))]
+const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(any(target_os = "macos", test))]
 const LAUNCHD_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -54,14 +64,15 @@ fn launchd_capture_paths(config_dir: &Path) -> LaunchdCapturePaths {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 struct BoundedServiceLog {
     file: fs::File,
     len: u64,
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 impl BoundedServiceLog {
+    #[cfg(any(target_os = "linux", target_os = "macos", test))]
     fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -74,6 +85,19 @@ impl BoundedServiceLog {
             .write(true)
             .open(path)
             .with_context(|| format!("Failed to open service log {}", path.display()))?;
+        let mut log = Self {
+            len: file.metadata()?.len(),
+            file,
+        };
+        if log.len > SERVICE_LOG_MAX_BYTES {
+            log.retain_tail(SERVICE_LOG_MAX_BYTES)?;
+        }
+        Ok(log)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+    fn open_desktop(path: &Path) -> Result<Self> {
+        let file = open_private_desktop_file(path)?;
         let mut log = Self {
             len: file.metadata()?.len(),
             file,
@@ -117,6 +141,628 @@ impl BoundedServiceLog {
         self.file.flush()?;
         self.len = bytes.len() as u64;
         Ok(())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+fn open_private_desktop_directory(path: &Path) -> Result<cap_std::fs::Dir> {
+    let logs_path = path
+        .parent()
+        .context("desktop log path has no parent directory")?;
+    let config_root = logs_path
+        .parent()
+        .context("desktop log path has no config root")?;
+    let root = open_or_create_private_desktop_root(config_root)?;
+    let logs_name = logs_path
+        .file_name()
+        .context("desktop log path has no logs directory name")?;
+    open_or_create_private_desktop_subdir(&root, Path::new(logs_name), logs_path)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+fn open_or_create_private_desktop_root(path: &Path) -> Result<cap_std::fs::Dir> {
+    use std::path::Component;
+
+    // macOS exposes these root-owned compatibility aliases as symlinks. Resolve
+    // only the fixed system aliases before the no-follow component walk; user-
+    // controlled symlinks below them must still be rejected.
+    #[cfg(target_os = "macos")]
+    let path = ["var", "tmp", "etc"]
+        .into_iter()
+        .find_map(|alias| {
+            path.strip_prefix(Path::new("/").join(alias))
+                .ok()
+                .map(|suffix| Path::new("/private").join(alias).join(suffix))
+        })
+        .unwrap_or_else(|| path.to_path_buf());
+    #[cfg(target_os = "macos")]
+    let path = path.as_path();
+
+    if !path.is_absolute() {
+        bail!("desktop config root is not absolute: {}", path.display());
+    }
+    let mut anchor = PathBuf::new();
+    let mut names = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => anchor.push(prefix.as_os_str()),
+            Component::RootDir => anchor.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::Normal(name) => names.push(PathBuf::from(name)),
+            Component::ParentDir => {
+                bail!(
+                    "desktop config root contains an unresolved parent component: {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    if anchor.as_os_str().is_empty() || names.is_empty() {
+        bail!(
+            "desktop config root has no directory name: {}",
+            path.display()
+        );
+    }
+
+    let mut directory = open_private_desktop_anchor(&anchor).with_context(|| {
+        format!(
+            "Failed to bind desktop config filesystem root {}",
+            anchor.display()
+        )
+    })?;
+    let mut current_path = anchor;
+    let mut creating_private_chain = false;
+    let final_index = names.len() - 1;
+    for (index, name) in names.into_iter().enumerate() {
+        current_path.push(&name);
+        if creating_private_chain || index == final_index {
+            directory = open_or_create_private_desktop_subdir(&directory, &name, &current_path)?;
+            continue;
+        }
+        match open_private_desktop_subdir(&directory, &name, false) {
+            Ok(next) => directory = next,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                creating_private_chain = true;
+                directory =
+                    open_or_create_private_desktop_subdir(&directory, &name, &current_path)?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to bind desktop config ancestor {}",
+                        current_path.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(directory)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+fn open_private_desktop_anchor(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        options.access_mode(GENERIC_READ);
+        options.custom_flags(0x0020_0000 | 0x0200_0000);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() {
+        return Err(std::io::Error::other(format!(
+            "desktop config ancestor is not a directory: {}",
+            path.display()
+        )));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x0000_0400 != 0 {
+            return Err(std::io::Error::other(format!(
+                "desktop config ancestor is a reparse point: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(cap_std::fs::Dir::from_std_file(file))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+fn open_or_create_private_desktop_subdir(
+    parent: &cap_std::fs::Dir,
+    name: &Path,
+    full_path: &Path,
+) -> Result<cap_std::fs::Dir> {
+    #[cfg(unix)]
+    use cap_std::fs::DirBuilderExt;
+    use cap_std::fs::{Dir, DirBuilder};
+
+    match parent.symlink_metadata(name) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                bail!(
+                    "desktop private directory is not a directory: {}",
+                    full_path.display()
+                );
+            }
+            #[cfg(windows)]
+            if cap_std::fs::MetadataExt::file_attributes(&metadata) & 0x0000_0400 != 0 {
+                bail!(
+                    "desktop private directory is a reparse point: {}",
+                    full_path.display()
+                );
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let builder = DirBuilder::new();
+            #[cfg(unix)]
+            let builder = {
+                let mut builder = builder;
+                builder.mode(0o700);
+                builder
+            };
+            parent.create_dir_with(name, &builder).with_context(|| {
+                format!(
+                    "Failed to create private desktop directory {}",
+                    full_path.display()
+                )
+            })?;
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to inspect private desktop directory {}",
+                    full_path.display()
+                )
+            });
+        }
+    }
+
+    let directory = open_private_desktop_subdir(parent, name, true).with_context(|| {
+        format!(
+            "Failed to bind private desktop directory {}",
+            full_path.display()
+        )
+    })?;
+    let std_file = directory.into_std_file();
+    let metadata = std_file.metadata().with_context(|| {
+        format!(
+            "Failed to inspect private desktop directory {}",
+            full_path.display()
+        )
+    })?;
+    if !metadata.is_dir() {
+        bail!(
+            "desktop private path is not a directory: {}",
+            full_path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let owner = unsafe { libc::geteuid() };
+        if metadata.uid() != owner {
+            bail!(
+                "desktop private directory {} is owned by uid {}, not the current user",
+                full_path.display(),
+                metadata.uid()
+            );
+        }
+        if metadata.mode() & 0o077 != 0 {
+            std_file
+                .set_permissions(fs::Permissions::from_mode(0o700))
+                .with_context(|| {
+                    format!(
+                        "Failed to restrict private desktop directory {}",
+                        full_path.display()
+                    )
+                })?;
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x0000_0400 != 0 {
+            bail!(
+                "desktop private directory is a reparse point: {}",
+                full_path.display()
+            );
+        }
+        enforce_windows_private_acl(&std_file, full_path, true)?;
+    }
+    Ok(Dir::from_std_file(std_file))
+}
+
+#[cfg(any(unix, windows))]
+fn open_private_desktop_subdir(
+    parent: &cap_std::fs::Dir,
+    name: &Path,
+    _require_write_dac: bool,
+) -> std::io::Result<cap_std::fs::Dir> {
+    use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt};
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    {
+        // GENERIC_READ preserves directory traversal/read-control access; WRITE_DAC is
+        // required only when SetSecurityInfo will harden this private directory.
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const WRITE_DAC: u32 = 0x0004_0000;
+        options.access_mode(GENERIC_READ | if _require_write_dac { WRITE_DAC } else { 0 });
+        options.custom_flags(0x0020_0000 | 0x0200_0000);
+    }
+    let file = parent.open_with(name, &options)?.into_std();
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() {
+        return Err(std::io::Error::other(format!(
+            "desktop directory entry is not a directory: {}",
+            name.display()
+        )));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x0000_0400 != 0 {
+            return Err(std::io::Error::other(format!(
+                "desktop directory entry is a reparse point: {}",
+                name.display()
+            )));
+        }
+    }
+    Ok(Dir::from_std_file(file))
+}
+
+#[cfg(windows)]
+#[link(name = "advapi32")]
+#[allow(non_snake_case)]
+unsafe extern "system" {
+    fn GetSecurityInfo(
+        handle: *mut std::ffi::c_void,
+        object_type: u32,
+        security_info: u32,
+        owner: *mut *mut std::ffi::c_void,
+        group: *mut *mut std::ffi::c_void,
+        dacl: *mut *mut std::ffi::c_void,
+        sacl: *mut *mut std::ffi::c_void,
+        security_descriptor: *mut *mut std::ffi::c_void,
+    ) -> u32;
+    fn SetSecurityInfo(
+        handle: *mut std::ffi::c_void,
+        object_type: u32,
+        security_info: u32,
+        owner: *mut std::ffi::c_void,
+        group: *mut std::ffi::c_void,
+        dacl: *const std::ffi::c_void,
+        sacl: *const std::ffi::c_void,
+    ) -> u32;
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+#[allow(non_snake_case)]
+unsafe extern "system" {
+    fn LocalFree(memory: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+}
+
+#[cfg(any(windows, test))]
+fn windows_owner_sid_matches(owner: &[u8], current_user: &[u8]) -> bool {
+    !owner.is_empty() && owner == current_user
+}
+
+#[cfg(any(windows, test))]
+fn windows_acl_ace_flags(is_directory: bool) -> u32 {
+    if is_directory { 0x1 | 0x2 } else { 0 }
+}
+
+#[cfg(windows)]
+fn enforce_windows_private_acl(file: &fs::File, path: &Path, is_directory: bool) -> Result<()> {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{
+        ACE_FLAGS, ACL, ACL_REVISION, AddAccessAllowedAceEx, GetLengthSid, GetTokenInformation,
+        InitializeAcl, PSID, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = HANDLE::default();
+    unsafe {
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).with_context(|| {
+            format!(
+                "Failed to open the current user token for {}",
+                path.display()
+            )
+        })?;
+    }
+
+    let result = (|| {
+        let mut token_bytes = 0u32;
+        let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut token_bytes) };
+        if token_bytes == 0 {
+            bail!(
+                "Failed to determine the current user SID for {}",
+                path.display()
+            );
+        }
+        let words = (token_bytes as usize).div_ceil(size_of::<u64>());
+        let mut token_storage = vec![0u64; words];
+        unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                Some(token_storage.as_mut_ptr().cast()),
+                token_bytes,
+                &mut token_bytes,
+            )
+            .with_context(|| {
+                format!("Failed to read the current user SID for {}", path.display())
+            })?;
+        }
+        let token_user = unsafe { &*token_storage.as_ptr().cast::<TOKEN_USER>() };
+        let current_sid_handle = token_user.User.Sid;
+        let current_sid_len = unsafe { GetLengthSid(current_sid_handle) } as usize;
+        if current_sid_len == 0 {
+            bail!("Current user SID is invalid for {}", path.display());
+        }
+        let current_sid_bytes = unsafe {
+            std::slice::from_raw_parts(current_sid_handle.0.cast::<u8>(), current_sid_len)
+        };
+
+        let mut owner_sid = std::ptr::null_mut();
+        let mut security_descriptor = std::ptr::null_mut();
+        let status = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                1,
+                1,
+                &mut owner_sid,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut security_descriptor,
+            )
+        };
+        if status != 0 {
+            if !security_descriptor.is_null() {
+                unsafe {
+                    let _ = LocalFree(security_descriptor);
+                }
+            }
+            bail!(
+                "Failed to query the owner SID for {} (Windows error {})",
+                path.display(),
+                status
+            );
+        }
+        let owner_result = (|| {
+            if owner_sid.is_null() {
+                bail!("{} has no owner SID", path.display());
+            }
+            let owner_sid_len = unsafe { GetLengthSid(PSID(owner_sid)) } as usize;
+            if owner_sid_len == 0 {
+                bail!("{} has an invalid owner SID", path.display());
+            }
+            let owner_sid =
+                unsafe { std::slice::from_raw_parts(owner_sid.cast::<u8>(), owner_sid_len) };
+            if !windows_owner_sid_matches(owner_sid, current_sid_bytes) {
+                bail!(
+                    "{} is not owned by the current Windows user; refusing ACL hardening",
+                    path.display()
+                );
+            }
+            let acl_size = (size_of::<ACL>() + 8 + current_sid_len).next_multiple_of(4);
+            let acl_words = acl_size.div_ceil(size_of::<u32>());
+            let mut acl_storage = vec![0u32; acl_words];
+            let acl = acl_storage.as_mut_ptr().cast::<ACL>();
+            unsafe {
+                InitializeAcl(acl, acl_size as u32, ACL_REVISION).with_context(|| {
+                    format!("Failed to initialize a private ACL for {}", path.display())
+                })?;
+                AddAccessAllowedAceEx(
+                    acl,
+                    ACL_REVISION,
+                    ACE_FLAGS(windows_acl_ace_flags(is_directory)),
+                    0x001F_01FF,
+                    current_sid_handle,
+                )
+                .with_context(|| {
+                    format!("Failed to add the current-user ACE for {}", path.display())
+                })?;
+            }
+            let status = unsafe {
+                SetSecurityInfo(
+                    file.as_raw_handle(),
+                    1,
+                    0x0000_0004 | 0x8000_0000,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    acl.cast(),
+                    std::ptr::null(),
+                )
+            };
+            if status != 0 {
+                bail!(
+                    "Failed to apply a private ACL to {} (Windows error {})",
+                    path.display(),
+                    status
+                );
+            }
+            Ok(())
+        })();
+        if !security_descriptor.is_null() {
+            unsafe {
+                let _ = LocalFree(security_descriptor);
+            }
+        }
+        owner_result
+    })();
+    unsafe {
+        let _ = CloseHandle(token);
+    }
+    result
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+fn open_private_desktop_file(path: &Path) -> Result<fs::File> {
+    use cap_std::fs::{OpenOptions, OpenOptionsExt};
+
+    let name = path
+        .file_name()
+        .context("desktop log path has no file name")?;
+    let directory = open_private_desktop_directory(path)?;
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    options
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    {
+        // GENERIC_READ/GENERIC_WRITE preserve log I/O; WRITE_DAC is required for
+        // SetSecurityInfo to apply the private DACL on this handle.
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const WRITE_DAC: u32 = 0x0004_0000;
+        options.access_mode(GENERIC_READ | GENERIC_WRITE | WRITE_DAC);
+        options.custom_flags(0x0020_0000 | 0x0200_0000);
+    }
+
+    let file = directory
+        .open_with(Path::new(name), &options)
+        .with_context(|| format!("Failed to open desktop log {}", path.display()))?
+        .into_std();
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("Failed to inspect desktop log {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("desktop log is not a regular file: {}", path.display());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let owner = unsafe { libc::geteuid() };
+        if metadata.uid() != owner {
+            bail!(
+                "desktop log {} is owned by uid {}, not the current user",
+                path.display(),
+                metadata.uid()
+            );
+        }
+        if metadata.mode() & 0o077 != 0 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("Failed to restrict desktop log {}", path.display()))?;
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x0000_0400 != 0 {
+            bail!("desktop log is a reparse point: {}", path.display());
+        }
+        enforce_windows_private_acl(&file, path, false)?;
+    }
+
+    Ok(file)
+}
+
+async fn desktop_config_dir() -> Result<PathBuf> {
+    let (config_dir, _) = resolve_runtime_dirs().await?;
+    normalize_desktop_config_dir(config_dir)
+}
+
+fn normalize_desktop_config_dir(config_dir: PathBuf) -> Result<PathBuf> {
+    use std::path::Component;
+
+    let absolute = if config_dir.is_absolute() {
+        config_dir
+    } else {
+        std::env::current_dir()?.join(config_dir)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::Normal(name) => normalized.push(name),
+            Component::ParentDir => {
+                normalized.pop();
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+async fn desktop_log_path() -> Result<PathBuf> {
+    Ok(desktop_config_dir()
+        .await?
+        .join("logs/zeroclaw-desktop-daemon.log"))
+}
+
+fn desktop_handshake_frame(prefix: &str, message: Option<&str>) -> String {
+    let mut line = prefix.to_string();
+    if let Some(message) = message {
+        line.push(' ');
+        line.push_str(&message.replace("\r\n", " ").replace(['\r', '\n'], " "));
+    }
+    let max_content_bytes = DESKTOP_READINESS_FRAME_MAX_BYTES - 1;
+    if line.len() > max_content_bytes {
+        let mut truncate_at = max_content_bytes - 3;
+        while !line.is_char_boundary(truncate_at) {
+            truncate_at -= 1;
+        }
+        line.truncate(truncate_at);
+        line.push_str("...");
+    }
+    line.push('\n');
+    line
+}
+
+fn desktop_error_frame(error: &anyhow::Error) -> String {
+    desktop_handshake_frame("ERROR", Some(&format!("{error:#}")))
+}
+
+fn emit_desktop_frame(frame: &str) {
+    let mut stdout = std::io::stdout().lock();
+    let _ = std::io::Write::write_all(&mut stdout, frame.as_bytes());
+    let _ = std::io::Write::flush(&mut stdout);
+}
+
+fn emit_desktop_handshake(prefix: &str, message: Option<&str>) {
+    let line = desktop_handshake_frame(prefix, message);
+    emit_desktop_frame(&line);
+}
+
+fn emit_desktop_error(error: &anyhow::Error) {
+    let frame = desktop_error_frame(error);
+    emit_desktop_frame(&frame);
+}
+
+fn handle_desktop_preflight<T>(
+    result: Result<T>,
+    emit_error: impl FnOnce(&anyhow::Error),
+) -> Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            emit_error(&error);
+            Err(error)
+        }
     }
 }
 
@@ -177,34 +823,34 @@ fn openrc_log_path(stderr: bool) -> &'static Path {
     })
 }
 
-#[cfg(any(target_os = "macos", test))]
-struct PendingLaunchdLog {
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+struct PendingServiceLog {
     chunks: VecDeque<Vec<u8>>,
     bytes: usize,
     closed: bool,
 }
 
-#[cfg(any(target_os = "macos", test))]
-struct LaunchdLogSinkInner {
-    pending: Mutex<PendingLaunchdLog>,
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+struct ServiceLogSinkInner {
+    pending: Mutex<PendingServiceLog>,
     ready: Condvar,
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 #[derive(Clone)]
-struct LaunchdLogSink(Arc<LaunchdLogSinkInner>);
+struct ServiceLogSink(Arc<ServiceLogSinkInner>);
 
-#[cfg(any(target_os = "macos", test))]
-impl LaunchdLogSink {
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+impl ServiceLogSink {
     fn push(&self, mut chunk: Vec<u8>) {
-        if chunk.len() > LAUNCHD_LOG_PENDING_BYTES {
-            chunk = chunk.split_off(chunk.len() - LAUNCHD_LOG_PENDING_BYTES);
+        if chunk.len() > SERVICE_LOG_PENDING_BYTES {
+            chunk = chunk.split_off(chunk.len() - SERVICE_LOG_PENDING_BYTES);
         }
         let mut pending = self.0.pending.lock().unwrap_or_else(|e| e.into_inner());
         if pending.closed {
             return;
         }
-        while pending.bytes + chunk.len() > LAUNCHD_LOG_PENDING_BYTES {
+        while pending.bytes + chunk.len() > SERVICE_LOG_PENDING_BYTES {
             let Some(discarded) = pending.chunks.pop_front() else {
                 break;
             };
@@ -222,20 +868,23 @@ impl LaunchdLogSink {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
-struct LaunchdCaptureWriters {
-    stdout: LaunchdLogSink,
-    stderr: LaunchdLogSink,
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+struct ServiceLogWriters {
+    stdout: ServiceLogSink,
+    stderr: ServiceLogSink,
     tasks: Vec<JoinHandle<()>>,
 }
 
-#[cfg(any(target_os = "macos", test))]
-impl LaunchdCaptureWriters {
-    fn open(paths: &LaunchdCapturePaths) -> Result<Self> {
-        let stdout_log = BoundedServiceLog::open(&paths.stdout)?;
-        let stderr_log = BoundedServiceLog::open(&paths.stderr)?;
-        let (stdout, stdout_task) = spawn_launchd_log_writer(paths.stdout.clone(), stdout_log);
-        let (stderr, stderr_task) = spawn_launchd_log_writer(paths.stderr.clone(), stderr_log);
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+impl ServiceLogWriters {
+    #[cfg(any(target_os = "macos", test))]
+    fn open_split(stdout_path: &Path, stderr_path: &Path) -> Result<Self> {
+        let stdout_log = BoundedServiceLog::open(stdout_path)?;
+        let stderr_log = BoundedServiceLog::open(stderr_path)?;
+        let (stdout, stdout_task) =
+            spawn_service_log_writer(stdout_path.to_path_buf(), stdout_log, "launchd");
+        let (stderr, stderr_task) =
+            spawn_service_log_writer(stderr_path.to_path_buf(), stderr_log, "launchd");
         Ok(Self {
             stdout,
             stderr,
@@ -243,10 +892,20 @@ impl LaunchdCaptureWriters {
         })
     }
 
+    fn open_combined(path: &Path) -> Result<Self> {
+        let log = BoundedServiceLog::open_desktop(path)?;
+        let (sink, task) = spawn_service_log_writer(path.to_path_buf(), log, "desktop");
+        Ok(Self {
+            stdout: sink.clone(),
+            stderr: sink,
+            tasks: vec![task],
+        })
+    }
+
     async fn finish(mut self) {
         self.stdout.close();
         self.stderr.close();
-        let deadline = Instant::now() + LAUNCHD_PIPE_DRAIN_TIMEOUT;
+        let deadline = Instant::now() + SERVICE_LOG_WRITER_DRAIN_TIMEOUT;
         for task in self.tasks.drain(..) {
             while !task.is_finished() && Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -258,28 +917,29 @@ impl LaunchdCaptureWriters {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
-impl Drop for LaunchdCaptureWriters {
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+impl Drop for ServiceLogWriters {
     fn drop(&mut self) {
         self.stdout.close();
         self.stderr.close();
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
-fn spawn_launchd_log_writer(
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+fn spawn_service_log_writer(
     path: PathBuf,
     mut log: BoundedServiceLog,
-) -> (LaunchdLogSink, JoinHandle<()>) {
-    let inner = Arc::new(LaunchdLogSinkInner {
-        pending: Mutex::new(PendingLaunchdLog {
+    failure_label: &'static str,
+) -> (ServiceLogSink, JoinHandle<()>) {
+    let inner = Arc::new(ServiceLogSinkInner {
+        pending: Mutex::new(PendingServiceLog {
             chunks: VecDeque::new(),
             bytes: 0,
             closed: false,
         }),
         ready: Condvar::new(),
     });
-    let sink = LaunchdLogSink(Arc::clone(&inner));
+    let sink = ServiceLogSink(Arc::clone(&inner));
     let task = std::thread::spawn(move || {
         let mut writable = true;
         loop {
@@ -301,7 +961,7 @@ fn spawn_launchd_log_writer(
             };
             if writable && let Err(error) = log.write_chunk(&chunk) {
                 eprintln!(
-                    "launchd log write failed for {}; continuing without capture: {error:#}",
+                    "{failure_label} log write failed for {}; continuing without capture: {error:#}",
                     path.display()
                 );
                 writable = false;
@@ -311,8 +971,8 @@ fn spawn_launchd_log_writer(
     (sink, task)
 }
 
-#[cfg(any(target_os = "macos", test))]
-async fn drain_launchd_pipe<R>(mut pipe: R, sink: LaunchdLogSink)
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+async fn drain_service_pipe<R>(mut pipe: R, sink: ServiceLogSink, failure_label: &'static str)
 where
     R: AsyncRead + Unpin,
 {
@@ -322,11 +982,19 @@ where
             Ok(0) => break,
             Ok(read) => sink.push(buffer[..read].to_vec()),
             Err(error) => {
-                sink.push(format!("launchd log pipe read failed: {error}\n").into_bytes());
+                sink.push(format!("{failure_label} log pipe read failed: {error}\n").into_bytes());
                 break;
             }
         }
     }
+}
+
+#[cfg(any(target_os = "macos", test))]
+async fn drain_launchd_pipe<R>(pipe: R, sink: ServiceLogSink)
+where
+    R: AsyncRead + Unpin,
+{
+    drain_service_pipe(pipe, sink, "launchd").await;
 }
 
 pub async fn run_launchd_daemon(config_dir: &Path) -> Result<()> {
@@ -355,7 +1023,7 @@ async fn run_with_launchd_capture<F>(paths: LaunchdCapturePaths, make_command: F
 where
     F: FnOnce() -> Result<TokioCommand>,
 {
-    let writers = LaunchdCaptureWriters::open(&paths)?;
+    let writers = ServiceLogWriters::open_split(&paths.stdout, &paths.stderr)?;
     let result = async {
         let command = make_command()?;
         supervise_launchd_child(command, &writers).await
@@ -373,10 +1041,10 @@ where
 #[cfg(any(target_os = "macos", test))]
 async fn supervise_launchd_child(
     mut command: TokioCommand,
-    writers: &LaunchdCaptureWriters,
+    writers: &ServiceLogWriters,
 ) -> Result<()> {
     #[cfg(any(target_os = "macos", all(test, unix)))]
-    let mut signals = LaunchdSignals::new()?;
+    let mut signals = ServiceSignals::new()?;
     command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -396,10 +1064,10 @@ async fn supervise_launchd_child(
     let stderr_task = zeroclaw_spawn::spawn!(drain_launchd_pipe(stderr, stderr_sink));
 
     #[cfg(any(target_os = "macos", all(test, unix)))]
-    let outcome = wait_for_launchd_child(&mut child, &mut signals).await;
+    let outcome = wait_for_service_child(&mut child, &mut signals).await;
     #[cfg(all(test, not(unix)))]
-    let outcome = wait_for_launchd_child(&mut child).await;
-    finish_launchd_pipes(stdout_task, stderr_task).await;
+    let outcome = wait_for_service_child(&mut child).await;
+    finish_service_pipes(stdout_task, stderr_task, LAUNCHD_PIPE_DRAIN_TIMEOUT).await;
     let status = outcome?;
     if status.success() {
         Ok(())
@@ -408,12 +1076,265 @@ async fn supervise_launchd_child(
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
-async fn finish_launchd_pipes(
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+pub async fn run_desktop_daemon(port: u16) -> Result<()> {
+    let path = handle_desktop_preflight(desktop_log_path().await, emit_desktop_error)?;
+    let executable = handle_desktop_preflight(
+        std::env::current_exe().context("Failed to resolve the desktop daemon executable"),
+        emit_desktop_error,
+    )?;
+    run_desktop_capture_with_executable(path, executable, port).await
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub async fn run_desktop_daemon(port: u16) -> Result<()> {
+    let _ = port;
+    bail!("the desktop daemon runner is unsupported on this platform")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+async fn run_with_desktop_capture<F>(path: PathBuf, make_command: F) -> Result<()>
+where
+    F: FnMut() -> Result<TokioCommand>,
+{
+    let writers = match ServiceLogWriters::open_combined(&path) {
+        Ok(writers) => writers,
+        Err(error) => {
+            emit_desktop_handshake("ERROR", Some(&format!("{error:#}")));
+            return Err(error);
+        }
+    };
+    let mut make_command = make_command;
+    let logs_dir = path
+        .parent()
+        .context("desktop log path has no logs directory")?
+        .to_path_buf();
+    let result =
+        async { supervise_desktop_child(&mut make_command, &writers, &logs_dir).await }.await;
+    if let Err(error) = &result {
+        writers
+            .stderr
+            .push(format!("desktop capture failed: {error:#}\n").into_bytes());
+        emit_desktop_handshake("ERROR", Some(&format!("{error:#}")));
+    }
+    writers.finish().await;
+    result
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+async fn run_desktop_capture_with_executable(
+    path: PathBuf,
+    executable: PathBuf,
+    port: u16,
+) -> Result<()> {
+    run_with_desktop_capture(path, move || {
+        let mut command = TokioCommand::new(&executable);
+        command.arg("daemon").arg("-p").arg(port.to_string());
+        Ok(command)
+    })
+    .await
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+fn prepare_desktop_restart_marker(logs_dir: &Path) -> Result<PathBuf> {
+    let marker = logs_dir.join(format!(
+        ".zeroclaw-desktop-restart-{}.marker",
+        uuid::Uuid::new_v4()
+    ));
+    match fs::remove_file(&marker) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to remove stale desktop restart marker {}",
+                    marker.display()
+                )
+            });
+        }
+    }
+    Ok(marker)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+fn consume_desktop_restart_marker(marker: &Path) -> Result<bool> {
+    match fs::symlink_metadata(marker) {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                bail!(
+                    "desktop restart marker is not a regular file: {}",
+                    marker.display()
+                );
+            }
+            fs::remove_file(marker).with_context(|| {
+                format!(
+                    "Failed to remove desktop restart marker {}",
+                    marker.display()
+                )
+            })?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "Failed to inspect desktop restart marker {}",
+                marker.display()
+            )
+        }),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+async fn supervise_desktop_child(
+    make_command: &mut impl FnMut() -> Result<TokioCommand>,
+    writers: &ServiceLogWriters,
+    logs_dir: &Path,
+) -> Result<()> {
+    #[cfg(unix)]
+    let mut signals = ServiceSignals::new()?;
+    let mut first_generation = true;
+    loop {
+        let marker_path = prepare_desktop_restart_marker(logs_dir)?;
+        let mut command = make_command()?;
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env(crate::restart::DESKTOP_SUPERVISED_ENV, "1")
+            .env(crate::restart::DESKTOP_RESTART_MARKER_ENV, &marker_path)
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        let mut child = {
+            let mut command = CommandWrap::from(command);
+            command
+                .wrap(KillOnDrop)
+                .wrap(WindowsSpawnFailureGuard)
+                .wrap(JobObject);
+            command
+                .spawn()
+                .context("Failed to start desktop daemon child in its supervisor job")?
+        };
+        #[cfg(not(windows))]
+        let mut child = command
+            .spawn()
+            .context("Failed to start desktop daemon child")?;
+        #[cfg(windows)]
+        let stdout = child
+            .stdout()
+            .take()
+            .context("desktop daemon stdout pipe unavailable")?;
+        #[cfg(not(windows))]
+        let stdout = child
+            .stdout
+            .take()
+            .context("desktop daemon stdout pipe unavailable")?;
+        #[cfg(windows)]
+        let stderr = child
+            .stderr()
+            .take()
+            .context("desktop daemon stderr pipe unavailable")?;
+        #[cfg(not(windows))]
+        let stderr = child
+            .stderr
+            .take()
+            .context("desktop daemon stderr pipe unavailable")?;
+        let stdout_sink = writers.stdout.clone();
+        let stderr_sink = writers.stderr.clone();
+        let stdout_task =
+            zeroclaw_spawn::spawn!(drain_service_pipe(stdout, stdout_sink, "desktop"));
+        let stderr_task =
+            zeroclaw_spawn::spawn!(drain_service_pipe(stderr, stderr_sink, "desktop"));
+        if first_generation {
+            emit_desktop_handshake("READY", None);
+            first_generation = false;
+        }
+        #[cfg(unix)]
+        let outcome = wait_for_service_child(&mut child, &mut signals).await;
+        #[cfg(not(unix))]
+        let outcome = child
+            .wait()
+            .await
+            .context("Failed to wait for desktop daemon child");
+        finish_service_pipes(stdout_task, stderr_task, DESKTOP_PIPE_DRAIN_TIMEOUT).await;
+        let status = outcome?;
+        let marked_restart = consume_desktop_restart_marker(&marker_path)?;
+        if status.code() == Some(crate::restart::DESKTOP_RESTART_EXIT_CODE) && marked_restart {
+            continue;
+        }
+        if status.success() {
+            return Ok(());
+        }
+        bail!("daemon child exited with status {status}");
+    }
+}
+
+/// Reaps a suspended Windows child if a later command wrapper cannot finish setup.
+///
+/// `JobObject` assigns the process before resuming it, so this guard runs before
+/// a failed assignment is returned and the child cannot have spawned descendants.
+#[cfg(windows)]
+#[derive(Debug)]
+struct WindowsSpawnFailureGuard;
+
+#[cfg(windows)]
+impl CommandWrapper for WindowsSpawnFailureGuard {
+    fn wrap_child(
+        &mut self,
+        child: Box<dyn ChildWrapper>,
+        _core: &CommandWrap,
+    ) -> std::io::Result<Box<dyn ChildWrapper>> {
+        Ok(Box::new(WindowsSpawnFailureChild { child: Some(child) }))
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct WindowsSpawnFailureChild {
+    child: Option<Box<dyn ChildWrapper>>,
+}
+
+#[cfg(windows)]
+impl ChildWrapper for WindowsSpawnFailureChild {
+    fn inner(&self) -> &dyn ChildWrapper {
+        self.child.as_deref().expect("guard child must be present")
+    }
+
+    fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+        self.child
+            .as_deref_mut()
+            .expect("guard child must be present")
+    }
+
+    fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
+        self.child.take().expect("guard child must be present")
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsSpawnFailureChild {
+    fn drop(&mut self) {
+        let Some(child) = self.child.as_deref_mut() else {
+            return;
+        };
+        let Some(raw_handle) = child.inner_child().raw_handle() else {
+            return;
+        };
+        let _ = child.start_kill();
+        let handle = windows::Win32::Foundation::HANDLE(raw_handle as _);
+        // A suspended pre-assignment child has no descendants. Waiting here
+        // closes the only gap between spawn and durable Job Object ownership.
+        let _ = unsafe { windows::Win32::System::Threading::WaitForSingleObject(handle, 5_000) };
+        let _ = child.try_wait();
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+async fn finish_service_pipes(
     mut stdout: tokio::task::JoinHandle<()>,
     mut stderr: tokio::task::JoinHandle<()>,
+    timeout: Duration,
 ) {
-    if tokio::time::timeout(LAUNCHD_PIPE_DRAIN_TIMEOUT, async {
+    if tokio::time::timeout(timeout, async {
         let _ = tokio::join!(&mut stdout, &mut stderr);
     })
     .await
@@ -425,14 +1346,14 @@ async fn finish_launchd_pipes(
     }
 }
 
-#[cfg(any(target_os = "macos", all(test, unix)))]
-struct LaunchdSignals {
+#[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
+struct ServiceSignals {
     interrupt: tokio::signal::unix::Signal,
     terminate: tokio::signal::unix::Signal,
 }
 
-#[cfg(any(target_os = "macos", all(test, unix)))]
-impl LaunchdSignals {
+#[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
+impl ServiceSignals {
     fn new() -> Result<Self> {
         use tokio::signal::unix::{SignalKind, signal};
 
@@ -443,25 +1364,25 @@ impl LaunchdSignals {
     }
 }
 
-#[cfg(any(target_os = "macos", all(test, unix)))]
-async fn wait_for_launchd_child(
+#[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
+async fn wait_for_service_child(
     child: &mut Child,
-    signals: &mut LaunchdSignals,
+    signals: &mut ServiceSignals,
 ) -> Result<std::process::ExitStatus> {
     let forwarded = tokio::select! {
         status = child.wait() => return status.context("Failed to wait for daemon child"),
         _ = signals.interrupt.recv() => libc::SIGINT,
         _ = signals.terminate.recv() => libc::SIGTERM,
     };
-    stop_launchd_child(child, forwarded).await
+    stop_service_child(child, forwarded).await
 }
 
-#[cfg(any(target_os = "macos", all(test, unix)))]
-async fn stop_launchd_child(
+#[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
+async fn stop_service_child(
     child: &mut Child,
     signal: libc::c_int,
 ) -> Result<std::process::ExitStatus> {
-    if let Err(error) = forward_launchd_signal(child, signal)
+    if let Err(error) = forward_service_signal(child, signal)
         && error
             .downcast_ref::<std::io::Error>()
             .and_then(std::io::Error::raw_os_error)
@@ -470,7 +1391,7 @@ async fn stop_launchd_child(
         return Err(error);
     }
 
-    match tokio::time::timeout(LAUNCHD_STOP_TIMEOUT, child.wait()).await {
+    match tokio::time::timeout(SERVICE_STOP_TIMEOUT, child.wait()).await {
         Ok(status) => status.context("Failed to wait for stopped daemon child"),
         Err(_) => {
             if let Some(status) = child
@@ -491,20 +1412,20 @@ async fn stop_launchd_child(
     }
 }
 
-#[cfg(any(target_os = "macos", all(test, unix)))]
-fn forward_launchd_signal(child: &Child, signal: libc::c_int) -> Result<()> {
+#[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
+fn forward_service_signal(child: &Child, signal: libc::c_int) -> Result<()> {
     let pid = child.id().context("daemon child PID unavailable")?;
     // SAFETY: `pid` belongs to the child owned by this runner, and the caller
-    // passes only the SIGINT or SIGTERM value received from launchd.
+    // passes only the SIGINT or SIGTERM value received by the supervisor.
     if unsafe { libc::kill(pid as libc::pid_t, signal) } == 0 {
         Ok(())
     } else {
-        Err(std::io::Error::last_os_error()).context("Failed to forward launchd stop signal")
+        Err(std::io::Error::last_os_error()).context("Failed to forward service stop signal")
     }
 }
 
 #[cfg(all(test, not(unix)))]
-async fn wait_for_launchd_child(child: &mut Child) -> Result<std::process::ExitStatus> {
+async fn wait_for_service_child(child: &mut Child) -> Result<std::process::ExitStatus> {
     child
         .wait()
         .await
@@ -949,8 +1870,6 @@ pub fn logs(config: &Config, init_system: InitSystem, lines: usize, follow: bool
 }
 
 fn logs_macos(config: &Config, lines: usize, follow: bool) -> Result<()> {
-    // Try the launchd log files first (StandardOutPath / StandardErrorPath from the plist).
-    // These are the most reliable source since they capture all daemon output.
     let exe = std::env::current_exe().ok();
     let homebrew_var_dir = exe.as_ref().and_then(|e| homebrew_var_dir_from_exe(e));
     let logs_dir = if let Some(ref var_dir) = homebrew_var_dir {
@@ -966,38 +1885,19 @@ fn logs_macos(config: &Config, lines: usize, follow: bool) -> Result<()> {
     let stderr_log = logs_dir.join("daemon.stderr.log");
     let stdout_log = logs_dir.join("daemon.stdout.log");
 
-    // Prefer stderr log (most informative), fall back to stdout
-    let log_file = if stderr_log.exists() {
-        stderr_log
-    } else if stdout_log.exists() {
-        stdout_log
+    let targets = if follow {
+        follow_log_targets(&stdout_log, &stderr_log)
     } else {
+        service_log_targets(&stdout_log, &stderr_log)
+    };
+    if targets.is_empty() {
         bail!(
             "No log files found in {}. Is the service installed?",
             logs_dir.display()
         );
-    };
-
-    if follow {
-        let status = Command::new("tail")
-            .args(["-n", &lines.to_string(), "-f"])
-            .arg(&log_file)
-            .status()
-            .context("Failed to run tail")?;
-        if !status.success() {
-            bail!("tail exited with non-zero status");
-        }
-    } else {
-        let status = Command::new("tail")
-            .args(["-n", &lines.to_string()])
-            .arg(&log_file)
-            .status()
-            .context("Failed to run tail")?;
-        if !status.success() {
-            bail!("tail exited with non-zero status");
-        }
     }
-    Ok(())
+    report_empty_capture(&targets, &logs_dir, follow);
+    tail_files(&targets, lines, follow)
 }
 
 fn logs_linux(config: &Config, init_system: InitSystem, lines: usize, follow: bool) -> Result<()> {
@@ -1013,21 +1913,22 @@ fn logs_linux(config: &Config, init_system: InitSystem, lines: usize, follow: bo
             }
         }
         InitSystem::Openrc => {
-            // OpenRC logs go to /var/log/<service>/error.log (as configured in the init script).
             let log_dir = linux_openrc_log_dir(config);
-            let log_file = log_dir.join("error.log");
-            if !log_file.exists() {
-                // Fall back to access log
-                let access_log = log_dir.join("access.log");
-                if !access_log.exists() {
-                    bail!(
-                        "No log files found at {}. Is the service installed?",
-                        log_dir.display()
-                    );
-                }
-                return tail_file(&access_log, lines, follow);
+            let access_log = log_dir.join("access.log");
+            let error_log = log_dir.join("error.log");
+            let targets = if follow {
+                follow_log_targets(&access_log, &error_log)
+            } else {
+                service_log_targets(&access_log, &error_log)
+            };
+            if targets.is_empty() {
+                bail!(
+                    "No log files found at {}. Is the service installed?",
+                    log_dir.display()
+                );
             }
-            tail_file(&log_file, lines, follow)?;
+            report_empty_capture(&targets, &log_dir, follow);
+            tail_files(&targets, lines, follow)?;
         }
         InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
     }
@@ -1044,61 +1945,113 @@ fn logs_windows(config: &Config, lines: usize, follow: bool) -> Result<()> {
     let stderr_log = logs_dir.join("daemon.stderr.log");
     let stdout_log = logs_dir.join("daemon.stdout.log");
 
-    let log_file = if stderr_log.exists() {
-        stderr_log
-    } else if stdout_log.exists() {
-        stdout_log
-    } else {
+    let targets = service_log_targets(&stdout_log, &stderr_log);
+    let Some((primary, rest)) = targets.split_first() else {
         bail!(
             "No log files found in {}. Is the service installed?",
             logs_dir.display()
         );
     };
+    report_empty_capture(&targets, &logs_dir, follow);
+    let label_each = !rest.is_empty();
 
-    if follow {
-        // Windows: use PowerShell Get-Content -Wait for tail -f equivalent
-        let status = Command::new("powershell")
-            .args([
-                "-Command",
-                &format!(
-                    "Get-Content -Path '{}' -Tail {} -Wait",
-                    log_file.display().to_string(),
-                    lines
-                ),
-            ])
-            .status()
-            .context("Failed to run PowerShell Get-Content")?;
-        if !status.success() {
-            bail!("PowerShell Get-Content exited with non-zero status");
+    if !follow {
+        for path in &targets {
+            if label_each {
+                println!("==> {} <==", path.display());
+            }
+            run_get_content(path, lines, false)?;
         }
-    } else {
-        let status = Command::new("powershell")
-            .args([
-                "-Command",
-                &format!(
-                    "Get-Content -Path '{}' -Tail {}",
-                    log_file.display().to_string(),
-                    lines
-                ),
-            ])
-            .status()
-            .context("Failed to run PowerShell Get-Content")?;
-        if !status.success() {
-            bail!("PowerShell Get-Content exited with non-zero status");
-        }
+        return Ok(());
+    }
+
+    // `Get-Content -Wait` blocks on one path, so only the primary stream is followed.
+    for path in rest {
+        println!("==> {} <==", path.display());
+        run_get_content(path, lines, false)?;
+    }
+    if label_each {
+        println!("==> {} <==", primary.display());
+    }
+    run_get_content(primary, lines, true)
+}
+
+fn get_content_command(path: &Path, lines: usize, follow: bool) -> String {
+    let quoted = path.display().to_string().replace('\'', "''");
+    let wait = if follow { " -Wait" } else { "" };
+    format!("Get-Content -LiteralPath '{quoted}' -Tail {lines}{wait}")
+}
+
+fn run_get_content(path: &Path, lines: usize, follow: bool) -> Result<()> {
+    let status = Command::new("powershell")
+        .args(["-Command", &get_content_command(path, lines, follow)])
+        .status()
+        .context("Failed to run PowerShell Get-Content")?;
+    if !status.success() {
+        bail!("PowerShell Get-Content exited with non-zero status");
     }
     Ok(())
 }
 
-/// Tail a log file using the system `tail` command.
-fn tail_file(path: &Path, lines: usize, follow: bool) -> Result<()> {
-    let mut args = vec!["-n".to_string(), lines.to_string()];
-    if follow {
-        args.push("-f".to_string());
+fn service_log_targets(primary: &Path, secondary: &Path) -> Vec<PathBuf> {
+    let candidates = [primary, secondary];
+    let with_content: Vec<PathBuf> = candidates
+        .iter()
+        .filter(|path| has_content(path))
+        .map(|path| path.to_path_buf())
+        .collect();
+    if !with_content.is_empty() {
+        return with_content;
     }
-    let status = Command::new("tail")
-        .args(&args)
-        .arg(path)
+    candidates
+        .iter()
+        .filter(|path| path.exists())
+        .map(|path| path.to_path_buf())
+        .collect()
+}
+
+fn follow_log_targets(primary: &Path, secondary: &Path) -> Vec<PathBuf> {
+    // A follower keeps the empty stream too: it is where a later failure lands.
+    [primary, secondary]
+        .into_iter()
+        .filter(|path| path.exists())
+        .map(Path::to_path_buf)
+        .collect()
+}
+
+fn has_content(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|meta| meta.len() > 0)
+}
+
+fn report_empty_capture(targets: &[PathBuf], logs_dir: &Path, follow: bool) {
+    if targets.iter().any(|path| has_content(path)) {
+        return;
+    }
+    if follow {
+        eprintln!(
+            "No daemon output captured yet in {}; waiting for new output.",
+            logs_dir.display()
+        );
+    } else {
+        eprintln!("No daemon output captured yet in {}.", logs_dir.display());
+    }
+}
+
+fn tail_command(paths: &[PathBuf], lines: usize, follow: bool) -> Command {
+    let mut command = Command::new("tail");
+    command.arg("-n").arg(lines.to_string());
+    if follow {
+        command.arg("-f");
+    }
+    command.args(paths);
+    command
+}
+
+fn tail_files(paths: &[PathBuf], lines: usize, follow: bool) -> Result<()> {
+    if paths.is_empty() {
+        bail!("No log files to tail");
+    }
+    let status = tail_command(paths, lines, follow)
         .status()
         .context("Failed to run tail")?;
     if !status.success() {
@@ -2274,6 +3227,56 @@ mod macos_plist_tests {
 mod bounded_service_log_tests {
     use super::*;
 
+    const DESKTOP_CAPTURE_TEST_CHILD_ENV: &str = "ZEROCLAW_DESKTOP_CAPTURE_TEST_CHILD";
+
+    fn desktop_capture_test_command(mode: &str) -> TokioCommand {
+        let executable = std::env::current_exe().expect("resolve current test binary");
+        let mut command = TokioCommand::new(executable);
+        command
+            .arg("desktop_capture_subprocess_helper")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(DESKTOP_CAPTURE_TEST_CHILD_ENV, mode);
+        command
+    }
+
+    #[test]
+    #[ignore = "subprocess helper for desktop capture tests"]
+    fn desktop_capture_subprocess_helper() {
+        use std::io::Write as _;
+
+        match std::env::var(DESKTOP_CAPTURE_TEST_CHILD_ENV).as_deref() {
+            Ok("streams") => {
+                std::io::stdout()
+                    .write_all(b"stdout-value")
+                    .expect("write stdout fixture");
+                std::io::stderr()
+                    .write_all(b"stderr-value")
+                    .expect("write stderr fixture");
+                std::process::exit(0);
+            }
+            Ok("compact") => {
+                let mut stdout = std::io::stdout().lock();
+                stdout
+                    .write_all(&vec![b'x'; 9 * 1024 * 1024])
+                    .expect("write compaction fixture");
+                stdout
+                    .write_all(b"desktop-newest-output")
+                    .expect("write newest output fixture");
+                stdout.flush().expect("flush compaction fixture");
+                std::process::exit(0);
+            }
+            Ok("nonzero") => {
+                std::io::stderr()
+                    .write_all(b"child-output")
+                    .expect("write nonzero fixture");
+                std::process::exit(7);
+            }
+            mode => panic!("unexpected desktop capture helper mode: {mode:?}"),
+        }
+    }
+
     #[test]
     fn opening_oversized_log_keeps_newest_bytes() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -2319,6 +3322,109 @@ mod bounded_service_log_tests {
         let bytes = fs::read(&path).expect("read bounded log");
         assert_eq!(bytes.len(), SERVICE_LOG_MAX_BYTES as usize);
         assert!(bytes.iter().all(|byte| *byte == b'z'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn desktop_log_storage_is_private_and_regular() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config/logs/zeroclaw-desktop-daemon.log");
+        drop(BoundedServiceLog::open_desktop(&path).expect("open desktop log"));
+
+        let directory = fs::symlink_metadata(path.parent().expect("log parent"))
+            .expect("inspect desktop log directory");
+        let file = fs::metadata(&path).expect("inspect desktop log file");
+        assert!(directory.is_dir());
+        assert_eq!(directory.uid(), unsafe { libc::geteuid() });
+        assert_eq!(directory.permissions().mode() & 0o777, 0o700);
+        assert!(file.is_file());
+        assert_eq!(file.uid(), unsafe { libc::geteuid() });
+        assert_eq!(file.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn desktop_log_rejects_final_symlink_without_touching_target() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = dir.path().join("target.log");
+        let path = dir.path().join("logs/zeroclaw-desktop-daemon.log");
+        fs::create_dir(dir.path().join("logs")).expect("create log directory");
+        fs::write(&target, b"original").expect("write target");
+        std::os::unix::fs::symlink(&target, &path).expect("create log symlink");
+
+        let error = match BoundedServiceLog::open_desktop(&path) {
+            Ok(_) => panic!("symlink must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("desktop log"));
+        assert_eq!(fs::read(&target).expect("read target"), b"original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn desktop_log_first_run_creates_nested_config_and_data_roots() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        for source in ["config", "data"] {
+            let root = dir.path().join(source).join("fresh/nested/root");
+            let path = root.join("logs/zeroclaw-desktop-daemon.log");
+            drop(BoundedServiceLog::open_desktop(&path).expect("open nested desktop log"));
+
+            for component in [
+                dir.path().join(source),
+                dir.path().join(source).join("fresh"),
+                dir.path().join(source).join("fresh/nested"),
+                root.clone(),
+                root.join("logs"),
+            ] {
+                let metadata = fs::symlink_metadata(&component).expect("inspect private directory");
+                assert!(metadata.is_dir());
+                assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+                assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+            }
+            assert!(path.is_file());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn desktop_log_rejects_symlink_as_nearest_existing_anchor() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let redirected = tempfile::tempdir().expect("redirect target");
+        let first_missing = dir.path().join("fresh");
+        std::os::unix::fs::symlink(redirected.path(), &first_missing)
+            .expect("create ancestor symlink");
+        let path = first_missing.join("nested/root/logs/zeroclaw-desktop-daemon.log");
+
+        let error = match BoundedServiceLog::open_desktop(&path) {
+            Ok(_) => panic!("ancestor symlink must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("ancestor"));
+        assert!(!redirected.path().join("nested").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn desktop_log_rejects_symlink_in_existing_ancestor_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let redirected = tempfile::tempdir().expect("redirect target");
+        let link = dir.path().join("redirected");
+        let existing = redirected.path().join("already/exists");
+        fs::create_dir_all(&existing).expect("create redirected subtree");
+        std::os::unix::fs::symlink(redirected.path(), &link)
+            .expect("create intermediate ancestor symlink");
+        let path = link.join("already/exists/config/logs/zeroclaw-desktop-daemon.log");
+
+        let error = match BoundedServiceLog::open_desktop(&path) {
+            Ok(_) => panic!("intermediate ancestor symlink must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("ancestor"));
+        assert!(!existing.join("config").exists());
     }
 
     #[test]
@@ -2372,20 +3478,20 @@ mod bounded_service_log_tests {
 
     #[test]
     fn pending_output_evicts_oldest_chunks() {
-        let inner = Arc::new(LaunchdLogSinkInner {
-            pending: Mutex::new(PendingLaunchdLog {
+        let inner = Arc::new(ServiceLogSinkInner {
+            pending: Mutex::new(PendingServiceLog {
                 chunks: VecDeque::new(),
                 bytes: 0,
                 closed: false,
             }),
             ready: Condvar::new(),
         });
-        let sink = LaunchdLogSink(Arc::clone(&inner));
+        let sink = ServiceLogSink(Arc::clone(&inner));
         sink.push(vec![b'a'; 700 * 1024]);
         sink.push(vec![b'b'; 700 * 1024]);
 
         let pending = inner.pending.lock().expect("pending queue");
-        assert!(pending.bytes <= LAUNCHD_LOG_PENDING_BYTES);
+        assert!(pending.bytes <= SERVICE_LOG_PENDING_BYTES);
         assert_eq!(pending.chunks.len(), 1);
         assert!(pending.chunks[0].iter().all(|byte| *byte == b'b'));
     }
@@ -2446,6 +3552,233 @@ mod bounded_service_log_tests {
         assert!(stderr.contains("daemon child exited with status"));
     }
 
+    #[test]
+    fn desktop_pre_capture_failures_emit_once_and_preserve_the_error() {
+        let cases = [
+            (
+                anyhow::Error::msg("Failed to resolve desktop log path: config\r\npath"),
+                "ERROR Failed to resolve desktop log path: config path\n",
+            ),
+            (
+                anyhow::Error::msg(
+                    "Failed to resolve the desktop daemon executable: executable\npath",
+                ),
+                "ERROR Failed to resolve the desktop daemon executable: executable path\n",
+            ),
+        ];
+
+        for (error, expected_frame) in cases {
+            let expected_error = format!("{error:#}");
+            let mut frames = Vec::new();
+            let returned = handle_desktop_preflight::<()>(Err(error), |error| {
+                frames.push(desktop_error_frame(error));
+            })
+            .expect_err("pre-capture failure should be preserved");
+            assert_eq!(format!("{returned:#}"), expected_error);
+            assert_eq!(frames.len(), 1);
+            let frame = &frames[0];
+            assert_eq!(frame, expected_frame);
+            assert_eq!(frame.matches('\n').count(), 1);
+            assert!(!frame[..frame.len() - 1].contains('\r'));
+        }
+    }
+
+    #[test]
+    fn desktop_error_frame_is_bounded_and_valid_utf8() {
+        let message = "failure ".to_string() + &"界".repeat(DESKTOP_READINESS_FRAME_MAX_BYTES);
+        let frame = desktop_handshake_frame("ERROR", Some(&message));
+
+        assert!(frame.len() <= DESKTOP_READINESS_FRAME_MAX_BYTES);
+        assert!(frame.starts_with("ERROR "));
+        assert!(frame.ends_with("...\n"));
+        assert_eq!(frame.matches('\n').count(), 1);
+    }
+
+    #[tokio::test]
+    async fn desktop_capture_combines_both_child_streams() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("logs/desktop-daemon.log");
+        run_with_desktop_capture(path.clone(), || Ok(desktop_capture_test_command("streams")))
+            .await
+            .expect("capture child output");
+
+        let log = fs::read(path).expect("read combined desktop log");
+        assert!(
+            log.windows(b"stdout-value".len())
+                .any(|window| window == b"stdout-value")
+        );
+        assert!(
+            log.windows(b"stderr-value".len())
+                .any(|window| window == b"stderr-value")
+        );
+    }
+
+    #[tokio::test]
+    async fn desktop_capture_compacts_continuous_output_and_preserves_newest() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("logs/desktop-daemon.log");
+        run_with_desktop_capture(path.clone(), || Ok(desktop_capture_test_command("compact")))
+            .await
+            .expect("capture continuous child output");
+
+        let log = fs::read(&path).expect("read compacted desktop log");
+        assert!(log.len() as u64 <= SERVICE_LOG_MAX_BYTES);
+        assert!(log.ends_with(b"desktop-newest-output"));
+    }
+
+    #[tokio::test]
+    async fn desktop_capture_records_spawn_startup_failure() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("logs/desktop-daemon.log");
+        let missing_child = dir.path().join("missing-desktop-child");
+        let error = run_with_desktop_capture(path.clone(), || {
+            Ok(TokioCommand::new(missing_child.clone()))
+        })
+        .await
+        .expect_err("missing child should fail to spawn");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to start desktop daemon child")
+        );
+        let log = fs::read_to_string(path).expect("read spawn failure diagnostics");
+        assert!(log.contains("desktop capture failed:"));
+        assert!(log.contains("Failed to start desktop daemon child"));
+    }
+
+    #[tokio::test]
+    async fn desktop_capture_records_nonzero_child_exit() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("logs/desktop-daemon.log");
+        let mut generations = 0;
+        let error = run_with_desktop_capture(path.clone(), || {
+            generations += 1;
+            Ok(desktop_capture_test_command("nonzero"))
+        })
+        .await
+        .expect_err("child should fail");
+
+        assert!(error.to_string().contains("status"));
+        assert_eq!(generations, 1);
+        let log = fs::read_to_string(path).expect("read nonzero-exit diagnostics");
+        assert!(log.contains("child-output"));
+        assert!(log.contains("daemon child exited with status"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn desktop_capture_restarts_once_for_dedicated_exit_code() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("logs/desktop-daemon.log");
+        let mut generations = 0;
+        run_with_desktop_capture(path, || {
+            generations += 1;
+            let mut command = TokioCommand::new("/bin/sh");
+            if generations == 1 {
+                command.args([
+                    "-c",
+                    "printf 'desktop-generation-one:%s\\n' \"$ZEROCLAW_DESKTOP_SUPERVISED\"; : > \"$ZEROCLAW_DESKTOP_RESTART_MARKER\"; sleep 0.1; exit 75",
+                ]);
+            } else {
+                command.args([
+                    "-c",
+                    "printf 'desktop-generation-two:%s\\n' \"$ZEROCLAW_DESKTOP_SUPERVISED\"; exit 0",
+                ]);
+            }
+            Ok(command)
+        })
+        .await
+        .expect("desktop supervisor should finish after normal second generation");
+        assert_eq!(generations, 2);
+        let log = fs::read_to_string(dir.path().join("logs/desktop-daemon.log"))
+            .expect("read two-generation desktop log");
+        assert!(log.contains("desktop-generation-one:1"));
+        assert!(log.contains("desktop-generation-two:1"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn desktop_capture_does_not_restart_for_unmarked_dedicated_exit_code() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("logs/desktop-daemon.log");
+        let mut generations = 0;
+        let error = run_with_desktop_capture(path, || {
+            generations += 1;
+            let mut command = TokioCommand::new("/bin/sh");
+            command.args(["-c", "exit 75"]);
+            Ok(command)
+        })
+        .await
+        .expect_err("unmarked dedicated exit must be ordinary failure");
+        assert_eq!(generations, 1);
+        assert!(error.to_string().contains("status"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn desktop_capture_reuses_stable_executable_after_atomic_swap() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("logs/desktop-daemon.log");
+        let executable = dir.path().join("desktop-child");
+        let replacement = dir.path().join("desktop-child.next");
+        fs::write(
+            &replacement,
+            format!(
+                "#!/bin/sh\nprintf 'stable-generation-two:%s\\n' \"$ZEROCLAW_DESKTOP_SUPERVISED\"\n"
+            ),
+        )
+        .expect("write replacement child");
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o700))
+            .expect("make replacement child executable");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nprintf 'stable-generation-one:%s\\n' \"$ZEROCLAW_DESKTOP_SUPERVISED\"\n: > \"$ZEROCLAW_DESKTOP_RESTART_MARKER\"\nmv \"$(dirname \"$0\")/desktop-child.next\" \"$0\"\nexit 75\n",
+        )
+        .expect("write initial child");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+            .expect("make initial child executable");
+
+        run_desktop_capture_with_executable(path.clone(), executable, 0)
+            .await
+            .expect("stable executable should survive an atomic replacement");
+
+        let log = fs::read_to_string(path).expect("read stable-path log");
+        assert!(log.contains("stable-generation-one:1"));
+        assert!(log.contains("stable-generation-two:1"));
+    }
+
+    #[test]
+    fn windows_acl_inheritance_flags_match_object_kind() {
+        assert_eq!(windows_acl_ace_flags(true), 0x3);
+        assert_eq!(windows_acl_ace_flags(false), 0);
+    }
+
+    #[test]
+    fn relative_desktop_config_dir_resolves_before_first_run_binding() {
+        let relative = PathBuf::from("relative-first-run-config");
+        let resolved = normalize_desktop_config_dir(relative.clone()).expect("resolve config dir");
+        assert_eq!(resolved, std::env::current_dir().unwrap().join(relative));
+        assert!(resolved.is_absolute());
+    }
+
+    #[test]
+    fn relative_desktop_config_dir_resolves_parent_components() {
+        let resolved = normalize_desktop_config_dir(PathBuf::from("nested/../config"))
+            .expect("resolve config dir parent component");
+        assert_eq!(resolved, std::env::current_dir().unwrap().join("config"));
+        assert!(resolved.is_absolute());
+    }
+
+    #[test]
+    fn windows_owner_sid_match_requires_exact_nonempty_bytes() {
+        assert!(windows_owner_sid_matches(b"owner", b"owner"));
+        assert!(!windows_owner_sid_matches(b"owner", b"other"));
+        assert!(!windows_owner_sid_matches(b"", b""));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn stop_signal_reaps_owned_child_and_preserves_status() {
@@ -2456,7 +3789,7 @@ mod bounded_service_log_tests {
             .expect("spawn child");
         let status = tokio::time::timeout(
             Duration::from_secs(2),
-            stop_launchd_child(&mut child, libc::SIGTERM),
+            stop_service_child(&mut child, libc::SIGTERM),
         )
         .await
         .expect("child stop timeout")
@@ -2857,20 +4190,183 @@ mod service_helper_tests {
 
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn tail_file_errors_on_missing_file() {
-        let missing = Path::new("/tmp/zeroclaw-test-nonexistent-log-file.log");
-        let result = tail_file(missing, 10, false);
+    fn tail_files_errors_on_missing_file() {
+        let missing = PathBuf::from("/tmp/zeroclaw-test-nonexistent-log-file.log");
+        let result = tail_files(&[missing], 10, false);
         assert!(result.is_err(), "tail on missing file should fail");
     }
 
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn tail_file_reads_existing_file() {
+    fn tail_files_reads_existing_file() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
         let log = dir.path().join("test-tail.log");
         fs::write(&log, "line1\nline2\nline3\nline4\nline5\n").unwrap();
-        // tail should succeed on existing file
-        let result = tail_file(&log, 3, false);
+        let result = tail_files(&[log], 3, false);
         assert!(result.is_ok(), "tail on existing file should succeed");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn tail_files_reads_every_named_file() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let first = dir.path().join("first.log");
+        let second = dir.path().join("second.log");
+        fs::write(&first, "first\n").unwrap();
+        fs::write(&second, "second\n").unwrap();
+        let result = tail_files(&[first, second], 3, false);
+        assert!(result.is_ok(), "tail on two existing files should succeed");
+    }
+
+    #[test]
+    fn tail_files_rejects_an_empty_selection() {
+        let result = tail_files(&[], 10, false);
+        assert!(result.is_err(), "tail with no paths should fail");
+    }
+
+    #[test]
+    fn service_log_targets_skips_the_stream_without_output() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let stdout_log = dir.path().join("daemon.stdout.log");
+        let stderr_log = dir.path().join("daemon.stderr.log");
+        fs::write(&stdout_log, "listening for messages\n").unwrap();
+        fs::write(&stderr_log, "").unwrap();
+
+        assert_eq!(
+            service_log_targets(&stdout_log, &stderr_log),
+            vec![stdout_log],
+            "an empty capture file must not hide the stream that has output"
+        );
+    }
+
+    #[test]
+    fn service_log_targets_lists_both_streams_when_both_have_output() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let stdout_log = dir.path().join("daemon.stdout.log");
+        let stderr_log = dir.path().join("daemon.stderr.log");
+        fs::write(&stdout_log, "listening for messages\n").unwrap();
+        fs::write(&stderr_log, "provider error\n").unwrap();
+
+        assert_eq!(
+            service_log_targets(&stdout_log, &stderr_log),
+            vec![stdout_log, stderr_log],
+            "both streams carry output, so both are shown, primary first"
+        );
+    }
+
+    #[test]
+    fn service_log_targets_keeps_empty_files_so_follow_can_attach() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let stdout_log = dir.path().join("daemon.stdout.log");
+        let stderr_log = dir.path().join("daemon.stderr.log");
+        fs::write(&stdout_log, "").unwrap();
+        fs::write(&stderr_log, "").unwrap();
+
+        assert_eq!(
+            service_log_targets(&stdout_log, &stderr_log),
+            vec![stdout_log, stderr_log],
+            "a daemon that has not written yet is still followable"
+        );
+    }
+
+    #[test]
+    fn service_log_targets_is_empty_when_nothing_was_captured() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let stdout_log = dir.path().join("daemon.stdout.log");
+        let stderr_log = dir.path().join("daemon.stderr.log");
+
+        assert!(
+            service_log_targets(&stdout_log, &stderr_log).is_empty(),
+            "no capture files means the caller reports a missing install"
+        );
+    }
+
+    #[test]
+    fn service_log_targets_ignores_a_missing_counterpart() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let stdout_log = dir.path().join("daemon.stdout.log");
+        let stderr_log = dir.path().join("daemon.stderr.log");
+        fs::write(&stdout_log, "listening for messages\n").unwrap();
+
+        assert_eq!(
+            service_log_targets(&stdout_log, &stderr_log),
+            vec![stdout_log],
+            "a capture file that was never created is not a target"
+        );
+    }
+
+    #[test]
+    fn get_content_command_uses_literal_path_and_doubles_quotes() {
+        let command = get_content_command(Path::new("C:\\logs\\o'brien[1].log"), 25, true);
+        assert_eq!(
+            command,
+            "Get-Content -LiteralPath 'C:\\logs\\o''brien[1].log' -Tail 25 -Wait"
+        );
+    }
+
+    #[test]
+    fn get_content_command_omits_wait_without_follow() {
+        let command = get_content_command(Path::new("C:\\logs\\daemon.stdout.log"), 50, false);
+        assert_eq!(
+            command,
+            "Get-Content -LiteralPath 'C:\\logs\\daemon.stdout.log' -Tail 50"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn follow_sees_a_failure_written_to_stderr_after_startup() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let stdout_log = dir.path().join("daemon.stdout.log");
+        let stderr_log = dir.path().join("daemon.stderr.log");
+        fs::write(&stdout_log, "listening for messages\n").unwrap();
+        fs::write(&stderr_log, "").unwrap();
+
+        let targets = follow_log_targets(&stdout_log, &stderr_log);
+        let mut viewer = tail_command(&targets, 10, true)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("tail should start");
+        let output = viewer.stdout.take().expect("tail stdout is piped");
+        let (line_tx, line_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(output).lines().map_while(Result::ok) {
+                if line_tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let saw = |needle: &str| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+                match line_rx.recv_timeout(left) {
+                    Ok(line) if line.contains(needle) => return true,
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+            false
+        };
+
+        let attached = saw("daemon.stderr.log <==");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&stderr_log)
+            .unwrap()
+            .write_all(b"launchd capture failed: child exited\n")
+            .unwrap();
+        let delivered = saw("launchd capture failed");
+        let _ = viewer.kill();
+        let _ = viewer.wait();
+
+        assert!(attached, "the follower must open the empty stderr file");
+        assert!(
+            delivered,
+            "a failure appended to stderr must reach the running viewer"
+        );
     }
 }

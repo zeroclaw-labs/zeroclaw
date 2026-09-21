@@ -26,13 +26,31 @@ A minimal build ships with:
 | `glob_search` | List files matching a glob pattern within the workspace |
 | `content_search` | Search file contents by regex within the workspace (ripgrep with grep fallback) |
 | `http_request` | HTTP GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS to allowlisted domains |
-| `web_search_tool` | Web search. Provider is configurable: DuckDuckGo (default, no key), Brave, Tavily, SearXNG, Jina, or Bocha |
+| `web_search_tool` | Web search. Provider is configurable: DuckDuckGo (default, no key), Brave, Tavily, SearXNG, Jina, Bocha, AnySearch, Serply, or Keenable (no key required; optional key lifts rate limits) |
 | `web_fetch` | Fetch a page and return clean plain text |
-| `browser` | Headless-browser automation. See [Browser automation](./browser.md) |
+| `browser` | Headless-browser automation. Opt-in: requires `[browser] automation_enabled = true`. See [Browser automation](./browser.md) |
 | `memory_recall` | Search long-term memory for relevant facts, preferences, or context |
 | `memory_store` | Store a fact, preference, or note in long-term memory |
 | `ask_user` | Send a question to the active channel and wait for a reply. Supports optional `choices` for structured responses (inline keyboard on Telegram, numbered list on CLI). On ACP, `choices` are required: free-form ask awaits the ACP elicitation RFD. Parameters: `question` (required), `choices` (optional list), `timeout_secs` (default 600). |
 | `escalate_to_human` | Send a structured escalation message with urgency routing. `high` / `critical` urgency additionally notifies any channels listed in `[escalation] alert_channels`. Parameters: `summary` (required), `context` (optional), `urgency` (`low`/`medium`/`high`/`critical`, default `medium`), `wait_for_response` (bool, default false), `timeout_secs` (default 600). On ACP, `wait_for_response: true` fails immediately if the channel cannot receive free-form replies (awaits ACP elicitation RFD). |
+
+### AnySearch provider
+
+AnySearch is an explicit, opt-in backend for `web_search_tool`:
+
+```toml
+[web_search]
+search_provider = "anysearch"
+# Optional; omit to use AnySearch's lower, rate-limited anonymous quota.
+anysearch_api_key = "..."
+```
+
+Search queries and the configured result limit are sent to
+`https://api.anysearch.com/v1/search`. When `anysearch_api_key` is configured,
+ZeroClaw sends it only as a Bearer authorization header; without a key, no
+`Authorization` header is sent. Selecting this provider therefore sends search
+queries to a third-party service even in anonymous mode. It does not change the
+default provider and is not used as an automatic fallback.
 
 Always registered alongside the built-ins:
 
@@ -99,11 +117,11 @@ When receipts are enabled, successful executions receive a [tool receipt](../sec
 The schema has no per-channel `tools_allow` / `tools_deny` field. Tool gating lives on the agent's risk profile (`[risk_profiles.<alias>]`):
 
 - `excluded_tools` removes the listed tools from every non-CLI channel (Discord, Telegram, Bluesky, Matrix, Slack, etc.) while leaving the local CLI untouched. The granularity is binary (CLI vs non-CLI), not per-channel. It also subtracts from the agentic-delegate allow-list resolved at runtime, which is the only way to block individual `<server>__<tool>` MCP names that would otherwise be auto-admitted by the rule below.
-- `allowed_tools` is the inverse: an allowlist of tools the agent may call in agentic mode (empty or omitted means no authorization constraint; the TOML config does not distinguish the two).
+- `allowed_tools` is an allowlist. Omitted and an explicit empty list (`allowed_tools = []`) mean the same legacy state: no authorization constraint. A nonempty list is a closed set for built-ins (and, via the MCP exception below, auto-admits namespaced MCP tools). An empty list does **not** mean deny-all; for that, set the sibling `deny_all_tools = true`, which denies built-ins, MCP tools, and skill-defined tools alike. Setting both `deny_all_tools = true` and a nonempty `allowed_tools` is a configuration error rejected at load.
 - **MCP exception**: when `allowed_tools` is non-empty, runtime-discovered MCP tools (any name containing `__`, the `<server>__<tool>` convention) are auto-admitted into the effective allow-list without having to be listed there individually. This keeps the post-#7464 eager-MCP default usable for agents that already pin an explicit allow-list. To block individual MCP tools, list them in `excluded_tools`.
 - The MCP exception is scoped to the **risk profile**'s `allowed_tools` only. Caller-supplied per-run allow-lists (cron job `allowed_tools`, narrowed delegate invocations, etc.) are still treated as strict explicit-list intersections. A job that narrows itself to `allowed_tools = ["cron_add"]` will not surface runtime-discovered MCP wrappers it did not name, even when the agent's risk profile would auto-admit them.
 
-If you need finer-grained gating, drop the profile's `level` to `read_only` or `supervised` and rely on the per-profile `auto_approve` / `always_ask` lists to gate sensitive tools behind operator approval.
+If you need finer-grained gating under Full autonomy, put sensitive tools in the per-profile `always_ask` list: they still prompt (or fail closed) even when `level = "full"`. Dropping the profile to `read_only` or `supervised` is only required when you want the whole risk-tier matrix, not when you need a handful of exceptions.
 
 See [Autonomy levels](../security/autonomy.md) for the full set of per-profile fields.
 

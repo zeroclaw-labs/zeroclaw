@@ -102,6 +102,21 @@ impl FileExplorerState {
         state
     }
 
+    /// Seed and focus a file selection for an input-bar integration test.
+    ///
+    /// The path must already be visible in the explorer's current listing so
+    /// pressing Enter exercises the same confirmation path as a user action.
+    #[cfg(test)]
+    pub(crate) fn select_path_for_test(&mut self, path: PathBuf) {
+        let visible_index = self
+            .visible_entries()
+            .into_iter()
+            .position(|entry_index| self.entries[entry_index].full_path == path)
+            .expect("test path should be visible in the explorer listing");
+        self.selected.insert(path);
+        self.list_state.select(Some(visible_index));
+    }
+
     pub fn new_dir_picker_remote(start_dir: PathBuf, rpc: Arc<crate::client::RpcClient>) -> Self {
         let mut state = Self {
             cwd: start_dir,

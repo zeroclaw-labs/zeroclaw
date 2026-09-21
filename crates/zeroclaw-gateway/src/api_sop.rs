@@ -208,7 +208,7 @@ fn resolve(
         // EPIC G: route through the broker (membership + quorum). With no
         // `[sop.approval]` policy this is exactly `resolve_gate`.
         guard
-            .resolve_via_broker(run_id, decision, principal)
+            .resolve_via_broker_deferred(run_id, decision, principal)
             .map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -381,7 +381,11 @@ pub(crate) mod tests {
         config.gateway.allow_remote_admin = true;
         let mut state = crate::api::test_state(config);
         state.sop_engine = Some(Arc::new(Mutex::new(engine)));
-        state.pairing = Arc::new(PairingGuard::new(true, &[token.to_string()]));
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[token.to_string()],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
         (state, run_id)
     }
 
@@ -420,6 +424,7 @@ pub(crate) mod tests {
             std::sync::Arc::new(zeroclaw_runtime::security::pairing::PairingGuard::new(
                 true,
                 &[token.to_string(), other.to_string()],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
             ));
         let resp = handle_sop_approve(
             State(state_other),
@@ -547,9 +552,12 @@ pub(crate) mod tests {
         // Pairing is now OFF - `is_authenticated` accepts any token, so the SAME
         // token string that legitimately satisfied membership when paired must NOT
         // grant an authenticated identity anymore.
-        state.pairing = std::sync::Arc::new(
-            zeroclaw_runtime::security::pairing::PairingGuard::new(false, &[]),
-        );
+        state.pairing =
+            std::sync::Arc::new(zeroclaw_runtime::security::pairing::PairingGuard::new(
+                false,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            ));
         let loopback: SocketAddr = "127.0.0.1:9".parse().unwrap();
 
         let resp = handle_sop_approve(

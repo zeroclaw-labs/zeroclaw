@@ -161,7 +161,7 @@ pub async fn run(config: &Config, alias: &str, out: &Path, force: bool) -> Resul
 /// The destination is never partially written and never keeps an entry the new
 /// manifest does not describe. On any returned error it is left as it was.
 async fn write_bundle(plan: &mut ExportPlan, out: &Path, force: bool) -> Result<BundleCopy> {
-    let dest = resolve_path(out)?;
+    let dest = resolve_destination_path(out)?;
     reject_source_overlap(&dest, plan, out)?;
 
     let (Some(parent_path), Some(name)) = (dest.parent(), dest.file_name()) else {
@@ -260,6 +260,20 @@ async fn write_bundle(plan: &mut ExportPlan, out: &Path, force: bool) -> Result<
 
     publish(staging, &parent, name, &dest, admission, &sources)?;
     Ok(copied)
+}
+
+/// Resolve a destination's parent without following the final named entry.
+///
+/// [`check_destination`] must inspect that final entry itself so it can refuse
+/// a symlink. Canonicalizing the whole destination here would replace the name
+/// with its target before the no-follow admission check ever sees it.
+fn resolve_destination_path(path: &Path) -> Result<PathBuf> {
+    let absolute = std::path::absolute(path)
+        .with_context(|| format!("failed to resolve {}", path.display()))?;
+    let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name()) else {
+        return Ok(absolute);
+    };
+    Ok(resolve_path(parent)?.join(name))
 }
 
 /// Resolve `path` to an absolute, symlink-free form.
@@ -3613,6 +3627,36 @@ mod tests {
             "{err}"
         );
         assert_eq!(entry_names(source.path()), vec!["IDENTITY.md".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_named_destination_symlink_is_refused_without_touching_its_target() {
+        let source = tempfile::tempdir().unwrap();
+        write(&source.path().join("IDENTITY.md"), "identity");
+
+        let parent = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        write(&target.path().join("keep.txt"), "target contents");
+        let out = parent.path().join("bundle");
+        std::os::unix::fs::symlink(target.path(), &out).unwrap();
+
+        let err = write_bundle(&mut plan_for(source.path()), &out, true)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("is a symlink"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(target.path().join("keep.txt")).unwrap(),
+            "target contents"
+        );
+        assert_eq!(entry_names(target.path()), vec!["keep.txt".to_string()]);
+        assert!(
+            std::fs::symlink_metadata(&out)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[tokio::test]

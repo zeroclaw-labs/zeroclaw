@@ -480,15 +480,31 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         since: Option<&str>,
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        let entries = self
-            .recall(query, limit * 2, session_id, since, until)
-            .await?;
-        let filtered: Vec<MemoryEntry> = entries
-            .into_iter()
-            .filter(|e| e.namespace == namespace)
-            .take(limit)
-            .collect();
-        Ok(filtered)
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut fetch_limit = limit;
+        loop {
+            let entries = self
+                .recall(query, fetch_limit, session_id, since, until)
+                .await?;
+            let backend_may_have_more = entries.len() >= fetch_limit;
+            let filtered: Vec<MemoryEntry> = entries
+                .into_iter()
+                .filter(|e| e.namespace == namespace)
+                .take(limit)
+                .collect();
+            if filtered.len() >= limit || !backend_may_have_more {
+                return Ok(filtered);
+            }
+
+            let next_fetch_limit = fetch_limit.saturating_mul(2);
+            if next_fetch_limit == fetch_limit {
+                return Ok(filtered);
+            }
+            fetch_limit = next_fetch_limit;
+        }
     }
 
     /// Bulk-export memories matching the given filter criteria.
