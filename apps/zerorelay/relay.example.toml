@@ -74,3 +74,33 @@ accept_rate_per_ip = 10.0
 # with `rate_limited`.
 connect_burst_per_node = 60
 connect_rate_per_node = 20.0
+
+[frontdoor]
+# Serve the browser enrollment frontdoor (pairing page) from this relay.
+# DEFAULT OFF.
+#
+# TRUST IMPLICATION - read before enabling. Enabling this makes the relay two
+# things it is not otherwise:
+#
+#   1. A TRUSTED CODE ORIGIN. Browsers that enrol here run enrollment
+#      JavaScript served by THIS relay, so a compromised relay can substitute
+#      code that leaks what the page handles.
+#   2. A PRINCIPAL IN ENROLLMENT. A browser cannot speak the daemon's TLS
+#      enrollment protocol, so the relay performs that exchange on its behalf.
+#      It therefore SEES the one-time pairing code and the issued certificate,
+#      and could use an observed pairing code to enrol a client of its own.
+#
+# What it does NOT see: the client private key. The browser generates the
+# keypair and sends only a CSR.
+#
+# Browser enrollment through this relay is RELAY-TERMINATED, not end-to-end.
+# The short-auth-string lets an operator DETECT a relay that substitutes a
+# different daemon CA; it cannot stop a relay that is trusted to relay.
+#
+# Browsers are offered ENROLLMENT ONLY - there is no browser session tier. Use
+# zerocode or another native client for sessions; those connect end-to-end
+# encrypted and never execute relay-served code.
+#
+# The blind-forwarder guarantee is unchanged for the RPC plane and for
+# zerocode/native enrollment whether this is on or off.
+# enabled = false

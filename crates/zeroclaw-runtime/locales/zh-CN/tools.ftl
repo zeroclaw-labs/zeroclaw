@@ -62,8 +62,11 @@ tool-file-download-error-move = 将已下载文件移动到位失败：{ $err }
 tool-file-download-success = 已下载 { $written } 字节到 { $dest_path }（{ $status }）
 tool-file-read = 读取带行号的文件内容。支持通过 offset 和 limit 进行部分读取。二进制文件和图像文件会被拒绝（图像请使用 image_info 工具）。设置 encoding="base64" 可以返回经 base64 编码的原始字节（适用于 .pdf/.xlsx/.docx 等二进制文件）；该模式下 offset/limit 被忽略。
 tool-file-write = 将内容写入工作区中的文件
-tool-git-operations = 执行结构化的 Git 操作（status、diff、log、branch、commit、add、checkout、stash）。提供解析后的 JSON 输出，并与安全策略集成以实现自主控制。
+tool-git-operations = 执行结构化的 Git 操作（status、diff、log、branch、commit、add、checkout、stash、worktree）。提供解析后的 JSON 输出，并与安全策略集成以实现自主控制。
 tool-git-operations-error-not-in-repo = 当前路径 '{ $path }' 不在 Git 仓库中。请选择一个 Git 工作树内的路径，通过 'path' 参数指定仓库子目录，或在运行 git_operations 前初始化一个仓库。
+tool-git-operations-error-repository-outside-authorized-roots = 在 '{ $path }' 的允许根目录内没有可访问的 Git 仓库。请选择位于适用允许根目录内的仓库路径，或在运行 git_operations 前初始化仓库。
+tool-git-operations-error-repository-not-authorized = '{ $path }' 的 Git 仓库元数据未获授权执行此操作。请选择位于适用允许根目录内的仓库。
+tool-git-operations-error-path-not-authorized = Git 路径 '{ $path }' 未获授权执行此操作。请选择位于适用允许根目录内的路径。
 tool-git-forge-error-requires-field = { $resource }.{ $action } 需要 '{ $field }'。
 tool-git-forge-error-requires-number = { $resource }.{ $action } 需要 'number'。
 tool-git-forge-error-issue-close-reason = issue.close 的 'reason' 必须为 'completed' 或 'not_planned'。

@@ -2650,6 +2650,7 @@ async fn safety_net_narration_reaches_both_draft_and_event_channels_once() {
                 model_provider: &provider,
                 provider_name: "mock",
                 model: "mock-model",
+                dispatch_model: "mock-model",
                 temperature: None,
             },
             crate::agent::loop_::ResolvedIo {
@@ -2672,11 +2673,17 @@ async fn safety_net_narration_reaches_both_draft_and_event_channels_once() {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 30_000,
-                context_token_budget: 100_000,
+                context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                    context_token_budget: 100_000,
+                    ..zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0)
+                },
+                context_limits_resolver: None,
                 knobs: &crate::agent::loop_::LoopKnobs::default(),
             },
         ),
         history: &mut history,
+        history_has_trim_breadcrumb: &mut false,
+        injected_memory_preamble: &mut None,
         channel_name: "cli",
         channel_reply_target: None,
         cancellation_token: None,
@@ -2692,6 +2699,7 @@ async fn safety_net_narration_reaches_both_draft_and_event_channels_once() {
         ingress: IngressContext::sub_turn(),
         agent_alias: None,
         turn_id: &turn_id,
+        served_route_sink: None,
     })
     .await
     .expect("loop should succeed");

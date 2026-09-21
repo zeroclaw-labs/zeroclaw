@@ -203,7 +203,13 @@ jobs:
               ;;
           esac
 
-          if grep -Eq '^(apps/zerorelay/(Dockerfile|compose\.yaml|relay\.example\.toml|src/main\.rs|src/lib\.rs|src/ws_accept\.rs|build\.rs)|scripts/ci/smoke_relay_fresh_volume\.sh|\.github/workflows/ci\.yml$)' "$changed_files"; then
+          # `src/.*\.rs` rather than an enumeration: the list rotted once already
+          # (it kept ws_accept.rs after the file was deleted and never gained the
+          # files that replaced it), silently dropping the relay's HTTP surface out
+          # of the trigger. A pattern cannot rot. Cargo.toml is included because a
+          # dependency bump changes what the image contains. Tests live in tests/
+          # and stay outside the trigger.
+          if grep -Eq '^(apps/zerorelay/(Dockerfile|compose\.yaml|relay\.example\.toml|Cargo\.toml|src/.*\.rs|build\.rs)|scripts/ci/smoke_relay_fresh_volume\.sh|\.github/workflows/ci\.yml$)' "$changed_files"; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
