@@ -150,8 +150,10 @@ pub use super::cost::{
 // History management moved to `super::history`.
 pub use super::history::{
     append_or_merge_system_message, canonicalize_tool_result_media_markers,
-    estimate_history_tokens, load_interactive_session_history, normalize_system_messages,
-    save_interactive_session_history, trim_history, truncate_tool_result,
+    estimate_history_tokens, load_interactive_session_history,
+    load_interactive_session_history_with_crumb, normalize_system_messages,
+    save_interactive_session_history, save_interactive_session_history_with_crumb, trim_history,
+    truncate_tool_result,
 };
 
 /// Minimum user-message length (in chars) for auto-save to memory.
@@ -800,6 +802,16 @@ pub async fn agent_turn(
     config: Option<&zeroclaw_config::schema::Config>,
     model_provider: &dyn ModelProvider,
     history: &mut Vec<ChatMessage>,
+    // Authoritative record that `history` carries the synthetic trim
+    // breadcrumb after its leading system messages; kept beside the buffer
+    // instead of being inferred from localized text. Set to true when a trim
+    // path inserts a crumb during the turn.
+    history_has_trim_breadcrumb: &mut bool,
+    // Out-param the loop writes through when it injects a recalled-memory
+    // preamble onto the last user message: the exact byte length injected,
+    // so the caller can strip precisely that block before persisting —
+    // see `ToolLoop::injected_memory_preamble`.
+    injected_memory_preamble: &mut Option<String>,
     tools_registry: &scoped::ScopedToolRegistry,
     observer: &dyn Observer,
     provider_name: &str,
@@ -829,6 +841,8 @@ pub async fn agent_turn(
         config,
         model_provider,
         history,
+        history_has_trim_breadcrumb,
+        injected_memory_preamble,
         tools_registry,
         observer,
         provider_name,
@@ -863,6 +877,10 @@ async fn agent_turn_with_sop_reassembly(
     config: Option<&zeroclaw_config::schema::Config>,
     model_provider: &dyn ModelProvider,
     history: &mut Vec<ChatMessage>,
+    // Authoritative breadcrumb provenance for `history` — see `agent_turn`.
+    history_has_trim_breadcrumb: &mut bool,
+    // See `agent_turn`.
+    injected_memory_preamble: &mut Option<String>,
     tools_registry: &scoped::ScopedToolRegistry,
     observer: &dyn Observer,
     provider_name: &str,
@@ -930,8 +948,10 @@ async fn agent_turn_with_sop_reassembly(
         context_token_budget,
         model_context_window_source: resolved_capacity.source,
     };
-    let result = run_tool_call_loop(ToolLoop {
+    let result = Box::pin(run_tool_call_loop(ToolLoop {
         sop_reassembly,
+        history_has_trim_breadcrumb,
+        injected_memory_preamble,
         exec: ResolvedAgentExecution::resolve(
             ResolvedModelAccess {
                 model_provider,
@@ -986,7 +1006,7 @@ async fn agent_turn_with_sop_reassembly(
         parent_agent_alias: None,
         served_route_sink: None,
         turn_id: &turn_id,
-    })
+    }))
     .await;
     // Snapshot token usage from the task-local cost context when the caller
     // scoped one around this call (the gateway scopes both
@@ -1921,6 +1941,8 @@ pub async fn run(
                 ChatMessage::system(&system_prompt),
                 ChatMessage::user(&enriched),
             ];
+            // One-shot transcript: no prior trim ran, so no crumb exists.
+            let mut history_has_trim_breadcrumb = false;
 
             // Compute per-turn excluded MCP tools from tool_filter_groups.
             let excluded_tools = compute_excluded_mcp_tools(
@@ -1999,6 +2021,8 @@ pub async fn run(
                                     },
                                 ),
                                 history: &mut history,
+                                history_has_trim_breadcrumb: &mut history_has_trim_breadcrumb,
+                                injected_memory_preamble: &mut None,
                                 channel_name,
                                 channel_reply_target: None,
                                 cancellation_token: None,
@@ -2212,12 +2236,15 @@ pub async fn run(
                 "CLI channel factory not registered — call register_cli_channel_fn at startup",
             )();
 
-            // Persistent conversation history across turns
-            let mut history = if let Some(path) = session_state_file.as_deref() {
-                load_interactive_session_history(path, &system_prompt)?
-            } else {
-                vec![ChatMessage::system(&system_prompt)]
-            };
+            // Persistent conversation history across turns, with explicit
+            // breadcrumb provenance. Legacy v1 files are migrated by inspecting
+            // the restored history for a leading breadcrumb.
+            let (mut history, mut history_has_trim_breadcrumb) =
+                if let Some(path) = session_state_file.as_deref() {
+                    load_interactive_session_history_with_crumb(path, &system_prompt)?
+                } else {
+                    (vec![ChatMessage::system(&system_prompt)], false)
+                };
 
             loop {
                 print!("> ");
@@ -2283,6 +2310,7 @@ pub async fn run(
 
                         history.clear();
                         history.push(ChatMessage::system(&system_prompt));
+                        history_has_trim_breadcrumb = false;
                         // Clear conversation and daily memory
                         let mut cleared = 0;
                         for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
@@ -2299,7 +2327,11 @@ pub async fn run(
                             println!("Conversation cleared.\n");
                         }
                         if let Some(path) = session_state_file.as_deref() {
-                            save_interactive_session_history(path, &history)?;
+                            save_interactive_session_history_with_crumb(
+                                path,
+                                &history,
+                                history_has_trim_breadcrumb,
+                            )?;
                         }
                         continue;
                     }
@@ -2469,6 +2501,11 @@ pub async fn run(
                                 print!("{text}");
                                 let _ = std::io::stdout().flush();
                             }
+                            StreamDelta::FlushBarrier(ack) => {
+                                // CLI prints deltas immediately; nothing is
+                                // buffered, so release the barrier right away.
+                                StreamDelta::ack_flush_barrier(&ack);
+                            }
                             StreamDelta::Reasoning(_) => {}
                             tool_event @ (StreamDelta::ToolStart { .. }
                             | StreamDelta::ToolComplete { .. }) => {
@@ -2565,6 +2602,9 @@ pub async fn run(
                                         },
                                     ),
                                     history: &mut history,
+                                    history_has_trim_breadcrumb:
+                                        &mut history_has_trim_breadcrumb,
+                                    injected_memory_preamble: &mut None,
                                     channel_name,
                                     channel_reply_target: None,
                                     cancellation_token: Some(cancel_token.clone()),
@@ -2674,20 +2714,25 @@ pub async fn run(
                                     "Context overflow in interactive loop, attempting recovery"
                                 );
                                 let taken = std::mem::take(&mut history);
-                                let recovery_budget =
-                                    interactive_context_recovery_budget(context_limits);
-                                let result = crate::agent::history_trim::trim_to_recent_turns(
-                                    taken,
-                                    recovery_budget,
-                                );
+                                let recovery_budget = interactive_context_recovery_budget(context_limits);
+                                let crumb_present_before_recovery = history_has_trim_breadcrumb;
+                                let result =
+                                    crate::agent::history_trim::trim_to_recent_turns_with_crumb(
+                                        taken,
+                                        recovery_budget,
+                                        crumb_present_before_recovery,
+                                    );
                                 if result.trimmed {
                                     let mut trimmed = result.history;
-                                    let system_count =
-                                        trimmed.iter().take_while(|m| m.role == "system").count();
-                                    trimmed.insert(
-                                        system_count,
-                                        crate::agent::history_trim::breadcrumb(),
-                                    );
+                                    // Owner-aware insertion: does not stack a
+                                    // second marker when the existing
+                                    // breadcrumb (protected from drop above)
+                                    // is still present.
+                                    history_has_trim_breadcrumb =
+                                        crate::agent::history_trim::insert_breadcrumb_deduped(
+                                            &mut trimmed,
+                                            crumb_present_before_recovery,
+                                        );
                                     history = trimmed;
                                     {
                                         let __zc_trim_span = ::zeroclaw_log::info_span!(
@@ -2848,7 +2893,11 @@ pub async fn run(
                 }
 
                 if let Some(path) = session_state_file.as_deref() {
-                    save_interactive_session_history(path, &history)?;
+                    save_interactive_session_history_with_crumb(
+                        path,
+                        &history,
+                        history_has_trim_breadcrumb,
+                    )?;
                 }
             }
         }
@@ -3386,6 +3435,8 @@ pub(crate) async fn process_message_shared(
             ChatMessage::system(&system_prompt),
             ChatMessage::user(&enriched),
         ];
+        // One-shot transcript: no prior trim ran, so no crumb exists.
+        let mut history_has_trim_breadcrumb = false;
         let mut excluded_tools = compute_excluded_mcp_tools(
             &tools_registry,
             &agent.resolved.tool_filter_groups,
@@ -3415,6 +3466,8 @@ pub(crate) async fn process_message_shared(
                     Some(&config),
                     model_provider.as_ref(),
                     &mut history,
+                    &mut history_has_trim_breadcrumb,
+                    &mut None,
                     &tools_registry,
                     observer.as_ref(),
                     &model_provider_ref,
@@ -3891,6 +3944,7 @@ mod tests {
         let payload = serde_json::to_string_pretty(&InteractiveSessionState {
             version: 1,
             history: vec![ChatMessage::user("orphan")],
+            history_has_trim_breadcrumb: false,
         })
         .unwrap();
         std::fs::write(&path, payload).unwrap();
@@ -3915,6 +3969,7 @@ mod tests {
                 ChatMessage::system("late loop-detection guidance"),
                 ChatMessage::user("follow-up"),
             ],
+            history_has_trim_breadcrumb: false,
         })
         .unwrap();
         std::fs::write(&path, payload).unwrap();
@@ -3956,6 +4011,7 @@ mod tests {
                 ChatMessage::user("follow-up"),
                 ChatMessage::system(""),
             ],
+            history_has_trim_breadcrumb: false,
         })
         .unwrap();
         std::fs::write(&path, payload).unwrap();
@@ -3985,6 +4041,7 @@ mod tests {
                 orphan_tool,
                 ChatMessage::user("next question"),
             ],
+            history_has_trim_breadcrumb: false,
         })
         .unwrap();
         std::fs::write(&path, payload).unwrap();
@@ -5292,6 +5349,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "acp",
             channel_reply_target: Some("operator"),
             cancellation_token: None,
@@ -5703,6 +5763,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -5784,6 +5847,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -5886,6 +5952,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcript starts fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -5963,6 +6032,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -6056,6 +6128,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -6134,6 +6209,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -6215,6 +6293,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -6297,6 +6378,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -6366,6 +6450,9 @@ mod tests {
                     knobs: &LoopKnobs::default(),
                 },
                 history: &mut history,
+                // Test transcripts start fresh: no prior trim, no crumb.
+                history_has_trim_breadcrumb: &mut false,
+                injected_memory_preamble: &mut None,
                 channel_name: "cli",
                 channel_reply_target: None,
                 cancellation_token: None,
@@ -6556,6 +6643,9 @@ mod tests {
                     knobs: &LoopKnobs::default(),
                 },
                 history: &mut history,
+                // Test transcripts start fresh: no prior trim, no crumb.
+                history_has_trim_breadcrumb: &mut false,
+                injected_memory_preamble: &mut None,
                 channel_name: "cli",
                 channel_reply_target: None,
                 cancellation_token: None,
@@ -6685,6 +6775,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -6766,6 +6859,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -6846,6 +6942,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -7011,6 +7110,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -7156,6 +7258,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "agent",
             channel_reply_target: None,
             cancellation_token: None,
@@ -7320,6 +7425,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "agent",
             channel_reply_target: None,
             cancellation_token: None,
@@ -7441,6 +7549,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -7617,6 +7728,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: Some(token.clone()),
@@ -7729,6 +7843,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: Some("chat-42"),
             cancellation_token: None,
@@ -7825,6 +7942,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: Some("chat-42"),
             cancellation_token: None,
@@ -7913,6 +8033,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "lark",
             channel_reply_target: Some("chat-99"),
             cancellation_token: None,
@@ -8009,6 +8132,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "feishu",
             channel_reply_target: Some("chat-77"),
             cancellation_token: None,
@@ -8108,6 +8234,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -8213,6 +8342,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -8310,6 +8442,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -8433,6 +8568,9 @@ mod tests {
                 knobs: &knobs,
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "acp",
             channel_reply_target: Some("operator"),
             cancellation_token: None,
@@ -8534,6 +8672,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "acp",
             channel_reply_target: Some("operator"),
             cancellation_token: None,
@@ -8640,6 +8781,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "acp",
             channel_reply_target: Some("operator"),
             cancellation_token: None,
@@ -8736,6 +8880,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -8836,6 +8983,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -8938,6 +9088,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9026,6 +9179,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9118,6 +9274,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9205,6 +9364,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9290,6 +9452,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9378,6 +9543,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9464,6 +9632,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9570,6 +9741,8 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
         })
         .await
         .expect_err("visible stream failure must remain an interruption error");
@@ -9649,6 +9822,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9726,6 +9902,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9804,6 +9983,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9882,6 +10064,9 @@ mod tests {
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9962,6 +10147,9 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10046,6 +10234,9 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10142,6 +10333,9 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10222,6 +10416,9 @@ Done."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10305,6 +10502,9 @@ Done."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10386,6 +10586,9 @@ Done."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10468,6 +10671,9 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10607,6 +10813,9 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10697,6 +10906,9 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10790,6 +11002,9 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10906,6 +11121,9 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10960,6 +11178,7 @@ This is an example, not an invocation."#;
                 StreamDelta::ToolStart { .. }
                 | StreamDelta::ToolComplete { .. }
                 | StreamDelta::Lifecycle(_) => true,
+                StreamDelta::FlushBarrier(_) => true,
             }),
             "draft deltas must not expose inline think tags: {deltas:?}"
         );
@@ -11034,6 +11253,9 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -11058,7 +11280,9 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
+                StreamDelta::Status(_)
+                | StreamDelta::Lifecycle(_)
+                | StreamDelta::FlushBarrier(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -11131,6 +11355,9 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -11155,7 +11382,9 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
+                StreamDelta::Status(_)
+                | StreamDelta::Lifecycle(_)
+                | StreamDelta::FlushBarrier(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -11239,6 +11468,9 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -12136,6 +12368,9 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -12160,7 +12395,9 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
+                StreamDelta::Status(_)
+                | StreamDelta::Lifecycle(_)
+                | StreamDelta::FlushBarrier(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -12246,6 +12483,9 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -12353,6 +12593,9 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -12460,6 +12703,9 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -12624,6 +12870,9 @@ This is an example, not an invocation."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -12648,7 +12897,9 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
+                StreamDelta::Status(_)
+                | StreamDelta::Lifecycle(_)
+                | StreamDelta::FlushBarrier(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -12713,6 +12964,8 @@ This is an example, not an invocation."#;
                 None,
                 &model_provider,
                 &mut history,
+                &mut false,
+                &mut None,
                 &tools_registry,
                 &observer,
                 "mock-provider",
@@ -12787,6 +13040,8 @@ This is an example, not an invocation."#;
                 None,
                 &model_provider,
                 &mut history,
+                &mut false,
+                &mut None,
                 &tools_registry,
                 &observer,
                 "mock-provider",
@@ -12918,6 +13173,8 @@ This is an example, not an invocation."#;
                 None,
                 &model_provider,
                 &mut history,
+                &mut false,
+                &mut None,
                 &tools_registry,
                 &observer,
                 "mock-provider",
@@ -12999,6 +13256,8 @@ This is an example, not an invocation."#;
                 None,
                 &model_provider,
                 &mut history,
+                &mut false,
+                &mut None,
                 &tools_registry,
                 &observer,
                 "mock-provider",
@@ -15306,6 +15565,9 @@ Let me check the result."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -15342,6 +15604,7 @@ Let me check the result."#;
                     d.legacy_status().unwrap_or_default()
                 }
                 StreamDelta::Lifecycle(_) => String::new(),
+                StreamDelta::FlushBarrier(_) => String::new(),
             })
             .collect();
 
@@ -15494,6 +15757,9 @@ Let me check the result."#;
                         knobs: &LoopKnobs::default(),
                     },
                     history: &mut history,
+                    // Test transcripts start fresh: no prior trim, no crumb.
+                    history_has_trim_breadcrumb: &mut false,
+                    injected_memory_preamble: &mut None,
                     channel_name: "test",
                     channel_reply_target: None,
                     cancellation_token: None,
@@ -15611,13 +15877,24 @@ Let me check the result."#;
                         strict_tool_parsing: false,
                         parallel_tools: false,
                         max_tool_result_chars: 0,
+                        // The reported-budget enforcement projects the NEXT
+                        // request from the durable history at the calibration
+                        // ratio (reported 80 / estimated ~30 ≈ 2.7), which lands
+                        // just over a 100-token budget for the 5-message
+                        // post-response history. The budget here must sit above
+                        // that projected next request so the accepted 80-token
+                        // context fill does not force a projection-driven trim;
+                        // the `must not trim` contract below stays meaningful.
                         context_limits:
-                            zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(100),
+                            zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(120),
                         context_limits_resolver: None,
                         receipt_generator: None,
                         knobs: &LoopKnobs::default(),
                     },
                     history: &mut history,
+                    // Test transcripts start fresh: no prior trim, no crumb.
+                    history_has_trim_breadcrumb: &mut false,
+                    injected_memory_preamble: &mut None,
                     channel_name: "test",
                     channel_reply_target: None,
                     cancellation_token: None,
@@ -15828,6 +16105,8 @@ Let me check the result."#;
                         knobs: &LoopKnobs::default(),
                     },
                     history: &mut history,
+                    history_has_trim_breadcrumb: &mut false,
+                    injected_memory_preamble: &mut None,
                     channel_name: "test",
                     channel_reply_target: None,
                     cancellation_token: None,
@@ -15929,6 +16208,9 @@ Let me check the result."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -16052,6 +16334,9 @@ Let me check the result."#;
                         knobs: &LoopKnobs::default(),
                     },
                     history: &mut history,
+                    // Test transcripts start fresh: no prior trim, no crumb.
+                    history_has_trim_breadcrumb: &mut false,
+                    injected_memory_preamble: &mut None,
                     channel_name: "test",
                     channel_reply_target: None,
                     cancellation_token: None,
@@ -16150,6 +16435,9 @@ Let me check the result."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -16244,6 +16532,9 @@ Let me check the result."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -17730,6 +18021,9 @@ Let me check the result."#;
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -17753,6 +18047,1500 @@ Let me check the result."#;
 
         let events = capturing.events.lock();
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("cli"));
+    }
+
+    #[tokio::test]
+    async fn reported_budget_calibrates_against_the_post_hook_request_population() {
+        // Regression for the request-seam contract: `reported_population_estimated`
+        // must be snapshotted from the POST-hook `provider_request_messages` (the
+        // request actually passed to the provider), not the pre-hook
+        // `prepared_messages`. A `before_llm_call` hook that grows the request
+        // changes the population the provider reports `input_tokens` for; if the
+        // calibration denominator came from the smaller pre-hook population, the
+        // ratio (and therefore the emitted calibrated `tokens_after`) would be
+        // inflated. The provider below reports `input_tokens` proportional to the
+        // messages it actually received, so the emitted accounting must be tied to
+        // that post-hook population.
+        use crate::hooks::{HookHandler, HookResult, HookRunner};
+
+        struct GrowingRequestHook;
+
+        #[async_trait]
+        impl HookHandler for GrowingRequestHook {
+            fn name(&self) -> &str {
+                "grow-request"
+            }
+
+            async fn before_llm_call(
+                &self,
+                messages: &mut Vec<ChatMessage>,
+                _model: &mut String,
+            ) -> HookResult<()> {
+                messages.push(ChatMessage::assistant("z".repeat(3000)));
+                HookResult::Continue(())
+            }
+        }
+
+        struct PostHookReportingProvider {
+            received: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+        }
+
+        #[async_trait]
+        impl ModelProvider for PostHookReportingProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("chat_with_system should not be used in this test");
+            }
+
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                let post_hook_estimate = estimate_history_tokens(request.messages);
+                self.received
+                    .lock()
+                    .expect("received lock should be valid")
+                    .push(request.messages.to_vec());
+                Ok(ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: Some(zeroclaw_providers::traits::TokenUsage {
+                        input_tokens: Some(post_hook_estimate as u64 * 4),
+                        output_tokens: Some(10),
+                        cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
+                    }),
+                    reasoning_content: None,
+                })
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for PostHookReportingProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "PostHookReportingProvider"
+            }
+        }
+
+        let mut hooks = HookRunner::new();
+        hooks.register(Box::new(GrowingRequestHook));
+
+        let provider = PostHookReportingProvider {
+            received: Arc::new(Mutex::new(Vec::new())),
+        };
+        let received = Arc::clone(&provider.received);
+        let observer = NoopObserver;
+        // The OLDEST turn carries deliberately large content so the durable
+        // history's own raw size dominates the reported-budget trim target
+        // below; a droppable turn must exist and dropping it must matter,
+        // or the post-response enforcement seam under test never fires (see
+        // budget derivation below).
+        let big_first_turn = "x".repeat(4000);
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(format!("first request {big_first_turn}").as_str()),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::user("second request"),
+            ChatMessage::assistant("second answer"),
+        ];
+        // The preflight iteration-0 trim AND the pre-dispatch gate both run
+        // against `context_token_budget` before the reported-budget seam
+        // under test ever fires, so the budget must cover the FULL post-hook
+        // population (durable history plus the hook's growth) — otherwise
+        // the pre-dispatch gate fails the turn on a genuine floor before any
+        // request is dispatched. The provider then reports `input_tokens` at
+        // 4x that same post-hook population (`ratio == 4`), so the
+        // reported-budget trim target scales down to `budget / 4`. That
+        // target must still land BELOW the durable history's own raw size
+        // (dominated by `big_first_turn`) after the response, or nothing is
+        // left to trim and the seam under test never fires; the oldest turn
+        // is large enough that this holds with a comfortable margin.
+        let retained_estimate = estimate_history_tokens(&history);
+        let hook_growth_estimate =
+            estimate_history_tokens(&[ChatMessage::assistant("z".repeat(3000).as_str())]);
+        let budget = retained_estimate + hook_growth_estimate + 20;
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
+        let turn_id = uuid::Uuid::new_v4().to_string();
+
+        run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    dispatch_model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    Vec::new(),
+                ),
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 2,
+                hooks: Some(&hooks),
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_limits: test_context_limits(budget),
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: Some(event_tx),
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+            served_route_sink: None,
+        })
+        .await
+        .expect("tool loop should succeed");
+
+        // The hook grew the request, so the provider must have seen a materially
+        // larger population than the durable history alone.
+        let post_hook_estimate = received
+            .lock()
+            .expect("received lock should be valid")
+            .first()
+            .map(|messages| estimate_history_tokens(messages))
+            .expect("the provider must have received at least one request");
+        assert!(
+            post_hook_estimate > estimate_history_tokens(&history),
+            "the hook must have grown the request population for this regression \
+             (post-hook {post_hook_estimate} vs retained {})",
+            estimate_history_tokens(&history)
+        );
+
+        // The reported-budget trim must be tied to the post-hook population: the
+        // provider reported `4 * post_hook_estimate`, and the runtime's
+        // calibration denominator is the same post-hook population, so the emitted
+        // `tokens_after` is `estimate_history_tokens(retained) * 4`. If the
+        // denominator were the smaller pre-hook population, the ratio would be
+        // inflated and `tokens_after` would not match.
+        let mut trimmed_event = None;
+        while let Ok(event) = event_rx.try_recv() {
+            if let zeroclaw_api::agent::TurnEvent::HistoryTrimmed { .. } = event {
+                trimmed_event = Some(event);
+            }
+        }
+        let trimmed = trimmed_event
+            .expect("the reported-budget enforcement must emit a HistoryTrimmed event");
+        let tokens_after = match trimmed {
+            zeroclaw_api::agent::TurnEvent::HistoryTrimmed { tokens_after, .. } => {
+                tokens_after.expect("reported-budget trim must carry token accounting")
+            }
+            other => panic!("expected HistoryTrimmed, got {other:?}"),
+        };
+        let expected = (estimate_history_tokens(&history) as f64 * 4.0).round() as u64;
+        assert_eq!(
+            tokens_after, expected,
+            "tokens_after must be calibrated against the post-hook request population \
+             (expected estimate(retained) * 4 = {expected})"
+        );
+    }
+
+    /// A provider that records every dispatched request and answers with a
+    /// scripted XML tool call on the first dispatch (when `script_tool_call`)
+    /// and plain text after.
+    struct DispatchRecordingProvider {
+        dispatched: Arc<Mutex<Vec<(bool, String)>>>,
+        script_tool_call: bool,
+    }
+
+    #[async_trait]
+    impl ModelProvider for DispatchRecordingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in this test");
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let dispatch_index = {
+                let mut guard = self
+                    .dispatched
+                    .lock()
+                    .expect("dispatched lock should be valid");
+                guard.push((request.tools.is_some(), model.to_string()));
+                guard.len()
+            };
+            let text = if self.script_tool_call && dispatch_index == 1 {
+                r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"X"}}
+</tool_call>"#
+            } else {
+                "done"
+            };
+            Ok(ChatResponse {
+                text: Some(text.to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for DispatchRecordingProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "DispatchRecordingProvider"
+        }
+    }
+
+    #[tokio::test]
+    async fn stateful_before_llm_call_hook_runs_once_per_dispatched_request() {
+        // A modifying `before_llm_call` hook must be observed exactly once per
+        // dispatched request. The dispatch seam runs it before each provider
+        // call; budget enforcement never executes it as an estimation step.
+        use crate::hooks::{HookHandler, HookResult, HookRunner};
+
+        struct CountingHook(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl HookHandler for CountingHook {
+            fn name(&self) -> &str {
+                "count-before-llm"
+            }
+            async fn before_llm_call(
+                &self,
+                _messages: &mut Vec<ChatMessage>,
+                _model: &mut String,
+            ) -> HookResult<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                HookResult::Continue(())
+            }
+        }
+
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let mut hooks = HookRunner::new();
+        hooks.register(Box::new(CountingHook(Arc::clone(&hook_calls))));
+
+        let provider = DispatchRecordingProvider {
+            dispatched: Arc::new(Mutex::new(Vec::new())),
+            script_tool_call: true,
+        };
+        let dispatched = Arc::clone(&provider.dispatched);
+        let observer = NoopObserver;
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("run the tool once"),
+        ];
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&tool_calls)),
+            )]);
+        let (event_tx, _event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
+        let turn_id = uuid::Uuid::new_v4().to_string();
+
+        run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    dispatch_model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 3,
+                hooks: Some(&hooks),
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: Some(event_tx),
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+            served_route_sink: None,
+        })
+        .await
+        .expect("tool loop should succeed");
+
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            hook_calls.load(Ordering::SeqCst),
+            2,
+            "the stateful hook must run exactly once per dispatched request"
+        );
+        assert_eq!(hook_calls.load(Ordering::SeqCst), {
+            let guard = dispatched.lock().unwrap();
+            guard.len()
+        });
+    }
+
+    #[tokio::test]
+    async fn terminal_response_never_invokes_before_llm_call_for_estimation() {
+        // A terminal response dispatches exactly one request; no later budget
+        // projection may execute a `before_llm_call` hook for a request that
+        // will never be sent.
+        use crate::hooks::{HookHandler, HookResult, HookRunner};
+
+        struct CountingHook(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl HookHandler for CountingHook {
+            fn name(&self) -> &str {
+                "count-before-llm-terminal"
+            }
+            async fn before_llm_call(
+                &self,
+                _messages: &mut Vec<ChatMessage>,
+                _model: &mut String,
+            ) -> HookResult<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                HookResult::Continue(())
+            }
+        }
+
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let mut hooks = HookRunner::new();
+        hooks.register(Box::new(CountingHook(Arc::clone(&hook_calls))));
+
+        let provider = DispatchRecordingProvider {
+            dispatched: Arc::new(Mutex::new(Vec::new())),
+            script_tool_call: false,
+        };
+        let observer = NoopObserver;
+        let mut history = vec![ChatMessage::system("system"), ChatMessage::user("hello")];
+        let (event_tx, _event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
+        let turn_id = uuid::Uuid::new_v4().to_string();
+
+        let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    dispatch_model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    Vec::new(),
+                ),
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 2,
+                hooks: Some(&hooks),
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_limits: test_context_limits(100_000),
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: Some(event_tx),
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+            served_route_sink: None,
+        })
+        .await
+        .expect("tool loop should succeed");
+
+        assert_eq!(result, "done");
+        assert_eq!(
+            hook_calls.load(Ordering::SeqCst),
+            1,
+            "a single-shot turn must invoke the hook only for its one dispatched request"
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum HookBudgetScenario {
+        NativeToPlain,
+        NativeToPlainWithCalibration,
+        PlainToNativeTrim,
+        PlainToNativeFloor,
+        SameModelCalibrated,
+        SummaryTrim,
+        SummaryCalibrated,
+        SummaryFloor,
+    }
+
+    async fn assert_hook_selected_request_budget(scenario: HookBudgetScenario) {
+        use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
+        use crate::agent::turn::{ToolProtocolPrompts, scope_tool_protocol_prompts};
+        use crate::hooks::{HookHandler, HookResult, HookRunner};
+
+        struct SelectNextModel {
+            calls: Arc<AtomicUsize>,
+            next_model: &'static str,
+        }
+
+        #[async_trait]
+        impl HookHandler for SelectNextModel {
+            fn name(&self) -> &str {
+                "select-next-model"
+            }
+
+            async fn before_llm_call(
+                &self,
+                _messages: &mut Vec<ChatMessage>,
+                model: &mut String,
+            ) -> HookResult<()> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) >= 1 {
+                    *model = self.next_model.to_string();
+                }
+                HookResult::Continue(())
+            }
+        }
+
+        struct LargeSchemaTool {
+            result_chars: usize,
+        }
+
+        #[async_trait]
+        impl crate::tools::Tool for LargeSchemaTool {
+            fn name(&self) -> &str {
+                "budget_tool"
+            }
+            fn description(&self) -> &str {
+                "Return a bounded result"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "value": {"type": "string", "description": "schema".repeat(1000)}
+                    }
+                })
+            }
+            async fn execute(
+                &self,
+                _args: serde_json::Value,
+            ) -> anyhow::Result<crate::tools::ToolResult> {
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: "r".repeat(self.result_chars).into(),
+                    error: None,
+                })
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for LargeSchemaTool {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+            }
+            fn alias(&self) -> &str {
+                "budget_tool"
+            }
+        }
+
+        struct RecordedRequest {
+            model: String,
+            messages: Vec<ChatMessage>,
+            schema_tokens: usize,
+        }
+
+        struct ReportingProvider {
+            requests: Arc<Mutex<Vec<RecordedRequest>>>,
+            usage_multiplier: u64,
+        }
+
+        #[async_trait]
+        impl ModelProvider for ReportingProvider {
+            fn capabilities_for_model(&self, model: &str) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    native_tool_calling: model == "native-model",
+                    ..ProviderCapabilities::default()
+                }
+            }
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("test must exercise chat requests")
+            }
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                let schema_tokens = request
+                    .tools
+                    .map_or(0, crate::agent::history::estimate_tool_schema_tokens);
+                let estimated = estimate_history_tokens(request.messages) + schema_tokens;
+                let mut requests = self.requests.lock().unwrap();
+                let first = requests.is_empty();
+                requests.push(RecordedRequest {
+                    model: model.to_string(),
+                    messages: request.messages.to_vec(),
+                    schema_tokens,
+                });
+                let native_call = first && request.tools.is_some();
+                Ok(ChatResponse {
+                    text: if native_call {
+                        None
+                    } else if first {
+                        Some(
+                            r#"<tool_call>{"name":"budget_tool","arguments":{}}</tool_call>"#
+                                .to_string(),
+                        )
+                    } else {
+                        Some("done".to_string())
+                    },
+                    tool_calls: if native_call {
+                        vec![ToolCall {
+                            id: "budget-call".to_string(),
+                            name: "budget_tool".to_string(),
+                            arguments: "{}".to_string(),
+                            extra_content: None,
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    usage: first.then_some(zeroclaw_providers::traits::TokenUsage {
+                        input_tokens: Some(estimated as u64 * self.usage_multiplier),
+                        output_tokens: Some(10),
+                        cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
+                    }),
+                    reasoning_content: None,
+                })
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for ReportingProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::System
+            }
+            fn alias(&self) -> &str {
+                "budget-provider"
+            }
+        }
+
+        let (first_model, next_model, usage_multiplier) = match scenario {
+            HookBudgetScenario::NativeToPlain => ("native-model", "plain-model", 1),
+            HookBudgetScenario::NativeToPlainWithCalibration => ("native-model", "plain-model", 4),
+            HookBudgetScenario::PlainToNativeTrim | HookBudgetScenario::PlainToNativeFloor => {
+                ("plain-model", "native-model", 1)
+            }
+            HookBudgetScenario::SameModelCalibrated => ("plain-model", "plain-model", 2),
+            HookBudgetScenario::SummaryTrim | HookBudgetScenario::SummaryFloor => {
+                ("plain-model", "plain-model", 1)
+            }
+            HookBudgetScenario::SummaryCalibrated => ("plain-model", "plain-model", 2),
+        };
+        let summary = matches!(
+            scenario,
+            HookBudgetScenario::SummaryTrim
+                | HookBudgetScenario::SummaryCalibrated
+                | HookBudgetScenario::SummaryFloor
+        );
+        let calibrated = matches!(
+            scenario,
+            HookBudgetScenario::SameModelCalibrated | HookBudgetScenario::SummaryCalibrated
+        );
+        let native_prompt = format!("system\n{NATIVE_TOOLS_TASK_FRAMING}\n\n## Safety\nsafe");
+        let text_prompt =
+            format!("system\n{NO_TOOLS_TASK_FRAMING}\n\n## Tools\nbudget_tool\n\n## Safety\nsafe");
+        let mut history = vec![
+            ChatMessage::system(if first_model == "native-model" {
+                &native_prompt
+            } else {
+                &text_prompt
+            }),
+            ChatMessage::user(format!("retained older turn {}", "o".repeat(2400))),
+            ChatMessage::assistant("older answer"),
+            ChatMessage::user("run the tool once"),
+        ];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                LargeSchemaTool {
+                    result_chars: if matches!(scenario, HookBudgetScenario::SummaryFloor) {
+                        4000
+                    } else {
+                        1600
+                    },
+                },
+            )]);
+        let schema_tokens =
+            crate::agent::history::estimate_tool_schema_tokens(&[tools_registry[0].spec()]);
+        let initial_tokens = estimate_history_tokens(&history);
+        let result_tokens = estimate_history_tokens(&[ChatMessage::assistant("r".repeat(1600))]);
+        let budget = match scenario {
+            HookBudgetScenario::NativeToPlain
+            | HookBudgetScenario::NativeToPlainWithCalibration => {
+                initial_tokens + schema_tokens + 100
+            }
+            HookBudgetScenario::PlainToNativeTrim => schema_tokens + result_tokens + 200,
+            HookBudgetScenario::PlainToNativeFloor => schema_tokens - 1,
+            HookBudgetScenario::SameModelCalibrated => initial_tokens + result_tokens + 200,
+            HookBudgetScenario::SummaryTrim | HookBudgetScenario::SummaryFloor => {
+                initial_tokens + 50
+            }
+            HookBudgetScenario::SummaryCalibrated => initial_tokens + result_tokens + 300,
+        };
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let mut hooks = HookRunner::new();
+        hooks.register(Box::new(SelectNextModel {
+            calls: Arc::clone(&hook_calls),
+            next_model,
+        }));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = ReportingProvider {
+            requests: Arc::clone(&requests),
+            usage_multiplier,
+        };
+        let mut crumb_present = false;
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let result = scope_tool_protocol_prompts(
+            Arc::new(ToolProtocolPrompts::new(native_prompt, text_prompt)),
+            run_tool_call_loop(ToolLoop {
+                parent_agent_alias: None,
+                sop_reassembly: None,
+                exec: ResolvedAgentExecution {
+                    model_access: ResolvedModelAccess {
+                        model_provider: &provider,
+                        provider_name: "budget-provider",
+                        model: first_model,
+                        dispatch_model: first_model,
+                        temperature: Some(0.0),
+                    },
+                    tools_registry: &tools_registry,
+                    observer: &NoopObserver,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    config: None,
+                    max_tool_iterations: if summary { 1 } else { 3 },
+                    hooks: Some(&hooks),
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 0,
+                    context_limits: test_context_limits(budget),
+                    context_limits_resolver: None,
+                    receipt_generator: None,
+                    knobs: &LoopKnobs::default(),
+                },
+                history: &mut history,
+                history_has_trim_breadcrumb: &mut crumb_present,
+                injected_memory_preamble: &mut None,
+                channel_name: "test",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: Some(event_tx),
+                steering: None,
+                new_messages_out: None,
+                image_cache: None,
+                memory: None,
+                ingress: IngressContext::sub_turn(),
+                agent_alias: None,
+                turn_id: &turn_id,
+                served_route_sink: None,
+            }),
+        )
+        .await;
+
+        let floor = matches!(
+            scenario,
+            HookBudgetScenario::PlainToNativeFloor | HookBudgetScenario::SummaryFloor
+        );
+        let untrimmed = matches!(
+            scenario,
+            HookBudgetScenario::NativeToPlain | HookBudgetScenario::NativeToPlainWithCalibration
+        );
+        if floor {
+            assert!(result.is_err(), "an unsatisfiable request must fail");
+        } else {
+            let text = result.expect("request must fit");
+            if summary {
+                assert!(text.starts_with("done"));
+            } else {
+                assert_eq!(text, "done");
+            }
+        }
+        assert_eq!(
+            hook_calls.load(Ordering::SeqCst),
+            if summary { 1 } else { 2 },
+            "one hook per preparation"
+        );
+        let captured = requests.lock().unwrap();
+        assert_eq!(captured.len(), if floor { 1 } else { 2 });
+        assert_eq!(captured[0].model, first_model);
+        for request in captured.iter() {
+            let tokens = estimate_history_tokens(&request.messages) + request.schema_tokens;
+            assert!(
+                tokens <= budget,
+                "an oversized request reached the provider"
+            );
+        }
+        if !floor {
+            let next = &captured[1];
+            assert_eq!(next.model, next_model);
+            assert_eq!(next.schema_tokens > 0, next_model == "native-model");
+            assert_eq!(
+                next.messages
+                    .iter()
+                    .any(|m| m.content.starts_with("retained older turn")),
+                untrimmed,
+            );
+            let framing = if next_model == "native-model" {
+                NATIVE_TOOLS_TASK_FRAMING
+            } else {
+                NO_TOOLS_TASK_FRAMING
+            };
+            assert!(next.messages[0].content.contains(framing));
+            if calibrated {
+                assert!(
+                    (estimate_history_tokens(&next.messages) + next.schema_tokens) * 2 <= budget,
+                    "same-model usage must still constrain the next request"
+                );
+            }
+            if untrimmed {
+                assert!(
+                    estimate_history_tokens(&next.messages) + schema_tokens > budget,
+                    "the stale native-schema projection must exceed this test's budget"
+                );
+            }
+            if summary {
+                assert_eq!(next.schema_tokens, 0, "the summary is tools-free");
+                assert!(
+                    next.messages
+                        .last()
+                        .unwrap()
+                        .content
+                        .starts_with("You have reached")
+                );
+                assert!(
+                    next.messages
+                        .iter()
+                        .any(|m| m.content == "run the tool once")
+                );
+                assert!(
+                    next.messages
+                        .iter()
+                        .any(|m| m.content.contains(&"r".repeat(1600)))
+                );
+            }
+        }
+        assert!(
+            history.iter().any(|m| m.content == "run the tool once"),
+            "keep the newest real turn"
+        );
+        if summary && floor {
+            assert!(
+                history
+                    .iter()
+                    .any(|m| m.content.contains(&"r".repeat(4000)))
+            );
+            assert!(
+                !history
+                    .iter()
+                    .any(|m| m.content.starts_with("You have reached")),
+                "failed summary must not append a synthetic user turn"
+            );
+        }
+        assert_eq!(
+            history
+                .iter()
+                .any(|m| m.content.starts_with("retained older turn")),
+            untrimmed,
+        );
+        assert_eq!(crumb_present, !untrimmed);
+        let mut trims = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                tokens_after,
+                tokens_after_source,
+                unsatisfiable_floor,
+                ..
+            } = event
+            {
+                trims.push((tokens_after, tokens_after_source, unsatisfiable_floor));
+            }
+        }
+        assert_eq!(trims.len(), usize::from(!untrimmed));
+        if let Some((tokens_after, source, unsatisfiable)) = trims.first() {
+            assert_eq!(*unsatisfiable, floor.then_some(true));
+            assert_eq!(tokens_after.unwrap() > budget as u64, floor);
+            let expected_source = if calibrated {
+                zeroclaw_api::agent::TokenCountSource::Calibrated
+            } else {
+                zeroclaw_api::agent::TokenCountSource::Estimated
+            };
+            assert_eq!(*source, Some(expected_source));
+            if summary && !floor {
+                let actual =
+                    estimate_history_tokens(&captured[1].messages) as u64 * usage_multiplier;
+                assert_eq!(
+                    *tokens_after,
+                    Some(actual),
+                    "trim event must count the summary prompt too"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_native_to_plain_preserves_history_not_needed_for_schemas() {
+        assert_hook_selected_request_budget(HookBudgetScenario::NativeToPlain).await;
+        assert_hook_selected_request_budget(HookBudgetScenario::NativeToPlainWithCalibration).await;
+    }
+
+    #[tokio::test]
+    async fn hook_plain_to_native_trims_the_actual_next_request() {
+        assert_hook_selected_request_budget(HookBudgetScenario::PlainToNativeTrim).await;
+    }
+
+    #[tokio::test]
+    async fn hook_plain_to_native_floor_never_dispatches_oversized_request() {
+        assert_hook_selected_request_budget(HookBudgetScenario::PlainToNativeFloor).await;
+    }
+
+    #[tokio::test]
+    async fn next_request_keeps_same_model_reported_usage_calibration() {
+        assert_hook_selected_request_budget(HookBudgetScenario::SameModelCalibrated).await;
+    }
+
+    #[tokio::test]
+    async fn max_iteration_summary_trims_the_prepared_request() {
+        assert_hook_selected_request_budget(HookBudgetScenario::SummaryTrim).await;
+        assert_hook_selected_request_budget(HookBudgetScenario::SummaryCalibrated).await;
+    }
+
+    #[tokio::test]
+    async fn max_iteration_summary_floor_preserves_the_latest_real_turn() {
+        assert_hook_selected_request_budget(HookBudgetScenario::SummaryFloor).await;
+    }
+
+    #[tokio::test]
+    async fn stateful_varying_growth_hook_fails_the_turn_instead_of_dispatching_oversized_request()
+    {
+        // A STATEFUL `before_llm_call` hook whose growth varies by iteration:
+        // it adds nothing to the first request and a materially large message
+        // to the second. The pre-dispatch gate measures the EXACT population
+        // about to be sent at each seam; a genuine floor on the second
+        // dispatch must surface the explicit unsatisfiable-floor outcome AND
+        // fail the turn instead of sending the request the gate just
+        // declared unsatisfiable.
+        use crate::agent::turn::{ToolProtocolPrompts, scope_tool_protocol_prompts};
+        use crate::hooks::{HookHandler, HookResult, HookRunner};
+
+        struct GrowOnSecondCall(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl HookHandler for GrowOnSecondCall {
+            fn name(&self) -> &str {
+                "grow-on-second-call"
+            }
+            async fn before_llm_call(
+                &self,
+                messages: &mut Vec<ChatMessage>,
+                _model: &mut String,
+            ) -> HookResult<()> {
+                if self.0.fetch_add(1, Ordering::SeqCst) >= 1 {
+                    messages.push(ChatMessage::assistant("y".repeat(30_000)));
+                }
+                HookResult::Continue(())
+            }
+        }
+
+        #[derive(Default)]
+        struct CapturingProvider {
+            requests: Arc<Mutex<Vec<Vec<String>>>>,
+        }
+
+        #[async_trait]
+        impl ModelProvider for CapturingProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("chat_with_system should not be used in this test");
+            }
+
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                self.requests
+                    .lock()
+                    .expect("requests lock should be valid")
+                    .push(request.messages.iter().map(|m| m.content.clone()).collect());
+                let count = self.requests.lock().unwrap().len();
+                let text = if count == 1 {
+                    r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"X"}}
+</tool_call>"#
+                } else {
+                    "done"
+                };
+                Ok(ChatResponse {
+                    text: Some(text.to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for CapturingProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "CapturingProvider"
+            }
+        }
+
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let mut hooks = HookRunner::new();
+        hooks.register(Box::new(GrowOnSecondCall(Arc::clone(&hook_calls))));
+
+        let provider = CapturingProvider::default();
+        let requests = Arc::clone(&provider.requests);
+        let observer = NoopObserver;
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("run the tool once"),
+        ];
+        let mut crumb_present = false;
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&tool_calls)),
+            )]);
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let prompts = Arc::new(ToolProtocolPrompts::new(
+            "native prompt".to_string(),
+            "text prompt".to_string(),
+        ));
+
+        scope_tool_protocol_prompts(
+            prompts,
+            run_tool_call_loop(ToolLoop {
+                parent_agent_alias: None,
+                sop_reassembly: None,
+                exec: ResolvedAgentExecution {
+                    model_access: ResolvedModelAccess {
+                        model_provider: &provider,
+                        provider_name: "mock-provider",
+                        model: "plain-model",
+                        dispatch_model: "plain-model",
+                        temperature: Some(0.0),
+                    },
+                    tools_registry: &tools_registry,
+                    observer: &observer,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    config: None,
+                    max_tool_iterations: 3,
+                    hooks: Some(&hooks),
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 0,
+                    // Tight enough that the second request's hook-grown
+                    // population exceeds it, but comfortable for the first.
+                    context_limits: test_context_limits(2_000),
+                    context_limits_resolver: None,
+                    receipt_generator: None,
+                    knobs: &LoopKnobs::default(),
+                },
+                history: &mut history,
+                history_has_trim_breadcrumb: &mut crumb_present,
+                injected_memory_preamble: &mut None,
+                channel_name: "test",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: Some(event_tx),
+                steering: None,
+                new_messages_out: None,
+                image_cache: None,
+                memory: None,
+                ingress: IngressContext::sub_turn(),
+                agent_alias: None,
+                turn_id: &turn_id,
+                served_route_sink: None,
+            }),
+        )
+        .await
+        .expect_err("a genuine floor must fail the turn instead of dispatching");
+
+        let captured = requests.lock().unwrap().clone();
+        assert_eq!(
+            captured.len(),
+            1,
+            "the oversized second request must never reach the provider"
+        );
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 2);
+        assert!(
+            !captured[0].iter().any(|content| content.starts_with("yyy")),
+            "the first request must not carry the hook growth"
+        );
+
+        let mut saw_floor = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if let zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                unsatisfiable_floor: Some(true),
+                token_budget: Some(2_000),
+                ..
+            } = event
+            {
+                saw_floor = true;
+            }
+        }
+        assert!(
+            saw_floor,
+            "the suppressed oversized dispatch must still emit the explicit floor outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn genuine_floor_with_no_droppable_turn_never_dispatches() {
+        // A single oversized turn with nothing older to drop: the
+        // pre-dispatch gate's durable-history trim is a no-op, so the
+        // "no whole turn was ever droppable" branch fires directly. This
+        // must fail the turn before ever calling the provider, not dispatch
+        // the request it just declared unsatisfiable.
+        use crate::agent::turn::{ToolProtocolPrompts, scope_tool_protocol_prompts};
+
+        let provider = RecordingModelProvider::new();
+        let observer = NoopObserver;
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("x".repeat(20_000)),
+        ];
+        let mut crumb_present = false;
+        let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]);
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let prompts = Arc::new(ToolProtocolPrompts::new(
+            "native prompt".to_string(),
+            "text prompt".to_string(),
+        ));
+
+        let err = scope_tool_protocol_prompts(
+            prompts,
+            run_tool_call_loop(ToolLoop {
+                parent_agent_alias: None,
+                sop_reassembly: None,
+                exec: ResolvedAgentExecution {
+                    model_access: ResolvedModelAccess {
+                        model_provider: &provider,
+                        provider_name: "mock-provider",
+                        model: "plain-model",
+                        dispatch_model: "plain-model",
+                        temperature: Some(0.0),
+                    },
+                    tools_registry: &tools_registry,
+                    observer: &observer,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    config: None,
+                    max_tool_iterations: 3,
+                    hooks: None,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 0,
+                    // Small enough that the single existing turn alone
+                    // exceeds it, with no older turn to drop.
+                    context_limits: test_context_limits(100),
+                    context_limits_resolver: None,
+                    receipt_generator: None,
+                    knobs: &LoopKnobs::default(),
+                },
+                history: &mut history,
+                history_has_trim_breadcrumb: &mut crumb_present,
+                injected_memory_preamble: &mut None,
+                channel_name: "test",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: Some(event_tx),
+                steering: None,
+                new_messages_out: None,
+                image_cache: None,
+                memory: None,
+                ingress: IngressContext::sub_turn(),
+                agent_alias: None,
+                turn_id: &turn_id,
+                served_route_sink: None,
+            }),
+        )
+        .await
+        .expect_err("a genuine floor with nothing droppable must fail the turn");
+
+        assert!(
+            provider.requests.lock().unwrap().is_empty(),
+            "the provider must never be called once a genuine floor is proven"
+        );
+
+        let mut saw_floor = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if let zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                unsatisfiable_floor: Some(true),
+                dropped_messages: 0,
+                ..
+            } = event
+            {
+                saw_floor = true;
+            }
+        }
+        assert!(
+            saw_floor,
+            "the suppressed dispatch must still emit the explicit floor outcome"
+        );
+        assert!(
+            !err.to_string().is_empty(),
+            "the failed turn must carry a non-empty error message"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_an_old_multimodal_turn_does_not_report_a_false_floor() {
+        // The pre-dispatch gate's internal trim loop measures a raw
+        // marker-based estimate for durable history but reserves a "growth"
+        // delta computed against the ACTUAL post-preparation population
+        // (which expands `[IMAGE:...]` markers into real base64 payloads).
+        // When the image-bearing turn is the one dropped, that delta is
+        // stale: the image is gone, but the heuristic still reserves its
+        // size and can internally conclude the request is an unsatisfiable
+        // floor. The caller must re-measure the actually-rebuilt request
+        // (which no longer contains the dropped image) and must NOT surface
+        // a floor that the real, smaller request does not hit.
+
+        #[derive(Default)]
+        struct CapturingVisionProvider {
+            requests: Arc<Mutex<Vec<Vec<String>>>>,
+        }
+
+        #[async_trait]
+        impl ModelProvider for CapturingVisionProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("chat_with_system should not be used in this test");
+            }
+
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                self.requests
+                    .lock()
+                    .expect("requests lock should be valid")
+                    .push(request.messages.iter().map(|m| m.content.clone()).collect());
+                Ok(ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+
+            fn supports_vision(&self) -> bool {
+                // A vision-capable provider: the image marker is expanded in
+                // place rather than routed to a separate vision provider or
+                // stripped, matching the common case this bug affects.
+                true
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for CapturingVisionProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "CapturingVisionProvider"
+            }
+        }
+
+        use crate::agent::turn::{ToolProtocolPrompts, scope_tool_protocol_prompts};
+
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("shot.png");
+        // PNG signature plus filler bytes so the base64-expanded payload is
+        // large enough to dwarf the raw `[IMAGE:...]` marker text — the
+        // exact mismatch the gate's heuristic must not misattribute after
+        // the carrying turn is dropped.
+        let mut image_bytes = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        image_bytes.extend(std::iter::repeat_n(0u8, 3_000));
+        std::fs::write(&image_path, &image_bytes).unwrap();
+        let marker = format!("[IMAGE:{}]", image_path.display());
+
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(format!("old turn with an attachment {marker}")),
+            ChatMessage::assistant("ok".to_string()),
+            ChatMessage::user("run once, no attachment this time".to_string()),
+        ];
+        let mut crumb_present = false;
+        let mut image_cache = zeroclaw_providers::multimodal::LocalImageCache::new();
+
+        let provider = CapturingVisionProvider::default();
+        let requests = Arc::clone(&provider.requests);
+        let observer = NoopObserver;
+        let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]);
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let prompts = Arc::new(ToolProtocolPrompts::new(
+            "native prompt".to_string(),
+            "text prompt".to_string(),
+        ));
+
+        scope_tool_protocol_prompts(
+            prompts,
+            run_tool_call_loop(ToolLoop {
+                parent_agent_alias: None,
+                sop_reassembly: None,
+                exec: ResolvedAgentExecution {
+                    model_access: ResolvedModelAccess {
+                        model_provider: &provider,
+                        provider_name: "mock-provider",
+                        model: "plain-model",
+                        dispatch_model: "plain-model",
+                        temperature: Some(0.0),
+                    },
+                    tools_registry: &tools_registry,
+                    observer: &observer,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    config: None,
+                    max_tool_iterations: 3,
+                    hooks: None,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 0,
+                    // Between the image-expanded population (well over
+                    // 1,000 estimated tokens for a ~3KB attachment) and the
+                    // real rebuilt population once that turn is dropped
+                    // (well under 100 tokens for two short text messages).
+                    context_limits: test_context_limits(500),
+                    context_limits_resolver: None,
+                    receipt_generator: None,
+                    knobs: &LoopKnobs::default(),
+                },
+                history: &mut history,
+                history_has_trim_breadcrumb: &mut crumb_present,
+                injected_memory_preamble: &mut None,
+                channel_name: "test",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: Some(event_tx),
+                steering: None,
+                new_messages_out: None,
+                image_cache: Some(&mut image_cache),
+                memory: None,
+                ingress: IngressContext::sub_turn(),
+                agent_alias: None,
+                turn_id: &turn_id,
+                served_route_sink: None,
+            }),
+        )
+        .await
+        .expect("tool loop should succeed");
+
+        let captured = requests.lock().unwrap().clone();
+        assert_eq!(captured.len(), 1, "one iteration must dispatch one request");
+        assert!(
+            !captured[0]
+                .iter()
+                .any(|content| content.contains("old turn with an attachment")),
+            "the dispatched request must not contain the dropped old turn"
+        );
+
+        let mut saw_trim = false;
+        let mut saw_false_floor = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if let zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                unsatisfiable_floor,
+                dropped_messages,
+                ..
+            } = event
+            {
+                if dropped_messages > 0 {
+                    saw_trim = true;
+                }
+                if unsatisfiable_floor == Some(true) {
+                    saw_false_floor = true;
+                }
+            }
+        }
+        assert!(
+            saw_trim,
+            "the old image-bearing turn must actually be dropped"
+        );
+        assert!(
+            !saw_false_floor,
+            "the rebuilt request no longer carries the dropped image and fits \
+             the budget, so it must not be reported as an unsatisfiable floor"
+        );
     }
 
     #[tokio::test]
@@ -17781,6 +19569,8 @@ Let me check the result."#;
             None,
             &model_provider,
             &mut history,
+            &mut false,
+            &mut None,
             &tools_registry,
             observer.as_ref(),
             "mock-provider",
@@ -17835,6 +19625,8 @@ Let me check the result."#;
             None, // config: configless test
             &model_provider,
             &mut history,
+            &mut false,
+            &mut None,
             &tools_registry,
             capturing.as_ref(),
             "mock-provider",
@@ -17906,6 +19698,8 @@ Let me check the result."#;
             None, // config
             &model_provider,
             &mut history,
+            &mut false,
+            &mut None,
             &tools_registry,
             capturing.as_ref(),
             "mock-provider",

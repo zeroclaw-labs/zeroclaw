@@ -1300,7 +1300,12 @@ fn all_tools_with_runtime_on_thread(
                 );
             }
         }
-        // Add full browser automation tool (pluggable backend)
+    }
+
+    // Full browser automation (pluggable backend) is a separate opt-in from
+    // `browser_open`: it drives a real Chrome/Chromium session that may
+    // already be logged in, so `[browser] enabled` alone must not grant it.
+    if browser_config.automation_enabled {
         match BrowserTool::new_with_backend(
             security.clone(),
             browser_config.allowed_domains.clone(),
@@ -2291,10 +2296,10 @@ fn register_plugin_tools(
 
     for scope in admitted {
         let package = scope.id().package().to_string();
-        let Some((manifest, wasm_path)) = details
+        let Some((manifest, component)) = details
             .iter()
-            .copied()
             .find(|(manifest, _)| manifest.name == package)
+            .map(|(manifest, component)| (*manifest, *component))
         else {
             continue;
         };
@@ -2317,7 +2322,7 @@ fn register_plugin_tools(
         }
 
         let tool = zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
-            wasm_path.to_path_buf(),
+            component.clone(),
             scope,
             services.clone(),
             plugin_limits,
@@ -4137,6 +4142,7 @@ permissions = ["http_client"]
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
+        assert!(!names.contains(&"browser"));
         assert!(names.contains(&"schedule"));
         assert!(names.contains(&"model_routing_config"));
         assert!(names.contains(&"pushover"));
@@ -4240,10 +4246,114 @@ permissions = ["http_client"]
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
+        assert!(
+            !names.contains(&"browser"),
+            "[browser] enabled must gate browser_open only; full automation \
+             requires the separate automation_enabled opt-in"
+        );
         assert!(names.contains(&"content_search"));
         assert!(names.contains(&"model_routing_config"));
         assert!(names.contains(&"pushover"));
         assert!(names.contains(&"proxy_config"));
+    }
+
+    /// Opting into `[browser] automation_enabled` registers the full
+    /// `browser` automation tool alongside `browser_open`.
+    #[test]
+    fn all_tools_includes_browser_automation_when_opted_in() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig {
+            enabled: true,
+            automation_enabled: true,
+            allowed_domains: vec!["example.com".into()],
+            session_name: None,
+            ..BrowserConfig::default()
+        };
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
+
+        let tools = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+        )
+        .expect("browser automation tool registry builds")
+        .tools;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"browser_open"));
+        assert!(names.contains(&"browser"));
+    }
+
+    /// The two flags gate independently: automation can be registered
+    /// without `browser_open`, proving `automation_enabled` is the only
+    /// thing standing between an operator and the automation tool.
+    #[test]
+    fn all_tools_registers_automation_without_browser_open() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig {
+            enabled: false,
+            automation_enabled: true,
+            allowed_domains: vec!["example.com".into()],
+            session_name: None,
+            ..BrowserConfig::default()
+        };
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
+
+        let tools = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+        )
+        .expect("automation-only tool registry builds")
+        .tools;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(!names.contains(&"browser_open"));
+        assert!(names.contains(&"browser"));
     }
 
     #[tokio::test]

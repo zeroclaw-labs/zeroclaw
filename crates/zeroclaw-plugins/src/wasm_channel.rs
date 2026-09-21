@@ -15,10 +15,10 @@ use crate::component::{
     engine, load_component, wt, wt_instantiate,
 };
 use crate::endpoint::PluginChannelEndpoint;
+use crate::host::AdmittedComponent;
 use crate::services::PluginHostServices;
 use anyhow::Result;
 use async_trait::async_trait;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -176,7 +176,7 @@ impl WasmChannel {
     /// [`Channel::listen`].
     pub async fn from_wasm(
         endpoint: PluginChannelEndpoint,
-        wasm_path: &Path,
+        component: &AdmittedComponent,
         services: &PluginHostServices,
         limits: crate::component::PluginLimits,
         egress: Option<crate::egress::EgressHostService>,
@@ -191,7 +191,7 @@ impl WasmChannel {
         services.resolve_config(endpoint.scope())?;
         let inbound = InboundQueue::default();
         let factory = ChannelInstanceFactory {
-            component: Arc::new(load_component(wasm_path)?),
+            component: Arc::new(load_component(component)?),
             services: services.clone(),
             egress,
             limits,
@@ -1432,9 +1432,10 @@ mod tests {
                 "invalid-before-load".to_string(),
             ))
         }));
+        let component = AdmittedComponent::test_component(b"not-a-component");
         let result = WasmChannel::from_wasm(
             endpoint,
-            Path::new("/path/that/must/not/exist.wasm"),
+            &component,
             &services,
             crate::component::test_limits(0),
             None,

@@ -546,10 +546,10 @@ pub async fn configured_plugin_channels_with_webhooks(
 
         for scope in scopes {
             let package = scope.id().package().to_string();
-            let Some((manifest, wasm_path)) = details
+            let Some((manifest, component)) = details
                 .iter()
-                .copied()
                 .find(|(manifest, _)| manifest.name == package)
+                .map(|(manifest, component)| (*manifest, *component))
             else {
                 continue;
             };
@@ -578,7 +578,7 @@ pub async fn configured_plugin_channels_with_webhooks(
                 channel_sender_authorizer(Arc::clone(&config), live_config.clone(), alias.clone());
             match zeroclaw_plugins::wasm_channel::WasmChannel::from_wasm(
                 endpoint,
-                wasm_path,
+                component,
                 &host_services,
                 limits,
                 Some(egress_service.clone()),
