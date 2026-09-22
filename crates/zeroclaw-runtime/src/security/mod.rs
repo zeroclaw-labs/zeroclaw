@@ -29,6 +29,12 @@ pub mod prompt_guard;
 #[cfg(target_os = "macos")]
 pub mod seatbelt;
 pub mod secrets;
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    feature = "sandbox-bubblewrap"
+))]
+mod shell_identity;
 pub mod traits;
 pub mod vulnerability;
 #[cfg(feature = "webauthn")]
