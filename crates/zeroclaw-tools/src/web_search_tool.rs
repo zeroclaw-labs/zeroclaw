@@ -2,6 +2,7 @@ use super::web_search_provider_routing::{
     SearchStatus, WebSearchProviderRoute, resolve_web_search_provider,
 };
 use crate::helpers::response_body;
+use crate::i18n::{get_required_tool_string, get_required_tool_string_with_args};
 use crate::util_helpers::truncate_with_ellipsis;
 use async_trait::async_trait;
 use regex::Regex;
@@ -42,10 +43,73 @@ fn anysearch_config_parse_attrs(path: &Path, line: Option<usize>) -> serde_json:
 }
 
 fn anysearch_config_parse_error(path: &Path, line: Option<usize>) -> anyhow::Error {
-    let location = line.map_or_else(String::new, |line| format!(", line {line}"));
-    anyhow::Error::msg(format!(
-        "Failed to parse config file {} for AnySearch API key ({ANYSEARCH_CONFIG_PARSE_ERROR}{location})",
-        path.display()
+    let path = path.display().to_string();
+    let location = line.map_or_else(String::new, |line| {
+        let line = line.to_string();
+        get_required_tool_string_with_args(
+            "tool-web-search-tool-error-anysearch-config-parse-line",
+            &[("line", &line)],
+        )
+    });
+    anyhow::Error::msg(get_required_tool_string_with_args(
+        "tool-web-search-tool-error-anysearch-config-parse",
+        &[
+            ("path", &path),
+            ("error_code", ANYSEARCH_CONFIG_PARSE_ERROR),
+            ("location", &location),
+        ],
+    ))
+}
+
+fn anysearch_optional_string<'a>(
+    result: &'a serde_json::Value,
+    field: &str,
+) -> anyhow::Result<Option<&'a str>> {
+    match result.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(Some)
+            .ok_or_else(anysearch_invalid_response_error),
+    }
+}
+
+fn anysearch_result_url(result: &serde_json::Value) -> anyhow::Result<String> {
+    let Some(url) = anysearch_optional_string(result, "url")? else {
+        return Err(anysearch_invalid_response_error());
+    };
+    let url = url.trim();
+    if url.is_empty() || url.chars().any(char::is_control) {
+        return Err(anysearch_invalid_response_error());
+    }
+    let parsed = reqwest::Url::parse(url).map_err(|_| anysearch_invalid_response_error())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(anysearch_invalid_response_error());
+    }
+    Ok(url.to_owned())
+}
+
+fn validate_anysearch_result(result: &serde_json::Value) -> anyhow::Result<()> {
+    if !result.is_object() {
+        return Err(anysearch_invalid_response_error());
+    }
+    anysearch_result_url(result)?;
+    anysearch_optional_string(result, "title")?;
+    anysearch_optional_string(result, "content")?;
+    anysearch_optional_string(result, "snippet")?;
+    Ok(())
+}
+
+fn anysearch_invalid_response_error() -> anyhow::Error {
+    ::zeroclaw_log::record!(
+        ERROR,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({"search_provider": "anysearch"})),
+        "web_search: invalid AnySearch response"
+    );
+    anyhow::Error::msg(get_required_tool_string(
+        "tool-web-search-tool-error-anysearch-invalid-response",
     ))
 }
 
@@ -1068,9 +1132,11 @@ impl WebSearchTool {
                     })),
                 "web_search: failed to read config for AnySearch API key"
             );
-            anyhow::Error::msg(format!(
-                "Failed to read config file {} for AnySearch API key: {e}",
-                self.config_path.display()
+            let path = self.config_path.display().to_string();
+            let error = e.to_string();
+            anyhow::Error::msg(get_required_tool_string_with_args(
+                "tool-web-search-tool-error-anysearch-config-read",
+                &[("path", &path), ("error", &error)],
             ))
         })?;
 
@@ -1146,13 +1212,14 @@ impl WebSearchTool {
         let response_body =
             response_body::read_bounded(response, Some(ANYSEARCH_RESPONSE_LIMIT_BYTES)).await?;
         if response_body.overflowed {
-            anyhow::bail!(
-                "AnySearch response exceeds the {} byte size limit",
-                ANYSEARCH_RESPONSE_LIMIT_BYTES
-            );
+            let limit = ANYSEARCH_RESPONSE_LIMIT_BYTES.to_string();
+            return Err(anyhow::Error::msg(get_required_tool_string_with_args(
+                "tool-web-search-tool-error-anysearch-response-too-large",
+                &[("limit", &limit)],
+            )));
         }
         let json: serde_json::Value = serde_json::from_slice(&response_body.bytes)
-            .map_err(|_| anyhow::Error::msg("Invalid AnySearch API response"))?;
+            .map_err(|_| anysearch_invalid_response_error())?;
         self.parse_anysearch_results(&json, query)
     }
 
@@ -1161,50 +1228,56 @@ impl WebSearchTool {
         json: &serde_json::Value,
         query: &str,
     ) -> anyhow::Result<String> {
-        if let Some(code) = json.get("code").and_then(|code| code.as_i64())
-            && code != 0
-        {
+        let Some(code) = json.get("code").and_then(serde_json::Value::as_i64) else {
+            return Err(anysearch_invalid_response_error());
+        };
+        if code != 0 {
             let message = json
                 .get("message")
                 .and_then(|message| message.as_str())
-                .unwrap_or("(no message)");
-            anyhow::bail!(
-                "AnySearch returned error (code {code}): {}",
-                cap_provider_error(message)
-            );
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .map_or_else(
+                    || get_required_tool_string("tool-web-search-tool-anysearch-no-error-details"),
+                    ToOwned::to_owned,
+                );
+            let code = code.to_string();
+            let message = cap_provider_error(&message);
+            return Err(anyhow::Error::msg(get_required_tool_string_with_args(
+                "tool-web-search-tool-error-anysearch-api",
+                &[("code", &code), ("message", &message)],
+            )));
         }
 
         let results = json
             .get("data")
             .and_then(|data| data.get("results"))
             .and_then(|results| results.as_array())
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"search_provider": "anysearch"})),
-                    "web_search: invalid AnySearch response"
-                );
-                anyhow::Error::msg("Invalid AnySearch API response")
-            })?;
+            .ok_or_else(anysearch_invalid_response_error)?;
 
         if results.is_empty() {
             return Ok(no_results_message(query));
         }
 
+        for result in results {
+            validate_anysearch_result(result)?;
+        }
+
         let mut blocks = Vec::new();
         for (index, result) in results.iter().take(self.max_results).enumerate() {
-            let title = result
-                .get("title")
-                .and_then(|title| title.as_str())
-                .unwrap_or("No title");
-            let url = result.get("url").and_then(|url| url.as_str()).unwrap_or("");
-            let body = result
-                .get("content")
-                .and_then(|content| content.as_str())
-                .filter(|content| !content.is_empty())
-                .or_else(|| result.get("snippet").and_then(|snippet| snippet.as_str()))
+            let title = anysearch_optional_string(result, "title")?
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .map_or_else(
+                    || get_required_tool_string("tool-web-search-tool-anysearch-no-title"),
+                    ToOwned::to_owned,
+                );
+            let url = anysearch_result_url(result)?;
+            let content = anysearch_optional_string(result, "content")?;
+            let snippet = anysearch_optional_string(result, "snippet")?;
+            let body = content
+                .filter(|content| !content.trim().is_empty())
+                .or_else(|| snippet.filter(|snippet| !snippet.trim().is_empty()))
                 .unwrap_or("");
 
             let mut block = vec![format!("{}. {}", index + 1, title), format!("   {url}")];
@@ -3855,6 +3928,105 @@ mod tests {
                 .to_string()
                 .contains("Invalid AnySearch API response")
         );
+
+        for malformed in [
+            serde_json::json!({"data": {"results": []}}),
+            serde_json::json!({"code": "0", "data": {"results": []}}),
+            serde_json::json!({"code": 0, "data": {"results": [null]}}),
+        ] {
+            assert_eq!(
+                tool.parse_anysearch_results(&malformed, "rust")
+                    .unwrap_err()
+                    .to_string(),
+                get_required_tool_string("tool-web-search-tool-error-anysearch-invalid-response")
+            );
+        }
+
+        let missing_title = serde_json::json!({
+            "code": 0,
+            "data": {"results": [{"url": "https://example.com"}]}
+        });
+        assert!(
+            tool.parse_anysearch_results(&missing_title, "rust")
+                .unwrap()
+                .contains(&get_required_tool_string(
+                    "tool-web-search-tool-anysearch-no-title"
+                ))
+        );
+
+        let whitespace_fields = serde_json::json!({
+            "code": 0,
+            "data": {"results": [{
+                "title": " \t",
+                "url": " https://example.com/result ",
+                "content": " \r\n",
+                "snippet": "fallback snippet"
+            }]}
+        });
+        let rendered = tool
+            .parse_anysearch_results(&whitespace_fields, "rust")
+            .unwrap();
+        assert!(rendered.contains("No title"));
+        assert!(rendered.contains("https://example.com/result"));
+        assert!(rendered.contains("fallback snippet"));
+
+        let indented_content = "    alpha\n    beta";
+        let indented_response = serde_json::json!({
+            "code": 0,
+            "data": {"results": [{
+                "url": "https://example.com/indented",
+                "content": indented_content
+            }]}
+        });
+        let rendered = tool
+            .parse_anysearch_results(&indented_response, "rust")
+            .unwrap();
+        assert!(rendered.contains(&format!("   {indented_content}")));
+
+        for invalid_result in [
+            serde_json::json!({"title": "title", "url": 123}),
+            serde_json::json!({"title": 123, "url": "https://example.com"}),
+            serde_json::json!({"content": false, "url": "https://example.com"}),
+            serde_json::json!({"snippet": [], "url": "https://example.com"}),
+            serde_json::json!({"title": "title"}),
+            serde_json::json!({"title": "title", "url": "javascript:alert(1)"}),
+            serde_json::json!({"title": "title", "url": "https://example.com\nforged"}),
+            serde_json::json!({}),
+        ] {
+            let response = serde_json::json!({
+                "code": 0,
+                "data": {"results": [invalid_result]}
+            });
+            assert_eq!(
+                tool.parse_anysearch_results(&response, "rust")
+                    .unwrap_err()
+                    .to_string(),
+                get_required_tool_string("tool-web-search-tool-error-anysearch-invalid-response")
+            );
+        }
+
+        let mut beyond_limit_results = vec![
+            serde_json::json!({"title": "valid", "url": "https://example.com"});
+            tool.max_results
+        ];
+        beyond_limit_results.push(serde_json::json!({"title": "invalid"}));
+        let invalid_after_limit = serde_json::json!({
+            "code": 0,
+            "data": {"results": beyond_limit_results}
+        });
+        assert!(
+            tool.parse_anysearch_results(&invalid_after_limit, "rust")
+                .is_err()
+        );
+
+        for message in [serde_json::Value::Null, serde_json::json!(" \t\r\n")] {
+            let api_error = serde_json::json!({"code": 429, "message": message});
+            let error = tool
+                .parse_anysearch_results(&api_error, "rust")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("no error details"));
+        }
     }
 
     #[tokio::test]
