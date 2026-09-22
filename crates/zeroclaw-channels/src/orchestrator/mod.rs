@@ -3151,9 +3151,9 @@ fn normalize_peer_username(raw: &str) -> String {
     raw.trim_start_matches('@').to_ascii_lowercase()
 }
 
-/// Whether the inbound sender belongs to an `output_modality = "voice"` peer
-/// group on the channel the message arrived on. The answer travels to the
-/// channel as `SendMessage::force_voice` / `SendMessage::suppress_voice`.
+/// Whether the inbound sender's peer group on the channel the message arrived
+/// on wants this reply voiced. The answer travels to the channel as
+/// `SendMessage::force_voice` / `SendMessage::suppress_voice`.
 ///
 /// Returns a tri-state, not a bool, because "no opinion" and "no" must stay
 /// distinguishable:
@@ -3162,11 +3162,20 @@ fn normalize_peer_username(raw: &str) -> String {
 ///   voice-peer groups are configured for it, or a miss on Telegram must leave
 ///   the channel's input-driven voice mode in charge. The caller keeps the
 ///   channel's own fallback intact.
-/// - `Some(true)` — the sender matches a configured voice peer.
-/// - `Some(false)` — voice peers ARE configured for this channel and the
-///   sender is not among them. This is the authoritative negative: callers
-///   must not fall back to room membership, or a non-member sender in a room
-///   that also contains a voice-group member would incorrectly get voiced.
+/// - `Some(true)` — the sender matches a configured voice peer, or a Matrix
+///   `mirror` peer whose message was a voice note.
+/// - `Some(false)` — the sender is a Matrix `text` peer, a Matrix `mirror`
+///   peer whose message was text, or voice peers ARE configured for this
+///   channel and the sender is not among them. This is the authoritative
+///   negative: callers must not fall back to room membership, or a non-member
+///   sender in a room that also contains a voice-group member would
+///   incorrectly get voiced.
+///
+/// On Matrix the groups are consulted in the order `voice`, `text`, `mirror`,
+/// so a sender named by more than one gets the first match. A `mirror` verdict
+/// is `msg.voice_origin` — the inbound event's own voice flag, never the
+/// transcript or an earlier message in the room — so it is bound to this one
+/// message and cannot leak between senders or turns.
 ///
 /// The decision lives here because this is the only place that holds both the
 /// sender and the reply target. A channel that inspects its own outbound
@@ -3196,36 +3205,54 @@ fn sender_prefers_voice(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
 ) -> Option<bool> {
+    use zeroclaw_config::multi_agent::OutputModality;
+
     let channel_type = msg.channel.as_str();
     let matrix = channel_type.starts_with("matrix");
     if !(matrix || channel_type.starts_with("telegram")) {
         return None;
     }
     let channel_alias = msg.channel_alias.as_deref().unwrap_or(channel_type);
-    let voice_peers: Vec<String> = ctx
-        .prompt_config
-        .channel_voice_peers(channel_type, channel_alias)
-        .into_iter()
-        .map(|p| normalize_peer_username(&p))
-        .collect();
-    if voice_peers.is_empty() {
-        return None;
-    }
-    let identities = std::iter::once(normalize_peer_username(msg.sender.as_str())).chain(
-        msg.platform_sender_id
-            .as_deref()
-            .map(normalize_peer_username),
-    );
-    if identities.into_iter().any(|identity| {
-        crate::allowlist::is_user_allowed(
-            &voice_peers,
-            &identity,
-            crate::allowlist::Match::Sensitive,
+    let identities: Vec<String> = std::iter::once(normalize_peer_username(msg.sender.as_str()))
+        .chain(
+            msg.platform_sender_id
+                .as_deref()
+                .map(normalize_peer_username),
         )
-    }) {
+        .collect();
+    // The normalized peers of every group of `modality` on this channel.
+    let peers_of = |modality: OutputModality| -> Vec<String> {
+        ctx.prompt_config
+            .channel_modality_peers(channel_type, channel_alias, modality)
+            .into_iter()
+            .map(|p| normalize_peer_username(&p))
+            .collect()
+    };
+    // Whether `peers` names the sender; `false` for an unconfigured modality.
+    let names_sender = |peers: &[String]| -> bool {
+        !peers.is_empty()
+            && identities.iter().any(|identity| {
+                crate::allowlist::is_user_allowed(
+                    peers,
+                    identity,
+                    crate::allowlist::Match::Sensitive,
+                )
+            })
+    };
+    let voice_peers = peers_of(OutputModality::Voice);
+    if names_sender(&voice_peers) {
         return Some(true);
     }
-    matrix.then_some(false)
+    if !matrix {
+        return None;
+    }
+    if names_sender(&peers_of(OutputModality::Text)) {
+        return Some(false);
+    }
+    if names_sender(&peers_of(OutputModality::Mirror)) {
+        return Some(msg.voice_origin);
+    }
+    (!voice_peers.is_empty()).then_some(false)
 }
 
 /// Maps a [`sender_prefers_voice`] verdict to the
@@ -10175,16 +10202,17 @@ async fn process_channel_message_body(
             } else {
                 // No `send_via` override: the peer group the sender belongs to
                 // decides. A positive verdict sets `force_voice` with
-                // `suppress_voice` left `None` (a `text` group stays the
-                // channel default rather than an explicit override). A
-                // negative verdict is authoritative — the sender is known to
-                // be outside every voice group configured for this channel —
-                // so it is carried as an explicit `suppress_voice_override`
-                // rather than left to fall back to room-membership lookup,
-                // which would incorrectly voice a reply to a non-member
-                // sender in a room that also contains a voice-group member.
-                // `None` (no groups configured, or a non-Matrix channel)
-                // keeps that membership fallback intact.
+                // `suppress_voice` left `None`. A negative verdict is
+                // authoritative — the sender is a `text` peer, a `mirror` peer
+                // who sent text, or known to be outside every voice group
+                // configured for this channel — so it is carried as an
+                // explicit `suppress_voice_override` rather than left to fall
+                // back to room-membership lookup, which would incorrectly
+                // voice a reply to a non-member sender in a room that also
+                // contains a voice-group member. A Matrix `mirror` member's
+                // verdict follows the message's `voice_origin`. `None` (no
+                // groups configured, or a non-Matrix channel) keeps that
+                // membership fallback intact.
                 let (suppress, force_voice) =
                     voice_override_from_sender_verdict(sender_prefers_voice(&ctx, &msg));
                 (
@@ -11760,12 +11788,51 @@ pub fn channel_alias_configured(config: &Config, channel_type: &str, alias: &str
     }
 }
 
+/// The `peer_groups` key that holds bindings for `<channel_type>.<alias>`, or
+/// `None` when no group carries that ref yet.
+///
+/// For reporting where a binding lives. The writer selects its target by the
+/// group's `channel` field, so the conventional `<type>_<alias>` name is a
+/// guess that may name nothing at all.
+#[must_use]
+pub fn channel_peer_group_key(config: &Config, channel_type: &str, alias: &str) -> Option<String> {
+    crate::identity_persist::instance_group_key(config, channel_type, alias)
+}
+
+/// The `peer_groups` key that already authorizes `identity`, for reporting an
+/// `already_bound` result without guessing a name. Delegates to the
+/// crate-private `identity_persist::authorizing_group_key`.
+#[must_use]
+pub fn channel_authorizing_group_key(
+    config: &Config,
+    channel_type: &str,
+    alias: &str,
+    identity: &str,
+) -> Option<String> {
+    crate::identity_persist::authorizing_group_key(
+        config,
+        channel_type,
+        alias,
+        identity,
+        |entry, user| {
+            entry.trim().trim_start_matches('@').to_lowercase()
+                == user.trim().trim_start_matches('@').to_lowercase()
+        },
+    )
+}
+
 /// Add `identity` to the peer group bound to `<type>.<alias>` in-place.
 ///
-/// Returns `Ok(true)` when the identity was newly added, `Ok(false)` when it
-/// was already present. Pure config mutation — no disk write, no daemon
-/// restart — so it is the single core shared by the CLI
-/// (`bind_telegram_identity`) and the gateway bind endpoint. The `channel`
+/// Returns `Ok(Some(key))` naming the `peer_groups` key actually written when
+/// the identity was newly added, `Ok(None)` when it was already present, and
+/// `Err` when an `ignore` entry denies the identity, because neither of those
+/// answers would leave it admissible. Callers that report where the identity
+/// landed must use the returned key: the writer selects its target by the
+/// group's `channel` field, so a custom key such as `[peer_groups.ops]` is a
+/// legitimate destination and the conventional `<type>_<alias>` name may not
+/// exist at all. Pure config
+/// mutation — no disk write, no daemon restart — so it is the single core
+/// shared by the CLI (`bind_telegram_identity`) and the gateway bind endpoint. The `channel`
 /// field is the dotted `<type>.<alias>` ref so authorization stays scoped to
 /// the bound alias; a bare type would broaden the peer across every alias of
 /// that type.
@@ -11774,10 +11841,7 @@ pub fn bind_channel_identity_into(
     channel_type: &str,
     alias: &str,
     identity: &str,
-) -> Result<bool> {
-    use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
-    use zeroclaw_config::providers::ChannelRef;
-
+) -> Result<Option<String>> {
     let Some(normalize) = channel_identity_normalizer(channel_type) else {
         anyhow::bail!(
             "Channel type `{channel_type}` does not support identity binding \
@@ -11802,31 +11866,29 @@ pub fn bind_channel_identity_into(
         );
     }
 
-    let group_name = format!("{channel_type}_{alias}");
-    let channel_ref = format!("{channel_type}.{alias}");
-    let group = config
-        .peer_groups
-        .entry(group_name)
-        .or_insert_with(|| PeerGroupConfig {
-            channel: ChannelRef::new(channel_ref),
-            ..PeerGroupConfig::default()
-        });
-
-    if group
-        .external_peers
-        .iter()
-        .any(|p| normalize(p.as_str()) == normalized)
-    {
-        return Ok(false);
-    }
-
-    group.external_peers.push(PeerUsername::new(normalized));
-    Ok(true)
+    // Everything after the closed-set and alias gates is the shared paired
+    // identity write, so it goes through the one writer that selects its target
+    // the way the runtime reader selects it: by the group's `channel` field,
+    // never by the `peer_groups` map key. Keys are arbitrary, so a group keyed
+    // `telegram_alerts` may carry `channel = "telegram.other"`; opening it by
+    // key wrote the grant where this channel's reader never looks while another
+    // channel's reader picked it up, and still reported success.
+    crate::identity_persist::merge_external_peer(
+        config,
+        channel_type,
+        alias,
+        &normalized,
+        |entry, identity| normalize(entry) == normalize(identity),
+    )
 }
 
 /// Telegram-specific thin wrapper over [`bind_channel_identity_into`], kept
 /// for the CLI entry point and its unit tests.
-fn bind_telegram_identity_into(config: &mut Config, identity: &str, alias: &str) -> Result<bool> {
+fn bind_telegram_identity_into(
+    config: &mut Config,
+    identity: &str,
+    alias: &str,
+) -> Result<Option<String>> {
     bind_channel_identity_into(config, "telegram", alias, identity)
 }
 
@@ -11834,7 +11896,7 @@ pub async fn bind_telegram_identity(config: &Config, identity: &str, alias: &str
     let normalized = normalize_telegram_identity(identity);
     let mut updated = config.clone();
 
-    if !bind_telegram_identity_into(&mut updated, identity, alias)? {
+    if bind_telegram_identity_into(&mut updated, identity, alias)?.is_none() {
         println!("✅ Telegram identity already bound to telegram.{alias}: {normalized}");
         return Ok(());
     }
@@ -12456,8 +12518,7 @@ fn build_channel_by_id(
                 let snapshot = wc.clone();
                 Arc::new(move || {
                     let config = cfg_arc.read();
-                    let mut external_peers = config.channel_external_peers("wecom-ws", &alias);
-                    external_peers.extend(config.channel_external_peers("wecom_ws", &alias));
+                    let external_peers = wecom_ws_external_peers(&config, &alias);
 
                     if let Some(wc_ws) = config.channels.wecom_ws.get(&alias) {
                         WeComWsRuntimePolicy::from_config(wc_ws, external_peers)
@@ -12905,6 +12966,18 @@ struct ConfiguredChannel {
     channel: Arc<dyn Channel>,
 }
 
+/// The resolved peer policy for a WeCom WebSocket alias.
+///
+/// This channel is written both `wecom-ws` and `wecom_ws` in `peer_groups`, and
+/// every startup path has to resolve both spellings in one pass: resolving them
+/// separately and concatenating leaves a wildcard under one spelling unaware of
+/// an `ignore` under the other. Named once so the one-shot and normal startup
+/// paths cannot answer this differently again.
+#[cfg(feature = "channel-wecom-ws")]
+pub(crate) fn wecom_ws_external_peers(config: &Config, alias: &str) -> Vec<String> {
+    config.channel_external_peers_for(&["wecom-ws", "wecom_ws"], alias)
+}
+
 /// Fold constructed channel plugins into the configured-channel set.
 ///
 /// Plugin channels join the ordinary set rather than getting a lifecycle of
@@ -13342,6 +13415,15 @@ fn matrix_state_dir(config_path: &std::path::Path, alias: &str) -> std::path::Pa
         .parent()
         .map(|p| p.join("state").join("matrix").join(alias))
         .unwrap_or_else(|| std::path::PathBuf::from(".zeroclaw/state/matrix").join(alias))
+}
+
+#[cfg(any(feature = "channel-bluesky", feature = "channel-reddit"))]
+fn live_external_peer_resolver(
+    config: Arc<RwLock<Config>>,
+    channel_type: &'static str,
+    alias: String,
+) -> Arc<dyn Fn() -> Vec<String> + Send + Sync> {
+    Arc::new(move || config.read().channel_external_peers(channel_type, &alias))
 }
 
 /// Build the Matrix channel for `[channels.matrix.<alias>]` with every
@@ -14626,8 +14708,7 @@ fn collect_configured_channels(
             let snapshot = wc_ws.clone();
             Arc::new(move || {
                 let config = cfg_arc.read();
-                let mut external_peers = config.channel_external_peers("wecom-ws", &alias);
-                external_peers.extend(config.channel_external_peers("wecom_ws", &alias));
+                let external_peers = wecom_ws_external_peers(&config, &alias);
 
                 if let Some(wc_ws) = config.channels.wecom_ws.get(&alias) {
                     WeComWsRuntimePolicy::from_config(wc_ws, external_peers)
@@ -14803,6 +14884,8 @@ fn collect_configured_channels(
         if !rd.enabled {
             continue;
         }
+        let peer_resolver =
+            live_external_peer_resolver(Arc::clone(config_arc), "reddit", alias.clone());
         channels.push(ConfiguredChannel {
             display_name: "Reddit",
             alias: Some(alias.clone()),
@@ -14813,6 +14896,7 @@ fn collect_configured_channels(
                 rd.refresh_token.clone(),
                 rd.username.clone(),
                 rd.subreddits.clone(),
+                peer_resolver,
             )),
         });
     }
@@ -14836,6 +14920,8 @@ fn collect_configured_channels(
         if !bs.enabled {
             continue;
         }
+        let peer_resolver =
+            live_external_peer_resolver(Arc::clone(config_arc), "bluesky", alias.clone());
         channels.push(ConfiguredChannel {
             display_name: "Bluesky",
             alias: Some(alias.clone()),
@@ -14843,6 +14929,7 @@ fn collect_configured_channels(
                 alias.clone(),
                 bs.handle.clone(),
                 bs.app_password.clone(),
+                peer_resolver,
             )),
         });
     }
@@ -18288,6 +18375,51 @@ pub(crate) mod tests {
     const ASSEMBLY_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
     use zeroclaw_runtime::agent::loop_::apply_policy_tool_filter;
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
+
+    #[cfg(feature = "channel-reddit")]
+    #[test]
+    fn reddit_peer_resolver_uses_the_production_alias() {
+        let config: Config = toml::from_str(
+            r#"
+            [peer_groups.ops]
+            channel = "reddit.ops"
+            external_peers = ["authorized-redditor"]
+
+            [peer_groups.other]
+            channel = "reddit.other"
+            external_peers = ["wrong-redditor"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+        let resolver =
+            live_external_peer_resolver(Arc::new(RwLock::new(config)), "reddit", "ops".to_string());
+
+        assert_eq!(resolver(), vec!["authorized-redditor".to_string()]);
+    }
+
+    #[cfg(feature = "channel-bluesky")]
+    #[test]
+    fn bluesky_peer_resolver_uses_the_production_alias() {
+        let config: Config = toml::from_str(
+            r#"
+            [peer_groups.work]
+            channel = "bluesky.work"
+            external_peers = ["allowed.bsky.social"]
+
+            [peer_groups.other]
+            channel = "bluesky.other"
+            external_peers = ["wrong.bsky.social"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+        let resolver = live_external_peer_resolver(
+            Arc::new(RwLock::new(config)),
+            "bluesky",
+            "work".to_string(),
+        );
+
+        assert_eq!(resolver(), vec!["allowed.bsky.social".to_string()]);
+    }
 
     fn source_block_after<'a>(
         source: &'a str,
@@ -22711,7 +22843,8 @@ api_key = "anthropic-key"
     /// delivery flags (`suppress_voice`, `force_voice`) and not only on
     /// recipient and text. `telegram(drafts)` names it `telegram` and, when
     /// asked, advertises draft support so a test can drive the streaming
-    /// finalization arm as well as the plain send.
+    /// finalization arm as well as the plain send; `matrix()` names it
+    /// `matrix` for the plain send.
     struct SendMessageRecordingChannel {
         channel_name: &'static str,
         drafts: bool,
@@ -22737,6 +22870,13 @@ api_key = "anthropic-key"
             Self {
                 channel_name: "telegram",
                 drafts,
+                ..Self::default()
+            }
+        }
+
+        fn matrix() -> Self {
+            Self {
+                channel_name: "matrix",
                 ..Self::default()
             }
         }
@@ -38850,6 +38990,30 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
+    fn text_peer_group(
+        channel: &str,
+        members: &[&str],
+    ) -> zeroclaw_config::multi_agent::PeerGroupConfig {
+        use zeroclaw_config::multi_agent::OutputModality;
+        zeroclaw_config::multi_agent::PeerGroupConfig {
+            output_modality: OutputModality::Text,
+            ..peer_group(channel, members, false)
+        }
+    }
+
+    /// `mirror` is the default modality, so this is what a `[peer_groups.*]`
+    /// entry without an explicit `output_modality` resolves to.
+    fn mirror_peer_group(
+        channel: &str,
+        members: &[&str],
+    ) -> zeroclaw_config::multi_agent::PeerGroupConfig {
+        use zeroclaw_config::multi_agent::OutputModality;
+        zeroclaw_config::multi_agent::PeerGroupConfig {
+            output_modality: OutputModality::Mirror,
+            ..peer_group(channel, members, false)
+        }
+    }
+
     /// A Matrix reply is addressed to `!room:server`, while the peer group
     /// names `@user:server`. Resolving the modality here — where the inbound
     /// sender is still in hand — is what makes a user-ID voice group work.
@@ -38861,6 +39025,15 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_alias: Some("default".into()),
             content: "hello".into(),
             ..Default::default()
+        }
+    }
+
+    /// The same message as a voice note: the Matrix inbound handler sets
+    /// `voice_origin` from the event's own MSC3245 flag.
+    fn matrix_voice_msg(sender: &str) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            voice_origin: true,
+            ..matrix_msg(sender)
         }
     }
 
@@ -39249,6 +39422,138 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    /// A Matrix room message from a sender the mirror group names, as the
+    /// inbound handler forwards it.
+    fn matrix_room_message(
+        sender: &str,
+        voice_origin: bool,
+    ) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            id: "$event-1:server".to_string(),
+            timestamp: 1,
+            voice_origin,
+            ..matrix_msg(sender)
+        }
+    }
+
+    /// Drives the real dispatch and reply-delivery path with a mirror group
+    /// that names the sender.
+    fn matrix_mirror_delivery_ctx(
+        channel: Arc<dyn Channel>,
+        model_provider: Arc<dyn ModelProvider>,
+        tools: Vec<Box<dyn Tool>>,
+    ) -> Arc<ChannelRuntimeContext> {
+        let mut peer_groups = HashMap::new();
+        peer_groups.insert(
+            "family".to_string(),
+            mirror_peer_group("matrix.default", &["@alice:server"]),
+        );
+        test_runtime_ctx_with_observer_and_tools(
+            channel,
+            model_provider,
+            zeroclaw_config::schema::Config {
+                peer_groups,
+                ..Default::default()
+            },
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+            Arc::new(NoopObserver),
+            tools,
+        )
+    }
+
+    #[tokio::test]
+    async fn matrix_mirror_voice_origin_is_force_voiced_on_delivery() {
+        let channel_impl = Arc::new(SendMessageRecordingChannel::matrix());
+        let ctx = matrix_mirror_delivery_ctx(
+            channel_impl.clone(),
+            Arc::new(DummyModelProvider),
+            Vec::new(),
+        );
+
+        process_channel_message(
+            ctx,
+            matrix_room_message("@alice:server", true),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        let reply = delivered_reply(sent.as_slice(), "!room:server");
+        assert!(
+            reply.force_voice,
+            "a mirror member's voice note must be answered with voice, got {reply:?}"
+        );
+        assert!(
+            !reply.suppress_voice,
+            "a voice-origin mirror reply must not be suppressed, got {reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_mirror_text_origin_stays_text_on_delivery() {
+        let channel_impl = Arc::new(SendMessageRecordingChannel::matrix());
+        let ctx = matrix_mirror_delivery_ctx(
+            channel_impl.clone(),
+            Arc::new(DummyModelProvider),
+            Vec::new(),
+        );
+
+        process_channel_message(
+            ctx,
+            matrix_room_message("@alice:server", false),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        let reply = delivered_reply(sent.as_slice(), "!room:server");
+        assert!(
+            !reply.force_voice,
+            "a mirror member's text message must not be voiced, got {reply:?}"
+        );
+        assert!(
+            reply.suppress_voice,
+            "a text-origin mirror reply is an explicit suppression, got {reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_explicit_text_override_beats_a_mirror_voice_origin() {
+        let channel_impl = Arc::new(SendMessageRecordingChannel::matrix());
+        let send_via = tools::SendViaTool::new(
+            Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+            Arc::new(parking_lot::RwLock::new(
+                HashMap::<String, Arc<dyn Channel>>::new(),
+            )),
+            Arc::new(HashMap::<String, zeroclaw_config::multi_agent::PeerGroupConfig>::new),
+        );
+        let ctx = matrix_mirror_delivery_ctx(
+            channel_impl.clone(),
+            Arc::new(SendViaTextRoutingProvider),
+            vec![Box::new(send_via)],
+        );
+
+        process_channel_message(
+            ctx,
+            matrix_room_message("@alice:server", true),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        let reply = delivered_reply(sent.as_slice(), "!room:server");
+        assert!(
+            reply.suppress_voice,
+            "the explicit text override must win over the voice-origin mirror verdict, got {reply:?}"
+        );
+        assert!(
+            !reply.force_voice,
+            "the explicit text override must not force voice, got {reply:?}"
+        );
+    }
+
     #[test]
     fn matrix_voice_group_member_gets_a_voiced_reply_by_user_id() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -39326,6 +39631,38 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    /// The mirror counterpart of the composition above: a mirror member's
+    /// voice note reaches the channel as `force_voice`, and their text message
+    /// as an explicit suppression.
+    #[test]
+    fn a_mirror_matrix_sender_composes_to_the_message_origin() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "family".into(),
+            mirror_peer_group("matrix.default", &["@alice:server"]),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert_eq!(
+            voice_override_from_sender_verdict(sender_prefers_voice(
+                &ctx,
+                &matrix_voice_msg("@alice:server")
+            )),
+            (None, true),
+            "a mirror member's voice note forces voice with membership fallback intact"
+        );
+        assert_eq!(
+            voice_override_from_sender_verdict(sender_prefers_voice(
+                &ctx,
+                &matrix_msg("@alice:server")
+            )),
+            (Some(true), false),
+            "a mirror member's text message must reach the channel as an explicit \
+             suppression, or `should_voice` falls back to room membership"
+        );
+    }
+
     #[test]
     fn matrix_voice_group_wildcard_voices_every_sender() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -39355,24 +39692,168 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    /// A `mirror` member's verdict is the inbound event's own voice flag, so
+    /// a voice note is answered with voice and a text message with text.
     #[test]
-    fn a_mirror_peer_group_does_not_voice() {
-        // `mirror` is the default modality and Matrix does not implement it;
-        // only an explicit `voice` group speaks. Because `channel_voice_peers`
-        // filters non-voice groups out entirely, this is "no voice groups
-        // configured" (`None`), not "sender rejected by a voice group"
-        // (`Some(false)`).
+    fn matrix_mirror_group_member_mirrors_the_message_origin() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut groups = std::collections::HashMap::new();
         groups.insert(
             "family".into(),
-            peer_group("matrix.default", &["@alice:server"], false),
+            mirror_peer_group("matrix.default", &["@alice:server"]),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert_eq!(
+            sender_prefers_voice(&ctx, &matrix_voice_msg("@alice:server")),
+            Some(true),
+            "a mirror member's voice note is answered with voice"
+        );
+        assert_eq!(
+            sender_prefers_voice(&ctx, &matrix_msg("@alice:server")),
+            Some(false),
+            "a mirror member's text message is answered with text, as an explicit \
+             suppression so room membership cannot voice it"
+        );
+    }
+
+    /// `voice` and `text` groups are fixed modalities: the message's origin
+    /// does not move them.
+    #[test]
+    fn matrix_voice_and_text_groups_ignore_the_message_origin() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "always_voice".into(),
+            voice_peer_group("matrix.default", &["@alice:server"]),
+        );
+        groups.insert(
+            "always_text".into(),
+            text_peer_group("matrix.default", &["@bob:server"]),
         );
         let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
 
         assert_eq!(
             sender_prefers_voice(&ctx, &matrix_msg("@alice:server")),
-            None
+            Some(true),
+            "a voice member's text message is still voiced"
+        );
+        assert_eq!(
+            sender_prefers_voice(&ctx, &matrix_voice_msg("@bob:server")),
+            Some(false),
+            "a text member's voice note is still answered in text"
+        );
+    }
+
+    /// The verdict is bound to the one message it was computed for: a
+    /// member's voice note does not voice a non-member's reply in the same
+    /// room, nor the member's own next text message.
+    #[test]
+    fn matrix_mirror_verdicts_do_not_leak_between_senders_or_messages() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "family".into(),
+            mirror_peer_group("matrix.default", &["@alice:server"]),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert_eq!(
+            sender_prefers_voice(&ctx, &matrix_voice_msg("@alice:server")),
+            Some(true)
+        );
+        assert_eq!(
+            sender_prefers_voice(&ctx, &matrix_msg("@bob:server")),
+            None,
+            "a non-member in the same room keeps 'no opinion' when the channel \
+             has no voice group"
+        );
+        assert_eq!(
+            sender_prefers_voice(&ctx, &matrix_msg("@alice:server")),
+            Some(false),
+            "the member's next text message is answered in text"
+        );
+
+        // With a voice group also configured, the non-member gets the
+        // authoritative negative that every non-member on the channel gets.
+        let tmp2 = tempfile::TempDir::new().unwrap();
+        let mut groups2 = std::collections::HashMap::new();
+        groups2.insert(
+            "family".into(),
+            mirror_peer_group("matrix.default", &["@alice:server"]),
+        );
+        groups2.insert(
+            "always_voice".into(),
+            voice_peer_group("matrix.default", &["@carol:server"]),
+        );
+        let ctx2 = channel_runtime_context_with_peer_groups(tmp2.path(), groups2);
+
+        assert_eq!(
+            sender_prefers_voice(&ctx2, &matrix_voice_msg("@alice:server")),
+            Some(true)
+        );
+        assert_eq!(
+            sender_prefers_voice(&ctx2, &matrix_msg("@bob:server")),
+            Some(false),
+            "a non-member is an authoritative negative once a voice group exists"
+        );
+        assert_eq!(
+            sender_prefers_voice(&ctx2, &matrix_msg("@alice:server")),
+            Some(false)
+        );
+    }
+
+    /// A sender named by an explicit `voice` or `text` group and by a `mirror`
+    /// group gets the explicit modality: `voice` first, then `text`, then
+    /// `mirror`, whatever the message's origin.
+    #[test]
+    fn explicit_modalities_beat_a_mirror_membership() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "family".into(),
+            mirror_peer_group("matrix.default", &["@alice:server", "@bob:server"]),
+        );
+        groups.insert(
+            "always_voice".into(),
+            voice_peer_group("matrix.default", &["@alice:server"]),
+        );
+        groups.insert(
+            "always_text".into(),
+            text_peer_group("matrix.default", &["@bob:server"]),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert_eq!(
+            sender_prefers_voice(&ctx, &matrix_msg("@alice:server")),
+            Some(true),
+            "voice membership voices a text message despite the mirror membership"
+        );
+        assert_eq!(
+            sender_prefers_voice(&ctx, &matrix_voice_msg("@bob:server")),
+            Some(false),
+            "text membership keeps a voice note in text despite the mirror membership"
+        );
+    }
+
+    /// Mirror resolution is Matrix-only: another channel's mirror group is
+    /// left to that channel's own input-driven modality.
+    #[test]
+    fn mirror_groups_on_other_channels_are_not_answered_here() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "family".into(),
+            mirror_peer_group("telegram.default", &["@alice"]),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        let mut msg = telegram_msg("@alice");
+        msg.voice_origin = true;
+        assert_eq!(
+            sender_prefers_voice(&ctx, &msg),
+            None,
+            "a Telegram mirror member's voice note is 'no opinion'"
         );
     }
 
@@ -42954,6 +43435,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 subject: None,
                 internal_sop_event: None,
                 references: Vec::new(),
+                voice_origin: false,
             },
             CancellationToken::new(),
         )
@@ -46141,6 +46623,7 @@ This is an example JSON object for profile settings."#;
                 subject: None,
                 internal_sop_event: None,
                 references: Vec::new(),
+                voice_origin: false,
             },
             CancellationToken::new(),
         )
@@ -47826,7 +48309,7 @@ This is an example JSON object for profile settings."#;
     fn bind_telegram_into_non_default_alias_is_resolvable() {
         let mut config = config_with_telegram_alias("alerts");
         let newly = bind_telegram_identity_into(&mut config, "123456789", "alerts").unwrap();
-        assert!(newly, "first bind should report newly added");
+        assert!(newly.is_some(), "first bind should report newly added");
         // The live resolver the channel uses must now see the identity.
         assert!(
             config
@@ -47867,9 +48350,15 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn bind_telegram_into_is_idempotent() {
         let mut config = config_with_telegram_alias("alerts");
-        assert!(bind_telegram_identity_into(&mut config, "123", "alerts").unwrap());
         assert!(
-            !bind_telegram_identity_into(&mut config, "123", "alerts").unwrap(),
+            bind_telegram_identity_into(&mut config, "123", "alerts")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            bind_telegram_identity_into(&mut config, "123", "alerts")
+                .unwrap()
+                .is_none(),
             "second bind of same identity should report already present"
         );
         assert_eq!(
@@ -47904,7 +48393,11 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn bind_channel_into_uses_scoped_dotted_channel_ref() {
         let mut config = config_with_telegram_alias("alerts");
-        assert!(bind_channel_identity_into(&mut config, "telegram", "alerts", "@user").unwrap());
+        assert!(
+            bind_channel_identity_into(&mut config, "telegram", "alerts", "@user")
+                .unwrap()
+                .is_some()
+        );
         let group = config
             .peer_groups
             .get("telegram_alerts")
@@ -47924,6 +48417,227 @@ This is an example JSON object for profile settings."#;
             config
                 .channel_external_peers("telegram", "other")
                 .is_empty()
+        );
+    }
+
+    /// Install an `ignore` entry on the peer group the bound alias resolves
+    /// from, the way an operator blocklisting an account would.
+    #[cfg(feature = "channel-telegram")]
+    fn ignore_identity_on(config: &mut Config, channel_type: &str, alias: &str, identity: &str) {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        config.peer_groups.insert(
+            format!("{channel_type}_{alias}_blocked"),
+            PeerGroupConfig {
+                channel: ChannelRef::new(format!("{channel_type}.{alias}")),
+                ignore: vec![PeerUsername::new(identity.to_string())],
+                ..PeerGroupConfig::default()
+            },
+        );
+    }
+
+    /// The CLI and the HTTP bind endpoint share this core, and the in-channel
+    /// `/bind` writers already refuse a write an `ignore` would shadow. This
+    /// core appended the grant and reported success, so the operator was told
+    /// the account was bound while the admission matcher still rejected it.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_channel_into_refuses_an_identity_an_ignore_denies() {
+        let mut config = config_with_telegram_alias("alerts");
+        ignore_identity_on(&mut config, "telegram", "alerts", "123456789");
+
+        let err = bind_channel_identity_into(&mut config, "telegram", "alerts", "123456789")
+            .expect_err("a denied identity must not report a successful bind");
+        assert!(
+            err.to_string().contains("ignore"),
+            "error should tell the operator what to edit, got: {err}"
+        );
+        assert!(
+            !err.to_string().contains("123456789"),
+            "identities are personal data and callers log this error: {err}"
+        );
+        assert!(
+            config
+                .peer_groups
+                .get("telegram_alerts")
+                .is_none_or(|g| g.external_peers.is_empty()),
+            "a refused bind must not leave a grant behind"
+        );
+        // The refusal is only honest if the identity really was inadmissible.
+        assert!(!crate::allowlist::is_user_allowed(
+            &config.channel_external_peers("telegram", "alerts"),
+            "123456789",
+            crate::allowlist::Match::Sensitive,
+        ));
+    }
+
+    /// A grant a deny shadows is not a usable binding either, so the
+    /// already-present answer would be just as false as the success one. This
+    /// is why the deny is checked before the idempotency short-circuit.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_channel_into_refuses_a_denied_identity_that_is_already_granted() {
+        let mut config = config_with_telegram_alias("alerts");
+        assert!(
+            bind_channel_identity_into(&mut config, "telegram", "alerts", "123456789")
+                .unwrap()
+                .is_some()
+        );
+        ignore_identity_on(&mut config, "telegram", "alerts", "123456789");
+
+        let err = bind_channel_identity_into(&mut config, "telegram", "alerts", "123456789")
+            .expect_err("a shadowed grant must be reported, not answered `already bound`");
+        assert!(err.to_string().contains("ignore"), "got: {err}");
+    }
+
+    /// The deny is matched with the channel's own identity rule, so the
+    /// spelling the operator reached for does not decide whether it lands.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_channel_into_refuses_a_differently_spelled_deny() {
+        // Telegram strips a leading `@`, so `@zeroclaw_user` and
+        // `zeroclaw_user` are one account on both sides of the comparison.
+        for ignored in ["@zeroclaw_user", "zeroclaw_user"] {
+            for bound in ["@zeroclaw_user", "zeroclaw_user"] {
+                let mut config = config_with_telegram_alias("alerts");
+                ignore_identity_on(&mut config, "telegram", "alerts", ignored);
+                assert!(
+                    bind_channel_identity_into(&mut config, "telegram", "alerts", bound).is_err(),
+                    "`ignore = [\"{ignored}\"]` must refuse a bind of `{bound}`"
+                );
+            }
+        }
+    }
+
+    /// An unrelated `ignore` must not block a legitimate bind.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_channel_into_still_binds_an_unignored_identity() {
+        let mut config = config_with_telegram_alias("alerts");
+        ignore_identity_on(&mut config, "telegram", "alerts", "999999999");
+
+        assert!(
+            bind_channel_identity_into(&mut config, "telegram", "alerts", "123456789")
+                .unwrap()
+                .is_some()
+        );
+        assert!(crate::allowlist::is_user_allowed(
+            &config.channel_external_peers("telegram", "alerts"),
+            "123456789",
+            crate::allowlist::Match::Sensitive,
+        ));
+    }
+
+    /// Peer-group map keys are arbitrary; the runtime authorizes by the
+    /// group's `channel` field. Selecting the write target by key therefore
+    /// appended the grant to whatever group happened to be named
+    /// `telegram_alerts`, even one bound to a different instance, and reported
+    /// success while the requested channel stayed unauthorized.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_channel_into_does_not_write_through_a_mismatched_group_key() {
+        use zeroclaw_config::multi_agent::PeerGroupConfig;
+        use zeroclaw_config::providers::ChannelRef;
+
+        let mut config = config_with_telegram_alias("alerts");
+        config.channels.telegram.insert(
+            "other".to_string(),
+            config.channels.telegram["alerts"].clone(),
+        );
+        // Conventional key for `alerts`, but bound to `other`.
+        config.peer_groups.insert(
+            "telegram_alerts".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("telegram.other".to_string()),
+                ..PeerGroupConfig::default()
+            },
+        );
+
+        let err = bind_channel_identity_into(&mut config, "telegram", "alerts", "123456789")
+            .expect_err("the conventional key belongs to another channel");
+        assert!(
+            err.to_string().contains("telegram.other"),
+            "the error should name the channel ref that actually owns the key, got: {err}"
+        );
+        assert!(
+            config.peer_groups["telegram_alerts"]
+                .external_peers
+                .is_empty(),
+            "nothing may be written into another channel's group"
+        );
+        // And the other channel did not silently gain the peer either.
+        assert!(
+            config
+                .channel_external_peers("telegram", "other")
+                .is_empty()
+        );
+    }
+
+    /// The bare-type variant: a group keyed `telegram_alerts` carrying
+    /// `channel = "telegram"` reads for every alias, so appending there would
+    /// broaden the grant across all of them.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_channel_into_refuses_a_bare_type_key_collision() {
+        use zeroclaw_config::multi_agent::PeerGroupConfig;
+        use zeroclaw_config::providers::ChannelRef;
+
+        let mut config = config_with_telegram_alias("alerts");
+        config.peer_groups.insert(
+            "telegram_alerts".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("telegram".to_string()),
+                ..PeerGroupConfig::default()
+            },
+        );
+
+        assert!(
+            bind_channel_identity_into(&mut config, "telegram", "alerts", "123456789").is_err()
+        );
+        assert!(
+            config.peer_groups["telegram_alerts"]
+                .external_peers
+                .is_empty(),
+            "a type-wide group must not be widened by an alias-scoped bind"
+        );
+    }
+
+    /// The write lands in the group the reader matches even when that group is
+    /// not the conventionally named one.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_channel_into_writes_into_the_group_the_reader_matches() {
+        use zeroclaw_config::multi_agent::PeerGroupConfig;
+        use zeroclaw_config::providers::ChannelRef;
+
+        let mut config = config_with_telegram_alias("alerts");
+        config.peer_groups.insert(
+            "some_other_name".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("telegram.alerts".to_string()),
+                ..PeerGroupConfig::default()
+            },
+        );
+
+        assert!(
+            bind_channel_identity_into(&mut config, "telegram", "alerts", "123456789")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            config.peer_groups["some_other_name"].external_peers.len(),
+            1,
+            "the identity belongs in the group whose channel ref the reader matches"
+        );
+        assert!(
+            !config.peer_groups.contains_key("telegram_alerts"),
+            "no conventional group should be minted when one already reads for this channel"
+        );
+        assert!(
+            config
+                .channel_external_peers("telegram", "alerts")
+                .contains(&"123456789".to_string())
         );
     }
 

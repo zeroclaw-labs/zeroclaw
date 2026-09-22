@@ -1779,7 +1779,7 @@ pub async fn run_gateway_with_plugin_webhooks(
 
     let state = AppState {
         config: config_state,
-        config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        config_write_lock: zeroclaw_config::write_lock::shared_config_write_lock(),
         model_provider,
         model,
         temperature,
@@ -9759,6 +9759,7 @@ path = "{trigger_path}"
             explicitly_addressed: false,
             conversation_scope: Default::default(),
             references: Vec::new(),
+            voice_origin: false,
         }
     }
 

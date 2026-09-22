@@ -2439,6 +2439,11 @@ mod inbound {
             }
             _ => None,
         };
+        // Read off this event alone: a reply whose parent is a voice note
+        // stays text-origin.
+        let voice_origin = media_kind
+            .as_ref()
+            .is_some_and(|info| matches!(info.kind, MediaCategory::Voice));
 
         if let Some(info) = media_kind {
             content = attach_media(
@@ -2505,7 +2510,7 @@ mod inbound {
             interruption_scope_id: interruption_scope,
             attachments,
             subject: None,
-
+            voice_origin,
             ..Default::default()
         };
 
@@ -7244,6 +7249,120 @@ mod tests {
                 msg.content
             );
             assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
+        }
+
+        /// `voice_origin` is the event's own MSC3245 flag, forwarded so the
+        /// orchestrator can answer a `mirror` peer in kind.
+        #[tokio::test]
+        async fn a_voice_message_forwards_voice_origin() {
+            let wav = build_wav();
+
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            mount_media_download(&matrix, &wav).await;
+
+            let stt = stt_server().await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = handler_ctx(
+                &format!("{}/v1/transcribe", stt.uri()),
+                workspace.path(),
+                tx,
+            );
+
+            let _guards = register_event_handlers(&client, &ctx);
+            let json = voice_event_json("$audio-origin:localhost");
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let msg = recv_forwarded(&mut rx).await;
+            assert!(
+                msg.voice_origin,
+                "an m.audio event carrying org.matrix.msc3245.voice is voice-origin"
+            );
+        }
+
+        /// A text event is not voice-origin, whatever its body says.
+        #[tokio::test]
+        async fn a_text_message_does_not_forward_voice_origin() {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = handler_ctx_with_resolver(None, workspace.path(), tx);
+            let _guards = register_event_handlers(&client, &ctx);
+
+            let json = text_parent_event(
+                "$text-origin:localhost",
+                "@alice:localhost",
+                "[voice transcript]: not actually a voice note",
+            );
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let msg = recv_forwarded(&mut rx).await;
+            assert!(
+                !msg.voice_origin,
+                "an m.text event is text-origin even when its body mimics a transcript"
+            );
+        }
+
+        /// A text reply whose parent is a voice note borrows the parent's
+        /// transcript but not its modality: only the event itself decides.
+        #[tokio::test]
+        async fn a_reply_to_a_voice_parent_does_not_forward_voice_origin() {
+            let wav = build_wav();
+
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            mount_media_download(&matrix, &wav).await;
+            mount_parent_event(&matrix, voice_event_json("$parent-origin:localhost"), 1).await;
+
+            let stt = stt_server().await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = handler_ctx(
+                &format!("{}/v1/transcribe", stt.uri()),
+                workspace.path(),
+                tx,
+            );
+
+            let _guards = register_event_handlers(&client, &ctx);
+            let json = plain_reply_event(
+                "$reply-origin:localhost",
+                "$parent-origin:localhost",
+                "what does this say?",
+            );
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let msg = recv_forwarded(&mut rx).await;
+            assert!(
+                msg.content
+                    .contains(&format!("[voice transcript]: {TRANSCRIPT}")),
+                "the parent transcript is still inserted: {}",
+                msg.content
+            );
+            assert!(
+                !msg.voice_origin,
+                "a text reply to a voice note is text-origin"
+            );
         }
 
         // Encrypted-media variant: the event carries an E2EE `file` source;

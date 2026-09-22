@@ -510,6 +510,22 @@ pub async fn handle_api_channel_bind(
 
     let mut working = state.config.read().clone();
 
+    // The daemon gives the gateway, the RPC path and the channels separate
+    // `Config` copies of the same file, so `_cfg_guard` alone is not enough:
+    // this handle's `peer_groups` can be older than what another writer has
+    // already saved. Without the refresh, an `ignore` persisted through RPC is
+    // both invisible to the bind check below and overwritten by the save.
+    match zeroclaw_config::schema::persisted_peer_groups(&working.config_path).await {
+        Ok(Some(persisted)) => working.peer_groups = persisted,
+        Ok(None) => {}
+        Err(e) => {
+            return error_response(ConfigApiError::new(
+                ConfigApiCode::ReloadFailed,
+                format!("could not read the persisted peer policy: {e}"),
+            ));
+        }
+    }
+
     // Reject a phantom alias loudly (404) rather than minting a peer group the
     // runtime never reads.
     if !zeroclaw_channels::orchestrator::channel_alias_configured(&working, channel_type, alias) {
@@ -519,13 +535,13 @@ pub async fn handle_api_channel_bind(
         ));
     }
 
-    let newly = match zeroclaw_channels::orchestrator::bind_channel_identity_into(
+    let target = match zeroclaw_channels::orchestrator::bind_channel_identity_into(
         &mut working,
         channel_type,
         alias,
         &body.identity,
     ) {
-        Ok(added) => added,
+        Ok(target) => target,
         Err(e) => {
             return error_response(ConfigApiError::new(
                 ConfigApiCode::ValidationFailed,
@@ -534,26 +550,42 @@ pub async fn handle_api_channel_bind(
         }
     };
 
-    let group = format!("{channel_type}_{alias}");
     let channel = format!("{channel_type}.{alias}");
 
-    if !newly {
+    // The writer picks its target by the group's `channel` field, so the
+    // destination may be any key, not the conventional `<type>_<alias>`.
+    // Reporting the conventional name would name a group that need not exist.
+    let Some(group) = target else {
+        // Name the group that actually carries the grant, including a bare
+        // type-wide one. Falling back to the conventional `<type>_<alias>` key
+        // named a block that need not exist and sent operators to edit it.
+        let source = zeroclaw_channels::orchestrator::channel_authorizing_group_key(
+            &working,
+            channel_type,
+            alias,
+            &body.identity,
+        )
+        .or_else(|| {
+            zeroclaw_channels::orchestrator::channel_peer_group_key(&working, channel_type, alias)
+        });
         return Json(serde_json::json!({
             "saved": false,
             "already_bound": true,
-            "group": group,
+            "group": source,
             "channel": channel,
         }))
         .into_response();
-    }
+    };
 
-    // Persist with a full `save` (the same path the CLI bind uses), NOT the
-    // incremental `save_dirty` behind `persist_and_swap`: a direct peer-group
-    // mutation isn't dirty-tracked, so `save_dirty` would never write it to
-    // disk (the bind would vanish on restart), and `save` also correctly
-    // materializes a brand-new peer-group table. Then swap the shared
-    // in-memory config so the running channel authorizes the peer live.
-    if let Err(e) = working.save().await {
+    // Incremental: only `peer_groups` is applied onto the current on-disk
+    // document, so the rest of this snapshot, which is still whatever this
+    // handle last saw, cannot drop another writer's keys. A full `save` here
+    // wrote the whole stale snapshot back. A direct peer-group mutation is not
+    // dirty-tracked, so the explicit `mark_dirty` is what makes `save_dirty`
+    // write it at all, and it materializes a brand-new table the same way.
+    // Then swap the shared in-memory config so the channel authorizes live.
+    working.mark_dirty("peer_groups");
+    if let Err(e) = working.save_dirty().await {
         return error_response(ConfigApiError::new(
             ConfigApiCode::ReloadFailed,
             format!("save failed: {e}"),
@@ -4497,6 +4529,325 @@ mod tests {
                 .is_empty(),
             "a phantom-alias bind must not create a peer group"
         );
+    }
+
+    /// Trust-boundary regression: an `ignore` naming the identity outranks the
+    /// grant a bind writes, so the endpoint must say so rather than answer
+    /// `saved` for a peer the running channel still rejects. The shared bind
+    /// core appended the grant and returned `Ok(true)`, and this handler
+    /// reported success on it.
+    #[tokio::test]
+    async fn channel_bind_refuses_an_identity_an_ignore_denies() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = config_with_telegram_alias(&tmp, "alerts");
+        config.peer_groups.insert(
+            "telegram_alerts_blocked".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("telegram.alerts".to_string()),
+                ignore: vec![PeerUsername::new("123456789".to_string())],
+                ..PeerGroupConfig::default()
+            },
+        );
+        let state = test_state(config);
+
+        let (status, json) = response_json(
+            handle_api_channel_bind(
+                axum::extract::State(state.clone()),
+                axum::http::HeaderMap::new(),
+                axum::Json(ChannelBindBody {
+                    channel_type: "telegram".to_string(),
+                    alias: "alerts".to_string(),
+                    identity: "123456789".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let message = json.to_string();
+        assert!(
+            message.contains("ignore"),
+            "the operator has to be told what to edit, got: {message}"
+        );
+        assert!(
+            state
+                .config
+                .read()
+                .peer_groups
+                .get("telegram_alerts")
+                .is_none_or(|g| g.external_peers.is_empty()),
+            "a refused bind must not mutate the peer group"
+        );
+    }
+
+    /// The HTTP surface of the same rule: peer-group keys are arbitrary, so a
+    /// group named `telegram_alerts` may be bound to a different instance. The
+    /// endpoint must refuse rather than report `saved` for a write the
+    /// requested channel's reader never sees.
+    #[tokio::test]
+    async fn channel_bind_refuses_a_group_key_bound_to_another_channel() {
+        use zeroclaw_config::multi_agent::PeerGroupConfig;
+        use zeroclaw_config::providers::ChannelRef;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = config_with_telegram_alias(&tmp, "alerts");
+        config.peer_groups.insert(
+            "telegram_alerts".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("telegram.other".to_string()),
+                ..PeerGroupConfig::default()
+            },
+        );
+        let state = test_state(config);
+
+        let (status, json) = response_json(
+            handle_api_channel_bind(
+                axum::extract::State(state.clone()),
+                axum::http::HeaderMap::new(),
+                axum::Json(ChannelBindBody {
+                    channel_type: "telegram".to_string(),
+                    alias: "alerts".to_string(),
+                    identity: "123456789".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            json.to_string().contains("telegram.other"),
+            "the operator has to be told which group owns the key, got: {json}"
+        );
+        assert!(
+            state.config.read().peer_groups["telegram_alerts"]
+                .external_peers
+                .is_empty(),
+            "a refused bind must not write into another channel's group"
+        );
+    }
+
+    /// The inverse: an unrelated `ignore` must not block a legitimate bind, or
+    /// the deny check would have turned the endpoint off.
+    #[tokio::test]
+    async fn channel_bind_still_binds_an_unignored_identity() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = config_with_telegram_alias(&tmp, "alerts");
+        config.peer_groups.insert(
+            "telegram_alerts_blocked".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("telegram.alerts".to_string()),
+                ignore: vec![PeerUsername::new("999999999".to_string())],
+                ..PeerGroupConfig::default()
+            },
+        );
+        let state = test_state(config);
+
+        let (status, _json) = response_json(
+            handle_api_channel_bind(
+                axum::extract::State(state.clone()),
+                axum::http::HeaderMap::new(),
+                axum::Json(ChannelBindBody {
+                    channel_type: "telegram".to_string(),
+                    alias: "alerts".to_string(),
+                    identity: "123456789".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            state
+                .config
+                .read()
+                .channel_external_peers("telegram", "alerts")
+                .contains(&"123456789".to_string())
+        );
+    }
+
+    /// The gateway and the RPC path hold separate `Config` copies of one file.
+    /// An `ignore` saved through RPC is therefore absent from the gateway's
+    /// snapshot, and a bind that trusted that snapshot both missed the deny and
+    /// wrote the stale policy table back over it. The handler re-reads the
+    /// persisted `peer_groups` under the write lock instead, so the deny is
+    /// authoritative for the check and survives the save.
+    #[tokio::test]
+    async fn channel_bind_refuses_a_deny_only_the_other_handle_has_saved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gateway_config = config_with_telegram_alias(&tmp, "alerts");
+        let config_path = gateway_config.config_path.clone();
+
+        // What the RPC handle persisted after the gateway took its snapshot.
+        // The gateway's own copy still has no `peer_groups` at all.
+        std::fs::write(
+            &config_path,
+            "[peer_groups.telegram_alerts]\n\
+             channel = \"telegram.alerts\"\n\
+             ignore = [\"999999999\"]\n",
+        )
+        .unwrap();
+
+        let state = test_state(gateway_config);
+        assert!(
+            state.config.read().peer_groups.is_empty(),
+            "the gateway snapshot must start stale for this to test anything"
+        );
+
+        let (status, _json) = response_json(
+            handle_api_channel_bind(
+                axum::extract::State(state.clone()),
+                axum::http::HeaderMap::new(),
+                axum::Json(ChannelBindBody {
+                    channel_type: "telegram".to_string(),
+                    alias: "alerts".to_string(),
+                    identity: "999999999".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a deny this handle had not seen must still refuse the bind"
+        );
+        let on_disk = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            on_disk.contains("999999999"),
+            "the persisted deny must survive, got:\n{on_disk}"
+        );
+    }
+
+    /// The other half: an unrelated bind still succeeds, and it must not drop
+    /// the deny the gateway's snapshot never carried.
+    #[tokio::test]
+    async fn channel_bind_preserves_a_deny_saved_by_the_other_handle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gateway_config = config_with_telegram_alias(&tmp, "alerts");
+        let config_path = gateway_config.config_path.clone();
+
+        // `sops_dir` stands in for any unrelated key another writer persisted
+        // after this handle took its snapshot. A full `save` of the stale
+        // snapshot would drop it along with the deny.
+        std::fs::write(
+            &config_path,
+            "sops_dir = \"/srv/written-by-the-other-handle\"\n\
+             \n\
+             [peer_groups.telegram_alerts]\n\
+             channel = \"telegram.alerts\"\n\
+             ignore = [\"999999999\"]\n",
+        )
+        .unwrap();
+
+        let state = test_state(gateway_config);
+        let (status, _json) = response_json(
+            handle_api_channel_bind(
+                axum::extract::State(state.clone()),
+                axum::http::HeaderMap::new(),
+                axum::Json(ChannelBindBody {
+                    channel_type: "telegram".to_string(),
+                    alias: "alerts".to_string(),
+                    identity: "123456789".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let on_disk = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            on_disk.contains("123456789"),
+            "the new grant must be persisted, got:\n{on_disk}"
+        );
+        assert!(
+            on_disk.contains("999999999"),
+            "the other handle's deny must not be erased, got:\n{on_disk}"
+        );
+        assert!(
+            on_disk.contains("/srv/written-by-the-other-handle"),
+            "an unrelated persisted key must survive the bind, got:\n{on_disk}"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_bind_reports_the_custom_group_it_actually_wrote() {
+        use zeroclaw_config::multi_agent::PeerGroupConfig;
+        use zeroclaw_config::providers::ChannelRef;
+
+        // The writer selects its target by the group's `channel` field, so a
+        // custom key is a legitimate destination. Reporting the conventional
+        // `telegram_alerts` would name a group that does not exist, and an
+        // operator following the response would edit the wrong block.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = config_with_telegram_alias(&tmp, "alerts");
+        config.peer_groups.insert(
+            "ops".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("telegram.alerts".to_string()),
+                ..PeerGroupConfig::default()
+            },
+        );
+        let state = test_state(config);
+
+        let bind = |state: AppState| async move {
+            response_json(
+                handle_api_channel_bind(
+                    axum::extract::State(state),
+                    axum::http::HeaderMap::new(),
+                    axum::Json(ChannelBindBody {
+                        channel_type: "telegram".to_string(),
+                        alias: "alerts".to_string(),
+                        identity: "123456789".to_string(),
+                    }),
+                )
+                .await,
+            )
+            .await
+        };
+
+        let (status, json) = bind(state.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["saved"], true);
+        assert_eq!(
+            json["group"], "ops",
+            "the response names the group the identity was written into"
+        );
+        assert!(
+            state
+                .config
+                .read()
+                .peer_groups
+                .get("ops")
+                .expect("the custom group is the destination")
+                .external_peers
+                .iter()
+                .any(|peer| peer.as_str() == "123456789")
+        );
+        assert!(
+            !state
+                .config
+                .read()
+                .peer_groups
+                .contains_key("telegram_alerts"),
+            "the conventional group was never created, which is why naming it would mislead"
+        );
+
+        // The idempotent answer has to name the same real group.
+        let (status, json) = bind(state.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["already_bound"], true);
+        assert_eq!(json["group"], "ops");
     }
 
     #[tokio::test]

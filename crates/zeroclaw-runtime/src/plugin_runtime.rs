@@ -262,12 +262,17 @@ pub(crate) fn plugin_limits(config: &Config) -> zeroclaw_plugins::component::Plu
     }
 }
 
+/// Plugin grants are compared verbatim: a plugin names its senders exactly, with
+/// none of the per-platform identity rules the chat channels carry. Denies still
+/// have to be decoded and applied first, which is what the shared policy helper
+/// is for.
 #[cfg(feature = "plugins-wasm")]
 fn plugin_sender_allowed(config: &Config, alias: &str, sender: &str) -> bool {
-    config
-        .channel_external_peers("plugin", alias)
-        .iter()
-        .any(|allowed| allowed == "*" || allowed == sender)
+    zeroclaw_config::schema::peer_policy_admits(
+        &config.channel_external_peers("plugin", alias),
+        &[sender],
+        |entry, user| entry == user,
+    )
 }
 
 #[cfg(feature = "plugins-wasm")]
@@ -690,6 +695,48 @@ mod tests {
             authorizer("anyone"),
             "wildcard uses native channel semantics"
         );
+    }
+
+    /// `channel_external_peers` carries every `ignore` entry as an encoded deny
+    /// marker and applies none of them, so the ingress has to. Both plugin
+    /// delivery paths, polling and webhook, share this predicate.
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn channel_sender_policy_applies_denies_before_grants() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        let policy = |grants: &[&str], ignore: &[&str]| {
+            let live = Arc::new(RwLock::new(Config::default()));
+            live.write().peer_groups.insert(
+                "operators".to_string(),
+                PeerGroupConfig {
+                    channel: ChannelRef::new("plugin.operations"),
+                    external_peers: grants.iter().map(|p| PeerUsername::new(*p)).collect(),
+                    ignore: ignore.iter().map(|p| PeerUsername::new(*p)).collect(),
+                    ..PeerGroupConfig::default()
+                },
+            );
+            channel_sender_authorizer(
+                Arc::new(Config::default()),
+                Some(Arc::clone(&live)),
+                "operations".to_string(),
+            )
+        };
+
+        let wildcard = policy(&["*"], &["alice"]);
+        assert!(!wildcard("alice"), "an explicit deny outranks a wildcard");
+        assert!(wildcard("bob"), "the wildcard still admits everyone else");
+
+        let exact = policy(&["alice", "bob"], &["alice"]);
+        assert!(!exact("alice"), "an explicit deny outranks an exact grant");
+        assert!(exact("bob"), "the sibling grant is untouched");
+
+        let deny_all = policy(&["*"], &["*"]);
+        assert!(!deny_all("alice"), "`ignore = [\"*\"]` denies everyone");
+
+        let granted = policy(&["alice"], &[]);
+        assert!(granted("alice"), "control: no deny, the grant stands");
     }
 
     fn write_executable_plugin(root: &Path, name: &str, capabilities: &[&str]) {
