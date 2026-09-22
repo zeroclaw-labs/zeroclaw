@@ -449,7 +449,7 @@ pub struct Agent {
     /// Channel name stamped onto observer events to identify the calling surface
     /// (e.g. "agent", "wss", "gateway"). Defaults to "agent" for direct Agent callers.
     channel_name: String,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
     /// The `DelegateTool` this Agent's registry registered, in its concrete
     /// type. Test-only: `tools` erases it behind `dyn Tool`, so a regression
@@ -622,7 +622,7 @@ pub struct AgentBuilder {
     exclude_memory: bool,
     provider_switch_config: Option<ProviderSwitchConfig>,
     config_generation: Option<ConfigGeneration>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
     #[cfg(test)]
     delegate_tool: Option<Arc<crate::tools::DelegateTool>>,
@@ -677,7 +677,7 @@ impl AgentBuilder {
             config_generation: None,
             exclude_memory: false,
             provider_switch_config: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-util"))]
             turn_datetime: None,
             #[cfg(test)]
             delegate_tool: None,
@@ -1109,7 +1109,7 @@ impl AgentBuilder {
             config_generation: self.config_generation,
             provider_switch_config: self.provider_switch_config,
             channel_name: self.channel_name.unwrap_or_else(|| "agent".to_string()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-util"))]
             turn_datetime: self.turn_datetime,
             #[cfg(test)]
             delegate_tool: self.delegate_tool,
@@ -1133,6 +1133,19 @@ struct MemoryPreambleTarget<'a> {
 impl Agent {
     pub fn builder() -> AgentBuilder {
         AgentBuilder::new()
+    }
+
+    /// Install a deterministic clock for downstream test fixtures.
+    ///
+    /// This method is available only to the crate's own tests or when the
+    /// dev-only `test-util` feature is enabled. Production builds always use
+    /// the live local clock.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_turn_datetime_for_test<F>(&mut self, provider: F)
+    where
+        F: Fn() -> chrono::DateTime<chrono::Local> + Send + Sync + 'static,
+    {
+        self.turn_datetime = Some(Arc::new(provider));
     }
 
     /// The full `Config` the agent was constructed from, when available. Sourced
@@ -1159,7 +1172,7 @@ impl Agent {
     }
 
     fn current_turn_datetime(&self) -> chrono::DateTime<chrono::Local> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-util"))]
         if let Some(provider) = &self.turn_datetime {
             return provider();
         }
