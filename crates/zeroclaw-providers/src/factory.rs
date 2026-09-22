@@ -320,6 +320,9 @@ pub fn apply_compat_options(
     if opts.cache_passthrough {
         b = b.with_cache_passthrough();
     }
+    if let Some(cache_ttl) = opts.cache_ttl {
+        b = b.with_cache_ttl(cache_ttl);
+    }
     // `provider_extra` alias is captured before `build()` because the WARN
     // path below reads it for logging. Only object-shaped JSON is threaded
     // through; other shapes produce a WARN and are ignored (matching the
@@ -1210,6 +1213,9 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         if let Some(ts) = opts.provider_timeout_secs {
             b = b.timeout_secs(ts);
         }
+        if let Some(cache_ttl) = opts.cache_ttl {
+            b = b.cache_ttl(cache_ttl);
+        }
         Ok(Box::new(b.build()))
     }
 }
@@ -2042,6 +2048,221 @@ mod tests {
             &ModelProviderRuntimeOptions::default(),
         );
         assert!(!default_provider.capabilities().prompt_caching);
+    }
+
+    /// D2a: `cache_ttl` must survive the factory boundary on both builders.
+    /// The compatible half goes through `apply_compat_options` and the native
+    /// half through `AnthropicModelProviderConfig::create_provider`; each
+    /// drives a structured chat against a capture mock, so deleting the
+    /// `with_cache_ttl` forwarding in `apply_compat_options` or the
+    /// `cache_ttl` forwarding in `create_provider` fails this test (the
+    /// markers lose their `ttl` field). The wire is the observation point
+    /// because both factory functions return `Box<dyn ModelProvider>` and
+    /// the configured lifetime has no trait-object readback.
+    #[tokio::test]
+    async fn cache_ttl_runtime_option_reaches_both_builders() {
+        use crate::traits::{ChatMessage, ChatRequest};
+        use zeroclaw_api::tool::ToolSpec;
+        use zeroclaw_config::schema::{AnthropicModelProviderConfig, CacheTtl};
+
+        fn collect_cache_controls(value: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    if let Some(control) = map.get("cache_control") {
+                        out.push(control.clone());
+                    }
+                    for nested in map.values() {
+                        collect_cache_controls(nested, out);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        collect_cache_controls(item, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        async fn compat_request(opts: &ModelProviderRuntimeOptions) -> serde_json::Value {
+            use axum::{Json, Router, routing::post};
+            use std::sync::{Arc, Mutex};
+            use tokio::net::TcpListener;
+
+            let captured: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+            let captured_for_route = Arc::clone(&captured);
+            let app = Router::new().route(
+                "/chat/completions",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let captured = Arc::clone(&captured_for_route);
+                    async move {
+                        captured.lock().unwrap().push(body);
+                        Json(serde_json::json!({
+                            "choices": [{"message": {"content": "ok"}}]
+                        }))
+                    }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let provider = apply_compat_options(
+                OpenAiCompatibleModelProvider::builder("test")
+                    .display_name("custom")
+                    .base_url(&format!("http://{addr}"))
+                    .auth_style(AuthStyle::Bearer),
+                opts,
+            );
+            let messages = vec![
+                ChatMessage::system("be brief"),
+                ChatMessage::user("first question"),
+                ChatMessage::assistant("first answer"),
+                ChatMessage::user("second question"),
+            ];
+            let result = provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test-model",
+                    None,
+                )
+                .await;
+            server.abort();
+            result.unwrap_or_else(|error| panic!("compat request failed: {error}"));
+            let requests = captured.lock().unwrap();
+            requests[0].clone()
+        }
+
+        async fn native_request(opts: &ModelProviderRuntimeOptions) -> serde_json::Value {
+            use axum::{Json, Router, routing::post};
+            use std::sync::{Arc, Mutex};
+            use tokio::net::TcpListener;
+
+            let captured: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+            let captured_for_route = Arc::clone(&captured);
+            let app = Router::new().route(
+                "/v1/messages",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let captured = Arc::clone(&captured_for_route);
+                    async move {
+                        captured.lock().unwrap().push(body);
+                        Json(serde_json::json!({
+                            "id": "msg_ttl",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "ok"}],
+                            "model": "claude-sonnet-4-5",
+                            "stop_reason": "end_turn",
+                            "usage": {"input_tokens": 10, "output_tokens": 2}
+                        }))
+                    }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let provider = AnthropicModelProviderConfig::default()
+                .create_provider(
+                    "anthropic",
+                    Some("test-key"),
+                    Some(&format!("http://{addr}")),
+                    opts,
+                )
+                .expect("native anthropic provider constructs");
+            let messages = vec![
+                ChatMessage::system("You are a helpful assistant."),
+                ChatMessage::user("gen a 2 sum in golang"),
+                ChatMessage::assistant("```go\nfunc twoSum() {}\n```"),
+                ChatMessage::user("what's meaning of make here?"),
+            ];
+            let tools = vec![ToolSpec::new(
+                "shell",
+                "Run a shell command",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"]
+                }),
+            )];
+            let result = provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: Some(&tools),
+                        thinking: None,
+                    },
+                    "claude-sonnet-4-5",
+                    Some(0.7),
+                )
+                .await;
+            server.abort();
+            result.unwrap_or_else(|error| panic!("native request failed: {error}"));
+            let requests = captured.lock().unwrap();
+            requests[0].clone()
+        }
+
+        let ttl_opts = ModelProviderRuntimeOptions {
+            cache_ttl: Some(CacheTtl::OneHour),
+            cache_passthrough: true,
+            ..ModelProviderRuntimeOptions::default()
+        };
+
+        let compat_one_hour = compat_request(&ttl_opts).await;
+        let mut controls = Vec::new();
+        collect_cache_controls(&compat_one_hour, &mut controls);
+        assert_eq!(
+            controls.len(),
+            2,
+            "system + rolling breakpoints expected: {compat_one_hour}"
+        );
+        for control in &controls {
+            assert_eq!(
+                control["ttl"], "1h",
+                "apply_compat_options must forward cache_ttl: {compat_one_hour}"
+            );
+        }
+
+        let compat_default = compat_request(&ModelProviderRuntimeOptions::default()).await;
+        let mut controls = Vec::new();
+        collect_cache_controls(&compat_default, &mut controls);
+        assert!(
+            controls.is_empty(),
+            "default options must place no cache_control: {compat_default}"
+        );
+
+        let native_one_hour = native_request(&ttl_opts).await;
+        let mut controls = Vec::new();
+        collect_cache_controls(&native_one_hour, &mut controls);
+        assert_eq!(
+            controls.len(),
+            3,
+            "system + tools + rolling markers expected: {native_one_hour}"
+        );
+        for control in &controls {
+            assert_eq!(
+                control["ttl"], "1h",
+                "create_provider must forward cache_ttl: {native_one_hour}"
+            );
+        }
+
+        let native_default = native_request(&ModelProviderRuntimeOptions::default()).await;
+        let mut controls = Vec::new();
+        collect_cache_controls(&native_default, &mut controls);
+        assert_eq!(controls.len(), 3, "marker placement is unconditional");
+        for control in &controls {
+            assert_eq!(
+                serde_json::to_string(control).unwrap(),
+                r#"{"type":"ephemeral"}"#,
+                "default options keep the pre-TTL native wire form: {native_default}"
+            );
+        }
     }
 
     #[test]

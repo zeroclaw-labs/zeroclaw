@@ -551,9 +551,17 @@ pub(crate) struct Logs {
     search_active: bool,
     search_buf: String,
     search_query: String, // committed query (applied on Enter)
+    /// Segment-aware cursor from the previous page. Preferred over
+    /// `next_cursor_offset`: it is the only cursor that can advance once
+    /// the oldest event on a page lives in a rotated archive segment.
+    next_cursor_segment: Option<String>,
     next_cursor_offset: Option<u64>,
     next_cursor_legacy: Option<(String, String)>,
     at_end: bool,
+    /// True when the daemon could not read part of the retained history. The
+    /// status line says so, because `at_end` alone would present a truncated
+    /// buffer as the whole stream.
+    history_incomplete: bool,
     loading: bool,
     active_log_path: Option<String>,
     // Viewport
@@ -589,9 +597,11 @@ impl Logs {
             search_active: false,
             search_buf: String::new(),
             search_query: String::new(),
+            next_cursor_segment: None,
             next_cursor_offset: None,
             next_cursor_legacy: None,
             at_end: false,
+            history_incomplete: false,
             loading: false,
             active_log_path: None,
             list_height: 0,
@@ -612,21 +622,43 @@ impl Logs {
         self.rpc.logs_subscribe().await?;
         self.subscribed = true;
         // Load initial history
-        self.load_page(None, None).await;
+        self.load_page(None, None, None).await;
         Ok(())
     }
 
     /// Fetch a page of older events. If `cursor` is None, fetches the newest.
     async fn load_page(
         &mut self,
+        cursor_segment: Option<String>,
         cursor_offset: Option<u64>,
         cursor_legacy: Option<(String, String)>,
     ) {
         self.loading = true;
+        // Set when a cursor-bearing response turns out to contain only events
+        // already in the buffer, which means the cursor bought no older
+        // history and paging cannot advance past it.
+        let mut stale_cursor_no_progress = false;
+        // Cursor precedence: segment cursor first (only one that can cross
+        // into a rotated archive), then plain byte offset, then the legacy
+        // `(ts, id)` pair for daemons predating either field. Send only
+        // the winning cursor to keep the request unambiguous.
+        let has_segment = cursor_segment.is_some();
+        let has_offset = !has_segment && cursor_offset.is_some();
+        let has_legacy = !has_segment && !has_offset && cursor_legacy.is_some();
+        let has_cursor = has_segment || has_offset || has_legacy;
         let params = LogsQueryParams {
-            until_ts: cursor_legacy.as_ref().map(|(ts, _)| ts.clone()),
-            until_id: cursor_legacy.as_ref().map(|(_, id)| id.clone()),
-            until_line_offset: cursor_offset,
+            until_ts: if has_legacy {
+                cursor_legacy.as_ref().map(|(ts, _)| ts.clone())
+            } else {
+                None
+            },
+            until_id: if has_legacy {
+                cursor_legacy.as_ref().map(|(_, id)| id.clone())
+            } else {
+                None
+            },
+            until_line_offset: if has_offset { cursor_offset } else { None },
+            until_segment_cursor: cursor_segment,
             severity_min: Some(self.min_severity),
             q: if self.search_query.is_empty() {
                 None
@@ -634,14 +666,9 @@ impl Logs {
                 Some(self.search_query.clone())
             },
             hide_internal: true,
-            limit: Some(if cursor_offset.is_none() && cursor_legacy.is_none() {
-                INITIAL_LOAD
-            } else {
-                PAGE_SIZE
-            }),
+            limit: Some(if has_cursor { PAGE_SIZE } else { INITIAL_LOAD }),
             ..Default::default()
         };
-        let has_cursor = cursor_offset.is_some() || cursor_legacy.is_some();
         match self.rpc.logs_query(params).await {
             Ok(result) => {
                 self.active_log_path = result.log_path;
@@ -654,23 +681,56 @@ impl Logs {
                     .collect();
                 let prepended = new_entries.len();
                 if has_cursor && prepended > 0 {
-                    // Prepend older events before the existing buffer
-                    let mut combined = new_entries;
-                    combined.append(&mut self.events);
-                    self.events = combined;
-                    // Shift selection to keep the same item visible
-                    if let Some(sel) = self.list_state.selected() {
-                        self.list_state.select(Some(sel + prepended));
+                    // Prepend older events before the existing buffer.
+                    // Deduplicate by id: a daemon predating segment cursors
+                    // answers an unresolvable one with the newest page rather
+                    // than the empty at-end sentinel current daemons return,
+                    // and prepending that without deduplication would show the
+                    // same events twice and scramble the chronological order.
+                    let existing_ids: std::collections::HashSet<String> =
+                        self.events.iter().map(|e| e.id.clone()).collect();
+                    let deduped: Vec<LogEntry> = new_entries
+                        .into_iter()
+                        .filter(|e| !existing_ids.contains(&e.id))
+                        .collect();
+                    let actually_prepended = deduped.len();
+                    if actually_prepended > 0 {
+                        let mut combined = deduped;
+                        combined.append(&mut self.events);
+                        self.events = combined;
+                        // Shift selection to keep the same item visible
+                        if let Some(sel) = self.list_state.selected() {
+                            self.list_state.select(Some(sel + actually_prepended));
+                        }
+                    } else {
+                        // Every returned event was a duplicate, so this page
+                        // carried no older history. Stop paging rather than
+                        // treating it as an ordinary older page.
+                        //
+                        // Recorded as a flag rather than returning early: the
+                        // cleanup at the end of this function clears
+                        // `self.loading`, and skipping it would leave the pane
+                        // on its loading indicator forever, with
+                        // `maybe_load_older`'s `!self.loading` guard blocking
+                        // every later attempt.
+                        stale_cursor_no_progress = true;
                     }
                 } else if !has_cursor {
                     self.events = new_entries;
                 }
-                // Prefer the byte-offset cursor (independent of id ordering);
-                // fall back to the legacy `[timestamp, id]` pair when the
-                // daemon has not been upgraded to expose it.
+                // Prefer the segment cursor (crosses rotated archives);
+                // fall back to the byte-offset cursor (independent of id
+                // ordering), then to the legacy `[timestamp, id]` pair when
+                // the daemon has not been upgraded to expose them.
+                self.next_cursor_segment = result.next_segment_cursor;
                 self.next_cursor_offset = result.next_cursor_line_offset;
                 self.next_cursor_legacy = result.next_cursor;
-                self.at_end = result.at_end;
+                // A no-progress page means this cursor cannot advance, so
+                // whatever `at_end` describes must not re-enable paging.
+                self.at_end = result.at_end || stale_cursor_no_progress;
+                // Sticky: a later page reading cleanly does not restore the
+                // segment this one could not read.
+                self.history_incomplete |= result.incomplete;
             }
             Err(_) => {
                 // Query unavailable (old daemon without logs/query, or no log file).
@@ -696,9 +756,14 @@ impl Logs {
 
         // Reset pagination so subsequent scroll-to-top loads can
         // fetch history matching the new filter set.
+        self.next_cursor_segment = None;
         self.next_cursor_offset = None;
         self.next_cursor_legacy = None;
         self.at_end = false;
+        // The buffer is refetched from scratch under the new filter, so a
+        // gap reported for the old one says nothing about the new pages. A
+        // segment that is still unreadable sets this again on the next query.
+        self.history_incomplete = false;
 
         let filtered = self.filtered_indices();
         if filtered.is_empty() {
@@ -832,6 +897,14 @@ impl Logs {
                 Span::styled("[loading] ", theme::warn_style())
             } else if !self.at_end {
                 Span::styled("[more\u{2191}] ", theme::dim_style())
+            } else {
+                Span::raw("")
+            },
+            if self.history_incomplete {
+                Span::styled(
+                    format!("{} ", crate::i18n::t("zc-logs-status-partial")),
+                    theme::warn_style(),
+                )
             } else {
                 Span::raw("")
             },
@@ -1591,10 +1664,16 @@ impl Logs {
         if sel == 0
             && !self.at_end
             && !self.loading
-            && (self.next_cursor_offset.is_some() || self.next_cursor_legacy.is_some())
+            && (self.next_cursor_segment.is_some()
+                || self.next_cursor_offset.is_some()
+                || self.next_cursor_legacy.is_some())
         {
-            self.load_page(self.next_cursor_offset, self.next_cursor_legacy.clone())
-                .await;
+            self.load_page(
+                self.next_cursor_segment.clone(),
+                self.next_cursor_offset,
+                self.next_cursor_legacy.clone(),
+            )
+            .await;
         }
     }
 
@@ -1964,6 +2043,46 @@ mod tests {
         assert!(text.contains(&crate::i18n::t("zc-logs-preview-only")));
         // And it must not sit on the "Loading…" placeholder.
         assert!(!text.contains(&crate::i18n::t("zc-logs-loading")));
+    }
+
+    #[tokio::test]
+    async fn status_line_renders_partial_badge_from_catalogue() {
+        let mut logs = test_logs();
+        logs.events.push(sample_entry());
+        logs.history_incomplete = true;
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| logs.draw(frame, frame.area()))
+            .expect("draw logs");
+
+        // The badge must resolve from the ZeroCode Fluent catalogue rather
+        // than a bare literal, so non-English users see a localized marker.
+        let badge = crate::i18n::t("zc-logs-status-partial");
+        assert!(!badge.contains('{'), "key must resolve: {badge:?}");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains(&badge), "rendered: {rendered:?}");
+
+        // A fully readable history must not show the badge.
+        logs.history_incomplete = false;
+        terminal
+            .draw(|frame| logs.draw(frame, frame.area()))
+            .expect("draw logs");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(!rendered.contains(&badge), "rendered: {rendered:?}");
     }
 
     #[test]

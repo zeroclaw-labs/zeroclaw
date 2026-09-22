@@ -65,8 +65,9 @@ Token counts are estimated by `history::estimate_history_tokens`: roughly four
 characters per token plus four framing tokens per message. This is a heuristic,
 not a provider tokenizer. Loadable `[IMAGE:...]` markers are charged a fixed
 per-image cost only in messages whose images are dispatched: user turns and the
-latest tool results. Markers that preparation strips from older tool results
-are not charged, and system and assistant text is priced as text.
+tool results of the current user turn. Markers that preparation strips from
+older tool results are not charged, and system and assistant text is priced as
+text.
 
 Proactive token-budget trimming runs before the first provider call of a turn
 when history already exceeds the effective budget and at provider-call
