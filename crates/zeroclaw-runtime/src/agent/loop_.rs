@@ -6071,7 +6071,7 @@ mod tests {
 
     #[tokio::test]
     async fn image_recovery_continuation_requires_new_input_to_restore_images() {
-        for resubmit in [false, true] {
+        for (resubmit, max_tool_iterations) in [(false, 3), (true, 3), (false, 1)] {
             let image = "data:image/png;base64,iVBORw0KGgoBAgME";
             let original = format!("inspect [IMAGE:{image}]");
             let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel(4);
@@ -6107,7 +6107,7 @@ mod tests {
                     approval: None,
                     multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
                     config: None,
-                    max_tool_iterations: 3,
+                    max_tool_iterations,
                     hooks: None,
                     excluded_tools: &[],
                     dedup_exempt_tools: &[],
@@ -6147,6 +6147,12 @@ mod tests {
             .expect("recovery and tool continuation complete");
 
             assert!(result.contains("done"));
+            if max_tool_iterations == 1 {
+                assert!(
+                    result.contains("Turn stopped: reached maximum tool iterations (1)"),
+                    "third physical request must be the graceful summary: {result}"
+                );
+            }
             assert_eq!(
                 *model_provider.image_counts.lock().unwrap(),
                 vec![1, 0, usize::from(resubmit)]

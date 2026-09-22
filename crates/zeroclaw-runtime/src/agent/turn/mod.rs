@@ -2922,6 +2922,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         model,
         context_limits,
     );
+    let summary_image_route = ProviderImageState::route(provider_name, model);
+    let summary_quarantined_image_ids = image_cache
+        .as_mut()
+        .map(|state| state.provider_state.quarantined(&summary_image_route))
+        .unwrap_or_default();
     let summary_result = finish_after_max_iterations(
         model_provider,
         turn_state.history,
@@ -2930,6 +2935,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         dispatch_model,
         temperature,
         multimodal_config,
+        &summary_quarantined_image_ids,
         pacing,
         cancellation_token.as_ref(),
         max_iterations,

@@ -1178,18 +1178,22 @@ pub fn omit_provider_image_ids(
 
     messages
         .iter()
-        .map(|message| {
+        .zip(image_marker_dispositions(messages))
+        .map(|(message, disposition)| {
+            if disposition != ImageMarkerDisposition::Normalized {
+                return message.clone();
+            }
+
             if message.role == "tool"
                 && let Ok(serde_json::Value::Object(mut object)) =
                     serde_json::from_str::<serde_json::Value>(&message.content)
                 && let Some(serde_json::Value::String(content)) = object.get("content").cloned()
             {
-                object.insert(
-                    "content".to_string(),
-                    serde_json::Value::String(omit_provider_image_ids_from_content(
-                        &content, omitted,
-                    )),
-                );
+                let filtered = omit_provider_image_ids_from_content(&content, omitted);
+                if filtered == content {
+                    return message.clone();
+                }
+                object.insert("content".to_string(), serde_json::Value::String(filtered));
                 return ChatMessage {
                     role: message.role.clone(),
                     content: serde_json::Value::Object(object).to_string(),
@@ -4004,5 +4008,40 @@ mod tests {
         assert!(filtered[0].content.contains(first));
         assert!(!filtered[0].content.contains(second));
         assert!(filtered[0].content.contains("compare"));
+    }
+
+    #[test]
+    fn provider_image_filter_preserves_literal_roles_and_tool_arguments() {
+        let marker = "[IMAGE:data:image/png;base64,AAAA]";
+        let assistant = serde_json::json!({
+            "reasoning_content": format!("signed literal {marker}"),
+            "signature": "signed-reasoning",
+            "tool_calls": [{"function": {"arguments": format!("{{\"literal\":\"{marker}\"}}")}}],
+        })
+        .to_string();
+        let old_tool = serde_json::json!({"content": format!("old {marker}")}).to_string();
+        let current_tool =
+            serde_json::json!({"tool_call_id": "call-1", "content": format!("new {marker}")})
+                .to_string();
+        let messages = vec![
+            ChatMessage::system(format!("system literal {marker}")),
+            ChatMessage::user("first turn"),
+            ChatMessage::tool(old_tool),
+            ChatMessage::user(format!("inspect {marker}")),
+            ChatMessage::assistant(assistant),
+            ChatMessage::tool(current_tool),
+        ];
+        let omitted = provider_image_ids(&[ChatMessage::user(marker)]);
+
+        let filtered = omit_provider_image_ids(&messages, &omitted);
+
+        assert_eq!(filtered[0].content, messages[0].content);
+        assert_eq!(filtered[2].content, messages[2].content);
+        assert_eq!(filtered[4].content, messages[4].content);
+        assert!(!filtered[3].content.contains(marker));
+        let tool: serde_json::Value = serde_json::from_str(&filtered[5].content).unwrap();
+        assert_eq!(tool["tool_call_id"], "call-1");
+        assert!(!tool["content"].as_str().unwrap().contains(marker));
+        assert!(provider_image_ids(&filtered).is_empty());
     }
 }
