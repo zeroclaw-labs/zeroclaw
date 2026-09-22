@@ -21,6 +21,7 @@ const TOP_LEVEL_PARAMS: &[&str] = &[
     "until_ts",
     "until_id",
     "until_line_offset",
+    "until_segment_cursor",
     "action",
     "category",
     "outcome",
@@ -45,8 +46,19 @@ pub struct LogsResponse {
     /// `?until_line_offset=` on the next request to resume without
     /// re-scanning already-read bytes.
     pub next_cursor_line_offset: Option<u64>,
+    /// Composite segment-aware cursor for the oldest event on this page. Pass
+    /// back as `?until_segment_cursor=` on the next request to paginate
+    /// across segment boundaries (active file + rotated archives). Supersedes
+    /// `next_cursor_line_offset` for `rotating`-mode deployments with
+    /// multiple retained segments.
+    pub next_segment_cursor: Option<String>,
     /// True when the file was fully scanned for this filter.
     pub at_end: bool,
+    /// True when a retained segment could not be read and was left out of this
+    /// page. `at_end` then means "no older events among the segments that could
+    /// be read", which is weaker than "no older events exist", so a client that
+    /// stops paging on `at_end` should present the history as partial.
+    pub incomplete: bool,
     /// Daemon start time so callers can implement "since daemon start"
     /// without an extra `/api/status` round-trip.
     pub daemon_started_at: String,
@@ -80,12 +92,14 @@ pub async fn handle_api_logs(
         return e.into_response();
     }
 
-    let Some(path) = zeroclaw_log::current_log_path() else {
+    let Some((active, reads_archives)) = zeroclaw_log::active_log_query_scope() else {
         return Json(LogsResponse {
             events: Vec::new(),
             next_cursor: None,
             next_cursor_line_offset: None,
+            next_segment_cursor: None,
             at_end: true,
+            incomplete: false,
             daemon_started_at: zeroclaw_runtime::health::daemon_started_at(),
             attribution_keys: attribution_keys_for_response(),
         })
@@ -110,6 +124,24 @@ pub async fn handle_api_logs(
     let until_line_offset = params
         .get("until_line_offset")
         .and_then(|raw| raw.parse::<u64>().ok());
+    let segment_cursor: Option<zeroclaw_log::SegmentCursor> = match params
+        .get("until_segment_cursor")
+        .map(|s| s.as_str())
+    {
+        None | Some("") => None,
+        Some(raw) => match zeroclaw_log::SegmentCursor::from_wire(raw) {
+            Some(c) => Some(c),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid until_segment_cursor: value is not a valid segment cursor",
+                    })),
+                )
+                    .into_response();
+            }
+        },
+    };
 
     let mut field_eq: BTreeMap<String, String> = BTreeMap::new();
     for (key, value) in &params {
@@ -150,8 +182,16 @@ pub async fn handle_api_logs(
         events,
         next_cursor,
         next_cursor_line_offset,
+        next_segment_cursor,
         at_end,
-    } = match zeroclaw_log::load_page(&path, &filter, limit) {
+        incomplete,
+    } = match zeroclaw_log::query_log_page(
+        &active,
+        reads_archives,
+        &filter,
+        limit,
+        segment_cursor.as_ref(),
+    ) {
         Ok(page) => page,
         Err(err) => {
             return (
@@ -173,7 +213,9 @@ pub async fn handle_api_logs(
         events: events_json,
         next_cursor,
         next_cursor_line_offset,
+        next_segment_cursor,
         at_end,
+        incomplete,
         daemon_started_at: zeroclaw_runtime::health::daemon_started_at(),
         attribution_keys: attribution_keys_for_response(),
     })

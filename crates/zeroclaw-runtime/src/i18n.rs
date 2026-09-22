@@ -1739,6 +1739,8 @@ mod tests {
             "cli-integrations-setup-heading",
             "cli-integrations-setup-macos-heading",
             "cli-integrations-builtin-heading",
+            "cli-integrations-chat-bind",
+            "cli-integrations-chat-enable",
         ];
         let args = [
             ("name", "definitely-not-a-real-integration"),
@@ -1759,6 +1761,53 @@ mod tests {
                     "{locale}: {key} left an unformatted placeholder: {formatted}"
                 );
             }
+
+            for (key, setup_args) in [
+                (
+                    "cli-integrations-chat-telegram-prepare",
+                    vec![("botfather", "@BotFather"), ("channel", "Telegram")],
+                ),
+                (
+                    "cli-integrations-chat-discord-prepare",
+                    vec![
+                        ("url", "https://discord.com/developers/applications"),
+                        ("intent", "MESSAGE CONTENT"),
+                    ],
+                ),
+                (
+                    "cli-integrations-chat-slack-prepare",
+                    vec![("url", "https://api.slack.com/apps")],
+                ),
+                (
+                    "cli-integrations-chat-configure",
+                    vec![("command", "zerocode"), ("channel", "Telegram")],
+                ),
+            ] {
+                let formatted = format_ftl_message(source, locale, key, &setup_args)
+                    .unwrap_or_else(|| panic!("{locale}: {key} should format"));
+                for (_, protected) in setup_args {
+                    assert!(
+                        formatted.contains(protected),
+                        "{locale}: {key} must preserve {protected:?}: {formatted}"
+                    );
+                }
+                assert!(
+                    !formatted.contains('{') && !formatted.contains('}'),
+                    "{locale}: {key} left an unformatted placeholder: {formatted}"
+                );
+            }
+
+            let enable = format_ftl_message(source, locale, "cli-integrations-chat-enable", &[])
+                .expect("channel activation guidance should format");
+            let expected = match locale {
+                "en" => "only after reviewing",
+                "es" => "solo después de revisar",
+                "fr" => "uniquement après avoir vérifié",
+                "ja" => "確認してから",
+                "zh-CN" => "确认设置和访问权限后",
+                _ => unreachable!("unlisted committed locale: {locale}"),
+            };
+            assert!(enable.contains(expected), "{locale}: {enable}");
 
             let unknown = format_ftl_message(source, locale, "cli-integrations-unknown", &args)
                 .unwrap_or_else(|| panic!("{locale}: cli-integrations-unknown should format"));

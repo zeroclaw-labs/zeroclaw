@@ -168,10 +168,7 @@ this is an intentional process-env bridge rather than a second Config secret
 field. Values are not written to provider TOML; a future typed Config bridge
 may load the same name at config time without changing the operator surface.
 
-An existing absolute `working_directory` is required. It is canonicalized and
-used for both the child cwd and ACP session boundary, so the provider never
-falls back to the daemon cwd. Optional `binary_path` selects a non-`PATH`
-binary. Alias `timeout_secs` bounds protocol reads and writes (default 600s).
+An existing absolute `working_directory` is required. It is canonicalized and used for both the child cwd and ACP session boundary, so the provider never falls back to the daemon cwd. Optional `binary_path` accepts an absolute path or a bare executable name (default `grok`); relative paths with separators are rejected. Bare names resolve against absolute host `PATH` directories before the child cwd is set, ignoring empty and relative entries. The selected file is canonicalized and checked for executability before spawn. Alias `timeout_secs` bounds protocol reads and writes (default 600s).
 
 The child environment is cleared before spawn. Process-runtime, locale, proxy,
 and CA variables on the built-in allowlist remain available; all other names

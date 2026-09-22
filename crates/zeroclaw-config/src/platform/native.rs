@@ -70,17 +70,31 @@ pub fn windows_tokio_cmd_shell_command(command: &str) -> tokio::process::Command
 ///
 /// `-NoProfile` skips user/host profile scripts for a predictable, faster
 /// startup; `-NonInteractive` prevents the shell from blocking on prompts; and
-/// `-Command` consumes the final argument as script text. Ordinary `arg`
-/// handling keeps the entire script in one process argument and preserves its
-/// internal PowerShell quoting.
+/// `-Command` consumes the final argument as script text. Commands in the
+/// policy's bounded PowerShell grammar receive a UTF-8 setup statement inside
+/// an empty `try`/`catch`, so unsupported settings never prevent the requested
+/// command from running. Full scripts are passed through unchanged: prepending
+/// a statement would invalidate leading declarations or named blocks, while a
+/// nested script-block wrapper would change scope and process-exit semantics.
 fn tokio_powershell_command(interpreter: &str, command: &str) -> tokio::process::Command {
+    let script = powershell_script_with_utf8_setup(command);
     let mut process = tokio::process::Command::new(interpreter);
     process
         .arg("-NoProfile")
         .arg("-NonInteractive")
         .arg("-Command")
-        .arg(command);
+        .arg(script);
     process
+}
+
+const POWERSHELL_UTF8_SETUP: &str = "try {\n    $utf8 = [System.Text.UTF8Encoding]::new($false)\n    [Console]::OutputEncoding = $utf8\n    $OutputEncoding = $utf8\n} catch {\n}";
+
+fn powershell_script_with_utf8_setup(command: &str) -> String {
+    if crate::policy::powershell_command_supports_statement_prelude(command) {
+        format!("{POWERSHELL_UTF8_SETUP}\n{command}")
+    } else {
+        command.to_owned()
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -408,9 +422,172 @@ mod tests {
             OsStr::new("-NoProfile"),
             OsStr::new("-NonInteractive"),
             OsStr::new("-Command"),
-            OsStr::new(script),
         ];
-        assert_eq!(args.as_slice(), expected.as_slice());
+        assert_eq!(&args[..3], expected.as_slice());
+        let script_arg = args[3].to_string_lossy();
+        assert!(script_arg.starts_with("try {"));
+        assert!(script_arg.contains("[Console]::OutputEncoding = $utf8"));
+        assert!(script_arg.contains("$OutputEncoding = $utf8"));
+        assert!(script_arg.contains("} catch {\n}"));
+        assert!(script_arg.ends_with(script));
+    }
+
+    #[test]
+    fn powershell_full_scripts_are_passed_through_unchanged() {
+        let command = "# comment\n#requires -Version 5.1 # keep; this comment\nusing namespace System.Text # keep; this comment too\nparam(\n    [string]$Value = @\"\nThis \" and ) # remain literal\n\"@\n)\nWrite-Output $Value";
+        let cwd = std::env::temp_dir();
+        let process = NativeRuntime::with_shell("pwsh".into())
+            .build_shell_command(command, &cwd)
+            .unwrap();
+        let process = process.as_std();
+        let script = process.get_args().nth(3).unwrap().to_string_lossy();
+
+        assert_eq!(script, command);
+
+        let named_blocks = "begin { Write-Output 'begin' }\nprocess { Write-Output 'process' }\nend { Write-Output 'end' }";
+        assert_eq!(
+            powershell_script_with_utf8_setup(named_blocks),
+            named_blocks
+        );
+    }
+
+    #[tokio::test]
+    async fn powershell_full_scripts_execute_with_native_semantics() {
+        let Some(interpreter) = ["pwsh", "powershell"].into_iter().find(|candidate| {
+            std::process::Command::new(candidate)
+                .arg("-NoProfile")
+                .arg("-Command")
+                .arg("exit 0")
+                .output()
+                .is_ok()
+        }) else {
+            return;
+        };
+
+        for (command, expected) in [
+            (
+                "#requires -Version 5.1 # keep; this comment\nusing namespace System.Text # keep; this comment too\n[Console]::Write('声明-ok')",
+                "声明-ok",
+            ),
+            (
+                "param(\n    [string]$Name = '参数-ok' # the comment may contain )\n)\n[Console]::Write($Name)",
+                "参数-ok",
+            ),
+            (
+                "param(\n    [string]$Message = @\"\nHere \" and ) # stay literal\n\"@\n)\n[Console]::Write($Message.Trim())",
+                "Here \" and ) # stay literal",
+            ),
+            (
+                "[CmdletBinding()]\nparam()\n[Console]::Write('attributed-ok')",
+                "attributed-ok",
+            ),
+            (
+                "begin { [Console]::Write('begin-') }\nprocess { [Console]::Write('process-') }\nend { [Console]::Write('end') }",
+                "begin-process-end",
+            ),
+        ] {
+            let output = tokio_powershell_command(interpreter, command)
+                .output()
+                .await
+                .unwrap();
+
+            assert!(
+                output.status.success(),
+                "stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+        }
+
+        let output = tokio_powershell_command(interpreter, "exit 23")
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(output.status.code(), Some(23));
+    }
+
+    #[tokio::test]
+    async fn powershell_utf8_setup_failure_does_not_block_a_simple_command() {
+        let Some(interpreter) = ["pwsh", "powershell"].into_iter().find(|candidate| {
+            std::process::Command::new(candidate)
+                .arg("-NoProfile")
+                .arg("-Command")
+                .arg("exit 0")
+                .output()
+                .is_ok()
+        }) else {
+            return;
+        };
+
+        let script = powershell_script_with_utf8_setup("Write-Output constrained-ok");
+        let constrained = format!(
+            "$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'\n{script}"
+        );
+        let output = tokio::process::Command::new(interpreter)
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-Command")
+            .arg(constrained)
+            .output()
+            .await
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            "constrained-ok"
+        );
+    }
+
+    #[tokio::test]
+    async fn powershell_command_adaptation_preserves_native_status() {
+        let Some(interpreter) = ["pwsh", "powershell"].into_iter().find(|candidate| {
+            std::process::Command::new(candidate)
+                .arg("-NoProfile")
+                .arg("-Command")
+                .arg("exit 0")
+                .output()
+                .is_ok()
+        }) else {
+            return;
+        };
+
+        #[cfg(target_os = "windows")]
+        let native_failure = "cmd /c exit 7";
+        #[cfg(not(target_os = "windows"))]
+        let native_failure = "sh -c 'exit 7'";
+
+        for (command, expected_success) in [
+            (native_failure.to_owned(), false),
+            ("[Console]::Write('status-ok')".to_owned(), true),
+            (
+                format!("{native_failure}; [Console]::Write('recovered')"),
+                true,
+            ),
+        ] {
+            let raw_status = tokio::process::Command::new(interpreter)
+                .arg("-NoProfile")
+                .arg("-NonInteractive")
+                .arg("-Command")
+                .arg(&command)
+                .output()
+                .await
+                .unwrap()
+                .status;
+            let adapted_status = tokio_powershell_command(interpreter, &command)
+                .output()
+                .await
+                .unwrap()
+                .status;
+
+            assert_eq!(raw_status.success(), expected_success, "raw: {command}");
+            assert_eq!(adapted_status.success(), expected_success, "{command}");
+            assert_eq!(adapted_status.code(), raw_status.code(), "{command}");
+        }
     }
 
     #[test]
@@ -766,32 +943,24 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn windows_powershell_shell_builds_powershell_command() {
+        use std::ffi::OsStr;
+
         let script = r#"Write-Output "quoted safe value" | Select-Object -First 1"#;
         let cwd = std::env::temp_dir();
-        let cmd = NativeRuntime::with_shell("pwsh".into())
+        let command = NativeRuntime::with_shell("pwsh".into())
             .build_shell_command(script, &cwd)
             .unwrap();
-        let debug = format!("{cmd:?}");
-        assert!(
-            debug.contains("pwsh"),
-            "PowerShell interpreter should appear, got: {debug}"
-        );
-        assert!(
-            debug.contains("-Command"),
-            "PowerShell invocation must use -Command, got: {debug}"
-        );
-        assert!(
-            debug.contains("quoted safe value"),
-            "PowerShell invocation must contain the script argument, got: {debug}"
-        );
-        assert!(
-            debug.contains("-NoProfile"),
-            "PowerShell invocation should pass -NoProfile, got: {debug}"
-        );
-        assert!(
-            !debug.contains("cmd.exe"),
-            "PowerShell shell must not fall back to cmd.exe, got: {debug}"
-        );
+        let command = command.as_std();
+
+        assert_eq!(command.get_program(), OsStr::new("pwsh"));
+        let args: Vec<_> = command.get_args().collect();
+        let expected = [
+            OsStr::new("-NoProfile"),
+            OsStr::new("-NonInteractive"),
+            OsStr::new("-Command"),
+        ];
+        assert_eq!(&args[..3], expected.as_slice());
+        assert!(args[3].to_string_lossy().ends_with(script));
     }
 
     #[test]

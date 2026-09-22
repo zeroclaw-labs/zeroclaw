@@ -3359,6 +3359,42 @@ impl Channel for WhatsAppWebChannel {
         bot_handle_guard.is_some()
     }
 
+    fn supports_native_polls(&self) -> bool {
+        true
+    }
+
+    /// Post a native WhatsApp poll. Unlike `send`, a recipient outside the
+    /// allowlist is an error rather than a silent no-op: this is a tool call,
+    /// and the caller has to learn that nothing was posted.
+    async fn send_poll(&self, poll: &zeroclaw_api::channel::PollRequest) -> Result<()> {
+        // Validated before the client is touched, so a caller that got the
+        // recipient wrong hears that instead of a connection error.
+        if !Self::is_jid(&poll.recipient) {
+            let normalized = self.normalize_phone(&poll.recipient);
+            anyhow::ensure!(
+                self.is_number_allowed(&normalized),
+                "recipient `{}` is not in this channel's allowlist",
+                poll.recipient
+            );
+        }
+        let deliverable_recipient = Self::resolve_outbound_recipient(&poll.recipient);
+        let to = self.recipient_to_jid(&deliverable_recipient)?;
+
+        let client = self.client.lock().clone();
+        let Some(client) = client else {
+            anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
+        };
+
+        Box::pin(
+            client
+                .polls()
+                .create(to, &poll.question, &poll.options, poll.selectable_count),
+        )
+        .await
+        .map_err(|e| anyhow::Error::msg(format!("WhatsApp poll creation failed: {e}")))?;
+        Ok(())
+    }
+
     async fn start_typing(&self, recipient: &str) -> Result<()> {
         let client = self.client.lock().clone();
         let Some(client) = client else {
@@ -7673,6 +7709,68 @@ mod tests {
         );
         let ch = WhatsAppWebChannel::new(&cfg, "alias", Arc::new(Vec::new), Arc::new(Vec::new));
         assert_eq!(ch.approval_timeout_secs, 300);
+    }
+
+    // ── Native polls ──
+
+    #[cfg(feature = "whatsapp-web")]
+    fn poll_channel(allowed_numbers: &[&str]) -> WhatsAppWebChannel {
+        let cfg = zeroclaw_config::schema::WhatsAppConfig {
+            enabled: true,
+            session_path: Some("/tmp/test-whatsapp-polls.db".into()),
+            ..Default::default()
+        };
+        let peers: Vec<String> = allowed_numbers.iter().map(|n| (*n).to_string()).collect();
+        WhatsAppWebChannel::new(
+            &cfg,
+            "poll_alias",
+            Arc::new(move || peers.clone()),
+            Arc::new(Vec::new),
+        )
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn poll_request(recipient: &str) -> zeroclaw_api::channel::PollRequest {
+        zeroclaw_api::channel::PollRequest::new(
+            recipient,
+            "Which tasting slot?",
+            vec!["Friday".into(), "Saturday".into()],
+        )
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn the_channel_advertises_native_polls() {
+        assert!(poll_channel(&["+15550001111"]).supports_native_polls());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn a_poll_without_a_client_reports_the_same_not_connected_error_as_send() {
+        let channel = poll_channel(&["+15550001111"]);
+        let error = channel
+            .send_poll(&poll_request("+15550001111"))
+            .await
+            .expect_err("no client is connected");
+        assert!(error.to_string().contains("not connected"), "{error}");
+    }
+
+    /// `send` drops a disallowed recipient with a warning and reports success.
+    /// A poll is a tool call, so it has to say that nothing was posted.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn a_poll_to_a_number_outside_the_allowlist_fails_loudly() {
+        let channel = poll_channel(&["+15550001111"]);
+        let error = channel
+            .send_poll(&poll_request("+15559999999"))
+            .await
+            .expect_err("the recipient is not allowed");
+        let message = error.to_string();
+        assert!(message.contains("allowlist"), "{message}");
+        assert!(
+            !message.contains("not connected"),
+            "the allowlist must be checked before the client, so the caller learns the real reason: {message}"
+        );
     }
 
     /// ...and a config built in Rust now agrees with one parsed from a file.
