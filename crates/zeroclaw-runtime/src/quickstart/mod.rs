@@ -720,6 +720,16 @@ pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor
         if !essentials.contains(&field_path) {
             continue;
         }
+        // Quickstart owns Anthropic's `auth_mode` selector as a synthetic,
+        // non-persisted choice between the legacy API-key and setup-token
+        // paths. Do not also surface the persisted provider `auth_mode` here:
+        // the identical field key would produce two incompatible controls.
+        // A future OAuth-aware Quickstart flow must replace this legacy
+        // selector deliberately, rather than coupling it to provider config.
+        if section_path == "providers.models.anthropic" && field_path == QUICKSTART_AUTH_MODE_FIELD
+        {
+            continue;
+        }
         let default = if section_path == "channels.webhook" && field_path == "port" {
             Some(zeroclaw_config::schema::DEFAULT_WEBHOOK_CHANNEL_PORT.to_string())
         } else if info.is_secret {
@@ -2564,9 +2574,11 @@ mod tests {
             .expect("anthropic.max entry");
         assert_eq!(entry.model.as_deref(), Some("claude-sonnet-4-5"));
         assert_eq!(entry.api_key.as_deref(), Some("sk-ant-oat01-test-token"));
-        assert!(
+        assert_eq!(
             cfg.get_prop("providers.models.anthropic.max.auth_mode")
-                .is_err()
+                .expect("persisted Anthropic auth_mode property"),
+            zeroclaw_config::traits::UNSET_DISPLAY,
+            "legacy Quickstart setup-token selection must not set the persisted OAuth mode"
         );
         let agent = cfg.agents.get("bot").expect("agent created");
         assert_eq!(agent.model_provider.as_str(), "anthropic.max");
@@ -2831,6 +2843,11 @@ mod tests {
         assert!(
             keys.contains(&"auth_mode"),
             "field_shape for claude/anthropic must include `auth_mode`; got {keys:?}",
+        );
+        assert_eq!(
+            rows.iter().filter(|row| row.key == "auth_mode").count(),
+            1,
+            "Quickstart must retain exactly one synthetic Anthropic auth selector"
         );
         let auth = rows
             .iter()

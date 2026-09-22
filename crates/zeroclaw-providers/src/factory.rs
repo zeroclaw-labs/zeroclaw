@@ -540,10 +540,10 @@ pub(crate) fn fallback_auth_ready_for_alias(
 }
 
 use zeroclaw_config::schema::{
-    Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnthropicModelProviderConfig,
-    AnyscaleModelProviderConfig, ArceeModelProviderConfig, AstraiModelProviderConfig,
-    AtlasCloudModelProviderConfig, AtomicChatModelProviderConfig, AuthMode,
-    AvianModelProviderConfig, AzureModelProviderConfig, BaichuanModelProviderConfig,
+    Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnthropicAuthMode,
+    AnthropicModelProviderConfig, AnyscaleModelProviderConfig, ArceeModelProviderConfig,
+    AstraiModelProviderConfig, AtlasCloudModelProviderConfig, AtomicChatModelProviderConfig,
+    AuthMode, AvianModelProviderConfig, AzureModelProviderConfig, BaichuanModelProviderConfig,
     BasetenModelProviderConfig, BedrockModelProviderConfig, CerebrasModelProviderConfig,
     CloudflareModelProviderConfig, CohereModelProviderConfig, CopilotModelProviderConfig,
     CrusoeModelProviderConfig, CustomModelProviderConfig, DeepinfraModelProviderConfig,
@@ -1200,10 +1200,37 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
+        let oauth = self.auth_mode == Some(AnthropicAuthMode::OAuth);
+        if oauth && has_api_key(key) {
+            anyhow::bail!(
+                "providers.models.anthropic.{alias}: auth_mode = \"oauth\" must not be combined with api_key"
+            );
+        }
+        if oauth && !AnthropicModelProviderConfig::has_official_oauth_endpoint(api_url) {
+            anyhow::bail!(
+                "providers.models.anthropic.{alias}: auth_mode = \"oauth\" requires the official https://api.anthropic.com endpoint"
+            );
+        }
+
         let mut b = crate::anthropic::AnthropicModelProvider::builder(alias)
-            .credential(key)
-            .server_fallback_models(self.server_fallback_models.clone())
-            .base_url(api_url.unwrap_or(fixed_family_endpoint::<Self>()));
+            .server_fallback_models(self.server_fallback_models.clone());
+        if oauth {
+            let state_dir = opts.zeroclaw_dir.clone().unwrap_or_else(|| {
+                directories::UserDirs::new().map_or_else(
+                    || std::path::PathBuf::from(".zeroclaw"),
+                    |dirs| dirs.home_dir().join(".zeroclaw"),
+                )
+            });
+            b = b.auth_profile(crate::auth::AuthService::new(
+                &state_dir,
+                opts.secrets_encrypt,
+            ));
+        } else {
+            b = b.credential(key);
+        }
+        // Use the centralized fixed endpoint for legacy aliases without an
+        // override; OAuth aliases above still reject every nonofficial URL.
+        b = b.base_url(api_url.unwrap_or(fixed_family_endpoint::<Self>()));
         if let Some(mt) = opts.provider_max_tokens {
             b = b.max_tokens(mt);
         }
@@ -1211,6 +1238,10 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
             b = b.timeout_secs(ts);
         }
         Ok(Box::new(b.build()))
+    }
+
+    fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        self.auth_mode == Some(AnthropicAuthMode::OAuth) || has_api_key(key)
     }
 }
 
