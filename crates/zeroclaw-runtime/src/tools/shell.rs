@@ -964,22 +964,12 @@ mod tests {
     async fn shell_blocks_disallowed_command() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
         let result = tool
-            .execute(json!({"command": "rm -rf /"}))
+            .execute(json!({"command": "zeroclaw_disallowed_test_command"}))
             .await
             .expect("disallowed command execution should return a result");
         assert!(!result.success);
         let error = result.error.as_deref().unwrap_or("");
-        // Which guard refuses first is dialect-dependent: on POSIX hosts the
-        // allowlist/high-risk checks fire, while under the Windows shell
-        // dialect the forbidden-path scan sees `/` (current-drive root) first
-        // and refuses with its own message. All three are the required
-        // refusal; none may be weakened into a pass.
-        assert!(
-            error.contains("not allowed")
-                || error.contains("high-risk")
-                || error.contains("forbidden path argument"),
-            "expected a refusal reason, got: {error:?}"
-        );
+        assert!(error.contains("not allowed"), "unexpected error: {error}");
     }
 
     #[tokio::test]

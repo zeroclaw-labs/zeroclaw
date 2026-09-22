@@ -67,9 +67,23 @@ There are two kinds of ignored advisory:
 ### 1. Real CVE / vulnerability (must be remediated)
 
 These ignores mark advisories with an exploitable bug. They are
-**temporary** and must be removed when a fix lands. There is currently
-no live entry in this category: the wasmtime-wasi CVE bundle tracked in
-**#8519** (`RUSTSEC-2026-0149`, `-0182`, `-0188`, then `-0222`) was
+**temporary** and must be removed when a fix lands.
+
+Live, deny+audit (both files):
+
+- **`imbl-sized-chunks` (`RUSTSEC-2026-0292`)**: double free /
+  use-after-free when an element's `Drop` panics during a `Chunk` or
+  `InlineArray` removal. Fixed in 0.2.0, but unreachable from here:
+  `crates/zeroclaw-channels/Cargo.toml` pins `matrix-sdk` 0.18, whose
+  `imbl` 6.1.0 requires `imbl-sized-chunks ^0.1.3`. Reached only through
+  `matrix-sdk -> imbl -> imbl-sized-chunks`, the same stack as the
+  `bitmaps` waiver below; `matrix-sdk` 0.19+ clears both at once. Remove
+  the `deny.toml` entry once the resolved graph no longer has an affected
+  version and the `.cargo/audit.toml` entry once none remains in
+  `Cargo.lock`. Waived in PR #11038; tracking #9899.
+
+The previous entry in this category, the wasmtime-wasi CVE bundle tracked
+in **#8519** (`RUSTSEC-2026-0149`, `-0182`, `-0188`, then `-0222`), was
 cleared by the `45.0.3` bump in PR #8542 and the subsequent `47.0.3`
 bump in PR #9589, which also removed the temporary waivers from both
 files.
@@ -108,8 +122,9 @@ Live, deny+audit (both files):
   reaches `imbl -> bitmaps` both directly and through `eyeball-im`.
   Remove the `deny.toml` entry only after `cargo deny` no longer resolves
   an affected `bitmaps`; remove the `.cargo/audit.toml` entry only after
-  no affected `bitmaps` remains in `Cargo.lock`. Tracking #9899 and
-  matrix-org/matrix-rust-sdk#6859.
+  no affected `bitmaps` remains in `Cargo.lock`. Cleared by the same
+  `matrix-sdk` 0.19+ bump as `RUSTSEC-2026-0292` above. Tracking #9899
+  (upstream matrix-org/matrix-rust-sdk#6859 closed 2026-09-14).
 
 The locked `bitmaps 3.2.1` also matches the separate informational
 unsoundness advisory `RUSTSEC-2025-0167`, which describes memory-corruption
@@ -193,17 +208,21 @@ unaffected by the advisory):
   `Cargo.lock`. `rand` is removed from both files because every
   locked version (0.8.6, 0.9.4, 0.10.1) is patched per the advisory,
   not because the crate left `Cargo.lock`. Remaining deny+audit live
-  ignores: `rustls-pemfile`, `proc-macro-error2`, `bitmaps`. Remaining
-  audit-only ignores: `rustls-webpki` (4) plus the 19 lockfile-stale
-  entries above.
-- **#9899**: *Triage and remove bitmaps unmaintained advisory waiver.*
-  Tracks the `RUSTSEC-2026-0247` waiver described above and owns
-  acceptance and revisit of the visible `RUSTSEC-2025-0167` warning.
-  Re-evaluate both when Matrix SDK dependencies change; stop accepting
-  `RUSTSEC-2025-0167` once no affected `bitmaps` remains in `Cargo.lock`
-  or the advisory marks every locked version patched/unaffected. The
-  `RUSTSEC-2026-0247` waiver does not suppress that separate warning.
-  Upstream replacement work is tracked in matrix-org/matrix-rust-sdk#6859.
+  ignores: `rustls-pemfile`, `proc-macro-error2`, `bitmaps`, and
+  `imbl-sized-chunks` (the one real-CVE entry, tracked in #9899 rather
+  than here). Remaining audit-only ignores: `rustls-webpki` (4) plus the
+  19 lockfile-stale entries above.
+- **#9899**: *Remove the `matrix-sdk -> imbl` advisory waivers.* Owns
+  `RUSTSEC-2026-0247` (`bitmaps`) and `RUSTSEC-2026-0292`
+  (`imbl-sized-chunks`), plus acceptance of the visible
+  `RUSTSEC-2025-0167` warning, which neither waiver suppresses. Removal
+  condition: drop both ignores from `deny.toml`, `.cargo/audit.toml`, and
+  this document once the resolved graph has `imbl-sized-chunks` >= 0.2
+  and no affected `bitmaps`. The path is bumping `matrix-sdk` from the
+  0.18 pin to 0.19+, which pulls `imbl` 7.0.2; `cargo update -p
+  matrix-sdk` alone is a no-op against that pin. Upstream
+  matrix-org/matrix-rust-sdk#6859 closed 2026-09-14, so the remaining
+  constraint is our own pin.
 - **#8059**: *Policy cleanup: deny.toml ignored-advisory tracking,
   multiple-versions, wildcards.* piiiico's RFC on adding per-entry
   rationale to `deny.toml` ignore blocks. This doc is the
@@ -237,6 +256,12 @@ two tools have drifted again. Open or update the tracking issue.
 
 ## Change log
 
+- 2026-09-21: Added `RUSTSEC-2026-0292` (`imbl-sized-chunks` double
+  free) to both files, the first live real-CVE waiver since the wasmtime
+  bundle cleared, with its category 1 entry above. Both reasons point at
+  #9899, now widened to own both `matrix-sdk -> imbl` waivers, rather
+  than at matrix-org/matrix-rust-sdk#6859, which closed 2026-09-14.
+  (PR #11038)
 - 2026-08-11: Mirrored the exact `RUSTSEC-2026-0247` `bitmaps` waiver
   from `deny.toml` into `.cargo/audit.toml` and added its dependency
   routes, #9899 lifecycle, and tool-specific removal conditions to this
