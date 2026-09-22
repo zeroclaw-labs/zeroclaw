@@ -51,6 +51,10 @@ Today `.github/labeler.yml` owns only path and scope labels such as `docs`, `ci`
 
 Size automation may recalculate on every pushed PR update so labels continue to describe the actual diff under review. #9345 owns the separate risk-classifier rollout. Its risk phase remains report-only until maintainers review the evidence and separately enable mutation. Report-only output must record the proposed risk, matching rule evidence, current risk, `risk:manual` state, and `domain:security` state so maintainers can audit mismatches and security-shaped work that escaped both triggers. Any future risk automation must honor `risk:manual` as a hard freeze: it cannot add, remove, or replace a PR's `risk:*` label until a maintainer removes the override.
 
+## Optional CI execution
+
+`ci:windows` is a maintainer-applied compute switch for advisory Windows tests on a PR, not a review or security approval. It is separate from the automatic `ci` path label. See [when to request Windows execution](./ci-and-actions.md#label-gated-advisory-windows-tests-windows-testsyml) for selection guidance, repeat-run behavior, and how to read the result.
+
 ## Cleanup protocol
 
 Label cleanup is a maintainer action, not a side effect of normal PR review.

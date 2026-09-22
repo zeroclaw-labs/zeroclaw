@@ -2673,10 +2673,7 @@ async fn safety_net_narration_reaches_both_draft_and_event_channels_once() {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 30_000,
-                context_limits: zeroclaw_config::schema::ResolvedContextLimits {
-                    context_token_budget: 100_000,
-                    ..zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0)
-                },
+                context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
                 context_limits_resolver: None,
                 knobs: &crate::agent::loop_::LoopKnobs::default(),
             },

@@ -4,7 +4,10 @@
 //! key-name redaction heuristic. Approval decisions bind to `request_id`; this
 //! transport forwards the summary without rebuilding it from raw arguments.
 
-use super::AppState;
+use super::{
+    AppState, GW_SESSION_PREFIX, gateway_cancel_key, register_cancel_token,
+    remove_cancel_token_if_current,
+};
 use crate::ws_approval::{PendingApprovals, WsApprovalChannel, new_pending_approvals};
 use axum::{
     extract::{
@@ -197,9 +200,6 @@ pub async fn handle_ws_chat(
     .into_response()
 }
 
-/// Gateway session key prefix to avoid collisions with channel sessions.
-const GW_SESSION_PREFIX: &str = "gw_";
-
 fn websocket_ping_interval(
     config: &zeroclaw_config::schema::Config,
 ) -> Option<tokio::time::Interval> {
@@ -242,6 +242,42 @@ async fn resolve_ws_memory_handle(
     zeroclaw_memory::create_memory_for_agent(config, agent_alias, api_key.as_deref())
         .await
         .map(Some)
+}
+
+/// Provider, model, and temperature for the turn-end WS memory
+/// consolidation, resolved from the live provider reference the agent
+/// reports after the turn. A mid-session model switch replaces the agent's
+/// active provider and model together without touching the agent's
+/// configured default, so the consolidation must be built from that live
+/// pair — resolving from the configured default and overriding only the
+/// model would pair one entry's provider with another entry's model. The
+/// live model wins when non-empty; otherwise the entry's configured model
+/// is used. Returns `None` when the reference no longer resolves (e.g. the
+/// entry was removed by a config reload, or the reference is not a dotted
+/// `<family>.<alias>`), in which case consolidation is skipped rather than
+/// silently rerouted to an unrelated entry.
+fn ws_consolidation_model(
+    config: &zeroclaw_config::schema::Config,
+    provider_ref: &str,
+    model: &str,
+) -> Option<(
+    Box<dyn zeroclaw_api::model_provider::ModelProvider>,
+    String,
+    Option<f64>,
+)> {
+    let (provider_type, provider_alias) = provider_ref.split_once('.')?;
+    let entry = config
+        .providers
+        .models
+        .find(provider_type, provider_alias)?;
+    let (provider, _, resolved_model, _) =
+        zeroclaw_runtime::agent::agent::build_session_model_provider(
+            config,
+            provider_ref,
+            Some(model),
+        )
+        .ok()?;
+    Some((provider, resolved_model, entry.temperature))
 }
 
 async fn handle_ws_sop_frame<S>(
@@ -349,6 +385,9 @@ async fn handle_socket(
 
     // Resolve session ID: use provided or generate a new UUID
     let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    // Transcript identity keeps the raw display id (`gw_{session_id}`) so
+    // existing persisted histories and metadata rows stay resumable across
+    // reconnects.
     let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
     // Match the sanitized form persisted by memory backend migrations.
     let mut memory_session_id = zeroclaw_api::session_keys::sanitize_session_key(&session_id);
@@ -1473,15 +1512,15 @@ async fn process_chat_message(
     // ── Cancellation token lifecycle ─────────────────────────────
     // Create a token before the turn starts so the abort endpoint
     // can cancel it. Remove it after the turn completes regardless
-    // of outcome (normal, error, or cancelled).
-    let cancel_token = tokio_util::sync::CancellationToken::new();
-    {
-        state
-            .cancel_tokens
-            .lock()
-            .expect("cancel_tokens lock poisoned")
-            .insert(session_key.to_string(), cancel_token.clone());
-    }
+    // of outcome (normal, error, or cancelled). Registration uses the
+    // process-local cancellation key shared with the webhook SSE transport,
+    // while persistence stays on the raw transcript key.
+    let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
+    register_cancel_token(
+        &state.cancel_tokens,
+        &gateway_cancel_key(session_id),
+        Arc::clone(&cancel_token),
+    );
 
     // Channel for streaming turn events from the agent.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
@@ -1513,7 +1552,7 @@ async fn process_chat_message(
                         .turn_streamed_with_steering_state(
                             &content_owned,
                             event_tx,
-                            Some(cancel_token.clone()),
+                            Some(cancel_token.as_ref().clone()),
                             Some(&mut steering_rx),
                         )
                         .instrument(span),
@@ -1742,13 +1781,11 @@ async fn process_chat_message(
     let (result, ()) = tokio::join!(turn_fut, forward_fut);
 
     // ── Remove cancel token (turn finished) ──────────────────────
-    {
-        state
-            .cancel_tokens
-            .lock()
-            .expect("cancel_tokens lock poisoned")
-            .remove(session_key);
-    }
+    remove_cancel_token_if_current(
+        &state.cancel_tokens,
+        &gateway_cancel_key(session_id),
+        &cancel_token,
+    );
 
     // Check if this turn was cancelled. `turn_streamed` propagates
     // `ToolLoopCancelled` through anyhow, so we detect it here.
@@ -1848,13 +1885,37 @@ async fn process_chat_message(
             // are extracted to long-term memory (Daily + Core categories).
             if state.auto_save {
                 if let Some(mem) = ws_memory.clone() {
-                    let model_provider = state.model_provider.clone();
-                    let model = state.model.clone();
-                    let temperature = state.temperature;
+                    // Read the live provider/model AFTER the turn: a
+                    // mid-session model switch replaces the agent's active
+                    // provider and model together (without touching the
+                    // agent's configured default), and consolidation must
+                    // follow the pair that actually finished the turn — the
+                    // same pairing the channel orchestrator hands to its
+                    // consolidation, instead of the gateway-wide boot
+                    // default.
+                    let (live_provider_ref, live_model) = {
+                        let (_, provider_ref, model) = agent.attribution_fields();
+                        (provider_ref, model)
+                    };
                     let memory_config = state.config.read().memory.clone();
                     let user_msg = content.to_string();
                     let assistant_resp = outcome.response.clone();
+                    let live_config = Arc::clone(&state.config);
                     zeroclaw_spawn::spawn!(async move {
+                        let config = live_config.read().clone();
+                        let Some((model_provider, model, temperature)) =
+                            ws_consolidation_model(&config, &live_provider_ref, &live_model)
+                        else {
+                            ::zeroclaw_log::record!(
+                                DEBUG,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                ),
+                                "WS memory consolidation skipped"
+                            );
+                            return;
+                        };
                         if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
                             model_provider.as_ref(),
                             &model,
@@ -3236,6 +3297,108 @@ data: {\"type\":\"message_stop\"}\n\n",
             .expect_err("missing cwd should be rejected");
 
         assert!(err.to_string().contains("cwd is not a usable directory"));
+    }
+
+    #[test]
+    fn ws_consolidation_model_pairs_the_active_provider_with_its_model() {
+        use zeroclaw_api::attribution::{ModelProviderKind, ProviderKind, Role};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig,
+            OpenAIModelProviderConfig,
+        };
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        // The install-wide first configured model (the openai slot precedes
+        // ollama in slot order) is also the agent's CONFIGURED default; a
+        // session can still switch to the ollama entry mid-conversation.
+        config.providers.models.openai.insert(
+            "install".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("install-wide-model".to_string()),
+                    temperature: Some(0.9),
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.ollama.insert(
+            "agent".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("agent-entry-model".to_string()),
+                    temperature: Some(0.3),
+                    ..Default::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.agents.insert(
+            "worker".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.install".into(),
+                ..Default::default()
+            },
+        );
+
+        // After a mid-session switch to the ollama entry — on the switching
+        // turn and every following one — the post-turn live pair is
+        // ("ollama.agent", "llama3"). Consolidation must build the ollama
+        // entry's provider (NOT the agent's configured openai default) and
+        // carry the switched model plus the switched entry's temperature.
+        // The ollama family builds through the OpenAI-compatible provider,
+        // so its attribution kind is Plugin; the entry alias is what pins
+        // the provider to the live reference.
+        let (provider, model, temperature) =
+            ws_consolidation_model(&config, "ollama.agent", "llama3")
+                .expect("the switched reference must resolve");
+        assert_eq!(model, "llama3");
+        assert_eq!(
+            temperature,
+            Some(0.3),
+            "consolidation must use the switched entry's temperature"
+        );
+        assert!(matches!(
+            provider.as_ref().role(),
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Plugin))
+        ));
+        assert_eq!(
+            provider.as_ref().alias(),
+            "agent",
+            "the consolidation provider must follow the live reference, not the configured default"
+        );
+
+        // Without a live model (empty), the switched entry's own model is used.
+        let (provider, model, temperature) = ws_consolidation_model(&config, "ollama.agent", "")
+            .expect("the switched reference must resolve");
+        assert_eq!(model, "agent-entry-model");
+        assert_eq!(temperature, Some(0.3));
+        assert!(matches!(
+            provider.as_ref().role(),
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Plugin))
+        ));
+        assert_eq!(provider.as_ref().alias(), "agent");
+
+        // The un-switched agent default resolves through the same path and
+        // stays paired with its own model and temperature. The openai family
+        // builds its dedicated provider, so the attribution kind differs
+        // from the switched ollama entry — both must follow their own
+        // reference.
+        let (provider, model, temperature) =
+            ws_consolidation_model(&config, "openai.install", "install-wide-model")
+                .expect("the configured reference must resolve");
+        assert_eq!(model, "install-wide-model");
+        assert_eq!(temperature, Some(0.9));
+        assert!(matches!(
+            provider.as_ref().role(),
+            Role::Provider(ProviderKind::Model(ModelProviderKind::OpenAi))
+        ));
+        assert_eq!(provider.as_ref().alias(), "install");
+
+        // A reference that no longer resolves — or one that is not a dotted
+        // `<family>.<alias>` — skips consolidation instead of falling back
+        // to an unrelated entry.
+        assert!(ws_consolidation_model(&config, "ollama.gone", "m").is_none());
+        assert!(ws_consolidation_model(&config, "not-dotted", "m").is_none());
     }
 
     #[test]

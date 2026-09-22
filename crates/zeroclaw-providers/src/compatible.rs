@@ -19,7 +19,7 @@ use reqwest::{
     header::{HeaderMap, HeaderValue, USER_AGENT},
 };
 use serde::{Deserialize, Serialize};
-use zeroclaw_config::schema::ToolResultImagePolicy;
+use zeroclaw_config::schema::{CacheTtl, ToolResultImagePolicy};
 
 const TOOL_RESULT_IMAGE_OMITTED_NOTICE: &str = "[tool-result image omitted by provider policy]";
 
@@ -60,6 +60,13 @@ pub struct OpenAiCompatibleModelProvider {
     extra_headers: std::collections::HashMap<String, String>,
     /// Optional reasoning effort for GPT-5/Codex-compatible backends.
     reasoning_effort: Option<String>,
+    /// When true, forward the configured reasoning effort to any model,
+    /// bypassing the OpenAI-reasoning-family name filter. The filter exists
+    /// because some backends reject unknown request params; operators enable
+    /// this only for backends they have verified accept `reasoning_effort`
+    /// (GLM/Kimi/DeepSeek/Qwen-style reasoners behind OpenAI-compatible
+    /// gateways commonly do).
+    reasoning_effort_passthrough: bool,
     /// Whether stored assistant reasoning should be replayed on outbound
     /// assistant history messages. Some providers reject reasoning fields as
     /// input even though they may return them in responses.
@@ -68,6 +75,10 @@ pub struct OpenAiCompatibleModelProvider {
     /// outbound request bodies (system prompt; rolling last message).
     /// Drives `capabilities().prompt_caching` and the request-build path.
     cache_passthrough: bool,
+    /// Cache entry lifetime carried by every breakpoint injected behind
+    /// `cache_passthrough`. One TTL per request by design. Inert without
+    /// passthrough: no markers are placed, so nothing carries a TTL.
+    cache_ttl: Option<CacheTtl>,
     /// Custom API path suffix (e.g. "/v2/generate").
     /// When set, overrides the default `/chat/completions` path detection.
     api_path: Option<String>,
@@ -469,6 +480,11 @@ pub struct OpenAiCompatibleBuilder {
     timeout_secs: Option<u64>,
     extra_headers: std::collections::HashMap<String, String>,
     reasoning_effort: Option<String>,
+    /// Set to `true` by
+    /// [`OpenAiCompatibleBuilder::with_reasoning_effort_passthrough`].
+    /// Default `false` keeps the OpenAI-reasoning-family name filter in
+    /// charge of which models receive `reasoning_effort`.
+    reasoning_effort_passthrough: bool,
     /// Set to `Some(false)` by
     /// [`OpenAiCompatibleBuilder::without_assistant_reasoning_replay`]. `None`
     /// preserves the default (replay enabled).
@@ -476,6 +492,9 @@ pub struct OpenAiCompatibleBuilder {
     /// Set by [`OpenAiCompatibleBuilder::with_cache_passthrough`]. Default
     /// `false`: requests and capability reporting are unchanged.
     cache_passthrough: bool,
+    /// Set by [`OpenAiCompatibleBuilder::with_cache_ttl`]. Default `None`:
+    /// breakpoints keep the 5-minute API default.
+    cache_ttl: Option<CacheTtl>,
     api_path: Option<String>,
     max_tokens: Option<u32>,
     models_dev_key: Option<String>,
@@ -608,6 +627,15 @@ impl OpenAiCompatibleBuilder {
         self
     }
 
+    /// Forward the configured reasoning effort to every model on this
+    /// provider, bypassing the OpenAI-reasoning-family name filter. The
+    /// filter exists because some backends reject unknown request params;
+    /// enable this only on backends verified to accept `reasoning_effort`.
+    pub fn with_reasoning_effort_passthrough(mut self) -> Self {
+        self.reasoning_effort_passthrough = true;
+        self
+    }
+
     /// Disable replay of stored assistant reasoning on outbound assistant
     /// history messages.
     pub fn without_assistant_reasoning_replay(mut self) -> Self {
@@ -623,6 +651,17 @@ impl OpenAiCompatibleBuilder {
     /// `prompt_caching` in the provider capabilities.
     pub fn with_cache_passthrough(mut self) -> Self {
         self.cache_passthrough = true;
+        self
+    }
+
+    /// Request the given cache entry lifetime on every breakpoint injected
+    /// behind `cache_passthrough`. Effective only together with
+    /// [`Self::with_cache_passthrough`]: without passthrough no breakpoints
+    /// are placed, so the setting is inert (no parse-time warning — an
+    /// operator may stage the value before switching passthrough on).
+    /// Defaults to the 5-minute API default when unset.
+    pub fn with_cache_ttl(mut self, cache_ttl: CacheTtl) -> Self {
+        self.cache_ttl = Some(cache_ttl);
         self
     }
 
@@ -760,8 +799,10 @@ impl OpenAiCompatibleBuilder {
             timeout_secs: self.timeout_secs.unwrap_or(120),
             extra_headers: self.extra_headers,
             reasoning_effort: self.reasoning_effort,
+            reasoning_effort_passthrough: self.reasoning_effort_passthrough,
             replay_assistant_reasoning: self.replay_assistant_reasoning_override.unwrap_or(true),
             cache_passthrough: self.cache_passthrough,
+            cache_ttl: self.cache_ttl,
             api_path: self.api_path,
             max_tokens: self.max_tokens,
             models_dev_key: self.models_dev_key,
@@ -801,8 +842,10 @@ impl OpenAiCompatibleModelProvider {
             timeout_secs: None,
             extra_headers: std::collections::HashMap::new(),
             reasoning_effort: None,
+            reasoning_effort_passthrough: false,
             replay_assistant_reasoning_override: None,
             cache_passthrough: false,
+            cache_ttl: None,
             api_path: None,
             max_tokens: None,
             models_dev_key: None,
@@ -1073,20 +1116,24 @@ impl OpenAiCompatibleModelProvider {
         if !self.cache_passthrough {
             return;
         }
+        // One TTL per request: every breakpoint this pass places carries
+        // the same configured lifetime. `None` resolves to the 5-minute
+        // API default, whose markers serialize without a `ttl` field.
+        let cache_ttl = self.cache_ttl.unwrap_or_default();
         let carrier = merged_system_carrier.and_then(|idx| {
             (idx < messages.len() && messages[idx].cache_role() != "system").then_some(idx)
         });
         match carrier {
             Some(idx) => {
                 if let Some(content) = messages[idx].cache_content() {
-                    content.apply_cache_control();
+                    content.apply_cache_control(cache_ttl);
                 }
             }
             None => {
                 if let Some(system) = messages.iter_mut().find(|m| m.cache_role() == "system")
                     && let Some(content) = system.cache_content()
                 {
-                    content.apply_cache_control();
+                    content.apply_cache_control(cache_ttl);
                 }
             }
         }
@@ -1100,7 +1147,7 @@ impl OpenAiCompatibleModelProvider {
                     continue;
                 }
                 if let Some(content) = message.cache_content()
-                    && content.apply_cache_control()
+                    && content.apply_cache_control(cache_ttl)
                 {
                     break;
                 }
@@ -1187,6 +1234,15 @@ impl OpenAiCompatibleModelProvider {
 
     fn reasoning_effort_for_model(&self, model: &str) -> Option<String> {
         let effort = self.reasoning_effort.as_ref()?;
+        // The name filter below exists because some OpenAI-compatible
+        // backends reject unknown request params (HTTP 400 for
+        // `reasoning_effort` on models they do not treat as reasoners).
+        // Operators who have verified their backend honors the param —
+        // GLM/Kimi/DeepSeek/Qwen-style reasoners behind OpenAI-compatible
+        // gateways commonly do — can bypass the filter per provider.
+        if self.reasoning_effort_passthrough {
+            return Some(effort.clone());
+        }
         let id = model
             .rsplit('/')
             .next()
@@ -1317,7 +1373,7 @@ impl MessageContent {
     /// image part stays unmarked: the image is covered by the following
     /// turn's rolling breakpoint. Empty text is never marked, because the
     /// wire format rejects empty text blocks that carry `cache_control`.
-    fn apply_cache_control(&mut self) -> bool {
+    fn apply_cache_control(&mut self, cache_ttl: CacheTtl) -> bool {
         match self {
             MessageContent::Text(text) => {
                 if text.is_empty() {
@@ -1325,7 +1381,9 @@ impl MessageContent {
                 }
                 *self = MessageContent::Parts(vec![MessagePart::Text {
                     text: std::mem::take(text),
-                    cache_control: Some(crate::anthropic::CacheControl::ephemeral()),
+                    cache_control: Some(crate::anthropic::CacheControl::ephemeral_with_ttl(
+                        cache_ttl,
+                    )),
                 }]);
                 true
             }
@@ -1337,7 +1395,9 @@ impl MessageContent {
                     } = part
                         && !text.is_empty()
                     {
-                        *cache_control = Some(crate::anthropic::CacheControl::ephemeral());
+                        *cache_control = Some(crate::anthropic::CacheControl::ephemeral_with_ttl(
+                            cache_ttl,
+                        ));
                         return true;
                     }
                 }
@@ -4685,6 +4745,206 @@ mod tests {
         );
     }
 
+    /// Capture mock for the TTL path: passthrough on or off, provider
+    /// built with the requested `cache_ttl` when set. Same wire as
+    /// [`Self::mock_streaming_cache_capture`] so tests pin both paths
+    /// against one shape.
+    async fn mock_cache_capture_with_ttl(
+        cache_passthrough: bool,
+        cache_ttl: Option<CacheTtl>,
+    ) -> (
+        OpenAiCompatibleModelProvider,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
+        use tokio::net::TcpListener;
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_route = std::sync::Arc::clone(&captured);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let captured = std::sync::Arc::clone(&captured_for_route);
+                async move {
+                    let streaming =
+                        body.get("stream").and_then(serde_json::Value::as_bool) == Some(true);
+                    captured.lock().unwrap().push(body);
+                    if streaming {
+                        return (
+                            StatusCode::OK,
+                            [("content-type", "text/event-stream")],
+                            concat!(
+                                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                                "data: [DONE]\n\n"
+                            ),
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut builder = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("custom")
+            .base_url(&format!("http://{addr}"))
+            .auth_style(AuthStyle::Bearer);
+        if cache_passthrough {
+            builder = builder.with_cache_passthrough();
+        }
+        if let Some(cache_ttl) = cache_ttl {
+            builder = builder.with_cache_ttl(cache_ttl);
+        }
+        let provider = builder.build();
+
+        (provider, captured, server)
+    }
+
+    /// D2 + D5: behind the flag, the 1h lifetime lands on every breakpoint
+    /// the compat provider places (system prompt; rolling last message),
+    /// and only breakpoint-carrying messages convert to block form. With
+    /// the default lifetime the body contains no `ttl` key at all.
+    #[tokio::test]
+    async fn cache_ttl_one_hour_marks_every_compat_breakpoint() {
+        let (provider, captured, server) =
+            mock_cache_capture_with_ttl(true, Some(CacheTtl::OneHour)).await;
+        let messages = vec![
+            ChatMessage::system("be brief"),
+            ChatMessage::user("first question"),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::user("second question"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("1h request failed: {error}"));
+
+        {
+            let requests = captured.lock().unwrap();
+            let body = &requests[0];
+            let msgs = body["messages"].as_array().expect("messages array");
+
+            let system_block = msgs[0]["content"][0]["cache_control"]
+                .as_object()
+                .expect("system breakpoint in block form");
+            assert_eq!(system_block["type"], "ephemeral");
+            assert_eq!(
+                system_block["ttl"], "1h",
+                "system marker carries the 1h lifetime"
+            );
+
+            let rolling_block = msgs[3]["content"][0]["cache_control"]
+                .as_object()
+                .expect("rolling breakpoint in block form");
+            assert_eq!(rolling_block["type"], "ephemeral");
+            assert_eq!(
+                rolling_block["ttl"], "1h",
+                "rolling marker carries the 1h lifetime"
+            );
+
+            assert_eq!(
+                msgs[2]["content"], "first answer",
+                "non-carrier messages must keep plain string serialization"
+            );
+        }
+
+        // Default-lifetime control run: same placement, no ttl anywhere.
+        let (provider, captured, server) = mock_cache_capture_with_ttl(true, None).await;
+        let messages = vec![
+            ChatMessage::system("be brief"),
+            ChatMessage::user("first question"),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::user("second question"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("default request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        let body = &requests[0];
+        assert!(
+            !body.to_string().contains("\"ttl\""),
+            "default config must keep the compat wire free of ttl keys: {body}"
+        );
+        let msgs = body["messages"].as_array().expect("messages array");
+        assert_eq!(msgs[0]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(msgs[3]["content"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    /// D3: `cache_ttl` without `cache_passthrough` is inert — the structured
+    /// `chat` path hits the `!cache_passthrough` early return in
+    /// `apply_cache_breakpoints`, so the body is byte-identical to the
+    /// flag-off structured wire and a staged value waiting for a passthrough
+    /// flip changes nothing on the wire. Removing that early return fails
+    /// this test (breakpoints would appear in the body).
+    #[tokio::test]
+    async fn cache_ttl_one_hour_without_passthrough_is_inert() {
+        let (provider, captured, server) =
+            mock_cache_capture_with_ttl(false, Some(CacheTtl::OneHour)).await;
+        let messages = vec![
+            ChatMessage::system("be brief"),
+            ChatMessage::user("first question"),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::user("second question"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("inert request failed: {error}"));
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0],
+            serde_json::json!({
+                "model": "test-model",
+                "messages": [
+                    {"role": "system", "content": "be brief"},
+                    {"role": "user", "content": "first question"},
+                    {"role": "assistant", "content": "first answer"},
+                    {"role": "user", "content": "second question"},
+                ],
+                "stream": false,
+            }),
+            "cache_ttl without passthrough must leave the structured body identical to flag-off"
+        );
+    }
+
     /// Streaming capture mock: records every request body, answers with a
     /// minimal SSE stream. Returns the provider built with or without the
     /// cache flag so tests can pin both wire paths.
@@ -5693,6 +5953,104 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("high"),
             "reasoning_effort must be present when no tools are sent; got: {value}"
+        );
+    }
+
+    // Opt-in reasoning-effort passthrough: the name filter is fail-closed
+    // because some backends reject unknown request params, so only an
+    // explicit per-provider flag forwards effort to non-OpenAI model names.
+    #[test]
+    fn reasoning_effort_passthrough_default_keeps_name_filter_for_glm_style_models() {
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_effort(Some("high".to_string()))
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "fireworks-primary/glm-5p3",
+            None,
+            false,
+            false,
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert!(
+            value.get("reasoning_effort").is_none(),
+            "flag unset must preserve the name filter: glm-style models never receive reasoning_effort; got: {value}"
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_passthrough_forwards_effort_to_glm_style_models() {
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_effort(Some("high".to_string()))
+            .with_reasoning_effort_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "fireworks-primary/glm-5p3",
+            None,
+            false,
+            false,
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("high"),
+            "flag on must forward the configured effort to glm-style models; got: {value}"
+        );
+
+        // Models the filter already passes keep the same outcome with the
+        // flag on: passthrough only widens coverage, it never narrows it.
+        let req =
+            p.build_native_tool_chat_request(&messages, None, "openai/o3-mini", None, false, false);
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("high"),
+            "o3-style models must keep receiving the effort with the flag on; got: {value}"
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_passthrough_without_configured_effort_sends_none() {
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_reasoning_effort_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "fireworks-primary/glm-5p3",
+            None,
+            false,
+            false,
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert!(
+            value.get("reasoning_effort").is_none(),
+            "passthrough without a configured effort must not invent one; got: {value}"
         );
     }
 

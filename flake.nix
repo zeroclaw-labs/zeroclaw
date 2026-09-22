@@ -45,10 +45,12 @@
           inherit nixpkgs system;
         };
         # >>> generated:flake-packages by `cargo generate installers` - do not edit <<<
-        # Default feature set: canonical lean Dist.
-        # Override with `packages.zeroclaw.override { features = [ ... ]; }`.
+        # Default feature sets: zeroclaw uses canonical lean Dist,
+        # zerocode uses its own package features (currently empty).
+        # Override per-package, e.g. `packages.zeroclaw.override { features = [ ... ]; }`.
         zeroclawDefaultFeatures = [ "acp-bridge" "agent-runtime" "channel-acp-server" "channel-discord" "channel-email" "channel-filesystem" "channel-git" "channel-lark" "channel-matrix" "channel-telegram" "channel-webhook" "gateway" "observability-prometheus" "schema-export" "whatsapp-web" ];
-        buildZeroclaw = { pname, cargoPkg, features ? zeroclawDefaultFeatures }:
+        zerocodeDefaultFeatures = [  ];
+        buildZeroclaw = { pname, cargoPkg, features }:
           (pkgs.makeRustPlatform {
             cargo = rustToolchain;
             rustc = rustToolchain;
@@ -69,9 +71,9 @@
           };
         # >>> end generated:flake-packages <<<
       in {
-        packages.zeroclaw = buildZeroclaw { pname = "zeroclaw"; cargoPkg = "zeroclaw"; };
-        packages.zerocode = buildZeroclaw { pname = "zerocode"; cargoPkg = "zerocode"; };
-        packages.default = buildZeroclaw { pname = "zeroclaw"; cargoPkg = "zeroclaw"; };
+        packages.zeroclaw = buildZeroclaw { pname = "zeroclaw"; cargoPkg = "zeroclaw"; features = zeroclawDefaultFeatures; };
+        packages.zerocode = buildZeroclaw { pname = "zerocode"; cargoPkg = "zerocode"; features = zerocodeDefaultFeatures; };
+        packages.default = buildZeroclaw { pname = "zeroclaw"; cargoPkg = "zeroclaw"; features = zeroclawDefaultFeatures; };
         checks = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           nixos-module-eval = pkgs.writeText "zeroclaw-nixos-module-eval" (
             builtins.toJSON nixosModuleEvalTests

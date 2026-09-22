@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 pub use zeroclaw_api::model_provider::ModelRefusalError as AnthropicRefusalError;
 use zeroclaw_api::model_provider::ThinkingDisplay;
 use zeroclaw_api::tool::ToolSpec;
+use zeroclaw_config::schema::CacheTtl;
 
 /// Anthropic's API documentation lists 1.0 as the default sampling temperature.
 const TEMPERATURE_DEFAULT: f64 = 1.0;
@@ -39,10 +40,11 @@ const MAX_ENCODED_IMAGE_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
 /// the model reads as fact.
 const TRUNCATED_DATA_NOTE: &str = "[truncated inline data removed]";
 /// Stand-in prose for a user message whose only content is an image, so the
-/// message never ends on an `image` block — `apply_cache_to_last_message` is a
-/// silent no-op on one, which would cost the request its cache breakpoint with
-/// nothing reporting it. Used by the user arm of
-/// [`AnthropicModelProvider::convert_messages`].
+/// message never ends on an `image` block. The turn then carries a block that
+/// `apply_cache_to_last_message` can mark, which keeps the rolling breakpoint
+/// on the latest message instead of rolling it back to an earlier one, and the
+/// model reads prose about the attachment rather than a bare image. Used by
+/// the user arm of [`AnthropicModelProvider::convert_messages`].
 const IMAGE_ONLY_TEXT_PLACEHOLDER: &str = "[image]";
 /// Stands in for a `tool_result` that never arrived, so an interrupted turn
 /// cannot wedge the session with a hard 400 on replay. See
@@ -94,6 +96,11 @@ pub struct AnthropicModelProvider {
     /// non-streaming requests only. Empty means requests are byte-identical to
     /// the pre-opt-in wire format.
     server_fallback_models: Vec<String>,
+    /// Cache entry lifetime carried by every cache marker this provider
+    /// places (OAuth prefix blocks, tools block, rolling last message).
+    /// One TTL per request by design. Defaults to the 5-minute API
+    /// default.
+    cache_ttl: CacheTtl,
     /// Memoized cleaned tool schemas: each registered schema is cleaned once
     /// per provider instance (not once per request) and the byte-stable
     /// result keeps the `cache_control` tools block identical across
@@ -474,12 +481,33 @@ struct NativeToolSpec {
 pub(crate) struct CacheControl {
     #[serde(rename = "type")]
     cache_type: String,
+    /// Wire `ttl` on the cache breakpoint. `None` serializes nothing,
+    /// keeping requests byte-identical to the 5-minute API default; only
+    /// the configured 1-hour lifetime emits the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl: Option<String>,
 }
 
 impl CacheControl {
     pub(crate) fn ephemeral() -> Self {
         Self {
             cache_type: "ephemeral".to_string(),
+            ttl: None,
+        }
+    }
+
+    /// Ephemeral breakpoint carrying the configured cache entry lifetime.
+    /// `FiveMinutes` serializes exactly like [`Self::ephemeral`] — the API
+    /// default needs no explicit `ttl` — so call sites can pass the
+    /// resolved TTL unconditionally without perturbing default-config
+    /// requests.
+    pub(crate) fn ephemeral_with_ttl(ttl: CacheTtl) -> Self {
+        match ttl {
+            CacheTtl::FiveMinutes => Self::ephemeral(),
+            CacheTtl::OneHour => Self {
+                cache_type: "ephemeral".to_string(),
+                ttl: Some("1h".to_string()),
+            },
         }
     }
 }
@@ -595,6 +623,7 @@ pub struct AnthropicBuilder {
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
     server_fallback_models: Vec<String>,
+    cache_ttl: Option<CacheTtl>,
 }
 
 impl AnthropicBuilder {
@@ -638,6 +667,13 @@ impl AnthropicBuilder {
         self
     }
 
+    /// Request the given cache entry lifetime on every cache marker this
+    /// provider places. Defaults to the 5-minute API default when unset.
+    pub fn cache_ttl(mut self, cache_ttl: CacheTtl) -> Self {
+        self.cache_ttl = Some(cache_ttl);
+        self
+    }
+
     pub fn build(self) -> AnthropicModelProvider {
         AnthropicModelProvider {
             alias: self.alias,
@@ -650,6 +686,7 @@ impl AnthropicBuilder {
                 .timeout_secs
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
             server_fallback_models: self.server_fallback_models,
+            cache_ttl: self.cache_ttl.unwrap_or_default(),
             schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
         }
     }
@@ -666,6 +703,7 @@ impl AnthropicModelProvider {
             max_tokens: None,
             timeout_secs: None,
             server_fallback_models: Vec::new(),
+            cache_ttl: None,
         }
     }
 
@@ -744,11 +782,15 @@ impl AnthropicModelProvider {
 
     /// For OAuth tokens, Anthropic requires the system prompt to start with the
     /// Claude Code identity prefix. This prepends it to any existing system prompt.
-    fn apply_oauth_system_prompt(system: Option<SystemPrompt>) -> Option<SystemPrompt> {
+    /// Every block this writes carries the configured cache entry lifetime.
+    fn apply_oauth_system_prompt(
+        system: Option<SystemPrompt>,
+        cache_ttl: CacheTtl,
+    ) -> Option<SystemPrompt> {
         let prefix = SystemBlock {
             block_type: "text".to_string(),
             text: "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
-            cache_control: Some(CacheControl::ephemeral()),
+            cache_control: Some(CacheControl::ephemeral_with_ttl(cache_ttl)),
         };
         match system {
             Some(SystemPrompt::Blocks(mut blocks)) => {
@@ -760,7 +802,7 @@ impl AnthropicModelProvider {
                 SystemBlock {
                     block_type: "text".to_string(),
                     text: s,
-                    cache_control: Some(CacheControl::ephemeral()),
+                    cache_control: Some(CacheControl::ephemeral_with_ttl(cache_ttl)),
                 },
             ])),
             None => Some(SystemPrompt::Blocks(vec![prefix])),
@@ -772,21 +814,46 @@ impl AnthropicModelProvider {
         messages.iter().filter(|m| m.role != "system").count() > 1
     }
 
-    /// Apply cache control to the last message content block
-    fn apply_cache_to_last_message(messages: &mut [NativeMessage]) {
-        if let Some(last_msg) = messages.last_mut()
-            && let Some(last_content) = last_msg.content.last_mut()
-        {
-            match last_content {
+    /// Apply the rolling cache breakpoint: the last `text` or `tool_result`
+    /// block of the last message, rolling back when that message cannot host
+    /// it. The rolling marker carries the configured cache entry lifetime.
+    ///
+    /// A message whose trailing block is `tool_use`, `image` or `thinking`
+    /// takes the marker on its last `text`/`tool_result` block instead, and a
+    /// message with no such block at all (an image-only turn) rolls the marker
+    /// back to the nearest earlier message that has one, so a turn that cannot
+    /// carry the breakpoint does not leave the request with the system
+    /// breakpoint alone. `tool_use`, `image` and `thinking` blocks are never
+    /// marked. At most one block is marked per call, and none when no message
+    /// holds a `text` or `tool_result` block. This is the conversation
+    /// breakpoint only: the last tool definition, the system block and, under
+    /// OAuth, the identity prefix carry their own, so a request has at most
+    /// four, which is Anthropic's limit.
+    fn apply_cache_to_last_message(messages: &mut [NativeMessage], cache_ttl: CacheTtl) {
+        for message in messages.iter_mut().rev() {
+            if Self::apply_cache_to_message(message, cache_ttl) {
+                return;
+            }
+        }
+    }
+
+    /// Mark the last `text` or `tool_result` block of `message` and return
+    /// whether one was found. A trailing markable block is just the first hit
+    /// of the same backward scan that serves the fallback case.
+    fn apply_cache_to_message(message: &mut NativeMessage, cache_ttl: CacheTtl) -> bool {
+        for content in message.content.iter_mut().rev() {
+            match content {
                 NativeContentOut::Text { cache_control, .. }
                 | NativeContentOut::ToolResult { cache_control, .. } => {
-                    *cache_control = Some(CacheControl::ephemeral());
+                    *cache_control = Some(CacheControl::ephemeral_with_ttl(cache_ttl));
+                    return true;
                 }
                 NativeContentOut::ToolUse { .. }
                 | NativeContentOut::Image { .. }
                 | NativeContentOut::Thinking { .. } => {}
             }
         }
+        false
     }
 
     fn convert_tools(&self, tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
@@ -809,9 +876,10 @@ impl AnthropicModelProvider {
             })
             .collect();
 
-        // Cache the last tool definition (caches all tools)
+        // Cache the last tool definition (caches all tools); the tools
+        // marker carries the configured cache entry lifetime.
         if let Some(last_tool) = native_tools.last_mut() {
-            last_tool.cache_control = Some(CacheControl::ephemeral());
+            last_tool.cache_control = Some(CacheControl::ephemeral_with_ttl(self.cache_ttl));
         }
 
         Some(native_tools)
@@ -1269,7 +1337,10 @@ impl AnthropicModelProvider {
         })
     }
 
-    fn convert_messages(messages: &[ChatMessage]) -> (Option<SystemPrompt>, Vec<NativeMessage>) {
+    fn convert_messages(
+        messages: &[ChatMessage],
+        cache_ttl: CacheTtl,
+    ) -> (Option<SystemPrompt>, Vec<NativeMessage>) {
         let mut system_text = None;
         let mut native_messages = Vec::new();
         let mut run = ToolResultRun::default();
@@ -1513,12 +1584,13 @@ impl AnthropicModelProvider {
         Self::order_tool_results_first(&mut native_messages);
         Self::backfill_orphaned_tool_uses(&mut native_messages, run.undelivered_ids());
 
-        // Always use Blocks format with cache_control for system prompts
+        // Always use Blocks format with cache_control for system prompts;
+        // the system marker carries the configured cache entry lifetime.
         let system_prompt = system_text.map(|text| {
             SystemPrompt::Blocks(vec![SystemBlock {
                 block_type: "text".to_string(),
                 text,
-                cache_control: Some(CacheControl::ephemeral()),
+                cache_control: Some(CacheControl::ephemeral_with_ttl(cache_ttl)),
             }])
         });
 
@@ -2697,7 +2769,7 @@ impl ModelProvider for AnthropicModelProvider {
 
         let system = system_prompt.map(|s| SystemPrompt::String(s.to_string()));
         let system = if Self::is_setup_token(credential) {
-            Self::apply_oauth_system_prompt(system)
+            Self::apply_oauth_system_prompt(system, self.cache_ttl)
         } else {
             system
         };
@@ -2786,11 +2858,12 @@ impl ModelProvider for AnthropicModelProvider {
             )
         })?;
 
-        let (system_prompt, mut messages) = Self::convert_messages(request.messages);
+        let (system_prompt, mut messages) =
+            Self::convert_messages(request.messages, self.cache_ttl);
 
         // Auto-cache last message if conversation is long
         if Self::should_cache_conversation(request.messages) {
-            Self::apply_cache_to_last_message(&mut messages);
+            Self::apply_cache_to_last_message(&mut messages, self.cache_ttl);
         }
 
         // Check for tool_choice override from the agent loop (e.g. "any"
@@ -2809,7 +2882,7 @@ impl ModelProvider for AnthropicModelProvider {
 
         // For OAuth tokens, prepend Claude Code identity to system prompt
         let system_prompt = if Self::is_setup_token(credential) {
-            Self::apply_oauth_system_prompt(system_prompt)
+            Self::apply_oauth_system_prompt(system_prompt, self.cache_ttl)
         } else {
             system_prompt
         };
@@ -3007,9 +3080,10 @@ impl ModelProvider for AnthropicModelProvider {
             }
         };
 
-        let (system_prompt, mut messages) = Self::convert_messages(request.messages);
+        let (system_prompt, mut messages) =
+            Self::convert_messages(request.messages, self.cache_ttl);
         if Self::should_cache_conversation(request.messages) {
-            Self::apply_cache_to_last_message(&mut messages);
+            Self::apply_cache_to_last_message(&mut messages, self.cache_ttl);
         }
 
         let tool_choice_override = zeroclaw_api::TOOL_CHOICE_OVERRIDE
@@ -3025,7 +3099,7 @@ impl ModelProvider for AnthropicModelProvider {
         };
 
         let system_prompt = if Self::is_setup_token(&credential) {
-            Self::apply_oauth_system_prompt(system_prompt)
+            Self::apply_oauth_system_prompt(system_prompt, self.cache_ttl)
         } else {
             system_prompt
         };
@@ -3471,10 +3545,11 @@ mod tests {
 
     /// Asserts that no converted message ends on an `image` block.
     ///
-    /// `apply_cache_to_last_message` writes nothing to an `image` block and says
-    /// nothing about it, so a message ending on one costs the request its
-    /// conversation cache breakpoint silently. `label` names the sub-case,
-    /// because the caller drives several histories through the same invariant.
+    /// The converter puts a turn's prose, or the `[image]` placeholder, after
+    /// its images so the turn holds a block `apply_cache_to_last_message` can
+    /// mark and the rolling breakpoint stays on the latest message instead of
+    /// rolling back to an earlier one. `label` names the sub-case, because the
+    /// caller drives several histories through the same invariant.
     fn assert_no_message_ends_on_an_image(label: &str, native_msgs: &[NativeMessage]) {
         let wire = serde_json::to_value(native_msgs).expect("serialize native messages");
         for message in wire.as_array().expect("messages array") {
@@ -4406,6 +4481,197 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(json, r#"{"type":"ephemeral"}"#);
     }
 
+    /// D5 pin: the default (5m) lifetime serializes byte-identically to the
+    /// pre-TTL wire, and only the 1h lifetime adds the `ttl` field.
+    #[test]
+    fn cache_control_ttl_serialization_pinned() {
+        let five_minutes = CacheControl::ephemeral_with_ttl(CacheTtl::FiveMinutes);
+        assert_eq!(
+            serde_json::to_string(&five_minutes).unwrap(),
+            r#"{"type":"ephemeral"}"#,
+            "5m must serialize exactly like the pre-TTL default marker"
+        );
+        let one_hour = CacheControl::ephemeral_with_ttl(CacheTtl::OneHour);
+        assert_eq!(
+            serde_json::to_string(&one_hour).unwrap(),
+            r#"{"type":"ephemeral","ttl":"1h"}"#,
+            "1h must emit exactly one added field, in declaration order"
+        );
+    }
+
+    /// Collect every `cache_control` object in a serialized request body so
+    /// TTL tests can assert on all markers at once (system, tools, rolling).
+    #[cfg(test)]
+    fn collect_cache_controls(value: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(control) = map.get("cache_control") {
+                    out.push(control.clone());
+                }
+                for nested in map.values() {
+                    collect_cache_controls(nested, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    collect_cache_controls(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// D2: the OAuth identity prefix and the system block are separate
+    /// markers; both carry the configured lifetime, never a mix.
+    #[test]
+    fn oauth_system_prompt_carries_configured_ttl_on_every_block() {
+        let one_hour = AnthropicModelProvider::apply_oauth_system_prompt(
+            Some(SystemPrompt::String("be brief".to_string())),
+            CacheTtl::OneHour,
+        );
+        let Some(SystemPrompt::Blocks(blocks)) = one_hour else {
+            panic!("oauth system prompt must produce blocks");
+        };
+        assert_eq!(blocks.len(), 2, "prefix plus system block");
+        for block in &blocks {
+            let control = block.cache_control.as_ref().expect("marker on each block");
+            assert_eq!(
+                serde_json::to_string(control).unwrap(),
+                r#"{"type":"ephemeral","ttl":"1h"}"#,
+                "every oauth block carries the 1h lifetime"
+            );
+        }
+
+        let default = AnthropicModelProvider::apply_oauth_system_prompt(
+            Some(SystemPrompt::String("be brief".to_string())),
+            CacheTtl::default(),
+        );
+        let Some(SystemPrompt::Blocks(blocks)) = default else {
+            panic!("oauth system prompt must produce blocks");
+        };
+        for block in &blocks {
+            let control = block.cache_control.as_ref().expect("marker on each block");
+            assert_eq!(
+                serde_json::to_string(control).unwrap(),
+                r#"{"type":"ephemeral"}"#,
+                "default lifetime keeps the pre-TTL wire form"
+            );
+        }
+    }
+
+    /// D2 + D5 mock pin: with the 1h lifetime configured, every marker the
+    /// native provider places in one request (system block, last tool,
+    /// rolling last message) carries `"ttl":"1h"`; with the default, the
+    /// body contains no `ttl` key at all.
+    #[tokio::test]
+    async fn native_cache_ttl_marks_every_marker_per_request() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        async fn run_request(cache_ttl: CacheTtl) -> serde_json::Value {
+            let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+            let captured_clone = Arc::clone(&captured);
+
+            let app = Router::new().route(
+                "/v1/messages",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let cap = captured_clone.clone();
+                    async move {
+                        *cap.lock().unwrap() = Some(body);
+                        Json(serde_json::json!({
+                            "id": "msg_ttl",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "ok"}],
+                            "model": "claude-sonnet-4-5",
+                            "stop_reason": "end_turn",
+                            "usage": {"input_tokens": 10, "output_tokens": 2}
+                        }))
+                    }
+                }),
+            );
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+
+            let provider = AnthropicModelProvider::builder("test")
+                .credential(Some("test-key"))
+                .base_url(&format!("http://{addr}"))
+                .cache_ttl(cache_ttl)
+                .build();
+
+            let messages = vec![
+                ChatMessage::system("You are a helpful assistant."),
+                ChatMessage::user("gen a 2 sum in golang"),
+                ChatMessage::assistant("```go\nfunc twoSum() {}\n```"),
+                ChatMessage::user("what's meaning of make here?"),
+            ];
+            let tools = vec![serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "shell",
+                    "description": "Run a shell command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"]
+                    }
+                }
+            })];
+
+            let result = provider
+                .chat_with_tools(&messages, &tools, "claude-sonnet-4-5", Some(0.7))
+                .await;
+            assert!(result.is_ok(), "request failed: {:?}", result.err());
+            server.abort();
+
+            captured
+                .lock()
+                .unwrap()
+                .take()
+                .expect("request body captured")
+        }
+
+        let one_hour = run_request(CacheTtl::OneHour).await;
+        let mut controls = Vec::new();
+        collect_cache_controls(&one_hour, &mut controls);
+        assert_eq!(
+            controls.len(),
+            3,
+            "system + tools + rolling last message markers expected: {one_hour}"
+        );
+        for control in &controls {
+            assert_eq!(
+                control["type"], "ephemeral",
+                "one TTL per request: every marker carries the 1h lifetime"
+            );
+            assert_eq!(
+                control["ttl"], "1h",
+                "one TTL per request: every marker carries the 1h lifetime"
+            );
+        }
+
+        let default = run_request(CacheTtl::default()).await;
+        assert!(
+            !default.to_string().contains("\"ttl\""),
+            "default config must produce requests with no ttl key anywhere: {default}"
+        );
+        let mut controls = Vec::new();
+        collect_cache_controls(&default, &mut controls);
+        assert_eq!(controls.len(), 3, "marker placement unchanged by the field");
+        for control in &controls {
+            assert_eq!(
+                serde_json::to_string(control).unwrap(),
+                r#"{"type":"ephemeral"}"#,
+                "default markers serialize byte-identically to the pre-TTL wire"
+            );
+        }
+    }
+
     #[test]
     fn system_prompt_string_variant_serializes() {
         let prompt = SystemPrompt::String("You are a helpful assistant".to_string());
@@ -4588,7 +4854,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             }],
         }];
 
-        AnthropicModelProvider::apply_cache_to_last_message(&mut messages);
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages, CacheTtl::default());
 
         match &messages[0].content[0] {
             NativeContentOut::Text { cache_control, .. } => {
@@ -4609,7 +4875,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             }],
         }];
 
-        AnthropicModelProvider::apply_cache_to_last_message(&mut messages);
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages, CacheTtl::default());
 
         match &messages[0].content[0] {
             NativeContentOut::ToolResult { cache_control, .. } => {
@@ -4631,7 +4897,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             }],
         }];
 
-        AnthropicModelProvider::apply_cache_to_last_message(&mut messages);
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages, CacheTtl::default());
 
         // ToolUse should not be affected
         match &messages[0].content[0] {
@@ -4642,10 +4908,229 @@ data: {\"type\":\"message_stop\"}\n\n";
         }
     }
 
+    /// A message ending in an image takes the rolling breakpoint on its text
+    /// block; the image block never carries one.
+    #[test]
+    fn apply_cache_to_last_message_text_then_image_marks_text() {
+        let mut messages = vec![NativeMessage {
+            role: "user".to_string(),
+            content: vec![
+                NativeContentOut::Text {
+                    text: "look at this".to_string(),
+                    cache_control: None,
+                },
+                NativeContentOut::Image {
+                    source: ImageSource {
+                        source_type: "base64".to_string(),
+                        media_type: "image/png".to_string(),
+                        data: CANONICAL_PNG_B64.to_string(),
+                    },
+                },
+            ],
+        }];
+
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages, CacheTtl::default());
+
+        match &messages[0].content[0] {
+            NativeContentOut::Text { cache_control, .. } => {
+                assert!(cache_control.is_some());
+            }
+            _ => panic!("Expected Text variant"),
+        }
+        let wire = serde_json::to_value(&messages).expect("serialize native messages");
+        assert!(
+            wire[0]["content"][1].get("cache_control").is_none(),
+            "the trailing image must not gain a cache marker: {wire}"
+        );
+    }
+
+    /// An image-only last message cannot host the breakpoint, so it rolls back
+    /// to the nearest earlier message that can; the image-only message itself
+    /// stays unmarked.
+    #[test]
+    fn apply_cache_to_last_message_image_only_rolls_back() {
+        let mut messages = vec![
+            NativeMessage {
+                role: "user".to_string(),
+                content: vec![NativeContentOut::Text {
+                    text: "hi".to_string(),
+                    cache_control: None,
+                }],
+            },
+            NativeMessage {
+                role: "assistant".to_string(),
+                content: vec![NativeContentOut::Text {
+                    text: "hello".to_string(),
+                    cache_control: None,
+                }],
+            },
+            NativeMessage {
+                role: "user".to_string(),
+                content: vec![NativeContentOut::Image {
+                    source: ImageSource {
+                        source_type: "base64".to_string(),
+                        media_type: "image/png".to_string(),
+                        data: CANONICAL_PNG_B64.to_string(),
+                    },
+                }],
+            },
+        ];
+
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages, CacheTtl::default());
+
+        match &messages[1].content[0] {
+            NativeContentOut::Text { cache_control, .. } => {
+                assert!(
+                    cache_control.is_some(),
+                    "the nearest earlier text block must carry the rolling breakpoint"
+                );
+            }
+            _ => panic!("Expected Text variant"),
+        }
+        let wire = serde_json::to_value(&messages).expect("serialize native messages");
+        assert!(
+            wire[2]["content"][0].get("cache_control").is_none(),
+            "the image-only last message must stay unmarked: {wire}"
+        );
+    }
+
+    /// An assistant tool-call message holds thinking, then text, then tool_use.
+    /// The backward scan skips the tool_use and marks the text, leaving both
+    /// unmarkable blocks alone. A second shape puts the thinking block last, so
+    /// the scan has to step over it too; the converter never emits thinking
+    /// after text, so that half pins the helper's contract, not a wire shape.
+    ///
+    /// Neither shape reaches this helper from `convert_messages` at present:
+    /// `backfill_orphaned_tool_uses` appends a stub `tool_result` message after
+    /// a trailing tool_use before the breakpoint pass runs. The test pins what
+    /// the helper does on its own, without that upstream step.
+    #[test]
+    fn apply_cache_to_last_message_skips_thinking_and_tool_use_to_mark_text() {
+        let mut messages = vec![NativeMessage {
+            role: "assistant".to_string(),
+            content: vec![
+                NativeContentOut::Thinking {
+                    thinking: "let me check".to_string(),
+                    signature: Some("sig".to_string()),
+                },
+                NativeContentOut::Text {
+                    text: "checking the weather".to_string(),
+                    cache_control: None,
+                },
+                NativeContentOut::ToolUse {
+                    id: "tool_123".to_string(),
+                    name: "get_weather".to_string(),
+                    input: serde_json::json!({}),
+                    cache_control: None,
+                },
+            ],
+        }];
+
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages, CacheTtl::default());
+
+        match &messages[0].content[1] {
+            NativeContentOut::Text { cache_control, .. } => {
+                assert!(cache_control.is_some());
+            }
+            _ => panic!("Expected Text variant"),
+        }
+        let wire = serde_json::to_value(&messages).expect("serialize native messages");
+        assert!(
+            wire[0]["content"][0].get("cache_control").is_none()
+                && wire[0]["content"][2].get("cache_control").is_none(),
+            "thinking and tool_use blocks must stay unmarked: {wire}"
+        );
+
+        let mut trailing_thinking = vec![NativeMessage {
+            role: "assistant".to_string(),
+            content: vec![
+                NativeContentOut::Text {
+                    text: "checking the weather".to_string(),
+                    cache_control: None,
+                },
+                NativeContentOut::Thinking {
+                    thinking: "let me check".to_string(),
+                    signature: Some("sig".to_string()),
+                },
+            ],
+        }];
+
+        AnthropicModelProvider::apply_cache_to_last_message(
+            &mut trailing_thinking,
+            CacheTtl::default(),
+        );
+
+        let wire = serde_json::to_value(&trailing_thinking).expect("serialize native messages");
+        assert_eq!(
+            wire[0]["content"][0]["cache_control"]["type"], "ephemeral",
+            "the scan must step over a trailing thinking block to the text: {wire}"
+        );
+        assert!(
+            wire[0]["content"][1].get("cache_control").is_none(),
+            "a trailing thinking block must stay unmarked: {wire}"
+        );
+    }
+
+    /// Whatever the last message's shape, the rolling pass leaves at most one
+    /// breakpoint in the whole message list; here, with markable blocks in
+    /// every message, exactly one.
+    #[test]
+    fn apply_cache_to_last_message_places_exactly_one_breakpoint() {
+        let mut messages = vec![
+            NativeMessage {
+                role: "user".to_string(),
+                content: vec![NativeContentOut::Text {
+                    text: "hi".to_string(),
+                    cache_control: None,
+                }],
+            },
+            NativeMessage {
+                role: "assistant".to_string(),
+                content: vec![NativeContentOut::Text {
+                    text: "hello".to_string(),
+                    cache_control: None,
+                }],
+            },
+            NativeMessage {
+                role: "user".to_string(),
+                content: vec![
+                    NativeContentOut::Text {
+                        text: "look at this".to_string(),
+                        cache_control: None,
+                    },
+                    NativeContentOut::Image {
+                        source: ImageSource {
+                            source_type: "base64".to_string(),
+                            media_type: "image/png".to_string(),
+                            data: CANONICAL_PNG_B64.to_string(),
+                        },
+                    },
+                ],
+            },
+        ];
+
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages, CacheTtl::default());
+
+        let breakpoints = messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter(|block| match block {
+                NativeContentOut::Text { cache_control, .. }
+                | NativeContentOut::ToolResult { cache_control, .. }
+                | NativeContentOut::ToolUse { cache_control, .. } => cache_control.is_some(),
+                NativeContentOut::Image { .. } | NativeContentOut::Thinking { .. } => false,
+            })
+            .count();
+        assert_eq!(
+            breakpoints, 1,
+            "exactly one rolling breakpoint per request, got {breakpoints}"
+        );
+    }
+
     #[test]
     fn apply_cache_empty_messages() {
         let mut messages = vec![];
-        AnthropicModelProvider::apply_cache_to_last_message(&mut messages);
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages, CacheTtl::default());
         // Should not panic
         assert!(messages.is_empty());
     }
@@ -4805,7 +5290,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             content: "Short system prompt".to_string(),
         }];
 
-        let (system_prompt, _) = AnthropicModelProvider::convert_messages(&messages);
+        let (system_prompt, _) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
 
         match system_prompt.unwrap() {
             SystemPrompt::Blocks(blocks) => {
@@ -4830,7 +5316,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             content: large_content.clone(),
         }];
 
-        let (system_prompt, _) = AnthropicModelProvider::convert_messages(&messages);
+        let (system_prompt, _) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
 
         match system_prompt.unwrap() {
             SystemPrompt::Blocks(blocks) => {
@@ -4932,7 +5419,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             },
         ];
 
-        let (system, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (system, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
 
         // System prompt extracted
         assert!(system.is_some());
@@ -5228,7 +5716,8 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .to_string(),
         }];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
 
         assert_eq!(native_msgs.len(), 1);
         assert_eq!(native_msgs[0].role, "user");
@@ -5269,7 +5758,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             content: format!("[IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"),
         }];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
 
         assert_eq!(native_msgs.len(), 1);
         assert_eq!(native_msgs[0].content.len(), 2);
@@ -5298,7 +5788,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             content: "Hello, how are you?".to_string(),
         }];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
 
         assert_eq!(native_msgs.len(), 1);
         assert_eq!(native_msgs[0].content.len(), 1);
@@ -5374,7 +5865,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             },
         ];
 
-        let (system, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (system, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
 
         assert!(system.is_some());
         // Should be: user, assistant, user (merged tool results)
@@ -5424,7 +5916,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             },
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
 
         let assistant_idx = native_msgs
             .iter()
@@ -5475,7 +5968,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             },
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
 
         let last = native_msgs.last().expect("messages present");
         assert_eq!(last.role, "user");
@@ -5521,7 +6015,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             },
         ];
 
-        let (_system, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_system, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
 
         assert!(
             roles_alternate(&native_msgs),
@@ -5550,7 +6045,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             ChatMessage::assistant("done"),
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
 
         assert!(
             roles_alternate(&native_msgs),
@@ -5615,7 +6111,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             ),
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
         let wire = serde_json::to_value(&native_msgs).expect("serialize native messages");
 
         for message in wire.as_array().expect("messages") {
@@ -5886,7 +6383,8 @@ data: {\"type\":\"message_stop\"}\n\n";
              and [IMAGE:data:image/jpeg;base64,{CANONICAL_JPEG_B64}]"
         ));
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
         let tool_result = first_tool_result_on_the_wire(&native_msgs);
         let blocks = tool_result["content"]
             .as_array()
@@ -5932,7 +6430,8 @@ data: {\"type\":\"message_stop\"}\n\n";
              [IMAGE:http://example.com/remote.png]"
         ));
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
         let tool_result = first_tool_result_on_the_wire(&native_msgs);
         let blocks = tool_result["content"]
             .as_array()
@@ -5981,7 +6480,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             "[IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
         ));
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
         let tool_result = first_tool_result_on_the_wire(&native_msgs);
         let blocks = tool_result["content"]
             .as_array()
@@ -6030,7 +6530,8 @@ data: {\"type\":\"message_stop\"}\n\n";
                 "prose [IMAGE:{rejected}] [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
             ));
 
-            let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+            let (_, native_msgs) =
+                AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
             let tool_result = first_tool_result_on_the_wire(&native_msgs);
             let blocks = tool_result["content"]
                 .as_array()
@@ -6081,12 +6582,13 @@ data: {\"type\":\"message_stop\"}\n\n";
             "shot [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
         ));
 
-        let (_, mut native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, mut native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
         assert!(
             AnthropicModelProvider::should_cache_conversation(&messages),
             "this history must be long enough to be cached, or the test is vacuous"
         );
-        AnthropicModelProvider::apply_cache_to_last_message(&mut native_msgs);
+        AnthropicModelProvider::apply_cache_to_last_message(&mut native_msgs, CacheTtl::default());
 
         let tool_result = first_tool_result_on_the_wire(&native_msgs);
         let blocks = tool_result["content"]
@@ -6099,6 +6601,57 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(
             tool_result["cache_control"]["type"], "ephemeral",
             "block-list content must not cost the request its cache breakpoint: {tool_result}"
+        );
+    }
+
+    /// A user turn that carries an attachment keeps its rolling breakpoint:
+    /// the marker lands on the turn's text block, the image block stays
+    /// unmarked, and the message list holds exactly one breakpoint.
+    #[test]
+    fn image_carrying_user_turn_keeps_rolling_breakpoint_on_text() {
+        let messages = vec![
+            ChatMessage::system("You look at pictures."),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user(format!(
+                "look at this [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
+            )),
+        ];
+
+        let (_, mut native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
+        assert!(
+            AnthropicModelProvider::should_cache_conversation(&messages),
+            "this history must be long enough to be cached, or the test is vacuous"
+        );
+        AnthropicModelProvider::apply_cache_to_last_message(&mut native_msgs, CacheTtl::default());
+
+        let wire = serde_json::to_value(&native_msgs).expect("serialize native messages");
+        let last = wire
+            .as_array()
+            .and_then(|on_wire| on_wire.last())
+            .expect("a last message");
+        let blocks = last["content"].as_array().expect("content blocks");
+        let text = blocks
+            .iter()
+            .find(|block| block["type"] == "text")
+            .expect("a text block in the image turn");
+        assert_eq!(
+            text["cache_control"]["type"], "ephemeral",
+            "the image turn's text block must carry the rolling breakpoint: {last}"
+        );
+        let image = blocks
+            .iter()
+            .find(|block| block["type"] == "image")
+            .expect("an image block in the image turn");
+        assert!(
+            image.get("cache_control").is_none(),
+            "the image block must not carry a cache marker: {last}"
+        );
+        assert_eq!(
+            wire.to_string().matches("cache_control").count(),
+            1,
+            "exactly one rolling breakpoint in the message list: {wire}"
         );
     }
 
@@ -6128,7 +6681,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             )),
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
 
         let tool_results = tool_results_on_the_wire(&native_msgs);
         assert_eq!(
@@ -6203,9 +6757,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             )),
         ];
 
-        let (_, from_two) = AnthropicModelProvider::convert_messages(&two_candidates);
+        let (_, from_two) =
+            AnthropicModelProvider::convert_messages(&two_candidates, CacheTtl::default());
         assert_tool_output_omitted("two unanswered tool_use blocks", &from_two, "raw output");
-        let (_, from_none) = AnthropicModelProvider::convert_messages(&no_candidates);
+        let (_, from_none) =
+            AnthropicModelProvider::convert_messages(&no_candidates, CacheTtl::default());
         assert_tool_output_omitted("no assistant turn at all", &from_none, "raw output");
 
         // Both calls are still open after the drop, so each gets its own stub:
@@ -6257,7 +6813,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             ChatMessage::tool("raw output".to_string()),
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
 
         let stubs = tool_results_on_the_wire(&native_msgs);
         assert_eq!(stubs.len(), 2, "one stub per open call: {stubs:?}");
@@ -6390,7 +6947,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             ChatMessage::user("what happened?"),
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
 
         let calls = tool_use_ids_on_the_wire(&native_msgs);
         assert_eq!(
@@ -6456,7 +7014,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             )),
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
 
         let tool_results = tool_results_on_the_wire(&native_msgs);
         assert_eq!(
@@ -6511,7 +7070,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             ChatMessage::tool(envelope),
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
 
         let tool_results = tool_results_on_the_wire(&native_msgs);
         assert_eq!(tool_results.len(), 1, "{tool_results:?}");
@@ -6588,7 +7148,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             ),
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
 
         let tool_results = tool_results_on_the_wire(&native_msgs);
         assert_eq!(
@@ -6657,7 +7218,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             ),
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
 
         let tool_results = tool_results_on_the_wire(&native_msgs);
         assert_eq!(
@@ -6714,7 +7276,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             ),
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
 
         let tool_results = tool_results_on_the_wire(&native_msgs);
         assert_eq!(
@@ -6772,7 +7335,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             ),
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
 
         let tool_results = tool_results_on_the_wire(&native_msgs);
         assert_eq!(
@@ -6822,7 +7386,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             ChatMessage::tool(injection.to_string()),
         ];
 
-        let (_, from_carrier) = AnthropicModelProvider::convert_messages(&ambiguous_carrier);
+        let (_, from_carrier) =
+            AnthropicModelProvider::convert_messages(&ambiguous_carrier, CacheTtl::default());
         assert!(
             no_block_text_contains(&top_level_user_blocks(&from_carrier), injection),
             "an unpairable tool's instructions must not be promoted to user-authored \
@@ -6856,7 +7421,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             ),
         ];
 
-        let (_, from_duplicate) = AnthropicModelProvider::convert_messages(&duplicate_result);
+        let (_, from_duplicate) =
+            AnthropicModelProvider::convert_messages(&duplicate_result, CacheTtl::default());
         assert!(
             no_block_text_contains(&top_level_user_blocks(&from_duplicate), injection),
             "a duplicate result's instructions must not be promoted to user-authored \
@@ -6901,7 +7467,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             )),
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
 
         let tool_results = tool_results_on_the_wire(&native_msgs);
         assert_eq!(tool_results.len(), 1, "{tool_results:?}");
@@ -6930,7 +7497,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             format!("[IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}\n{CANONICAL_PNG_B64}");
         let messages = history_with_tool_result(&format!("saved {wrapped}"));
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
         let wire = serde_json::to_string(&native_msgs).expect("serialize");
         assert!(
             !wire.contains(CANONICAL_PNG_B64),
@@ -6946,7 +7514,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         let with_prose = history_with_tool_result(&format!(
             "[IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}\nthe screenshot was truncated"
         ));
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&with_prose);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&with_prose, CacheTtl::default());
         let wire = serde_json::to_string(&native_msgs).expect("serialize");
         assert!(
             wire.contains("the screenshot was truncated"),
@@ -7006,7 +7575,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             format!("what does data:application/json;base64,{CANONICAL_PNG_B64} decode to?");
         let messages = vec![ChatMessage::user(&quoted)];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
         let wire = serde_json::to_string(&native_msgs).expect("serialize");
 
         assert!(
@@ -7036,7 +7606,8 @@ data: {\"type\":\"message_stop\"}\n\n";
              — also what does {quoted} decode to?"
         ))];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
         let wire = serde_json::to_value(&native_msgs).expect("serialize");
 
         let text = wire[0]["content"]
@@ -7072,7 +7643,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         let truncated = format!("here it is [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}");
         let messages = vec![ChatMessage::user(&truncated)];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
         let wire = serde_json::to_string(&native_msgs).expect("serialize");
 
         assert!(
@@ -7137,7 +7709,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             format!("[IMAGE:data:image/png;base64,AAAAdata:image/png;base64,{CANONICAL_PNG_B64}");
         let messages = history_with_tool_result(&format!("saved {overlapped}"));
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
         let wire = serde_json::to_string(&native_msgs).expect("serialize");
 
         assert!(
@@ -7382,7 +7955,8 @@ data: {\"type\":\"message_stop\"}\n\n";
                 ChatMessage::tool(envelope.to_string()),
             ];
 
-            let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+            let (_, native_msgs) =
+                AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
             let wire = serde_json::to_value(&native_msgs).expect("serialize");
             let mut texts = Vec::new();
             text_fields(&wire, &mut texts);
@@ -7420,7 +7994,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             ChatMessage::tool(serde_json::json!({"tool_call_id": null}).to_string()),
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
         let wire = serde_json::to_string(&native_msgs).expect("serialize");
 
         assert!(
@@ -7450,7 +8025,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         ] {
             let messages = vec![ChatMessage::user(format!("look at [IMAGE:{reference}]"))];
 
-            let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+            let (_, native_msgs) =
+                AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
             let blocks = last_user_blocks(&native_msgs);
 
             assert!(
@@ -7500,7 +8076,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             ),
         ];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
         let blocks = last_user_blocks(&native_msgs);
 
         let last_tool_result = blocks
@@ -7543,7 +8120,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             ("tool result", tool_messages),
             ("user message", user_messages),
         ] {
-            let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+            let (_, native_msgs) =
+                AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
             // The whole serialized request, not just `text` fields: an
             // image-free tool result carries its prose as a bare JSON string on
             // `content`, which is a text position all the same.
@@ -7602,7 +8180,8 @@ data: {\"type\":\"message_stop\"}\n\n";
                 "prose [IMAGE:{rejected}] [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
             ))];
 
-            let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+            let (_, native_msgs) =
+                AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
             let blocks = last_user_blocks(&native_msgs);
 
             let images: Vec<&serde_json::Value> = blocks
@@ -7642,7 +8221,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         let only_rejected = vec![ChatMessage::user(
             "[IMAGE:data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=]",
         )];
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&only_rejected);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&only_rejected, CacheTtl::default());
         let blocks = last_user_blocks(&native_msgs);
 
         assert!(
@@ -7667,14 +8247,15 @@ data: {\"type\":\"message_stop\"}\n\n";
     /// No converted message ends on an `image` block, whatever the user arm was
     /// given.
     ///
-    /// `apply_cache_to_last_message` is a silent no-op on an `image` block, so a
-    /// message ending on one costs the request its conversation cache breakpoint
-    /// with nothing reporting it. Four fallback tests used to assert this as a
-    /// trailing detail, but each built its image through a path that no longer
-    /// exists: the ambiguous carrier and the demoted duplicate both stopped
-    /// emitting top-level blocks. The user arm is now the only place an `image`
-    /// block reaches top-level content, so the invariant is stated once, here,
-    /// against it.
+    /// The user arm pushes a turn's images first and its prose, or the `[image]`
+    /// placeholder, last, so the turn holds a block `apply_cache_to_last_message`
+    /// can mark and the rolling breakpoint stays on the latest message rather
+    /// than rolling back to an earlier one. Four fallback tests used to assert
+    /// this as a trailing detail, but each built its image through a path that
+    /// no longer exists: the ambiguous carrier and the demoted duplicate both
+    /// stopped emitting top-level blocks. The user arm is now the only place an
+    /// `image` block reaches top-level content, so the invariant is stated once,
+    /// here, against it.
     ///
     /// The blank-prose case pins a dependency across the two modules. `[image]`
     /// stands in only when the text is exactly empty, and a real text block is
@@ -7718,7 +8299,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         ];
 
         for (label, messages) in histories {
-            let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+            let (_, native_msgs) =
+                AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
             // Without an image on the wire the invariant holds for free, and a
             // reference the converter quietly rejected would make it do so.
             assert!(
@@ -7739,10 +8321,11 @@ data: {\"type\":\"message_stop\"}\n\n";
     /// Fails before the change: preparation already produced the data URI, and
     /// the converter then stripped it and wrote an omission note.
     ///
-    /// The tool message has to be last. `latest_tool_result_indices` only
-    /// normalizes the trailing run of tool results; anywhere else the marker is
-    /// replaced with `[image removed from history]` and this test asserts
-    /// nothing.
+    /// The tool message has to stay inside the current user turn.
+    /// `current_turn_tool_result_indices` normalizes tool-result images only
+    /// for the turn that produced them; once a later user message arrives the
+    /// marker is replaced with `[image removed from history]` and this test
+    /// asserts nothing.
     #[tokio::test]
     async fn prepared_local_image_reaches_the_wire_as_a_nested_block() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -7788,7 +8371,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             "preparation must have found the marker, or the rest asserts nothing"
         );
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&prepared.messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
         let tool_result = first_tool_result_on_the_wire(&native_msgs);
         assert_eq!(tool_result["tool_use_id"], "toolu_shot");
 
@@ -7839,7 +8423,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             "what is this [IMAGE:data:image/jpeg;base64,/9j/4AAQ]",
         )];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
 
         let has_image = native_msgs
             .iter()
@@ -7870,7 +8455,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             image_path.display()
         ))];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
         let blocks = last_user_blocks(&native_msgs);
 
         assert!(
@@ -7910,7 +8496,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         .to_string();
         let messages = vec![ChatMessage::user("list"), ChatMessage::tool(tool_env)];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
 
         let tool_result = first_tool_result_on_the_wire(&native_msgs);
         assert!(
@@ -7940,7 +8527,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         .to_string();
         let messages = vec![ChatMessage::user("doc"), ChatMessage::tool(tool_env)];
 
-        let (_, native_msgs) = AnthropicModelProvider::convert_messages(&messages);
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
 
         let tool_result = first_tool_result_on_the_wire(&native_msgs);
         assert_eq!(tool_result["content"], "see [IMAGE:<path>] for details");

@@ -88,6 +88,14 @@ session_path = "/var/lib/zeroclaw/wa.db"
 allowed_groups = ["120363012345678901@g.us", "120363098765432109"]
 ```
 
+## Polls
+
+The `poll` tool posts a native WhatsApp poll in Web mode instead of the numbered text fallback used on channels without native polls. The tool accepts 2–10 options; the WhatsApp library accepts up to 12, but the tool schema does not expose 11–12. `multi_select` lets a voter select multiple options.
+
+Raw phone-number recipients are checked against the channel's number allowlist, and a disallowed number returns an error instead of silently doing nothing. As with ordinary sends, JID recipients bypass that number check. `duration_minutes` does not expire a native poll.
+
+Votes are not read back yet: the poll card shows the result to people in the chat, and the agent only learns that the poll was posted.
+
 ## Tool approval over chat (`approval_timeout_secs`)
 
 When a tool needs approval (it is in `always_ask`, or the risk profile does not

@@ -1,4 +1,4 @@
-//! Architecture gate for Quality Gate runner selection.
+//! Architecture gate for Quality Gate and Advisory Windows Tests runner selection.
 //!
 //! The compile-heavy jobs name their Blacksmith runner label directly instead
 //! of reading it from a `fmt` output. `runs-on` resolves before a job is
@@ -30,25 +30,25 @@ const RUNNER_LABEL: &str = "blacksmith-8vcpu-ubuntu-2404";
 /// from the required gate's critical path entirely.
 const HOUSEKEEPING_LABEL: &str = "blacksmith-4vcpu-ubuntu-2404";
 
-/// Every Quality Gate housekeeping job on the Blacksmith 4-vCPU class. Same contract as
-/// `COMPILE_JOBS`: this list is the reviewable inventory the workflow is
-/// checked against.
-const HOUSEKEEPING_JOBS: [&str; 15] = [
-    "fmt",
-    "gate",
-    "history-guard",
-    "repo-structure",
-    "docs-style",
-    "zerocode-rpc-boundary",
-    "parallel-runtime-test-changes",
-    "path-changes",
-    "relay-container-smoke-changes",
-    "windows-clippy-tools-changes",
-    "nix-eval",
-    "nix-hash-drift",
-    "relay-container-smoke",
-    "security",
-    "web-permission-tests",
+/// Every housekeeping job in the two workflows on the Blacksmith 4-vCPU class.
+/// Workflow-qualified IDs keep same-named jobs in different workflows distinct.
+const HOUSEKEEPING_JOBS: [&str; 16] = [
+    "ci.yml/fmt",
+    "ci.yml/gate",
+    "ci.yml/history-guard",
+    "ci.yml/repo-structure",
+    "ci.yml/docs-style",
+    "ci.yml/zerocode-rpc-boundary",
+    "ci.yml/parallel-runtime-test-changes",
+    "ci.yml/path-changes",
+    "ci.yml/relay-container-smoke-changes",
+    "ci.yml/windows-clippy-tools-changes",
+    "ci.yml/nix-eval",
+    "ci.yml/nix-hash-drift",
+    "ci.yml/relay-container-smoke",
+    "ci.yml/security",
+    "ci.yml/web-permission-tests",
+    "windows-tests.yml/windows-test-scope",
 ];
 
 /// Jobs that stay on GitHub-hosted `ubuntu-latest` because they depend on the
@@ -93,13 +93,27 @@ fn ci_workflow() -> String {
         .expect("failed to read .github/workflows/ci.yml")
 }
 
+fn runner_workflow_jobs() -> BTreeMap<String, String> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    ["ci.yml", "windows-tests.yml"]
+        .into_iter()
+        .flat_map(|filename| {
+            let workflow = fs::read_to_string(root.join(filename))
+                .unwrap_or_else(|error| panic!("failed to read {filename}: {error}"));
+            job_blocks(&workflow)
+                .into_iter()
+                .map(move |(name, block)| (format!("{filename}/{name}"), block))
+        })
+        .collect()
+}
+
 /// Split the `jobs:` mapping into `job id -> job body`. Only scans after the
 /// top-level `jobs:` key so that `on:` children such as `pull_request:` are
 /// never mistaken for jobs.
 fn job_blocks(workflow: &str) -> BTreeMap<String, String> {
     let (_, jobs) = workflow
         .split_once("\njobs:\n")
-        .expect("ci.yml must declare a top-level jobs mapping");
+        .expect("workflow must declare a top-level jobs mapping");
     let header = Regex::new(r"(?m)^  ([a-z0-9-]+):$").expect("valid job-header pattern");
 
     let starts: Vec<(usize, String)> = header
@@ -109,13 +123,13 @@ fn job_blocks(workflow: &str) -> BTreeMap<String, String> {
             (whole.start(), capture[1].to_string())
         })
         .collect();
-    assert!(!starts.is_empty(), "ci.yml must define at least one job");
+    assert!(!starts.is_empty(), "workflow must define at least one job");
 
     let mut blocks = BTreeMap::new();
     for (index, (offset, name)) in starts.iter().enumerate() {
         let end = starts.get(index + 1).map_or(jobs.len(), |(next, _)| *next);
         let previous = blocks.insert(name.clone(), jobs[*offset..end].to_string());
-        assert!(previous.is_none(), "duplicate job id {name} in ci.yml");
+        assert!(previous.is_none(), "duplicate job id {name} in workflow");
     }
     blocks
 }
@@ -168,15 +182,17 @@ fn compile_jobs_pin_the_runner_label_instead_of_reading_it_from_fmt() {
 
 #[test]
 fn only_the_declared_compile_jobs_claim_the_blacksmith_fleet() {
-    let workflow = ci_workflow();
-    let blocks = job_blocks(&workflow);
+    let blocks = runner_workflow_jobs();
 
-    let claiming: BTreeSet<&str> = blocks
+    let claiming: BTreeSet<String> = blocks
         .iter()
         .filter(|(_, block)| block.contains(RUNNER_LABEL))
-        .map(|(name, _)| name.as_str())
+        .map(|(name, _)| name.clone())
         .collect();
-    let declared: BTreeSet<&str> = COMPILE_JOBS.into_iter().collect();
+    let declared: BTreeSet<String> = COMPILE_JOBS
+        .into_iter()
+        .map(|name| format!("ci.yml/{name}"))
+        .collect();
 
     assert_eq!(
         claiming, declared,
@@ -203,37 +219,22 @@ fn rust_cache_callers_pass_a_reviewed_provider_input() {
 
 #[test]
 fn housekeeping_jobs_pin_the_four_vcpu_label() {
-    let workflow = ci_workflow();
-    let blocks = job_blocks(&workflow);
+    let blocks = runner_workflow_jobs();
 
     for name in HOUSEKEEPING_JOBS {
         let block = blocks
             .get(name)
-            .unwrap_or_else(|| panic!("ci.yml must define the {name} job"));
+            .unwrap_or_else(|| panic!("missing workflow job {name}"));
         assert!(
             block.contains(&format!("    runs-on: {HOUSEKEEPING_LABEL}\n")),
             "{name} must run on {HOUSEKEEPING_LABEL}"
         );
     }
-
-    // The advisory selector keeps its runner contract after moving workflows.
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let advisory = fs::read_to_string(root.join(".github/workflows/windows-tests.yml"))
-        .expect("failed to read .github/workflows/windows-tests.yml");
-    let advisory_blocks = job_blocks(&advisory);
-    let selector = advisory_blocks
-        .get("windows-test-scope")
-        .expect("windows-tests.yml must define the advisory selector");
-    assert!(
-        selector.contains(&format!("    runs-on: {HOUSEKEEPING_LABEL}\n")),
-        "the advisory selector must run on {HOUSEKEEPING_LABEL}"
-    );
 }
 
 #[test]
 fn only_the_declared_housekeeping_jobs_claim_the_four_vcpu_class() {
-    let workflow = ci_workflow();
-    let blocks = job_blocks(&workflow);
+    let blocks = runner_workflow_jobs();
 
     let claiming: BTreeSet<&str> = blocks
         .iter()
@@ -251,21 +252,23 @@ fn only_the_declared_housekeeping_jobs_claim_the_four_vcpu_class() {
 
 #[test]
 fn hosted_linux_stays_an_explicit_allowlist() {
-    let workflow = ci_workflow();
-    let blocks = job_blocks(&workflow);
+    let blocks = runner_workflow_jobs();
 
-    let hosted: BTreeSet<&str> = blocks
+    let hosted: BTreeSet<String> = blocks
         .iter()
         .filter(|(_, block)| block.contains("    runs-on: ubuntu-latest\n"))
-        .map(|(name, _)| name.as_str())
+        .map(|(name, _)| name.clone())
         .collect();
-    let declared: BTreeSet<&str> = HOSTED_LINUX_JOBS.into_iter().collect();
+    let declared: BTreeSet<String> = HOSTED_LINUX_JOBS
+        .into_iter()
+        .map(|name| format!("ci.yml/{name}"))
+        .collect();
 
     assert_eq!(
         hosted, declared,
         "a Linux job may use GitHub-hosted ubuntu-latest only when it depends \
          on the hosted image itself (see HOSTED_LINUX_JOBS): every job here is \
-         one the required gate cannot run during a hosted-runner outage"
+         one these workflows cannot run during a hosted-runner outage"
     );
 }
 

@@ -18,7 +18,7 @@ zeroclaw-memory.workspace = true
 zeroclaw-providers.workspace = true
 zeroclaw-runtime.workspace = true
 zeroclaw-tool-call-parser.workspace = true
-zeroclaw-tools.workspace = true
+zeroclaw-tools = { workspace = true, optional = true }
 anyhow = "1.0"
 lru = "0.18.2"
 rumqttc = { version = "0.25", optional = true }
@@ -217,6 +217,7 @@ channel-email = [
   "dep:mail-parser",
   "dep:rustls",
   "dep:rustls-pki-types",
+  "dep:zeroclaw-tools",
   "tls-client",
 ]
 tls-client = ["dep:tokio-rustls", "dep:webpki-roots"]
@@ -277,8 +278,8 @@ channel-clawdtalk = []
 channel-webhook = ["dep:axum"]
 channel-whatsapp-cloud = []
 channel-voice-call = ["dep:axum"]
-channel-acp-server = []
-channel-matrix = ["dep:matrix-sdk", "dep:mime_guess"]
+channel-acp-server = ["dep:zeroclaw-tools"]
+channel-matrix = ["dep:matrix-sdk", "dep:mime_guess", "dep:zeroclaw-tools"]
 voice-wake = ["dep:cpal"]
 
 [target.'cfg(unix)'.dependencies]
@@ -289,6 +290,7 @@ libc = "0.2"
 # so channel test fixtures can mint the now-sealed `ChannelRuntimeContext`
 # tools registry. dev-dependency only: never enabled in the shipped channels lib.
 zeroclaw-runtime = { workspace = true, features = ["test-util"] }
+zeroclaw-tools.workspace = true
 axum = { version = "0.8", default-features = false, features = [
   "http1",
   "json",

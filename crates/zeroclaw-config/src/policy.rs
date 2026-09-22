@@ -2770,6 +2770,16 @@ fn split_simple_powershell_pipeline(command: &str) -> Option<Vec<String>> {
     powershell_variables_are_simple(command).then_some(segments)
 }
 
+/// Return whether `command` fits the one canonical bounded PowerShell grammar.
+///
+/// Native PowerShell execution uses this to decide whether a setup statement
+/// can be prepended without rewriting a full script. Inputs outside this
+/// grammar must remain byte-for-byte unchanged so declarations, named blocks,
+/// and other PowerShell syntax keep their native `-Command` behavior.
+pub(crate) fn powershell_command_supports_statement_prelude(command: &str) -> bool {
+    split_simple_powershell_pipeline(command).is_some()
+}
+
 /// Accept only `$Name` and `$Name.Property` reads outside single-quoted
 /// literals. Subexpressions, braced variables, scoped variables, and special
 /// variables are rejected because they change parsing or hide executable text.

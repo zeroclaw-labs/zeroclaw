@@ -28,7 +28,8 @@ env:
 # The Rust-compiling jobs below (lint, build, check, check-plugin-backends,
 # check-32bit, bench, test, test-channel-features, memory-postgres-test, msrv, parallel-runtime-test,
 # installer-drift) and the Linux `build` matrix entry name their runner label
-# directly, so they start as soon as the run does.
+# directly, so runner selection does not wait for fmt. The build matrix still
+# waits for path-changes to select its Windows task-owner recovery tests.
 # `tests/architecture/ci_runner_labels.rs` fails the workspace suite if those
 # labels or their cache-provider inputs drift apart, so moving the fleet stays
 # one reviewed edit even though the constant is written more than once.
@@ -365,6 +366,7 @@ jobs:
 
   build:
     name: ${{ matrix.label }} ${{ matrix.target }}
+    # All build legs wait for this detector; only the Windows recovery step is filtered.
     needs: [path-changes]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
@@ -450,16 +452,20 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      # Recovery-filter invariant and retirement condition: README.md bespoke CI gate registry.
       - name: Test Windows task-owner recovery
         if: runner.os == 'Windows' && needs.path-changes.outputs.windows_recovery != 'false'
         shell: bash
         run: |
-          cargo test --profile ci --locked -p zeroclaw-runtime --lib \
+          set -euo pipefail
+          cargo test --locked -p zeroclaw-runtime --lib \
             --target x86_64-pc-windows-msvc \
-            control_plane::authority::tests::windows_process_exit_is_detected -- --exact
-          cargo test --profile ci --locked -p zeroclaw-runtime --lib \
+            control_plane::authority::tests::windows_process_exit_is_detected -- --exact 2>&1 | tee "$RUNNER_TEMP/windows-owner-exit.log"
+          grep -Fq 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/windows-owner-exit.log"
+          cargo test --locked -p zeroclaw-runtime --lib \
             --target x86_64-pc-windows-msvc \
-            control_plane::boot::tests::recovery_retains_live_foreign_process_then_reclaims_after_exit -- --exact
+            control_plane::boot::tests::recovery_retains_live_foreign_process_then_reclaims_after_exit -- --exact 2>&1 | tee "$RUNNER_TEMP/windows-owner-recovery.log"
+          grep -Fq 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/windows-owner-recovery.log"
 
   check:
     name: Check (${{ matrix.name }})

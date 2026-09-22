@@ -72,7 +72,7 @@ GitHub's default squash-merge:
 - Formats the body inconsistently
 - Doesn't match project conventions
 
-Direct-pushing a squash to master bypasses the PR merge mechanism: the PR shows "Closed" instead of "Merged" (no purple badge, no linked issue auto-close, no merge association). The skill uses `gh pr merge --subject --body` to get both the badge and the correctly formatted commit.
+Direct-pushing a squash to master bypasses the PR merge mechanism: the PR shows "Closed" instead of "Merged" (no purple badge, no linked issue auto-close, no merge association). The skill uses `gh pr merge --subject --body-file` to get both the badge and the correctly formatted commit.
 
 ### Format
 

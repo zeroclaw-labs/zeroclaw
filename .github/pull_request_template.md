@@ -11,6 +11,10 @@
   example `type:docs`, `risk:low`, `size:S`, `docs`. During label-spelling
   migration, copy the exact live label spelling from the GitHub UI.
 
+### What this does, simply
+
+Explain the change for someone unfamiliar with this part of ZeroClaw: what it is for, what was missing or wrong, and what this PR changes. Include important limits or unchanged behavior where relevant. Use ordinary language and enough context to tell the story, rather than repeating the technical summary.
+
 ## Testing (required)
 
 ### How you can test (when useful)
