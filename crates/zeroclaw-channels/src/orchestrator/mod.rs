@@ -4244,6 +4244,11 @@ fn channel_user_error_message(error: &anyhow::Error, safe_error: &str) -> String
 }
 
 fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
+    // The turn engine owns local capacity rejection. Keep its typed terminal
+    // reason even when an outer context includes a provider's overflow text.
+    if zeroclaw_runtime::agent::context_window_exceeded_from_error(err).is_some() {
+        return false;
+    }
     let lower = err.to_string().to_lowercase();
     [
         "exceeds the context window",
@@ -10432,15 +10437,23 @@ async fn process_channel_message_body(
                         .await;
                 }
             } else {
-                let safe_error = zeroclaw_providers::sanitize_api_error(&e.to_string());
+                let context_window_exceeded =
+                    zeroclaw_runtime::agent::context_window_exceeded_from_error(&e);
+                let safe_error = if context_window_exceeded.is_some() {
+                    String::new()
+                } else {
+                    zeroclaw_providers::sanitize_api_error(&e.to_string())
+                };
                 eprintln!(
-                    "  ❌ LLM error after {}ms: {safe_error}",
+                    "  ❌ Turn error after {}ms: {safe_error}",
                     started_at.elapsed().as_millis(),
                 );
 
                 // Evict cached model_provider on auth errors so the next request
                 // re-creates it with fresh OAuth credentials.
-                if zeroclaw_providers::reliable::is_auth_error(&e) {
+                if context_window_exceeded.is_none()
+                    && zeroclaw_providers::reliable::is_auth_error(&e)
+                {
                     let cache_key = provider_cache_key(
                         &route.model_provider,
                         route.api_key.as_deref(),
@@ -10461,6 +10474,20 @@ async fn process_channel_message_body(
                         );
                     }
                 }
+                let mut error_attributes = ::serde_json::json!({
+                    "model_provider": route.model_provider,
+                    "model": route.model,
+                    "sender": msg.sender,
+                });
+                if let Some(exceeded) = context_window_exceeded {
+                    error_attributes["error_kind"] = "context_window_exceeded".into();
+                    error_attributes["estimated_tokens"] = exceeded.estimated_tokens.into();
+                    error_attributes["model_context_window"] = exceeded.model_context_window.into();
+                    error_attributes["provider_attempted"] = false.into();
+                } else {
+                    error_attributes["error_kind"] = "provider_error".into();
+                    error_attributes["error"] = safe_error.clone().into();
+                }
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -10468,15 +10495,11 @@ async fn process_channel_message_body(
                         .with_duration(
                             u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
                         )
-                        .with_attrs(::serde_json::json!({
-                            "model_provider": route.model_provider,
-                            "model": route.model,
-                            "sender": msg.sender,
-                            "error": safe_error,
-                        })),
+                        .with_attrs(error_attributes),
                     "channel_message_error"
                 );
-                let should_rollback_user_turn = should_rollback_failed_user_turn(&e);
+                let should_rollback_user_turn =
+                    context_window_exceeded.is_none() && should_rollback_failed_user_turn(&e);
                 let rolled_back = should_rollback_user_turn
                     && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &timestamped_content);
 
@@ -18825,6 +18848,112 @@ pub(crate) mod tests {
             None,
             "the configured base=none policy must be resolved only by Matrix rendering"
         );
+    }
+
+    #[test]
+    fn local_capacity_cause_is_not_a_provider_overflow() {
+        let error = anyhow::Error::new(zeroclaw_runtime::agent::ContextWindowExceeded {
+            estimated_tokens: 65_537,
+            model_context_window: 65_536,
+        })
+        .context("maximum context length; private provider diagnostics");
+        assert!(!is_context_window_overflow_error(&error));
+        let message =
+            zeroclaw_runtime::i18n::get_required_cli_string("turn-context-window-exceeded-error");
+        assert_eq!(
+            channel_user_error_message(&error, "private fallback"),
+            format!("⚠️ Error: {message}")
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn matrix_context_window_failure_is_delivered_and_logged_before_provider_dispatch() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+
+        while rx.try_recv().is_ok() {}
+        let channel_impl = Arc::new(DraftRecordingChannel::matrix(
+            zeroclaw_config::schema::MatrixStreamMode::SingleMessage,
+        ));
+        let provider = Arc::new(PrecheckProbeModelProvider::default());
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.matrix.insert(
+            "private".to_string(),
+            zeroclaw_config::schema::MatrixConfig {
+                stream_mode: zeroclaw_config::schema::MatrixStreamMode::SingleMessage,
+                ..Default::default()
+            },
+        );
+        config.providers.models.custom.insert(
+            "capacity".to_string(),
+            zeroclaw_config::schema::CustomModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("test-model".to_string()),
+                    context_window: Some(64),
+                    ..Default::default()
+                },
+            },
+        );
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel_impl.clone(),
+            provider.clone(),
+            config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "custom.capacity",
+            None,
+        );
+        ctx.provider_cache
+            .lock()
+            .unwrap()
+            .insert("custom.capacity".to_string(), provider.clone());
+        let msg = ChannelMessage {
+            id: "matrix-capacity-error".to_string(),
+            explicitly_addressed: true,
+            sender: "capacity-sender".to_string(),
+            reply_target: "!private:example.com".to_string(),
+            content: "private-context-prompt ".repeat(256),
+            channel: "matrix".to_string(),
+            channel_alias: Some("private".to_string()),
+            timestamp: 1,
+            ..Default::default()
+        };
+        process_channel_message(ctx.clone(), msg, CancellationToken::new()).await;
+
+        let terminal =
+            zeroclaw_runtime::i18n::get_required_cli_string("turn-context-window-exceeded-error");
+        let expected = format!("⚠️ Error: {terminal}");
+        assert_eq!(
+            *channel_impl.sent_messages.lock().await,
+            [format!("!private:example.com:{expected}")]
+        );
+        assert_eq!(provider.main_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.precheck_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            ctx.provider_cache
+                .lock()
+                .unwrap()
+                .contains_key("custom.capacity")
+        );
+        assert!(!channel_impl.cancelled_drafts.lock().await.is_empty());
+
+        let event = std::iter::from_fn(|| rx.try_recv().ok())
+            .find(|value| {
+                value.get("message").and_then(|v| v.as_str()) == Some("channel_message_error")
+                    && value.pointer("/attributes/sender").and_then(|v| v.as_str())
+                        == Some("capacity-sender")
+            })
+            .expect("local capacity failure must emit a channel error event");
+        let attributes = &event["attributes"];
+        assert_eq!(attributes["error_kind"], "context_window_exceeded");
+        assert_eq!(attributes["provider_attempted"], false);
+        assert_eq!(attributes["model_context_window"], 64);
+        assert!(attributes["estimated_tokens"].as_u64().unwrap() > 64);
+        assert!(attributes.get("history_compacted").is_none());
+        assert!(attributes.get("error").is_none());
+        assert!(!event.to_string().contains("private-context-prompt"));
     }
 
     #[test]

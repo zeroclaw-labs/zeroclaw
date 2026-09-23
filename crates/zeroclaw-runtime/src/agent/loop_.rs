@@ -2116,7 +2116,12 @@ pub async fn run(
 
                             continue;
                         }
-                        return Err(project_cli_terminal_completion_error(e));
+                        // Cron owns its terminal projection and needs the typed cause.
+                        return Err(if origin == TurnOrigin::Cron {
+                            e
+                        } else {
+                            project_cli_terminal_completion_error(e)
+                        });
                     }
                 }
             }
@@ -18569,7 +18574,10 @@ Let me check the result."#;
         SummaryFloor,
     }
 
-    async fn assert_hook_selected_request_budget(scenario: HookBudgetScenario) {
+    async fn assert_hook_selected_request_budget(
+        scenario: HookBudgetScenario,
+        allow_soft_floor: bool,
+    ) {
         use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
         use crate::agent::turn::{ToolProtocolPrompts, scope_tool_protocol_prompts};
         use crate::hooks::{HookHandler, HookResult, HookRunner};
@@ -18785,6 +18793,12 @@ Let me check the result."#;
             }
             HookBudgetScenario::SummaryCalibrated => initial_tokens + result_tokens + 300,
         };
+        let over_soft_budget = matches!(
+            scenario,
+            HookBudgetScenario::PlainToNativeFloor | HookBudgetScenario::SummaryFloor
+        );
+        let floor = over_soft_budget && !allow_soft_floor;
+        let capacity = if floor { budget } else { 32_768 };
         let hook_calls = Arc::new(AtomicUsize::new(0));
         let mut hooks = HookRunner::new();
         hooks.register(Box::new(SelectNextModel {
@@ -18830,7 +18844,16 @@ Let me check the result."#;
                     parallel_tools: false,
                     max_tool_result_chars: 0,
                     context_limits: test_context_limits(budget),
-                    context_limits_resolver: None,
+                    context_limits_resolver: Some(Arc::new(move |_, selected_model| {
+                        zeroclaw_config::schema::ResolvedContextLimits {
+                            model_context_window: if summary || selected_model == next_model {
+                                capacity
+                            } else {
+                                32_768
+                            },
+                            ..test_context_limits(budget)
+                        }
+                    })),
                     receipt_generator: None,
                     knobs: &LoopKnobs::default(),
                 },
@@ -18857,16 +18880,16 @@ Let me check the result."#;
         )
         .await;
 
-        let floor = matches!(
-            scenario,
-            HookBudgetScenario::PlainToNativeFloor | HookBudgetScenario::SummaryFloor
-        );
         let untrimmed = matches!(
             scenario,
             HookBudgetScenario::NativeToPlain | HookBudgetScenario::NativeToPlainWithCalibration
         );
         if floor {
-            assert!(result.is_err(), "an unsatisfiable request must fail");
+            let error = result.expect_err("a model-capacity floor must fail");
+            let exceeded = crate::agent::context_window_exceeded_from_error(&error)
+                .expect("capacity failure must retain its typed cause");
+            assert_eq!(exceeded.model_context_window, capacity);
+            assert!(exceeded.estimated_tokens > capacity);
         } else {
             let text = result.expect("request must fit");
             if summary {
@@ -18886,7 +18909,7 @@ Let me check the result."#;
         for request in captured.iter() {
             let tokens = estimate_history_tokens(&request.messages) + request.schema_tokens;
             assert!(
-                tokens <= budget,
+                tokens <= if allow_soft_floor { capacity } else { budget },
                 "an oversized request reached the provider"
             );
         }
@@ -18978,7 +19001,7 @@ Let me check the result."#;
         assert_eq!(trims.len(), usize::from(!untrimmed));
         if let Some((tokens_after, source, unsatisfiable)) = trims.first() {
             assert_eq!(*unsatisfiable, floor.then_some(true));
-            assert_eq!(tokens_after.unwrap() > budget as u64, floor);
+            assert_eq!(tokens_after.unwrap() > budget as u64, over_soft_budget);
             let expected_source = if calibrated {
                 zeroclaw_api::agent::TokenCountSource::Calibrated
             } else {
@@ -18999,34 +19022,48 @@ Let me check the result."#;
 
     #[tokio::test]
     async fn hook_native_to_plain_preserves_history_not_needed_for_schemas() {
-        assert_hook_selected_request_budget(HookBudgetScenario::NativeToPlain).await;
-        assert_hook_selected_request_budget(HookBudgetScenario::NativeToPlainWithCalibration).await;
+        assert_hook_selected_request_budget(HookBudgetScenario::NativeToPlain, false).await;
+        assert_hook_selected_request_budget(
+            HookBudgetScenario::NativeToPlainWithCalibration,
+            false,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn hook_plain_to_native_trims_the_actual_next_request() {
-        assert_hook_selected_request_budget(HookBudgetScenario::PlainToNativeTrim).await;
+        assert_hook_selected_request_budget(HookBudgetScenario::PlainToNativeTrim, false).await;
     }
 
     #[tokio::test]
     async fn hook_plain_to_native_floor_never_dispatches_oversized_request() {
-        assert_hook_selected_request_budget(HookBudgetScenario::PlainToNativeFloor).await;
+        assert_hook_selected_request_budget(HookBudgetScenario::PlainToNativeFloor, false).await;
     }
 
     #[tokio::test]
     async fn next_request_keeps_same_model_reported_usage_calibration() {
-        assert_hook_selected_request_budget(HookBudgetScenario::SameModelCalibrated).await;
+        assert_hook_selected_request_budget(HookBudgetScenario::SameModelCalibrated, false).await;
     }
 
     #[tokio::test]
     async fn max_iteration_summary_trims_the_prepared_request() {
-        assert_hook_selected_request_budget(HookBudgetScenario::SummaryTrim).await;
-        assert_hook_selected_request_budget(HookBudgetScenario::SummaryCalibrated).await;
+        assert_hook_selected_request_budget(HookBudgetScenario::SummaryTrim, false).await;
+        assert_hook_selected_request_budget(HookBudgetScenario::SummaryCalibrated, false).await;
     }
 
     #[tokio::test]
     async fn max_iteration_summary_floor_preserves_the_latest_real_turn() {
-        assert_hook_selected_request_budget(HookBudgetScenario::SummaryFloor).await;
+        assert_hook_selected_request_budget(HookBudgetScenario::SummaryFloor, false).await;
+    }
+
+    #[tokio::test]
+    async fn hook_selected_native_schema_soft_floor_still_dispatches() {
+        assert_hook_selected_request_budget(HookBudgetScenario::PlainToNativeFloor, true).await;
+    }
+
+    #[tokio::test]
+    async fn max_iteration_summary_soft_floor_still_dispatches() {
+        assert_hook_selected_request_budget(HookBudgetScenario::SummaryFloor, true).await;
     }
 
     #[tokio::test]
@@ -19173,7 +19210,10 @@ Let me check the result."#;
                     max_tool_result_chars: 0,
                     // Tight enough that the second request's hook-grown
                     // population exceeds it, but comfortable for the first.
-                    context_limits: test_context_limits(2_000),
+                    context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                        model_context_window: 2_000,
+                        ..test_context_limits(2_000)
+                    },
                     context_limits_resolver: None,
                     receipt_generator: None,
                     knobs: &LoopKnobs::default(),
@@ -19231,21 +19271,27 @@ Let me check the result."#;
         );
     }
 
-    #[tokio::test]
-    async fn genuine_floor_with_no_droppable_turn_never_dispatches() {
-        // A single oversized turn with nothing older to drop: the
-        // pre-dispatch gate's durable-history trim is a no-op, so the
-        // "no whole turn was ever droppable" branch fires directly. This
-        // must fail the turn before ever calling the provider, not dispatch
-        // the request it just declared unsatisfiable.
+    async fn assert_context_floor_dispatch(
+        context_token_budget: usize,
+        model_context_window: usize,
+        mut history: Vec<ChatMessage>,
+        should_dispatch: bool,
+        streaming: bool,
+    ) {
+        // Both the fixed prompt and newest turn exceed the soft threshold.
+        // Neither may be discarded to make that threshold fit.
         use crate::agent::turn::{ToolProtocolPrompts, scope_tool_protocol_prompts};
 
-        let provider = RecordingModelProvider::new();
+        let provider = RecordingModelProvider::new().with_vision_support();
+        let stream_provider =
+            StreamingNativeToolEventModelProvider::with_turns(vec![NativeStreamTurn::Text(
+                "done".into(),
+            )]);
         let observer = NoopObserver;
-        let mut history = vec![
-            ChatMessage::system("system"),
-            ChatMessage::user("x".repeat(20_000)),
-        ];
+        let retained: Vec<_> = history
+            .iter()
+            .map(|message| (message.role.clone(), message.content.clone()))
+            .collect();
         let mut crumb_present = false;
         let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]);
         let (event_tx, mut event_rx) =
@@ -19256,14 +19302,18 @@ Let me check the result."#;
             "text prompt".to_string(),
         ));
 
-        let err = scope_tool_protocol_prompts(
+        let result = scope_tool_protocol_prompts(
             prompts,
             run_tool_call_loop(ToolLoop {
                 parent_agent_alias: None,
                 sop_reassembly: None,
                 exec: ResolvedAgentExecution {
                     model_access: ResolvedModelAccess {
-                        model_provider: &provider,
+                        model_provider: if streaming {
+                            &stream_provider
+                        } else {
+                            &provider
+                        },
                         provider_name: "mock-provider",
                         model: "plain-model",
                         dispatch_model: "plain-model",
@@ -19285,9 +19335,10 @@ Let me check the result."#;
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
-                    // Small enough that the single existing turn alone
-                    // exceeds it, with no older turn to drop.
-                    context_limits: test_context_limits(100),
+                    context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                        model_context_window,
+                        ..test_context_limits(context_token_budget)
+                    },
                     context_limits_resolver: None,
                     receipt_generator: None,
                     knobs: &LoopKnobs::default(),
@@ -19313,33 +19364,112 @@ Let me check the result."#;
                 served_route_sink: None,
             }),
         )
-        .await
-        .expect_err("a genuine floor with nothing droppable must fail the turn");
+        .await;
 
-        assert!(
-            provider.requests.lock().unwrap().is_empty(),
-            "the provider must never be called once a genuine floor is proven"
+        assert_eq!(
+            provider.requests.lock().unwrap().len(),
+            usize::from(should_dispatch && !streaming)
         );
-
+        assert_eq!(
+            stream_provider.stream_calls.load(Ordering::SeqCst),
+            usize::from(should_dispatch && streaming),
+            "only requests within model capacity may reach stream_chat",
+        );
+        assert_eq!(stream_provider.chat_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            !crumb_present,
+            "a floor cannot claim to have dropped a turn"
+        );
+        let after: Vec<_> = history
+            .iter()
+            .take(retained.len())
+            .map(|message| (message.role.clone(), message.content.clone()))
+            .collect();
+        assert_eq!(
+            after, retained,
+            "the complete newest turn must remain intact"
+        );
         let mut saw_floor = false;
+        let mut delivered = String::new();
         while let Ok(event) = event_rx.try_recv() {
-            if let zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
-                unsatisfiable_floor: Some(true),
-                dropped_messages: 0,
-                ..
-            } = event
-            {
-                saw_floor = true;
+            match event {
+                zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                    unsatisfiable_floor: Some(true),
+                    dropped_messages: 0,
+                    ..
+                } => saw_floor = true,
+                zeroclaw_api::agent::TurnEvent::Chunk { delta } => delivered.push_str(&delta),
+                _ => {}
             }
         }
+        assert_eq!(delivered, if should_dispatch { "done" } else { "" });
+        assert_eq!(saw_floor, !should_dispatch);
+        if should_dispatch {
+            result.expect("a soft floor within model capacity must reach the provider");
+            if !streaming {
+                let requests = provider.requests.lock().unwrap();
+                assert!(estimate_history_tokens(&requests[0]) <= model_context_window);
+            }
+        } else {
+            let error =
+                result.expect_err("a true model-capacity floor must not reach the provider");
+            let exceeded = crate::agent::context_window_exceeded_from_error(&error)
+                .expect("capacity failure must retain its typed cause");
+            assert_eq!(exceeded.model_context_window, model_context_window);
+            assert!(exceeded.estimated_tokens > model_context_window);
+        }
+    }
+
+    fn context_floor_history() -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::system(format!("text prompt {}", "s".repeat(4000))),
+            ChatMessage::user("x".repeat(20_000)),
+        ]
+    }
+
+    #[tokio::test]
+    async fn soft_context_floor_dispatches_the_complete_latest_turn() {
+        assert_context_floor_dispatch(100, 32_768, context_floor_history(), true, false).await;
+        let history = context_floor_history();
+        let exact_capacity = estimate_history_tokens(&history);
+        assert_context_floor_dispatch(100, exact_capacity, history, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn genuine_floor_with_no_droppable_turn_never_dispatches() {
+        assert_context_floor_dispatch(100, 100, context_floor_history(), false, false).await;
+        assert_context_floor_dispatch(100_000, 100, context_floor_history(), false, false).await;
+    }
+
+    #[tokio::test]
+    async fn disabled_soft_budget_still_enforces_model_capacity() {
+        assert_context_floor_dispatch(0, 100, context_floor_history(), false, false).await;
+        assert_context_floor_dispatch(0, 32_768, context_floor_history(), true, false).await;
+    }
+
+    #[tokio::test]
+    async fn prepared_image_capacity_is_enforced_with_soft_trimming_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("shot.png");
+        let mut image_bytes = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        image_bytes.extend(std::iter::repeat_n(0u8, 3_000));
+        std::fs::write(&image_path, image_bytes).unwrap();
+        let history = vec![
+            ChatMessage::system("text prompt"),
+            ChatMessage::user(format!("inspect [IMAGE:{}]", image_path.display())),
+        ];
         assert!(
-            saw_floor,
-            "the suppressed dispatch must still emit the explicit floor outcome"
+            estimate_history_tokens(&history) > 100,
+            "the image's fixed token cost must exceed model capacity"
         );
-        assert!(
-            !err.to_string().is_empty(),
-            "the failed turn must carry a non-empty error message"
-        );
+        assert_context_floor_dispatch(0, 100, history, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn streaming_context_floor_uses_model_capacity_not_the_soft_budget() {
+        assert_context_floor_dispatch(100, 32_768, context_floor_history(), true, true).await;
+        assert_context_floor_dispatch(100, 100, context_floor_history(), false, true).await;
+        assert_context_floor_dispatch(0, 100, context_floor_history(), false, true).await;
     }
 
     #[tokio::test]
@@ -19477,7 +19607,10 @@ Let me check the result."#;
                     // 1,000 estimated tokens for a ~3KB attachment) and the
                     // real rebuilt population once that turn is dropped
                     // (well under 100 tokens for two short text messages).
-                    context_limits: test_context_limits(500),
+                    context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                        model_context_window: 500,
+                        ..test_context_limits(0)
+                    },
                     context_limits_resolver: None,
                     receipt_generator: None,
                     knobs: &LoopKnobs::default(),

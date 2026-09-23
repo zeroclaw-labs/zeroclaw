@@ -51,6 +51,15 @@ The token budget comes from `ResolvedRuntime::effective_context_budget()`:
   The explicit zero sentinel remains zero and continues to disable proactive
   trimming.
 
+The effective budget is a proactive trimming target, not a hard request limit.
+After dropping all eligible older turns, the runtime retains the newest complete
+turn even if it remains above that target. It sends the request when the prepared
+messages, images, hooks, and tool schemas fit the resolved model context window.
+A request that still exceeds that capacity fails before provider dispatch; raising
+the proactive target alone cannot make it fit. This capacity check also applies
+when proactive trimming is disabled (`max_context_tokens = 0`) and to the final
+summary request after the tool iteration limit is reached.
+
 Capacity and budget are resolved together for the active provider/model route.
 Classifier hints and explicit session switches use the same route selection as
 provider dispatch, so the next model call, proactive trim, overflow diagnostic,

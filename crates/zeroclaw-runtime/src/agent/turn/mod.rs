@@ -44,12 +44,13 @@ pub use knobs::{LoopKnobs, MaxIterationBehavior};
 pub(crate) use max_iter::finish_after_max_iterations;
 pub(crate) use outcome::StreamCancelledAfterOutput;
 pub use outcome::{
-    ModelSwitchCallback, ModelSwitchRequested, ServedRoute, ServedRouteSink, ToolLoopCancelled,
-    is_model_switch_requested, is_tool_loop_cancelled,
+    ContextWindowExceeded, append_safeguard_fallback_notice, context_window_exceeded_from_error,
+    is_semantic_empty_terminal_completion, semantic_empty_terminal_completion_message,
+    terminal_completion_error_message,
 };
 pub use outcome::{
-    append_safeguard_fallback_notice, is_semantic_empty_terminal_completion,
-    semantic_empty_terminal_completion_message, terminal_completion_error_message,
+    ModelSwitchCallback, ModelSwitchRequested, ServedRoute, ServedRouteSink, ToolLoopCancelled,
+    is_model_switch_requested, is_tool_loop_cancelled,
 };
 pub(crate) use outcome::{current_model_switch_state, scope_model_switch_state};
 #[cfg(test)]
@@ -386,6 +387,49 @@ enum PreDispatchOutcome {
     Floor,
 }
 
+fn dispatch_trim_budget(limits: zeroclaw_config::schema::ResolvedContextLimits) -> usize {
+    if limits.context_token_budget == 0 {
+        limits.model_context_window
+    } else {
+        limits.context_token_budget.min(limits.model_context_window)
+    }
+}
+
+fn context_window_exceeded_error(
+    (provider_name, model): (&str, &str),
+    limits: zeroclaw_config::schema::ResolvedContextLimits,
+    tokens: u64,
+    token_source: zeroclaw_api::agent::TokenCountSource,
+) -> anyhow::Error {
+    let span = ::zeroclaw_log::info_span!(
+        target: "zeroclaw_log_internal_scope",
+        "zeroclaw_scope",
+        model = %model,
+        model_provider = %provider_name,
+    );
+    let _guard = span.entered();
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+            .with_category(::zeroclaw_log::EventCategory::Agent)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "error_key": "context_window_exceeded",
+                "estimated_tokens": tokens,
+                "token_count_source": token_source,
+                "model_context_window": limits.model_context_window,
+                "model_context_window_source": format!("{:?}", limits.model_context_window_source),
+                "context_token_budget": limits.context_token_budget,
+            })),
+        "Provider-facing request exceeds the active model context window"
+    );
+    ContextWindowExceeded {
+        estimated_tokens: usize::try_from(tokens).unwrap_or(usize::MAX),
+        model_context_window: limits.model_context_window,
+    }
+    .into()
+}
+
 struct PreDispatchTrimResult {
     outcome: PreDispatchOutcome,
     dropped_messages: usize,
@@ -599,13 +643,6 @@ async fn enforce_reported_budget(
     // `tokens_before` for every trim, replacing the prior provider count the
     // raw selection would otherwise report.
     let mut tokens_after: usize;
-    // Whether the projection loop reached the newest-turn/schema floor while the
-    // projected next request was still over the budget. `drop_oldest_whole_turn`
-    // returns zero only when no droppable whole turn remains, so reaching it with
-    // nothing trimmed means the request cannot be brought under the budget without
-    // dropping the newest turn — an outcome that must be surfaced, not silently
-    // kept as if the trim succeeded.
-    let mut hit_floor = false;
     // The decision seam targets the actual next request without executing any
     // hook: the durable projection is compared against the budget minus the
     // measured hook reserve, so a request-growing `before_llm_call` hook cannot
@@ -628,7 +665,6 @@ async fn enforce_reported_budget(
         let dropped =
             crate::agent::history_trim::drop_oldest_whole_turn(&mut trimmed, taken_had_crumb);
         if dropped == 0 {
-            hit_floor = true;
             break;
         }
         trimmed_any = true;
@@ -656,63 +692,8 @@ async fn enforce_reported_budget(
             }
             let dropped = crate::agent::history_trim::drop_oldest_whole_turn(&mut trimmed, true);
             if dropped == 0 {
-                hit_floor = true;
                 break;
             }
-        }
-        // If the breadcrumb pushes the retained newest turn over the decision
-        // budget and no more whole turn can be dropped, carry the floor flag so
-        // the explicit floor is surfaced instead of a successful ordinary
-        // trim that still exceeds the budget. The floor event reports the REAL
-        // structural removals that happened on the way to the floor (this loop
-        // may already have dropped turns before the breadcrumb-induced floor)
-        // and marks the outcome unsatisfiable so clients never read it as an
-        // ordinary successful trim.
-        if hit_floor && tokens_after > decision_budget {
-            let structural_drops = taken_len.saturating_sub(
-                trimmed
-                    .len()
-                    .saturating_add(usize::from(taken_had_crumb))
-                    .saturating_sub(1),
-            );
-            let floor_turns = crate::agent::history_trim::count_turns(&trimmed).saturating_sub(1);
-            *history = trimmed;
-            if let Some(tx) = event_tx {
-                let _ = tx
-                    .send(TurnEvent::HistoryTrimmed {
-                        dropped_messages: structural_drops,
-                        kept_turns: floor_turns,
-                        reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
-                        token_budget: Some(context_token_budget as u64),
-                        tokens_before: Some(projected_pre_trim as u64),
-                        tokens_after: Some(tokens_after as u64),
-                        tokens_before_source: Some(
-                            zeroclaw_api::agent::TokenCountSource::Calibrated,
-                        ),
-                        tokens_after_source: Some(
-                            zeroclaw_api::agent::TokenCountSource::Calibrated,
-                        ),
-                        unsatisfiable_floor: Some(true),
-                    })
-                    .await;
-            }
-            observer.record_event(
-                &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
-                    dropped_messages: structural_drops,
-                    kept_turns: floor_turns,
-                    reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
-                    channel: None,
-                    agent_alias: None,
-                    turn_id: None,
-                    token_budget: Some(context_token_budget as u64),
-                    tokens_before: Some(projected_pre_trim as u64),
-                    tokens_after: Some(tokens_after as u64),
-                    tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
-                    tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
-                    unsatisfiable_floor: Some(true),
-                },
-            );
-            return;
         }
         // Recompute the structural counts against the final retained set so the
         // emitted event reflects the re-trim, not just the first raw pass. The
@@ -731,8 +712,8 @@ async fn enforce_reported_budget(
         // is persisted and re-dispatched next — a calibrated estimate of the
         // prepared retained population (breadcrumb included, schemas included),
         // WITHOUT the transient hook growth that each dispatched request adds
-        // back on top. The decision seam above reserved that growth against the
-        // budget, so the post-hook next request fits.
+        // back on top. A protected newest turn may remain above the soft target;
+        // only the next actual dispatch can decide whether model capacity fits.
         result.tokens_after = projected_provider_facing_tokens(
             &trimmed,
             multimodal_config,
@@ -784,49 +765,6 @@ async fn enforce_reported_budget(
                 tokens_before_source: Some(tokens_before_source),
                 tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
                 unsatisfiable_floor: None,
-            },
-        );
-    } else if hit_floor {
-        // The projected next request is over the budget but history already sits
-        // at the newest-turn/schema floor: `drop_oldest_whole_turn` returned zero,
-        // so no whole turn could be removed. Nothing was dropped, so no breadcrumb
-        // is injected and no trim claim is made; instead the floor is surfaced
-        // explicitly with the honest accounting so clients and operators see that
-        // the request cannot be brought under the configured budget. `kept_turns`
-        // excludes a leading crumb left by an earlier trim so the count stays
-        // breadcrumb-aware.
-        let floor_turns = crate::agent::history_trim::count_turns(&trimmed)
-            .saturating_sub(usize::from(taken_had_crumb));
-        *history = trimmed;
-        if let Some(tx) = event_tx {
-            let _ = tx
-                .send(TurnEvent::HistoryTrimmed {
-                    dropped_messages: 0,
-                    kept_turns: floor_turns,
-                    reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
-                    token_budget: Some(context_token_budget as u64),
-                    tokens_before: Some(projected_pre_trim as u64),
-                    tokens_after: Some(tokens_after as u64),
-                    tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
-                    tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
-                    unsatisfiable_floor: Some(true),
-                })
-                .await;
-        }
-        observer.record_event(
-            &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
-                dropped_messages: 0,
-                kept_turns: floor_turns,
-                reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
-                channel: None,
-                agent_alias: None,
-                turn_id: None,
-                token_budget: Some(context_token_budget as u64),
-                tokens_before: Some(projected_pre_trim as u64),
-                tokens_after: Some(tokens_after as u64),
-                tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
-                tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
-                unsatisfiable_floor: Some(true),
             },
         );
     } else {
@@ -1411,6 +1349,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             context_limits,
         );
         let context_token_budget = active_context_limits.context_token_budget;
+        let model_context_window = active_context_limits.model_context_window;
+        // Zero disables proactive trimming, but model capacity still applies.
+        let trim_budget = dispatch_trim_budget(active_context_limits);
         let ctx = base_ctx.for_route(
             active_model_provider_name,
             provider_request_model,
@@ -1500,7 +1441,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         // Budget and dispatch share these post-hook messages, schemas and
         // prompt framing. Rebuild after each whole-turn drop without invoking
-        // the hook again, and reject an unsatisfiable request before dispatch.
+        // the hook again. The soft target never makes the newest turn droppable;
+        // only the model's capacity can reject its final retained population.
         let history_len_before = turn_state.history.len();
         let crumb_before = turn_state.crumb_present;
         let tokens_before_dispatch = dispatch_tokens(reported_population_estimated);
@@ -1513,14 +1455,13 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // a dropped turn can carry a disproportionate share of the measured
         // population (e.g. a large multimodal attachment), so only the
         // rebuilt post-hook request re-measured below is authoritative. A
-        // genuine floor (no further whole turn can be dropped and the
-        // rebuilt request is still over budget) fails the turn below instead
-        // of dispatching the request it just declared unsatisfiable.
+        // floor is fatal only when the rebuilt request exceeds model capacity.
+        // A newest turn above the proactive target can still be dispatched.
         let mut trim_result = surface_oversized_dispatch_if_needed(
             turn_state.history,
             &mut turn_state.crumb_present,
             tokens_before_dispatch,
-            context_token_budget,
+            trim_budget,
         );
         *history_has_trim_breadcrumb = turn_state.crumb_present;
         let history_was_trimmed = turn_state.history.len() != history_len_before
@@ -1551,7 +1492,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             let mut total_dropped_messages = trim_result.dropped_messages;
             let mut dropped_turns = usize::from(trim_result.dropped_messages > 0);
             let mut tokens_after_dispatch = tokens_before_dispatch;
-            let mut genuine_floor = false;
             let max_iterations = crate::agent::history_trim::count_turns(turn_state.history) + 1;
             for _ in 0..max_iterations {
                 // Preserve the hook's mutations to retained messages by
@@ -1608,14 +1548,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     crate::agent::history::estimate_history_tokens(&provider_request_messages)
                         + tool_schema_tokens;
                 tokens_after_dispatch = dispatch_tokens(reported_population_estimated);
-                if tokens_after_dispatch <= context_token_budget as u64 {
-                    genuine_floor = false;
+                if tokens_after_dispatch <= trim_budget as u64 {
                     break;
                 }
                 if trim_result.outcome == PreDispatchOutcome::Floor {
                     // The prior call already found no droppable whole turn;
                     // re-running it would repeat the same no-op decision.
-                    genuine_floor = true;
                     break;
                 }
                 // Still over budget on the authoritative rebuilt count: try
@@ -1627,7 +1565,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     turn_state.history,
                     &mut turn_state.crumb_present,
                     tokens_after_dispatch,
-                    context_token_budget,
+                    trim_budget,
                 );
                 *history_has_trim_breadcrumb = turn_state.crumb_present;
                 total_dropped_messages += trim_result.dropped_messages;
@@ -1635,16 +1573,21 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 let dropped_more = turn_state.history.len() != before_len
                     || turn_state.crumb_present != before_crumb;
                 if !dropped_more {
-                    genuine_floor = true;
                     break;
                 }
             }
+            let exceeds_model_window = tokens_after_dispatch > model_context_window as u64;
+            let event_budget = if exceeds_model_window {
+                model_context_window
+            } else {
+                trim_budget
+            };
             trim_result.dropped_messages = total_dropped_messages;
             record_dispatch_trim(
                 (active_model_provider_name, provider_request_model),
                 &trim_result,
                 dropped_turns,
-                context_token_budget,
+                trim_budget,
                 tokens_before_dispatch,
                 tokens_after_dispatch,
                 dispatch_token_source,
@@ -1655,12 +1598,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         dropped_messages: trim_result.dropped_messages,
                         kept_turns: trim_result.kept_turns,
                         reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
-                        token_budget: Some(context_token_budget as u64),
+                        token_budget: Some(event_budget as u64),
                         tokens_before: Some(tokens_before_dispatch),
                         tokens_after: Some(tokens_after_dispatch),
                         tokens_before_source: Some(dispatch_token_source),
                         tokens_after_source: Some(dispatch_token_source),
-                        unsatisfiable_floor: genuine_floor.then_some(true),
+                        unsatisfiable_floor: exceeds_model_window.then_some(true),
                     })
                     .await;
             }
@@ -1672,24 +1615,17 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     channel: None,
                     agent_alias: None,
                     turn_id: None,
-                    token_budget: Some(context_token_budget as u64),
+                    token_budget: Some(event_budget as u64),
                     tokens_before: Some(tokens_before_dispatch),
                     tokens_after: Some(tokens_after_dispatch),
                     tokens_before_source: Some(dispatch_token_source),
                     tokens_after_source: Some(dispatch_token_source),
-                    unsatisfiable_floor: genuine_floor.then_some(true),
+                    unsatisfiable_floor: exceeds_model_window.then_some(true),
                 },
             );
-            if genuine_floor {
-                // The rebuilt request is still over budget after dropping
-                // every available whole turn: dispatching it would send the
-                // request this event just declared unsatisfiable. Fail the
-                // turn instead of sending it.
-                return Err(anyhow::Error::msg(crate::i18n::get_required_cli_string(
-                    "turn-context-budget-floor-error",
-                )));
-            }
-        } else if trim_result.outcome == PreDispatchOutcome::Floor {
+        } else if trim_result.outcome == PreDispatchOutcome::Floor
+            && tokens_before_dispatch > model_context_window as u64
+        {
             // No droppable whole turn remained at all — the durable history
             // and rebuilt request are identical, so the gate's measured
             // population is already the authoritative count.
@@ -1699,7 +1635,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         dropped_messages: 0,
                         kept_turns: trim_result.kept_turns,
                         reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
-                        token_budget: Some(context_token_budget as u64),
+                        token_budget: Some(model_context_window as u64),
                         tokens_before: Some(tokens_before_dispatch),
                         tokens_after: Some(tokens_before_dispatch),
                         tokens_before_source: Some(dispatch_token_source),
@@ -1716,7 +1652,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     channel: None,
                     agent_alias: None,
                     turn_id: None,
-                    token_budget: Some(context_token_budget as u64),
+                    token_budget: Some(model_context_window as u64),
                     tokens_before: Some(tokens_before_dispatch),
                     tokens_after: Some(tokens_before_dispatch),
                     tokens_before_source: Some(dispatch_token_source),
@@ -1724,12 +1660,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     unsatisfiable_floor: Some(true),
                 },
             );
-            // No whole turn was ever droppable, so this is already the
-            // authoritative population: fail the turn instead of dispatching
-            // the request this event just declared unsatisfiable.
-            return Err(anyhow::Error::msg(crate::i18n::get_required_cli_string(
-                "turn-context-budget-floor-error",
-            )));
+        }
+        let retained_tokens = dispatch_tokens(reported_population_estimated);
+        if retained_tokens > model_context_window as u64 {
+            return Err(context_window_exceeded_error(
+                (active_model_provider_name, provider_request_model),
+                active_context_limits,
+                retained_tokens,
+                dispatch_token_source,
+            ));
         }
 
         // Fail closed on the local budget BEFORE announcing the request.
@@ -2536,7 +2475,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         knobs,
         event_tx.as_ref(),
         turn_state.canonical.as_deref_mut(),
-        summary_limits.context_token_budget,
+        summary_limits,
         &mut turn_state.crumb_present,
         DispatchTokenCounter::for_route(pending_reported_usage, provider_name, model),
         observer,
@@ -4203,15 +4142,9 @@ mod reported_budget_tests {
     }
 
     #[tokio::test]
-    async fn enforce_surfaces_the_untrimmable_newest_turn_floor() {
-        // History already sits at the newest-turn/schema floor: only the protected
-        // newest whole turn remains (plus system). The projected next request is
-        // over the budget because of a materially large deferred schema
-        // population, and `drop_oldest_whole_turn` returns zero (no droppable
-        // whole turn exists), so the trim cannot satisfy the budget. The floor
-        // must be surfaced explicitly with the honest accounting — the projected
-        // request still exceeds the budget with nothing dropped — rather than
-        // silently persisting an over-budget request as if the trim succeeded.
+    async fn enforce_soft_floor_keeps_the_latest_turn_without_a_false_failure() {
+        // Reported-budget maintenance is proactive only: a protected newest
+        // turn above its target is neither a deletion nor a capacity failure.
         let big = "x".repeat(2000);
         let mut history = vec![
             ChatMessage::system("system"),
@@ -4262,53 +4195,7 @@ mod reported_budget_tests {
         )
         .await;
 
-        // The floor is an explicit outcome, not a silent no-op: an event must be
-        // emitted even though no whole turn could be dropped.
-        let event = rx
-            .recv()
-            .await
-            .expect("the untrimmable floor must emit a HistoryTrimmed event");
-        let (dropped_messages, kept_turns, tokens_before, tokens_after, token_budget) = match event
-        {
-            TurnEvent::HistoryTrimmed {
-                dropped_messages,
-                kept_turns,
-                tokens_before,
-                tokens_after,
-                token_budget,
-                ..
-            } => (
-                dropped_messages,
-                kept_turns,
-                tokens_before,
-                tokens_after,
-                token_budget,
-            ),
-            other => panic!("expected HistoryTrimmed, got {other:?}"),
-        };
-        assert_eq!(
-            dropped_messages, 0,
-            "at the newest-turn floor nothing can be dropped"
-        );
-        assert_eq!(kept_turns, 1, "only the protected newest turn remains");
-        let tokens_after =
-            tokens_after.expect("the floor event must carry the projected post-trim token count");
-        let tokens_before =
-            tokens_before.expect("the floor event must carry the projected pre-trim token count");
-        assert!(
-            tokens_after > budget as u64,
-            "the projected request must still exceed the budget at the floor \
-             (tokens_after {tokens_after}, budget {budget})"
-        );
-        assert_eq!(
-            tokens_before, tokens_after,
-            "with nothing dropped the projected pre-trim and post-trim counts coincide"
-        );
-        assert_eq!(
-            token_budget,
-            Some(budget as u64),
-            "the configured budget must still be reported so the floor is anchored"
-        );
+        assert!(rx.try_recv().is_err(), "no trim or hard rejection occurred");
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         assert_eq!(
             after, taken,
@@ -4317,15 +4204,9 @@ mod reported_budget_tests {
     }
 
     #[tokio::test]
-    async fn enforce_breadcrumb_induced_floor_after_real_drop_reports_both_facts() {
-        // Two real turns: the projection drops the oldest turn to fit, but the
-        // inserted model-visible breadcrumb pushes the retained newest turn
-        // back over the budget and no further whole turn can be dropped. The
-        // floor outcome must report BOTH facts honestly: the messages that
-        // were actually removed on the way to the floor, and the
-        // unsatisfiable flag clients use as the authoritative discriminator —
-        // not a zero-drop "nothing was trimmed" claim about a history that
-        // lost a real turn.
+    async fn enforce_soft_floor_after_real_drop_reports_honest_trim_counts() {
+        // Preserve real deletion counts when the breadcrumb leaves the newest
+        // turn above the soft target, without mislabeling it as a hard failure.
         let big = "x".repeat(2000);
         let mut history = vec![
             ChatMessage::system("system"),
@@ -4416,9 +4297,8 @@ mod reported_budget_tests {
             "kept_turns must be breadcrumb-aware: only the newest real turn remains"
         );
         assert_eq!(
-            unsatisfiable_floor,
-            Some(true),
-            "the client-visible unsatisfiable flag must mark the floor even after real drops"
+            unsatisfiable_floor, None,
+            "a soft target cannot declare the model capacity unsatisfiable"
         );
         let tokens_after =
             tokens_after.expect("the floor event must carry the projected post-trim count");
