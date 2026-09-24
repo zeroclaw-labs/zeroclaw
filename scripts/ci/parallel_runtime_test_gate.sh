@@ -6,6 +6,10 @@ runs="${ZEROCLAW_PARALLEL_TEST_RUNS:-3}"
 threads="${ZEROCLAW_PARALLEL_TEST_THREADS:-16}"
 scope="${ZEROCLAW_PARALLEL_TEST_SCOPE:-all}"
 
+# Runtime binaries use 8 MiB Tokio worker stacks. Keep this full-path stress
+# gate on the same stack contract while still allowing callers to override it.
+export RUST_MIN_STACK="${RUST_MIN_STACK:-8388608}"
+
 case "$runs" in
     ''|*[!0-9]*|0)
         echo "ZEROCLAW_PARALLEL_TEST_RUNS must be a positive integer (got: $runs)."

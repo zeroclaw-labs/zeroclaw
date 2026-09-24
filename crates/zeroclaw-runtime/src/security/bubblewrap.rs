@@ -107,7 +107,11 @@ impl BubblewrapSandbox {
             .map(|s| s.to_string_lossy().to_string())
             .collect();
 
-        let mut bwrap_cmd = Command::new("bwrap");
+        let launcher = which::which("bwrap")
+            .ok()
+            .and_then(|path| path.canonicalize().ok())
+            .unwrap_or_else(|| "bwrap".into());
+        let mut bwrap_cmd = Command::new(launcher);
         bwrap_cmd.args([
             "--ro-bind",
             "/usr",
@@ -152,6 +156,14 @@ impl Sandbox for BubblewrapSandbox {
 
     fn is_available(&self) -> bool {
         Self::is_installed()
+    }
+
+    fn execution_fingerprint_material(
+        &self,
+        _launch_program: &std::path::Path,
+    ) -> std::io::Result<Vec<u8>> {
+        let support = Self::hardening_support();
+        Ok(format!("sandbox-policy-v1:bubblewrap:cap_drop={}", support.cap_drop).into_bytes())
     }
 
     fn name(&self) -> &str {
@@ -205,8 +217,8 @@ mod tests {
         sandbox.wrap_command(&mut cmd).unwrap();
 
         assert_eq!(
-            cmd.get_program().to_string_lossy(),
-            "bwrap",
+            std::path::Path::new(cmd.get_program()).file_name(),
+            Some(std::ffi::OsStr::new("bwrap")),
             "wrapped command should use bwrap as program"
         );
 

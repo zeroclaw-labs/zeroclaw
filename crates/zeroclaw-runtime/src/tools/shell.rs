@@ -1,13 +1,18 @@
 use crate::platform::RuntimeAdapter;
 use crate::security::SecurityPolicy;
-use crate::security::traits::Sandbox;
+use crate::security::traits::{Sandbox, SandboxShellProgram};
 use crate::tools::shell_env::SAFE_SHELL_ENV_VARS;
 use async_trait::async_trait;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::platform::is_android;
+use zeroclaw_api::runtime_traits::ShellExecutionDomain;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
 
 /// Maximum output size in bytes (1MB).
@@ -68,7 +73,7 @@ pub struct ShellTool {
     /// vars are overlaid on top of the safe-env snapshot, letting the user's
     /// real shell environment (PATH, credentials, etc.) reach subprocesses
     /// even though the daemon itself may have a stripped-down env.
-    tui_env: Option<HashMap<String, String>>,
+    tui_env: Option<Arc<HashMap<String, String>>>,
     persistent_writes: bool,
 }
 
@@ -116,9 +121,1135 @@ impl ShellTool {
     /// Pass `Some(env)` to enable forwarding; `None` is a no-op (same as not
     /// calling this method at all).
     pub fn with_tui_env(mut self, env: Option<HashMap<String, String>>) -> Self {
-        self.tui_env = env;
+        self.tui_env = env.map(Arc::new);
         self
     }
+
+    /// Return an on-demand view over the exact runtime inputs this shell tool
+    /// uses. Approval stores this resolver, not a snapshot of its derived
+    /// facts, so mint and execution-time validation cannot drift.
+    pub(crate) fn execution_facts_resolver(&self) -> Arc<ShellExecutionFactsResolver> {
+        Arc::new(ShellExecutionFactsResolver {
+            security: Arc::clone(&self.security),
+            runtime: Arc::clone(&self.runtime),
+            sandbox: Arc::clone(&self.sandbox),
+            tui_env: self.tui_env.as_ref().map(Arc::clone),
+        })
+    }
+}
+
+/// Shell-v1 execution fact resolver shared by the approval gate and the
+/// concrete shell tool. It owns only shared handles to the canonical runtime
+/// objects and materializes a fresh command for every check.
+pub struct ShellExecutionFactsResolver {
+    security: Arc<SecurityPolicy>,
+    runtime: Arc<dyn RuntimeAdapter>,
+    sandbox: Arc<dyn Sandbox>,
+    tui_env: Option<Arc<HashMap<String, String>>>,
+}
+
+pub(crate) struct PreparedShellExecution {
+    pub command: tokio::process::Command,
+    pub facts: serde_json::Value,
+}
+
+impl ShellExecutionFactsResolver {
+    pub(crate) fn prepare(&self, source: &str) -> anyhow::Result<PreparedShellExecution> {
+        self.prepare_with_binding(source)
+    }
+
+    fn prepare_static_allow(&self, source: &str) -> anyhow::Result<PreparedShellExecution> {
+        let mut command = self
+            .runtime
+            .build_shell_command(source, &self.security.workspace_dir)?;
+        self.sandbox.wrap_command(command.as_std_mut())?;
+        let child_environment = self.child_environment();
+        Self::finalize_command(&mut command, &child_environment);
+        Ok(PreparedShellExecution {
+            command,
+            facts: serde_json::Value::Null,
+        })
+    }
+
+    fn prepare_with_binding(&self, source: &str) -> anyhow::Result<PreparedShellExecution> {
+        let action = zeroclaw_config::tool_policy::extract_shell_action(
+            source,
+            self.runtime.shell_dialect(),
+            Some(&self.security.workspace_dir),
+        );
+        let zeroclaw_config::tool_policy::ToolAction::Shell(shell_action) = &action;
+
+        let preliminary = self
+            .runtime
+            .build_shell_command(source, &self.security.workspace_dir)?;
+        let runtime_cwd = preliminary
+            .as_std()
+            .get_current_dir()
+            .unwrap_or(&self.security.workspace_dir)
+            .canonicalize()?;
+        let original_interpreter_program = preliminary.as_std().get_program().to_os_string();
+        let child_environment = self.child_environment();
+        let interpreter_program = resolve_program(
+            preliminary.as_std().get_program(),
+            &runtime_cwd,
+            child_environment_value(&child_environment, "PATH"),
+            child_environment_value(&child_environment, "PATHEXT"),
+        )?;
+        let mut command = self.runtime.build_shell_command_with_program(
+            source,
+            &self.security.workspace_dir,
+            &interpreter_program,
+        )?;
+        self.runtime.pin_shell_command(
+            command.as_std_mut(),
+            &interpreter_program,
+            &self.security.workspace_dir,
+        )?;
+        if command.as_std().get_current_dir().is_none() {
+            command.current_dir(&runtime_cwd);
+        }
+        let interpreter_program = command.as_std().get_program().to_os_string();
+        let interpreter_arguments: Vec<OsString> = command
+            .as_std()
+            .get_args()
+            .map(OsStr::to_os_string)
+            .collect();
+
+        let sandbox_program = self
+            .sandbox
+            .wrap_shell_command(command.as_std_mut(), &original_interpreter_program)?;
+        let sandbox_launcher_program = command.as_std().get_program().to_os_string();
+        let sandbox_launcher = resolve_program(
+            &sandbox_launcher_program,
+            &runtime_cwd,
+            child_environment_value(&child_environment, "PATH"),
+            child_environment_value(&child_environment, "PATHEXT"),
+        )?;
+        ensure_program_is_pinned(&sandbox_launcher_program, &sandbox_launcher)?;
+        self.sandbox
+            .pin_shell_command(command.as_std_mut(), &sandbox_launcher)?;
+        if command.as_std().get_current_dir().is_none() {
+            command.current_dir(&runtime_cwd);
+        }
+        Self::finalize_command(&mut command, &child_environment);
+
+        let std_command = command.as_std();
+        let cwd = std_command.get_current_dir().ok_or_else(|| {
+            anyhow::Error::msg("shell launch did not provide a working directory")
+        })?;
+        let resolved_cwd = cwd.canonicalize()?;
+        let effective_path = environment_variable(std_command, "PATH");
+        let host_interpreter = process_identity(
+            &interpreter_program,
+            &interpreter_arguments,
+            &resolved_cwd,
+            effective_path,
+            environment_variable(std_command, "PATHEXT"),
+        )?;
+        ensure_program_is_pinned(&interpreter_program, &host_interpreter.resolved_program)?;
+        let execution_domain = match &sandbox_program {
+            SandboxShellProgram::Host => self.runtime.shell_execution_domain(),
+            SandboxShellProgram::Isolated { mutable_mount, .. } => ShellExecutionDomain::Isolated {
+                name: "sandbox",
+                mutable_mount: *mutable_mount,
+            },
+        };
+        let interpreter = match (&sandbox_program, execution_domain) {
+            (SandboxShellProgram::Isolated { program, .. }, _) => json!({
+                "program": os_identity(program),
+                "resolved_program": serde_json::Value::Null,
+                "execution_domain": "sandbox",
+                "arguments": interpreter_arguments
+                    .iter()
+                    .map(|arg| os_identity(arg))
+                    .collect::<Vec<_>>(),
+            }),
+            (SandboxShellProgram::Host, ShellExecutionDomain::Isolated { name: domain, .. }) => {
+                let profile = self.runtime.shell_profile().ok_or_else(|| {
+                    anyhow::Error::msg(
+                        "isolated shell runtime did not declare its inner interpreter",
+                    )
+                })?;
+                json!({
+                    "program": os_identity(OsStr::new(&profile.name)),
+                    "resolved_program": serde_json::Value::Null,
+                    "execution_domain": domain,
+                    "arguments_source": "sandbox.launch.arguments",
+                })
+            }
+            (SandboxShellProgram::Host, ShellExecutionDomain::Host) => host_interpreter.facts,
+        };
+        let launch_arguments: Vec<OsString> =
+            std_command.get_args().map(OsStr::to_os_string).collect();
+        let launch = process_identity(
+            std_command.get_program(),
+            &launch_arguments,
+            &resolved_cwd,
+            effective_path,
+            environment_variable(std_command, "PATHEXT"),
+        )?;
+        ensure_program_is_pinned(std_command.get_program(), &launch.resolved_program)?;
+        let sandbox_material = self
+            .sandbox
+            .execution_fingerprint_material(&launch.resolved_program)?;
+        let sandbox_policy_digest = hex::encode(Sha256::digest(&sandbox_material));
+        let mut environment: Vec<serde_json::Value> = std_command
+            .get_envs()
+            .map(|(key, value)| {
+                json!({
+                    "name": os_identity(key),
+                    "value": value.map(os_identity),
+                })
+            })
+            .collect();
+        environment.sort_by_key(|entry| entry.to_string());
+
+        let mut facts = shell_action.fingerprint_facts();
+        let object = facts
+            .as_object_mut()
+            .ok_or_else(|| anyhow::Error::msg("shell fingerprint facts must be a JSON object"))?;
+        if !matches!(
+            shell_action.parse_status,
+            zeroclaw_config::tool_policy::ParseStatus::Clean
+        ) {
+            anyhow::bail!("shell syntax cannot be normalized into a complete execution identity");
+        }
+        if execution_domain == ShellExecutionDomain::Host {
+            ensure_static_shell_startup(
+                self.runtime.shell_dialect(),
+                &interpreter_program,
+                std_command,
+                shell_action,
+            )?;
+        } else {
+            ensure_isolated_shell_startup(
+                self.runtime.as_ref(),
+                self.runtime.shell_dialect(),
+                std_command,
+            )?;
+        }
+        let segment_identities = segment_executable_identities(
+            shell_action,
+            self.runtime.shell_dialect(),
+            execution_domain,
+            &interpreter_program,
+            &resolved_cwd,
+            effective_path,
+            environment_variable(std_command, "PATHEXT"),
+        )?;
+        let fact_segments = object
+            .get_mut("segments")
+            .and_then(serde_json::Value::as_array_mut)
+            .ok_or_else(|| anyhow::Error::msg("shell fingerprint segments must be an array"))?;
+        for (segment, identity) in fact_segments.iter_mut().zip(segment_identities) {
+            let segment = segment
+                .as_object_mut()
+                .ok_or_else(|| anyhow::Error::msg("shell fingerprint segment must be an object"))?;
+            segment.insert("resolved_executable".to_string(), identity);
+        }
+        // The source is not an authority or display match. It closes the gap
+        // for shell syntax (notably inline redirects) that the conservative
+        // v1 normalizer deliberately marks degraded instead of interpreting.
+        object.insert("source".to_string(), json!(source));
+        object.insert("cwd".to_string(), json!(path_identity(&resolved_cwd)));
+        object.insert("runtime".to_string(), json!(self.runtime.name()));
+        object.insert("interpreter".to_string(), interpreter);
+        object.insert(
+            "environment".to_string(),
+            json!({
+                "inherit": false,
+                "changes": environment,
+            }),
+        );
+        object.insert(
+            "redirections".to_string(),
+            json!({
+                "shell": "embedded_in_source",
+                "process": {"stdin": "null", "stdout": "piped", "stderr": "piped"},
+            }),
+        );
+        object.insert(
+            "stdin".to_string(),
+            json!({"process": "null", "shell": "embedded_in_source"}),
+        );
+        // Sandbox escape approval is explicitly outside shell v1. A closed
+        // enum value records that no escalation request can exist here.
+        object.insert("requested_escalation".to_string(), json!("none"));
+        object.insert(
+            "sandbox".to_string(),
+            json!({
+                "backend": self.sandbox.name(),
+                "prepared": true,
+                "policy_sha256": sandbox_policy_digest,
+                "launch": launch.facts,
+            }),
+        );
+        // No distinct authenticated principal reaches the current turn. The
+        // canonical authority is the API's shared-operator sentinel; agent,
+        // channel, sender, and model aliases are not identity substitutes.
+        object.insert(
+            "originating_principal".to_string(),
+            json!(zeroclaw_api::principal::Principal::shared_operator()),
+        );
+
+        Ok(PreparedShellExecution { command, facts })
+    }
+
+    fn child_environment(&self) -> HashMap<String, String> {
+        let mut environment = HashMap::new();
+        for var in collect_allowed_shell_env_vars(&self.security) {
+            if let Ok(value) = std::env::var(&var) {
+                environment.insert(var, value);
+            }
+        }
+        if let Some(session_id) = get_session_id() {
+            environment.insert(SESSION_ID_ENV_VAR.to_string(), session_id);
+        }
+        if let Some(tui_env) = &self.tui_env {
+            environment.extend(
+                tui_env
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+        }
+        if is_android() {
+            let ambient = std::env::var("PATH").unwrap_or_default();
+            let tui_path = self
+                .tui_env
+                .as_ref()
+                .and_then(|env| env.get("PATH"))
+                .map(String::as_str);
+            environment.insert("PATH".to_string(), android_child_path(tui_path, &ambient));
+        }
+        environment
+    }
+
+    fn finalize_command(
+        command: &mut tokio::process::Command,
+        child_environment: &HashMap<String, String>,
+    ) {
+        command.env_clear();
+        for (key, value) in child_environment {
+            command.env(key, value);
+        }
+        #[cfg(unix)]
+        command.process_group(0);
+        command.kill_on_drop(true);
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+        command.stdin(std::process::Stdio::null());
+    }
+}
+
+fn ensure_static_shell_startup(
+    dialect: crate::platform::ShellDialect,
+    interpreter_program: &OsStr,
+    command: &std::process::Command,
+    action: &zeroclaw_config::tool_policy::ShellAction,
+) -> anyhow::Result<()> {
+    if dialect != crate::platform::ShellDialect::Posix {
+        return Ok(());
+    }
+    let shell = shell_program_name(Path::new(interpreter_program));
+    let nonempty_env =
+        |name| environment_variable(command, name).is_some_and(|value| !value.is_empty());
+    if !modeled_posix_shell(&shell) {
+        anyhow::bail!(
+            "shell startup behavior for {shell} is not modeled completely; fresh approval cannot be bound safely"
+        );
+    }
+    if nonempty_env("ENV") || nonempty_env("BASH_ENV") {
+        anyhow::bail!(
+            "shell startup environment can change executable resolution; fresh approval cannot be bound safely"
+        );
+    }
+    if command.get_envs().any(|(key, value)| {
+        let key = key.to_string_lossy();
+        value.is_some() && key.starts_with("BASH_FUNC_") && key.ends_with("%%")
+    }) {
+        anyhow::bail!(
+            "exported shell functions can change executable resolution; fresh approval cannot be bound safely"
+        );
+    }
+    if nonempty_env("CDPATH") && action.segments.iter().any(|segment| segment.base == "cd") {
+        anyhow::bail!(
+            "CDPATH can change a literal directory target; fresh approval cannot be bound safely"
+        );
+    }
+    if let Some(segment) = action
+        .segments
+        .iter()
+        .find(|segment| unmodeled_posix_interpreter_command(&segment.base))
+    {
+        anyhow::bail!(
+            "shell command '{}' can change executable lookup or working directory state; fresh approval cannot be bound safely",
+            segment.base
+        );
+    }
+    Ok(())
+}
+
+fn modeled_posix_shell(shell: &str) -> bool {
+    matches!(shell, "sh" | "dash" | "ash" | "bash")
+}
+
+fn ensure_isolated_shell_startup(
+    runtime: &dyn RuntimeAdapter,
+    dialect: crate::platform::ShellDialect,
+    command: &std::process::Command,
+) -> anyhow::Result<()> {
+    let profile = runtime.shell_profile().ok_or_else(|| {
+        anyhow::Error::msg("isolated shell runtime did not declare an interpreter")
+    })?;
+    if profile.dialect != dialect {
+        anyhow::bail!("isolated shell runtime profile does not match its declared shell dialect");
+    }
+    if dialect != crate::platform::ShellDialect::Posix {
+        return Ok(());
+    }
+    let shell = profile.name.trim_end_matches(".exe").to_ascii_lowercase();
+    if !modeled_posix_shell(&shell) {
+        anyhow::bail!(
+            "isolated shell startup behavior for {shell} is not modeled completely; fresh approval cannot be bound safely"
+        );
+    }
+    let nonempty_env =
+        |name| environment_variable(command, name).is_some_and(|value| !value.is_empty());
+    if nonempty_env("ENV") || nonempty_env("BASH_ENV") {
+        anyhow::bail!(
+            "isolated shell startup environment cannot be bound safely to the inner interpreter"
+        );
+    }
+    if command.get_envs().any(|(key, value)| {
+        let key = key.to_string_lossy();
+        value.is_some() && key.starts_with("BASH_FUNC_") && key.ends_with("%%")
+    }) {
+        anyhow::bail!(
+            "isolated bash can import shell functions; fresh approval cannot be bound safely"
+        );
+    }
+    Ok(())
+}
+
+fn shell_program_name(program: &Path) -> String {
+    program
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or_default()
+        .trim_end_matches(".exe")
+        .to_ascii_lowercase()
+}
+
+fn unmodeled_posix_shell(shell: &str) -> bool {
+    matches!(
+        shell,
+        "zsh"
+            | "fish"
+            | "ksh"
+            | "mksh"
+            | "csh"
+            | "tcsh"
+            | "rc"
+            | "es"
+            | "oil"
+            | "osh"
+            | "xonsh"
+            | "elvish"
+            | "nu"
+            | "nushell"
+            | "pwsh"
+            | "powershell"
+            | "cmd"
+            | "cmd.exe"
+    )
+}
+
+fn ensure_nested_shell_startup(
+    segment: &zeroclaw_config::tool_policy::ShellSegment,
+    resolved_program: Option<&Path>,
+) -> anyhow::Result<()> {
+    let shell =
+        resolved_program.map_or_else(|| segment.base.to_ascii_lowercase(), shell_program_name);
+    let inline_env = |name| {
+        segment_environment_value(segment, name, crate::platform::ShellDialect::Posix)
+            .is_some_and(|value| !value.is_empty())
+    };
+    if inline_env("ENV") || inline_env("BASH_ENV") {
+        anyhow::bail!(
+            "external command has a dynamic shell startup environment; fresh approval cannot be bound safely"
+        );
+    }
+    if unmodeled_posix_shell(&shell) {
+        anyhow::bail!(
+            "nested shell '{shell}' has unmodeled startup behavior; fresh approval cannot be bound safely"
+        );
+    }
+    if matches!(shell.as_str(), "busybox" | "toybox")
+        && segment.arguments.first().is_some_and(|argument| {
+            let applet = shell_program_name(Path::new(argument));
+            modeled_posix_shell(&applet) || unmodeled_posix_shell(&applet)
+        })
+    {
+        anyhow::bail!(
+            "multi-call executable '{shell}' selects a nested shell with an unmodeled code source"
+        );
+    }
+    if !modeled_posix_shell(&shell) {
+        return Ok(());
+    }
+    if !segment.arguments.is_empty() {
+        anyhow::bail!(
+            "nested shell '{shell}' has an unmodeled code source; fresh approval cannot be bound safely"
+        );
+    }
+    Ok(())
+}
+
+fn unmodeled_posix_interpreter_command(base: &str) -> bool {
+    matches!(
+        base,
+        // Bash builtins not included in the closed, stateless identity set.
+        "."
+            | "alias"
+            | "bind"
+            | "builtin"
+            | "caller"
+            | "compgen"
+            | "complete"
+            | "compopt"
+            | "declare"
+            | "dirs"
+            | "disown"
+            | "enable"
+            | "eval"
+            | "exec"
+            | "export"
+            | "fc"
+            | "getopts"
+            | "hash"
+            | "help"
+            | "history"
+            | "let"
+            | "local"
+            | "logout"
+            | "mapfile"
+            | "popd"
+            | "pushd"
+            | "readarray"
+            | "read"
+            | "readonly"
+            | "set"
+            | "shopt"
+            | "source"
+            | "suspend"
+            | "typeset"
+            | "unalias"
+            | "unset"
+            // Reserved words and control operators must never fall through to
+            // PATH lookup if extraction produced them as a segment.
+            | "!"
+            | "[["
+            | "]]"
+            | "{"
+            | "}"
+            | "case"
+            | "coproc"
+            | "do"
+            | "done"
+            | "elif"
+            | "else"
+            | "esac"
+            | "fi"
+            | "for"
+            | "function"
+            | "if"
+            | "in"
+            | "select"
+            | "then"
+            | "time"
+            | "until"
+            | "while"
+    )
+}
+
+fn segment_executable_identities(
+    action: &zeroclaw_config::tool_policy::ShellAction,
+    dialect: crate::platform::ShellDialect,
+    domain: ShellExecutionDomain,
+    interpreter_program: &OsStr,
+    initial_cwd: &Path,
+    path: Option<&OsStr>,
+    pathext: Option<&OsStr>,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    if !action.execution_context_static {
+        anyhow::bail!(
+            "shell execution context cannot be reconstructed safely; use literal inline environment assignments and directory changes"
+        );
+    }
+
+    let mut cwd = initial_cwd.to_path_buf();
+    let mut identities = Vec::with_capacity(action.segments.len());
+    for segment in &action.segments {
+        if dialect == crate::platform::ShellDialect::Posix
+            && segment.base == "cd"
+            && matches!(
+                segment.connector,
+                Some(
+                    zeroclaw_config::tool_policy::ShellConnector::And
+                        | zeroclaw_config::tool_policy::ShellConnector::Or
+                        | zeroclaw_config::tool_policy::ShellConnector::Pipeline
+                )
+            )
+        {
+            anyhow::bail!("conditional shell directory changes cannot be reconstructed safely");
+        }
+        let segment_path = segment_environment_value(segment, "PATH", dialect).or(path);
+        let segment_pathext = segment_environment_value(segment, "PATHEXT", dialect).or(pathext);
+        identities.push(segment_executable_identity(
+            segment,
+            dialect,
+            domain,
+            interpreter_program,
+            &cwd,
+            segment_path,
+            segment_pathext,
+        )?);
+        if dialect == crate::platform::ShellDialect::Posix && segment.base == "cd" {
+            let target = Path::new(&segment.arguments[0]);
+            let target = if target.is_absolute() {
+                target.to_path_buf()
+            } else {
+                cwd.join(target)
+            };
+            cwd = target.canonicalize().map_err(|error| {
+                anyhow::Error::msg(format!(
+                    "shell directory change target '{}' cannot be resolved: {error}",
+                    target.display()
+                ))
+            })?;
+            if !cwd.is_dir() {
+                anyhow::bail!(
+                    "shell directory change target '{}' is not a directory",
+                    cwd.display()
+                );
+            }
+        }
+    }
+    Ok(identities)
+}
+
+fn segment_executable_identity(
+    segment: &zeroclaw_config::tool_policy::ShellSegment,
+    dialect: crate::platform::ShellDialect,
+    domain: ShellExecutionDomain,
+    interpreter_program: &OsStr,
+    cwd: &Path,
+    path: Option<&OsStr>,
+    pathext: Option<&OsStr>,
+) -> anyhow::Result<serde_json::Value> {
+    if interpreter_builtin(dialect, interpreter_program, &segment.base) {
+        return Ok(json!({
+            "kind": "interpreter_builtin",
+            "name": segment.base,
+            "interpreter": os_identity(interpreter_program),
+        }));
+    }
+    if let ShellExecutionDomain::Isolated {
+        name: domain,
+        mutable_mount,
+    } = domain
+    {
+        if mutable_mount {
+            anyhow::bail!(
+                "isolated shell external executable '{}' may resolve through mutable mounted content",
+                segment.executable
+            );
+        }
+        if dialect == crate::platform::ShellDialect::Posix {
+            ensure_nested_shell_startup(segment, None)?;
+        }
+        return Ok(json!({
+            "kind": "isolated_runtime",
+            "domain": domain,
+            "program": segment.executable,
+        }));
+    }
+    if dialect == crate::platform::ShellDialect::PowerShell {
+        let requested = Path::new(&segment.executable);
+        if !requested.is_absolute() && requested.components().count() <= 1 {
+            anyhow::bail!(
+                "PowerShell command '{}' is not a closed interpreter command or explicit executable path",
+                segment.executable
+            );
+        }
+    }
+    let resolved = resolve_program(OsStr::new(&segment.executable), cwd, path, pathext)?;
+    if dialect == crate::platform::ShellDialect::Posix {
+        ensure_nested_shell_startup(segment, Some(&resolved))?;
+    }
+    Ok(json!({
+        "kind": "host_executable",
+        "path": path_identity(&resolved),
+        "content_sha256": executable_content_sha256(&resolved)?,
+    }))
+}
+
+fn segment_environment_value<'a>(
+    segment: &'a zeroclaw_config::tool_policy::ShellSegment,
+    name: &str,
+    dialect: crate::platform::ShellDialect,
+) -> Option<&'a OsStr> {
+    segment
+        .env_assignments
+        .iter()
+        .rev()
+        .find_map(|(key, value)| {
+            let matches = if dialect == crate::platform::ShellDialect::WindowsCmd {
+                key.eq_ignore_ascii_case(name)
+            } else {
+                key == name
+            };
+            matches.then_some(OsStr::new(strip_assignment_quotes(value)))
+        })
+}
+
+fn strip_assignment_quotes(value: &str) -> &str {
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        if matches!(
+            (bytes[0], bytes[value.len() - 1]),
+            (b'\'', b'\'') | (b'"', b'"')
+        ) {
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
+}
+
+fn interpreter_builtin(
+    dialect: crate::platform::ShellDialect,
+    interpreter_program: &OsStr,
+    base: &str,
+) -> bool {
+    match dialect {
+        crate::platform::ShellDialect::Posix => {
+            let required_builtin = matches!(
+                base,
+                ":" | "."
+                    | "break"
+                    | "cd"
+                    | "command"
+                    | "continue"
+                    | "eval"
+                    | "exec"
+                    | "exit"
+                    | "export"
+                    | "readonly"
+                    | "return"
+                    | "set"
+                    | "shift"
+                    | "trap"
+                    | "unset"
+            );
+            let shell = Path::new(interpreter_program)
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or_default()
+                .trim_end_matches(".exe")
+                .to_ascii_lowercase();
+            required_builtin
+                || (modeled_posix_shell(&shell)
+                    && matches!(
+                        base,
+                        "[" | "alias"
+                            | "bg"
+                            | "echo"
+                            | "false"
+                            | "fc"
+                            | "fg"
+                            | "getopts"
+                            | "hash"
+                            | "jobs"
+                            | "kill"
+                            | "printf"
+                            | "pwd"
+                            | "read"
+                            | "test"
+                            | "times"
+                            | "true"
+                            | "type"
+                            | "ulimit"
+                            | "umask"
+                            | "unalias"
+                            | "wait"
+                    ))
+        }
+        crate::platform::ShellDialect::WindowsCmd => {
+            let shell = Path::new(interpreter_program)
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or_default()
+                .trim_end_matches(".exe");
+            shell.eq_ignore_ascii_case("cmd")
+                && matches!(
+                    base,
+                    "assoc"
+                        | "break"
+                        | "call"
+                        | "cd"
+                        | "chdir"
+                        | "cls"
+                        | "color"
+                        | "copy"
+                        | "date"
+                        | "del"
+                        | "dir"
+                        | "echo"
+                        | "endlocal"
+                        | "erase"
+                        | "exit"
+                        | "for"
+                        | "ftype"
+                        | "goto"
+                        | "if"
+                        | "md"
+                        | "mkdir"
+                        | "mklink"
+                        | "move"
+                        | "path"
+                        | "pause"
+                        | "popd"
+                        | "prompt"
+                        | "pushd"
+                        | "rd"
+                        | "rem"
+                        | "ren"
+                        | "rename"
+                        | "rmdir"
+                        | "set"
+                        | "setlocal"
+                        | "shift"
+                        | "start"
+                        | "time"
+                        | "title"
+                        | "type"
+                        | "ver"
+                        | "verify"
+                        | "vol"
+                )
+        }
+        crate::platform::ShellDialect::PowerShell => powershell_interpreter_command(base),
+        crate::platform::ShellDialect::None => false,
+    }
+}
+
+fn powershell_interpreter_command(base: &str) -> bool {
+    matches!(
+        base.to_ascii_lowercase().as_str(),
+        "add-content"
+            | "clear-content"
+            | "compare-object"
+            | "convertfrom-json"
+            | "convertto-json"
+            | "copy-item"
+            | "echo"
+            | "foreach-object"
+            | "format-list"
+            | "format-table"
+            | "get-childitem"
+            | "get-content"
+            | "get-item"
+            | "get-location"
+            | "join-path"
+            | "measure-object"
+            | "move-item"
+            | "new-item"
+            | "out-file"
+            | "pop-location"
+            | "push-location"
+            | "read-host"
+            | "remove-item"
+            | "rename-item"
+            | "select-object"
+            | "set-content"
+            | "set-location"
+            | "sort-object"
+            | "split-path"
+            | "tee-object"
+            | "test-path"
+            | "where-object"
+            | "write-error"
+            | "write-host"
+            | "write-output"
+            | "write-warning"
+            | "cat"
+            | "cd"
+            | "cls"
+            | "copy"
+            | "cp"
+            | "del"
+            | "dir"
+            | "erase"
+            | "gc"
+            | "gci"
+            | "gi"
+            | "gl"
+            | "ls"
+            | "md"
+            | "mkdir"
+            | "move"
+            | "mv"
+            | "popd"
+            | "pushd"
+            | "pwd"
+            | "rd"
+            | "ren"
+            | "ri"
+            | "rm"
+            | "rmdir"
+            | "select"
+            | "sl"
+            | "type"
+    )
+}
+
+fn child_environment_value<'a>(
+    environment: &'a HashMap<String, String>,
+    name: &str,
+) -> Option<&'a OsStr> {
+    environment.iter().find_map(|(key, value)| {
+        environment_name_matches(OsStr::new(key), name).then_some(value.as_ref())
+    })
+}
+
+#[cfg(windows)]
+fn environment_name_matches(actual: &OsStr, expected: &str) -> bool {
+    actual.to_string_lossy().eq_ignore_ascii_case(expected)
+}
+
+#[cfg(not(windows))]
+fn environment_name_matches(actual: &OsStr, expected: &str) -> bool {
+    actual == OsStr::new(expected)
+}
+
+struct ProcessIdentity {
+    facts: serde_json::Value,
+    resolved_program: PathBuf,
+}
+
+fn process_identity(
+    program: &OsStr,
+    arguments: &[OsString],
+    cwd: &Path,
+    path: Option<&OsStr>,
+    pathext: Option<&OsStr>,
+) -> anyhow::Result<ProcessIdentity> {
+    let resolved_program = resolve_program(program, cwd, path, pathext)?;
+    let content_sha256 = executable_content_sha256(&resolved_program)?;
+    Ok(ProcessIdentity {
+        facts: json!({
+            "program": os_identity(program),
+            "resolved_program": path_identity(&resolved_program),
+            "content_sha256": content_sha256,
+            "arguments": arguments.iter().map(|arg| os_identity(arg)).collect::<Vec<_>>(),
+        }),
+        resolved_program,
+    })
+}
+
+fn executable_content_sha256(path: &Path) -> anyhow::Result<String> {
+    let mut file = std::fs::File::open(path).map_err(|error| {
+        anyhow::Error::msg(format!(
+            "shell execution program '{}' cannot be opened for fingerprinting: {error}",
+            path.display()
+        ))
+    })?;
+    let mut hasher = Sha256::new();
+    let mut prefix = [0_u8; 2];
+    let mut prefix_len = 0;
+    while prefix_len < prefix.len() {
+        let read = file.read(&mut prefix[prefix_len..]).map_err(|error| {
+            anyhow::Error::msg(format!(
+                "shell execution program '{}' cannot be read for fingerprinting: {error}",
+                path.display()
+            ))
+        })?;
+        if read == 0 {
+            break;
+        }
+        prefix_len += read;
+    }
+    if prefix_len == prefix.len() && prefix == *b"#!" {
+        anyhow::bail!(
+            "shell execution program '{}' uses an unpinned shebang interpreter",
+            path.display()
+        );
+    }
+    hasher.update(&prefix[..prefix_len]);
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            anyhow::Error::msg(format!(
+                "shell execution program '{}' cannot be read for fingerprinting: {error}",
+                path.display()
+            ))
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn ensure_program_is_pinned(program: &OsStr, resolved_program: &Path) -> anyhow::Result<()> {
+    if Path::new(program) == resolved_program {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "shell execution program '{}' was not pinned to its resolved executable '{}'",
+        Path::new(program).display(),
+        resolved_program.display()
+    )
+}
+
+fn environment_variable<'a>(command: &'a std::process::Command, name: &str) -> Option<&'a OsStr> {
+    command.get_envs().find_map(|(key, value)| {
+        environment_name_matches(key, name)
+            .then_some(value)
+            .flatten()
+    })
+}
+
+fn resolve_program(
+    program: &OsStr,
+    cwd: &Path,
+    path: Option<&OsStr>,
+    pathext: Option<&OsStr>,
+) -> anyhow::Result<PathBuf> {
+    #[cfg(not(windows))]
+    let _ = pathext;
+    let requested = Path::new(program);
+    if requested.components().count() > 1 || requested.is_absolute() {
+        let candidate = if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            cwd.join(requested)
+        };
+        return executable_candidate(&candidate).ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "shell execution program '{}' cannot be resolved as an executable",
+                candidate.display()
+            ))
+        });
+    }
+
+    #[cfg(windows)]
+    if requested
+        .to_string_lossy()
+        .trim_end_matches(".exe")
+        .eq_ignore_ascii_case("cmd")
+        && let Some(system_cmd) = windows_command_interpreter()
+    {
+        return Ok(system_cmd);
+    }
+
+    let path = path.ok_or_else(|| {
+        anyhow::Error::msg(format!(
+            "shell execution program '{}' is relative but the final environment has no PATH",
+            requested.display()
+        ))
+    })?;
+    #[cfg(not(windows))]
+    let directories: Vec<PathBuf> = std::env::split_paths(path).collect();
+    #[cfg(windows)]
+    let mut directories: Vec<PathBuf> = std::env::split_paths(path).collect();
+    #[cfg(windows)]
+    directories.insert(0, cwd.to_path_buf());
+    for directory in directories {
+        let directory = if directory.is_absolute() {
+            directory
+        } else {
+            cwd.join(directory)
+        };
+        let candidate = directory.join(requested);
+        if let Some(resolved) = executable_candidate(&candidate) {
+            return Ok(resolved);
+        }
+        #[cfg(windows)]
+        if requested.extension().is_none() {
+            let extensions = pathext
+                .map(|value| value.to_string_lossy().into_owned())
+                .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string());
+            for extension in extensions.split(';').filter(|part| !part.is_empty()) {
+                let extension = extension.trim_start_matches('.');
+                if let Some(resolved) = executable_candidate(&candidate.with_extension(extension)) {
+                    return Ok(resolved);
+                }
+            }
+        }
+    }
+    Err(anyhow::Error::msg(format!(
+        "shell execution program '{}' cannot be resolved through the final PATH",
+        requested.display()
+    )))
+}
+
+#[cfg(windows)]
+fn windows_command_interpreter() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    let mut buffer = vec![0u16; 32_768];
+    // SAFETY: `buffer` is a valid writable UTF-16 slice for the duration of
+    // the Win32 call. A zero or oversized result is rejected below.
+    let len = unsafe { GetSystemDirectoryW(Some(&mut buffer)) } as usize;
+    if len == 0 || len >= buffer.len() {
+        return None;
+    }
+    let system_dir = OsString::from_wide(&buffer[..len]);
+    executable_candidate(&PathBuf::from(system_dir).join("cmd.exe"))
+}
+
+fn executable_candidate(candidate: &Path) -> Option<PathBuf> {
+    let resolved = candidate.canonicalize().ok()?;
+    let metadata = resolved.metadata().ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return None;
+        }
+    }
+    Some(resolved)
+}
+
+#[cfg(unix)]
+fn os_identity(value: &OsStr) -> serde_json::Value {
+    use std::os::unix::ffi::OsStrExt;
+    json!({"encoding": "unix_bytes_hex", "value": hex::encode(value.as_bytes())})
+}
+
+#[cfg(windows)]
+fn os_identity(value: &OsStr) -> serde_json::Value {
+    use std::os::windows::ffi::OsStrExt;
+    let encoded = value
+        .encode_wide()
+        .map(|unit| format!("{unit:04x}"))
+        .collect::<String>();
+    json!({"encoding": "windows_wide_hex", "value": encoded})
+}
+
+#[cfg(not(any(unix, windows)))]
+fn os_identity(value: &OsStr) -> serde_json::Value {
+    json!({"encoding": "utf8_lossy", "value": value.to_string_lossy()})
+}
+
+fn path_identity(path: &Path) -> serde_json::Value {
+    os_identity(path.as_os_str())
 }
 
 fn decode_output(bytes: &[u8]) -> String {
@@ -187,10 +1318,10 @@ impl Tool for ShellTool {
                     "type": "string",
                     "description": "The shell command to execute"
                 },
-                "approved": {
-                    "type": "boolean",
-                    "description": "Set true to explicitly approve medium/high-risk commands in supervised mode",
-                    "default": false
+                "intent": {
+                    "type": "string",
+                    "maxLength": 200,
+                    "description": "What this command is meant to accomplish, in one sentence. Shown to the operator next to the real command during approval; never used for authorization."
                 }
             },
             "required": ["command"]
@@ -212,23 +1343,105 @@ impl Tool for ShellTool {
 
                 anyhow::Error::msg("Missing 'command' parameter")
             })?;
-        let approved = args
-            .get("approved")
+        // These keys are runtime plumbing stripped before the approval gate.
+        // A confirmation and a dispatch-time policy/session Allow remain
+        // distinct authorities even though both bind the same fresh facts.
+        if args
+            .get(crate::agent::RUNTIME_AUTHORIZATION_REJECTED_ARG)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(crate::i18n::get_required_cli_string(
+                    "tool-shell-execution-context-unverified",
+                )),
+            });
+        }
+        let confirmed = args
+            .get("__zeroclaw_confirmation_consumed")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let policy_allowed = args
+            .get(crate::agent::RUNTIME_POLICY_ALLOW_ARG)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let confirmation_expires_at = args
+            .get(crate::agent::RUNTIME_CONFIRMATION_EXPIRES_AT_ARG)
+            .and_then(serde_json::Value::as_u64);
 
-        match self.security.validate_command_execution_for_shell(
-            command,
-            approved,
-            self.runtime.shell_dialect(),
-        ) {
-            Ok(_) => {}
-            Err(reason) => {
+        if !confirmed
+            && !policy_allowed
+            && let Err(reason) = self.security.validate_command_execution_confirmed(
+                command,
+                false,
+                self.runtime.shell_dialect(),
+            )
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(reason),
+            });
+        }
+
+        let resolver = self.execution_facts_resolver();
+        let prepared = match if confirmed || policy_allowed {
+            resolver.prepare(command)
+        } else {
+            resolver.prepare_static_allow(command)
+        } {
+            Ok(prepared) => prepared,
+            Err(error) => {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(reason),
+                    error: Some(super::runtime_command_error::format_runtime_command_error(
+                        &error,
+                    )),
                 });
+            }
+        };
+        if confirmed || policy_allowed {
+            let expected = args
+                .get(crate::agent::RUNTIME_CONFIRMATION_FINGERPRINT_ARG)
+                .and_then(serde_json::Value::as_str);
+            let actual = zeroclaw_api::permission::ActionFingerprint::compute(&prepared.facts);
+            if expected != Some(actual.as_hex().as_str()) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(crate::i18n::get_required_cli_string(
+                        "tool-shell-execution-context-changed",
+                    )),
+                });
+            }
+        }
+        if confirmed && confirmation_expires_at.is_none() {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(crate::i18n::get_required_cli_string(
+                    "tool-shell-confirmation-validity-unverified",
+                )),
+            });
+        }
+
+        if !policy_allowed {
+            match self.security.validate_command_execution_confirmed(
+                command,
+                confirmed,
+                self.runtime.shell_dialect(),
+            ) {
+                Ok(_) => {}
+                Err(reason) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(reason),
+                    });
+                }
             }
         }
 
@@ -247,86 +1460,20 @@ impl Tool for ShellTool {
             });
         }
 
-        // Execute with timeout to prevent hanging commands.
-        // Clear the environment to prevent leaking API keys and other secrets
-        // (CWE-200), then re-add only safe, functional variables.
-        let mut cmd = match self
-            .runtime
-            .build_shell_command(command, &self.security.workspace_dir)
+        if confirmation_expires_at
+            .is_some_and(|expires_at| chrono::Utc::now().timestamp().max(0) as u64 >= expires_at)
         {
-            Ok(cmd) => cmd,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(super::runtime_command_error::format_runtime_command_error(
-                        &e,
-                    )),
-                });
-            }
-        };
-
-        // Apply sandbox wrapping before execution.
-        // The Sandbox trait operates on std::process::Command, so use as_std_mut
-        // to get a mutable reference to the underlying command.
-        self.sandbox.wrap_command(cmd.as_std_mut()).map_err(|e| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                "shell tool: sandbox wrap_command failed"
-            );
-            anyhow::Error::msg(format!("Sandbox error: {e}"))
-        })?;
-
-        cmd.env_clear();
-
-        for var in collect_allowed_shell_env_vars(&self.security) {
-            if let Ok(val) = std::env::var(&var) {
-                cmd.env(&var, val);
-            }
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(crate::i18n::get_required_cli_string(
+                    "tool-shell-confirmation-expired",
+                )),
+            });
         }
 
-        // Injected after env_clear so it survives; absent when the turn is unscoped.
-        if let Some(session_id) = get_session_id() {
-            cmd.env(SESSION_ID_ENV_VAR, session_id);
-        }
-
-        // Overlay TUI env on top of the safe-env snapshot. TUI vars win on
-        // conflict — the user's real PATH etc. should take precedence over
-        // whatever the daemon process inherited.
-        if let Some(ref tui_env) = self.tui_env {
-            for (k, v) in tui_env {
-                cmd.env(k, v);
-            }
-        }
-
-        // Android: platform tools (sh, getprop, am, dumpsys, content, pm, ...)
-        // live in /system/bin and /system/xbin. The cleared+rebuilt PATH above
-        // may omit them, leaving the shell unable to resolve any platform tool.
-        // Detect Android at runtime (works for bionic and musl builds).
-        if is_android() {
-            let ambient = std::env::var("PATH").unwrap_or_default();
-            let tui_path = self
-                .tui_env
-                .as_ref()
-                .and_then(|env| env.get("PATH"))
-                .map(String::as_str);
-            cmd.env("PATH", android_child_path(tui_path, &ambient));
-        }
-
+        let mut cmd = prepared.command;
         let timeout_secs = self.timeout_secs;
-        // Run in own process group so `ChildGroupGuard` can reap the
-        // whole subtree (backgrounded jobs, subshells) on any exit path.
-        #[cfg(unix)]
-        cmd.process_group(0);
-        cmd.kill_on_drop(true);
-        // `output()` pipes stdio implicitly; `spawn()` does not.
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        cmd.stdin(std::process::Stdio::null());
-
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -598,8 +1745,1305 @@ mod tests {
     use super::*;
     use crate::platform::{DockerRuntime, NativeRuntime, RuntimeAdapter};
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use zeroclaw_config::schema::DockerRuntimeConfig;
     use zeroclaw_tools::wrappers::RateLimitedTool;
+
+    #[cfg(unix)]
+    struct SwitchingInterpreterRuntime {
+        first: PathBuf,
+        second: PathBuf,
+        use_second: AtomicBool,
+    }
+
+    #[cfg(unix)]
+    impl RuntimeAdapter for SwitchingInterpreterRuntime {
+        fn name(&self) -> &str {
+            "switching-test-runtime"
+        }
+
+        fn has_filesystem_access(&self) -> bool {
+            true
+        }
+
+        fn storage_path(&self) -> PathBuf {
+            self.first.clone()
+        }
+
+        fn supports_long_running(&self) -> bool {
+            false
+        }
+
+        fn shell_dialect(&self) -> crate::platform::ShellDialect {
+            crate::platform::ShellDialect::Posix
+        }
+
+        fn build_shell_command(
+            &self,
+            command: &str,
+            workspace_dir: &Path,
+        ) -> anyhow::Result<tokio::process::Command> {
+            let program = if self.use_second.load(Ordering::SeqCst) {
+                &self.second
+            } else {
+                &self.first
+            };
+            let mut process = tokio::process::Command::new(program);
+            process.arg("-c").arg(command).current_dir(workspace_dir);
+            Ok(process)
+        }
+    }
+
+    #[cfg(unix)]
+    struct SwitchingArgumentsRuntime {
+        shell: PathBuf,
+        builds: AtomicUsize,
+        mutable_mount: bool,
+    }
+
+    #[cfg(unix)]
+    impl RuntimeAdapter for SwitchingArgumentsRuntime {
+        fn name(&self) -> &str {
+            "switching-arguments-test-runtime"
+        }
+
+        fn has_filesystem_access(&self) -> bool {
+            true
+        }
+
+        fn storage_path(&self) -> PathBuf {
+            self.shell.clone()
+        }
+
+        fn supports_long_running(&self) -> bool {
+            false
+        }
+
+        fn shell_dialect(&self) -> crate::platform::ShellDialect {
+            crate::platform::ShellDialect::Posix
+        }
+
+        fn shell_execution_domain(&self) -> ShellExecutionDomain {
+            ShellExecutionDomain::Isolated {
+                name: "switching-arguments-test",
+                mutable_mount: self.mutable_mount,
+            }
+        }
+
+        fn build_shell_command(
+            &self,
+            _command: &str,
+            workspace_dir: &Path,
+        ) -> anyhow::Result<tokio::process::Command> {
+            let invocation = self.builds.fetch_add(1, Ordering::SeqCst);
+            let command = if invocation == 0 {
+                "printf preliminary"
+            } else {
+                "printf executed"
+            };
+            let mut process = tokio::process::Command::new(&self.shell);
+            process.arg("-c").arg(command).current_dir(workspace_dir);
+            Ok(process)
+        }
+    }
+
+    #[cfg(unix)]
+    fn executable_file(path: &Path) {
+        let search_path = std::env::var_os("PATH").unwrap_or_default();
+        let source = resolve_program(OsStr::new("true"), Path::new("/"), Some(&search_path), None)
+            .expect("test requires a true executable");
+        std::fs::copy(source, path).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn mutate_executable(path: &Path) {
+        use std::io::Write;
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(b"changed")
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn switching_shell_fixture() -> (
+        tempfile::TempDir,
+        Arc<SecurityPolicy>,
+        Arc<SwitchingInterpreterRuntime>,
+        ShellTool,
+    ) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let first = temp.path().join("first").join("sh");
+        let second = temp.path().join("second").join("sh");
+        std::fs::create_dir_all(first.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(second.parent().unwrap()).unwrap();
+        executable_file(&first);
+        executable_file(&second);
+        let profile = zeroclaw_config::schema::RiskProfileConfig::default();
+        let security = Arc::new(SecurityPolicy::from_risk_profile(&profile, temp.path()));
+        let runtime = Arc::new(SwitchingInterpreterRuntime {
+            first,
+            second,
+            use_second: AtomicBool::new(false),
+        });
+        let tool = ShellTool::new(
+            Arc::clone(&security),
+            Arc::clone(&runtime) as Arc<dyn RuntimeAdapter>,
+        );
+        (temp, security, runtime, tool)
+    }
+
+    #[cfg(unix)]
+    struct NamedWrapperSandbox {
+        name: &'static str,
+        wrapper: Option<PathBuf>,
+    }
+
+    #[cfg(unix)]
+    struct IsolatedProgramSandbox;
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl Sandbox for IsolatedProgramSandbox {
+        fn wrap_command(&self, _command: &mut std::process::Command) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn wrap_shell_command(
+            &self,
+            _command: &mut std::process::Command,
+            _original_program: &OsStr,
+        ) -> std::io::Result<SandboxShellProgram> {
+            Ok(SandboxShellProgram::Isolated {
+                program: OsString::from("sh"),
+                mutable_mount: false,
+            })
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &str {
+            "isolated-program-test"
+        }
+
+        fn description(&self) -> &str {
+            "test isolated shell program"
+        }
+    }
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl Sandbox for NamedWrapperSandbox {
+        fn wrap_command(&self, command: &mut std::process::Command) -> std::io::Result<()> {
+            let Some(wrapper) = &self.wrapper else {
+                return Ok(());
+            };
+            let program = command.get_program().to_os_string();
+            let arguments: Vec<OsString> = command.get_args().map(OsStr::to_os_string).collect();
+            let cwd = command.get_current_dir().map(Path::to_path_buf);
+            let mut wrapped = std::process::Command::new(wrapper);
+            wrapped.arg(program).args(arguments);
+            if let Some(cwd) = cwd {
+                wrapped.current_dir(cwd);
+            }
+            *command = wrapped;
+            Ok(())
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "test sandbox"
+        }
+    }
+
+    #[cfg(unix)]
+    fn execution_fingerprint(
+        tool: &ShellTool,
+        source: &str,
+    ) -> zeroclaw_api::permission::ActionFingerprint {
+        let facts = tool
+            .execution_facts_resolver()
+            .prepare(source)
+            .unwrap()
+            .facts;
+        zeroclaw_api::permission::ActionFingerprint::compute(&facts)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_v1_fingerprint_changes_with_concrete_execution_context() {
+        let (temp, security, runtime, base_tool) = switching_shell_fixture();
+        let base = execution_fingerprint(&base_tool, "echo hi");
+
+        let env_tool = ShellTool::new(
+            Arc::clone(&security),
+            Arc::clone(&runtime) as Arc<dyn RuntimeAdapter>,
+        )
+        .with_tui_env(Some(HashMap::from([(
+            "FINGERPRINT_TEST".to_string(),
+            "changed".to_string(),
+        )])));
+        assert_ne!(base, execution_fingerprint(&env_tool, "echo hi"));
+
+        let other_workspace = temp.path().join("other-workspace");
+        std::fs::create_dir(&other_workspace).unwrap();
+        let profile = zeroclaw_config::schema::RiskProfileConfig::default();
+        let other_security = Arc::new(SecurityPolicy::from_risk_profile(
+            &profile,
+            &other_workspace,
+        ));
+        let cwd_tool = ShellTool::new(
+            other_security,
+            Arc::clone(&runtime) as Arc<dyn RuntimeAdapter>,
+        );
+        assert_ne!(base, execution_fingerprint(&cwd_tool, "echo hi"));
+
+        let wrapper = temp.path().join("sandbox-wrapper");
+        executable_file(&wrapper);
+        let sandbox_tool = ShellTool::new_with_sandbox(
+            Arc::clone(&security),
+            Arc::clone(&runtime) as Arc<dyn RuntimeAdapter>,
+            Arc::new(NamedWrapperSandbox {
+                name: "test-wrapper",
+                wrapper: Some(wrapper),
+            }),
+        );
+        assert_ne!(base, execution_fingerprint(&sandbox_tool, "echo hi"));
+        assert_ne!(
+            base,
+            execution_fingerprint(&base_tool, "echo hi >/dev/null")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_v1_fingerprint_binds_host_executable_contents() {
+        let (temp, security, runtime, interpreter_tool) = switching_shell_fixture();
+        let interpreter_facts = interpreter_tool
+            .execution_facts_resolver()
+            .prepare("echo hi")
+            .unwrap()
+            .facts;
+        assert!(interpreter_facts["interpreter"]["content_sha256"].is_string());
+        let interpreter_before =
+            zeroclaw_api::permission::ActionFingerprint::compute(&interpreter_facts);
+        mutate_executable(&runtime.first);
+        let interpreter_after = execution_fingerprint(&interpreter_tool, "echo hi");
+        assert_ne!(interpreter_before, interpreter_after);
+
+        let segment = temp.path().join("segment-helper");
+        executable_file(&segment);
+        let segment_tool = ShellTool::new(Arc::clone(&security), Arc::new(NativeRuntime::new()));
+        let segment_command = segment.to_string_lossy();
+        let segment_facts = segment_tool
+            .execution_facts_resolver()
+            .prepare(&segment_command)
+            .unwrap()
+            .facts;
+        assert!(segment_facts["segments"][0]["resolved_executable"]["content_sha256"].is_string());
+        let segment_before = zeroclaw_api::permission::ActionFingerprint::compute(&segment_facts);
+        mutate_executable(&segment);
+        let segment_after = execution_fingerprint(&segment_tool, &segment_command);
+        assert_ne!(segment_before, segment_after);
+
+        let wrapper = temp.path().join("sandbox-wrapper");
+        executable_file(&wrapper);
+        let wrapper_tool = ShellTool::new_with_sandbox(
+            security,
+            Arc::new(NativeRuntime::new()),
+            Arc::new(NamedWrapperSandbox {
+                name: "content-test-wrapper",
+                wrapper: Some(wrapper.clone()),
+            }),
+        );
+        let wrapper_facts = wrapper_tool
+            .execution_facts_resolver()
+            .prepare("echo hi")
+            .unwrap()
+            .facts;
+        assert!(wrapper_facts["sandbox"]["launch"]["content_sha256"].is_string());
+        let wrapper_before = zeroclaw_api::permission::ActionFingerprint::compute(&wrapper_facts);
+        mutate_executable(&wrapper);
+        let wrapper_after = execution_fingerprint(&wrapper_tool, "echo hi");
+        assert_ne!(wrapper_before, wrapper_after);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_v1_treats_invalid_assignment_name_as_the_executable() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let bin = workspace.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let executable = bin.join("tool=x");
+        executable_file(&executable);
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            workspace.path(),
+        ));
+        let tool = ShellTool::new(Arc::clone(&security), Arc::new(NativeRuntime::new()));
+        let resolver = tool.execution_facts_resolver();
+
+        let command = "bin/tool=x echo safe";
+        let before = resolver.prepare(command).unwrap().facts;
+        assert_eq!(
+            before["segments"][0]["resolved_executable"]["path"],
+            path_identity(&executable.canonicalize().unwrap())
+        );
+        mutate_executable(&executable);
+        let after = resolver.prepare(command).unwrap().facts;
+        assert_ne!(
+            zeroclaw_api::permission::ActionFingerprint::compute(&before),
+            zeroclaw_api::permission::ActionFingerprint::compute(&after)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_v1_rejects_ambiguous_posix_assignment_and_grouping_syntax() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            workspace.path(),
+        ));
+        let tool = ShellTool::new(security, Arc::new(NativeRuntime::new()));
+        let resolver = tool.execution_facts_resolver();
+
+        for command in [
+            r"FOO=bar\ baz printf ACTUAL",
+            "PATH+=:subdir helper",
+            "PATH=~/bin helper",
+            "(cd child; helper)",
+        ] {
+            let error = match resolver.prepare(command) {
+                Ok(_) => panic!("ambiguous POSIX syntax must fail closed: {command}"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("cannot be reconstructed safely")
+                    || error
+                        .to_string()
+                        .contains("cannot be normalized into a complete execution identity"),
+                "{command}: {error}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_v1_rejects_shebang_executables() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let script = workspace.path().join("script");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            workspace.path(),
+        ));
+        let tool = ShellTool::new(Arc::clone(&security), Arc::new(NativeRuntime::new()));
+
+        let error = match tool.execution_facts_resolver().prepare("./script") {
+            Ok(_) => panic!("shebang executable must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unpinned shebang interpreter"));
+        let binary = workspace.path().join("binary");
+        executable_file(&binary);
+        assert!(executable_content_sha256(&binary).is_ok());
+
+        let wrapper = ShellTool::new(
+            security,
+            Arc::new(NativeRuntime::with_shell(
+                script.to_string_lossy().into_owned(),
+            )),
+        );
+        assert!(
+            wrapper
+                .execution_facts_resolver()
+                .prepare("echo strict")
+                .is_err()
+        );
+        assert!(
+            wrapper
+                .execution_facts_resolver()
+                .prepare_static_allow("echo static")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn shell_v1_limits_isolated_executables_that_can_use_mutable_mounts() {
+        use zeroclaw_config::tool_policy::{ToolAction, extract_shell_action};
+
+        let domain = ShellExecutionDomain::Isolated {
+            name: "test",
+            mutable_mount: true,
+        };
+        let ToolAction::Shell(action) =
+            extract_shell_action("./script", crate::platform::ShellDialect::Posix, None);
+        let error = segment_executable_identity(
+            &action.segments[0],
+            crate::platform::ShellDialect::Posix,
+            domain,
+            OsStr::new("sh"),
+            Path::new("/workspace"),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("mutable mounted content"));
+
+        let ToolAction::Shell(path_override) =
+            extract_shell_action("PATH=. helper", crate::platform::ShellDialect::Posix, None);
+        assert!(
+            segment_executable_identity(
+                &path_override.segments[0],
+                crate::platform::ShellDialect::Posix,
+                domain,
+                OsStr::new("sh"),
+                Path::new("/workspace"),
+                None,
+                None,
+            )
+            .is_err()
+        );
+
+        let ToolAction::Shell(image_command) =
+            extract_shell_action("git status", crate::platform::ShellDialect::Posix, None);
+        let error = segment_executable_identity(
+            &image_command.segments[0],
+            crate::platform::ShellDialect::Posix,
+            domain,
+            OsStr::new("sh"),
+            Path::new("/workspace"),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("mutable mounted content"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_v1_facts_bind_every_required_dimension() {
+        let (_temp, _security, _runtime, tool) = switching_shell_fixture();
+        let resolver = tool.execution_facts_resolver();
+        let facts = resolver.prepare("echo hi >/dev/null").unwrap().facts;
+        for field in [
+            "interpreter",
+            "segments",
+            "cwd",
+            "environment",
+            "redirections",
+            "stdin",
+            "requested_escalation",
+            "sandbox",
+            "originating_principal",
+        ] {
+            assert!(
+                facts.get(field).is_some(),
+                "missing shell-v1 fingerprint dimension: {field}"
+            );
+        }
+        assert_eq!(
+            facts["originating_principal"],
+            json!(zeroclaw_api::principal::Principal::shared_operator())
+        );
+        assert_eq!(facts["requested_escalation"], "none");
+        assert_eq!(facts["redirections"]["process"]["stdin"], "null");
+        assert!(facts["interpreter"]["resolved_program"].is_object());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_v1_facts_bind_the_final_runtime_argv() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let shell = resolve_program(OsStr::new("sh"), workspace.path(), Some(&path), None)
+            .expect("test requires a POSIX shell");
+        let runtime = Arc::new(SwitchingArgumentsRuntime {
+            shell,
+            builds: AtomicUsize::new(0),
+            mutable_mount: false,
+        });
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            workspace.path(),
+        ));
+        let tool = ShellTool::new_with_sandbox(
+            security,
+            runtime.clone() as Arc<dyn RuntimeAdapter>,
+            Arc::new(IsolatedProgramSandbox),
+        )
+        .with_tui_env(Some(HashMap::from([(
+            "PATH".to_string(),
+            path.to_string_lossy().into_owned(),
+        )])));
+
+        let mut prepared = tool
+            .execution_facts_resolver()
+            .prepare("printf requested")
+            .unwrap();
+        assert_eq!(runtime.builds.load(Ordering::SeqCst), 2);
+        assert_eq!(prepared.facts["interpreter"]["execution_domain"], "sandbox");
+        assert!(prepared.facts["interpreter"]["resolved_program"].is_null());
+        let actual_arguments: Vec<OsString> = prepared
+            .command
+            .as_std()
+            .get_args()
+            .map(OsStr::to_os_string)
+            .collect();
+        assert_eq!(
+            prepared.facts["interpreter"]["arguments"],
+            json!(
+                actual_arguments
+                    .iter()
+                    .map(|argument| os_identity(argument))
+                    .collect::<Vec<_>>()
+            )
+        );
+        let output = prepared.command.output().await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "executed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_v1_uses_declared_inner_shell_for_isolated_runtime() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let shell = resolve_program(OsStr::new("sh"), workspace.path(), Some(&path), None)
+            .expect("test requires a POSIX shell");
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            workspace.path(),
+        ));
+        let runtime = Arc::new(SwitchingArgumentsRuntime {
+            shell: shell.clone(),
+            builds: AtomicUsize::new(0),
+            mutable_mount: false,
+        });
+        let tool = ShellTool::new(security, runtime).with_tui_env(Some(HashMap::from([(
+            "PATH".to_string(),
+            path.to_string_lossy().into_owned(),
+        )])));
+
+        let facts = tool
+            .execution_facts_resolver()
+            .prepare("echo ok")
+            .unwrap()
+            .facts;
+        assert_eq!(
+            facts["interpreter"]["program"],
+            os_identity(OsStr::new("sh"))
+        );
+        assert_eq!(
+            facts["interpreter"]["execution_domain"],
+            "switching-arguments-test"
+        );
+        assert_eq!(
+            facts["interpreter"]["arguments_source"],
+            "sandbox.launch.arguments"
+        );
+        assert_eq!(
+            facts["sandbox"]["launch"]["resolved_program"],
+            path_identity(&shell)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_allow_preserves_mutable_isolated_runtime_compatibility() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let shell = resolve_program(OsStr::new("sh"), workspace.path(), Some(&path), None)
+            .expect("test requires a POSIX shell");
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            workspace.path(),
+        ));
+        let runtime = Arc::new(SwitchingArgumentsRuntime {
+            shell,
+            builds: AtomicUsize::new(0),
+            mutable_mount: true,
+        });
+        let resolver = ShellTool::new(security, runtime)
+            .with_tui_env(Some(HashMap::from([(
+                "PATH".to_string(),
+                path.to_string_lossy().into_owned(),
+            )])))
+            .execution_facts_resolver();
+
+        let error = match resolver.prepare("git status") {
+            Ok(_) => panic!("confirmation-bound execution must reject mutable lookup"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("mutable mounted content"));
+        assert!(resolver.prepare_static_allow("git status").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_v1_resolves_inline_path_wrapper_and_literal_cd_segments() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outer_bin = workspace.path().join("outer-bin");
+        let inline_bin = workspace.path().join("inline-bin");
+        let subdir = workspace.path().join("subdir");
+        std::fs::create_dir_all(&outer_bin).unwrap();
+        std::fs::create_dir_all(&inline_bin).unwrap();
+        std::fs::create_dir_all(&subdir).unwrap();
+        let outer_helper = outer_bin.join("zc-helper");
+        let inline_helper = inline_bin.join("zc-helper");
+        let relative_helper = subdir.join("helper");
+        executable_file(&outer_helper);
+        executable_file(&inline_helper);
+        executable_file(&relative_helper);
+
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            workspace.path(),
+        ));
+        let path = std::env::join_paths([
+            outer_bin.as_path(),
+            Path::new("/usr/bin"),
+            Path::new("/bin"),
+        ])
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+        let tool = ShellTool::new(security, Arc::new(NativeRuntime::new()))
+            .with_tui_env(Some(HashMap::from([("PATH".to_string(), path)])));
+        let resolver = tool.execution_facts_resolver();
+
+        let inline = resolver
+            .prepare(&format!("PATH={} zc-helper", inline_bin.display()))
+            .unwrap()
+            .facts;
+        assert_eq!(
+            inline["segments"][0]["resolved_executable"]["path"],
+            path_identity(&inline_helper.canonicalize().unwrap())
+        );
+
+        let wrapped = resolver.prepare("command zc-helper").unwrap().facts;
+        assert_eq!(wrapped["segments"][0]["executable"], "zc-helper");
+        assert_eq!(
+            wrapped["segments"][0]["resolved_executable"]["path"],
+            path_identity(&outer_helper.canonicalize().unwrap())
+        );
+
+        let changed_cwd = resolver.prepare("cd subdir && ./helper").unwrap().facts;
+        assert_eq!(
+            changed_cwd["segments"][0]["resolved_executable"]["kind"],
+            "interpreter_builtin"
+        );
+        assert_eq!(
+            changed_cwd["segments"][1]["resolved_executable"]["path"],
+            path_identity(&relative_helper.canonicalize().unwrap())
+        );
+
+        let builtin = resolver.prepare("echo ok").unwrap().facts;
+        assert_eq!(
+            builtin["segments"][0]["resolved_executable"]["kind"],
+            "interpreter_builtin"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_v1_fails_closed_on_unmodeled_lookup_state_and_launch_wrappers() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let bin = workspace.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        executable_file(&bin.join("zc-helper"));
+        for decoy in [
+            "if",
+            "time",
+            "xargs",
+            "builtin",
+            "declare",
+            "typeset",
+            "local",
+            "enable",
+            "pushd",
+            "popd",
+            "let",
+            "mapfile",
+            "readarray",
+            "[[",
+            "]]",
+            "{",
+            "}",
+            "zsh",
+            "fish",
+            "ksh",
+            "mksh",
+        ] {
+            executable_file(&bin.join(decoy));
+        }
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            workspace.path(),
+        ));
+        let path = std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let shell = resolve_program(
+            OsStr::new("bash"),
+            workspace.path(),
+            Some(OsStr::new(&path)),
+            None,
+        )
+        .or_else(|_| {
+            resolve_program(
+                OsStr::new("sh"),
+                workspace.path(),
+                Some(OsStr::new(&path)),
+                None,
+            )
+        })
+        .unwrap();
+        let tool = ShellTool::new(
+            security,
+            Arc::new(NativeRuntime::with_shell(
+                shell.to_string_lossy().into_owned(),
+            )),
+        )
+        .with_tui_env(Some(HashMap::from([("PATH".to_string(), path)])));
+        let resolver = tool.execution_facts_resolver();
+
+        for command in [
+            "echo $(date)",
+            "source ./commands.sh",
+            "eval echo ok",
+            "PATH=/tmp; zc-helper",
+            "PATH=/tmp :; zc-helper",
+            "PATH=/tmp export FOO=x; zc-helper",
+            "PATH+=:/attacker zc-helper",
+            "readonly PATH=/attacker; zc-helper",
+            "export PATH+=:/attacker; zc-helper",
+            "readonly PATH+=:/attacker; zc-helper",
+            "export P\\A\\T\\H=/attacker; zc-helper",
+            "readonly P\\A\\T\\H=/attacker; zc-helper",
+            "unset P\\A\\T\\H; zc-helper",
+            "printf -v PATH /attacker; zc-helper",
+            "printf -vPATH /attacker; zc-helper",
+            "read PATH; zc-helper",
+            "getopts x PATH; zc-helper",
+            "fc",
+            "cd sub\\dir && ./helper",
+            "trap /tmp/hook EXIT; echo ok",
+            "env PATH=/tmp zc-helper",
+            "exec zc-helper",
+            "sudo zc-helper",
+            "nice zc-helper",
+            "nohup zc-helper",
+            "timeout 1 zc-helper",
+            "xargs zc-helper",
+            "xargs",
+            "time",
+            "if",
+            "builtin zc-helper",
+            "declare PATH=/attacker; zc-helper",
+            "typeset PATH=/attacker; zc-helper",
+            "local PATH=/attacker; zc-helper",
+            "enable -n echo; echo ok",
+            "pushd subdir; zc-helper",
+            "popd; zc-helper",
+            "let PATH=0; zc-helper",
+            "mapfile PATH; zc-helper",
+            "readarray PATH; zc-helper",
+            "[[ -x zc-helper ]]",
+            "{ zc-helper; }",
+            "zsh",
+            "fish",
+            "ksh",
+            "mksh",
+            "BASH_ENV=/tmp/zeroclaw-bash-env bash",
+            "for",
+            "while",
+            "until",
+            "case",
+            "select",
+            "function",
+            "coproc",
+            "sh -c 'zc-helper'",
+            "bash -lc 'zc-helper'",
+            "bash -xc 'zc-helper'",
+            "sh ./mutable-script",
+            "bash script",
+            "bash -l",
+        ] {
+            assert!(
+                resolver.prepare(command).is_err(),
+                "unmodeled execution state must fail closed: {command}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_v1_fails_closed_on_conditional_directory_changes() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let decoy = workspace.path().join("decoy");
+        std::fs::create_dir_all(&decoy).unwrap();
+        executable_file(&workspace.path().join("helper"));
+        executable_file(&decoy.join("helper"));
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            workspace.path(),
+        ));
+        let tool = ShellTool::new(security, Arc::new(NativeRuntime::new()));
+        let resolver = tool.execution_facts_resolver();
+
+        for command in ["false && cd decoy; ./helper", "true || cd decoy; ./helper"] {
+            assert!(
+                resolver.prepare(command).is_err(),
+                "conditional cwd state must fail closed: {command}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_v1_fails_closed_on_bash_startup_code_sources() {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let Ok(bash) = resolve_program(OsStr::new("bash"), Path::new("/"), Some(&path), None)
+        else {
+            return;
+        };
+        let workspace = tempfile::TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            workspace.path(),
+        ));
+        let base_path = path.to_string_lossy().into_owned();
+
+        let bash_env_tool = ShellTool::new(
+            Arc::clone(&security),
+            Arc::new(NativeRuntime::with_shell(
+                bash.to_string_lossy().into_owned(),
+            )),
+        )
+        .with_tui_env(Some(HashMap::from([
+            ("PATH".to_string(), base_path.clone()),
+            ("BASH_ENV".to_string(), "/tmp/zeroclaw-bash-env".to_string()),
+        ])));
+        assert!(
+            bash_env_tool
+                .execution_facts_resolver()
+                .prepare("echo ok")
+                .is_err()
+        );
+
+        let nested_bash_env_tool =
+            ShellTool::new(Arc::clone(&security), Arc::new(NativeRuntime::new())).with_tui_env(
+                Some(HashMap::from([
+                    ("PATH".to_string(), base_path.clone()),
+                    ("BASH_ENV".to_string(), "/tmp/zeroclaw-bash-env".to_string()),
+                ])),
+            );
+        assert!(
+            nested_bash_env_tool
+                .execution_facts_resolver()
+                .prepare("bash")
+                .is_err()
+        );
+
+        let function_tool = ShellTool::new(
+            security,
+            Arc::new(NativeRuntime::with_shell(
+                bash.to_string_lossy().into_owned(),
+            )),
+        )
+        .with_tui_env(Some(HashMap::from([
+            ("PATH".to_string(), base_path),
+            (
+                "BASH_FUNC_zc_helper%%".to_string(),
+                "() { echo replaced; }".to_string(),
+            ),
+        ])));
+        assert!(
+            function_tool
+                .execution_facts_resolver()
+                .prepare("echo ok")
+                .is_err()
+        );
+
+        let cdpath_tool = ShellTool::new(
+            Arc::new(SecurityPolicy::from_risk_profile(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+                workspace.path(),
+            )),
+            Arc::new(NativeRuntime::new()),
+        )
+        .with_tui_env(Some(HashMap::from([
+            (
+                "PATH".to_string(),
+                std::env::var("PATH").unwrap_or_default(),
+            ),
+            ("CDPATH".to_string(), "/tmp".to_string()),
+        ])));
+        assert!(
+            cdpath_tool
+                .execution_facts_resolver()
+                .prepare("cd child && ./helper")
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_v1_fails_closed_for_unmodeled_posix_shell_startup() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        for shell in ["zsh", "fish", "ksh", "custom-shell"] {
+            let interpreter = workspace.path().join(shell);
+            executable_file(&interpreter);
+            let tool = ShellTool::new(
+                Arc::new(SecurityPolicy::from_risk_profile(
+                    &zeroclaw_config::schema::RiskProfileConfig::default(),
+                    workspace.path(),
+                )),
+                Arc::new(NativeRuntime::with_shell(
+                    interpreter.to_string_lossy().into_owned(),
+                )),
+            );
+            assert!(
+                tool.execution_facts_resolver().prepare("echo ok").is_err(),
+                "{shell} startup configuration is outside the shell-v1 closed model"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_v1_resolves_nested_shell_aliases_before_startup_checks() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let bin = workspace.path().join("bin");
+        let targets = workspace.path().join("targets");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&targets).unwrap();
+        for shell in ["bash", "zsh", "ksh"] {
+            let target = targets.join(shell);
+            executable_file(&target);
+            symlink(&target, bin.join(format!("alias-{shell}"))).unwrap();
+        }
+        std::fs::hard_link(targets.join("bash"), bin.join("runner")).unwrap();
+        let path = std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            workspace.path(),
+        ));
+        for hook in [
+            ("BASH_ENV", "/tmp/zeroclaw-bash-env"),
+            ("BASH_FUNC_zc_helper%%", "() { echo replaced; }"),
+        ] {
+            let tool = ShellTool::new(Arc::clone(&security), Arc::new(NativeRuntime::new()))
+                .with_tui_env(Some(HashMap::from([
+                    ("PATH".to_string(), path.clone()),
+                    (hook.0.to_string(), hook.1.to_string()),
+                ])));
+            for executable in ["alias-bash", "runner"] {
+                assert!(
+                    tool.execution_facts_resolver().prepare(executable).is_err(),
+                    "a shell alias or hard link must not bypass {}: {executable}",
+                    hook.0
+                );
+            }
+        }
+        let tool = ShellTool::new(security, Arc::new(NativeRuntime::new()))
+            .with_tui_env(Some(HashMap::from([("PATH".to_string(), path)])));
+        assert!(
+            tool.execution_facts_resolver()
+                .prepare("BASH_ENV=/tmp/zeroclaw-bash-env runner")
+                .is_err(),
+            "inline BASH_ENV must fail closed for every external segment"
+        );
+        for alias in ["alias-zsh", "alias-ksh"] {
+            assert!(
+                tool.execution_facts_resolver().prepare(alias).is_err(),
+                "canonical unmodeled shell alias must fail closed: {alias}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_v1_rejects_multicall_nested_shells() {
+        use zeroclaw_config::tool_policy::{ToolAction, extract_shell_action};
+
+        for launcher in ["busybox", "toybox"] {
+            let ToolAction::Shell(action) = extract_shell_action(
+                &format!("{launcher} sh ./script"),
+                crate::platform::ShellDialect::Posix,
+                None,
+            );
+            let error = ensure_nested_shell_startup(
+                &action.segments[0],
+                Some(Path::new(&format!("/bin/{launcher}"))),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("multi-call executable"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_v1_uses_case_sensitive_posix_path_environment() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let actual_bin = workspace.path().join("actual-bin");
+        let decoy_bin = workspace.path().join("decoy-bin");
+        std::fs::create_dir_all(&actual_bin).unwrap();
+        std::fs::create_dir_all(&decoy_bin).unwrap();
+        let actual = actual_bin.join("zc-case-helper");
+        executable_file(&actual);
+        executable_file(&decoy_bin.join("zc-case-helper"));
+        let path = std::env::join_paths([
+            actual_bin.as_path(),
+            Path::new("/usr/bin"),
+            Path::new("/bin"),
+        ])
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            workspace.path(),
+        ));
+        let tool = ShellTool::new(security, Arc::new(NativeRuntime::new())).with_tui_env(Some(
+            HashMap::from([
+                ("PATH".to_string(), path),
+                ("Path".to_string(), decoy_bin.to_string_lossy().into_owned()),
+            ]),
+        ));
+
+        let facts = tool
+            .execution_facts_resolver()
+            .prepare("zc-case-helper")
+            .unwrap()
+            .facts;
+        assert_eq!(
+            facts["segments"][0]["resolved_executable"]["path"],
+            path_identity(&actual.canonicalize().unwrap())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_v1_uses_dialect_specific_closed_command_classification() {
+        use zeroclaw_config::tool_policy::{ToolAction, extract_shell_action};
+
+        let ToolAction::Shell(cmd_action) = extract_shell_action(
+            "command helper",
+            crate::platform::ShellDialect::WindowsCmd,
+            None,
+        );
+        assert_eq!(cmd_action.segments[0].executable, "command");
+        for source in [
+            "set PATH=C:\\tools & helper",
+            "path C:\\tools",
+            "call helper",
+            "start helper",
+            "if exist file helper",
+            "for %i in (*) do helper",
+            "echo %PATH%",
+            "cmd /C helper",
+        ] {
+            let ToolAction::Shell(action) =
+                extract_shell_action(source, crate::platform::ShellDialect::WindowsCmd, None);
+            assert!(
+                !action.execution_context_static,
+                "dynamic cmd.exe source must fail closed: {source}"
+            );
+        }
+
+        let ToolAction::Shell(write_output) = extract_shell_action(
+            "Write-Output ok",
+            crate::platform::ShellDialect::PowerShell,
+            None,
+        );
+        let builtin = segment_executable_identity(
+            &write_output.segments[0],
+            crate::platform::ShellDialect::PowerShell,
+            ShellExecutionDomain::Host,
+            OsStr::new("pwsh"),
+            Path::new("/"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(builtin["kind"], "interpreter_builtin");
+
+        let ToolAction::Shell(unknown) = extract_shell_action(
+            "git status",
+            crate::platform::ShellDialect::PowerShell,
+            None,
+        );
+        assert!(
+            segment_executable_identity(
+                &unknown.segments[0],
+                crate::platform::ShellDialect::PowerShell,
+                ShellExecutionDomain::Host,
+                OsStr::new("pwsh"),
+                Path::new("/"),
+                std::env::var_os("PATH").as_deref(),
+                None,
+            )
+            .is_err()
+        );
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let explicit = workspace.path().join("helper");
+        executable_file(&explicit);
+        let ToolAction::Shell(explicit_action) = extract_shell_action(
+            explicit.to_string_lossy().as_ref(),
+            crate::platform::ShellDialect::PowerShell,
+            None,
+        );
+        let identity = segment_executable_identity(
+            &explicit_action.segments[0],
+            crate::platform::ShellDialect::PowerShell,
+            ShellExecutionDomain::Host,
+            OsStr::new("pwsh"),
+            workspace.path(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(identity["kind"], "host_executable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execution_revalidation_marks_changed_interpreter_stale() {
+        use zeroclaw_api::permission::{ConsumeOutcome, RouteId};
+
+        let (_temp, security, runtime, tool) = switching_shell_fixture();
+        let profile = zeroclaw_config::schema::RiskProfileConfig::default();
+        let manager = crate::approval::ApprovalManager::from_risk_profile(&profile);
+        manager.set_policy_context(Arc::clone(&security), crate::platform::ShellDialect::Posix);
+        manager.set_shell_execution_context(tool.execution_facts_resolver());
+
+        let command = "echo hi";
+        let approved_facts = manager.shell_fingerprint_facts(command).unwrap();
+        let confirmation = manager.mint_confirmation(&approved_facts, RouteId::cli(), 60);
+        runtime.use_second.store(true, Ordering::SeqCst);
+        let args = json!({
+            "command": command,
+            "__zeroclaw_confirmation_id": confirmation.confirmation_id.to_string(),
+        });
+        let (outcome, fingerprint, _expires_at) = manager.authorize_shell_execution(&args);
+        assert_eq!(
+            outcome,
+            crate::approval::ShellAuthorizationOutcome::Confirmation(ConsumeOutcome::Stale)
+        );
+        assert!(fingerprint.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fingerprint_mismatch_is_rejected_before_spawn() {
+        let (temp, _security, runtime, tool) = switching_shell_fixture();
+        let marker = temp.path().join("spawned");
+        mutate_executable(&runtime.first);
+
+        let result = tool
+            .execute(json!({
+                "command": "echo hi",
+                "__zeroclaw_confirmation_consumed": true,
+                "__zeroclaw_confirmation_fingerprint": "00".repeat(32),
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("fresh approval required"))
+        );
+        assert!(
+            !marker.exists(),
+            "mismatched approval must fail before spawn"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn confirmation_expiry_after_consume_is_rejected_before_spawn() {
+        use zeroclaw_api::permission::{ConsumeOutcome, RouteId};
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let marker = workspace.path().join("expired-confirmation-spawned");
+        let profile = zeroclaw_config::schema::RiskProfileConfig::default();
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            &profile,
+            workspace.path(),
+        ));
+        let tool = ShellTool::new(security.clone(), Arc::new(NativeRuntime::new()));
+        let manager = crate::approval::ApprovalManager::from_risk_profile(&profile);
+        manager.set_policy_context(security, crate::platform::ShellDialect::Posix);
+        manager.set_shell_execution_context(tool.execution_facts_resolver());
+        let command = format!("touch {}", marker.display());
+        let facts = manager.shell_fingerprint_facts(&command).unwrap();
+        let (authorization_args, fingerprint, expires_at) = loop {
+            let confirmation = manager.mint_confirmation(&facts, RouteId::cli(), 1);
+            let authorization_args = json!({
+                "command": command,
+                "__zeroclaw_confirmation_id": confirmation.confirmation_id.to_string(),
+            });
+            let (outcome, fingerprint, expires_at) =
+                manager.authorize_shell_execution(&authorization_args);
+            match outcome {
+                crate::approval::ShellAuthorizationOutcome::Confirmation(
+                    ConsumeOutcome::Consumed,
+                ) => {
+                    break (
+                        authorization_args,
+                        fingerprint.unwrap(),
+                        expires_at.unwrap(),
+                    );
+                }
+                crate::approval::ShellAuthorizationOutcome::Confirmation(
+                    ConsumeOutcome::Expired,
+                ) => continue,
+                other => panic!("fresh confirmation returned {other:?}"),
+            }
+        };
+        while (chrono::Utc::now().timestamp().max(0) as u64) < expires_at {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let result = tool
+            .execute(json!({
+                "command": authorization_args["command"].clone(),
+                "__zeroclaw_confirmation_consumed": true,
+                "__zeroclaw_confirmation_fingerprint": fingerprint.as_hex(),
+                "__zeroclaw_confirmation_expires_at": expires_at,
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            !marker.exists(),
+            "expired confirmation must fail before spawn"
+        );
+    }
 
     #[tokio::test]
     async fn get_session_id_returns_scoped_session_key() {
@@ -710,6 +3154,41 @@ mod tests {
         RateLimitedTool::new(ShellTool::new(security.clone(), test_runtime()), security)
     }
 
+    #[tokio::test]
+    async fn wrapped_shell_requires_approval_for_git_diff_output_file() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        std::fs::write(workspace.path().join("a.txt"), "before\n").unwrap();
+        std::fs::write(workspace.path().join("b.txt"), "after\n").unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        });
+        let tool = wrapped_shell(security);
+
+        let result = tool
+            .execute(json!({
+                "command": "git diff --no-index --output=unapproved.patch a.txt b.txt"
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "output-file mutation must require approval"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("requires operator approval")),
+            "unexpected policy result: {:?}",
+            result.error
+        );
+        assert!(!workspace.path().join("unapproved.patch").exists());
+    }
+
     /// A forbidden path argument is refused by whichever guard sees it first,
     /// and the two guards word it differently. On a Windows shell dialect the
     /// policy's own scan inside `validate_command_execution_for_shell` runs
@@ -729,6 +3208,25 @@ mod tests {
             error.contains("Path blocked") || error.contains("forbidden path argument"),
             "{context}: expected a path-guard refusal, got: {error:?}"
         );
+    }
+
+    #[cfg(unix)]
+    fn powershell_test_runtime() -> (Option<tempfile::TempDir>, Arc<dyn RuntimeAdapter>) {
+        let temp = tempfile::tempdir().unwrap();
+        let powershell = temp.path().join("pwsh");
+        executable_file(&powershell);
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell(
+            powershell.to_string_lossy().into_owned(),
+        ));
+        (Some(temp), runtime)
+    }
+
+    #[cfg(windows)]
+    fn powershell_test_runtime() -> (Option<tempfile::TempDir>, Arc<dyn RuntimeAdapter>) {
+        (
+            None,
+            Arc::new(NativeRuntime::with_shell("powershell".into())),
+        )
     }
 
     #[test]
@@ -754,7 +3252,10 @@ mod tests {
                 .expect("schema required field should be an array")
                 .contains(&json!("command"))
         );
-        assert!(schema["properties"]["approved"].is_object());
+        // The runtime-owned `approved` arg is intentionally absent from the
+        // schema: the model must never be told it can self-approve (RFC 7155).
+        // `agent::set_runtime_approved_arg` is the only writer on the loop path.
+        assert!(schema["properties"].get("approved").is_none());
     }
 
     #[cfg(all(any(unix, windows), not(target_os = "android")))]
@@ -808,11 +3309,8 @@ mod tests {
         let powershell_dir = tempfile::tempdir().unwrap();
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-
             let powershell = powershell_dir.path().join("pwsh");
-            std::fs::write(&powershell, "#!/bin/sh\nexit 99\n").unwrap();
-            std::fs::set_permissions(&powershell, std::fs::Permissions::from_mode(0o755)).unwrap();
+            executable_file(&powershell);
             config.runtime.shell = Some(powershell.to_string_lossy().into_owned());
         }
         #[cfg(target_os = "windows")]
@@ -1046,7 +3544,7 @@ mod tests {
             block_high_risk_commands: true,
             ..SecurityPolicy::default()
         });
-        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell("pwsh".into()));
+        let (_powershell_dir, runtime) = powershell_test_runtime();
         let tool = ShellTool::new(security, runtime);
 
         let result = tool
@@ -1073,7 +3571,7 @@ mod tests {
             allowed_commands: vec!["cat".into()],
             ..SecurityPolicy::default()
         });
-        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell("pwsh".into()));
+        let (_powershell_dir, runtime) = powershell_test_runtime();
         let tool = RateLimitedTool::new(ShellTool::new(security.clone(), runtime), security);
 
         let result = tool
@@ -1105,7 +3603,7 @@ mod tests {
             block_high_risk_commands: true,
             ..SecurityPolicy::default()
         });
-        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell("pwsh".into()));
+        let (_powershell_dir, runtime) = powershell_test_runtime();
         let tool = RateLimitedTool::new(ShellTool::new(security.clone(), runtime), security);
 
         let result = tool
@@ -1137,7 +3635,7 @@ mod tests {
             block_high_risk_commands: true,
             ..SecurityPolicy::default()
         });
-        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell("pwsh".into()));
+        let (_powershell_dir, runtime) = powershell_test_runtime();
         let tool = RateLimitedTool::new(ShellTool::new(security.clone(), runtime), security);
 
         let result = tool
@@ -1206,7 +3704,7 @@ mod tests {
         });
         // Policy rejection happens before spawn, so this test does not require
         // pwsh to be installed on the host.
-        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell("pwsh".into()));
+        let (_powershell_dir, runtime) = powershell_test_runtime();
         let tool = ShellTool::new(security, runtime);
 
         let result = tool
@@ -1686,6 +4184,8 @@ mod tests {
 
     #[tokio::test]
     async fn shell_requires_approval_for_medium_risk_command() {
+        use zeroclaw_api::permission::{ConsumeOutcome, RouteId};
+
         let workspace = tempfile::TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
@@ -1694,7 +4194,16 @@ mod tests {
             ..SecurityPolicy::default()
         });
 
-        let tool = ShellTool::new(security.clone(), test_runtime());
+        let stable_environment = SAFE_SHELL_ENV_VARS
+            .iter()
+            .filter_map(|name| {
+                std::env::var(name)
+                    .ok()
+                    .map(|value| ((*name).to_string(), value))
+            })
+            .collect();
+        let tool =
+            ShellTool::new(security.clone(), test_runtime()).with_tui_env(Some(stable_environment));
         let denied = tool
             .execute(json!({"command": medium_risk_write_command()}))
             .await
@@ -1705,13 +4214,41 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap_or("")
-                .contains("explicit approval")
+                .contains("operator approval")
+        );
+
+        let profile = zeroclaw_config::schema::RiskProfileConfig::default();
+        let manager = crate::approval::ApprovalManager::from_risk_profile(&profile);
+        manager.set_policy_context(Arc::clone(&security), tool.runtime.shell_dialect());
+        manager.set_shell_execution_context(tool.execution_facts_resolver());
+        let facts = manager
+            .shell_fingerprint_facts(medium_risk_write_command())
+            .unwrap();
+        assert_eq!(
+            facts,
+            manager
+                .shell_fingerprint_facts(medium_risk_write_command())
+                .unwrap(),
+            "approval facts must be stable before minting"
+        );
+        let confirmation = manager.mint_confirmation(&facts, RouteId::cli(), 60);
+        let authorization_args = json!({
+            "command": medium_risk_write_command(),
+            "__zeroclaw_confirmation_id": confirmation.confirmation_id.to_string(),
+        });
+        let (outcome, fingerprint, expires_at) =
+            manager.authorize_shell_execution(&authorization_args);
+        assert_eq!(
+            outcome,
+            crate::approval::ShellAuthorizationOutcome::Confirmation(ConsumeOutcome::Consumed)
         );
 
         let allowed = tool
             .execute(json!({
                 "command": medium_risk_write_command(),
-                "approved": true
+                "__zeroclaw_confirmation_consumed": true,
+                "__zeroclaw_confirmation_fingerprint": fingerprint.unwrap().as_hex(),
+                "__zeroclaw_confirmation_expires_at": expires_at.unwrap(),
             }))
             .await
             .expect("approved command execution should succeed");

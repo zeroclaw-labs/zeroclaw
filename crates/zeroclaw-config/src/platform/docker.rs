@@ -1,8 +1,9 @@
 use crate::schema::DockerRuntimeConfig;
 use anyhow::{Context, Result};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use zeroclaw_api::runtime_traits::{RuntimeAdapter, ShellDialect};
+use std::process::Command;
+use zeroclaw_api::runtime_traits::{RuntimeAdapter, ShellDialect, ShellExecutionDomain};
 
 /// Canonicalization failures that the runtime layer can present through
 /// localized tool diagnostics without parsing an English error chain.
@@ -87,8 +88,9 @@ impl DockerRuntime {
         command: &str,
         workspace_dir: &Path,
         env_keys: &[&OsStr],
+        program: &Path,
     ) -> anyhow::Result<tokio::process::Command> {
-        let mut process = tokio::process::Command::new("docker");
+        let mut process = tokio::process::Command::new(program);
         process
             .arg("run")
             .arg("--rm")
@@ -140,6 +142,41 @@ impl DockerRuntime {
 
         Ok(process)
     }
+
+    fn pinned_image_id(&self, launcher: &Path) -> Result<String> {
+        let output = Command::new(launcher)
+            .arg("image")
+            .arg("inspect")
+            .arg("--format={{.Id}}")
+            .arg(self.config.image.trim())
+            .output()
+            .with_context(|| {
+                format!(
+                    "Failed to inspect Docker runtime image with {}",
+                    launcher.display()
+                )
+            })?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "Docker runtime image inspection failed with status {}",
+                output.status
+            );
+        }
+        parse_docker_image_id(&output.stdout)
+    }
+}
+
+fn parse_docker_image_id(stdout: &[u8]) -> Result<String> {
+    let image_id = std::str::from_utf8(stdout)
+        .context("Docker runtime image ID was not valid UTF-8")?
+        .trim();
+    let digest = image_id
+        .strip_prefix("sha256:")
+        .context("Docker runtime image inspection returned a non-content-addressed ID")?;
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("Docker runtime image inspection returned an invalid image ID");
+    }
+    Ok(format!("sha256:{}", digest.to_ascii_lowercase()))
 }
 
 fn docker_env_key(key: &OsStr) -> Result<&str> {
@@ -183,12 +220,52 @@ impl RuntimeAdapter for DockerRuntime {
         ShellDialect::Posix
     }
 
+    fn shell_execution_domain(&self) -> ShellExecutionDomain {
+        ShellExecutionDomain::Isolated {
+            name: "docker-runtime",
+            mutable_mount: self.config.mount_workspace,
+        }
+    }
+
     fn build_shell_command(
         &self,
         command: &str,
         workspace_dir: &Path,
     ) -> anyhow::Result<tokio::process::Command> {
-        self.build_shell_command_inner(command, workspace_dir, &[])
+        self.build_shell_command_inner(command, workspace_dir, &[], Path::new("docker"))
+    }
+
+    fn build_shell_command_with_program(
+        &self,
+        command: &str,
+        workspace_dir: &Path,
+        program: &Path,
+    ) -> anyhow::Result<tokio::process::Command> {
+        self.build_shell_command_inner(command, workspace_dir, &[], program)
+    }
+
+    fn pin_shell_command(
+        &self,
+        command: &mut Command,
+        resolved_launcher: &Path,
+        _workspace_dir: &Path,
+    ) -> anyhow::Result<()> {
+        let image_id = self.pinned_image_id(resolved_launcher)?;
+        let mut args: Vec<_> = command.get_args().map(OsStr::to_os_string).collect();
+        let image_index = args
+            .len()
+            .checked_sub(4)
+            .context("Docker runtime launch omitted its image argument")?;
+        if args.get(image_index).map(OsString::as_os_str)
+            != Some(OsStr::new(self.config.image.trim()))
+        {
+            anyhow::bail!("Docker runtime launch image did not match its canonical configuration");
+        }
+        args[image_index] = image_id.into();
+        let mut pinned = Command::new(resolved_launcher);
+        pinned.args(args);
+        *command = pinned;
+        Ok(())
     }
 
     fn build_shell_command_with_env_keys(
@@ -197,13 +274,54 @@ impl RuntimeAdapter for DockerRuntime {
         workspace_dir: &Path,
         env_keys: &[&OsStr],
     ) -> anyhow::Result<tokio::process::Command> {
-        self.build_shell_command_inner(command, workspace_dir, env_keys)
+        self.build_shell_command_inner(command, workspace_dir, env_keys, Path::new("docker"))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn docker_image_id_parser_requires_a_content_address() {
+        let uppercase = format!("sha256:{}\n", "A".repeat(64));
+        assert_eq!(
+            parse_docker_image_id(uppercase.as_bytes()).unwrap(),
+            format!("sha256:{}", "a".repeat(64))
+        );
+        assert!(parse_docker_image_id(b"alpine:latest\n").is_err());
+        assert!(parse_docker_image_id(b"sha256:1234\n").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn docker_runtime_pins_the_launch_to_the_inspected_image_id() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let launcher = temp.path().join("docker");
+        std::fs::write(
+            &launcher,
+            format!("#!/bin/sh\nprintf 'sha256:{}\\n'\n", "b".repeat(64)),
+        )
+        .unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let runtime = DockerRuntime::new(DockerRuntimeConfig::default());
+        let mut command = runtime
+            .build_shell_command("echo ok", temp.path())
+            .unwrap()
+            .into_std();
+        runtime
+            .pin_shell_command(&mut command, &launcher, temp.path())
+            .unwrap();
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            args.get(args.len() - 4),
+            Some(&OsStr::new(&format!("sha256:{}", "b".repeat(64))))
+        );
+        assert_eq!(command.get_program(), launcher.as_os_str());
+    }
 
     #[test]
     fn docker_runtime_name() {

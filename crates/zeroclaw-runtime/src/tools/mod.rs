@@ -567,6 +567,10 @@ pub struct AllToolsResult {
     pub reaction_handle: PerToolChannelHandle,
     pub poll_handle: Option<PerToolChannelHandle>,
     pub escalate_handle: Option<PerToolChannelHandle>,
+    /// On-demand shell-v1 execution facts backed by the exact runtime and
+    /// sandbox objects used by the registered shell tool.
+    #[doc(hidden)]
+    pub shell_execution: Option<Arc<shell::ShellExecutionFactsResolver>>,
     /// Pre-boxed Arcs of every tool (before policy filter). Used by
     /// skill-scoped builtin elevation to resolve targets at registration.
     pub unfiltered_tool_arcs: Vec<Arc<dyn Tool>>,
@@ -603,6 +607,7 @@ impl AllToolsResult {
             reaction_handle: Arc::new(RwLock::new(HashMap::new())),
             poll_handle: None,
             escalate_handle: None,
+            shell_execution: None,
             unfiltered_tool_arcs: Vec::new(),
             #[cfg(test)]
             delegate_tool: None,
@@ -1091,18 +1096,17 @@ fn all_tools_with_runtime_on_thread(
     // of each taking a full `Config` clone: registry construction (per agent
     // build and per channel-message turn) previously paid three deep copies.
     let root_config_shared = Arc::new(root_config.clone());
+    let shell_tool = shell_tool
+        .with_timeout_secs(if security.shell_timeout_secs > 0 {
+            security.shell_timeout_secs
+        } else {
+            root_config.shell_tool.timeout_secs
+        })
+        .with_tui_env(tui_env)
+        .with_persistent_writes(persistent_writes);
+    let shell_execution = shell_tool.execution_facts_resolver();
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(RateLimitedTool::new(
-            shell_tool
-                .with_timeout_secs(if security.shell_timeout_secs > 0 {
-                    security.shell_timeout_secs
-                } else {
-                    root_config.shell_tool.timeout_secs
-                })
-                .with_tui_env(tui_env)
-                .with_persistent_writes(persistent_writes),
-            security.clone(),
-        )),
+        Arc::new(RateLimitedTool::new(shell_tool, security.clone())),
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
                 FileReadTool::new_with_persistence(security.clone(), persistent_writes),
@@ -2026,6 +2030,7 @@ fn all_tools_with_runtime_on_thread(
                     reaction_handle,
                     poll_handle: Some(poll_handle),
                     escalate_handle,
+                    shell_execution: Some(Arc::clone(&shell_execution)),
                 };
             }
 
@@ -2253,6 +2258,7 @@ fn all_tools_with_runtime_on_thread(
         reaction_handle,
         poll_handle: Some(poll_handle),
         escalate_handle,
+        shell_execution: Some(shell_execution),
         #[cfg(test)]
         delegate_tool: built_delegate_tool,
     }

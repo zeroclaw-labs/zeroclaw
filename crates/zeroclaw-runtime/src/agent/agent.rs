@@ -2188,6 +2188,7 @@ impl Agent {
             live_config.clone(),
             acp_sessions,
         )?;
+        let shell_execution = all_tools_result.shell_execution.clone();
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter
         // arcs internally. Bundle-aware via `[agents.<alias>].skill_bundles`.
@@ -2206,7 +2207,7 @@ impl Agent {
                 security: &security,
                 built: all_tools_result,
                 skills: &skills,
-                runtime,
+                runtime: Arc::clone(&runtime),
                 caller_allowed: None,
                 connect_mcp: initialize_mcp,
                 connect_peripherals: false,
@@ -2300,6 +2301,12 @@ impl Agent {
         } else {
             ApprovalManager::for_non_interactive(risk_profile)
         };
+        // RFC 7155: the gate resolves the actual shell command, which
+        // needs the policy and the runtime's dialect.
+        approval_manager.set_policy_context(Arc::clone(&security), runtime.shell_dialect());
+        if let Some(resolver) = shell_execution {
+            approval_manager.set_shell_execution_context(resolver);
+        }
 
         // Daemon-backed agents resolve limits from a generation CELL rather than
         // directly from `live_config`. Callers with an acknowledged model

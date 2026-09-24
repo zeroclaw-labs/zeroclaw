@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use serde_json::json;
@@ -51,6 +51,22 @@ impl Drop for EnvGuard {
     }
 }
 
+struct CwdGuard(PathBuf);
+
+impl CwdGuard {
+    fn set(path: &Path) -> Self {
+        let previous = std::env::current_dir().expect("read test working directory");
+        std::env::set_current_dir(path).expect("set fake Docker working directory");
+        Self(previous)
+    }
+}
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        std::env::set_current_dir(&self.0).expect("restore test working directory");
+    }
+}
+
 async fn env_lock() -> MutexGuard<'static, ()> {
     ENV_LOCK.get_or_init(|| Mutex::new(())).lock().await
 }
@@ -58,11 +74,13 @@ async fn env_lock() -> MutexGuard<'static, ()> {
 fn write_fake_docker(bin_dir: &Path) {
     std::fs::create_dir_all(bin_dir).expect("create fake Docker bin directory");
     let docker = bin_dir.join("docker");
+    std::fs::copy("/bin/sh", &docker).expect("copy fake Docker launcher");
+    let command_dir = bin_dir.parent().expect("fake Docker command directory");
     std::fs::write(
-        &docker,
-        "#!/bin/sh\nfor arg in \"$@\"; do\n  printf '%s\\n' \"$arg\"\ndone\n",
+        command_dir.join("run"),
+        "printf 'run\\n'\nfor arg in \"$@\"; do\n  printf '%s\\n' \"$arg\"\ndone\n",
     )
-    .expect("write fake Docker executable");
+    .expect("write fake Docker run command");
     let mut permissions = std::fs::metadata(&docker)
         .expect("read fake Docker metadata")
         .permissions();
@@ -76,6 +94,7 @@ async fn config_loaded_docker_runtime_executes_one_docker_run_through_shell_tool
     let install = TempDir::new().expect("create isolated install");
     let bin_dir = install.path().join("bin");
     write_fake_docker(&bin_dir);
+    let _cwd = CwdGuard::set(install.path());
 
     std::fs::write(
         install.path().join("config.toml"),
@@ -160,7 +179,10 @@ sandbox_backend = "docker"
         !args.contains(&"alpine:latest"),
         "Docker sandbox image shadowed runtime config: {args:?}"
     );
-    assert!(args.contains(&"library/alpine:3.23"), "{args:?}");
+    assert!(
+        args.contains(&"library/alpine:3.23"),
+        "static policy Allow must preserve Docker's pull-on-run behavior: {args:?}"
+    );
     assert!(args.contains(&"bridge"), "{args:?}");
     assert!(args.contains(&"--read-only"), "{args:?}");
     assert!(args.contains(&"echo issue-9231"), "{args:?}");

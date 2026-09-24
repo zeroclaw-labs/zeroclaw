@@ -111,12 +111,7 @@ impl Tool for CronRunTool {
         json!({
             "type": "object",
             "properties": {
-                "job_id": { "type": "string" },
-                "approved": {
-                    "type": "boolean",
-                    "description": "Set true to explicitly approve medium/high-risk shell commands in supervised mode",
-                    "default": false
-                }
+                "job_id": { "type": "string" }
             },
             "required": ["job_id"]
         })
@@ -307,6 +302,26 @@ mod tests {
         Arc::new(
             SecurityPolicy::for_agent(cfg, TEST_AGENT).expect("test-agent has resolvable profiles"),
         )
+    }
+
+    #[test]
+    fn schema_does_not_advertise_self_approval() {
+        // `approved` is runtime plumbing injected by the approval gate,
+        // never a model-facing parameter (RFC 7155).
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        seed_test_agent(&mut config);
+        let cfg = Arc::new(config);
+        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+        assert!(
+            tool.parameters_schema()["properties"]
+                .get("approved")
+                .is_none()
+        );
     }
 
     struct BlockingRuntime {
@@ -647,7 +662,7 @@ mod tests {
         std::fs::create_dir_all(&config.data_dir).unwrap();
         seed_test_agent(&mut config);
         let cfg = Arc::new(config);
-        // Create with explicit approval so the job persists for the run test.
+        // Create with operator approval so the job persists for the run test.
         let job = cron::add_shell_job_with_approval(
             &cfg,
             TEST_AGENT,
@@ -670,7 +685,7 @@ mod tests {
             denied
                 .error
                 .unwrap_or_default()
-                .contains("explicit approval")
+                .contains("operator approval")
         );
     }
 

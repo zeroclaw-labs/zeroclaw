@@ -204,12 +204,26 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 #[cfg(target_os = "windows")]
 const WINDOWS_COMMAND_INTERPRETER: &str = "cmd.exe";
 #[cfg(target_os = "windows")]
+const WINDOWS_COMMAND_DISABLE_AUTORUN_ARG: &str = "/D";
+#[cfg(target_os = "windows")]
 const WINDOWS_COMMAND_EXECUTE_ARG: &str = "/C";
 
 #[cfg(target_os = "windows")]
 pub fn windows_tokio_cmd_shell_command(command: &str) -> tokio::process::Command {
-    let mut process = tokio::process::Command::new(WINDOWS_COMMAND_INTERPRETER);
+    windows_tokio_cmd_shell_command_with_interpreter(
+        Path::new(WINDOWS_COMMAND_INTERPRETER),
+        command,
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn windows_tokio_cmd_shell_command_with_interpreter(
+    interpreter: &Path,
+    command: &str,
+) -> tokio::process::Command {
+    let mut process = tokio::process::Command::new(interpreter);
     process
+        .raw_arg(WINDOWS_COMMAND_DISABLE_AUTORUN_ARG)
         .raw_arg(WINDOWS_COMMAND_EXECUTE_ARG)
         .raw_arg(windows_cmd_shell_raw_arg(command))
         .creation_flags(CREATE_NO_WINDOW);
@@ -268,6 +282,7 @@ pub fn windows_std_cmd_shell_command(command: &str) -> std::process::Command {
 
     let mut process = std::process::Command::new(WINDOWS_COMMAND_INTERPRETER);
     process
+        .raw_arg(WINDOWS_COMMAND_DISABLE_AUTORUN_ARG)
         .raw_arg(WINDOWS_COMMAND_EXECUTE_ARG)
         .raw_arg(windows_cmd_shell_raw_arg(command))
         .creation_flags(CREATE_NO_WINDOW);
@@ -422,6 +437,32 @@ impl RuntimeAdapter for NativeRuntime {
             process.current_dir(workspace_dir);
             Ok(process)
         }
+    }
+
+    fn build_shell_command_with_program(
+        &self,
+        command: &str,
+        workspace_dir: &Path,
+        program: &Path,
+    ) -> anyhow::Result<tokio::process::Command> {
+        #[cfg(not(target_os = "windows"))]
+        let mut process = if self.shell_dialect() == ShellDialect::PowerShell {
+            tokio_powershell_command(&program.to_string_lossy(), command)
+        } else {
+            let mut process = tokio::process::Command::new(program);
+            process.arg("-c").arg(command);
+            process
+        };
+
+        #[cfg(target_os = "windows")]
+        let mut process = if self.shell_dialect() == ShellDialect::PowerShell {
+            windows_tokio_powershell_command(&program.to_string_lossy(), command)
+        } else {
+            windows_tokio_cmd_shell_command_with_interpreter(program, command)
+        };
+
+        process.current_dir(workspace_dir);
+        Ok(process)
     }
 }
 

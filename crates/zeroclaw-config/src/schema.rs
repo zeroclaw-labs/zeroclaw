@@ -14243,6 +14243,16 @@ pub struct RiskProfileConfig {
     /// `<server>__<tool>` MCP names that would otherwise be auto-admitted
     /// by the `allowed_tools` MCP exception described above.
     pub excluded_tools: Vec<String>,
+    /// Command/tool-level fine-grained permission rules (RFC 7155
+    /// `tool_policy`). Empty = only the legacy-compiled rules adjudicate —
+    /// the default, with behavior identical to a profile without the
+    /// section. See [`crate::tool_policy::ToolPolicyConfig`].
+    #[serde(
+        default,
+        skip_serializing_if = "crate::tool_policy::ToolPolicyConfig::is_empty"
+    )]
+    #[nested]
+    pub tool_policy: crate::tool_policy::ToolPolicyConfig,
     // ── Sandbox (from security.sandbox) ─────────────────────────────
     /// Whether the sandbox is enabled for this profile. `None` inherits global.
     pub sandbox_enabled: Option<bool>,
@@ -14275,6 +14285,7 @@ impl Default for RiskProfileConfig {
             allowed_tools: Vec::new(),
             deny_all_tools: false,
             excluded_tools: Vec::new(),
+            tool_policy: crate::tool_policy::ToolPolicyConfig::default(),
             sandbox_enabled: None,
             sandbox_backend: None,
             firejail_args: Vec::new(),
@@ -22582,6 +22593,11 @@ impl Config {
         // covers the same path.
         self.collect_context_compression_ignored_warnings(&mut warnings);
         self.collect_verifiable_intent_warnings(&mut warnings);
+        for (alias, profile) in &self.risk_profiles {
+            warnings.extend(crate::tool_policy::collect_shadowing_warnings(
+                alias, profile,
+            ));
+        }
         warnings.extend(validate_memory_semantics(&self.memory));
         for (alias, wa) in &self.channels.whatsapp {
             warnings.extend(validate_whatsapp_semantics(alias, wa));
@@ -23830,6 +23846,11 @@ impl Config {
                 anyhow::bail!(
                     "risk_profiles.{profile_alias}.deny_all_tools cannot be combined with a non-empty allowed_tools list: deny_all_tools denies every tool, while allowed_tools = [] alone means unrestricted"
                 );
+            }
+            if let Err(error) =
+                crate::tool_policy::validate_tool_policy(profile_alias, &profile.tool_policy)
+            {
+                anyhow::bail!("{error}");
             }
         }
 

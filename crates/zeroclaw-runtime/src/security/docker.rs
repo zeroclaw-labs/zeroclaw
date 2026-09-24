@@ -1,7 +1,8 @@
 //! Docker sandbox (container isolation)
 
-use crate::security::traits::Sandbox;
-use std::path::PathBuf;
+use crate::security::traits::{Sandbox, SandboxShellProgram};
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Docker sandbox backend
@@ -83,17 +84,22 @@ impl DockerSandbox {
             .map(|o| o.status.success())
             .unwrap_or(false)
     }
-}
 
-impl Sandbox for DockerSandbox {
-    fn wrap_command(&self, cmd: &mut Command) -> std::io::Result<()> {
-        let program = cmd.get_program().to_string_lossy().to_string();
+    fn wrap_command_with_inner_program(
+        &self,
+        cmd: &mut Command,
+        inner_program: &std::ffi::OsStr,
+    ) -> std::io::Result<()> {
+        let program = inner_program.to_string_lossy().to_string();
         let args: Vec<String> = cmd
             .get_args()
             .map(|s| s.to_string_lossy().to_string())
             .collect();
-
-        let mut docker_cmd = Command::new("docker");
+        let launcher = which::which("docker")
+            .ok()
+            .and_then(|path| path.canonicalize().ok())
+            .unwrap_or_else(|| "docker".into());
+        let mut docker_cmd = Command::new(launcher);
         docker_cmd.args([
             "run",
             "--rm",
@@ -104,7 +110,6 @@ impl Sandbox for DockerSandbox {
             "--network",
             "none",
         ]);
-
         if let Some(workspace) = &self.workspace_dir {
             let workspace_str = workspace.to_string_lossy();
             docker_cmd.arg("-v");
@@ -112,17 +117,102 @@ impl Sandbox for DockerSandbox {
             docker_cmd.arg("--workdir");
             docker_cmd.arg(workspace_str.as_ref());
         }
-
         docker_cmd.arg(&self.image);
         docker_cmd.arg(&program);
         docker_cmd.args(&args);
-
         *cmd = docker_cmd;
         Ok(())
     }
 
+    fn pinned_image_id(&self, launcher: &Path) -> std::io::Result<String> {
+        let output = Command::new(launcher)
+            .arg("image")
+            .arg("inspect")
+            .arg("--format={{.Id}}")
+            .arg(&self.image)
+            .output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "Docker sandbox image inspection failed with status {}",
+                output.status
+            )));
+        }
+        parse_docker_image_id(&output.stdout)
+    }
+}
+
+fn parse_docker_image_id(stdout: &[u8]) -> std::io::Result<String> {
+    let image_id = std::str::from_utf8(stdout)
+        .map_err(|_| std::io::Error::other("Docker sandbox image ID was not valid UTF-8"))?
+        .trim();
+    let digest = image_id.strip_prefix("sha256:").ok_or_else(|| {
+        std::io::Error::other("Docker sandbox image inspection returned a non-content-addressed ID")
+    })?;
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(std::io::Error::other(
+            "Docker sandbox image inspection returned an invalid image ID",
+        ));
+    }
+    Ok(format!("sha256:{}", digest.to_ascii_lowercase()))
+}
+
+impl Sandbox for DockerSandbox {
+    fn wrap_command(&self, cmd: &mut Command) -> std::io::Result<()> {
+        let program = cmd.get_program().to_os_string();
+        self.wrap_command_with_inner_program(cmd, &program)
+    }
+
+    fn wrap_shell_command(
+        &self,
+        cmd: &mut Command,
+        original_program: &std::ffi::OsStr,
+    ) -> std::io::Result<SandboxShellProgram> {
+        self.wrap_command_with_inner_program(cmd, original_program)?;
+        Ok(SandboxShellProgram::Isolated {
+            program: original_program.to_os_string(),
+            mutable_mount: self.workspace_dir.is_some(),
+        })
+    }
+
     fn is_available(&self) -> bool {
         Self::is_installed()
+    }
+
+    fn execution_fingerprint_material(
+        &self,
+        _launch_program: &std::path::Path,
+    ) -> std::io::Result<Vec<u8>> {
+        let mut material =
+            format!("sandbox-policy-v1:docker:image={}:workspace=", self.image).into_bytes();
+        if let Some(workspace) = &self.workspace_dir {
+            append_path_material(&mut material, workspace);
+        } else {
+            material.extend_from_slice(b"none");
+        }
+        Ok(material)
+    }
+
+    fn pin_shell_command(
+        &self,
+        command: &mut Command,
+        resolved_launcher: &Path,
+    ) -> std::io::Result<()> {
+        let image_id = self.pinned_image_id(resolved_launcher)?;
+        let mut args: Vec<OsString> = command.get_args().map(OsStr::to_os_string).collect();
+        let image_index = if self.workspace_dir.is_some() { 12 } else { 8 };
+        let image = args.get_mut(image_index).ok_or_else(|| {
+            std::io::Error::other("Docker sandbox launch omitted its image argument")
+        })?;
+        if image != OsStr::new(&self.image) {
+            return Err(std::io::Error::other(
+                "Docker sandbox launch image did not match its canonical configuration",
+            ));
+        }
+        *image = image_id.into();
+        let mut pinned = Command::new(resolved_launcher);
+        pinned.args(args);
+        *command = pinned;
+        Ok(())
     }
 
     fn name(&self) -> &str {
@@ -140,9 +230,66 @@ impl Sandbox for DockerSandbox {
     }
 }
 
+fn append_path_material(material: &mut Vec<u8>, path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        material.extend_from_slice(path.as_os_str().as_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        for unit in path.as_os_str().encode_wide() {
+            material.extend_from_slice(&unit.to_be_bytes());
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    material.extend_from_slice(path.to_string_lossy().as_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn docker_sandbox_image_id_parser_requires_a_content_address() {
+        let uppercase = format!("sha256:{}\n", "C".repeat(64));
+        assert_eq!(
+            parse_docker_image_id(uppercase.as_bytes()).unwrap(),
+            format!("sha256:{}", "c".repeat(64))
+        );
+        assert!(parse_docker_image_id(b"ubuntu:latest\n").is_err());
+        assert!(parse_docker_image_id(b"sha256:abcd\n").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn docker_sandbox_pins_the_launch_to_the_inspected_image_id() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let launcher = temp.path().join("docker");
+        std::fs::write(
+            &launcher,
+            format!("#!/bin/sh\nprintf 'sha256:{}\\n'\n", "d".repeat(64)),
+        )
+        .unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let sandbox = DockerSandbox::default();
+        let mut command = Command::new("sh");
+        command.args(["-c", "echo ok"]);
+        sandbox
+            .wrap_shell_command(&mut command, OsStr::new("sh"))
+            .unwrap();
+        sandbox.pin_shell_command(&mut command, &launcher).unwrap();
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            args.get(8),
+            Some(&OsStr::new(&format!("sha256:{}", "d".repeat(64))))
+        );
+        assert_eq!(command.get_program(), launcher.as_os_str());
+    }
 
     #[test]
     fn docker_sandbox_name() {
@@ -182,8 +329,11 @@ mod tests {
         sandbox.wrap_command(&mut cmd).unwrap();
 
         assert_eq!(
-            cmd.get_program().to_string_lossy(),
-            "docker",
+            std::path::Path::new(cmd.get_program()).file_name(),
+            Some(std::ffi::OsStr::new(&format!(
+                "docker{}",
+                std::env::consts::EXE_SUFFIX
+            ))),
             "wrapped command should use docker as program"
         );
 
@@ -267,6 +417,28 @@ mod tests {
             args.contains(&"ubuntu:22.04".to_string()),
             "must use the custom image"
         );
+    }
+
+    #[test]
+    fn docker_shell_wrap_preserves_container_program_spelling() {
+        let sandbox = DockerSandbox::default();
+        let mut cmd = Command::new("/host/usr/bin/dash");
+        cmd.args(["-c", "echo hello"]);
+
+        sandbox
+            .wrap_shell_command(&mut cmd, std::ffi::OsStr::new("sh"))
+            .unwrap();
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let image_index = args
+            .iter()
+            .position(|arg| arg == "alpine:latest")
+            .expect("docker image argument");
+        assert_eq!(args.get(image_index + 1).map(String::as_str), Some("sh"));
+        assert!(!args.iter().any(|arg| arg == "/host/usr/bin/dash"));
     }
 
     #[test]

@@ -2208,6 +2208,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         activated_tools,
                         excluded_tools,
                         model_switch_callback: model_switch_callback.as_ref(),
+                        approval,
                     };
                     execute_tools_parallel(
                         &executable_calls,
@@ -2226,6 +2227,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         activated_tools,
                         excluded_tools,
                         model_switch_callback: model_switch_callback.as_ref(),
+                        approval,
                     };
                     execute_tools_sequential(
                         &executable_calls,
@@ -2731,9 +2733,11 @@ pub(crate) async fn assemble_owned_execution(
         sop_audit,
         None,
     )?;
+    let shell_execution = built.shell_execution.clone();
     let skills = crate::skills::load_skills_for_agent_from_config(config, alias);
     // Capture before `runtime` is moved into `ScopedAssembly` below.
     let shell_profile = runtime.shell_profile();
+    let shell_dialect = runtime.shell_dialect();
     // The same gated seam run(), process_message, and independent delegation use:
     // step 2 filters with THIS agent's SecurityPolicy, `connect_mcp` grants only
     // this agent's MCP bundles, and its skills register as tools. Peripherals stay
@@ -2794,6 +2798,10 @@ pub(crate) async fn assemble_owned_execution(
         Some(parent) => parent.derive_for_risk_profile(&risk_profile),
         None => crate::approval::ApprovalManager::for_non_interactive(&risk_profile),
     };
+    approval.set_policy_context(Arc::clone(&security), shell_dialect);
+    if let Some(resolver) = shell_execution {
+        approval.set_shell_execution_context(resolver);
+    }
 
     Ok(OwnedAgentExecution {
         model_provider,
@@ -5450,6 +5458,18 @@ mod sop_step_reassembly_tests {
             owned.approval.approval_requirement("shell"),
             crate::approval::ApprovalRequirement::Prompt,
             "a live approval back-channel must survive delegation"
+        );
+        assert_eq!(
+            owned
+                .approval
+                .policy()
+                .map(|policy| policy.workspace_dir.clone()),
+            Some(config.agent_workspace_dir("restricted")),
+            "the child manager must use the target agent's policy context"
+        );
+        assert!(
+            owned.approval.shell_fingerprint_facts("echo ok").is_ok(),
+            "the child manager must use its registered ShellTool resolver"
         );
         // The plain non-interactive parent keeps the auto-deny shape.
         let plain_parent = crate::approval::ApprovalManager::for_non_interactive(
