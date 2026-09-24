@@ -75,6 +75,9 @@ export class HttpError extends Error {
  * the behaviour that depends on the code.
  */
 export type ConfigApiCode = components["schemas"]["ConfigApiCode"];
+export type PluginCatalogEntry = components["schemas"]["PluginCatalogEntry"];
+export type PluginCatalogIssue = components["schemas"]["PluginCatalogIssue"];
+export type PluginsResponse = components["schemas"]["PluginsResponse"];
 export const ConfigApiCodes = {
   configChangedExternally: "config_changed_externally",
 } as const satisfies Record<string, ConfigApiCode>;
@@ -2035,6 +2038,11 @@ export function getIntegrations(): Promise<Integration[]> {
     const result = unwrapField(data, "integrations");
     return Array.isArray(result) ? result : [];
   });
+}
+
+/** Read-only plugin packages from installed and cached-registry sources. */
+export function getPlugins(): Promise<PluginsResponse> {
+  return apiFetch<PluginsResponse>("/api/plugins");
 }
 
 // ---------------------------------------------------------------------------
