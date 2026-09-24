@@ -31,7 +31,16 @@ set -euo pipefail
 # hardcoded here, so they cannot drift from the manifests.
 # tests/architecture/publish_contract.rs asserts the same invariants in CI.
 
-REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+# The release helpers live beside this script. The tree being packaged is
+# normally the checkout this script came from, but release recovery runs the
+# current tooling against an older tagged tree: a publisher bug found after the
+# tag was cut can then be fixed on master without moving the tag.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="${PUBLISH_SOURCE_ROOT:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
+if [[ ! -f "$REPO_ROOT/Cargo.toml" ]]; then
+  echo "error: $REPO_ROOT has no Cargo.toml; set PUBLISH_SOURCE_ROOT to the release tree." >&2
+  exit 1
+fi
 cd "$REPO_ROOT"
 
 EXECUTE=0
@@ -80,7 +89,7 @@ if [[ -n "$EXPECTED_VERSION" && "$VERSION" != "$EXPECTED_VERSION" ]]; then
 fi
 
 # The root package intentionally includes the generated, gitignored web/dist
-# tree. Both workflow jobs build it immediately before invoking this script,
+# tree. The preflight job builds it and the publish job restores that build,
 # so Cargo needs --allow-dirty to package those files. Keep that exception
 # narrow: tracked changes or ordinary untracked files mean the checkout is not
 # the immutable release source and must fail before any registry operation.
@@ -103,13 +112,31 @@ if [[ ! -s web/dist/index.html ]]; then
   exit 1
 fi
 
+# The workflow builds the dashboard once, in preflight, and hands that tree to
+# the publish job as an artifact. WEB_DIST_DIGEST is the digest preflight
+# recorded; recomputing it here proves the tarball about to be packaged carries
+# the bundle that was verified, not a rebuild or a partial download.
+if [[ -n "${WEB_DIST_DIGEST:-}" ]]; then
+  if ! actual_web_digest="$(bash "$SCRIPT_DIR/web_dist_digest.sh" web/dist)"; then
+    echo "error: could not compute the web/dist digest; refusing to publish." >&2
+    exit 1
+  fi
+  if [[ "$actual_web_digest" != "$WEB_DIST_DIGEST" ]]; then
+    echo "error: web/dist does not match the bundle preflight verified." >&2
+    echo "       expected: $WEB_DIST_DIGEST" >&2
+    echo "       actual:   $actual_web_digest" >&2
+    exit 1
+  fi
+  echo "web/dist matches the verified bundle ($actual_web_digest)."
+fi
+
 META="$(cargo metadata --format-version 1 --no-deps)"
 
 # Resolve the entire graph before registry queries, even during a tokenless dry
 # run or a resume. Versioned dev-dependencies survive Cargo packaging and must
 # already exist when their consumer uploads. Stream metadata: the full workspace
 # exceeds the platform limit for a single argv entry.
-ORDER="$(python3 "$REPO_ROOT/scripts/release/publish_order.py" "$VERSION" <<<"$META")" || {
+ORDER="$(python3 "$SCRIPT_DIR/publish_order.py" "$VERSION" <<<"$META")" || {
   echo "error: could not compute publish order." >&2
   exit 1
 }

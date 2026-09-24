@@ -401,7 +401,7 @@ fn publish_order_is_streamed_and_exercised_by_preflight() {
     );
 
     let order = script
-        .find("ORDER=\"$(python3 \"$REPO_ROOT/scripts/release/publish_order.py\" \"$VERSION\" <<<\"$META\"")
+        .find("ORDER=\"$(python3 \"$SCRIPT_DIR/publish_order.py\" \"$VERSION\" <<<\"$META\"")
         .expect("publisher streams metadata into its order helper");
     let dry_run = script
         .find("if [[ $EXECUTE -eq 0 ]]")
