@@ -155,16 +155,125 @@ struct CronChannelRegistryLease {
 
 impl Drop for CronChannelRegistryLease {
     fn drop(&mut self) {
-        let mut current = CRON_CHANNEL_REGISTRY
-            .write()
+        // Withdrawing the generation and taking it back from the sessions it
+        // reached happen under one lock, the same one an installation holds
+        // while it decides whether its chosen generation is still live. That
+        // is what makes a concurrent registration safe in either order rather
+        // than in one particular order: it either completes before this runs,
+        // and the sweep below reaches what it installed, or it finds the
+        // registry no longer naming its generation and installs nothing live.
+        let mut seeded = SEEDED_TOOL_HANDLES
+            .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if current
-            .as_ref()
-            .is_some_and(|registry| Arc::ptr_eq(registry, &self.published))
         {
-            *current = Some(Arc::new(HashMap::new()));
+            let mut current = CRON_CHANNEL_REGISTRY
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            if current
+                .as_ref()
+                .is_some_and(|registry| Arc::ptr_eq(registry, &self.published))
+            {
+                *current = Some(Arc::new(HashMap::new()));
+            }
+        }
+        retire_seeded_channels(&mut seeded, &self.published);
+    }
+}
+
+/// Tool channel maps this process has seeded with live channel instances.
+///
+/// A dashboard session is handed its own map and keeps it for as long as the
+/// connection is open, so the entries have to be taken back where they were
+/// put. Weak, because a session that has ended is nothing to retire.
+static SEEDED_TOOL_HANDLES: std::sync::Mutex<Vec<SeededToolHandle>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// A [`tools::PerToolChannelHandle`] this process seeded, held weakly.
+type SeededToolHandle = std::sync::Weak<RwLock<HashMap<String, Arc<dyn Channel>>>>;
+
+/// What a registration chose, before it installs anything.
+///
+/// Selection and installation are two steps with a gap between them, and a
+/// reload can retire the chosen generation inside that gap. Keeping the
+/// generation here is what lets the install refuse it: an `Arc` of a retired
+/// registry is still perfectly usable, which is the whole danger.
+struct SelectedChannels {
+    built: HashMap<String, Arc<dyn Channel>>,
+    generation: Option<CronChannelRegistry>,
+}
+
+/// Choose the instances a registration will install: what this surface built
+/// from config, plus the running generation to prefer over it.
+fn select_channels_for_tools(built: HashMap<String, Arc<dyn Channel>>) -> SelectedChannels {
+    SelectedChannels {
+        built,
+        generation: live_channel_registry(),
+    }
+}
+
+/// Copy the selection into each tool handle, remembering the handles so the
+/// instances can be withdrawn when the generation they came from retires.
+///
+/// The generation is re-checked here, under the same lock the retirement sweep
+/// takes, and dropped if it is no longer the published one. Without that a
+/// registration that chose a live instance and then lost the race would
+/// install an authenticated channel that nothing will ever take back, because
+/// the sweep for that generation has already run.
+fn install_selected_channels(
+    selected: SelectedChannels,
+    handles: &[&tools::PerToolChannelHandle],
+) -> HashMap<String, Arc<dyn Channel>> {
+    let mut seeded = SEEDED_TOOL_HANDLES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let generation = selected.generation.filter(|generation| {
+        CRON_CHANNEL_REGISTRY
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, generation))
+    });
+    let map = prefer_live_channels(selected.built, generation.as_ref());
+    seeded.retain(|handle| handle.strong_count() > 0);
+    for handle in handles {
+        let mut entries = handle.write();
+        for (key, channel) in &map {
+            entries.insert(key.clone(), Arc::clone(channel));
+        }
+        drop(entries);
+        if !seeded
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .any(|known| Arc::ptr_eq(&known, handle))
+        {
+            seeded.push(Arc::downgrade(handle));
         }
     }
+    map
+}
+
+/// Take back every copy of a retired generation's channel instances.
+///
+/// The running instances are shared, not cloned, so a session seeded while the
+/// channel task was up holds the same authenticated object. Ending that task
+/// clears the registry, which stops new lookups, but says nothing about the
+/// copies already handed out: an open dashboard connection could still send
+/// through an alias the operator had disabled and reloaded away. The entries
+/// are removed by identity, so whatever a session built for itself - its
+/// approval channel, for one - is left alone.
+fn retire_seeded_channels(seeded: &mut Vec<SeededToolHandle>, retired: &CronChannelRegistry) {
+    if retired.is_empty() {
+        return;
+    }
+    seeded.retain(|handle| {
+        let Some(handle) = handle.upgrade() else {
+            return false;
+        };
+        handle
+            .write()
+            .retain(|_, channel| !retired.values().any(|live| Arc::ptr_eq(live, channel)));
+        true
+    });
 }
 
 /// Observer wrapper that forwards tool-call events to a channel sender
@@ -12995,11 +13104,14 @@ pub(crate) fn wecom_ws_external_peers(config: &Config, alias: &str) -> Vec<Strin
 ///
 /// Note the deliberate asymmetry with `collect_configured_channels`: plugin
 /// channels are constructed asynchronously, so the synchronous
-/// `build_channel_map` and `register_channels_for_tools` surfaces cannot see
-/// them. Nostr already has this shape. The consequence is that channel-addressed
-/// *tools* cannot target a plugin channel yet; inbound and outbound delivery
-/// through the supervised listener are unaffected. Closing that gap means making
-/// those two surfaces async, which is deliberately not part of this change.
+/// `build_channel_map` and `register_channels_for_tools` surfaces cannot
+/// *build* them. Nostr already has this shape. They reach channel-addressed
+/// tools anyway, because those surfaces take the running instances from
+/// `CRON_CHANNEL_REGISTRY`, where the supervised listener publishes them under
+/// the same `plugin.<alias>` key: a live-only key is kept rather than dropped
+/// for exactly this reason. So the gap is narrower than "async or nothing" -
+/// what is left is a session seeded before the listener publishes, which sees
+/// the plugin channel only after the next registration.
 fn append_configured_plugin_channels(
     configured: &mut Vec<ConfiguredChannel>,
     plugin_channels: Vec<Arc<dyn Channel>>,
@@ -13234,7 +13346,52 @@ pub fn build_channel_map(
 ) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
     let config_arc = Arc::new(RwLock::new(config.clone()));
     let configured = collect_configured_channels(&config_arc, "", &[], None, None);
-    configured_channel_map(&configured)
+    prefer_live_channels(
+        configured_channel_map(&configured),
+        live_channel_registry().as_ref(),
+    )
+}
+
+/// Replace freshly built channels with the running instances, and add the ones
+/// this surface cannot construct at all.
+///
+/// A channel built from config here has never been through `listen()`. For a
+/// stateless channel that is invisible: it sends over HTTP with the configured
+/// token. For a session-bound one it is fatal - `WhatsAppWebChannel` only holds
+/// its client after pairing, so a fresh instance reports "not connected" while
+/// the real channel is serving traffic. The running task publishes its
+/// instances in [`CRON_CHANNEL_REGISTRY`], so prefer those, exactly as
+/// `deliver_announcement` already does.
+///
+/// Live-only keys are kept as well: plugin channels are constructed
+/// asynchronously and so never appear in the synchronous map, which is why
+/// channel-addressed tools could not target them.
+fn prefer_live_channels(
+    mut built: HashMap<String, Arc<dyn Channel>>,
+    live: Option<&CronChannelRegistry>,
+) -> HashMap<String, Arc<dyn Channel>> {
+    if let Some(live) = live {
+        for (key, channel) in live.iter() {
+            // A live entry replaces what this surface built for the same key,
+            // but only a plugin channel may add a key of its own: those are
+            // the ones config cannot build. Anything else the caller did not
+            // just build is a retired generation - a disabled alias whose task
+            // has not finished tearing down - and must not come back to life
+            // for a dashboard session that outlived it.
+            if built.contains_key(key) || key.starts_with("plugin.") {
+                built.insert(key.clone(), Arc::clone(channel));
+            }
+        }
+    }
+    built
+}
+
+/// The instances the running channel task published, if one is running.
+fn live_channel_registry() -> Option<CronChannelRegistry> {
+    CRON_CHANNEL_REGISTRY
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 pub fn register_channels_for_tools(
@@ -13256,12 +13413,9 @@ pub fn register_channels_for_tools(
         escalate_handle.as_ref(),
     ];
 
-    let map = configured_channel_map(&configured);
-    for (key, channel) in &map {
-        for handle in handles.iter().flatten() {
-            handle.write().insert(key.clone(), Arc::clone(channel));
-        }
-    }
+    let handles: Vec<&tools::PerToolChannelHandle> = handles.into_iter().flatten().collect();
+    let selected = select_channels_for_tools(configured_channel_map(&configured));
+    let map = install_selected_channels(selected, &handles);
     let mut names: Vec<String> = map.keys().cloned().collect();
     names.sort();
     names
@@ -20054,6 +20208,99 @@ temperature = 0.3
         );
     }
 
+    #[test]
+    fn prefer_live_channels_swaps_in_the_running_instance() {
+        // The built instance has never been through `listen()`; the running
+        // one holds the session. Same key, so the running one has to win.
+        let built_whatsapp = mock_channel("whatsapp");
+        let live_whatsapp = mock_channel("whatsapp");
+        let built = HashMap::from([(
+            "whatsapp.ventas".to_string(),
+            Arc::clone(&built_whatsapp) as Arc<dyn Channel>,
+        )]);
+        let live: CronChannelRegistry = Arc::new(HashMap::from([(
+            "whatsapp.ventas".to_string(),
+            Arc::clone(&live_whatsapp) as Arc<dyn Channel>,
+        )]));
+
+        let merged = prefer_live_channels(built, Some(&live));
+
+        assert!(Arc::ptr_eq(
+            merged.get("whatsapp.ventas").unwrap(),
+            &(Arc::clone(&live_whatsapp) as Arc<dyn Channel>)
+        ));
+    }
+
+    #[test]
+    fn prefer_live_channels_does_not_resurrect_a_retired_alias() {
+        // A dashboard session seeded after an alias was disabled must not get
+        // that alias back from a registry generation still tearing down.
+        let retired = mock_channel("telegram");
+        let built = HashMap::new();
+        let live: CronChannelRegistry = Arc::new(HashMap::from([(
+            "telegram.retired".to_string(),
+            Arc::clone(&retired) as Arc<dyn Channel>,
+        )]));
+
+        let merged = prefer_live_channels(built, Some(&live));
+
+        assert!(
+            merged.is_empty(),
+            "a key config no longer builds stays gone"
+        );
+    }
+
+    #[test]
+    fn prefer_live_channels_keeps_channels_only_one_side_knows() {
+        // Plugin channels are built asynchronously, so they exist only in the
+        // live registry; a configured channel that is not running exists only
+        // in the built map. Both stay reachable.
+        let built_only = mock_channel("telegram");
+        let live_only = mock_channel("plugin");
+        let built = HashMap::from([(
+            "telegram.work".to_string(),
+            Arc::clone(&built_only) as Arc<dyn Channel>,
+        )]);
+        let live: CronChannelRegistry = Arc::new(HashMap::from([(
+            "plugin.acme".to_string(),
+            Arc::clone(&live_only) as Arc<dyn Channel>,
+        )]));
+
+        let merged = prefer_live_channels(built, Some(&live));
+
+        assert_eq!(merged.len(), 2);
+        assert!(Arc::ptr_eq(
+            merged.get("telegram.work").unwrap(),
+            &(Arc::clone(&built_only) as Arc<dyn Channel>)
+        ));
+        assert!(Arc::ptr_eq(
+            merged.get("plugin.acme").unwrap(),
+            &(Arc::clone(&live_only) as Arc<dyn Channel>)
+        ));
+    }
+
+    #[test]
+    fn prefer_live_channels_without_a_running_task_returns_what_was_built() {
+        let built_only = mock_channel("telegram");
+        let built = HashMap::from([(
+            "telegram.work".to_string(),
+            Arc::clone(&built_only) as Arc<dyn Channel>,
+        )]);
+
+        let merged = prefer_live_channels(built, None);
+
+        assert_eq!(merged.len(), 1);
+        assert!(Arc::ptr_eq(
+            merged.get("telegram.work").unwrap(),
+            &(Arc::clone(&built_only) as Arc<dyn Channel>)
+        ));
+    }
+
+    /// The registry and the seeded-handle list are process-wide, so the tests
+    /// that publish a generation have to take turns. Without this they pass
+    /// alone and fail together, which is the worst way to learn it.
+    static REGISTRY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     struct CronChannelRegistryRestore(Option<CronChannelRegistry>);
 
     impl Drop for CronChannelRegistryRestore {
@@ -20064,8 +20311,132 @@ temperature = 0.3
         }
     }
 
+    /// The interleaving the retirement sweep alone cannot cover: a session is
+    /// seeded while the channel is up, but its registration is paused between
+    /// choosing the live instances and installing them, and the alias is
+    /// disabled and reloaded in that gap. Nothing sweeps that copy afterwards,
+    /// because the sweep for its generation has already run, so the install
+    /// itself has to refuse it.
+    #[test]
+    fn a_registration_that_lost_the_race_installs_nothing_live() {
+        let _serialized = REGISTRY_TEST_LOCK.blocking_lock();
+        let previous = CRON_CHANNEL_REGISTRY
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let _restore = CronChannelRegistryRestore(previous);
+
+        let running = mock_channel("whatsapp");
+        let (_published, lease) = publish_cron_channel_registry(&[ConfiguredChannel {
+            display_name: "WhatsApp",
+            alias: Some("ventas".to_string()),
+            channel: Arc::clone(&running),
+        }]);
+
+        // The registration reaches the point of having chosen its instances.
+        let built = configured_channel_map(&[ConfiguredChannel {
+            display_name: "WhatsApp",
+            alias: Some("ventas".to_string()),
+            channel: mock_channel("whatsapp"),
+        }]);
+        let selected = select_channels_for_tools(built);
+        assert!(
+            selected
+                .generation
+                .as_ref()
+                .is_some_and(|generation| generation.contains_key("whatsapp.ventas")),
+            "the registration did choose the running instance"
+        );
+
+        // The alias is disabled and the daemon reloads, all of it, while the
+        // registration is between its two steps.
+        drop(lease);
+
+        // Only now does the registration install what it chose.
+        let session: tools::PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
+        let map = install_selected_channels(selected, &[&session]);
+
+        for entry in [
+            map.get("whatsapp.ventas"),
+            session.read().get("whatsapp.ventas"),
+        ] {
+            assert!(
+                !entry.is_some_and(|channel| Arc::ptr_eq(
+                    channel,
+                    &(Arc::clone(&running) as Arc<dyn Channel>)
+                )),
+                "a retired generation must not be installed by a registration that \
+                 chose it before the reload"
+            );
+        }
+    }
+
+    /// The lifecycle this guards: a dashboard connection is opened while the
+    /// channel is running and is seeded with the authenticated instance, then
+    /// the operator disables that alias and reloads. The connection outlives
+    /// the channel task, and the copy it holds is the same object the task
+    /// was serving traffic with, so clearing the registry does not revoke it.
+    #[test]
+    fn a_retired_generation_is_taken_back_from_the_sessions_it_seeded() {
+        let _serialized = REGISTRY_TEST_LOCK.blocking_lock();
+        let previous = CRON_CHANNEL_REGISTRY
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let _restore = CronChannelRegistryRestore(previous);
+
+        let running = mock_channel("whatsapp");
+        let (_published, lease) = publish_cron_channel_registry(&[ConfiguredChannel {
+            display_name: "WhatsApp",
+            alias: Some("ventas".to_string()),
+            channel: Arc::clone(&running),
+        }]);
+
+        // What the dashboard session gets: its own map, seeded from the map
+        // the tool registration builds while the channel is up.
+        let session: tools::PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
+        let own = mock_channel("ws");
+        session
+            .write()
+            .insert("ws".to_string(), Arc::clone(&own) as Arc<dyn Channel>);
+        let built = configured_channel_map(&[ConfiguredChannel {
+            display_name: "WhatsApp",
+            alias: Some("ventas".to_string()),
+            // Config builds a fresh instance; it has never been paired.
+            channel: mock_channel("whatsapp"),
+        }]);
+        install_selected_channels(select_channels_for_tools(built), &[&session]);
+        assert!(
+            Arc::ptr_eq(
+                session.read().get("whatsapp.ventas").expect("seeded"),
+                &(Arc::clone(&running) as Arc<dyn Channel>)
+            ),
+            "the session is seeded with the running instance"
+        );
+
+        // The alias is disabled and the daemon reloads: the channel task ends.
+        drop(lease);
+
+        assert!(
+            session.read().get("whatsapp.ventas").is_none(),
+            "a session that outlived the channel task cannot send through it"
+        );
+        assert!(
+            session.read().get("whatsapp").is_none(),
+            "nor through the bare-type key the same instance was reachable by"
+        );
+        assert!(
+            session
+                .read()
+                .get("ws")
+                .is_some_and(|channel| Arc::ptr_eq(channel, &(own as Arc<dyn Channel>))),
+            "what the session built for itself is untouched"
+        );
+    }
+
     #[tokio::test]
     async fn ending_channel_task_clears_stale_delivery_handles() {
+        let _serialized = REGISTRY_TEST_LOCK.lock().await;
         let previous = CRON_CHANNEL_REGISTRY
             .read()
             .unwrap_or_else(|e| e.into_inner())
