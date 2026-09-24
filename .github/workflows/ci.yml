@@ -68,6 +68,27 @@ env:
 # and is not an exposure.
 
 jobs:
+  # ── Master-push debounce ─────────────────────────────────────────────────
+  # Master pushes arrive in bursts (median gap ~10 min, many under 5), and the
+  # run-level `cancel-in-progress` cancels each superseded push only after its
+  # compile fleet has started: over one week, 33+ master runs were cancelled
+  # mid-compile. On push events the compile-heavy jobs wait here first, so a
+  # push that is superseded within the window is cancelled while this job is
+  # sleeping, before any compile begins. On pull_request and merge_group this
+  # job is skipped: a skipped job resolves without a runner, so PR and queue
+  # latency are unchanged. Gated jobs use
+  # `!cancelled() && needs.master-debounce.result != 'failure'` so a skip lets
+  # them run; `gate` needs this job so a debounce failure cannot turn skipped
+  # compile jobs into a green gate.
+  master-debounce:
+    name: Debounce master push
+    if: github.event_name == 'push'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - name: Wait for a newer push to supersede this run
+        run: sleep 300
+
   # ── Required formatting check ────────────────────────────────────────────
   # Ordering note: neither GitHub-hosted nor compile jobs wait on `fmt`.
   # Path-detector and other job dependencies still apply. Compile jobs pin
@@ -253,6 +274,8 @@ jobs:
 
   lint:
     name: Lint
+    needs: [master-debounce]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     # Measured green run on b86b1737: rustdoc step 2m22s, total Lint 10m40s
     # (under the prior 15m ceiling). Keep 15 unless a cold-cache run proves more.
@@ -299,6 +322,8 @@ jobs:
 
   windows-clippy-tools-changes:
     name: Detect Windows Clippy changes
+    needs: [master-debounce]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     # Ordering note: this detector only runs `git diff` and never compiles, so it
     # does not wait on `fmt`. Waiting would serialise its own multi-minute
     # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
@@ -342,7 +367,7 @@ jobs:
   windows-clippy-tools:
     name: Clippy (x86_64-pc-windows-msvc, targeted)
     needs: [windows-clippy-tools-changes]
-    if: needs.windows-clippy-tools-changes.outputs.run == 'true'
+    if: ${{ !cancelled() && needs.windows-clippy-tools-changes.result == 'success' && needs.windows-clippy-tools-changes.outputs.run == 'true' }}
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -376,7 +401,8 @@ jobs:
   build:
     name: ${{ matrix.label }} ${{ matrix.target }}
     # All build legs wait for this detector; only the Windows recovery step is filtered.
-    needs: [path-changes]
+    needs: [path-changes, master-debounce]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' && needs.path-changes.result == 'success' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     strategy:
@@ -478,6 +504,8 @@ jobs:
 
   check:
     name: Check (${{ matrix.name }})
+    needs: [master-debounce]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 20
     env:
@@ -520,6 +548,8 @@ jobs:
 
   check-plugin-backends:
     name: Check (${{ matrix.name }})
+    needs: [master-debounce]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 20
     strategy:
@@ -609,6 +639,9 @@ jobs:
   msrv:
     name: MSRV (declared floor)
     needs: [installer-drift]
+    # Explicit status check: an implicit success() would be skipped on PRs,
+    # because the skipped push-only master-debounce is a transitive ancestor.
+    if: ${{ !cancelled() && needs.installer-drift.result == 'success' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 20
     steps:
@@ -650,6 +683,8 @@ jobs:
 
   check-32bit:
     name: Check (32-bit)
+    needs: [master-debounce]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
@@ -673,13 +708,14 @@ jobs:
 
   bench:
     name: Benchmarks Compile
+    needs: [master-debounce]
     # Bitrot guard only: compiles `agent_benchmarks` under `agent-runtime`
     # without running it. Zero failures across 22 red runs and no bench-fix
     # commit in 6 months, and its narrow form was introduced by #8896 as a
     # measurement slice for #7108 rather than as coverage. Master, merge-queue
     # and manual runs still execute it, so benches cannot rot undetected before
     # a release; only the per-PR 570s is dropped. Revert by deleting this `if`.
-    if: github.event_name != 'pull_request'
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' && github.event_name != 'pull_request' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
@@ -734,6 +770,8 @@ jobs:
 
   test:
     name: Test
+    needs: [master-debounce]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
@@ -774,6 +812,8 @@ jobs:
   # In particular, Lark runs without defaults and QQ excludes live-auth tests.
   test-channel-features:
     name: Test (channel ${{ matrix.name }})
+    needs: [master-debounce]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 30
     strategy:
@@ -815,6 +855,8 @@ jobs:
 
   memory-postgres-test:
     name: Test (PostgreSQL Memory)
+    needs: [master-debounce]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 20
     services:
@@ -862,6 +904,8 @@ jobs:
 
   parallel-runtime-test-changes:
     name: Detect parallel runtime test changes
+    needs: [master-debounce]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     # Ordering note: this detector only runs `git diff` and never compiles, so it
     # does not wait on `fmt`. Waiting would serialise its own multi-minute
     # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
@@ -909,7 +953,7 @@ jobs:
   parallel-runtime-test:
     name: Parallel Runtime Test
     needs: [parallel-runtime-test-changes]
-    if: needs.parallel-runtime-test-changes.outputs.run == 'true'
+    if: ${{ !cancelled() && needs.parallel-runtime-test-changes.result == 'success' && needs.parallel-runtime-test-changes.outputs.run == 'true' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
@@ -937,6 +981,8 @@ jobs:
 
   test-landlock:
     name: Test (Landlock)
+    needs: [master-debounce]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -1170,6 +1216,8 @@ jobs:
   # Guards generated installation surfaces against canonical-spec drift from PR #7558; see the bespoke gate registry in README.md.
   installer-drift:
     name: Installer Drift
+    needs: [master-debounce]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 15
     outputs:
@@ -1242,7 +1290,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, msrv, check-32bit, bench, test, test-channel-features, memory-postgres-test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
+    needs: [master-debounce, fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, msrv, check-32bit, bench, test, test-channel-features, memory-postgres-test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Check results

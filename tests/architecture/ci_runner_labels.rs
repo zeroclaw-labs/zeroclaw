@@ -32,8 +32,9 @@ const HOUSEKEEPING_LABEL: &str = "blacksmith-4vcpu-ubuntu-2404";
 
 /// Every housekeeping job in the two workflows on the Blacksmith 4-vCPU class.
 /// Workflow-qualified IDs keep same-named jobs in different workflows distinct.
-const HOUSEKEEPING_JOBS: [&str; 16] = [
+const HOUSEKEEPING_JOBS: [&str; 17] = [
     "ci.yml/fmt",
+    "ci.yml/master-debounce",
     "ci.yml/gate",
     "ci.yml/history-guard",
     "ci.yml/repo-structure",
@@ -283,4 +284,87 @@ fn the_required_gate_still_waits_for_formatting() {
         "CI Required Gate must keep needing fmt: it is the only thing that still \
          makes a formatting error block merge"
     );
+}
+
+/// The job-level `if:` expression of a job, empty when it declares none.
+fn job_if(block: &str) -> String {
+    block
+        .lines()
+        .find(|line| line.starts_with("    if: "))
+        .map(|line| line.trim_start().trim_start_matches("if: ").to_string())
+        .unwrap_or_default()
+}
+
+/// Master pushes wait in `master-debounce` so a superseded push is cancelled
+/// before its compile fleet starts. That job is skipped on pull_request and
+/// merge_group, and GitHub's implicit `success()` propagates a skipped
+/// ancestor transitively, so any job downstream of it that lacks an explicit
+/// status function would silently skip on every PR while `CI Required Gate`
+/// still reported green. This guard keeps every downstream job explicit.
+#[test]
+fn jobs_downstream_of_the_master_debounce_never_skip_silently() {
+    let workflow = ci_workflow();
+    let blocks = job_blocks(&workflow);
+
+    let debounce = blocks
+        .get("master-debounce")
+        .expect("ci.yml must define the master-debounce job");
+    assert_eq!(
+        job_if(debounce),
+        "github.event_name == 'push'",
+        "master-debounce must run only on master pushes, never on PRs or the merge queue"
+    );
+
+    let gate = blocks.get("gate").expect("ci.yml must define the gate job");
+    assert!(
+        needs(gate)
+            .iter()
+            .any(|dependency| dependency == "master-debounce"),
+        "CI Required Gate must need master-debounce, so a debounce failure cannot \
+         leave skipped compile jobs behind a green gate"
+    );
+
+    let mut downstream: BTreeSet<String> = BTreeSet::from(["master-debounce".to_string()]);
+    loop {
+        let before = downstream.len();
+        for (name, block) in &blocks {
+            if needs(block)
+                .iter()
+                .any(|dependency| downstream.contains(dependency))
+            {
+                downstream.insert(name.clone());
+            }
+        }
+        if downstream.len() == before {
+            break;
+        }
+    }
+    downstream.remove("master-debounce");
+    downstream.remove("gate");
+    assert!(
+        downstream.len() > 10,
+        "the compile fleet must wait on master-debounce; found only {downstream:?}"
+    );
+
+    for name in &downstream {
+        let block = &blocks[name];
+        let condition = job_if(block);
+        assert!(
+            condition.contains("!cancelled()"),
+            "{name} is downstream of the push-only master-debounce and must use an \
+             explicit `!cancelled()` condition; an implicit success() skips it on PRs"
+        );
+        for dependency in needs(block) {
+            let expected = if dependency == "master-debounce" {
+                "needs.master-debounce.result != 'failure'".to_string()
+            } else {
+                format!("needs.{dependency}.result == 'success'")
+            };
+            assert!(
+                condition.contains(&expected),
+                "{name} must check `{expected}` so replacing implicit success() does not \
+                 let it run after a failed dependency"
+            );
+        }
+    }
 }
