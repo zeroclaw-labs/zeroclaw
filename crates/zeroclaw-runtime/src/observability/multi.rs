@@ -1,13 +1,18 @@
 use super::traits::{Observer, ObserverEvent, ObserverMetric};
 use std::any::Any;
+use std::sync::Arc;
 
 /// Combine multiple observers — fan-out events to all backends
 pub struct MultiObserver {
-    observers: Vec<Box<dyn Observer>>,
+    observers: Vec<Arc<dyn Observer>>,
 }
 
 impl MultiObserver {
     pub fn new(observers: Vec<Box<dyn Observer>>) -> Self {
+        Self::from_shared(observers.into_iter().map(Arc::from).collect())
+    }
+
+    pub(crate) fn from_shared(observers: Vec<Arc<dyn Observer>>) -> Self {
         Self { observers }
     }
 }

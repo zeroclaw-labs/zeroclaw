@@ -121,6 +121,14 @@ Approval is a pre-execution control. It is not a receipt, and it is not proof
 that a tool ran. Audit entries record the decision and the deciding channel or
 backchannel.
 
+The observer boundary also emits `AuthorizationRequested` immediately before
+the operator path and `AuthorizationResponded` when it resolves. Those events
+carry only tool name, allow/deny outcome, channel, agent alias, and turn
+correlation. They deliberately exclude the approval prompt, tool arguments,
+replacement content, and result. A configured lifecycle command maps the first
+event to `blocked` and the response back to `working`; delivery failure never
+changes the approval decision or cancels the turn.
+
 Prompt-required shell calls have an extra loop guard: if the agent repeats the
 same prompt-required shell call before approval, the loop aborts instead of
 prompting over and over.
@@ -170,6 +178,8 @@ After execution:
 - terminal observer `ToolCall` events add duration, success flag, and scrubbed
   result while repeating the correlation fields needed by span-oriented
   backends;
+- the external lifecycle projection, when configured, retains only the bounded
+  tool name and success bit from those richer observer events;
 - progress streams show start/completion lines with scrubbed failure text;
 - `after_tool_call` hooks run for executed calls;
 - results are bounded by `max_tool_result_chars` before they are appended to
