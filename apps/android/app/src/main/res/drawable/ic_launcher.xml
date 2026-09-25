@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="@color/cellclaw_overlay_surface"
+        android:pathData="M54,6 A48,48 0,1 1,53.99 6" />
+    <path
+        android:fillColor="@color/cellclaw_overlay_accent"
+        android:pathData="M54,14 A40,40 0,1 1,53.99 14" />
+    <path
+        android:fillColor="@color/cellclaw_overlay_text_primary"
+        android:pathData="M30,29 L78,29 L78,39 L46,69 L78,69 L78,79 L30,79 L30,69 L62,39 L30,39 Z" />
+</vector>

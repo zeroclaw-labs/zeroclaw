@@ -49,6 +49,9 @@ ZeroClaw v0.8.5 is a security, connectivity, and operator-experience release spa
 - Default skills to compact prompt injection, retain the v0.8.x compatibility path for full injection, and reduce skill hashing to observable bytes (#8313, #9913, #9837).
 - Report the active native shell dialect, support PowerShell on Windows, and preserve coding-CLI environments across platform adapters (#9981, #9182, #10403).
 - Warn about dangling channel references, expose workspace paths to config tooling, retain detailed tool output alongside short errors, and make config/provider path handling fallible and safer around bare paths (#9311, #9616, #10132, #10364, #10498).
+- Add an opt-in Android-native tool family (`android_screenshot`, `android_ui_read`, `android_action`, `android_dialog`, `android_launch`, `android_device`) and an experimental standalone APK under `apps/android/`. The bundled agent reaches the in-app Accessibility and device bridge over a private Unix-domain socket. The family is off by default, requires `[android] enabled = true` plus a runtime Android check, revalidates the foreground package before mutation, and keeps privileged system-dialog confirmation separate from ordinary autonomous UI control.
+- Isolate headerless gateway `/webhook` calls in fresh session scopes so one-shot clients cannot recall unrelated conversation memory; callers that want continuity opt in with `X-Session-Id`.
+- Serialize tool-call batches containing `android_*` operations so taps, typing, screenshots, and app launches preserve model-emitted order even under full autonomy.
 
 ### Security and Supply Chain
 

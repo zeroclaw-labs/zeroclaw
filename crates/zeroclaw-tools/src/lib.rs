@@ -7,6 +7,10 @@ pub mod microsoft365;
 pub mod util_helpers;
 
 pub mod a2a_client;
+/// Android-native tools. Production builds include them only on Android;
+/// Unix-hosted crate tests retain the module for protocol coverage.
+#[cfg(any(target_os = "android", all(test, unix)))]
+pub mod android;
 pub mod ask_user;
 pub mod backup_tool;
 pub mod browser;
