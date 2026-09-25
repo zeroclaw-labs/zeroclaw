@@ -97,7 +97,7 @@ class PreflightTest(unittest.TestCase):
         output = io.StringIO()
         # Clear inherited credentials and all other Apple/Tauri configuration.
         with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(output), \
-                contextlib.redirect_stderr(output), mock.patch.object(self.helper.time, "sleep") as sleep:
+                contextlib.redirect_stderr(output), mock.patch.object(self.helper, "_sleep") as sleep:
             code = self.helper.main()
         log = output.getvalue()
         for value in values.values():

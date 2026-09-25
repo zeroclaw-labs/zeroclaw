@@ -16,6 +16,13 @@ import subprocess
 import time
 
 
+# Backoff sleep, reached through this module attribute rather than
+# `time.sleep` directly. The test patches it to assert the retry policy, and
+# patching the process-global `time.sleep` would also intercept the sleeps
+# `subprocess` takes in its own wait loop, which is a flaky assertion.
+_sleep = time.sleep
+
+
 SIGNING = ("APPLE_CERTIFICATE", "APPLE_CERTIFICATE_PASSWORD", "APPLE_SIGNING_IDENTITY")
 NOTARY = ("APPLE_ID", "APPLE_PASSWORD", "APPLE_TEAM_ID")
 
@@ -58,7 +65,7 @@ def authenticate(credentials):
             return False
         delay = 5 * (attempt + 1)
         print(f"Apple notarization preflight: {reason}; retrying in {delay}s ({attempt + 2}/3).")
-        time.sleep(delay)
+        _sleep(delay)
     return False
 
 
