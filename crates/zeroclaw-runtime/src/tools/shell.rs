@@ -1,7 +1,7 @@
 use crate::platform::RuntimeAdapter;
 use crate::security::SecurityPolicy;
 use crate::security::traits::Sandbox;
-use crate::tools::shell_env::SAFE_SHELL_ENV_VARS;
+use crate::tools::shell_env::{ForwardedEnvironment, SAFE_SHELL_ENV_VARS};
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -68,7 +68,7 @@ pub struct ShellTool {
     /// vars are overlaid on top of the safe-env snapshot, letting the user's
     /// real shell environment (PATH, credentials, etc.) reach subprocesses
     /// even though the daemon itself may have a stripped-down env.
-    tui_env: Option<HashMap<String, String>>,
+    tui_env: Option<ForwardedEnvironment>,
     persistent_writes: bool,
 }
 
@@ -116,6 +116,11 @@ impl ShellTool {
     /// Pass `Some(env)` to enable forwarding; `None` is a no-op (same as not
     /// calling this method at all).
     pub fn with_tui_env(mut self, env: Option<HashMap<String, String>>) -> Self {
+        self.tui_env = env.map(Arc::new);
+        self
+    }
+
+    pub(crate) fn with_shared_tui_env(mut self, env: Option<ForwardedEnvironment>) -> Self {
         self.tui_env = env;
         self
     }
@@ -297,7 +302,7 @@ impl Tool for ShellTool {
         // conflict — the user's real PATH etc. should take precedence over
         // whatever the daemon process inherited.
         if let Some(ref tui_env) = self.tui_env {
-            for (k, v) in tui_env {
+            for (k, v) in tui_env.iter() {
                 cmd.env(k, v);
             }
         }

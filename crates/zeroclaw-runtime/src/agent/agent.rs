@@ -350,6 +350,9 @@ async fn forward_history_trim_notice(
 
 pub struct Agent {
     model_provider: Box<dyn ModelProvider>,
+    /// Shared with the shell tool and RPC session admission; this is the
+    /// immutable execution environment, not a cached authorization decision.
+    forwarded_environment: Option<crate::tools::ForwardedEnvironment>,
     /// Sealed per-agent tool set. Stored as a [`crate::tools::scoped::ScopedToolRegistry`]
     /// so it can only be handed to the turn engine after passing through
     /// `assemble()` (the seal).
@@ -1083,6 +1086,7 @@ impl AgentBuilder {
                 anyhow::Error::msg("model_provider is required")
             })?,
             tools,
+            forwarded_environment: None,
             memory: memory.clone(),
             observer: self.observer.ok_or_else(|| {
                 ::zeroclaw_log::record!(
@@ -2316,6 +2320,7 @@ impl Agent {
 
         let acp_sessions =
             acp_session_store.map(|store| tools::AcpSessionReadView::new(store, agent_alias));
+        let tui_env = tui_env.map(Arc::new);
         let all_tools_result = tools::all_tools_with_runtime_and_acp_sessions(
             Arc::new(config.clone()),
             &security,
@@ -2334,7 +2339,7 @@ impl Agent {
             config,
             canvas_store,
             false,
-            tui_env,
+            tui_env.clone(),
             sop_engine,
             sop_audit,
             // Daemon-backed constructors supply the shared handle; tools that
@@ -2604,6 +2609,7 @@ impl Agent {
         }
         let mut agent = builder.build()?;
 
+        agent.forwarded_environment = tui_env;
         agent.tool_search = tool_search_handle;
 
         // Wire per-tool channel-map handles into the agent so callers (e.g.
@@ -2617,6 +2623,10 @@ impl Agent {
         };
 
         Ok(agent)
+    }
+
+    pub(crate) fn forwarded_environment(&self) -> Option<crate::tools::ForwardedEnvironment> {
+        self.forwarded_environment.clone()
     }
 
     fn trim_history(&mut self, turn_id: Option<&str>) -> Option<HistoryTrimNotice> {
