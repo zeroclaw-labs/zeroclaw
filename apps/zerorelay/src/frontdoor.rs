@@ -964,6 +964,71 @@ mod tests {
         assert_eq!(path, "/enroll");
     }
 
+    /// A prefill link (`/?node=..&code=..`) is served the ordinary page: the
+    /// query is dropped at the request line, so the pairing code is never routed
+    /// on, stored, or reflected into the response. The page reads the values
+    /// client-side and scrubs them from the address bar.
+    #[tokio::test]
+    async fn a_prefill_link_serves_the_page_without_reflecting_the_code() {
+        let cfg = crate::RelayConfig {
+            frontdoor_enabled: true,
+            ..Default::default()
+        };
+        let inner = crate::RelayServer::new(cfg).inner.clone();
+        let secret = "PrefillSecret0123456789";
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let request = format!(
+            "GET /?node=0d3c4f3e8b9a1d2c3b4a5968778695a4&code={secret} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        let session = match accept(server, true).await.expect("accept") {
+            Accepted::Http(s) => s,
+            _ => panic!("expected a frontdoor HTTP session"),
+        };
+        let task = tokio::spawn(async move { serve_session(session, inner).await });
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        task.await.unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        assert!(
+            text.starts_with("HTTP/1.1 200 OK"),
+            "the page must be served: {text}"
+        );
+        assert!(
+            text.contains("ZeroClaw browser enrollment"),
+            "not the enrollment page"
+        );
+        assert!(
+            !text.contains(secret),
+            "the pairing code was reflected into the response"
+        );
+        let head = text
+            .split("\r\n\r\n")
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        assert!(
+            head.contains("cache-control: no-store"),
+            "a prefilled page must not be cached: {head}"
+        );
+        assert!(
+            head.contains("referrer-policy: no-referrer"),
+            "the link must not leak via Referer: {head}"
+        );
+    }
+
+    #[test]
+    fn a_get_with_a_prefill_query_routes_to_the_page_path() {
+        let (method, path) =
+            request_line(b"GET /?node=abc&code=PairingCode123 HTTP/1.1\r\nHost: x\r\n\r\n")
+                .expect("request line");
+        assert_eq!(method, "GET");
+        assert_eq!(
+            path, "/",
+            "the query (and the code in it) must not reach routing"
+        );
+    }
+
     #[test]
     fn content_length_is_read_from_headers_only() {
         // The request line is skipped, so a path that looks like a header cannot

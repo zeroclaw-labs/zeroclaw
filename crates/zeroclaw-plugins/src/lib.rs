@@ -11,6 +11,10 @@ mod component_config;
 mod component_logging;
 #[cfg(feature = "plugins-wasmtime")]
 mod component_secrets;
+#[cfg(feature = "plugins-wasmtime")]
+mod component_state;
+#[cfg(feature = "plugins-wasmtime")]
+mod component_websocket;
 pub mod config;
 pub mod egress;
 pub mod endpoint;
@@ -24,6 +28,9 @@ pub mod runtime;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod services;
 pub mod signature;
+#[cfg(feature = "plugins-wasmtime")]
+pub(crate) mod sockets;
+pub mod validate;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod wasi_http;
 #[cfg(feature = "plugins-wasmtime")]
@@ -138,6 +145,10 @@ pub enum PluginPermission {
     MemoryRead,
     /// Can write agent memory
     MemoryWrite,
+    /// Can read this exact plugin instance's encrypted durable state
+    StateRead,
+    /// Can write this exact plugin instance's encrypted durable state
+    StateWrite,
 }
 
 /// Information about a loaded plugin.

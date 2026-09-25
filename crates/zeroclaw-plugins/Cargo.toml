@@ -24,6 +24,13 @@ plugins-wasmtime = [
   "dep:http-body-util",
   "dep:rustls",
   "dep:tokio-rustls",
+  # The socket adapter's per-connection actor and its buffered stream I/O.
+  "dep:zeroclaw-spawn",
+  "tokio/io-util",
+  # The WebSocket adapter: framing over the host's own pinned, TLS-configured
+  # stream. The crates are already in the workspace graph at these versions.
+  "dep:futures-util",
+  "dep:tokio-tungstenite",
   "dep:webpki-roots",
   # The operator's own trust decision. Provider HTTPS already reads the
   # platform store; plugin egress reading a different set of roots on the same
@@ -66,8 +73,12 @@ hyper = { version = "1", default-features = false, features = ["http1", "client"
 http-body-util = { version = "0.1", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"], optional = true }
+zeroclaw-spawn = { workspace = true, optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["sink"], optional = true }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
 webpki-roots = { version = "1.0.6", optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
+zeroize.workspace = true
 
 [dev-dependencies]
 rcgen = "0.13"

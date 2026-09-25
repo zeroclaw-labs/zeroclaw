@@ -70,10 +70,16 @@
             buildInputs = [ pkgs.stdenv.cc.cc ];
           };
         # >>> end generated:flake-packages <<<
+        webPkgs = pkgs.callPackage ./nix/web.nix { inherit rustToolchain; };
       in {
         packages.zeroclaw = buildZeroclaw { pname = "zeroclaw"; cargoPkg = "zeroclaw"; features = zeroclawDefaultFeatures; };
         packages.zerocode = buildZeroclaw { pname = "zerocode"; cargoPkg = "zerocode"; features = zerocodeDefaultFeatures; };
         packages.default = buildZeroclaw { pname = "zeroclaw"; cargoPkg = "zeroclaw"; features = zeroclawDefaultFeatures; };
+        # Web dashboard bundle (see nix/web.nix). Kept outside the
+        # `generated:flake-packages` block so `cargo generate installers`
+        # does not clobber it.
+        packages.zeroclaw-web = webPkgs.zeroclawWeb;
+        packages.zeroclaw-openapi-spec = webPkgs.openapiSpec;
         checks = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           nixos-module-eval = pkgs.writeText "zeroclaw-nixos-module-eval" (
             builtins.toJSON nixosModuleEvalTests

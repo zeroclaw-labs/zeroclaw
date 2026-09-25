@@ -913,6 +913,7 @@ impl Observer for OtelObserver {
                 "OTel metric flush failed"
             );
         }
+        zeroclaw_log::flush_log_exporter();
     }
 
     fn name(&self) -> &str {

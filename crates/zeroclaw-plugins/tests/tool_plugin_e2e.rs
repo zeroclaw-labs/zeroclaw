@@ -16,7 +16,7 @@ use zeroclaw_plugins::runtime;
 use zeroclaw_plugins::services::PluginHostServices;
 use zeroclaw_plugins::{PluginCapability, PluginManifest, PluginPermission};
 
-use support::admit_fixture;
+use support::{admit_fixture, state_service};
 
 fn fixture() -> PathBuf {
     static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
@@ -64,7 +64,7 @@ fn limits() -> PluginLimits {
     }
 }
 
-async fn execute(binding: &str) -> String {
+async fn execute(binding: &str, grant_state: bool) -> String {
     let manifest = PluginManifest {
         name: "tool-secret-fixture".to_string(),
         version: "0.0.0".to_string(),
@@ -73,7 +73,11 @@ async fn execute(binding: &str) -> String {
         wasm_path: Some("tool-secret-fixture.wasm".to_string()),
         wasm_sha256: None,
         capabilities: vec![PluginCapability::Tool],
-        permissions: vec![PluginPermission::ConfigRead],
+        permissions: vec![
+            PluginPermission::ConfigRead,
+            PluginPermission::StateRead,
+            PluginPermission::StateWrite,
+        ],
         config_schema: Some(serde_json::json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -88,13 +92,14 @@ async fn execute(binding: &str) -> String {
         publisher_key: None,
         egress: Default::default(),
     };
-    let scope = PluginInstanceScope::from_manifest(
-        &manifest,
-        PluginCapability::Tool,
-        binding,
-        [PluginPermission::ConfigRead],
-    )
-    .expect("admit fixture scope");
+    let mut grants = vec![PluginPermission::ConfigRead];
+    if grant_state {
+        grants.extend([PluginPermission::StateRead, PluginPermission::StateWrite]);
+    }
+    let scope =
+        PluginInstanceScope::from_manifest(&manifest, PluginCapability::Tool, binding, grants)
+            .expect("admit fixture scope");
+    let component = admit_fixture(&fixture(), &manifest);
     let configured = HashMap::from([
         ("binding_label".to_string(), binding.to_string()),
         ("api_token".to_string(), format!("token-{binding}")),
@@ -103,8 +108,7 @@ async fn execute(binding: &str) -> String {
     let resolver = PluginConfigResolver::new(move |scope| {
         resolve_plugin_config(&resolver_manifest, scope, Some(&configured))
     });
-    let services = PluginHostServices::new(resolver);
-    let component = admit_fixture(&fixture(), &manifest);
+    let services = PluginHostServices::new(resolver, state_service());
     let mut plugin = runtime::create_plugin(&component, &scope, &services, limits())
         .await
         .expect("instantiate fixture tool");
@@ -120,13 +124,23 @@ async fn execute(binding: &str) -> String {
     .await
     .expect("execute fixture tool");
     assert!(result.success);
+    if grant_state {
+        runtime::call_execute(&mut plugin, br#"{}"#)
+            .await
+            .expect("second execution reuses durable state with CAS");
+    }
     result.output.to_string()
 }
 
 #[tokio::test]
 async fn tool_world_reads_only_schema_designated_secrets() {
-    let (main, backup) = tokio::join!(execute("main"), execute("backup"));
+    let (main, backup) = tokio::join!(execute("main", true), execute("backup", true));
 
     assert_eq!(main, "main");
     assert_eq!(backup, "backup");
+}
+
+#[tokio::test]
+async fn tool_world_denies_state_without_effective_grants() {
+    assert_eq!(execute("state-denied", false).await, "state-denied");
 }

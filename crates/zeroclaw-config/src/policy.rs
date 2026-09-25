@@ -4227,6 +4227,30 @@ impl SecurityPolicy {
             .next()
     }
 
+    /// Canonicalize a caller-supplied path into the same filesystem namespace
+    /// the policy prefixes live in, exactly as the internal readability and
+    /// allowlist checks do before they compare.
+    ///
+    /// Every accessor that takes a `resolved` path — `is_resolved_path_readable`,
+    /// `is_resolved_path_allowed`, `approved_read_root`, `approved_read_roots`,
+    /// `approved_write_roots` — assumes its input is already canonical. Callers
+    /// that authorize a request and then bind the granted operation to a root
+    /// MUST resolve the request once through this accessor and carry the
+    /// returned target into both the check and the operation. Feeding the raw
+    /// request spelling to `approved_read_root` while checking readability on a
+    /// separately resolved target lets an alias that resolves inside an
+    /// entitled root pass readability yet fall out of every configured root
+    /// (returning `None`/`Unconfined`), after which the operation would touch
+    /// the still-swappable raw path outside the boundary. Returns `None` when
+    /// the path cannot be resolved (a symlink cycle, or a target whose parents
+    /// do not exist); the caller MUST fail closed.
+    pub fn resolve_policy_target(&self, path: &Path) -> Option<PathBuf> {
+        if cfg!(windows) && is_null_device(path) {
+            return Some(path.to_path_buf());
+        }
+        resolve_symlinked_path(path)
+    }
+
     /// Return every canonical bounded root that authorizes writing `resolved`.
     ///
     /// This intentionally excludes `allowed_roots_read_only`; callers use it

@@ -446,6 +446,71 @@ pub(crate) const APP_JS: &str = r##"(function () {
       submitting = false;
     }
   });
+
+  // ---- 8< ---- zeroclaw-enroll-prefill ---- 8< ----
+  // A link such as /?node=<id>&code=<pairing code> (or the same pair in the
+  // #fragment, which never leaves the browser) fills the two fields so a phone
+  // user does not have to type a long node id. It only fills them: nothing is
+  // fetched and nothing is submitted - the user still presses "Fetch the agent
+  // CA" and confirms the short authentication string. Values are checked
+  // against the same shapes the relay and daemon accept; anything else is
+  // ignored. The parameters are then removed from the address bar and the
+  // current history entry, so a copied URL or a later bookmark does not carry
+  // the code. The browser may still keep the originally opened link in its own
+  // history store, which no page can rewrite; the code is one-time and
+  // short-lived, so that copy is spent or expired. The pairing code is never
+  // echoed into a status line, an error, or any log output.
+  const NODE_ID_SHAPE = /^[\x21-\x7e]{1,128}$/;
+  const PAIRING_CODE_SHAPE = /^[0-9A-Za-z]{6,128}$/;
+
+  function readPrefill(loc) {
+    const fromQuery = new URLSearchParams(loc.search || '');
+    const fromFragment = new URLSearchParams((loc.hash || '').replace(/^#/, ''));
+    // The fragment wins: it is the form that never reaches a server.
+    const pick = (key) => (fromFragment.has(key) ? fromFragment.get(key) : fromQuery.get(key));
+    const present = ['node', 'code'].some((key) => fromQuery.has(key) || fromFragment.has(key));
+    const node = pick('node');
+    const code = pick('code');
+    return {
+      present,
+      nodeId: node !== null && NODE_ID_SHAPE.test(node) ? node : '',
+      pairingCode: code !== null && PAIRING_CODE_SHAPE.test(code) ? code : '',
+      rejected: (node !== null && !NODE_ID_SHAPE.test(node)) || (code !== null && !PAIRING_CODE_SHAPE.test(code)),
+    };
+  }
+
+  function scrubbedUrl(loc) {
+    const query = new URLSearchParams(loc.search || '');
+    const fragment = new URLSearchParams((loc.hash || '').replace(/^#/, ''));
+    for (const key of ['node', 'code']) { query.delete(key); fragment.delete(key); }
+    const q = query.toString();
+    const f = fragment.toString();
+    return (loc.pathname || '/') + (q ? '?' + q : '') + (f ? '#' + f : '');
+  }
+
+  function applyPrefill(loc, hist) {
+    const prefill = readPrefill(loc);
+    if (!prefill.present) return;
+    // Scrub first, so the code is out of the address bar even if a field is
+    // already filled or the value is rejected.
+    if (hist && typeof hist.replaceState === 'function') {
+      try { hist.replaceState(null, '', scrubbedUrl(loc)); } catch (_) { /* best effort */ }
+    }
+    let filled = false;
+    if (prefill.nodeId && !$('node-id').value) { $('node-id').value = prefill.nodeId; filled = true; }
+    if (prefill.pairingCode && !$('pairing-code').value) { $('pairing-code').value = prefill.pairingCode; filled = true; }
+    if (prefill.rejected) {
+      setError('Part of this link was not a valid node id or pairing code, so it was ignored. Check the fields before continuing.');
+    }
+    if (filled) {
+      setStatus('Filled in from your link. Check the node id matches your agent, then press "Fetch the agent CA".');
+    }
+  }
+
+  if (typeof location !== 'undefined') {
+    applyPrefill(location, typeof history !== 'undefined' ? history : null);
+  }
+  // ---- >8 ---- zeroclaw-enroll-prefill ---- >8 ----
 })();
 "##;
 
@@ -670,6 +735,13 @@ process.stdout.write(JSON.stringify({{ fingerprint, sas }}));
     /// Returns `None` when node is unavailable so the suite still runs; callers
     /// assert loudly on the value when it is present.
     fn run_page_app(driver: &str) -> Option<serde_json::Value> {
+        run_page_app_with("", driver)
+    }
+
+    /// [`run_page_app`] with a `prelude` that runs after the DOM shim and
+    /// BEFORE the shipped page script, so a test can supply `location`,
+    /// `history`, or pre-filled fields the page sees at load time.
+    fn run_page_app_with(prelude: &str, driver: &str) -> Option<serde_json::Value> {
         // No packages: enough of a DOM for the page's handlers, and a swappable
         // fetch. Element stubs are cached by id, so `__el(id)` inside the driver
         // is the same object the page mutated.
@@ -692,7 +764,11 @@ const __nextTick = () => new Promise((r) => setImmediate(r));
 "#;
         let dir = tempfile::tempdir().ok()?;
         let script = dir.path().join("page-app.mjs");
-        std::fs::write(&script, format!("{DOM_SHIM}\n{APP_JS}\n{driver}\n")).ok()?;
+        std::fs::write(
+            &script,
+            format!("{DOM_SHIM}\n{prelude}\n{APP_JS}\n{driver}\n"),
+        )
+        .ok()?;
         let output = std::process::Command::new("node")
             .arg(&script)
             .output()
@@ -872,4 +948,175 @@ process.stdout.write(JSON.stringify({
   errorText: __el('error').textContent,
 }));
 "#;
+
+    // ---- URL prefill ----
+
+    const PREFILL_BEGIN: &str = "// ---- 8< ---- zeroclaw-enroll-prefill ---- 8< ----";
+    const PREFILL_END: &str = "// ---- >8 ---- zeroclaw-enroll-prefill ---- >8 ----";
+
+    /// A 32-character node id, the length a phone user would otherwise type.
+    const PREFILL_NODE: &str = "0d3c4f3e8b9a1d2c3b4a5968778695a4";
+    const PREFILL_CODE: &str = "Xy7Kq2Lm9Pz4";
+
+    /// Prelude: a `location` built from `url`, a `history` that records
+    /// `replaceState`, and a fetch that counts calls instead of answering.
+    fn prefill_prelude(url: &str, extra: &str) -> String {
+        let url = serde_json::to_string(url).expect("url as a JS string literal");
+        format!(
+            r#"
+const __u = new URL({url}, 'https://relay.example');
+globalThis.location = {{ pathname: __u.pathname, search: __u.search, hash: __u.hash }};
+const __replaced = [];
+globalThis.history = {{ replaceState(_s, _t, u) {{ __replaced.push(u); }} }};
+let __fetchCalls = 0;
+__fetch = async () => {{ __fetchCalls += 1; throw new Error('prefill must not fetch'); }};
+{extra}
+"#
+        )
+    }
+
+    const PREFILL_DRIVER: &str = r#"
+await __nextTick();
+console.log(JSON.stringify({
+  node: __el('node-id').value,
+  code: __el('pairing-code').value,
+  status: __el('status').textContent,
+  error: __el('error').textContent,
+  replaced: __replaced,
+  fetchCalls: __fetchCalls,
+  sasValue: __el('sas-value').textContent,
+}));
+"#;
+
+    fn run_prefill(url: &str, extra: &str) -> Option<serde_json::Value> {
+        run_page_app_with(&prefill_prelude(url, extra), PREFILL_DRIVER)
+    }
+
+    #[test]
+    fn a_query_link_fills_both_fields_without_submitting() {
+        let url = format!("/?node={PREFILL_NODE}&code={PREFILL_CODE}");
+        let Some(r) = run_prefill(&url, "") else {
+            eprintln!("skipping: node is not available to run the page driver");
+            return;
+        };
+        assert_eq!(r["node"].as_str(), Some(PREFILL_NODE));
+        assert_eq!(r["code"].as_str(), Some(PREFILL_CODE));
+        // Filling is all it does: no request leaves the page and the flow does
+        // not advance to the SAS step on its own.
+        assert_eq!(r["fetchCalls"].as_u64(), Some(0), "prefill must not submit");
+        assert_eq!(
+            r["sasValue"].as_str(),
+            Some(""),
+            "no SAS may be derived without the user pressing the button"
+        );
+        assert!(
+            r["status"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Fetch the agent CA"),
+            "the user is told to press the button themselves: {r}"
+        );
+        // The code is scrubbed from the address bar.
+        assert_eq!(r["replaced"], serde_json::json!(["/"]));
+        assert_eq!(r["error"].as_str(), Some(""));
+    }
+
+    #[test]
+    fn the_fragment_wins_over_the_query_and_unrelated_params_survive_the_scrub() {
+        let url = format!(
+            "/?lang=en&node=query-node&code=QueryCode99#node={PREFILL_NODE}&code={PREFILL_CODE}&tab=2"
+        );
+        let Some(r) = run_prefill(&url, "") else {
+            eprintln!("skipping: node is not available to run the page driver");
+            return;
+        };
+        assert_eq!(r["node"].as_str(), Some(PREFILL_NODE));
+        assert_eq!(r["code"].as_str(), Some(PREFILL_CODE));
+        assert_eq!(r["replaced"], serde_json::json!(["/?lang=en#tab=2"]));
+    }
+
+    #[test]
+    fn malformed_values_are_ignored_scrubbed_and_never_echoed() {
+        // A too-short code and a node id carrying a space and markup.
+        let url = "/?node=bad%20node%3Cscript%3E&code=12ab";
+        let Some(r) = run_prefill(url, "") else {
+            eprintln!("skipping: node is not available to run the page driver");
+            return;
+        };
+        assert_eq!(r["node"].as_str(), Some(""));
+        assert_eq!(r["code"].as_str(), Some(""));
+        assert_eq!(r["fetchCalls"].as_u64(), Some(0));
+        // Still scrubbed, even though nothing was used.
+        assert_eq!(r["replaced"], serde_json::json!(["/"]));
+        let error = r["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("ignored"),
+            "the user is told the link was ignored: {r}"
+        );
+        for shown in [error, r["status"].as_str().unwrap_or_default()] {
+            assert!(!shown.contains("12ab"), "the code was echoed: {shown}");
+            assert!(
+                !shown.contains("<script"),
+                "the node id was echoed: {shown}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_prefill_does_not_overwrite_what_the_user_already_typed() {
+        let url = format!("/?node={PREFILL_NODE}&code={PREFILL_CODE}");
+        let typed =
+            "__el('node-id').value = 'typed-node'; __el('pairing-code').value = 'TypedCode1';";
+        let Some(r) = run_prefill(&url, typed) else {
+            eprintln!("skipping: node is not available to run the page driver");
+            return;
+        };
+        assert_eq!(r["node"].as_str(), Some("typed-node"));
+        assert_eq!(r["code"].as_str(), Some("TypedCode1"));
+        assert_eq!(r["replaced"], serde_json::json!(["/"]));
+    }
+
+    #[test]
+    fn a_page_without_prefill_params_leaves_the_url_alone() {
+        let Some(r) = run_prefill("/?lang=en", "") else {
+            eprintln!("skipping: node is not available to run the page driver");
+            return;
+        };
+        assert_eq!(r["replaced"], serde_json::json!([]));
+        assert_eq!(r["node"].as_str(), Some(""));
+        assert_eq!(r["status"].as_str(), Some(""));
+    }
+
+    /// Structural guard that holds even where node is unavailable: the prefill
+    /// section never submits, never fetches, and never logs.
+    #[test]
+    fn the_prefill_section_never_submits_fetches_or_logs() {
+        let start = APP_JS
+            .find(PREFILL_BEGIN)
+            .expect("prefill section start marker");
+        let end = APP_JS
+            .find(PREFILL_END)
+            .expect("prefill section end marker");
+        assert!(end > start, "markers must be in order");
+        let section = &APP_JS[start..end];
+        for forbidden in [
+            "fetch(",
+            "postJson(",
+            ".click(",
+            "_click",
+            "submit(",
+            "requestSubmit",
+            "console.",
+        ] {
+            assert!(
+                !section.contains(forbidden),
+                "the prefill section must not contain {forbidden:?}"
+            );
+        }
+        // And the page ships no console logging anywhere that could print a code.
+        assert!(
+            !APP_JS.contains("console.log("),
+            "the page must not log to the console"
+        );
+    }
 }

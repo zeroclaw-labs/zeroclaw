@@ -703,6 +703,7 @@ mod tests {
         SopRun {
             run_id: run_id.into(),
             sop_name: sop_name.into(),
+            initiating_agent: None,
             trigger_event: make_event(),
             frame_marker_id: format!("marker-{run_id}"),
             status,
@@ -716,6 +717,7 @@ mod tests {
             llm_calls_saved: 0,
             revision: 0,
             revision_base: 0,
+            decided_mode: None,
         }
     }
 
@@ -1278,6 +1280,7 @@ mod tests {
         let run = SopRun {
             run_id: "r1".into(),
             sop_name: "test-sop".into(),
+            initiating_agent: None,
             trigger_event: make_event(),
             frame_marker_id: "marker-r1".into(),
             status: SopRunStatus::Running,
@@ -1291,6 +1294,7 @@ mod tests {
             llm_calls_saved: 0,
             revision: 0,
             revision_base: 0,
+            decided_mode: None,
         };
         audit.log_run_start(&run).await.unwrap();
 
@@ -1393,6 +1397,7 @@ mod tests {
         let running_run = SopRun {
             run_id: "r1".into(),
             sop_name: "test-sop".into(),
+            initiating_agent: None,
             trigger_event: make_event(),
             frame_marker_id: "marker-r1".into(),
             status: SopRunStatus::Running,
@@ -1406,6 +1411,7 @@ mod tests {
             llm_calls_saved: 0,
             revision: 0,
             revision_base: 0,
+            decided_mode: None,
         };
         audit.log_run_start(&running_run).await.unwrap();
 

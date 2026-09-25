@@ -33,6 +33,7 @@ Accepted ADRs are immutable. If the architecture changes, write a new ADR and ma
 | [ADR-015](./ADR-015-unified-capability-catalog.md) | proposed | The unified capability catalog is a read-only projection over package, capability, implementation, configuration, and runtime owners. |
 | [ADR-016](./ADR-016-holding-crate-exceptions.md) | proposed | Extraction is the default for holding-crate subsystems; bounded exceptions are recorded, scoped, and granted by the Core Team. |
 | [ADR-017](./ADR-017-inbound-authentication-and-principals.md) | proposed | Inbound authentication resolves credentials into canonical principals and permission-profile grants before privileged runtime surfaces act. |
+| [ADR-018](./ADR-018-runtime-security-and-provenance.md) | proposed | Runtime security and provenance use runtime-owned decision boundaries for protected actions, model admission, internal turns, and canonical evidence. |
 
 ADR-006 and ADR-007 are implementation-gated roadmap decisions from [FND-002](../../foundations/fnd-002-documentation-standards.md). Their target directions are recorded, but they remain proposed until the acceptance boundaries in each record ship.
 
@@ -49,3 +50,5 @@ ADR-015 remains proposed until unified catalog projections preserve source-of-tr
 ADR-016 remains proposed until the holding-crate contract states the exception rule and carries an active-exception table, and at least one exception has been granted or refused through the process.
 
 ADR-017 remains proposed until canonical identity and grant resolution, native and peer-credential compatibility, RPC/WSS enforcement, OIDC and gateway integration, principal-owned session and private-memory storage, migration/recovery documentation, and internal-origin ownership rules meet the acceptance gates in the record.
+
+ADR-018 remains proposed until the runtime action pipeline, ingress/provenance envelope, internal-principal conversation binding, peer reply provenance, separated outcomes, durable audit path, and implementation ratchets meet the acceptance gates in the record.

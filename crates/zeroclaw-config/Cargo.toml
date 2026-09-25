@@ -25,12 +25,13 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 directories = "6.0"
 hex = "0.4"
 hostname = "0.4.2"
+hmac.workspace = true
 parking_lot = "0.12"
 postgres = { version = "0.19", default-features = false, features = ["with-chrono-0_4"], optional = true }
 rand = "0.10"
 regex = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring"] }
-rusqlite = { version = "0.37", default-features = false, features = ["bundled"] }
+rusqlite = { version = "0.40", default-features = false, features = ["bundled", "fallible_uint"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
 schemars = { version = "1.2", optional = true }
 serde = { version = "1.0", default-features = false, features = ["derive"] }

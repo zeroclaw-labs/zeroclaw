@@ -687,6 +687,7 @@ mod tests {
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }
     }
 
@@ -720,6 +721,7 @@ mod tests {
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }
     }
 

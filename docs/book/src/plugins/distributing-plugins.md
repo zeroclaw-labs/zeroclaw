@@ -120,9 +120,16 @@ an optional `sha256` digest of the zip.
 
 `zeroclaw plugin install <name>` resolves the entry, downloads the zip,
 verifies the digest when present, safely extracts, and hands the extracted
-directory to the same `PluginHost::install` path a local install uses. The
-extraction is defensive by construction (`src/plugin_registry.rs`), and your
-archive must survive it:
+directory to the same admission and install path a local install uses: the
+manifest is signature-checked and validated, a name that is already installed
+is refused, the component is read once (confined to the package, no symlinks,
+capped at 64 MiB), and the install-time load check instantiates those admitted
+bytes against this host's
+WIT world before anything is installed. A component that does not load fails
+the install with the instantiation diagnostic; `--no-verify` installs it
+anyway, skipping the check, and the daemon will skip the plugin at startup
+instead. The extraction is defensive by construction
+(`src/plugin_registry.rs`), and your archive must survive it:
 
 - The zip must contain either a root-level `manifest.toml` or exactly one
   nested plugin directory containing one. Zero manifests or more than one is

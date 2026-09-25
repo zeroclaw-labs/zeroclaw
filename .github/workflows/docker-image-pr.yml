@@ -31,6 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       prebuilt_images: ${{ steps.detect.outputs.prebuilt_images }}
+      source_builds: ${{ steps.detect.outputs.source_builds }}
       source_matrix: ${{ steps.detect.outputs.source_matrix }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -47,7 +48,23 @@ jobs:
             containerfile_required=true
           fi
 
+          # Files that the source-image matrix actually compiles or smokes.
+          # The release workflow is NOT among them: its Docker job packages
+          # prebuilt binaries through prepare_docker_context.sh, which is what
+          # the `images` job validates. A diff whose only Docker-path change is
+          # the release workflow therefore gains nothing from the source
+          # matrix, and on long-lived PRs that edit it for unrelated release
+          # steps it reran every push.
+          source_inputs='^(Dockerfile|Dockerfile\.debian|Dockerfile\.alpine|Dockerfile\.ci|Containerfile|docker-compose\.yml|docker-compose\.alpine\.yml|\.dockerignore|dev/config\.template\.toml|\.github/workflows/docker-image-pr\.yml|scripts/ci/prepare_docker_context\.sh|scripts/ci/smoke_docker_compose\.sh)$'
+          source_builds=true
+
           if [ -n "$changed_files" ] && \
+             printf '%s\n' "$changed_files" | grep -Fxq '.github/workflows/release-stable-manual.yml' && \
+             ! printf '%s\n' "$changed_files" | grep -Eq "$source_inputs"; then
+            prebuilt_images=true
+            source_builds=false
+            source_matrix='{"include":[]}'
+          elif [ -n "$changed_files" ] && \
              ! printf '%s\n' "$changed_files" | grep -Eqv '^(docker-compose\.yml|docker-compose\.alpine\.yml)$'; then
             prebuilt_images=false
             source_matrix='{"include":[{"dockerfile":"Dockerfile.alpine","platform":"linux/amd64","tag":"zeroclaw-pr-source-alpine:build","cache-scope":"docker-source-alpine-amd64","gateway_smoke":true}]}'
@@ -68,8 +85,11 @@ jobs:
               source_matrix=$(jq -c '.include += [{"dockerfile":"Containerfile","platform":"linux/amd64","tag":"zeroclaw-pr-source-all-features:build","cache-scope":"containerfile-source-all-features-amd64","gateway_smoke":false}]' <<< "$source_matrix")
             fi
           fi
-          echo "prebuilt_images=$prebuilt_images" >> "$GITHUB_OUTPUT"
-          echo "source_matrix=$source_matrix" >> "$GITHUB_OUTPUT"
+          {
+            echo "prebuilt_images=$prebuilt_images"
+            echo "source_builds=$source_builds"
+            echo "source_matrix=$source_matrix"
+          } >> "$GITHUB_OUTPUT"
 
   compose:
     name: Validate Alpine Compose merge
@@ -137,6 +157,10 @@ jobs:
   source-images:
     name: Source Image Build (no push)
     needs: changes
+    # Skipped (not evaluated) when the detector found no source-image input;
+    # job-level `if` runs before the matrix expands, so the empty matrix is
+    # never handed to fromJSON.
+    if: needs.changes.outputs.source_builds == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:

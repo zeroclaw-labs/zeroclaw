@@ -424,11 +424,15 @@ pub struct Agent {
     /// When MCP deferred loading is enabled, tools are activated via `tool_search`
     /// and stored here for lookup during tool execution.
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
-    /// Pre-rendered MCP pinned-resource system-prompt section, read once at
-    /// construction from each server's `pinned_resources` and provenance-wrapped
-    /// (`trust="untrusted-external"`). Empty when no pins are configured or all
-    /// were skipped. Appended to the system prompt in `build_system_prompt`.
-    mcp_pinned_section: String,
+    tool_search: Option<Arc<crate::tools::ToolSearchTool>>,
+    /// MCP pinned resources, read once at construction from each server's
+    /// `pinned_resources` and provenance-wrapped (`trust="untrusted-external"`).
+    /// Kept as attributed blocks rather than pre-rendered text so a later
+    /// principal tool narrowing can withdraw a block whose `<server>__<uri>`
+    /// key the selector no longer names; `build_system_prompt` renders what
+    /// remains. Empty when no pins are configured, all were skipped, or all
+    /// were pruned.
+    mcp_pinned: Vec<zeroclaw_tools::mcp_context::PinnedResourceBlock>,
     mcp_deferred_section: String,
     /// Hook runner for tool-call auditing and lifecycle side effects.
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
@@ -617,7 +621,7 @@ pub struct AgentBuilder {
     shell_profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
     approval_route: Option<zeroclaw_config::autonomy::ApprovalRoute>,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
-    mcp_pinned_section: Option<String>,
+    mcp_pinned: Vec<zeroclaw_tools::mcp_context::PinnedResourceBlock>,
     mcp_deferred_section: Option<String>,
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
     approval_manager: Option<Arc<ApprovalManager>>,
@@ -637,6 +641,12 @@ impl Default for AgentBuilder {
         Self::new()
     }
 }
+
+/// Key given to a pinned section supplied through the deprecated
+/// [`AgentBuilder::mcp_pinned_section`]. It is deliberately not a legal
+/// `<server>__<uri>` tool name, so a principal's allowed-tool list can never
+/// contain it and `Agent::narrow_to_principal_tools` always prunes the block.
+const UNATTRIBUTED_PINNED_KEY: &str = "\0unattributed-pinned-section";
 
 impl AgentBuilder {
     pub fn new() -> Self {
@@ -672,7 +682,7 @@ impl AgentBuilder {
             shell_profile: None,
             approval_route: None,
             activated_tools: None,
-            mcp_pinned_section: None,
+            mcp_pinned: Vec::new(),
             mcp_deferred_section: None,
             hook_runner: None,
             approval_manager: None,
@@ -908,8 +918,43 @@ impl AgentBuilder {
         self
     }
 
+    pub fn mcp_pinned_blocks(
+        mut self,
+        blocks: Vec<zeroclaw_tools::mcp_context::PinnedResourceBlock>,
+    ) -> Self {
+        self.mcp_pinned = blocks;
+        self
+    }
+
+    /// Compatibility setter for callers built against the pre-attribution
+    /// signature, which took the rendered section as one string.
+    ///
+    /// The string carries no `<server>__<uri>` attribution, so it cannot be
+    /// matched against a principal's allowed tool names. Restoring it as plain
+    /// text would let construction-time content outlive a narrowing that no
+    /// longer grants it, which is the leak the attributed blocks exist to
+    /// close. It is therefore wrapped in a block keyed with
+    /// `UNATTRIBUTED_PINNED_KEY`, a name no allowed-tool list can contain,
+    /// so `narrow_to_principal_tools` prunes it on the first narrowing. A
+    /// caller that never narrows (the unscoped constructions this setter
+    /// exists for) sees the section exactly as before.
+    ///
+    /// Prefer [`Self::mcp_pinned_blocks`]: it keeps content revocable per
+    /// resource instead of dropping all of it at the first narrowing.
+    #[deprecated(
+        note = "pass attributed blocks via mcp_pinned_blocks; an unattributed section is pruned whenever a principal selector narrows the session"
+    )]
     pub fn mcp_pinned_section(mut self, section: Option<String>) -> Self {
-        self.mcp_pinned_section = section;
+        self.mcp_pinned = section
+            .filter(|rendered| !rendered.trim().is_empty())
+            .map(
+                |rendered| zeroclaw_tools::mcp_context::PinnedResourceBlock {
+                    key: UNATTRIBUTED_PINNED_KEY.to_string(),
+                    rendered,
+                },
+            )
+            .into_iter()
+            .collect();
         self
     }
 
@@ -1112,7 +1157,8 @@ impl AgentBuilder {
             inject_memory: !exclude_memory,
             shell_profile: self.shell_profile,
             activated_tools: self.activated_tools,
-            mcp_pinned_section: self.mcp_pinned_section.unwrap_or_default(),
+            tool_search: None,
+            mcp_pinned: self.mcp_pinned,
             mcp_deferred_section: self.mcp_deferred_section.unwrap_or_default(),
             hook_runner: self.hook_runner,
             approval_manager: self.approval_manager,
@@ -1632,6 +1678,43 @@ impl Agent {
         }
     }
 
+    /// Apply a current principal tool ceiling to an existing session. This is
+    /// intentionally narrowing-only: session construction already intersects
+    /// the principal and agent policies, while a later policy refresh must
+    /// never let an old static or activated tool survive a removed grant.
+    ///
+    /// Pinned MCP resource content is governed by the same selector: each
+    /// block was admitted at assembly under its `<server>__<uri>` name, so a
+    /// narrowing that no longer names it withdraws the block from every later
+    /// prompt rather than letting construction-time text outlive its grant.
+    pub fn narrow_to_principal_tools(&mut self, allowed: Option<&[String]>) {
+        let Some(allowed) = allowed else {
+            return;
+        };
+        self.tools
+            .retain(|tool| allowed.iter().any(|name| name == tool.name()));
+        if let Some(search) = &self.tool_search {
+            search.narrow_to_caller(allowed);
+        }
+        if let Some(activated) = &self.activated_tools {
+            // A poisoned lock must not preserve a revoked executable tool.
+            activated
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain_allowed(allowed);
+        }
+        self.mcp_pinned.retain(|block| allowed.contains(&block.key));
+        self.disable_principal_unaware_nested_tools();
+    }
+
+    /// Nested builders do not yet carry the RPC principal's two selectors.
+    /// Refuse only those entry points, not the correctly narrowed parent turn.
+    pub(crate) fn disable_principal_unaware_nested_tools(&mut self) {
+        self.tools
+            .retain(|tool| !tool.requires_unrestricted_principal());
+        self.refresh_system_prompt();
+    }
+
     #[cfg(test)]
     pub fn tool_names(&self) -> Vec<&str> {
         self.tools.iter().map(|t| t.name()).collect()
@@ -1640,6 +1723,37 @@ impl Agent {
     #[cfg(test)]
     pub fn system_prompt_for_test(&self) -> Result<String> {
         self.build_system_prompt()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn dispatch_tool_for_test(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> super::tool_execution::ToolExecutionOutcome {
+        super::tool_execution::execute_one_tool(
+            name,
+            args,
+            Some("principal-test-call"),
+            super::tool_execution::ToolDispatchContext {
+                tools_registry: &self.tools,
+                activated_tools: self.activated_tools.as_ref(),
+                excluded_tools: &[],
+                model_switch_callback: None,
+            },
+            &super::turn::TurnMeta {
+                agent_alias: Some(&self.agent_alias),
+                parent_agent_alias: None,
+                turn_id: "principal-test-turn",
+                channel_name: "rpc",
+            },
+            self.observer.as_ref(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("production dispatch returns a tool outcome")
     }
 
     #[cfg(test)]
@@ -1743,6 +1857,7 @@ impl Agent {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -1770,6 +1885,7 @@ impl Agent {
             sop_engine,
             sop_audit,
             canvas_store,
+            None,
             None,
             None,
             None,
@@ -1802,6 +1918,7 @@ impl Agent {
             sop_audit,
             canvas_store,
             Some(acp_session_store),
+            None,
             None,
             None,
         )
@@ -1837,6 +1954,7 @@ impl Agent {
             canvas_store,
             None,
             Some(live_config),
+            None,
             None,
         )
         .await
@@ -1897,6 +2015,7 @@ impl Agent {
             Some(acp_session_store),
             Some(live_config),
             None,
+            None,
         )
         .await
     }
@@ -1931,12 +2050,14 @@ impl Agent {
             None,
             None,
             None,
+            None,
         )
         .await
     }
 
     /// Build a daemon-backed TUI Agent whose structured-history cap follows
     /// the shared config after reloads.
+    #[allow(clippy::too_many_arguments)]
     pub async fn from_live_config_with_tui_env(
         live_config: Arc<parking_lot::RwLock<Config>>,
         agent_alias: &str,
@@ -1946,6 +2067,34 @@ impl Agent {
         tui_env: Option<std::collections::HashMap<String, String>>,
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
+    ) -> Result<Self> {
+        Self::from_live_config_with_tui_env_and_principal_tools(
+            live_config,
+            agent_alias,
+            session_cwd,
+            initialize_mcp,
+            exclude_memory,
+            tui_env,
+            sop_engine,
+            sop_audit,
+            None,
+        )
+        .await
+    }
+
+    /// Additive RPC constructor. The shared resolver owns grants; this argument
+    /// is only the current assembly ceiling, not a long-lived policy snapshot.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn from_live_config_with_tui_env_and_principal_tools(
+        live_config: Arc<parking_lot::RwLock<Config>>,
+        agent_alias: &str,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        exclude_memory: bool,
+        tui_env: Option<std::collections::HashMap<String, String>>,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+        principal_allowed_tools: Option<Vec<String>>,
     ) -> Result<Self> {
         // Stack-budget boundary for the daemon-backed construction paths
         // (`session/new`, rehydration, plugin agents). The whole incarnation
@@ -1981,6 +2130,7 @@ impl Agent {
                 None,
                 Some(Arc::clone(&live_config)),
                 Some(live_config),
+                principal_allowed_tools,
             ))
         })
         .await
@@ -2000,6 +2150,7 @@ impl Agent {
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
         acp_session_store: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+        principal_allowed_tools: Option<Vec<String>>,
     ) -> Result<Self> {
         let handle = tokio::runtime::Handle::current();
         let agent_alias = agent_alias.to_string();
@@ -2021,6 +2172,7 @@ impl Agent {
                 Some(acp_session_store),
                 Some(Arc::clone(&live_config)),
                 Some(live_config),
+                principal_allowed_tools,
             ))
         })
         .await
@@ -2043,6 +2195,11 @@ impl Agent {
         acp_session_store: Option<Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
         live_config: Option<Arc<parking_lot::RwLock<Config>>>,
         live_model_config: Option<Arc<parking_lot::RwLock<Config>>>,
+        // The caller principal's tool selector (RFC 7141 composition by
+        // intersection): `None` = unrestricted, `Some(list)` keeps only the
+        // named tools from the assembled surface (empty = a tool-less
+        // agent). Fed by the RPC dispatcher from the resolved grants.
+        principal_allowed_tools: Option<Vec<String>>,
     ) -> Result<Self> {
         let agent_cfg = config
             .agent(agent_alias)
@@ -2146,6 +2303,7 @@ impl Agent {
                 // engine with a real channel-delivering adapter instead.
                 let (engine, audit) = crate::sop::build_sop_engine(
                     config.sop.clone(),
+                    &config.decision_models,
                     &config.data_dir,
                     &config.install_root_dir(),
                     mem,
@@ -2207,7 +2365,13 @@ impl Agent {
                 built: all_tools_result,
                 skills: &skills,
                 runtime,
-                caller_allowed: None,
+                // The principal's tool selector must gate deferred/MCP
+                // tools too, not only the static registry narrowed by
+                // `.allowed_tools()` below. `caller_allowed` is exact-match
+                // (no `<server>__<tool>` auto-admit escape), so an empty
+                // principal list denies every MCP tool and a named list
+                // admits only the named ones.
+                caller_allowed: principal_allowed_tools.as_deref(),
                 connect_mcp: initialize_mcp,
                 connect_peripherals: false,
                 exclude_memory,
@@ -2223,14 +2387,15 @@ impl Agent {
         )
         .await;
         // The Agent injects two distinct MCP prompt slots: `mcp_deferred_section` (the
-        // deferred tool-search listing) and `mcp_pinned_section` (pinned resources).
+        // deferred tool-search listing) and `mcp_pinned` (pinned resources, kept as
+        // attributed blocks so live narrowing can prune them).
         // `assemble` surfaces the two atomically, so from_config threads each into its
         // own slot below - no duplication, and the deferred advertisement the
         // regression suite asserts is preserved.
         let deferred_section = assembled.deferred_section().to_string();
-        let pinned_section = assembled.pinned_section().to_string();
+        let pinned_blocks = assembled.pinned_blocks().to_vec();
         let crate::tools::scoped::ScopedAssembled {
-            registry,
+            mut registry,
             delegate_handle: _,
             ask_user_handle,
             reaction_handle,
@@ -2238,11 +2403,19 @@ impl Agent {
             escalate_handle,
             channel_room_handle,
             activated_handle,
+            tool_search_handle,
             // from_config performs no per-turn tool_filter_groups filtering
             // itself, so mcp_tool_names is dropped here along with `registry`'s
             // already-consumed sibling fields via `..`.
             ..
         } = assembled;
+        // Nested delegation has no principal-agent ceiling parameter yet. A
+        // constrained principal can still use its correctly narrowed session,
+        // but cannot enter either bounded or independent delegation and lose
+        // that ceiling.
+        if principal_allowed_tools.is_some() {
+            registry.retain(|tool| !tool.requires_unrestricted_principal());
+        }
         // Thread the sealed registry straight to the builder - `.tools(...)` now
         // takes a `ScopedToolRegistry`, so no `into_inner()` unwrap here.
         let tools = registry;
@@ -2361,6 +2534,7 @@ impl Agent {
         let builder = builder.delegate_tool(built_delegate_tool);
         let mut builder = builder
             .model_provider(model_provider)
+            .allowed_tools(principal_allowed_tools)
             .tools(tools)
             .memory(memory.clone())
             .observer(observer)
@@ -2405,7 +2579,7 @@ impl Agent {
             .approval_route(risk_profile.approval_route.clone())
             .activated_tools(activated_handle)
             .mcp_deferred_section(Some(deferred_section))
-            .mcp_pinned_section(Some(pinned_section))
+            .mcp_pinned_blocks(pinned_blocks)
             .hook_runner(if config.hooks.enabled {
                 Some(Arc::new(crate::hooks::HookRunner::from_config(
                     &config.hooks,
@@ -2429,6 +2603,8 @@ impl Agent {
             builder = builder.config_generation(generation);
         }
         let mut agent = builder.build()?;
+
+        agent.tool_search = tool_search_handle;
 
         // Wire per-tool channel-map handles into the agent so callers (e.g.
         // the ACP server) can register back-channels after construction.
@@ -2682,13 +2858,23 @@ impl Agent {
         if receipts.enabled && receipts.inject_system_prompt {
             prompt.push_str(crate::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
         }
-        if !self.mcp_deferred_section.is_empty() {
+        let deferred_section = if self.tools.iter().any(|tool| tool.name() == "tool_search") {
+            self.tool_search.as_ref().map_or_else(
+                || self.mcp_deferred_section.clone(),
+                |search| search.deferred_prompt_section(),
+            )
+        } else {
+            String::new()
+        };
+        if !deferred_section.is_empty() {
             prompt.push_str("\n\n");
-            prompt.push_str(&self.mcp_deferred_section);
+            prompt.push_str(&deferred_section);
         }
-        if !self.mcp_pinned_section.is_empty() {
+        let pinned_section =
+            zeroclaw_tools::mcp_context::render_pinned_resources_section(&self.mcp_pinned);
+        if !pinned_section.is_empty() {
             prompt.push_str("\n\n");
-            prompt.push_str(&self.mcp_pinned_section);
+            prompt.push_str(&pinned_section);
         }
         Ok(prompt)
     }
@@ -6906,6 +7092,363 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn principal_turn_executes_permitted_tool_and_refuses_removed_tool() {
+        struct PrincipalNativeProvider(MockModelProvider);
+        #[async_trait]
+        impl ModelProvider for PrincipalNativeProvider {
+            fn supports_native_tools(&self) -> bool {
+                true
+            }
+            async fn chat_with_system(
+                &self,
+                system: Option<&str>,
+                message: &str,
+                model: &str,
+                temperature: Option<f64>,
+            ) -> Result<String> {
+                self.0
+                    .chat_with_system(system, message, model, temperature)
+                    .await
+            }
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                model: &str,
+                temperature: Option<f64>,
+            ) -> Result<zeroclaw_providers::ChatResponse> {
+                self.0.chat(request, model, temperature).await
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for PrincipalNativeProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                self.0.role()
+            }
+            fn alias(&self) -> &str {
+                "principal-native-fixture"
+            }
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let response = |names: &[&str]| zeroclaw_providers::ChatResponse {
+            text: None,
+            tool_calls: names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| zeroclaw_providers::ToolCall {
+                    id: format!("call-{i}"),
+                    name: (*name).into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                })
+                .collect(),
+            usage: None,
+            reasoning_content: None,
+        };
+        let done = || zeroclaw_providers::ChatResponse {
+            text: Some("done".into()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning_content: None,
+        };
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(PrincipalNativeProvider(MockModelProvider {
+                responses: Mutex::new(vec![
+                    response(&["echo", "forbidden"]),
+                    done(),
+                    response(&["echo"]),
+                    done(),
+                ]),
+            })))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![
+                    Box::new(CountingTool {
+                        calls: Arc::clone(&calls),
+                    }),
+                    Box::new(NamedMockTool::new("forbidden")),
+                    Box::new(NamedMockTool::new("keep")),
+                ],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .build()
+            .unwrap();
+        agent.narrow_to_principal_tools(Some(&["echo".into(), "keep".into()]));
+        assert_eq!(agent.tool_names(), vec!["echo", "keep"]);
+        assert_eq!(agent.turn("first turn").await.unwrap(), "done");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(format!("{:?}", agent.history).contains("Unknown tool: forbidden"));
+        // Keep a harmless capability so the second turn still uses the tool
+        // protocol and must reject the model's request for the removed echo.
+        // Empty-surface behavior is covered by the RPC selector matrix.
+        agent.narrow_to_principal_tools(Some(&["keep".into()]));
+        assert_eq!(agent.tool_names(), vec!["keep"]);
+        assert_eq!(agent.turn("after revocation").await.unwrap(), "done");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "revoked tool must not execute again"
+        );
+        assert!(format!("{:?}", agent.history).contains("Unknown tool: echo"));
+    }
+
+    /// The deprecated `mcp_pinned_section` keeps pre-attribution callers
+    /// compiling, so it must still render their section. It carries no
+    /// `<server>__<uri>` attribution, so it cannot be matched against a
+    /// principal's allowed names: the first narrowing withdraws it instead of
+    /// letting construction-time text outlive the grant it was built under.
+    #[tokio::test]
+    async fn a_compatibility_pinned_section_renders_then_is_pruned_by_any_narrowing() {
+        let tmp = tempfile::tempdir().unwrap();
+        #[allow(deprecated)]
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(NamedMockTool::new("keep"))],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .mcp_pinned_section(Some("LEGACY-PINNED-CONTENT".to_string()))
+            .build()
+            .unwrap();
+
+        let prompt = agent.system_prompt_for_test().unwrap();
+        assert!(
+            prompt.contains("LEGACY-PINNED-CONTENT"),
+            "the compatibility setter must still render its section: {prompt}"
+        );
+
+        // Narrow with a list that also names every plausible attribution this
+        // section could be given. The block survives only if its key is one a
+        // grant can name, so this fails if the shim keys it like a real
+        // resource instead of with the unnameable sentinel.
+        agent.narrow_to_principal_tools(Some(&[
+            "keep".into(),
+            "docs__legacy".into(),
+            "legacy".into(),
+            "pinned".into(),
+            "mcp__pinned".into(),
+            "LEGACY-PINNED-CONTENT".into(),
+        ]));
+        let prompt = agent.system_prompt_for_test().unwrap();
+        assert!(
+            !prompt.contains("LEGACY-PINNED-CONTENT"),
+            "an unattributed section must not survive a principal narrowing: {prompt}"
+        );
+        assert!(!prompt.contains("## Pinned MCP Resources"), "{prompt}");
+        assert_eq!(agent.tool_names(), vec!["keep"]);
+
+        // The sentinel is unnameable by construction: a tool name reaches the
+        // allowed list from config and can never carry a NUL, so no grant can
+        // spell this key and retain the block.
+        assert!(
+            UNATTRIBUTED_PINNED_KEY.contains('\0'),
+            "the compatibility key must not be a legal tool name"
+        );
+    }
+
+    /// An empty or whitespace-only compatibility section adds no block, so it
+    /// cannot render an empty pinned heading.
+    #[tokio::test]
+    async fn a_blank_compatibility_pinned_section_adds_no_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        for blank in [None, Some(String::new()), Some("   \n".to_string())] {
+            #[allow(deprecated)]
+            let agent = Agent::builder()
+                .model_provider(Box::new(MockModelProvider {
+                    responses: Mutex::new(vec![]),
+                }))
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![Box::new(NamedMockTool::new("keep"))],
+                ))
+                .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                .observer(Arc::new(crate::observability::NoopObserver {}))
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(tmp.path().to_path_buf())
+                .mcp_pinned_section(blank.clone())
+                .build()
+                .unwrap();
+            assert!(
+                !agent
+                    .system_prompt_for_test()
+                    .unwrap()
+                    .contains("## Pinned MCP Resources"),
+                "blank section {blank:?} must not render a pinned heading"
+            );
+        }
+    }
+
+    /// Pinned MCP resource text is admitted under the resource's
+    /// `<server>__<uri>` selector name. A later narrowing that drops the name
+    /// must withdraw the already-materialized block from every later prompt,
+    /// not only stop the executable tools.
+    #[tokio::test]
+    async fn narrowing_prunes_pinned_mcp_resources_from_later_prompts() {
+        use zeroclaw_tools::mcp_context::PinnedResourceBlock;
+        let tmp = tempfile::tempdir().unwrap();
+        let block = |key: &str, text: &str| PinnedResourceBlock {
+            key: key.into(),
+            rendered: format!(
+                "<mcp-resource server=\"docs\" uri=\"{key}\" mime=\"text/plain\" \
+                 trust=\"untrusted-external\">\n{text}\n</mcp-resource>"
+            ),
+        };
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(NamedMockTool::new("keep"))],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .mcp_pinned_blocks(vec![
+                block("docs__handbook", "HANDBOOK-CONTENT"),
+                block("docs__roster", "ROSTER-CONTENT"),
+            ])
+            .build()
+            .unwrap();
+
+        let prompt = agent.system_prompt_for_test().unwrap();
+        assert!(prompt.contains("## Pinned MCP Resources"));
+        assert!(prompt.contains("HANDBOOK-CONTENT") && prompt.contains("ROSTER-CONTENT"));
+
+        // Revoking one pinned resource withdraws exactly its block.
+        agent.narrow_to_principal_tools(Some(&["keep".into(), "docs__handbook".into()]));
+        let prompt = agent.system_prompt_for_test().unwrap();
+        assert!(
+            prompt.contains("HANDBOOK-CONTENT"),
+            "the still-granted resource stays pinned"
+        );
+        assert!(
+            !prompt.contains("ROSTER-CONTENT"),
+            "the revoked resource must not reach later prompts: {prompt}"
+        );
+
+        // A selector that names no pinned resource leaves no section at all,
+        // and narrowing never brings a pruned block back.
+        agent.narrow_to_principal_tools(Some(&["keep".into()]));
+        let prompt = agent.system_prompt_for_test().unwrap();
+        assert!(!prompt.contains("## Pinned MCP Resources"), "{prompt}");
+        assert!(!prompt.contains("HANDBOOK-CONTENT"));
+        agent.narrow_to_principal_tools(Some(&["keep".into(), "docs__roster".into()]));
+        assert!(
+            !agent
+                .system_prompt_for_test()
+                .unwrap()
+                .contains("ROSTER-CONTENT"),
+            "narrowing is narrowing-only; a pruned block is not re-admitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn principal_nested_pipeline_skill_alias_cannot_bypass_ceiling() {
+        let mut agent = blank_input_agent(Box::new(MockModelProvider {
+            responses: Mutex::new(vec![]),
+        }));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let echo: Arc<dyn Tool> = Arc::new(CountingTool {
+            calls: Arc::clone(&calls),
+        });
+        let pipeline: Arc<dyn Tool> = Arc::new(crate::tools::PipelineTool::with_access_policy(
+            zeroclaw_config::schema::PipelineConfig::default(),
+            vec![echo],
+            None,
+        ));
+        let skill = make_skill("wrapped", &["pipeline"]);
+        let wrapper = crate::tools::skill_tool::SkillBuiltinTool::new(
+            "wrapped",
+            &skill.tools[0],
+            Arc::clone(&pipeline),
+            HashMap::new(),
+        );
+        let wrapper_name = wrapper.name().to_owned();
+        agent.tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+            Box::new(crate::tools::ArcToolRef(pipeline)),
+            Box::new(wrapper),
+        ]);
+        assert_eq!(
+            agent.tool_names().len(),
+            2,
+            "both raw and wrapped entry points exist before narrowing"
+        );
+        agent.narrow_to_principal_tools(Some(&[
+            crate::tools::PipelineTool::NAME.into(),
+            wrapper_name.clone(),
+        ]));
+        assert!(agent.tool_names().is_empty());
+        for name in [crate::tools::PipelineTool::NAME, wrapper_name.as_str()] {
+            assert!(
+                !agent
+                    .dispatch_tool_for_test(
+                        name,
+                        serde_json::json!({"steps":[{"tool":"echo","args":{}}]})
+                    )
+                    .await
+                    .success
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn principal_poisoned_activated_set_is_pruned_before_dispatch() {
+        let mut agent = blank_input_agent(Box::new(MockModelProvider {
+            responses: Mutex::new(vec![]),
+        }));
+        let activated = Arc::new(std::sync::Mutex::new(crate::tools::ActivatedToolSet::new()));
+        for name in ["mcp__keep", "mcp__revoke"] {
+            activated
+                .lock()
+                .unwrap()
+                .activate(name.into(), Arc::new(NamedMockTool::new(name)));
+        }
+        agent.activated_tools = Some(Arc::clone(&activated));
+        assert!(
+            agent
+                .dispatch_tool_for_test("mcp__revoke", serde_json::json!({}))
+                .await
+                .success
+        );
+        let poison = Arc::clone(&activated);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poison.lock().unwrap();
+                panic!("test poison");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(activated.is_poisoned());
+        agent.narrow_to_principal_tools(Some(&["mcp__keep".into()]));
+        assert!(
+            agent
+                .dispatch_tool_for_test("mcp__keep", serde_json::json!({}))
+                .await
+                .success
+        );
+        assert!(
+            !agent
+                .dispatch_tool_for_test("mcp__revoke", serde_json::json!({}))
+                .await
+                .success
+        );
+        assert!(
+            !activated
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_activated("mcp__revoke")
+        );
+    }
+
+    #[tokio::test]
     async fn turn_without_tools_returns_text() {
         let model_provider = Box::new(MockModelProvider {
             responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
@@ -8229,10 +8772,10 @@ mod tests {
         let current = "11111111-1111-4111-8111-111111111111";
         let previous = "22222222-2222-4222-8222-222222222222";
         store
-            .create_session(current, "test-agent", "/current")
+            .create_session(current, "test-agent", "/current", None)
             .unwrap();
         store
-            .create_session(previous, "test-agent", "/previous")
+            .create_session(previous, "test-agent", "/previous", None)
             .unwrap();
         store
             .append_turn(

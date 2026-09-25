@@ -27,9 +27,13 @@
 //! an empty registry rejects everything — wiring it on is a deliberate, later
 //! step.
 
+pub mod native;
 pub mod oidc;
+pub mod peercred;
 
+pub use native::NativeAuthProvider;
 pub use oidc::OidcAuthProvider;
+pub use peercred::{PeercredAuthProvider, UidRoster};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -130,7 +134,7 @@ pub trait AuthProvider: Send + Sync {
 /// The configured set of providers, selected by name. **Default-deny**: an
 /// empty registry rejects everything, an unknown selection rejects, a
 /// mis-kinded credential rejects, and a selected provider's denial is final.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ProviderRegistry {
     providers: Vec<Arc<dyn AuthProvider>>,
     by_name: HashMap<String, usize>,

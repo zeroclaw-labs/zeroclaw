@@ -3278,8 +3278,15 @@ fn which_zerocode_on_path() -> bool {
 #[cfg(feature = "plugins-wasm")]
 #[derive(Subcommand, Debug)]
 enum PluginCommands {
-    /// List installed and cached-registry plugins
-    List,
+    /// List installed and cached-registry plugins. With `--verify`, list the
+    /// installed packages with their host-load verdicts.
+    List {
+        /// Also load-check each plugin against this host's WIT ABI and
+        /// annotate whether it would actually load (slower: this compiles and
+        /// instantiates every installed component)
+        #[arg(long)]
+        verify: bool,
+    },
     /// Search an installable plugin registry
     Search {
         /// Query to match against plugin names and descriptions
@@ -3295,6 +3302,10 @@ enum PluginCommands {
         /// Registry JSON URL used for install-by-name
         #[arg(long)]
         registry: Option<String>,
+        /// Install even if the plugin fails to load against this host's WIT ABI
+        /// (skips the install-time load-check)
+        #[arg(long)]
+        no_verify: bool,
     },
     /// Remove an installed plugin
     Remove {
@@ -3308,6 +3319,237 @@ enum PluginCommands {
     },
     /// Move plugins from legacy install directories into the configured one
     Migrate,
+}
+
+/// Run the install-time load-check on an admitted source and decide whether
+/// the install may proceed. A plugin that does not instantiate against this
+/// host's WIT world would install cleanly and then be silently skipped at
+/// daemon startup; this surfaces that failure at the CLI with its full
+/// diagnostic. The check runs against the exact bytes admission read,
+/// which are the bytes [`PluginHost::install_admitted`] then installs, so what
+/// was verified is what gets installed. With `--no-verify` the check is not
+/// run at all (nothing is compiled or instantiated) and a note says so; a
+/// source with no WASM component has nothing to instantiate and passes.
+#[cfg(feature = "plugins-wasm")]
+async fn verify_plugin_loads_or_bail(
+    admitted: &zeroclaw::plugins::host::AdmittedSource,
+    limits: zeroclaw::plugins::component::PluginLimits,
+    no_verify: bool,
+) -> Result<()> {
+    let manifest = admitted.manifest();
+    let Some(component) = admitted.component() else {
+        return Ok(());
+    };
+    if no_verify {
+        eprintln!(
+            "{}",
+            ta(
+                "cli-plugin-install-verify-bypassed",
+                &[("name", manifest.name.as_str())],
+                format!(
+                    "note: skipping the install-time load check for '{}' (--no-verify); if it does not load against this host it will be skipped at startup",
+                    manifest.name
+                ),
+            )
+        );
+        return Ok(());
+    }
+    match zeroclaw::plugins::validate::verify_component_loads(component, manifest, limits).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let detail = format!("{error:#}");
+            bail!(ta(
+                "cli-plugin-install-verify-failed",
+                &[("name", manifest.name.as_str()), ("error", detail.as_str())],
+                format!(
+                    "install failed: '{}' does not load against this host:\n{detail}\nOverride with --no-verify to install anyway.",
+                    manifest.name
+                ),
+            ))
+        }
+    }
+}
+
+/// The load verdict for one *installed* plugin.
+///
+/// `PluginInfo::loaded` only reports that a package was discovered, so a plugin
+/// the daemon will type-check and silently skip still lists as if it worked.
+/// This is the verdict that separates the two, and it comes from the same
+/// `verify_component_loads` check `plugin install` gates on: a plugin that
+/// predates that gate, was installed with `--no-verify`, or outlived a host
+/// upgrade is exactly the case the install gate cannot cover.
+#[cfg(feature = "plugins-wasm")]
+#[derive(Debug)]
+enum PluginLoadStatus {
+    /// The component instantiates against this host's WIT world.
+    Loads,
+    /// It does not. Carries the full wasmtime cause chain, including the
+    /// WIT-drift rebuild hint when instantiation was what failed.
+    Fails(String),
+    /// A skill-only package ships no component, so there is nothing to load.
+    NoComponent,
+}
+
+#[cfg(feature = "plugins-wasm")]
+impl PluginLoadStatus {
+    /// Whether `plugin info` should exit non-zero, so a script can branch on
+    /// it. Only a real load failure qualifies: a skill-only package has
+    /// nothing to instantiate, which is not evidence that anything is broken.
+    const fn is_load_failure(&self) -> bool {
+        matches!(self, Self::Fails(_))
+    }
+}
+
+/// Run the load-check for one installed plugin.
+#[cfg(feature = "plugins-wasm")]
+async fn installed_plugin_load_status(
+    host: &zeroclaw::plugins::host::PluginHost,
+    info: &zeroclaw::plugins::PluginInfo,
+    limits: zeroclaw::plugins::component::PluginLimits,
+) -> Result<PluginLoadStatus> {
+    // The host's admitted bytes, not a reread of `wasm_path`: these are what
+    // the daemon compiles, so the verdict describes what will actually run.
+    let Some(component) = host.admitted_component(&info.name) else {
+        return Ok(PluginLoadStatus::NoComponent);
+    };
+    let manifest = host
+        .manifest(&info.name)
+        .ok_or_else(|| anyhow::Error::msg("installed plugin manifest is unavailable"))?;
+    match zeroclaw::plugins::validate::verify_component_loads(component, manifest, limits).await {
+        Ok(()) => Ok(PluginLoadStatus::Loads),
+        Err(error) => Ok(PluginLoadStatus::Fails(format!("{error:#}"))),
+    }
+}
+
+/// The first line of a diagnostic. A list row annotates each plugin with just
+/// enough to tell one failure from another; `plugin info` prints the whole
+/// chain.
+#[cfg(feature = "plugins-wasm")]
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or(text).trim()
+}
+
+/// Render the body of `zeroclaw plugin list`.
+///
+/// Each entry carries its load verdict only when `--verify` ran, so the default
+/// listing stays a directory read and costs no compilation.
+#[cfg(feature = "plugins-wasm")]
+fn plugin_list_lines(
+    entries: &[(zeroclaw::plugins::PluginInfo, Option<PluginLoadStatus>)],
+) -> Vec<String> {
+    if entries.is_empty() {
+        return vec![t("cli-plugins-none", "No plugins installed.")];
+    }
+
+    let mut lines = vec![t("cli-plugins-installed", "Installed plugins:")];
+    for (info, status) in entries {
+        let description = info
+            .description
+            .clone()
+            .unwrap_or_else(|| t("cli-plugin-no-description", "(no description)"));
+        let Some(status) = status else {
+            lines.push(format!("  {} v{} — {description}", info.name, info.version));
+            continue;
+        };
+        // The row is indented in code, not in Fluent: Fluent trims the leading
+        // whitespace of a single-line value, so an indent written there is lost.
+        let identity = format!("{} v{} — {description}", info.name, info.version);
+        let args = [
+            ("name", info.name.as_str()),
+            ("version", info.version.as_str()),
+            ("description", description.as_str()),
+        ];
+        let row = match status {
+            PluginLoadStatus::Loads => ta(
+                "cli-plugin-list-entry-loads",
+                &args,
+                format!("{identity} [loads]"),
+            ),
+            PluginLoadStatus::Fails(error) => {
+                let cause = first_line(error);
+                let mut args = args.to_vec();
+                args.push(("error", cause));
+                ta(
+                    "cli-plugin-list-entry-failed",
+                    &args,
+                    format!("{identity} [does not load: {cause}]"),
+                )
+            }
+            PluginLoadStatus::NoComponent => ta(
+                "cli-plugin-list-entry-no-component",
+                &args,
+                format!("{identity} [no component to load]"),
+            ),
+        };
+        lines.push(format!("  {row}"));
+    }
+    lines
+}
+
+/// Render `zeroclaw plugin info`. The load verdict is always the last line:
+/// "does this plugin work here" is the question the command exists to answer,
+/// and the manifest alone cannot answer it.
+#[cfg(feature = "plugins-wasm")]
+fn plugin_info_lines(
+    info: &zeroclaw::plugins::PluginInfo,
+    config_entries: &[(zeroclaw::plugins::PluginCapability, String)],
+    status: &PluginLoadStatus,
+) -> Vec<String> {
+    let mut lines = vec![ta(
+        "cli-plugin-name-version",
+        &[("name", &info.name), ("version", &info.version)],
+        "Plugin",
+    )];
+    if let Some(desc) = &info.description {
+        lines.push(ta(
+            "cli-plugin-description",
+            &[("desc", desc)],
+            "Description",
+        ));
+    }
+    lines.push(ta(
+        "cli-plugin-capabilities",
+        &[("v", &format!("{:?}", info.capabilities))],
+        "Capabilities",
+    ));
+    lines.push(ta(
+        "cli-plugin-permissions",
+        &[("v", &format!("{:?}", info.permissions))],
+        "Permissions",
+    ));
+    for (capability, key) in config_entries {
+        lines.push(ta(
+            "cli-plugin-config-entry-key",
+            &[("capability", &format!("{capability:?}")), ("key", key)],
+            "Config entry key",
+        ));
+    }
+    match &info.wasm_path {
+        Some(path) => lines.push(ta(
+            "cli-plugin-wasm",
+            &[("path", &path.display().to_string())],
+            "WASM",
+        )),
+        None => lines.push(t("cli-plugin-wasm-none", "WASM: (skill-only plugin)")),
+    }
+    lines.push(match status {
+        PluginLoadStatus::Loads => t(
+            "cli-plugin-info-load-ok",
+            "Loads: yes. The component instantiates against this host's WIT world.",
+        ),
+        PluginLoadStatus::Fails(error) => ta(
+            "cli-plugin-info-load-failed",
+            &[("error", error)],
+            format!(
+                "Loads: no. {error}\nRebuild the plugin against the WIT shipped with this host (see wit/v0) and reinstall it."
+            ),
+        ),
+        PluginLoadStatus::NoComponent => t(
+            "cli-plugin-info-load-not-applicable",
+            "Loads: not applicable. This is a skill-only plugin, so there is no component to instantiate.",
+        ),
+    });
+    lines
 }
 
 #[cfg(feature = "plugins-wasm")]
@@ -3327,15 +3569,47 @@ fn plugin_host_with_configured_security(
     )
 }
 
+/// The `[[plugins.entries]]` instance keys a manifest's admitted bindings own.
+///
+/// One row per instance. The key is
+/// [`PluginInstanceScope::config_entry_key`][k] — `zpi1_` + Base64URL of the
+/// canonical `(package, capability, binding)` tuple — and it is the *only* key
+/// for that instance's host-owned state: the private `config` map and the
+/// `egress_hosts` grant live in the same row, resolved by the same key.
+/// Deriving it here rather than at each call site is what keeps that true.
+///
+/// A row is owed when the instance has host-owned state to hold: a private
+/// config object (`config_schema`), a declared egress destination, or a network
+/// permission whose reach the operator must grant. A manifest with none of
+/// those owns no state and gets no row.
+///
+/// The network-permission arm widens master's config-only predicate on purpose.
+/// The second grant path is the plugin whose destination *is* deployment
+/// configuration — a self-hosted Gitea, a LAN Nextcloud — which its author
+/// cannot declare, so it ships `http_client` with no `[egress]` table and often
+/// no `config_schema`. Without a row there is nowhere to author that grant:
+/// `config set plugins.entries.<key>.egress_hosts` only resolves keys already
+/// present in live config, and `plugin info` would not even print the opaque
+/// key to address. Pinned by
+/// `a_network_permission_alone_earns_a_row_so_the_operator_can_grant_reach`.
+///
+/// [k]: zeroclaw::plugins::instance::PluginInstanceScope::config_entry_key
 #[cfg(feature = "plugins-wasm")]
-fn installed_plugin_config_entries(
-    host: &zeroclaw::plugins::host::PluginHost,
-    plugin_name: &str,
+fn manifest_config_entries(
+    manifest: &zeroclaw::plugins::PluginManifest,
 ) -> Result<Vec<(zeroclaw::plugins::PluginCapability, String)>> {
-    let manifest = host
-        .manifest(plugin_name)
-        .ok_or_else(|| anyhow::Error::msg("installed plugin manifest is unavailable"))?;
-    if manifest.config_schema.is_none()
+    use zeroclaw::plugins::PluginPermission;
+    let declares_network = manifest.permissions.iter().any(|p| {
+        matches!(
+            p,
+            PluginPermission::HttpClient
+                | PluginPermission::WebSocketClient
+                | PluginPermission::SocketClient
+        )
+    });
+    let owns_state =
+        manifest.config_schema.is_some() || !manifest.egress.hosts.is_empty() || declares_network;
+    if !owns_state
         || !manifest
             .capabilities
             .contains(&zeroclaw::plugins::PluginCapability::Tool)
@@ -3346,6 +3620,8 @@ fn installed_plugin_config_entries(
     // Tool registration currently owns the only package-name runtime binding.
     // Alias-owned channel bindings must seed their actual instance key when
     // their production construction path lands; install must not invent one.
+    // A channel-only package therefore yields no entry at all — the grant
+    // ceremony stays silent for it rather than seeding a key nothing reads.
     let scope = zeroclaw::plugins::instance::PluginInstanceScope::for_package_binding(
         manifest,
         zeroclaw::plugins::PluginCapability::Tool,
@@ -3357,15 +3633,637 @@ fn installed_plugin_config_entries(
     )])
 }
 
-/// Seed empty `[[plugins.entries]]` blocks for a freshly installed plugin's
-/// canonical default instance keys. `config set
+#[cfg(feature = "plugins-wasm")]
+fn installed_plugin_config_entries(
+    host: &zeroclaw::plugins::host::PluginHost,
+    plugin_name: &str,
+) -> Result<Vec<(zeroclaw::plugins::PluginCapability, String)>> {
+    let manifest = host
+        .manifest(plugin_name)
+        .ok_or_else(|| anyhow::Error::msg("installed plugin manifest is unavailable"))?;
+    manifest_config_entries(manifest)
+}
+
+/// The destinations `plugin_name`'s manifest **declares** (its `[egress]`
+/// table), resolved from the admitted manifest at use time.
+///
+/// This is the declaration, never a grant: nothing here confers network reach.
+/// An unknown plugin and a plugin that declares nothing give the same answer —
+/// an empty list — because "declares nothing" is the same state as "no
+/// `[egress]` table".
+///
+/// A declaration also counts only with a transport that can use it:
+/// `http_client`, the one the host governs today. Without it the declared
+/// hosts are not seeded, because a row persists across `plugin remove`, and a
+/// grant seeded for a version that could not reach the network would silently
+/// become live reach when a later version of the same package adds
+/// `http_client`. That later install then meets an existing row, which is
+/// never extended, so the operator grants it deliberately. `plugin list`
+/// applies the same rule.
+#[cfg(feature = "plugins-wasm")]
+fn declared_egress_hosts(
+    host: &zeroclaw::plugins::host::PluginHost,
+    plugin_name: &str,
+) -> Vec<String> {
+    host.manifest(plugin_name)
+        .filter(|m| {
+            m.permissions
+                .contains(&zeroclaw::plugins::PluginPermission::HttpClient)
+        })
+        .map(|m| m.egress.hosts.clone())
+        .unwrap_or_default()
+}
+
+/// Print the destinations a freshly seeded instance row was granted, one line
+/// each, plus the exact command that edits the grant later.
+///
+/// The grant ceremony: installation is an explicit operator act, and the
+/// printed, persisted allowlist is its record. `package` is what the operator
+/// recognizes; `instance_key` is the opaque `zpi1_` row the grant actually
+/// lives on, and it reaches the operator inside the printed command rather than
+/// as a bare token they would have to transcribe. A manifest that declares
+/// nothing prints nothing.
+#[cfg(feature = "plugins-wasm")]
+fn print_egress_grant_ceremony(
+    config_dir: &std::path::Path,
+    package: &str,
+    instance_key: &str,
+    granted: &[String],
+) {
+    use crate::plugins::egress_ceremony::egress_set_command;
+    if granted.is_empty() {
+        return;
+    }
+    println!(
+        "{}",
+        ta(
+            "cli-plugin-egress-seeded",
+            &[("name", package), ("count", &granted.len().to_string())],
+            "Granted egress from the manifest declaration."
+        )
+    );
+    for host in granted {
+        // The literal carries indentation only; the prose is the Fluent value.
+        println!(
+            "  {}",
+            ta(
+                "cli-plugin-egress-destination",
+                &[("host", host)],
+                "-> host"
+            )
+        );
+    }
+    println!(
+        "{}",
+        ta(
+            "cli-plugin-egress-edit-command",
+            &[(
+                "command",
+                &egress_set_command(config_dir, instance_key, granted)
+            )],
+            "Edit this grant later with the printed command."
+        )
+    );
+}
+
+/// Print the declaration-versus-grant difference for an instance row that
+/// already exists, and change nothing. [`existing_egress_grant_lines`] builds
+/// what this prints.
+#[cfg(feature = "plugins-wasm")]
+fn report_existing_egress_grant(
+    config: &crate::config::schema::Config,
+    package: &str,
+    instance_key: &str,
+    declared_egress: &[String],
+) {
+    for line in existing_egress_grant_lines(config, package, instance_key, declared_egress) {
+        println!("{line}");
+    }
+}
+
+/// The lines `plugin install` prints for an instance row that already exists.
+///
+/// This is the security invariant of the ceremony: a package upgrade whose
+/// declaration grew must not extend an existing grant. The operator applies the
+/// difference deliberately, with the exact command printed here. The comparison
+/// reads the same `zpi1_` row `entry_config` resolves against, so "granted"
+/// means the one allowlist the runtime enforces.
+///
+/// Install and `plugin list` answer the same question — is this grant usable?
+/// — so they consult the same runtime-backed planner. If the runtime would
+/// refuse the row as it stands, the same verdict line `plugin list` prints
+/// comes first, with the runtime's own reason and the repair command; the
+/// upgrade difference is then computed over the entries the runtime accepts,
+/// so the apply-command never carries a rejected entry forward; and if a
+/// private carve-out would still be refused after that command, the same
+/// incomplete-repair line follows. Under a deployment-wide refusal nothing is
+/// printed here: the caller reports that once, with its own paths, and a
+/// per-row command would imply the grant could take effect when it cannot.
+#[cfg(feature = "plugins-wasm")]
+fn existing_egress_grant_lines(
+    config: &crate::config::schema::Config,
+    package: &str,
+    instance_key: &str,
+    declared_egress: &[String],
+) -> Vec<String> {
+    use crate::plugins::egress_ceremony::{
+        EgressGapPlan, EgressGrantState, deployment_rejection, diff_declaration,
+        egress_set_command, partition_valid_hosts, plan_egress_gap, should_report_diff,
+    };
+    let runtime = egress_runtime_inputs(config);
+    if deployment_rejection(&runtime).is_some() {
+        return Vec::new();
+    }
+    let (granted, allow_private) = config.plugins.entry_egress(instance_key);
+    // Called only for rows the install just found, so the row exists.
+    let state = EgressGrantState::Enforced {
+        granted: granted.clone(),
+        allow_private: allow_private.clone(),
+        row_exists: true,
+    };
+    let plan = plan_egress_gap(
+        egress_command_config_dir(config),
+        instance_key,
+        declared_egress,
+        &state,
+        &runtime,
+    );
+    let mut lines = Vec::new();
+
+    // The runtime's verdict on the row as it stands, in the same words
+    // `plugin list` uses.
+    let (rejected, repair_incomplete) = match &plan {
+        EgressGapPlan::Grant {
+            rejected,
+            repair_incomplete,
+            ..
+        } => (rejected.clone(), repair_incomplete.clone()),
+        EgressGapPlan::Nothing | EgressGapPlan::Migrate { .. } => (None, None),
+    };
+    if let (Some(reason), EgressGapPlan::Grant { command, .. }) = (&rejected, &plan) {
+        lines.push(egress_invalid_grant_line(package, reason, command));
+    }
+
+    // The upgrade difference, over the entries the runtime accepts.
+    let (accepted, _rejected_entries) = partition_valid_hosts(&granted);
+    let diff = diff_declaration(declared_egress, &accepted);
+    if should_report_diff(&diff) {
+        if !diff.declared_not_granted.is_empty() {
+            lines.push(ta(
+                "cli-plugin-egress-declared-not-granted",
+                &[
+                    ("name", package),
+                    ("count", &diff.declared_not_granted.len().to_string()),
+                ],
+                "This plugin declares destinations its config entry does not grant.",
+            ));
+            for host in &diff.declared_not_granted {
+                lines.push(format!(
+                    "  {}",
+                    ta("cli-plugin-egress-added", &[("host", host)], "+ host")
+                ));
+            }
+            lines.push(ta(
+                "cli-plugin-egress-apply-command",
+                &[(
+                    "command",
+                    &egress_set_command(
+                        egress_command_config_dir(config),
+                        instance_key,
+                        &diff.union(),
+                    ),
+                )],
+                "Grant them with the printed command.",
+            ));
+        }
+        if !diff.granted_not_declared.is_empty() {
+            lines.push(ta(
+                "cli-plugin-egress-granted-not-declared",
+                &[
+                    ("name", package),
+                    ("count", &diff.granted_not_declared.len().to_string()),
+                ],
+                "This entry grants destinations the manifest no longer declares.",
+            ));
+            for host in &diff.granted_not_declared {
+                lines.push(format!(
+                    "  {}",
+                    ta("cli-plugin-egress-removed", &[("host", host)], "- host")
+                ));
+            }
+        }
+        lines.push(ta(
+            "cli-plugin-egress-never-extended",
+            &[("name", package)],
+            "Installing a package never extends an existing egress grant.",
+        ));
+    }
+
+    // A manifest with no `[egress]` table stays quiet about operator-authored
+    // grants (see `should_report_diff`), but the row survives `plugin remove`
+    // and is keyed by package name alone, so a reinstalled package, possibly
+    // from another publisher, inherits whatever it grants. Say so once, here,
+    // where the package takes that reach over.
+    if declared_egress.is_empty()
+        && let Some(grants) = egress_grant_summary(&granted, &allow_private)
+    {
+        lines.push(ta(
+            "cli-plugin-egress-inherited",
+            &[
+                ("name", package),
+                ("grants", &grants),
+                ("key", instance_key),
+            ],
+            "This plugin declares no egress but inherits its existing config entry's grant.",
+        ));
+    }
+
+    if let Some(reason) = &repair_incomplete {
+        lines.push(egress_repair_incomplete_line(package, reason, instance_key));
+    }
+    lines
+}
+
+/// What an instance row grants, for the lines that warn a grant outlives or
+/// is inherited by a package: its hosts, then its private carve-outs. `None`
+/// when the row grants nothing.
+#[cfg(feature = "plugins-wasm")]
+fn egress_grant_summary(granted: &[String], allow_private: &[String]) -> Option<String> {
+    let mut parts = Vec::new();
+    if !granted.is_empty() {
+        parts.push(granted.join(", "));
+    }
+    if !allow_private.is_empty() {
+        parts.push(format!("private: {}", allow_private.join(", ")));
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
+/// The lines `plugin remove` prints for the package's config rows that keep an
+/// egress grant. `plugin remove` deletes the package, not its configuration,
+/// and a package installed later under the same name inherits these rows.
+#[cfg(feature = "plugins-wasm")]
+fn removed_plugin_kept_grant_lines(
+    config: &crate::config::schema::Config,
+    package: &str,
+    instance_keys: &[String],
+) -> Vec<String> {
+    instance_keys
+        .iter()
+        .filter_map(|key| {
+            let (granted, allow_private) = config.plugins.entry_egress(key);
+            egress_grant_summary(&granted, &allow_private).map(|grants| {
+                ta(
+                    "cli-plugin-removed-grant-kept",
+                    &[("name", package), ("key", key), ("grants", &grants)],
+                    "The plugin's config entry keeps its egress grant.",
+                )
+            })
+        })
+        .collect()
+}
+
+/// The one line both surfaces print when the runtime refuses a canonical row:
+/// the runtime's reason, and the command that replaces the grant with only
+/// the entries it accepts.
+#[cfg(feature = "plugins-wasm")]
+fn egress_invalid_grant_line(package: &str, reason: &str, command: &str) -> String {
+    format!(
+        "  {}",
+        ta(
+            "cli-plugin-egress-invalid-grant",
+            &[("name", package), ("reason", reason), ("command", command)],
+            "The runtime rejects this plugin's egress grant; replace it with the printed \
+             command."
+        )
+    )
+}
+
+/// The one line both surfaces print when the printed command repairs the
+/// hosts but a private carve-out would still be refused.
+#[cfg(feature = "plugins-wasm")]
+fn egress_repair_incomplete_line(package: &str, reason: &str, instance_key: &str) -> String {
+    format!(
+        "    {}",
+        ta(
+            "cli-plugin-egress-repair-incomplete",
+            &[("name", package), ("reason", reason), ("key", instance_key)],
+            "After the printed command the runtime would still reject the grant; fix \
+             egress_allow_private by hand."
+        )
+    )
+}
+
+/// The migration diagnostic, on the surface an operator already
+/// runs: for every installed `http_client` plugin, a terse report of the
+/// destinations it declares that its instance row does not grant — denials
+/// waiting to happen — and the exact command that closes the gap.
+///
+/// Only declared-but-not-granted is flagged. The reverse (granted but not
+/// declared) is the operator's own authored grant, which is a first-class
+/// grant path, not a finding.
+///
+/// A package whose bindings own no derivable instance key (a channel-only
+/// package, until its alias-aware key path lands) yields no entries and is
+/// skipped in silence: there is no row to compare against, and inventing one
+/// would report a gap against a key nothing reads.
+///
+/// [`egress_grant_gap_lines`] builds what this prints, including the ordering
+/// rule for an install whose grant is still on a legacy row.
+#[cfg(feature = "plugins-wasm")]
+fn print_egress_grant_gaps(
+    config: &crate::config::schema::Config,
+    host: &zeroclaw::plugins::host::PluginHost,
+    plugins: &[zeroclaw::plugins::PluginInfo],
+) -> Result<()> {
+    if let Some(line) = egress_deployment_gap_line(config) {
+        // Every plugin's policy is refused alike, and no per-plugin command
+        // can take effect until this is fixed, so no per-plugin lines follow.
+        println!("{line}");
+        return Ok(());
+    }
+    for p in plugins {
+        let Some(manifest) = host.manifest(&p.name) else {
+            continue;
+        };
+        for line in egress_grant_gap_lines(config, manifest)? {
+            println!("{line}");
+        }
+    }
+    Ok(())
+}
+
+/// The runtime's inputs to a plugin egress policy that live outside any one
+/// row: the same values `plugin_egress_policy` hands the constructor, so the
+/// diagnostic's verdict is the runtime's.
+#[cfg(feature = "plugins-wasm")]
+fn egress_runtime_inputs(
+    config: &crate::config::schema::Config,
+) -> crate::plugins::egress_ceremony::EgressRuntimeInputs {
+    crate::plugins::egress_ceremony::EgressRuntimeInputs {
+        nat64_prefixes: config.security.nat64_prefixes.clone(),
+        max_connections_per_instance: config.plugins.limits.max_connections_per_instance,
+    }
+}
+
+/// The configuration directory every printed grant command addresses. The
+/// loaded config's path is the resolved one — `--config-dir` and
+/// `ZEROCLAW_CONFIG_DIR` are already folded in — so a command copied from this
+/// process acts on the profile the operator inspected, not on whichever one
+/// their shell resolves by default.
+#[cfg(feature = "plugins-wasm")]
+fn egress_command_config_dir(config: &crate::config::schema::Config) -> &std::path::Path {
+    config
+        .config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+}
+
+/// One line, printed once, when the runtime would refuse *every* plugin
+/// egress policy in this deployment: a malformed `security.nat64_prefixes`
+/// or a zero `plugins.limits.max_connections_per_instance`. No row edit
+/// changes that, so it is reported here with its own paths and never as a
+/// per-plugin grant repair.
+#[cfg(feature = "plugins-wasm")]
+fn egress_deployment_gap_line(config: &crate::config::schema::Config) -> Option<String> {
+    let reason =
+        crate::plugins::egress_ceremony::deployment_rejection(&egress_runtime_inputs(config))?;
+    Some(format!(
+        "  {}",
+        ta(
+            "cli-plugin-egress-deployment-rejected",
+            &[("reason", &reason)],
+            "The runtime rejects every plugin egress policy in this deployment; check \
+             security.nat64_prefixes and plugins.limits.max_connections_per_instance."
+        )
+    ))
+}
+
+/// The lines [`print_egress_grant_gaps`] emits for one installed package,
+/// already rendered through Fluent and indented. Empty when the package has
+/// nothing to report.
+///
+/// Split out from the printing so the diagnostic's *ordering* is assertable:
+/// on a legacy install the migration step has to come before the grant
+/// command, and a test that could only inspect stdout could not pin that.
+///
+/// The decision itself lives in [`crate::plugins::egress_ceremony`]:
+/// `resolve_grant_state` separates the grant the runtime enforces (the
+/// canonical `zpi1_` row, and only that) from the grant the operator authored
+/// (stranded on a package-name row on a pre-typed-config install), and
+/// `plan_egress_gap` derives the report from that split. A stranded row always
+/// gets the rename printed, because nothing is enforced until it happens; the
+/// grant command follows only when the declaration still lacks destinations
+/// after the rename, and it always carries the authored grant forward because
+/// `config set` replaces the list. This function only renders the plan.
+#[cfg(feature = "plugins-wasm")]
+fn egress_grant_gap_lines(
+    config: &crate::config::schema::Config,
+    manifest: &zeroclaw::plugins::PluginManifest,
+) -> Result<Vec<String>> {
+    use crate::plugins::egress_ceremony::{
+        deployment_rejection, plan_egress_gap, resolve_grant_state,
+    };
+    use zeroclaw::plugins::PluginPermission;
+
+    if !manifest.permissions.contains(&PluginPermission::HttpClient) {
+        return Ok(Vec::new());
+    }
+    let package = manifest.name.clone();
+    let declared = manifest.egress.hosts.clone();
+    // Every key this call derives comes from the default tool binding, whose
+    // binding string is the package name, so the package name is the whole
+    // candidate set. An alias-aware key path extends this list, not the rule.
+    let legacy_candidates = [package.clone()];
+    let row_names: Vec<String> = config
+        .plugins
+        .entries
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect();
+    // The same inputs `plugin_egress_policy` hands the policy constructor at
+    // request time, so the diagnostic's verdict on a row is the runtime's.
+    // Under a deployment-wide refusal this prints nothing: the caller reports
+    // that once, with its own paths, and a per-row command would imply the
+    // grant could take effect when it cannot. This report only ever
+    // attributes a refusal to the row itself.
+    let runtime = egress_runtime_inputs(config);
+    if deployment_rejection(&runtime).is_some() {
+        return Ok(Vec::new());
+    }
+
+    let mut lines = Vec::new();
+    for (_, instance_key) in manifest_config_entries(manifest)? {
+        // `resolve_grant_state` answers the two questions this diagnostic must
+        // keep apart — what the runtime enforces (the canonical `zpi1_` row,
+        // and only that) versus what the operator authored (which, on a
+        // pre-typed-config install, is stranded on a package-name row the
+        // runtime never reads). `plan_egress_gap` turns the answer into the
+        // report, asking the runtime's own policy constructor whether it
+        // accepts the row; this function only renders the plan.
+        let state = resolve_grant_state(&instance_key, &legacy_candidates, &row_names, |row| {
+            config.plugins.entry_egress(row)
+        });
+        lines.extend(render_egress_gap_plan(
+            &package,
+            &instance_key,
+            &plan_egress_gap(
+                egress_command_config_dir(config),
+                &instance_key,
+                &declared,
+                &state,
+                &runtime,
+            ),
+        ));
+    }
+    Ok(lines)
+}
+
+/// Render one instance's plan as the lines `plugin list` prints. Shared with
+/// the install-time existing-row report through the two line helpers below,
+/// so both surfaces describe a refused row in exactly the same words.
+#[cfg(feature = "plugins-wasm")]
+fn render_egress_gap_plan(
+    package: &str,
+    instance_key: &str,
+    plan: &crate::plugins::egress_ceremony::EgressGapPlan,
+) -> Vec<String> {
+    use crate::plugins::egress_ceremony::EgressGapPlan;
+    let mut lines = Vec::new();
+    match plan {
+        EgressGapPlan::Nothing => {}
+        EgressGapPlan::Grant {
+            missing,
+            rejected,
+            repair_incomplete,
+            command,
+            ..
+        } => {
+            if let Some(reason) = rejected {
+                // The runtime refuses the row as it stands, so every request
+                // is denied. The command is the repair, because it carries
+                // only the entries the runtime accepts.
+                lines.push(egress_invalid_grant_line(package, reason, command));
+            }
+            if !missing.is_empty() {
+                let hosts = missing.join(", ");
+                lines.push(format!(
+                    "  {}",
+                    ta(
+                        "cli-plugin-egress-gap",
+                        &[("name", package), ("hosts", &hosts), ("command", command)],
+                        "This plugin declares destinations its entry does not grant."
+                    )
+                ));
+            }
+            if let Some(reason) = repair_incomplete {
+                lines.push(egress_repair_incomplete_line(package, reason, instance_key));
+            }
+        }
+        EgressGapPlan::Migrate {
+            legacy_row,
+            missing,
+            rejected,
+            repair_incomplete,
+            grant: Some(command),
+            ..
+        } => {
+            // Something still has to change after the rename — an uncovered
+            // destination, a row the runtime refuses, or both — so this is the
+            // numbered two-step: rename first so the grant command addresses a
+            // row that exists. Neither headline carries the command, because
+            // it only resolves after the rename.
+            if let Some(reason) = rejected {
+                lines.push(format!(
+                    "  {}",
+                    ta(
+                        "cli-plugin-egress-invalid-grant-legacy",
+                        &[("name", package), ("reason", reason)],
+                        "The runtime rejects this plugin's egress grant, and its grant is \
+                         still on a legacy config row."
+                    )
+                ));
+            }
+            if !missing.is_empty() {
+                let hosts = missing.join(", ");
+                lines.push(format!(
+                    "  {}",
+                    ta(
+                        "cli-plugin-egress-gap-legacy",
+                        &[("name", package), ("hosts", &hosts)],
+                        "This plugin declares destinations its entry does not grant, and \
+                         its grant is still on a legacy config row."
+                    )
+                ));
+            }
+            lines.push(format!(
+                "    {}",
+                ta(
+                    "cli-plugin-egress-migrate-step",
+                    &[
+                        ("name", package),
+                        ("legacy", legacy_row),
+                        ("key", instance_key),
+                    ],
+                    "1) migrate the row: rename it to the instance key, then save."
+                )
+            ));
+            lines.push(format!(
+                "    {}",
+                ta(
+                    "cli-plugin-egress-grant-step",
+                    &[("command", command)],
+                    "2) grant the destinations with the printed command."
+                )
+            ));
+            if let Some(reason) = repair_incomplete {
+                lines.push(egress_repair_incomplete_line(package, reason, instance_key));
+            }
+        }
+        EgressGapPlan::Migrate {
+            legacy_row,
+            grant: None,
+            ..
+        } => {
+            // The rename alone yields a row the runtime accepts that covers the
+            // declaration: no grant command is offered, because one would only
+            // replace a list the operator already has right.
+            lines.push(format!(
+                "  {}",
+                ta(
+                    "cli-plugin-egress-legacy-inert",
+                    &[
+                        ("name", package),
+                        ("legacy", legacy_row),
+                        ("key", instance_key),
+                    ],
+                    "This plugin's egress grant is on a legacy config row the runtime does \
+                     not read; rename the row to the instance key to put it in effect."
+                )
+            ));
+        }
+    }
+    lines
+}
+
+/// Seed `[[plugins.entries]]` blocks for a freshly installed plugin's canonical
+/// default instance keys, carrying the manifest's declared egress destinations
+/// into each row this call creates. `config set
 /// plugins.entries.<instance-key>.config.<key>` routes through natural-key path
 /// resolution, which only matches entries already present in live config.
-/// Idempotent: existing entries and operator values remain untouched.
+/// Idempotent: existing entries and operator values remain untouched — an
+/// existing row's `egress_hosts` is reported against, never rewritten.
+/// A pre-typed-config row keyed by the package name is unsupported beta state:
+/// refuse before creating a canonical row and print the same ordered update
+/// guidance as `plugin list` — including its rule that a deployment-wide
+/// refusal is reported once, on its own, with no row steps that could not
+/// take effect. The operator's old row remains untouched.
 #[cfg(feature = "plugins-wasm")]
 async fn seed_plugin_config_entries(
     config: &mut crate::config::schema::Config,
+    package: &str,
     entries: &[(zeroclaw::plugins::PluginCapability, String)],
+    declared_egress: &[String],
 ) -> Result<()> {
     if entries.is_empty() {
         return Ok(());
@@ -3393,31 +4291,180 @@ async fn seed_plugin_config_entries(
     }
 
     let mut created = Vec::new();
+    let mut existing = Vec::new();
+    let legacy_candidates = [package.to_string()];
     for (_, instance_key) in entries {
+        let row_names: Vec<String> = config
+            .plugins
+            .entries
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+        let state = crate::plugins::egress_ceremony::resolve_grant_state(
+            instance_key,
+            &legacy_candidates,
+            &row_names,
+            |row| config.plugins.entry_egress(row),
+        );
+        if matches!(
+            state,
+            crate::plugins::egress_ceremony::EgressGrantState::Stranded { .. }
+        ) {
+            // Same contract as `plugin list` and the existing-row report: under
+            // a deployment-wide refusal no per-row command can take effect, so
+            // the refusal is reported once, with its own paths, and the
+            // rename-then-grant steps wait until it is fixed. The install is
+            // still refused: the stranded row is unsupported state either way.
+            if let Some(line) = egress_deployment_gap_line(config) {
+                anyhow::bail!("{line}");
+            }
+            let plan = crate::plugins::egress_ceremony::plan_egress_gap(
+                egress_command_config_dir(config),
+                instance_key,
+                declared_egress,
+                &state,
+                &egress_runtime_inputs(config),
+            );
+            let guidance = render_egress_gap_plan(package, instance_key, &plan);
+            anyhow::bail!("{}", guidance.join("\n"));
+        }
         if config
             .create_map_key("plugins.entries", instance_key)
             .map_err(anyhow::Error::msg)?
         {
             config.mark_dirty(&format!("plugins.entries.{instance_key}"));
             created.push(instance_key);
+        } else {
+            existing.push(instance_key);
         }
     }
-    if created.is_empty() {
-        return Ok(());
+
+    // Seed the declaration into the rows just created, before the save, so the
+    // grant lands through the same dirty-path persistence the entry itself
+    // uses — one row per instance carrying both `config` and `egress_hosts`.
+    // `egress_hosts` is a plaintext sibling of the `#[secret]` `config` map, so
+    // `encrypt_secrets` leaves it readable in the file the operator audits
+    // (asserted by `seeded_egress_is_written_plaintext_beside_encrypted_config`).
+    let granted = crate::plugins::egress_ceremony::canonical_hosts(declared_egress);
+    if !granted.is_empty() {
+        for instance_key in &created {
+            config
+                .set_prop(
+                    &crate::plugins::egress_ceremony::egress_hosts_path(instance_key),
+                    &granted.join(","),
+                )
+                .with_context(|| {
+                    format!("failed to seed the declared egress allowlist for '{package}'")
+                })?;
+        }
     }
-    Box::pin(config.save_dirty()).await?;
-    for instance_key in created {
-        println!(
-            "{}",
-            ta(
-                "cli-plugin-config-entry-seeded",
-                &[("name", instance_key)],
-                "Seeded config entry. Set plugin config values with \
-                 `zeroclaw config set plugins.entries.<instance-key>.config.<key>`."
-            )
-        );
+
+    if !created.is_empty() {
+        Box::pin(config.save_dirty()).await?;
+        for instance_key in &created {
+            println!(
+                "{}",
+                ta(
+                    "cli-plugin-config-entry-seeded",
+                    &[("name", instance_key)],
+                    "Seeded config entry. Set plugin config values with \
+                     `zeroclaw config set plugins.entries.<instance-key>.config.<key>`."
+                )
+            );
+            print_egress_grant_ceremony(
+                egress_command_config_dir(config),
+                package,
+                instance_key,
+                &granted,
+            );
+        }
+    }
+
+    // Rows that already existed — an upgrade, a reinstall, or an
+    // operator-authored row. Never auto-extend: report the difference
+    // and leave `egress_hosts` exactly as the operator left it. A
+    // deployment-wide refusal is reported once, here, and the per-row report
+    // then stays silent for the same reason `plugin list` does.
+    if !existing.is_empty()
+        && let Some(line) = egress_deployment_gap_line(config)
+    {
+        println!("{line}");
+    }
+    for instance_key in existing {
+        report_existing_egress_grant(config, package, instance_key, declared_egress);
     }
     Ok(())
+}
+
+/// Publish a plugin and seed its config entries as one transaction.
+///
+/// `host.install_admitted` either performs a *fresh publish* — copying the package into
+/// the plugins directory and inserting it into the loaded set — or, when the
+/// package is already loaded, fails with `AlreadyLoaded` *before* copying
+/// anything. So the only half-installed window is a fresh publish whose config
+/// seeding then fails: the package is on disk and in the loaded set, yet the
+/// command reports an error and a naive retry would hit `AlreadyLoaded`,
+/// forcing a manual removal.
+///
+/// This closes that window. On any failure after a fresh publish the
+/// just-published package is rolled back with `host.remove` — the same removal
+/// `plugin remove` performs — so the plugins directory and the loaded set are
+/// left clean and a retry is a normal fresh install. The original seeding error
+/// is preserved and returned; if the rollback itself fails, both errors are
+/// surfaced and the package is left in place with a manual-removal instruction,
+/// never silently swallowed.
+///
+/// `announce_installed` prints the call site's own "installed" message once the
+/// publish *and* the seeding have both succeeded, so the two install paths keep
+/// their distinct user-facing text and a rolled-back install never reports
+/// success first.
+#[cfg(feature = "plugins-wasm")]
+async fn publish_and_seed_plugin(
+    host: &mut zeroclaw::plugins::host::PluginHost,
+    config: &mut crate::config::schema::Config,
+    admitted: zeroclaw::plugins::host::AdmittedSource,
+    announce_installed: impl FnOnce(&str),
+) -> Result<()> {
+    // A fresh publish: the package is now on disk and in the loaded set. An
+    // already-present package fails here, before any copy, so nothing past this
+    // point ever runs against a package this call did not itself publish.
+    let name = host.install_admitted(admitted)?;
+
+    let seed_result: Result<()> = async {
+        let config_entries = installed_plugin_config_entries(host, &name)?;
+        let declared = declared_egress_hosts(host, &name);
+        Box::pin(seed_plugin_config_entries(
+            config,
+            &name,
+            &config_entries,
+            &declared,
+        ))
+        .await?;
+        // Only now is the install committed: a seed refusal below rolls the
+        // publish back, and an install that is about to be undone must never
+        // have announced success.
+        announce_installed(&name);
+        Ok(())
+    }
+    .await;
+
+    let Err(seed_err) = seed_result else {
+        return Ok(());
+    };
+
+    // Seeding failed after a fresh publish: undo the publish so the state is
+    // clean and the operator can simply re-run the install.
+    match host.remove(&name) {
+        Ok(()) => Err(seed_err.context(format!(
+            "the plugin package '{name}' was rolled back after its configuration \
+             could not be seeded; re-run the install once the cause above is resolved"
+        ))),
+        Err(rollback_err) => Err(seed_err.context(format!(
+            "the plugin package '{name}' could not be seeded and rolling it back \
+             ALSO failed ({rollback_err}); the package is still installed — remove \
+             it with `zeroclaw plugin remove {name}` before retrying"
+        ))),
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -5924,6 +6971,15 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
             let mut degraded_nag: Option<tokio::task::JoinHandle<()>> =
                 gate_security_posture(&current_config, allow_degraded_security)?;
             let startup_feedback_enabled = !cli.verbose;
+            // Cron drivers a generation aborted that had not stopped by the time
+            // its teardown returned. Held across the reload boundary so the next
+            // generation adopts them instead of the process losing track of a
+            // task that is still doing work under superseded config.
+            let mut carried_sop_drivers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+            // Runs whose aborted driver the previous generation could not settle.
+            // The next engine restores them as active, so it has to own their
+            // terminal write too; see `SopDriverTeardown::unsettled_runs`.
+            let mut carried_unsettled_sop_runs: Vec<String> = Vec::new();
             loop {
                 if startup_feedback_enabled && daemon::stderr_is_interactive_foreground() {
                     let mut stderr = std::io::stderr().lock();
@@ -5955,33 +7011,106 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     let sop_adapters = build_sop_adapters(&current_config);
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
                         current_config.sop.clone(),
+                        &current_config.decision_models,
                         &current_config.data_dir,
                         &current_config.install_root_dir(),
                         mem,
                         sop_adapters,
                     );
+                    let unsettled = std::mem::take(&mut carried_unsettled_sop_runs);
+                    if !unsettled.is_empty() {
+                        let mut guard = match engine.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        guard.adopt_orphaned_run_settlements(unsettled.into_iter().map(|run_id| {
+                            (
+                                run_id,
+                                zeroclaw_runtime::sop::OrphanedRunSettlement::DriverAborted,
+                            )
+                        }));
+                    }
                     (Some(engine), Some(audit))
                 } else {
+                    let unsettled = std::mem::take(&mut carried_unsettled_sop_runs);
+                    if !unsettled.is_empty() {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({ "run_ids": unsettled })),
+                            "SOP runtime is disabled after reload, so runs whose driver was \
+                             aborted at teardown cannot be settled; they stay Running in the \
+                             store until the SOP runtime is enabled again"
+                        );
+                    }
                     (None, None)
                 };
 
                 // EPIC A1 + SOP cron: drive periodic maintenance and cron
                 // triggers against the shared engine for this daemon iteration.
+                // The generation-owned driver supervisor: exists whenever the
+                // SOP engine does, whether or not the maintenance tick runs.
+                let sop_driver_supervisor = if sop_engine.is_some() {
+                    Some(SopDriverSupervisor::new(std::mem::take(
+                        &mut carried_sop_drivers,
+                    )))
+                } else {
+                    let carried = std::mem::take(&mut carried_sop_drivers);
+                    if !carried.is_empty() {
+                        // No generation to adopt them: re-aborted and reported
+                        // rather than silently dropped. Production drops the
+                        // reaper's handle; the reaper owns the drivers.
+                        drop(reap_orphaned_sop_drivers(carried));
+                    }
+                    None
+                };
                 let sop_maintenance = spawn_sop_maintenance(
+                    &current_config,
                     sop_engine.as_ref(),
                     sop_audit.as_ref(),
                     current_config.sop.maintenance_interval_secs,
+                    sop_driver_supervisor
+                        .as_ref()
+                        .map(|supervisor| supervisor.drivers.clone()),
                 );
+                // Channel-ingress half of the supervisor: the sink registers
+                // every driver it spawns in the generation's supervisor set.
+                let sop_driver_sink = match (sop_driver_supervisor.as_ref(), sop_engine.as_ref()) {
+                    (Some(supervisor), Some(engine)) => {
+                        Some(zeroclaw_runtime::sop::SopDriverSink::new(
+                            current_config.clone(),
+                            std::sync::Arc::clone(engine),
+                            sop_audit.clone(),
+                            supervisor.drivers.clone(),
+                        ))
+                    }
+                    _ => None,
+                };
 
                 #[cfg(feature = "gateway")]
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
+                    let sop_dh = sop_driver_supervisor
+                        .as_ref()
+                        .map(|supervisor| supervisor.drivers.clone());
                     let plugin_webhooks = Arc::clone(&plugin_webhooks);
-                    move |host, port, config, tx, reload_controls, tui_registry, ready_tx| {
+                    move |host,
+                          port,
+                          config,
+                          tx,
+                          reload_controls,
+                          tui_registry,
+                          pairing,
+                          ready_tx| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
+                        let sop_driver_handles = sop_dh.clone();
                         let plugin_webhooks = Arc::clone(&plugin_webhooks);
                         Box::pin(async move {
                             Box::pin(zeroclaw_gateway::run_gateway_with_plugin_webhooks(
@@ -5994,9 +7123,11 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                 Some(canvas_store),
                                 sop_engine,
                                 sop_audit,
+                                pairing,
                                 zeroclaw_gateway::GatewaySupervision::new(
                                     ready_tx,
                                     plugin_webhooks,
+                                    sop_driver_handles,
                                 ),
                             ))
                             .await
@@ -6007,11 +7138,13 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 registry.register_channels(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
+                    let sop_ds = sop_driver_sink.clone();
                     let plugin_webhooks = channel_plugin_webhooks.clone();
                     move |config, cancel| {
                         let canvas_store = canvas_store_for_channels.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
+                        let sop_driver_sink = sop_ds.clone();
                         let plugin_webhooks = plugin_webhooks.clone();
                         Box::pin(async move {
                             let channels = zeroclaw_channels::orchestrator::start_channels_with_plugin_webhooks(
@@ -6021,6 +7154,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                 sop_engine,
                                 sop_audit,
                                 plugin_webhooks,
+                                sop_driver_sink,
                             );
                             Box::pin(channels).await
                         })
@@ -6031,15 +7165,18 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 registry.register_mqtt(Box::new({
                     let engine = sop_engine.clone();
                     let audit = sop_audit.clone();
+                    let driver_sink = sop_driver_sink.clone();
                     move |mqtt_config| {
                         let engine = engine.clone();
                         let audit = audit.clone();
+                        let driver_sink = driver_sink.clone();
                         Box::pin(async move {
                             if let (Some(engine), Some(audit)) = (engine, audit) {
                                 zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
                                     &mqtt_config,
                                     engine,
                                     audit,
+                                    driver_sink,
                                 )
                                 .await
                             } else {
@@ -6535,7 +7672,13 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
 
                 // Pass the shared SOP engine through the registry so
                 // RpcContext (RPC/TUI agent sessions) can share it.
-                registry.set_sop_engine(sop_engine, sop_audit);
+                registry.set_sop_engine(
+                    sop_engine,
+                    sop_audit,
+                    sop_driver_supervisor
+                        .as_ref()
+                        .map(|supervisor| supervisor.drivers.clone()),
+                );
 
                 let exit = Box::pin(daemon::run(
                     current_config.clone(),
@@ -6546,8 +7689,21 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     startup_feedback_enabled,
                 ))
                 .await;
-                if let Some(handle) = sop_maintenance {
-                    handle.abort();
+                // Before the loop re-reads config and builds a fresh SOP
+                // engine: in-flight cron drivers hold this generation's config
+                // and engine, so they must not straddle the rebuild.
+                if let Some(maintenance) = sop_maintenance {
+                    // Producer first: no new driver can register while the
+                    // supervisor's drain runs.
+                    maintenance.stop().await;
+                }
+                if let Some(supervisor) = sop_driver_supervisor {
+                    // Anything still running is carried into the next
+                    // generation rather than detached, so a driver that has not
+                    // yet reached an await point stays owned and observable.
+                    let teardown = supervisor.shutdown().await;
+                    carried_sop_drivers = teardown.still_running;
+                    carried_unsettled_sop_runs = teardown.unsettled_runs;
                 }
                 let exit = exit?;
                 match exit {
@@ -7331,6 +8487,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                     let sop_adapters = build_sop_adapters(&config);
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
                         config.sop.clone(),
+                        &config.decision_models,
                         &config.data_dir,
                         &config.install_root_dir(),
                         mem,
@@ -7341,17 +8498,51 @@ Add pricing to the active provider profile or supply a catalog entry."
                     (None, None)
                 };
                 // EPIC A1 + SOP cron: same tick as the full daemon path.
+                let sop_driver_supervisor = sop_engine
+                    .as_ref()
+                    .map(|_| SopDriverSupervisor::new(Vec::new()));
                 let sop_maintenance = spawn_sop_maintenance(
+                    &config,
                     sop_engine.as_ref(),
                     sop_audit.as_ref(),
                     config.sop.maintenance_interval_secs,
+                    sop_driver_supervisor
+                        .as_ref()
+                        .map(|supervisor| supervisor.drivers.clone()),
                 );
+                // Channel-ingress half of the supervisor: the sink registers
+                // every driver it spawns in the generation's supervisor set.
+                let sop_driver_sink = match (sop_driver_supervisor.as_ref(), sop_engine.as_ref()) {
+                    (Some(supervisor), Some(engine)) => {
+                        Some(zeroclaw_runtime::sop::SopDriverSink::new(
+                            config.clone(),
+                            std::sync::Arc::clone(engine),
+                            sop_audit.clone(),
+                            supervisor.drivers.clone(),
+                        ))
+                    }
+                    _ => None,
+                };
+
                 let result = Box::pin(channels::start_channels(
-                    config, None, cancel, sop_engine, sop_audit,
+                    config,
+                    None,
+                    cancel,
+                    sop_engine,
+                    sop_audit,
+                    sop_driver_sink,
                 ))
                 .await;
-                if let Some(handle) = sop_maintenance {
-                    handle.abort();
+                // `channel start` runs one configuration generation and exits,
+                // but drivers still hold the engine; drain them before the
+                // process tears the subsystem down.
+                if let Some(maintenance) = sop_maintenance {
+                    maintenance.stop().await;
+                }
+                if let Some(supervisor) = sop_driver_supervisor {
+                    // No next generation on this path: the process exits after
+                    // `channel start` returns, which ends any straggler.
+                    drop(supervisor.shutdown().await);
                 }
                 result
             }
@@ -7380,7 +8571,8 @@ Add pricing to the active provider profile or supply a catalog entry."
             // engine). List/Validate/Show stay local + synchronous.
             cmd @ (SopCommands::Approve { .. }
             | SopCommands::Deny { .. }
-            | SopCommands::Pending) => sop_admin_dispatch(cmd, &config).await,
+            | SopCommands::Pending
+            | SopCommands::Logs { .. }) => sop_admin_dispatch(cmd, &config).await,
             other => sop::handle_command(other, &config),
         },
 
@@ -8234,7 +9426,8 @@ Add pricing to the active provider profile or supply a catalog entry."
                     } else {
                         raw_path.to_string()
                     };
-                    if matches!(op_name, "add" | "replace") && config.ensure_map_key_for_path(&path)
+                    if matches!(op_name, "add" | "replace")
+                        && config.ensure_map_or_list_key_for_path(&path)
                     {
                         let err = ConfigApiError::new(
                             ConfigApiCode::ValidationFailed,
@@ -8559,9 +9752,25 @@ Add pricing to the active provider profile or supply a catalog entry."
 
         #[cfg(feature = "plugins-wasm")]
         Commands::Plugin { plugin_command } => match plugin_command {
-            PluginCommands::List => {
+            PluginCommands::List { verify } => {
                 let host = plugin_host_with_configured_security(&config)?;
-                plugin_catalog::print(&config, &host);
+                let plugins = host.list_plugins();
+                if verify {
+                    let limits = zeroclaw_runtime::plugin_runtime::plugin_limits(&config);
+                    let mut entries = Vec::new();
+                    for info in &plugins {
+                        entries.push((
+                            info.clone(),
+                            Some(installed_plugin_load_status(&host, info, limits).await?),
+                        ));
+                    }
+                    for line in plugin_list_lines(&entries) {
+                        println!("{line}");
+                    }
+                } else {
+                    plugin_catalog::print(&config, &host);
+                }
+                print_egress_grant_gaps(&config, &host, &plugins)?;
                 let target = config.plugins.resolved_plugins_dir().display().to_string();
                 for legacy in crate::config::schema::legacy_plugin_dirs_with_entries(&config) {
                     eprintln!(
@@ -8628,25 +9837,37 @@ Add pricing to the active provider profile or supply a catalog entry."
                 }
                 Ok(())
             }
-            PluginCommands::Install { source, registry } => {
+            PluginCommands::Install {
+                source,
+                registry,
+                no_verify,
+            } => {
                 if plugin_registry::looks_like_url(&source) {
                     bail!(
                         "`zeroclaw plugin install <url>` is not supported; use `--registry <url>` with a plugin name, or install a local plugin path"
                     );
                 }
                 let mut host = plugin_host_with_configured_security(&config)?;
+                let limits = zeroclaw_runtime::plugin_runtime::plugin_limits(&config);
                 if plugin_registry::is_local_plugin_source(&source) {
-                    let name = host.install(&source)?;
-                    let config_entries = installed_plugin_config_entries(&host, &name)?;
-                    println!(
-                        "{}",
-                        ta(
-                            "cli-plugin-installed-from",
-                            &[("source", &source)],
-                            "Plugin installed"
-                        )
-                    );
-                    Box::pin(seed_plugin_config_entries(&mut config, &config_entries)).await?;
+                    let admitted = host.admit_source(&source)?;
+                    verify_plugin_loads_or_bail(&admitted, limits, no_verify).await?;
+                    Box::pin(publish_and_seed_plugin(
+                        &mut host,
+                        &mut config,
+                        admitted,
+                        |_name| {
+                            println!(
+                                "{}",
+                                ta(
+                                    "cli-plugin-installed-from",
+                                    &[("source", &source)],
+                                    "Plugin installed"
+                                )
+                            );
+                        },
+                    ))
+                    .await?;
                 } else {
                     let registry_url = plugin_registry::registry_url(registry.as_deref());
                     println!(
@@ -8664,100 +9885,78 @@ Add pricing to the active provider profile or supply a catalog entry."
                     )
                     .await?;
                     let plugin_dir = downloaded.plugin_dir().display().to_string();
-                    let name = host.install(&plugin_dir)?;
-                    let config_entries = installed_plugin_config_entries(&host, &name)?;
-                    println!(
-                        "{}",
-                        ta(
-                            "cli-plugin-installed-name-version",
-                            &[
-                                ("name", &downloaded.manifest().name),
-                                ("version", &downloaded.manifest().version),
-                            ],
-                            "Plugin installed"
-                        )
-                    );
-                    Box::pin(seed_plugin_config_entries(&mut config, &config_entries)).await?;
+                    let admitted = host.admit_source(&plugin_dir)?;
+                    verify_plugin_loads_or_bail(&admitted, limits, no_verify).await?;
+                    Box::pin(publish_and_seed_plugin(
+                        &mut host,
+                        &mut config,
+                        admitted,
+                        |_name| {
+                            println!(
+                                "{}",
+                                ta(
+                                    "cli-plugin-installed-name-version",
+                                    &[
+                                        ("name", &downloaded.manifest().name),
+                                        ("version", &downloaded.manifest().version),
+                                    ],
+                                    "Plugin installed"
+                                )
+                            );
+                        },
+                    ))
+                    .await?;
                 }
                 Ok(())
             }
             PluginCommands::Remove { name } => {
                 let mut host = plugin_host_with_configured_security(&config)?;
+                #[cfg(feature = "plugins-wasm")]
+                let instance_keys: Vec<String> = installed_plugin_config_entries(&host, &name)
+                    .map(|entries| entries.into_iter().map(|(_, key)| key).collect())
+                    .unwrap_or_default();
                 host.remove(&name)?;
                 println!(
                     "{}",
                     ta("cli-plugin-removed", &[("name", &name)], "Plugin removed")
                 );
+                #[cfg(feature = "plugins-wasm")]
+                for line in removed_plugin_kept_grant_lines(&config, &name, &instance_keys) {
+                    println!("{line}");
+                }
                 Ok(())
             }
             PluginCommands::Info { name } => {
                 let host = plugin_host_with_configured_security(&config)?;
+                let limits = zeroclaw_runtime::plugin_runtime::plugin_limits(&config);
                 match host.get_plugin(&name) {
                     Some(info) => {
-                        println!(
-                            "{}",
-                            ta(
-                                "cli-plugin-name-version",
-                                &[("name", &info.name), ("version", &info.version)],
-                                "Plugin"
-                            )
-                        );
-                        if let Some(desc) = &info.description {
-                            println!(
-                                "{}",
-                                ta("cli-plugin-description", &[("desc", desc)], "Description")
-                            );
+                        let config_entries = installed_plugin_config_entries(&host, &info.name)?;
+                        // The load-check always runs here. "Why does my plugin
+                        // not show up?" is the question this command is reached
+                        // for, and discovery metadata cannot answer it.
+                        let status = installed_plugin_load_status(&host, &info, limits).await?;
+                        for line in plugin_info_lines(&info, &config_entries, &status) {
+                            println!("{line}");
                         }
-                        println!(
-                            "{}",
-                            ta(
-                                "cli-plugin-capabilities",
-                                &[("v", &format!("{:?}", info.capabilities))],
-                                "Capabilities"
-                            )
-                        );
-                        println!(
-                            "{}",
-                            ta(
-                                "cli-plugin-permissions",
-                                &[("v", &format!("{:?}", info.permissions))],
-                                "Permissions"
-                            )
-                        );
-                        for (capability, key) in installed_plugin_config_entries(&host, &info.name)?
-                        {
-                            println!(
-                                "{}",
-                                ta(
-                                    "cli-plugin-config-entry-key",
-                                    &[("capability", &format!("{capability:?}")), ("key", &key),],
-                                    "Config entry key"
-                                )
-                            );
-                        }
-                        match &info.wasm_path {
-                            Some(path) => println!(
-                                "{}",
-                                ta(
-                                    "cli-plugin-wasm",
-                                    &[("path", &path.display().to_string())],
-                                    "WASM"
-                                )
-                            ),
-                            None => println!(
-                                "{}",
-                                t("cli-plugin-wasm-none", "WASM: (skill-only plugin)")
-                            ),
+                        if status.is_load_failure() {
+                            // The diagnostic is already on stdout; this is the
+                            // non-zero exit a script can branch on.
+                            bail!(ta(
+                                "cli-plugin-info-load-failed-exit",
+                                &[("name", &info.name)],
+                                format!("plugin '{}' does not load against this host", info.name),
+                            ));
                         }
                     }
-                    None => println!(
-                        "{}",
-                        ta(
-                            "cli-plugin-not-found",
-                            &[("name", &name)],
-                            "Plugin not found"
-                        )
-                    ),
+                    // A name that is not installed is an error, not a report:
+                    // a script asking about a plugin must not read exit 0 as
+                    // "it is here and loads".
+                    None => bail!(ta(
+                        "cli-plugin-not-found",
+                        &[("name", &name)],
+                        "Plugin not found"
+                    )),
                 }
                 Ok(())
             }
@@ -9218,6 +10417,119 @@ async fn sop_admin_request(cmd: SopCommands, config: &crate::config::Config) -> 
             }
             Ok(())
         }
+        SopCommands::Logs {
+            run_id,
+            limit,
+            json,
+        } => {
+            let url = gateway_admin_url(&host, port, prefix, "/admin/sop/logs");
+            let resp = client
+                .get(&url)
+                .query(&[("run_id", run_id.as_str()), ("limit", &limit.to_string())])
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+                .map_err(|e| anyhow::Error::msg(format!("Failed to connect to gateway: {e}")))?;
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            if !status.is_success() {
+                let err = body
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("request failed");
+                anyhow::bail!("Gateway responded {status}: {err}");
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&body)?);
+                return Ok(());
+            }
+
+            if body
+                .get("persistence_enabled")
+                .and_then(|value| value.as_bool())
+                == Some(false)
+            {
+                println!(
+                    "{}",
+                    t("cli-sop-logs-disabled", "Log persistence is not enabled.")
+                );
+                return Ok(());
+            }
+
+            let events = body
+                .get("events")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if events.is_empty() {
+                println!(
+                    "{}",
+                    ta(
+                        "cli-sop-logs-none",
+                        &[("run_id", run_id.as_str())],
+                        "No persisted logs found for this SOP run."
+                    )
+                );
+                return Ok(());
+            }
+            println!(
+                "{}",
+                ta(
+                    "cli-sop-logs-header",
+                    &[("run_id", run_id.as_str())],
+                    "SOP run logs:"
+                )
+            );
+            for event in events.iter().rev() {
+                let timestamp = event
+                    .get("@timestamp")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?");
+                let severity = event
+                    .get("severity_text")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?");
+                let category = event
+                    .pointer("/event/category")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?");
+                let action = event
+                    .pointer("/event/action")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?");
+                let message = event
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                println!(
+                    "{}",
+                    ta(
+                        "cli-sop-logs-row",
+                        &[
+                            ("timestamp", timestamp),
+                            ("severity", severity),
+                            ("category", category),
+                            ("action", action),
+                            ("message", message),
+                        ],
+                        "  (log event)",
+                    )
+                );
+            }
+            // A retained segment the daemon could not read was left out, so the
+            // rows above are not the run's full history. Say so instead of
+            // presenting a partial timeline as complete.
+            if body.get("incomplete").and_then(|value| value.as_bool()) == Some(true) {
+                println!(
+                    "{}",
+                    t(
+                        "cli-sop-logs-incomplete",
+                        "Some retained log segments could not be read; this history may be incomplete."
+                    )
+                );
+            }
+            Ok(())
+        }
         SopCommands::Approve { run_id } => {
             let url = gateway_admin_url(&host, port, prefix, "/admin/sop/approve");
             sop_admin_post(&client, &url, serde_json::json!({ "run_id": run_id })).await
@@ -9231,7 +10543,7 @@ async fn sop_admin_request(cmd: SopCommands, config: &crate::config::Config) -> 
             )
             .await
         }
-        // List/Validate/Show are dispatched on the local synchronous path.
+        // List/Validate/Show/Graph/Delete are dispatched on the local path.
         _ => anyhow::bail!("local SOP verb reached the gateway dispatch path"),
     }
 }
@@ -10322,7 +11634,54 @@ fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapte
         route: Some(route),
         forge,
         llm,
+        decision: std::collections::HashMap::default(),
     }
+}
+
+/// Abort SOP cron drivers that no generation will adopt, and keep joining them.
+///
+/// `abort` only requests cancellation, so a driver that reaches no await point
+/// keeps running under the superseded config. Dropping its `JoinHandle` would
+/// detach that task, losing the last way to observe work still in flight — so a
+/// reaper owns the handles and joins them instead.
+///
+/// Returns the reaper's handle (`None` when nothing was still running) so a test
+/// can observe that ownership was retained rather than merely claimed.
+#[cfg(feature = "agent-runtime")]
+fn reap_orphaned_sop_drivers(
+    carried: Vec<tokio::task::JoinHandle<()>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let orphaned = carried
+        .iter()
+        .filter(|driver| !driver.is_finished())
+        .count();
+    for driver in &carried {
+        driver.abort();
+    }
+    if orphaned == 0 {
+        return None;
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({"orphaned": orphaned})),
+        "SOP cron driver(s) from a previous generation are still running, but this \
+         configuration runs no SOP maintenance to own them; re-aborted and handed to a \
+         reaper that joins them"
+    );
+    Some(::zeroclaw_spawn::spawn!(async move {
+        for driver in carried {
+            let _ = driver.await;
+        }
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({"orphaned": orphaned})),
+            "orphaned SOP cron driver(s) from a superseded generation have stopped"
+        );
+    }))
 }
 
 /// Spawn the periodic SOP maintenance tick (EPIC A1 + SOP cron): on each interval it
@@ -10330,34 +11689,43 @@ fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapte
 /// prunes terminal runs past the retention policy, and dispatches cached cron
 /// SOP triggers. Returns `None` (no task) when the tick is disabled
 /// (`interval_secs == 0`) or no SOP engine is configured. The caller owns the
-/// returned handle and aborts it when the foreground daemon/channel run exits.
-/// The tick itself self-approves nothing - timeout handling follows
+/// returned handle and shuts it down when the foreground daemon/channel run
+/// exits. The tick itself self-approves nothing - timeout handling follows
 /// `approval_timeout_action` (default `escalate`, fail-closed).
 #[cfg(feature = "agent-runtime")]
 fn spawn_sop_maintenance(
+    config: &Config,
     sop_engine: Option<&std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<&std::sync::Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     interval_secs: u64,
-) -> Option<tokio::task::JoinHandle<()>> {
+    // The generation's supervisor set: the tick registers every driver it
+    // starts here, and the supervisor — not this ticker — owns the drain.
+    drivers: Option<SopDriverSet>,
+) -> Option<SopMaintenance> {
     if interval_secs == 0 {
         return None;
     }
     let engine = sop_engine.cloned()?;
+    let drivers = drivers?;
     let audit = sop_audit.cloned();
+    let config = config.clone();
     let cron_cache = audit
         .as_ref()
         .map(|_| zeroclaw_runtime::sop::dispatch::SopCronCache::from_engine(&engine));
-    Some(::zeroclaw_spawn::spawn!(async move {
+    let tick_drivers = drivers;
+    let ticker = ::zeroclaw_spawn::spawn!(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_cron_check = chrono::Utc::now();
         loop {
             ticker.tick().await;
             let Some(report) = run_sop_maintenance_tick(
+                &config,
                 &engine,
                 audit.as_ref(),
                 cron_cache.as_ref(),
                 &mut last_cron_check,
+                &tick_drivers,
             )
             .await
             else {
@@ -10379,7 +11747,287 @@ fn spawn_sop_maintenance(
                 );
             }
         }
-    }))
+    });
+    Some(SopMaintenance { ticker })
+}
+
+/// In-flight headless drivers for one daemon generation — cron-started,
+/// channel-started, and approval-resumed alike.
+///
+/// Shared between every producer that registers drivers and the
+/// [`SopDriverSupervisor`] that drains them before the subsystem rebuilds.
+#[cfg(feature = "agent-runtime")]
+type SopDriverSet = zeroclaw_runtime::sop::SopDriverHandles;
+
+/// How long a daemon generation waits for its in-flight cron drivers to finish
+/// before aborting the stragglers. Long enough for a step already in a provider
+/// call to land, short enough that a reload is not held hostage by one.
+#[cfg(feature = "agent-runtime")]
+const SOP_DRIVER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long the shutdown waits for aborted drivers to actually stop. An aborted
+/// task ends at its next await point, so this is a grace for that hop, not a
+/// second drain — a driver still running when it expires is reported rather than
+/// waited on forever, so one wedged task cannot hold a reload open.
+#[cfg(feature = "agent-runtime")]
+const SOP_DRIVER_ABORT_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// One daemon generation's SOP maintenance tick. The drivers the tick starts
+/// register in the generation's [`SopDriverSupervisor`], which owns the drain;
+/// stopping the tick (see [`Self::stop`]) only guarantees no further producer
+/// runs while that drain finalizes the set.
+#[cfg(feature = "agent-runtime")]
+struct SopMaintenance {
+    ticker: tokio::task::JoinHandle<()>,
+}
+
+/// What one generation's driver teardown hands to the next generation.
+#[cfg(feature = "agent-runtime")]
+struct SopDriverTeardown {
+    /// Drivers aborted but not yet stopped; the next generation adopts them
+    /// (see [`SopDriverSupervisor::carried`]).
+    still_running: Vec<tokio::task::JoinHandle<()>>,
+    /// Runs whose driver was aborted but whose terminal write could not be
+    /// made here: the store refused it, or a straggler still held the engine.
+    /// Their durable rows are still `Running`, so the next generation's engine
+    /// restores them; it adopts these so its maintenance owns the settlement
+    /// instead of renewing a claim nothing will release.
+    unsettled_runs: Vec<String>,
+}
+
+/// One daemon generation's headless-driver supervisor. Every driver the
+/// generation starts — a cron tick, channel ingress, or an approval resume —
+/// registers in `drivers`, and teardown drains the set before the loop
+/// rebuilds, so no headless work straddles a reload unowned.
+///
+/// Exists whenever the SOP engine exists; the maintenance ticker is one
+/// producer among several, not the owner.
+#[cfg(feature = "agent-runtime")]
+struct SopDriverSupervisor {
+    drivers: SopDriverSet,
+    /// Drivers a previous generation aborted that had not stopped by the time
+    /// its teardown returned.
+    ///
+    /// Cancellation lands at a task's next await point, and a task that reaches
+    /// none cannot be forced. Rather than dropping those handles — which
+    /// detaches the tasks and loses every way to observe them — this generation
+    /// adopts them: [`Self::shutdown`] reports the ones still running and hands
+    /// the rest forward again, so a straggler stays owned and counted until it
+    /// actually ends. They are already aborted, so they are never waited on
+    /// again; a wedged task costs one `is_finished` check per reload, not
+    /// another drain.
+    carried: Vec<tokio::task::JoinHandle<()>>,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl SopMaintenance {
+    /// Abort the tick and JOIN it. `abort` only requests cancellation, and a
+    /// tick already inside its body can still spawn and register a driver;
+    /// awaiting the aborted handle is what guarantees no new producer runs
+    /// while the supervisor's drain below finalizes the set.
+    async fn stop(self) {
+        self.ticker.abort();
+        let _ = self.ticker.await;
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+impl SopDriverSupervisor {
+    fn new(carried: Vec<tokio::task::JoinHandle<()>>) -> Self {
+        if !carried.is_empty() {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"carried": carried.len()})),
+                "Adopted SOP driver(s) that a previous generation aborted but that had not \
+                 stopped; this generation tracks them until they do"
+            );
+        }
+        Self {
+            drivers: SopDriverSet::default(),
+            carried,
+        }
+    }
+
+    /// Let in-flight drivers finish under the configuration they started
+    /// with, aborting — and then joining — any that overrun
+    /// [`SOP_DRIVER_DRAIN_TIMEOUT`]. The caller must stop every producer
+    /// (the maintenance tick, via [`SopMaintenance::stop`]) first.
+    ///
+    /// Returns the drivers that were still running when this returned: aborted,
+    /// but not yet stopped, because cancellation only lands at a task's next
+    /// await point and one that reaches none cannot be forced. The next
+    /// generation adopts them (see [`SopMaintenance::carried`]) instead of
+    /// detaching them. **A returned handle means a task from this generation is
+    /// still executing under superseded config, for as long as it takes to
+    /// yield** — the caller cannot assume a clean boundary, only a tracked one.
+    /// Empty on every ordinary shutdown.
+    #[must_use]
+    async fn shutdown(self) -> SopDriverTeardown {
+        self.shutdown_with_deadlines(SOP_DRIVER_DRAIN_TIMEOUT, SOP_DRIVER_ABORT_JOIN_TIMEOUT)
+            .await
+    }
+
+    /// [`Self::shutdown`] with the two deadlines supplied, so a test can drive
+    /// the drain-expiry and join-expiry paths without waiting out the
+    /// production ones.
+    async fn shutdown_with_deadlines(
+        self,
+        drain_timeout: std::time::Duration,
+        abort_join_timeout: std::time::Duration,
+    ) -> SopDriverTeardown {
+        // Adopted from an earlier generation: already aborted, so they are
+        // re-checked rather than re-waited. Anything still running is handed
+        // forward again below.
+        let mut still_running: Vec<tokio::task::JoinHandle<()>> = self
+            .carried
+            .into_iter()
+            .filter(|driver| !driver.is_finished())
+            .collect();
+        // Borrowed by the drain below, not consumed: it must be able to time
+        // out without dropping the handles, because dropping a `JoinHandle`
+        // detaches its task rather than stopping it — and the abort arm still
+        // has to join them.
+        // Closed, not merely emptied. A producer can outlive the point where
+        // its generation stops accepting work — an RPC connection task can
+        // resolve an approval after the listener stopped accepting — so a
+        // driver can still arrive here. Closing makes that registration fail
+        // instead of landing in a vector this generation will never drain
+        // again.
+        let mut pending = match self.drivers.lock() {
+            Ok(mut drivers) => drivers.close_and_take_owned(),
+            Err(poisoned) => poisoned.into_inner().close_and_take_owned(),
+        };
+        if pending.is_empty() {
+            return SopDriverTeardown {
+                still_running,
+                unsettled_runs: Vec::new(),
+            };
+        }
+        // A cursor, not an iterator: when the drain deadline fires mid-loop the
+        // abort arm below has to resume where this one stopped. Awaiting a
+        // `JoinHandle` that already resolved panics ("polled after
+        // completion"), so a second pass over the whole vector would turn a
+        // mixed batch — one driver that finished in time, one that did not —
+        // into a shutdown panic instead of a carried-forward straggler.
+        let mut joined_upto = 0usize;
+        let drained = tokio::time::timeout(drain_timeout, async {
+            while joined_upto < pending.len() {
+                let _ = (&mut pending[joined_upto].handle).await;
+                joined_upto += 1;
+            }
+        })
+        .await;
+        if drained.is_ok() {
+            return SopDriverTeardown {
+                still_running,
+                unsettled_runs: Vec::new(),
+            };
+        }
+        // `abort` only *requests* cancellation: the task stops at its next
+        // await point, which is after this call returns. Joining the aborted
+        // handles is what makes the boundary real — without it the next
+        // generation could start while a straggler is still inside a provider
+        // call under the superseded config. The join is bounded in turn, so a
+        // task that reaches no await point cannot wedge the reload; it is
+        // carried forward instead, still aborted and still tracked.
+        // Only the handles the drain did not consume: the ones before the
+        // cursor already resolved, and both aborting and re-awaiting them is
+        // either a no-op or a panic.
+        let aborted_from = joined_upto;
+        for driver in &pending[aborted_from..] {
+            driver.handle.abort();
+        }
+        let joined = tokio::time::timeout(abort_join_timeout, async {
+            while joined_upto < pending.len() {
+                let _ = (&mut pending[joined_upto].handle).await;
+                joined_upto += 1;
+            }
+        })
+        .await;
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "drain_timeout_secs": drain_timeout.as_secs(),
+                    "abort_join_timeout_secs": abort_join_timeout.as_secs(),
+                    "joined_after_abort": joined.is_ok(),
+                })),
+            "SOP cron drivers did not finish before the drain deadline; aborted them so the next \
+             daemon generation does not overlap superseded configuration"
+        );
+        // Every aborted driver leaves its run `Running` and claimed with nothing
+        // to advance it, and the next generation restores active runs without
+        // starting drivers for them. Settle each one here, before that engine is
+        // built from the same store. `try_lock`, not `lock`: a straggler that has
+        // not reached an await point may hold the engine, and waiting on it
+        // would wedge the reload. A run that cannot be settled now is handed to
+        // the next generation, whose maintenance owns the retry.
+        let mut unsettled_runs = Vec::new();
+        for driver in &pending[aborted_from..] {
+            let Some((run_id, engine)) = driver.run.as_ref() else {
+                continue;
+            };
+            let settled = match engine.try_lock() {
+                Ok(mut guard) => guard
+                    .settle_orphaned_run(
+                        run_id,
+                        zeroclaw_runtime::sop::OrphanedRunSettlement::DriverAborted,
+                    )
+                    .map_err(|e| e.to_string()),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned
+                    .into_inner()
+                    .settle_orphaned_run(
+                        run_id,
+                        zeroclaw_runtime::sop::OrphanedRunSettlement::DriverAborted,
+                    )
+                    .map_err(|e| e.to_string()),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    Err("the engine is still held by a driver that has not stopped".to_string())
+                }
+            };
+            if let Err(error) = settled {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "run_id": run_id,
+                            "error": error,
+                        })),
+                    "Could not settle a SOP run whose driver was aborted at teardown; the next \
+                     generation's maintenance takes over the terminal write"
+                );
+                unsettled_runs.push(run_id.clone());
+            }
+        }
+        still_running.extend(
+            pending
+                .into_iter()
+                .filter(|driver| !driver.handle.is_finished())
+                .map(|driver| driver.handle),
+        );
+        if !still_running.is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "abort_join_timeout_secs": abort_join_timeout.as_secs(),
+                        "still_running": still_running.len(),
+                    })),
+                "SOP cron driver(s) had not stopped when the post-abort join grace expired; they \
+                 keep running under the superseded config until they reach an await point, and \
+                 the next generation starts alongside them. Carried into that generation so they \
+                 stay tracked rather than detached"
+            );
+        }
+        SopDriverTeardown {
+            still_running,
+            unsettled_runs,
+        }
+    }
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -10405,10 +12053,12 @@ impl SopMaintenanceTickReport {
 
 #[cfg(feature = "agent-runtime")]
 async fn run_sop_maintenance_tick(
+    config: &Config,
     engine: &std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>,
     audit: Option<&std::sync::Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     cron_cache: Option<&zeroclaw_runtime::sop::dispatch::SopCronCache>,
     last_cron_check: &mut chrono::DateTime<chrono::Utc>,
+    drivers: &SopDriverSet,
 ) -> Option<SopMaintenanceTickReport> {
     let maintenance = match engine.lock() {
         Ok(mut e) => e.run_maintenance_tick(),
@@ -10438,8 +12088,28 @@ async fn run_sop_maintenance_tick(
         .await;
         for result in &results {
             match result {
-                zeroclaw_runtime::sop::dispatch::DispatchResult::Started { .. } => {
+                zeroclaw_runtime::sop::dispatch::DispatchResult::Started { action, .. } => {
                     report.cron_started += 1;
+                    if matches!(
+                        action.as_ref(),
+                        zeroclaw_runtime::sop::SopRunAction::ExecuteStep { .. }
+                            | zeroclaw_runtime::sop::SopRunAction::DeterministicStep { .. }
+                    ) {
+                        // Admitted so this daemon generation can drain the
+                        // driver before a reload swaps the config and engine it
+                        // captured. Admission and creation share one lock, so a
+                        // generation that drained mid-tick refuses the driver
+                        // rather than starting one nothing will drain. Finished
+                        // handles are dropped on the way in so a long-lived
+                        // daemon does not accumulate them.
+                        zeroclaw_runtime::sop::spawn_and_register_sop_driver(
+                            drivers,
+                            config.clone(),
+                            std::sync::Arc::clone(engine),
+                            Some(std::sync::Arc::clone(audit)),
+                            action.as_ref().clone(),
+                        );
+                    }
                 }
                 zeroclaw_runtime::sop::dispatch::DispatchResult::Skipped { .. }
                 | zeroclaw_runtime::sop::dispatch::DispatchResult::Deferred { .. }
@@ -10457,7 +12127,22 @@ async fn run_sop_maintenance_tick(
                 }
             }
         }
-        zeroclaw_runtime::sop::dispatch::process_headless_results(&results);
+        let unhandled = results
+            .iter()
+            .filter(|result| {
+                !matches!(
+                    result,
+                    zeroclaw_runtime::sop::dispatch::DispatchResult::Started { action, .. }
+                        if matches!(
+                            action.as_ref(),
+                            zeroclaw_runtime::sop::SopRunAction::ExecuteStep { .. }
+                                | zeroclaw_runtime::sop::SopRunAction::DeterministicStep { .. }
+                        )
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        zeroclaw_runtime::sop::dispatch::process_headless_results(&unhandled);
     }
 
     Some(report)
@@ -10481,7 +12166,7 @@ async fn run_gateway_if_enabled(
     // manually" message, None for tui_registry (no TUI socket), and None
     // for canvas_store so the gateway falls back to its own default.
     let result = Box::pin(gateway::run_gateway(
-        host, port, config, tx, None, None, None, None, None, None,
+        host, port, config, tx, None, None, None, None, None, None, None, None,
     ))
     .await;
     // Self-respawn after the listener is released, if an in-app upgrade
@@ -12069,6 +13754,30 @@ mod tests {
             discover_desktop_app(&dirs).as_deref(),
             Some(high_bin.as_path())
         );
+    }
+
+    #[test]
+    fn sop_logs_cli_parses_run_limit_and_json_output() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "sop",
+            "logs",
+            "run-123-0001",
+            "--limit",
+            "42",
+            "--json",
+        ])
+        .expect("sop logs command should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Sop {
+                sop_command: SopCommands::Logs {
+                    run_id,
+                    limit: 42,
+                    json: true,
+                }
+            } if run_id == "run-123-0001"
+        ));
     }
 
     #[test]
@@ -13907,22 +15616,344 @@ mod tests {
         );
     }
 
+    /// Fixture for the cron-dispatch regressions: a one-step SOP on a
+    /// once-a-minute cron trigger, a mock OpenAI-compatible provider so the
+    /// step's agent turn actually completes, and the engine/audit/cache trio
+    /// the maintenance tick consumes.
+    ///
+    /// `owner` is the SOP's `agent`. `Some("sop-runner")` names the one
+    /// configured agent; `None` leaves the procedure unowned, which the
+    /// headless driver must refuse rather than borrow an identity for.
+    #[cfg(feature = "agent-runtime")]
+    struct CronSopHarness {
+        _tmp: tempfile::TempDir,
+        _server: wiremock::MockServer,
+        config: Config,
+        engine: std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>,
+        audit: std::sync::Arc<zeroclaw_runtime::sop::SopAuditLogger>,
+        cache: zeroclaw_runtime::sop::dispatch::SopCronCache,
+        drivers: SopDriverSet,
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    const CRON_SOP_AGENT: &str = "sop-runner";
+
+    #[cfg(feature = "agent-runtime")]
+    async fn cron_sop_harness(owner: Option<&str>) -> CronSopHarness {
+        cron_sop_harness_with(owner, false).await
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    fn orphaned_run_sop(name: &str) -> zeroclaw_runtime::sop::Sop {
+        use zeroclaw_runtime::sop::{
+            Sop, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger,
+        };
+        Sop {
+            name: name.into(),
+            description: "orphaned-run regression".into(),
+            version: "0.1.0".into(),
+            execution_mode: SopExecutionMode::Auto,
+            priority: SopPriority::Normal,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Step one".into(),
+                body: "Do step one".into(),
+                suggested_tools: vec![],
+                requires_confirmation: false,
+                kind: SopStepKind::default(),
+                schema: None,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 2,
+            location: None,
+            deterministic: false,
+            admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+            decision: None,
+        }
+    }
+
+    /// Start one run on `store` and return the engine holding it plus its id.
+    #[cfg(feature = "agent-runtime")]
+    fn engine_with_one_running_run(
+        name: &str,
+        store: std::sync::Arc<dyn zeroclaw_runtime::sop::SopRunStore>,
+    ) -> (
+        std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>,
+        String,
+    ) {
+        let mut engine =
+            zeroclaw_runtime::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default())
+                .with_store(store);
+        engine.set_sops_for_test(vec![orphaned_run_sop(name)]);
+        let action = engine
+            .start_run(
+                name,
+                zeroclaw_runtime::sop::SopEvent {
+                    source: zeroclaw_runtime::sop::SopTriggerSource::Manual,
+                    topic: None,
+                    payload: None,
+                    timestamp: "2026-09-24T00:00:00Z".into(),
+                },
+            )
+            .expect("the run starts");
+        let run_id = match &action {
+            zeroclaw_runtime::sop::SopRunAction::ExecuteStep { run_id, .. } => run_id.clone(),
+            other => panic!("expected the run to be ready for a driver, got {other:?}"),
+        };
+        (std::sync::Arc::new(std::sync::Mutex::new(engine)), run_id)
+    }
+
+    /// A reload that has to abort a driver mid-step must not strand its run.
+    ///
+    /// The aborted driver leaves the run `Running` and claimed, and the next
+    /// generation restores active runs without starting drivers for them. This
+    /// uses the SQLite store the daemon runs on and rebuilds the replacement
+    /// engine from the same database, because in-memory cleanup alone would
+    /// leave the durable row restorable: the run has to be terminal on disk,
+    /// with its claim released, before the next generation reads it.
     #[tokio::test]
     #[cfg(feature = "agent-runtime")]
-    async fn sop_maintenance_tick_dispatches_cached_cron_triggers() {
+    async fn an_aborted_driver_settles_its_run_before_the_next_generation_restores_it() {
+        use zeroclaw_runtime::sop::SopRunStore as _;
+        use zeroclaw_runtime::sop::types::SopRunStatus;
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let db = tmp.path().join("sop-runs.db");
+        let name = "aborted-driver";
+        let store =
+            std::sync::Arc::new(zeroclaw_runtime::sop::SqliteRunStore::open(&db).expect("store"));
+        let (engine, run_id) = engine_with_one_running_run(name, store.clone());
+        assert_eq!(
+            store.claim_counts(name).unwrap().0,
+            1,
+            "the run holds a claim"
+        );
+
+        // A driver mid-step that will not finish on its own.
+        let drivers = SopDriverSet::default();
+        assert!(zeroclaw_runtime::sop::admit_sop_driver_for_run(
+            &drivers,
+            &run_id,
+            &engine,
+            || ::zeroclaw_spawn::spawn!(std::future::pending::<()>()),
+        ));
+
+        let teardown = SopDriverSupervisor {
+            drivers,
+            carried: Vec::new(),
+        }
+        .shutdown_with_deadlines(
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            teardown.still_running.is_empty(),
+            "the aborted driver stopped"
+        );
+        assert!(
+            teardown.unsettled_runs.is_empty(),
+            "the run was settled at teardown, so nothing is handed on"
+        );
+
+        {
+            let guard = engine.lock().unwrap();
+            assert!(!guard.active_runs().contains_key(&run_id));
+            assert_eq!(
+                guard.get_run(&run_id).unwrap().status,
+                SopRunStatus::Failed,
+                "a step that was underway and did not finish is recorded as failed"
+            );
+        }
+        assert_eq!(
+            store.claim_counts(name).unwrap().0,
+            0,
+            "settlement released the claim"
+        );
+        assert!(
+            store
+                .list_events(&run_id)
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "run_driver_aborted"),
+            "the durable record says why the run ended"
+        );
+
+        // The replacement generation opens the same database.
+        let reopened =
+            std::sync::Arc::new(zeroclaw_runtime::sop::SqliteRunStore::open(&db).expect("store"));
+        let mut rebuilt =
+            zeroclaw_runtime::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default())
+                .with_store(reopened.clone());
+        rebuilt.set_sops_for_test(vec![orphaned_run_sop(name)]);
+        rebuilt.restore_runs();
+        assert!(
+            !rebuilt.active_runs().contains_key(&run_id),
+            "the next generation must not restore a settled run as active"
+        );
+        rebuilt.run_maintenance_tick();
+        assert_eq!(
+            reopened.claim_counts(name).unwrap().0,
+            0,
+            "and nothing renews a claim for it"
+        );
+    }
+
+    /// When the terminal write at teardown fails, the run is still `Running` on
+    /// disk and the next generation restores it with a renewed claim. That
+    /// generation must take over the settlement rather than hold the claim
+    /// forever with no driver.
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn a_run_teardown_could_not_settle_is_settled_by_the_next_generation() {
+        use zeroclaw_runtime::sop::SopRunStore as _;
+        use zeroclaw_runtime::sop::store::testing::FailFirstTerminalWrite;
+        use zeroclaw_runtime::sop::types::SopRunStatus;
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let db = tmp.path().join("sop-runs.db");
+        let name = "unsettled-at-teardown";
+        let store = std::sync::Arc::new(FailFirstTerminalWrite::new(
+            zeroclaw_runtime::sop::SqliteRunStore::open(&db).expect("store"),
+        ));
+        let (engine, run_id) = engine_with_one_running_run(name, store.clone());
+
+        let drivers = SopDriverSet::default();
+        assert!(zeroclaw_runtime::sop::admit_sop_driver_for_run(
+            &drivers,
+            &run_id,
+            &engine,
+            || ::zeroclaw_spawn::spawn!(std::future::pending::<()>()),
+        ));
+        let teardown = SopDriverSupervisor {
+            drivers,
+            carried: Vec::new(),
+        }
+        .shutdown_with_deadlines(
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            store.fired(),
+            "the teardown's terminal write was the one that failed"
+        );
+        assert_eq!(
+            teardown.unsettled_runs,
+            vec![run_id.clone()],
+            "a run teardown could not settle is handed to the next generation"
+        );
+        assert_eq!(
+            store.claim_counts(name).unwrap().0,
+            1,
+            "still claimed on disk"
+        );
+
+        // The next generation, as the daemon loop builds it: a fresh engine on
+        // the same store that restores active runs, then adopts the hand-off.
+        let mut next =
+            zeroclaw_runtime::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default())
+                .with_store(store.clone());
+        next.set_sops_for_test(vec![orphaned_run_sop(name)]);
+        next.restore_runs();
+        assert!(
+            next.active_runs().contains_key(&run_id),
+            "the unsettled row restores as active"
+        );
+        next.adopt_orphaned_run_settlements(teardown.unsettled_runs.into_iter().map(|run_id| {
+            (
+                run_id,
+                zeroclaw_runtime::sop::OrphanedRunSettlement::DriverAborted,
+            )
+        }));
+        let summary = next.run_maintenance_tick();
+        assert_eq!(summary.settled_orphaned_runs, 1);
+        assert!(!next.active_runs().contains_key(&run_id));
+        assert_eq!(next.get_run(&run_id).unwrap().status, SopRunStatus::Failed);
+        assert_eq!(
+            store.claim_counts(name).unwrap().0,
+            0,
+            "the next generation released the claim instead of renewing it"
+        );
+    }
+
+    /// `calls_tool`: the model asks for one tool before answering, so a test can
+    /// assert on what the step recorded having run.
+    #[cfg(feature = "agent-runtime")]
+    async fn cron_sop_harness_with(owner: Option<&str>, calls_tool: bool) -> CronSopHarness {
         use std::sync::{Arc, Mutex};
-        use zeroclaw_config::schema::{MemoryConfig, SopConfig};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, MemoryConfig, RiskProfileConfig, SopConfig,
+        };
         use zeroclaw_memory::traits::Memory;
         use zeroclaw_runtime::sop::{
             Sop, SopEngine, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger,
         };
+
+        let server = wiremock::MockServer::start().await;
+        if calls_tool {
+            // Consumed by the first request only, so the follow-up falls through
+            // to the plain answer mounted below.
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::path("/chat/completions"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({
+                        "id": "chatcmpl-tool",
+                        "object": "chat.completion",
+                        "created": 0,
+                        "model": "test-model",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": serde_json::Value::Null,
+                                "tool_calls": [{
+                                    "id": "call-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "audit_probe",
+                                        "arguments": "{}",
+                                    },
+                                }],
+                            },
+                            "finish_reason": "tool_calls",
+                        }],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                    }),
+                ))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+        }
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "test-model",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "step one done"},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                })),
+            )
+            .mount(&server)
+            .await;
 
         let mut engine = SopEngine::new(SopConfig::default());
         engine.set_sops_for_test(vec![Sop {
             name: "cron-sop".into(),
             description: "cron regression".into(),
             version: "0.1.0".into(),
-            execution_mode: SopExecutionMode::Supervised,
+            execution_mode: SopExecutionMode::Auto,
             priority: SopPriority::Normal,
             triggers: vec![SopTrigger::Cron {
                 expression: "* * * * *".into(),
@@ -13943,7 +15974,8 @@ mod tests {
             deterministic: false,
             admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
-            agent: None,
+            agent: owner.map(str::to_string),
+            decision: None,
         }]);
         let engine = Arc::new(Mutex::new(engine));
 
@@ -13957,14 +15989,859 @@ mod tests {
         let audit = Arc::new(zeroclaw_runtime::sop::SopAuditLogger::new(memory));
         let cache = zeroclaw_runtime::sop::dispatch::SopCronCache::from_engine(&engine);
 
+        let mut providers = zeroclaw_config::providers::Providers::default();
+        {
+            let base = providers
+                .models
+                .ensure("custom", "default")
+                .expect("`custom` slot must exist on ModelProviders");
+            base.api_key = Some("test-key".into());
+            base.model = Some("test-model".into());
+            base.uri = Some(server.uri());
+        }
+        let mut agents = std::collections::HashMap::new();
+        agents.insert(
+            CRON_SOP_AGENT.to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "custom.default".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        // A headless step runs under the owning agent's fail-closed approval
+        // policy, so a Supervised agent's step may only use tools it
+        // auto-approves, exactly as in a real deployment. `audit_probe` is the
+        // tool the call-recording regression asks for.
+        let mut risk_profile = RiskProfileConfig::default();
+        risk_profile.auto_approve.push("audit_probe".into());
+        let mut risk_profiles = std::collections::HashMap::new();
+        risk_profiles.insert("default".to_string(), risk_profile);
+        let mut config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            config_path: tmp.path().join("config.toml"),
+            providers,
+            agents,
+            risk_profiles,
+            ..Config::default()
+        };
+        config.reliability.provider_retries = 0;
+        config.reliability.scheduler_retries = 0;
+
+        CronSopHarness {
+            _tmp: tmp,
+            _server: server,
+            config,
+            engine,
+            audit,
+            cache,
+            drivers: SopDriverSet::default(),
+        }
+    }
+
+    /// Wait for the cron-started run to leave the active set, then return the
+    /// retained terminal run.
+    #[cfg(feature = "agent-runtime")]
+    async fn await_terminal_cron_run(
+        harness: &CronSopHarness,
+    ) -> zeroclaw_runtime::sop::types::SopRun {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                {
+                    let engine = harness.engine.lock().unwrap();
+                    if engine.active_runs().is_empty()
+                        && let Some(run) = engine.finished_runs(Some("cron-sop")).first()
+                    {
+                        return (*run).clone();
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cron-started SOP should be driven to a retained terminal run")
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_tick_drives_cached_cron_triggers() {
+        let harness = cron_sop_harness(Some(CRON_SOP_AGENT)).await;
+
         let mut last_cron_check = chrono::Utc::now() - chrono::Duration::minutes(2);
-        let report =
-            run_sop_maintenance_tick(&engine, Some(&audit), Some(&cache), &mut last_cron_check)
-                .await
-                .expect("maintenance tick should complete");
+        let report = run_sop_maintenance_tick(
+            &harness.config,
+            &harness.engine,
+            Some(&harness.audit),
+            Some(&harness.cache),
+            &mut last_cron_check,
+            &harness.drivers,
+        )
+        .await
+        .expect("maintenance tick should complete");
 
         assert_eq!(report.cron_started, 1);
-        assert_eq!(engine.lock().unwrap().active_runs().len(), 1);
+        assert_eq!(
+            harness.drivers.lock().unwrap().len(),
+            1,
+            "the tick must retain its driver so the daemon generation can drain it"
+        );
+
+        let run = await_terminal_cron_run(&harness).await;
+        // The point of the regression: the cron path must run the step through
+        // the resolved agent and SUCCEED, not merely stop being stranded.
+        assert_eq!(
+            run.status,
+            zeroclaw_runtime::sop::types::SopRunStatus::Completed,
+            "cron-started run should reach Completed, got {:?} ({:?})",
+            run.status,
+            run.step_results
+        );
+        let step = run
+            .step_results
+            .first()
+            .expect("the driven step should be recorded on the run");
+        assert_eq!(
+            step.status,
+            zeroclaw_runtime::sop::types::SopStepStatus::Completed
+        );
+        assert_eq!(
+            step.effective_agent.as_deref(),
+            Some(CRON_SOP_AGENT),
+            "the step must be attributed to the SOP's own agent"
+        );
+        assert!(
+            step.output.contains("step one done"),
+            "step output should carry the agent turn's result, got {:?}",
+            step.output
+        );
+    }
+
+    /// An unattended run is the one whose record cannot be reconstructed from a
+    /// conversation afterwards: nobody watched it, and there is no session to
+    /// read back. The headless driver recorded `tool_calls: []` regardless of
+    /// what the step actually ran, so the stored record did not merely omit the
+    /// calls, it asserted there had been none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn headless_step_records_the_tool_calls_it_made() {
+        let harness = cron_sop_harness_with(Some(CRON_SOP_AGENT), true).await;
+
+        let mut last_cron_check = chrono::Utc::now() - chrono::Duration::minutes(2);
+        run_sop_maintenance_tick(
+            &harness.config,
+            &harness.engine,
+            Some(&harness.audit),
+            Some(&harness.cache),
+            &mut last_cron_check,
+            &harness.drivers,
+        )
+        .await
+        .expect("maintenance tick should complete");
+
+        let run = await_terminal_cron_run(&harness).await;
+        let step = run
+            .step_results
+            .first()
+            .expect("the cron run executed its step");
+
+        assert!(
+            !step.tool_calls.is_empty(),
+            "a headless step must record the calls it made, got {:?}",
+            step.tool_calls
+        );
+        assert_eq!(
+            step.tool_calls[0].tool, "audit_probe",
+            "the recorded call must name the tool the step actually requested"
+        );
+    }
+
+    /// With the maintenance tick disabled entirely, the generation's driver
+    /// supervisor must still exist and drive channel-started work: a file
+    /// event through the production filesystem adapter starts an auto-mode
+    /// SOP whose driver registers in the supervisor's set and completes under
+    /// the SOP's own agent. Guards the conditional sink construction and the
+    /// adapter wiring, which a dispatch-helper regression cannot see.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn filesystem_adapter_drives_a_run_with_maintenance_disabled() {
+        use zeroclaw_runtime::sop::{
+            Sop, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger,
+        };
+
+        let harness = cron_sop_harness(Some(CRON_SOP_AGENT)).await;
+        let watch = tempfile::tempdir().expect("watch dir");
+        // Canonical, not as handed out: on macOS the temp dir sits under
+        // `/var`, a symlink to `/private/var`, and the watcher reports the
+        // resolved path. Configuring the trigger with the unresolved one makes
+        // `filesystem_path_matches` compare two spellings of the same
+        // directory and never fire, so the adapter would look broken on a
+        // platform where it is not.
+        let watch_dir = std::fs::canonicalize(watch.path()).expect("canonical watch dir");
+        {
+            let mut engine = harness.engine.lock().unwrap();
+            engine.set_sops_for_test(vec![Sop {
+                name: "fs-sop".into(),
+                description: "maintenance-disabled adapter regression".into(),
+                version: "0.1.0".into(),
+                execution_mode: SopExecutionMode::Auto,
+                priority: SopPriority::Normal,
+                triggers: vec![SopTrigger::Filesystem {
+                    path: watch_dir.to_string_lossy().into_owned(),
+                    events: vec![],
+                    condition: None,
+                }],
+                steps: vec![SopStep {
+                    number: 1,
+                    title: "Step one".into(),
+                    body: "Do step one".into(),
+                    suggested_tools: vec![],
+                    requires_confirmation: false,
+                    kind: SopStepKind::default(),
+                    schema: None,
+                    ..SopStep::default()
+                }],
+                cooldown_secs: 0,
+                max_concurrent: 2,
+                location: None,
+                deterministic: false,
+                admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
+                max_pending_approvals: 0,
+                agent: Some(CRON_SOP_AGENT.to_string()),
+                decision: None,
+            }]);
+        }
+
+        // No maintenance tick exists anywhere in this test: the supervisor's
+        // set stands alone, exactly as when `maintenance_interval_secs == 0`.
+        let supervisor_set = zeroclaw_runtime::sop::SopDriverHandles::default();
+        let sink = zeroclaw_runtime::sop::SopDriverSink::new(
+            harness.config.clone(),
+            std::sync::Arc::clone(&harness.engine),
+            Some(std::sync::Arc::clone(&harness.audit)),
+            supervisor_set.clone(),
+        );
+        let channel = zeroclaw_channels::filesystem::FilesystemChannel::new(
+            zeroclaw_channels::filesystem::FilesystemChannelConfig {
+                config: zeroclaw_config::schema::FilesystemConfig {
+                    enabled: true,
+                    paths: vec![watch_dir.to_string_lossy().into_owned()],
+                    events: vec!["created".into(), "modified".into()],
+                    debounce_ms: 50,
+                    ..Default::default()
+                },
+                alias: "fswatch".into(),
+                engine: std::sync::Arc::clone(&harness.engine),
+                audit: std::sync::Arc::clone(&harness.audit),
+                driver_sink: Some(sink),
+            },
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let listener = ::zeroclaw_spawn::spawn!(async move {
+            use zeroclaw_api::channel::Channel;
+            let _ = channel.listen(tx).await;
+        });
+        // Give the watcher a beat to arm before the event lands.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        std::fs::write(watch.path().join("event.txt"), "review please").expect("write event");
+
+        let run = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                {
+                    let engine = harness.engine.lock().unwrap();
+                    if let Some(run) = engine.finished_runs(Some("fs-sop")).first() {
+                        return (*run).clone();
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("a file event must start and finish a run with no maintenance tick");
+        assert_eq!(
+            run.status,
+            zeroclaw_runtime::sop::types::SopRunStatus::Completed,
+            "{:?}",
+            run.step_results
+        );
+        assert!(
+            !supervisor_set.lock().unwrap().is_empty(),
+            "the driver must register in the supervisor set"
+        );
+        listener.abort();
+    }
+
+    /// The channel half of the same gap: a channel-triggered auto SOP was
+    /// admitted by the shared ingress and then stranded, because no caller of
+    /// the ingress owned a driver for the run it had just started. With the
+    /// ingress carrying a `SopDriverSink`, the started run must be handed a
+    /// supervised driver and reach a retained terminal state under the SOP's
+    /// own agent.
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn channel_ingress_drives_started_run_to_terminal() {
+        use zeroclaw_runtime::sop::{
+            Sop, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger,
+        };
+
+        let harness = cron_sop_harness(Some(CRON_SOP_AGENT)).await;
+
+        // Same machinery as the cron regressions (agent, provider mock, audit,
+        // driver set) — only the trigger source changes.
+        {
+            let mut engine = harness.engine.lock().unwrap();
+            engine.set_sops_for_test(vec![Sop {
+                name: "channel-sop".into(),
+                description: "channel ingress regression".into(),
+                version: "0.1.0".into(),
+                execution_mode: SopExecutionMode::Auto,
+                priority: SopPriority::Normal,
+                triggers: vec![SopTrigger::Channel {
+                    channel: "telegram".into(),
+                    alias: None,
+                    condition: None,
+                }],
+                steps: vec![SopStep {
+                    number: 1,
+                    title: "Step one".into(),
+                    body: "Do step one".into(),
+                    suggested_tools: vec![],
+                    requires_confirmation: false,
+                    kind: SopStepKind::default(),
+                    schema: None,
+                    ..SopStep::default()
+                }],
+                cooldown_secs: 0,
+                max_concurrent: 2,
+                location: None,
+                deterministic: false,
+                admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
+                max_pending_approvals: 0,
+                agent: Some(CRON_SOP_AGENT.to_string()),
+                decision: None,
+            }]);
+        }
+
+        let sink = zeroclaw_runtime::sop::SopDriverSink::new(
+            harness.config.clone(),
+            std::sync::Arc::clone(&harness.engine),
+            Some(std::sync::Arc::clone(&harness.audit)),
+            harness.drivers.clone(),
+        );
+
+        let results = zeroclaw_runtime::sop::dispatch::dispatch_untrusted_fan_in_driven(
+            &harness.engine,
+            &harness.audit,
+            Some(&sink),
+            zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
+            Some("telegram.main:message"),
+            Some("review please"),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            results.len(),
+            1,
+            "exactly one SOP should match, got {results:?}"
+        );
+        assert!(
+            matches!(
+                &results[0],
+                zeroclaw_runtime::sop::dispatch::DispatchResult::Started { .. }
+            ),
+            "the channel event should start the SOP, got {:?}",
+            results[0]
+        );
+        assert_eq!(
+            harness.drivers.lock().unwrap().len(),
+            1,
+            "the ingress must register the started run's driver in the shared set"
+        );
+
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                {
+                    let engine = harness.engine.lock().unwrap();
+                    if engine.active_runs().is_empty()
+                        && let Some(run) = engine.finished_runs(Some("channel-sop")).first()
+                    {
+                        return (*run).clone();
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("channel-started SOP should be driven to a retained terminal run");
+
+        assert_eq!(
+            run.status,
+            zeroclaw_runtime::sop::types::SopRunStatus::Completed,
+            "channel-started run should reach Completed, got {:?} ({:?})",
+            run.status,
+            run.step_results
+        );
+        let step = run
+            .step_results
+            .first()
+            .expect("the driven step should be recorded on the run");
+        assert_eq!(
+            step.status,
+            zeroclaw_runtime::sop::types::SopStepStatus::Completed
+        );
+        assert_eq!(
+            step.effective_agent.as_deref(),
+            Some(CRON_SOP_AGENT),
+            "the step must be attributed to the SOP's own agent"
+        );
+        assert!(
+            step.output.contains("step one done"),
+            "step output should carry the agent turn's result, got {:?}",
+            step.output
+        );
+    }
+
+    /// A cron SOP with no owning agent must fail closed. Before this, the
+    /// headless driver fell back to the alphabetically first configured agent,
+    /// running an unattended procedure under an unrelated agent's provider,
+    /// workspace, tools, and risk profile.
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_tick_refuses_unowned_cron_sop() {
+        let harness = cron_sop_harness(None).await;
+
+        let mut last_cron_check = chrono::Utc::now() - chrono::Duration::minutes(2);
+        let report = run_sop_maintenance_tick(
+            &harness.config,
+            &harness.engine,
+            Some(&harness.audit),
+            Some(&harness.cache),
+            &mut last_cron_check,
+            &harness.drivers,
+        )
+        .await
+        .expect("maintenance tick should complete");
+        assert_eq!(report.cron_started, 1);
+
+        let run = await_terminal_cron_run(&harness).await;
+        assert_eq!(
+            run.status,
+            zeroclaw_runtime::sop::types::SopRunStatus::Failed,
+            "an unowned headless SOP must fail, not borrow another agent"
+        );
+        let step = run
+            .step_results
+            .first()
+            .expect("the refused step should be recorded on the run");
+        assert_eq!(
+            step.effective_agent, None,
+            "a refused step must not be attributed to any agent"
+        );
+        assert!(
+            step.output.contains("no owning agent"),
+            "the failure should name the missing owner, got {:?}",
+            step.output
+        );
+        assert!(
+            !step.output.contains(CRON_SOP_AGENT),
+            "the refusal must not fall back to the one configured agent, got {:?}",
+            step.output
+        );
+    }
+
+    /// Disabling an agent withdraws it from service. An unattended cron SOP is
+    /// the one run with nobody watching, so a disabled owner must stop it
+    /// rather than quietly keep executing under the agent the operator turned
+    /// off.
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_tick_refuses_a_disabled_owner() {
+        let mut harness = cron_sop_harness(Some(CRON_SOP_AGENT)).await;
+        harness
+            .config
+            .agents
+            .get_mut(CRON_SOP_AGENT)
+            .expect("harness configures the owning agent")
+            .enabled = false;
+
+        let mut last_cron_check = chrono::Utc::now() - chrono::Duration::minutes(2);
+        let report = run_sop_maintenance_tick(
+            &harness.config,
+            &harness.engine,
+            Some(&harness.audit),
+            Some(&harness.cache),
+            &mut last_cron_check,
+            &harness.drivers,
+        )
+        .await
+        .expect("maintenance tick should complete");
+        assert_eq!(report.cron_started, 1);
+
+        let run = await_terminal_cron_run(&harness).await;
+        assert_eq!(
+            run.status,
+            zeroclaw_runtime::sop::types::SopRunStatus::Failed,
+            "a SOP owned by a disabled agent must fail closed"
+        );
+        let step = run
+            .step_results
+            .first()
+            .expect("the refused step should be recorded on the run");
+        assert_eq!(
+            step.effective_agent, None,
+            "a refused step must not be attributed to any agent"
+        );
+        assert!(
+            step.output.contains("disabled"),
+            "the failure should name the disabled owner, got {:?}",
+            step.output
+        );
+        assert!(
+            !step.output.contains("step one done"),
+            "the step must not have run under the disabled agent, got {:?}",
+            step.output
+        );
+    }
+
+    /// `abort` only requests cancellation. Shutdown must join the handles it
+    /// aborts, or the replacement generation can start while a straggler is
+    /// still running under the superseded config — the overlap this teardown
+    /// exists to prevent.
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_shutdown_joins_the_drivers_it_aborts() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// Flips its flag when the driver task's future is dropped, which is
+        /// what actually happens when an aborted task stops.
+        struct StoppedFlag(std::sync::Arc<AtomicBool>);
+        impl Drop for StoppedFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let stopped = std::sync::Arc::new(AtomicBool::new(false));
+        let driver_flag = std::sync::Arc::clone(&stopped);
+        let drivers = SopDriverSet::default();
+        // Outlasts the drain deadline: shutdown has to abort it.
+        assert!(zeroclaw_runtime::sop::admit_sop_driver(&drivers, || {
+            ::zeroclaw_spawn::spawn!(async move {
+                let _flag = StoppedFlag(driver_flag);
+                tokio::time::sleep(std::time::Duration::from_hours(24)).await;
+            })
+        }));
+
+        // Short deadlines so the drain-expiry path runs without waiting out the
+        // production ones; the logic under test is identical.
+        let carried = SopDriverSupervisor {
+            drivers,
+            carried: Vec::new(),
+        }
+        .shutdown_with_deadlines(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "shutdown returned while an aborted driver was still running"
+        );
+        assert!(
+            carried.still_running.is_empty(),
+            "a driver that stopped on abort has nothing to carry forward"
+        );
+    }
+
+    /// A generation that adopts no drivers must still own the ones it inherited.
+    /// The flag is the point: if the reaper returned without joining — or if the
+    /// handles were dropped, which detaches the tasks — it would still be false
+    /// when the reaper finished.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn orphaned_sop_drivers_are_reaped_rather_than_detached() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let started = std::sync::Arc::new(AtomicBool::new(false));
+        let finished = std::sync::Arc::new(AtomicBool::new(false));
+        let start_flag = std::sync::Arc::clone(&started);
+        let flag = std::sync::Arc::clone(&finished);
+        // Blocking, so `abort` cannot stop it once it is polled: exactly the
+        // driver whose handle must not be dropped.
+        let driver = ::zeroclaw_spawn::spawn!(async move {
+            start_flag.store(true, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            flag.store(true, Ordering::SeqCst);
+        });
+        // Wait for the first poll. `abort` on a task the runtime has not polled
+        // yet cancels it outright, which under load would leave the driver never
+        // having run at all — a race in the test, not in the reaper.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the driver must begin before it is reaped");
+
+        let reaper = reap_orphaned_sop_drivers(vec![driver])
+            .expect("a driver still running must be reaped, not dropped");
+        tokio::time::timeout(std::time::Duration::from_secs(5), reaper)
+            .await
+            .expect("the reaper must finish once its drivers stop")
+            .expect("the reaper task itself must not fail");
+
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "the reaper must join its drivers before finishing"
+        );
+    }
+
+    /// Nothing to own: every carried driver already stopped, so there is no
+    /// reaper to spawn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn finished_drivers_need_no_reaper() {
+        let driver = ::zeroclaw_spawn::spawn!(async {});
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !driver.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+
+        assert!(
+            reap_orphaned_sop_drivers(vec![driver]).is_none(),
+            "a batch with nothing running must not spawn a reaper"
+        );
+    }
+
+    /// The drain and the post-abort join are two passes over the SAME handles.
+    /// When the drain deadline lands mid-batch — one driver already joined, one
+    /// still running — the second pass must resume at the cursor rather than
+    /// re-await a handle that already resolved: polling a completed
+    /// `JoinHandle` panics, which would turn an ordinary slow driver into a
+    /// shutdown panic whenever a sibling finished in time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_shutdown_survives_a_mixed_completion_batch() {
+        // Ordered deliberately: the first resolves at once, so the drain
+        // consumes its handle before the deadline; the second reaches no await
+        // point and outlives both deadlines.
+        // Briefly pending rather than instantly complete: admission prunes
+        // finished handles, so a zero-await task would be pruned by the next
+        // admission and this test would lose the mixed batch it exists for.
+        let drivers = SopDriverSet::default();
+        assert!(zeroclaw_runtime::sop::admit_sop_driver(&drivers, || {
+            ::zeroclaw_spawn::spawn!(async {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            })
+        }));
+        assert!(zeroclaw_runtime::sop::admit_sop_driver(&drivers, || {
+            ::zeroclaw_spawn::spawn!(async {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            })
+        }));
+        let carried = SopDriverSupervisor {
+            drivers,
+            carried: Vec::new(),
+        }
+        .shutdown_with_deadlines(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+
+        assert_eq!(
+            carried.still_running.len(),
+            1,
+            "only the driver that outlived the grace is carried; the one the drain \
+             already joined must not be awaited a second time"
+        );
+    }
+
+    /// The other half of the contract: a driver that reaches no await point
+    /// cannot be cancelled on demand, and the join grace exists so one cannot
+    /// wedge a reload. It must then be carried into the next generation rather
+    /// than dropped — dropping a `JoinHandle` detaches the task, losing the
+    /// last way to observe work still running under superseded config.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_shutdown_carries_a_driver_that_outlives_its_abort() {
+        let drivers = SopDriverSet::default();
+        // Blocking, not `tokio::time::sleep`: abort lands at the next await
+        // point, and this task deliberately reaches none while the grace runs.
+        assert!(zeroclaw_runtime::sop::admit_sop_driver(&drivers, || {
+            ::zeroclaw_spawn::spawn!(async {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            })
+        }));
+
+        let started = std::time::Instant::now();
+        let carried = SopDriverSupervisor {
+            drivers,
+            carried: Vec::new(),
+        }
+        .shutdown_with_deadlines(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+
+        assert_eq!(
+            carried.still_running.len(),
+            1,
+            "a driver still running when the join grace expired must be carried, not detached"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the join grace must bound the wait rather than block on the task"
+        );
+
+        // The next generation adopts it: already aborted, so it is re-checked
+        // and handed on again without a second drain.
+        let adopted_at = std::time::Instant::now();
+        let still_carried = SopDriverSupervisor {
+            drivers: SopDriverSet::default(),
+            carried: carried.still_running,
+        }
+        .shutdown_with_deadlines(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+
+        assert_eq!(
+            still_carried.still_running.len(),
+            1,
+            "an adopted driver that is still running stays carried"
+        );
+        assert!(
+            adopted_at.elapsed() < std::time::Duration::from_millis(500),
+            "adopting an already-aborted driver must not re-drain it"
+        );
+    }
+
+    /// A producer can outlive the point where its generation stops taking work:
+    /// the RPC listener stops accepting while its existing connection tasks keep
+    /// running, so one of them can resolve an approval after the drain has
+    /// already taken the set. The drain therefore CLOSES the set rather than
+    /// merely emptying it.
+    ///
+    /// Refusing the driver afterwards is not enough on its own. Creating the
+    /// task first and checking the generation second lets Tokio poll the driver
+    /// in between, so a rejected run can already be mutating the SOP engine
+    /// under superseded config and permissions before anything cancels it — and
+    /// cancellation is only cooperative, so a driver that reaches no await point
+    /// could not be stopped at all, only abandoned. Admission therefore creates
+    /// the task only once the generation has accepted it, which is what this
+    /// proves: the body never runs, rather than being cancelled once it has.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_driver_admitted_after_the_drain_never_starts() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let drivers = SopDriverSet::default();
+        let carried = SopDriverSupervisor {
+            drivers: std::sync::Arc::clone(&drivers),
+            carried: Vec::new(),
+        }
+        .shutdown()
+        .await;
+        assert!(
+            carried.still_running.is_empty() && carried.unsettled_runs.is_empty(),
+            "a generation with no drivers drains clean"
+        );
+        assert!(
+            drivers.lock().unwrap().is_closed(),
+            "the drain must close the set so late producers cannot join it"
+        );
+
+        // One flag for the act of creating the driver, one for the driver's own
+        // body. A closed generation may set neither: the work has to be refused
+        // before it starts, not cancelled once it has.
+        let spawned = std::sync::Arc::new(AtomicBool::new(false));
+        let body_ran = std::sync::Arc::new(AtomicBool::new(false));
+        let spawned_flag = std::sync::Arc::clone(&spawned);
+        let body_flag = std::sync::Arc::clone(&body_ran);
+
+        let admitted = zeroclaw_runtime::sop::admit_sop_driver(&drivers, || {
+            spawned_flag.store(true, Ordering::SeqCst);
+            ::zeroclaw_spawn::spawn!(async move {
+                body_flag.store(true, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_hours(24)).await;
+            })
+        });
+
+        assert!(
+            !admitted,
+            "a driver produced after its generation drained must be refused"
+        );
+        assert!(
+            !spawned.load(Ordering::SeqCst),
+            "the refused driver must never be created at all; creating it and refusing it \
+             afterwards is precisely the race this admission order closes"
+        );
+        assert!(
+            drivers.lock().unwrap().is_empty(),
+            "the refused driver must not land in the drained set"
+        );
+
+        // Give a task that should not exist every chance to run before
+        // concluding that it did not. Without this, a body that HAD started
+        // might simply not have been polled yet, and the assertion below would
+        // pass on scheduling luck rather than on the refusal.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !body_ran.load(Ordering::SeqCst),
+            "no driver body may run under a generation that has already drained"
+        );
+    }
+
+    /// The open half of the same boundary, and the control for the refusal test
+    /// above: admission creates the driver AND takes ownership of it in one
+    /// step, so the set a generation drains really does hold the task it
+    /// started — and a driver body that is allowed to run does run, which is
+    /// what stops the refusal test from passing vacuously.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_driver_admitted_into_an_open_generation_is_created_and_owned() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let drivers = SopDriverSet::default();
+        let body_ran = std::sync::Arc::new(AtomicBool::new(false));
+        let body_flag = std::sync::Arc::clone(&body_ran);
+
+        let admitted = zeroclaw_runtime::sop::admit_sop_driver(&drivers, || {
+            ::zeroclaw_spawn::spawn!(async move {
+                body_flag.store(true, Ordering::SeqCst);
+            })
+        });
+
+        assert!(admitted, "an open generation admits a driver");
+        assert_eq!(
+            drivers.lock().unwrap().len(),
+            1,
+            "the admitted driver is owned by the generation that admitted it"
+        );
+
+        let carried = SopDriverSupervisor {
+            drivers: std::sync::Arc::clone(&drivers),
+            carried: Vec::new(),
+        }
+        .shutdown()
+        .await;
+        assert!(
+            carried.still_running.is_empty() && carried.unsettled_runs.is_empty(),
+            "the admitted driver finished well inside the drain"
+        );
+        assert!(
+            body_ran.load(Ordering::SeqCst),
+            "an admitted driver's body must actually run, or the refusal test proves nothing"
+        );
     }
 
     #[test]
@@ -14108,6 +16985,2266 @@ mod tests {
         assert!(
             msg.contains("No model provider configured"),
             "error must mention missing provider; got: {msg}"
+        );
+    }
+
+    /// Runtime load verification for an *already installed* plugin.
+    ///
+    /// The install gate cannot cover a plugin installed before it existed,
+    /// installed through `--no-verify`, or one whose host was upgraded
+    /// underneath it. These are the two surfaces that can: `plugin info`
+    /// always, `plugin list --verify` on demand.
+    ///
+    /// The assertions run against the rendered lines rather than captured
+    /// stdout because those functions *are* the output. That is also what lets
+    /// the plain listing be checked for the absence of the flag's effect.
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    mod plugin_load_check {
+        use super::*;
+        use std::path::{Path, PathBuf};
+        use std::process::Command;
+        use std::sync::OnceLock;
+        use zeroclaw::plugins::host::PluginHost;
+
+        /// The wasmtime-independent part of a compile failure's cause chain.
+        /// Asserting on this rather than on translated prose keeps the test
+        /// honest under any locale the process happens to detect.
+        const LOAD_FAILURE_CAUSE: &str = "failed to load WASM component";
+
+        fn verifier_limits() -> zeroclaw::plugins::component::PluginLimits {
+            zeroclaw_runtime::plugin_runtime::plugin_limits(
+                &crate::config::schema::Config::default(),
+            )
+        }
+
+        /// The fixture package's manifest, mirroring the one the plugins
+        /// crate's end-to-end test installs.
+        const FIXTURE_MANIFEST: &str = r#"name = "tool-fixture"
+version = "0.0.0"
+wasm_path = "tool-fixture.wasm"
+capabilities = ["tool"]
+permissions = ["config_read"]
+
+[config_schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+additionalProperties = false
+
+[config_schema.properties.label]
+type = "string"
+"#;
+
+        /// This test binary sits at `<target>/<profile>/deps/<name>`, so its
+        /// own path is what locates the target directory when
+        /// `CARGO_TARGET_DIR` has moved it.
+        fn cargo_target_dir() -> PathBuf {
+            let exe = std::env::current_exe().expect("test binary path");
+            exe.ancestors()
+                .nth(3)
+                .expect("test binary should sit under <target>/<profile>/deps/")
+                .to_path_buf()
+        }
+
+        /// Build the in-tree tool component once per test binary. There is no
+        /// skip path: a fixture that cannot be built is a test failure, not a
+        /// silently green run.
+        fn tool_fixture() -> PathBuf {
+            static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
+            FIXTURE
+                .get_or_init(|| {
+                    let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("crates/zeroclaw-plugins/tests/fixtures/tool-fixture");
+                    // Its own target directory, so the nested Cargo invocation
+                    // cannot contend with this test process's build lock.
+                    let target_dir = cargo_target_dir().join("tmp/plugin-load-check-fixture");
+                    let status = Command::new(env!("CARGO"))
+                        .current_dir(&fixture_dir)
+                        .args([
+                            "build",
+                            "--locked",
+                            "--quiet",
+                            "--package",
+                            "zeroclaw-tool-plugin-fixture",
+                            "--target",
+                            "wasm32-wasip2",
+                            "--target-dir",
+                        ])
+                        .arg(&target_dir)
+                        .status()
+                        .expect("run Cargo for the tool component fixture");
+                    assert!(
+                        status.success(),
+                        "tool fixture must build; install the wasm32-wasip2 target"
+                    );
+
+                    let wasm =
+                        target_dir.join("wasm32-wasip2/debug/zeroclaw_tool_plugin_fixture.wasm");
+                    assert!(wasm.is_file(), "tool fixture WASM was not produced");
+                    wasm
+                })
+                .clone()
+        }
+
+        /// Seed a throwaway config directory and install the fixture into it
+        /// through the real `PluginHost::install`, so the package under test is
+        /// laid out exactly as `zeroclaw plugin install` leaves one.
+        fn install_fixture(workspace: &Path) -> PluginHost {
+            let source = workspace.join("source/tool-fixture");
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::copy(tool_fixture(), source.join("tool-fixture.wasm")).unwrap();
+            std::fs::write(source.join("manifest.toml"), FIXTURE_MANIFEST).unwrap();
+
+            let mut host = PluginHost::new(workspace).expect("throwaway plugin host");
+            let installed = host
+                .install(source.to_str().expect("utf-8 temp path"))
+                .expect("install the in-tree tool fixture");
+            assert_eq!(installed, "tool-fixture");
+            host
+        }
+
+        #[tokio::test]
+        async fn plugin_info_reports_that_the_installed_fixture_loads() {
+            let workspace = tempfile::tempdir().unwrap();
+            let host = install_fixture(workspace.path());
+            let info = host
+                .get_plugin("tool-fixture")
+                .expect("the installed fixture is discovered");
+            let config_entries = installed_plugin_config_entries(&host, &info.name).unwrap();
+
+            let status = installed_plugin_load_status(&host, &info, verifier_limits())
+                .await
+                .unwrap();
+            assert!(
+                matches!(status, PluginLoadStatus::Loads),
+                "the in-tree tool fixture must load against this host; got {status:?}"
+            );
+
+            let lines = plugin_info_lines(&info, &config_entries, &status);
+            assert!(
+                lines.iter().any(|line| line.contains("tool-fixture")),
+                "info must name the plugin: {lines:#?}"
+            );
+            assert!(
+                !lines.iter().any(|line| line.contains(LOAD_FAILURE_CAUSE)),
+                "a plugin that loads must carry no load failure: {lines:#?}"
+            );
+            // The verdict is a rendered line, not an implied one: the same
+            // plugin under a different verdict must end differently.
+            let other = plugin_info_lines(&info, &config_entries, &PluginLoadStatus::NoComponent);
+            assert_eq!(lines.len(), other.len(), "one verdict line either way");
+            assert_ne!(
+                lines.last(),
+                other.last(),
+                "the last line must be the verdict: {lines:#?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn load_verdict_uses_the_runtime_resolved_plugin_limits() {
+            let workspace = tempfile::tempdir().unwrap();
+            let host = install_fixture(workspace.path());
+            let info = host
+                .get_plugin("tool-fixture")
+                .expect("the installed fixture is discovered");
+
+            let mut constrained = crate::config::schema::Config::default();
+            constrained.plugins.limits.max_instances = 1;
+            let constrained_status = installed_plugin_load_status(
+                &host,
+                &info,
+                zeroclaw_runtime::plugin_runtime::plugin_limits(&constrained),
+            )
+            .await
+            .expect("the load verdict is reported, not raised");
+            assert!(
+                matches!(constrained_status, PluginLoadStatus::Fails(_)),
+                "a limit below the component's required instances must not report loads: {constrained_status:?}"
+            );
+
+            let default_status = installed_plugin_load_status(&host, &info, verifier_limits())
+                .await
+                .expect("the load verdict is reported, not raised");
+            assert!(
+                matches!(default_status, PluginLoadStatus::Loads),
+                "the same component must load under the default runtime limits: {default_status:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn plugin_info_and_list_verify_expose_a_plugin_that_no_longer_loads() {
+            let workspace = tempfile::tempdir().unwrap();
+            let installed = install_fixture(workspace.path());
+            let wasm = installed
+                .get_plugin("tool-fixture")
+                .and_then(|info| info.wasm_path)
+                .expect("the fixture ships a component");
+
+            // Replace the installed component with an artifact this host cannot
+            // instantiate. Discovery is unaffected: the manifest is intact and
+            // the file exists, which is the whole reported state a plain
+            // listing has to go on. Each CLI invocation builds a fresh host
+            // that admits the installed bytes from disk, so the check below
+            // uses one too rather than the host that did the install.
+            std::fs::write(&wasm, b"not a wasm component").unwrap();
+            let host = PluginHost::new(workspace.path()).expect("rediscover the installed plugin");
+            let info = host
+                .get_plugin("tool-fixture")
+                .expect("the replaced component is still discovered");
+            let config_entries = installed_plugin_config_entries(&host, &info.name).unwrap();
+            assert!(
+                info.loaded,
+                "discovery still calls the package loaded, which is why the check is needed"
+            );
+
+            let status = installed_plugin_load_status(&host, &info, verifier_limits())
+                .await
+                .unwrap();
+            let PluginLoadStatus::Fails(cause) = &status else {
+                panic!("a non-component artifact must not report as loading; got {status:?}");
+            };
+            assert!(
+                cause.contains(LOAD_FAILURE_CAUSE),
+                "the verdict must carry the cause chain; got: {cause}"
+            );
+
+            let lines = plugin_info_lines(&info, &config_entries, &status);
+            assert!(
+                lines
+                    .last()
+                    .is_some_and(|line| line.contains(LOAD_FAILURE_CAUSE)),
+                "plugin info must end on the failure and its cause: {lines:#?}"
+            );
+
+            // `plugin list --verify` annotates the row; plain `plugin list`
+            // renders exactly what it rendered before the flag existed.
+            let verified = plugin_list_lines(&[(info.clone(), Some(status))]);
+            let plain = plugin_list_lines(&[(info.clone(), None)]);
+            assert_eq!(plain.len(), 2, "header plus one row: {plain:#?}");
+            assert_eq!(verified.len(), 2, "header plus one row: {verified:#?}");
+            assert_eq!(plain[0], verified[0], "the header is not verdict-dependent");
+            assert!(
+                plain[1].starts_with("  tool-fixture v0.0.0 — "),
+                "plain row shape is unchanged: {:?}",
+                plain[1]
+            );
+            assert!(
+                !plain[1].contains(LOAD_FAILURE_CAUSE),
+                "plain list must not run the check: {:?}",
+                plain[1]
+            );
+            assert!(
+                verified[1].starts_with("  tool-fixture v0.0.0 — "),
+                "the verified row keeps the same identity prefix: {:?}",
+                verified[1]
+            );
+            assert!(
+                verified[1].contains(LOAD_FAILURE_CAUSE),
+                "the verified row must name the failure: {:?}",
+                verified[1]
+            );
+        }
+
+        #[test]
+        fn plugin_list_verify_reports_a_skill_only_package_as_not_applicable() {
+            // A package with no component is not a failure: there is nothing to
+            // instantiate, and reporting one as broken would train operators to
+            // ignore the column.
+            let info = zeroclaw::plugins::PluginInfo {
+                name: "skills-only".to_string(),
+                version: "1.0.0".to_string(),
+                description: Some("markdown bundle".to_string()),
+                capabilities: vec![zeroclaw::plugins::PluginCapability::Skill],
+                permissions: Vec::new(),
+                wasm_path: None,
+                loaded: true,
+            };
+
+            let lines = plugin_list_lines(&[(info.clone(), Some(PluginLoadStatus::NoComponent))]);
+            assert_eq!(lines.len(), 2, "{lines:#?}");
+            assert!(
+                lines[1].starts_with("  skills-only v1.0.0 — markdown bundle"),
+                "{:?}",
+                lines[1]
+            );
+            assert!(
+                !lines[1].contains(LOAD_FAILURE_CAUSE),
+                "a component-less package must not read as a load failure: {:?}",
+                lines[1]
+            );
+            let plain = plugin_list_lines(&[(info.clone(), None)]);
+            assert_ne!(
+                lines[1], plain[1],
+                "--verify must still say something about a component-less package"
+            );
+
+            let info_lines = plugin_info_lines(&info, &[], &PluginLoadStatus::NoComponent);
+            assert!(
+                !info_lines
+                    .iter()
+                    .any(|line| line.contains(LOAD_FAILURE_CAUSE)),
+                "{info_lines:#?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_skill_only_package_is_not_applicable_rather_than_a_failure() {
+            // A markdown bundle rides the same install machinery but ships no
+            // component. Reporting it as a load failure would train an operator
+            // to ignore the verdict, so the check must short-circuit before it
+            // ever reaches the instantiator.
+            let workspace = tempfile::tempdir().unwrap();
+            let source = workspace.path().join("source/skills-only");
+            std::fs::create_dir_all(source.join("skills/greet")).unwrap();
+            std::fs::write(
+                source.join("manifest.toml"),
+                "name = \"skills-only\"\n\
+                 version = \"1.0.0\"\n\
+                 capabilities = [\"skill\"]\n",
+            )
+            .unwrap();
+            std::fs::write(
+                source.join("skills/greet/SKILL.md"),
+                "---\nname: greet\ndescription: say hello\n---\n\nHello.\n",
+            )
+            .unwrap();
+
+            let mut host = PluginHost::new(workspace.path()).expect("throwaway plugin host");
+            host.install(source.to_str().expect("utf-8 temp path"))
+                .expect("install the skill-only package");
+            let info = host
+                .get_plugin("skills-only")
+                .expect("the skill bundle is discovered");
+            assert!(info.wasm_path.is_none(), "the fixture ships no component");
+
+            let status = installed_plugin_load_status(&host, &info, verifier_limits())
+                .await
+                .unwrap();
+            assert!(
+                matches!(status, PluginLoadStatus::NoComponent),
+                "a component-less package is not applicable, not broken; got {status:?}"
+            );
+            assert!(!status.is_load_failure(), "and must not fail the exit code");
+        }
+
+        #[test]
+        fn only_a_real_load_failure_makes_plugin_info_exit_non_zero() {
+            // The exit code is the scriptable part of the contract. A package
+            // with no component must not be reported as broken.
+            assert!(PluginLoadStatus::Fails("boom".to_string()).is_load_failure());
+            assert!(!PluginLoadStatus::Loads.is_load_failure());
+            assert!(!PluginLoadStatus::NoComponent.is_load_failure());
+        }
+
+        #[test]
+        fn plugin_list_without_verify_renders_no_verdict() {
+            let info = zeroclaw::plugins::PluginInfo {
+                name: "some-plugin".to_string(),
+                version: "0.2.0".to_string(),
+                description: None,
+                capabilities: vec![zeroclaw::plugins::PluginCapability::Tool],
+                permissions: Vec::new(),
+                wasm_path: Some(PathBuf::from("/nonexistent/some-plugin.wasm")),
+                loaded: false,
+            };
+
+            let plain = plugin_list_lines(&[(info, None)]);
+            assert_eq!(plain.len(), 2, "{plain:#?}");
+            assert!(
+                plain[1].starts_with("  some-plugin v0.2.0 — "),
+                "{:?}",
+                plain[1]
+            );
+            assert!(
+                plugin_list_lines(&[]).len() == 1,
+                "an empty listing is the single 'no plugins' line"
+            );
+        }
+    }
+
+    /// A config rooted in `dir` with secret encryption on and an existing
+    /// `config.toml`, so `save_dirty` takes its incremental path and
+    /// `encrypt_secrets` has a key directory to work in.
+    #[cfg(feature = "plugins-wasm")]
+    fn config_in_dir(dir: &std::path::Path) -> crate::config::schema::Config {
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "schema_version = 0\n").expect("seed config file");
+        let mut config = crate::config::schema::Config::default();
+        config.config_path = path;
+        config.secrets.encrypt = true;
+        config
+    }
+
+    /// Build an admitted-shape manifest from TOML, the way a real plugin ships
+    /// one, so the instance key derives from the same fields production reads.
+    #[cfg(feature = "plugins-wasm")]
+    fn manifest_from_toml(src: &str) -> zeroclaw::plugins::PluginManifest {
+        toml::from_str(src).expect("test manifest must parse")
+    }
+
+    /// A tool manifest declaring `hosts` and requesting `permissions`, with a
+    /// config schema unless `with_config_schema` is false.
+    #[cfg(feature = "plugins-wasm")]
+    fn tool_manifest_with(
+        name: &str,
+        hosts: &[&str],
+        permissions: &[&str],
+        with_config_schema: bool,
+    ) -> zeroclaw::plugins::PluginManifest {
+        let quote = |xs: &[&str]| -> String {
+            xs.iter()
+                .map(|x| format!("\"{x}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let schema = if with_config_schema {
+            "config_schema = { type = \"object\" }\n"
+        } else {
+            ""
+        };
+        manifest_from_toml(&format!(
+            "name = \"{name}\"\n\
+             version = \"1.0.0\"\n\
+             wasm_path = \"plugin.wasm\"\n\
+             capabilities = [\"tool\"]\n\
+             permissions = [{}]\n\
+             {schema}\
+             [egress]\n\
+             hosts = [{}]\n",
+            quote(permissions),
+            quote(hosts)
+        ))
+    }
+
+    /// The common case: a tool plugin that requests `http_client`.
+    #[cfg(feature = "plugins-wasm")]
+    fn tool_manifest(
+        name: &str,
+        hosts: &[&str],
+        with_config_schema: bool,
+    ) -> zeroclaw::plugins::PluginManifest {
+        tool_manifest_with(name, hosts, &["http_client"], with_config_schema)
+    }
+
+    /// The `zpi1_` key production derives for a package's default tool binding.
+    #[cfg(feature = "plugins-wasm")]
+    fn expected_instance_key(manifest: &zeroclaw::plugins::PluginManifest) -> String {
+        zeroclaw::plugins::instance::PluginInstanceScope::for_package_binding(
+            manifest,
+            zeroclaw::plugins::PluginCapability::Tool,
+            std::iter::empty(),
+        )
+        .expect("scope must derive")
+        .id()
+        .config_entry_key()
+        .expect("instance key must derive")
+    }
+
+    /// Read the `[[plugins.entries]]` table named `name` back off disk.
+    #[cfg(feature = "plugins-wasm")]
+    fn entry_on_disk(path: &std::path::Path, name: &str) -> toml::Table {
+        let raw = std::fs::read_to_string(path).expect("config file must exist after save");
+        let doc: toml::Table = toml::from_str(&raw).expect("saved config must be valid TOML");
+        doc.get("plugins")
+            .and_then(toml::Value::as_table)
+            .and_then(|p| p.get("entries"))
+            .and_then(toml::Value::as_array)
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|e| e.get("name").and_then(toml::Value::as_str) == Some(name))
+            })
+            .and_then(toml::Value::as_table)
+            .cloned()
+            .unwrap_or_else(|| panic!("no [[plugins.entries]] row named '{name}' on disk"))
+    }
+
+    /// THE unification invariant (typed instance config plus the egress
+    /// grant): `plugin install` seeds the egress grant onto the SAME `zpi1_`
+    /// instance-key row
+    /// that carries the instance's private config — one row per instance,
+    /// never one row for config and a second keyed by the package name.
+    ///
+    /// Pinned as observable state: the row's `name` on disk is the derived
+    /// instance key, that row carries the grant, and no package-name-keyed row
+    /// exists at all.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn install_seeds_egress_onto_the_instance_key_row_not_a_package_name_row() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let path = config.config_path.clone();
+
+        let manifest = tool_manifest("weather-tool", &["api.example.com"], true);
+        let instance_key = expected_instance_key(&manifest);
+        assert!(
+            instance_key.starts_with("zpi1_"),
+            "the entry key must be the opaque instance key; got {instance_key}"
+        );
+        assert_ne!(
+            instance_key, "weather-tool",
+            "the instance key must not collapse to the package name"
+        );
+
+        let entries = manifest_config_entries(&manifest).expect("entries must derive");
+        seed_plugin_config_entries(
+            &mut config,
+            "weather-tool",
+            &entries,
+            &manifest.egress.hosts,
+        )
+        .await
+        .expect("seeding a fresh entry must succeed");
+
+        // Exactly one row, keyed by the instance key, carrying the grant.
+        assert_eq!(
+            config.plugins.entries.len(),
+            1,
+            "one row per instance: {:?}",
+            config
+                .plugins
+                .entries
+                .iter()
+                .map(|e| e.name.clone())
+                .collect::<Vec<_>>()
+        );
+        let entry = &config.plugins.entries[0];
+        assert_eq!(
+            entry.name, instance_key,
+            "the seeded row must be keyed by the instance key"
+        );
+        assert_eq!(entry.egress_hosts, vec!["api.example.com".to_string()]);
+
+        // The same row is the one `entry_egress` resolves — the read `plugin
+        // list` and the runtime policy both perform.
+        let (granted, _private) = config.plugins.entry_egress(&instance_key);
+        assert_eq!(
+            granted,
+            vec!["api.example.com".to_string()],
+            "entry_egress must resolve the grant by instance key"
+        );
+        assert!(
+            config.plugins.entry_egress("weather-tool").0.is_empty(),
+            "no package-name-keyed row may carry the grant"
+        );
+
+        // And it is the instance key that persists to disk.
+        let on_disk = entry_on_disk(&path, &instance_key);
+        let hosts: Vec<&str> = on_disk
+            .get("egress_hosts")
+            .and_then(toml::Value::as_array)
+            .expect("egress_hosts must be persisted")
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect();
+        assert_eq!(hosts, vec!["api.example.com"]);
+        let raw = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            !raw.contains("name = \"weather-tool\""),
+            "install must not write a package-name-keyed entry:\n{raw}"
+        );
+    }
+
+    /// Grant ceremony, install half: the declaration seeds the row it
+    /// just created, and it lands as a PLAINTEXT sibling of the encrypted
+    /// `config` map — the allowlist is what the operator audits, so it has to
+    /// be readable in the file they audit.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn seeded_egress_is_written_plaintext_beside_encrypted_config() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let path = config.config_path.clone();
+
+        let manifest = tool_manifest(
+            "weather-tool",
+            &["api.example.com", "*.cdn.example.com"],
+            true,
+        );
+        let instance_key = expected_instance_key(&manifest);
+        let entries = manifest_config_entries(&manifest).expect("entries must derive");
+        seed_plugin_config_entries(
+            &mut config,
+            "weather-tool",
+            &entries,
+            &manifest.egress.hosts,
+        )
+        .await
+        .expect("seeding a fresh entry must succeed");
+
+        // In memory: the grant is on the plaintext field, canonicalized, and
+        // nothing leaked into the secret map.
+        let entry = config
+            .plugins
+            .entries
+            .iter()
+            .find(|e| e.name == instance_key)
+            .expect("install must seed an entry");
+        assert_eq!(
+            entry.egress_hosts,
+            vec![
+                "*.cdn.example.com".to_string(),
+                "api.example.com".to_string()
+            ],
+            "the declaration must seed egress_hosts, sorted and canonical"
+        );
+        assert!(
+            entry.config.is_empty(),
+            "egress must never be written into the #[secret] config map: {:?}",
+            entry.config
+        );
+
+        // Now add a genuine secret through the same call the CLI's `zeroclaw
+        // config set` makes, so the file carries both kinds of value and the
+        // save path can be shown to treat them differently.
+        config
+            .set_prop_persistent(
+                &format!("plugins.entries.{instance_key}.config.api_key"),
+                "sk-not-real",
+            )
+            .expect("plugin config values must be settable");
+        Box::pin(config.save_dirty())
+            .await
+            .expect("save must succeed");
+
+        let on_disk = entry_on_disk(&path, &instance_key);
+        let hosts: Vec<&str> = on_disk
+            .get("egress_hosts")
+            .and_then(toml::Value::as_array)
+            .expect("egress_hosts must be persisted")
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect();
+        assert_eq!(
+            hosts,
+            vec!["*.cdn.example.com", "api.example.com"],
+            "the granted allowlist must be readable plaintext on disk"
+        );
+        for host in &hosts {
+            assert!(
+                !host.starts_with("enc2:"),
+                "egress destinations must not be encrypted: {host}"
+            );
+        }
+        let api_key = on_disk
+            .get("config")
+            .and_then(toml::Value::as_table)
+            .and_then(|c| c.get("api_key"))
+            .and_then(toml::Value::as_str)
+            .expect("the secret config value must be persisted");
+        assert!(
+            api_key.starts_with("enc2:"),
+            "secret config values must still encrypt at rest; got {api_key}"
+        );
+    }
+
+    /// Grant ceremony, upgrade half and the security invariant of this
+    /// stage: an install that finds an EXISTING instance row never extends its
+    /// allowlist, however much the new manifest declares. The operator applies
+    /// the difference deliberately.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn install_never_auto_extends_an_existing_egress_grant() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let path = config.config_path.clone();
+
+        // v1: one declared destination, seeded at first install.
+        let v1 = tool_manifest("weather-tool", &["api.example.com"], true);
+        let instance_key = expected_instance_key(&v1);
+        let entries = manifest_config_entries(&v1).expect("entries must derive");
+        seed_plugin_config_entries(&mut config, "weather-tool", &entries, &v1.egress.hosts)
+            .await
+            .expect("first install must seed");
+
+        // v2 of the same package declares an extra destination. Its instance
+        // key is unchanged (identity is package/capability/binding, not
+        // version), so installing it meets the existing row — and must leave
+        // it exactly as the operator left it.
+        let v2 = tool_manifest(
+            "weather-tool",
+            &["api.example.com", "api2.example.com"],
+            true,
+        );
+        assert_eq!(
+            expected_instance_key(&v2),
+            instance_key,
+            "a version bump must not move the instance key"
+        );
+        let entries_v2 = manifest_config_entries(&v2).expect("entries must derive");
+        seed_plugin_config_entries(&mut config, "weather-tool", &entries_v2, &v2.egress.hosts)
+            .await
+            .expect("re-seeding an existing entry must not fail");
+
+        let entry = config
+            .plugins
+            .entries
+            .iter()
+            .find(|e| e.name == instance_key)
+            .expect("the entry must still exist");
+        assert_eq!(
+            entry.egress_hosts,
+            vec!["api.example.com".to_string()],
+            "a package upgrade must NEVER extend an existing egress grant"
+        );
+        assert_eq!(
+            config.plugins.entries.len(),
+            1,
+            "re-seeding must not duplicate the entry"
+        );
+
+        let on_disk = entry_on_disk(&path, &instance_key);
+        let hosts: Vec<&str> = on_disk
+            .get("egress_hosts")
+            .and_then(toml::Value::as_array)
+            .expect("egress_hosts must be persisted")
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect();
+        assert_eq!(
+            hosts,
+            vec!["api.example.com"],
+            "the on-disk grant must be untouched by the upgrade"
+        );
+    }
+
+    /// A `[[plugins.entries]]` row as a pre-typed-config install left it:
+    /// keyed by the package name, carrying the operator's values.
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn legacy_package_named_entry(
+        package: &str,
+        hosts: &[&str],
+    ) -> crate::config::schema::PluginEntryConfig {
+        crate::config::schema::PluginEntryConfig {
+            name: package.to_string(),
+            config: std::collections::HashMap::from([(
+                "api_key".to_string(),
+                "operator-secret".to_string(),
+            )]),
+            egress_hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
+            egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
+        }
+    }
+
+    /// The no-row repair works end to end. An installed HTTP plugin with no
+    /// config row (installed before this ceremony, or its row removed by hand)
+    /// gets a gap line whose command is a `config patch`, since `config set`
+    /// cannot create a row. That command is run through a real `sh`, with
+    /// `zeroclaw` replaced by a function that records its arguments and input;
+    /// the recorded patch is then applied the way the `config patch` handler
+    /// applies one (create the map key, convert the value, set it, save). The
+    /// row and its grant exist on disk afterwards, and the gap is gone.
+    #[tokio::test]
+    #[cfg(all(unix, feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn the_absent_row_repair_creates_the_row_and_its_grant() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest("gitea-tool", &["git.example.com"], false);
+        let instance_key = expected_instance_key(&manifest);
+        assert!(
+            config.plugins.entries.is_empty(),
+            "the instance starts with no row"
+        );
+
+        let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        assert_eq!(lines.len(), 1, "one gap, one line: {lines:?}");
+        let command = crate::plugins::egress_ceremony::egress_create_command(
+            egress_command_config_dir(&config),
+            &instance_key,
+            &["git.example.com".to_string()],
+        );
+        assert!(
+            lines[0].contains(&command),
+            "a missing row must be repaired by the command that creates it: {lines:?}"
+        );
+
+        // Run the printed command through a real shell.
+        let args_file = tmp.path().join("captured-args");
+        let stdin_file = tmp.path().join("captured-stdin");
+        let script = format!(
+            "zeroclaw() {{ printf '%s\\n' \"$@\" > '{}'; cat > '{}'; }}\n{command}\n",
+            args_file.display(),
+            stdin_file.display()
+        );
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .expect("run sh");
+        assert!(status.success(), "the printed command must run: {command}");
+        let args = std::fs::read_to_string(&args_file).expect("captured arguments");
+        let dir = egress_command_config_dir(&config)
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            vec!["--config-dir", dir.as_str(), "config", "patch", "-"],
+            "the command must reach `config patch -` for the selected configuration"
+        );
+        let body = std::fs::read_to_string(&stdin_file).expect("captured input");
+
+        // Apply the patch as the handler does.
+        let ops: Vec<serde_json::Value> = serde_json::from_str(&body).expect("a JSON Patch");
+        assert_eq!(ops.len(), 1, "{body}");
+        assert_eq!(ops[0]["op"], "add", "{body}");
+        let path = ops[0]["path"]
+            .as_str()
+            .and_then(|p| p.strip_prefix('/'))
+            .expect("a JSON Pointer path")
+            .replace('/', ".");
+        assert!(
+            !config.ensure_map_or_list_key_for_path(&path),
+            "the row key must be creatable: {path}"
+        );
+        let value = json_value_to_setprop_string(&ops[0]["value"], &config, &path, 0, false)
+            .expect("the list converts like any patched value");
+        config
+            .set_prop_persistent(&path, &value)
+            .expect("the grant is written");
+        Box::pin(config.save_dirty())
+            .await
+            .expect("the patch saves");
+
+        let on_disk = entry_on_disk(&config.config_path, &instance_key);
+        let hosts: Vec<&str> = on_disk
+            .get("egress_hosts")
+            .and_then(toml::Value::as_array)
+            .expect("the row carries egress_hosts")
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect();
+        assert_eq!(hosts, vec!["git.example.com"]);
+        assert!(
+            egress_grant_gap_lines(&config, &manifest)
+                .expect("gap lines must build")
+                .is_empty(),
+            "after the repair the declaration is granted"
+        );
+    }
+
+    /// `plugin list`'s gap diagnostic, canonical case: the row the printed
+    /// command addresses exists, so the command resolves and is printed on its
+    /// own. This is the shape the legacy case below must NOT take.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn the_gap_diagnostic_prints_the_grant_command_alone_when_the_canonical_row_exists() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest(
+            "weather-tool",
+            &["api.example.com", "api2.example.com"],
+            true,
+        );
+        let instance_key = expected_instance_key(&manifest);
+        config.plugins.entries = vec![crate::config::schema::PluginEntryConfig {
+            name: instance_key.clone(),
+            config: std::collections::HashMap::new(),
+            egress_hosts: vec!["api.example.com".to_string()],
+            egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
+        }];
+
+        let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        assert_eq!(lines.len(), 1, "one gap, one line: {lines:?}");
+        assert!(
+            lines[0].contains("api2.example.com"),
+            "the gap must name the ungranted destination: {lines:?}"
+        );
+        assert!(
+            lines[0].contains(&crate::plugins::egress_ceremony::egress_set_command(
+                egress_command_config_dir(&config),
+                &instance_key,
+                &[
+                    "api.example.com".to_string(),
+                    "api2.example.com".to_string()
+                ],
+            )),
+            "the command must carry the union against the canonical key: {lines:?}"
+        );
+    }
+
+    /// REGRESSION: on a pre-typed-config install the row is still keyed by the
+    /// package name, so `entry_egress` resolves nothing against the canonical
+    /// `zpi1_` key, the gap is reported, and the command the diagnostic used to
+    /// print addressed a row that does not exist. Running it as printed fails
+    /// with `Unknown property` and grants nothing.
+    ///
+    /// The diagnostic must detect that state and print the documented rename
+    /// FIRST, naming both the legacy row and the key to give it, with the grant
+    /// command explicitly second. Detection only: a list command must not
+    /// rewrite the operator's config.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn a_legacy_package_named_row_gets_the_migration_step_before_the_grant_command() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest(
+            "weather-tool",
+            &["api.example.com", "api2.example.com"],
+            true,
+        );
+        let instance_key = expected_instance_key(&manifest);
+        config.plugins.entries = vec![legacy_package_named_entry(
+            "weather-tool",
+            &["api.example.com"],
+        )];
+        assert!(
+            config.plugins.entry_egress(&instance_key).0.is_empty(),
+            "the premise: the canonical key resolves no grant on a legacy install"
+        );
+
+        let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        let rendered = lines.join("\n");
+
+        // The migration instruction names the row to rename and the name to
+        // give it. Either one missing leaves the operator unable to act.
+        assert!(
+            rendered.contains("weather-tool") && rendered.contains(&instance_key),
+            "the output must name both the legacy row and the canonical key: {rendered}"
+        );
+
+        // Ordering is the fix. The grant command only resolves after the
+        // rename, so it must never be the first thing offered.
+        let grant_at = lines
+            .iter()
+            .position(|line| line.contains("config set plugins.entries"))
+            .expect("the grant command must still be printed");
+        let migrate_at = lines
+            .iter()
+            .position(|line| {
+                line.contains(&instance_key) && !line.contains("config set plugins.entries")
+            })
+            .expect("a migration line naming the canonical key must be printed");
+        assert!(
+            migrate_at < grant_at,
+            "the rename must precede the grant command: {lines:?}"
+        );
+        assert!(
+            !lines[0].contains("config set plugins.entries"),
+            "the bare grant command must not lead the report: {lines:?}"
+        );
+
+        // Detection, not mutation: `plugin list` never edits config.
+        assert_eq!(
+            config.plugins.entries.len(),
+            1,
+            "the diagnostic must not create a row"
+        );
+        assert_eq!(
+            config.plugins.entries[0].name, "weather-tool",
+            "the diagnostic must not rename the operator's row"
+        );
+        assert_eq!(
+            config.plugins.entries[0].egress_hosts,
+            vec!["api.example.com".to_string()],
+            "the diagnostic must not rewrite the operator's grant"
+        );
+    }
+
+    /// REGRESSION (operator-grant loss): the legacy row carries a grant the
+    /// operator authored themselves — a self-hosted `gitea.example.net` the
+    /// manifest never declares — alongside a declared `api.example.com`. The
+    /// manifest also declares a new `api2.example.com` the row does not grant.
+    ///
+    /// The migrate-then-grant command must be built from the LEGACY row's grant
+    /// unioned with the declaration, not from the empty canonical row. `config
+    /// set` REPLACES the list, so following the printed instructions verbatim
+    /// (rename the row, then run the grant command) must not silently delete the
+    /// operator-only `gitea.example.net`. This end-to-end applies the printed
+    /// command's value through the real config setter and proves all three hosts
+    /// survive. The sibling legacy test above cannot catch this: its sole grant
+    /// is also declared, so the empty-vs-legacy union is identical there.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn the_legacy_migration_command_preserves_an_operator_only_grant() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest(
+            "weather-tool",
+            &["api.example.com", "api2.example.com"],
+            true,
+        );
+        let instance_key = expected_instance_key(&manifest);
+
+        // A pre-typed-config row: package-name keyed, granting one declared host
+        // AND one operator-authored host the manifest does not declare.
+        config.plugins.entries = vec![legacy_package_named_entry(
+            "weather-tool",
+            &["api.example.com", "gitea.example.net"],
+        )];
+        assert!(
+            config.plugins.entry_egress(&instance_key).0.is_empty(),
+            "premise: the canonical key resolves no grant on a legacy install"
+        );
+
+        let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        let grant_line = lines
+            .iter()
+            .find(|line| line.contains("config set plugins.entries"))
+            .expect("the migrate ceremony must still print a grant command");
+        // The command double-quotes its value; take what is between the quotes.
+        let command_value = &printed_command_value(grant_line);
+        assert!(
+            command_value.contains("gitea.example.net"),
+            "the printed command must carry the operator-only grant forward: {grant_line}"
+        );
+
+        // Follow the printed instructions verbatim: (1) rename the legacy row to
+        // the canonical instance key, then (2) apply the grant command's value
+        // through the real config setter — the same path `zeroclaw config set`
+        // takes. `config set` REPLACES the list, so the row's grant after this is
+        // exactly the command's value.
+        config.plugins.entries[0].name = instance_key.clone();
+        config
+            .set_prop(
+                &crate::plugins::egress_ceremony::egress_hosts_path(&instance_key),
+                command_value,
+            )
+            .expect("applying the grant command must succeed after the rename");
+
+        let (granted, _private) = config.plugins.entry_egress(&instance_key);
+        assert!(
+            granted.contains(&"gitea.example.net".to_string()),
+            "the operator-only grant must survive the migration command: {granted:?}"
+        );
+        assert!(
+            granted.contains(&"api2.example.com".to_string()),
+            "the newly declared host must be granted by the migration command: {granted:?}"
+        );
+        assert!(
+            granted.contains(&"api.example.com".to_string()),
+            "the already-granted declared host must survive too: {granted:?}"
+        );
+    }
+
+    /// The quoted value of the `zeroclaw config set` command printed on `line`.
+    /// A verdict line also carries the runtime's reason, which quotes the
+    /// offending entry, so the value is read after the command, not from the
+    /// first quote on the line.
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn printed_command_value(line: &str) -> String {
+        use crate::plugins::egress_ceremony::{POWERSHELL_ONLY_MARKER, ShellDialect};
+        let start = line
+            .find("config set plugins.entries")
+            .expect("the line must carry a config set command");
+        let quoted = &line[start..];
+        // Undo the host shell's quoting. A Windows line is one double-quoted
+        // argument with no escapes inside, unless it was refused, in which case
+        // the marker names the PowerShell form that follows it.
+        let dialect = match ShellDialect::host() {
+            ShellDialect::Windows if line.starts_with(POWERSHELL_ONLY_MARKER) => {
+                ShellDialect::PowerShell
+            }
+            ShellDialect::Windows => {
+                let open = quoted
+                    .find('"')
+                    .expect("the printed Windows command double-quotes its value");
+                let rest = &quoted[open + 1..];
+                let close = rest.find('"').expect("the quoted value must close");
+                return rest[..close].to_string();
+            }
+            other => other,
+        };
+        let open = quoted
+            .find('\'')
+            .expect("the printed command single-quotes its value");
+        // The argument runs to the closing quote, and an embedded quote was
+        // written as `'\''` (POSIX) or `''` (PowerShell).
+        let mut value = String::new();
+        let mut rest = &quoted[open + 1..];
+        loop {
+            let close = rest.find('\'').expect("the quoted value must close");
+            value.push_str(&rest[..close]);
+            rest = &rest[close + 1..];
+            let escaped_quote = match dialect {
+                ShellDialect::Posix => rest.strip_prefix("\\''"),
+                ShellDialect::PowerShell => rest.strip_prefix('\''),
+                ShellDialect::Windows => unreachable!("handled above"),
+            };
+            if let Some(after) = escaped_quote {
+                value.push('\'');
+                rest = after;
+            } else {
+                break;
+            }
+        }
+        value
+    }
+
+    /// The runtime's own acceptance check for a row, with the same inputs the
+    /// diagnostic hands the planner. Tests assert against this, not against a
+    /// re-implementation, so "the repaired row is accepted" means exactly that.
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn runtime_accepts_row(config: &crate::config::schema::Config, instance_key: &str) -> bool {
+        let (hosts, allow_private) = config.plugins.entry_egress(instance_key);
+        zeroclaw::plugins::egress::EgressPolicy::new(
+            &hosts,
+            &allow_private,
+            &config.security.nat64_prefixes,
+            config.plugins.limits.max_connections_per_instance,
+        )
+        .is_ok()
+    }
+
+    /// REGRESSION (silent inert grant): the legacy row's grant already covers
+    /// everything the manifest declares, so a declaration-versus-grant diff
+    /// against that row is empty. But the runtime never reads a package-name
+    /// row — it resolves the grant by the canonical `zpi1_` key, which has no
+    /// row — so every request is denied until the operator renames the row.
+    /// The diagnostic must still print the rename. Using the stranded row to
+    /// decide *whether* to speak, rather than only *what command to offer*,
+    /// made this case silent: the state that most needed the instruction
+    /// produced no output at all.
+    ///
+    /// No grant command is offered: the rename alone puts a row the runtime
+    /// accepts into effect, and `config set` would only replace a list that
+    /// is already right.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn a_stranded_grant_that_already_covers_the_declaration_still_prints_the_rename() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest("weather-tool", &["api.example.com"], true);
+        let instance_key = expected_instance_key(&manifest);
+
+        // The legacy row grants everything declared, plus an operator host.
+        config.plugins.entries = vec![legacy_package_named_entry(
+            "weather-tool",
+            &["api.example.com", "gitea.example.net"],
+        )];
+        assert!(
+            config.plugins.entry_egress(&instance_key).0.is_empty(),
+            "premise: the runtime resolves NO grant by the canonical key, so the plugin \
+             has no reach however complete the legacy row looks"
+        );
+
+        let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        let rendered = lines.join("\n");
+        assert!(
+            !lines.is_empty(),
+            "a stranded grant is inert; the diagnostic must not report it as healthy"
+        );
+        assert!(
+            rendered.contains("weather-tool") && rendered.contains(&instance_key),
+            "the rename instruction must name the legacy row and the key to give it: {rendered}"
+        );
+        assert!(
+            !rendered.contains("config set plugins.entries"),
+            "nothing is missing after the rename and the runtime accepts the row, so no \
+             grant command may be offered: {rendered}"
+        );
+
+        // Follow the printed instruction: the rename alone restores reach, the
+        // runtime accepts the row, and the diagnostic goes quiet.
+        config.plugins.entries[0].name = instance_key.clone();
+        let (granted, _private) = config.plugins.entry_egress(&instance_key);
+        assert_eq!(
+            granted,
+            vec![
+                "api.example.com".to_string(),
+                "gitea.example.net".to_string()
+            ],
+            "after the rename the runtime reads the authored grant unchanged"
+        );
+        assert!(runtime_accepts_row(&config, &instance_key));
+        assert!(
+            egress_grant_gap_lines(&config, &manifest)
+                .expect("gap lines must build")
+                .is_empty(),
+            "a canonical row that covers the declaration has nothing to report"
+        );
+    }
+
+    /// REGRESSION (rejected authored entry): the legacy row grants `*.com`,
+    /// which the grammar rejects as a single-label wildcard, but a hand-edited
+    /// config survives `load_or_init`, which only warns. The containment
+    /// relation trusts its inputs, so `*.com` "covers" the declared `api.com`,
+    /// and a planner that let the row vouch for itself would print the rename
+    /// alone. After that rename the runtime builds the policy from the row,
+    /// rejects `*.com`, and denies every request. The diagnostic must report
+    /// the runtime's reason, still print the rename, and print a grant
+    /// command that leaves the rejected entry out, so following the steps
+    /// yields a row the runtime accepts.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn a_stranded_grant_the_runtime_rejects_is_named_and_kept_out_of_the_printed_command() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest("weather-tool", &["api.com"], true);
+        let instance_key = expected_instance_key(&manifest);
+        config.plugins.entries = vec![legacy_package_named_entry("weather-tool", &["*.com"])];
+
+        let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("*.com"),
+            "the runtime's reason names the rejected entry so the operator can find it: {rendered}"
+        );
+        assert!(
+            rendered.contains(&instance_key),
+            "the rename must still be printed: {rendered}"
+        );
+        let grant_line = lines
+            .iter()
+            .find(|line| line.contains("config set plugins.entries"))
+            .expect("a refused row must force a grant command, since the rename alone would put a refused allowlist in effect");
+        let command_value = &printed_command_value(grant_line);
+        assert!(
+            command_value.contains("api.com") && !command_value.contains("*.com"),
+            "the command must carry the declaration and leave the rejected entry out: {grant_line}"
+        );
+
+        // Follow the printed steps: rename, then apply. The resulting row is
+        // one the runtime accepts, and the diagnostic goes quiet.
+        config.plugins.entries[0].name = instance_key.clone();
+        config
+            .set_prop(
+                &crate::plugins::egress_ceremony::egress_hosts_path(&instance_key),
+                command_value,
+            )
+            .expect("applying the printed command must succeed after the rename");
+        assert_eq!(
+            config.plugins.entry_egress(&instance_key).0,
+            vec!["api.com".to_string()]
+        );
+        assert!(
+            runtime_accepts_row(&config, &instance_key),
+            "the repaired row must be one the runtime's own constructor accepts"
+        );
+        assert!(
+            egress_grant_gap_lines(&config, &manifest)
+                .expect("gap lines must build")
+                .is_empty(),
+            "a repaired canonical row that covers the declaration has nothing to report"
+        );
+    }
+
+    /// REGRESSION (planner must not out-lenient the runtime): a canonical row
+    /// whose grant covers the declaration but carries boundary whitespace. The
+    /// runtime refuses that row on the raw bytes, so every request is denied;
+    /// a planner that trimmed before judging would call it healthy. The
+    /// diagnostic must report the runtime's reason and print a command that
+    /// yields a row the runtime accepts.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn a_canonical_row_the_runtime_refuses_for_whitespace_is_reported_and_repaired() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest("weather-tool", &["api.example.com"], true);
+        let instance_key = expected_instance_key(&manifest);
+        config.plugins.entries = vec![crate::config::schema::PluginEntryConfig {
+            name: instance_key.clone(),
+            config: std::collections::HashMap::new(),
+            egress_hosts: vec![" api.example.com ".to_string(), String::new()],
+            egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
+        }];
+        assert!(
+            !runtime_accepts_row(&config, &instance_key),
+            "premise: the runtime refuses this row as it stands"
+        );
+
+        let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("whitespace"),
+            "the runtime's own reason must be reported: {rendered}"
+        );
+        let grant_line = lines
+            .iter()
+            .find(|line| line.contains("config set plugins.entries"))
+            .expect("a refused row must be offered a repair command");
+        let command_value = &printed_command_value(grant_line);
+        config
+            .set_prop(
+                &crate::plugins::egress_ceremony::egress_hosts_path(&instance_key),
+                command_value,
+            )
+            .expect("applying the printed command must succeed");
+        assert!(
+            runtime_accepts_row(&config, &instance_key),
+            "the repaired row must be one the runtime's own constructor accepts"
+        );
+        assert!(
+            egress_grant_gap_lines(&config, &manifest)
+                .expect("gap lines must build")
+                .is_empty()
+        );
+    }
+
+    /// REGRESSION (deployment-wide refusal blamed on a row): the row is valid
+    /// but does not cover the whole declaration; only `security.nat64_prefixes`
+    /// is malformed, which the config loader only warns about. The runtime
+    /// refuses every policy for it. A report that ran the constructor and
+    /// attributed any failure to the row would call the grant refused and tell
+    /// the operator to fix `egress_allow_private`; a report that merely
+    /// filtered the deployment error out would still print a per-row grant
+    /// command, implying the grant could take effect when it cannot. The
+    /// per-plugin report must stay silent, and the deployment line must name
+    /// the responsible paths, once. Once the deployment is fixed, the real gap
+    /// is reported as usual.
+    /// A row outlives `plugin remove` and is keyed by package name alone, so a
+    /// package reinstalled under the name, which may come from another
+    /// publisher and declare nothing, inherits the old grant. Install must say
+    /// so, private carve-outs included, and `remove` must say the grant stays.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn an_undeclaring_reinstall_is_told_it_inherits_the_existing_grant() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest("weather-tool", &[], true);
+        let instance_key = expected_instance_key(&manifest);
+        config.plugins.entries = vec![crate::config::schema::PluginEntryConfig {
+            name: instance_key.clone(),
+            config: std::collections::HashMap::new(),
+            egress_hosts: vec!["api.example.com".to_string(), "10.0.0.5".to_string()],
+            egress_allow_private: vec!["10.0.0.5".to_string()],
+            tls_profiles: Vec::new(),
+        }];
+
+        let install = existing_egress_grant_lines(&config, "weather-tool", &instance_key, &[]);
+        assert_eq!(install.len(), 1, "{install:?}");
+        assert!(
+            install[0].contains("declares no egress")
+                && install[0].contains("api.example.com, 10.0.0.5; private: 10.0.0.5")
+                && install[0].contains(&instance_key),
+            "{install:?}"
+        );
+
+        let removed = removed_plugin_kept_grant_lines(
+            &config,
+            "weather-tool",
+            std::slice::from_ref(&instance_key),
+        );
+        assert_eq!(removed.len(), 1, "{removed:?}");
+        assert!(
+            removed[0].contains(&instance_key) && removed[0].contains("private: 10.0.0.5"),
+            "{removed:?}"
+        );
+
+        // A row that grants nothing has nothing to inherit or keep.
+        config.plugins.entries[0].egress_hosts.clear();
+        config.plugins.entries[0].egress_allow_private.clear();
+        assert!(
+            existing_egress_grant_lines(&config, "weather-tool", &instance_key, &[]).is_empty()
+        );
+        assert!(
+            removed_plugin_kept_grant_lines(&config, "weather-tool", &[instance_key]).is_empty()
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn a_deployment_wide_refusal_is_reported_once_with_its_own_paths_not_as_a_row_repair() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest(
+            "weather-tool",
+            &["api.example.com", "api2.example.com"],
+            true,
+        );
+        let instance_key = expected_instance_key(&manifest);
+        config.plugins.entries = vec![crate::config::schema::PluginEntryConfig {
+            name: instance_key.clone(),
+            config: std::collections::HashMap::new(),
+            egress_hosts: vec!["api.example.com".to_string()],
+            egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
+        }];
+        config.security.nat64_prefixes = vec!["2001:db8::/97".to_string()];
+        assert!(
+            !runtime_accepts_row(&config, &instance_key),
+            "premise: the runtime refuses every policy under a malformed prefix list"
+        );
+
+        let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        assert!(
+            lines.is_empty(),
+            "no per-row line may print under a deployment-wide refusal, not even for \
+             the real gap: {lines:?}"
+        );
+        assert!(
+            existing_egress_grant_lines(
+                &config,
+                "weather-tool",
+                &instance_key,
+                &manifest.egress.hosts
+            )
+            .is_empty(),
+            "the install-time report follows the same rule"
+        );
+        let deployment = egress_deployment_gap_line(&config)
+            .expect("the deployment refusal must be reported on its own");
+        assert!(
+            deployment.contains("security.nat64_prefixes")
+                && deployment.contains("max_connections_per_instance"),
+            "the deployment line must name the paths that fix it: {deployment}"
+        );
+        assert!(
+            !deployment.contains("egress_allow_private")
+                && !deployment.contains("config set plugins.entries"),
+            "the deployment line must not offer a row repair: {deployment}"
+        );
+
+        // Fix the deployment: the row's real gap is now reported as usual.
+        config.security.nat64_prefixes.clear();
+        assert_eq!(egress_deployment_gap_line(&config), None);
+        let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("api2.example.com")
+                && lines[0].contains("config set plugins.entries"),
+            "the uncovered destination and its command are reported once the deployment \
+             is accepted: {lines:?}"
+        );
+    }
+
+    /// REGRESSION (install and list must agree): a canonical row whose hosts
+    /// cover the declaration but whose `egress_allow_private` names a host no
+    /// grant covers. The host-only upgrade diff is empty, so a reinstall that
+    /// looked only at hosts would print nothing while the runtime refuses the
+    /// row and denies every request. The install-time report must print the
+    /// same runtime verdict `plugin list` prints, word for word, including
+    /// that the printed command alone does not complete the repair.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn reinstall_reports_the_runtime_verdict_for_an_existing_row_with_an_ungranted_carveout() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest("weather-tool", &["api.example.com"], true);
+        let instance_key = expected_instance_key(&manifest);
+        config.plugins.entries = vec![crate::config::schema::PluginEntryConfig {
+            name: instance_key.clone(),
+            config: std::collections::HashMap::new(),
+            egress_hosts: vec!["api.example.com".to_string()],
+            egress_allow_private: vec!["other.example.com".to_string()],
+            tls_profiles: Vec::new(),
+        }];
+        assert!(
+            !runtime_accepts_row(&config, &instance_key),
+            "premise: the row is refused"
+        );
+
+        let install = existing_egress_grant_lines(
+            &config,
+            "weather-tool",
+            &instance_key,
+            &manifest.egress.hosts,
+        );
+        let rendered = install.join("\n");
+        assert!(
+            rendered.contains("not granted"),
+            "the runtime's reason must be reported at install: {rendered}"
+        );
+        assert!(
+            rendered.contains("config set plugins.entries"),
+            "a repair command must be offered at install: {rendered}"
+        );
+        assert!(
+            rendered.contains("egress_allow_private"),
+            "the command alone does not complete the repair, and install must say so: {rendered}"
+        );
+
+        // Same words as `plugin list`: both surfaces share one renderer.
+        let list = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        for line in &list {
+            assert!(
+                install.contains(line),
+                "install must print every verdict line list prints; missing {line:?} in {install:?}"
+            );
+        }
+    }
+
+    /// REGRESSION (install and list must agree, rejected entry): a canonical
+    /// row granting `*.com`, which the runtime rejects. The install-time
+    /// report must name the runtime's reason and offer a command whose value
+    /// leaves the rejected entry out, rather than staying silent or printing a
+    /// replacement that carries it forward.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn reinstall_names_a_rejected_host_entry_and_keeps_it_out_of_the_apply_command() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest("weather-tool", &["api.com"], true);
+        let instance_key = expected_instance_key(&manifest);
+        config.plugins.entries = vec![crate::config::schema::PluginEntryConfig {
+            name: instance_key.clone(),
+            config: std::collections::HashMap::new(),
+            egress_hosts: vec!["*.com".to_string()],
+            egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
+        }];
+        assert!(
+            !runtime_accepts_row(&config, &instance_key),
+            "premise: the row is refused"
+        );
+
+        let install = existing_egress_grant_lines(
+            &config,
+            "weather-tool",
+            &instance_key,
+            &manifest.egress.hosts,
+        );
+        let rendered = install.join("\n");
+        assert!(
+            rendered.contains("*.com"),
+            "the reason names the entry: {rendered}"
+        );
+        for line in install
+            .iter()
+            .filter(|line| line.contains("config set plugins.entries"))
+        {
+            let value = &printed_command_value(line);
+            assert!(
+                value.contains("api.com") && !value.contains("*.com"),
+                "every printed command must carry the declaration and leave the rejected \
+                 entry out: {line}"
+            );
+        }
+        assert!(
+            install
+                .iter()
+                .any(|line| line.contains("config set plugins.entries")),
+            "a repair command must be offered: {rendered}"
+        );
+    }
+
+    /// A manifest that declares nothing grants nothing: `http_client` alone
+    /// still confers no reach, and the seeded row stays deny-everything.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn a_manifest_without_a_declaration_seeds_no_egress() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+
+        // A config schema still earns a row; the egress grant on it is empty.
+        let manifest = tool_manifest("silent-tool", &[], true);
+        let instance_key = expected_instance_key(&manifest);
+        let entries = manifest_config_entries(&manifest).expect("entries must derive");
+        seed_plugin_config_entries(&mut config, "silent-tool", &entries, &manifest.egress.hosts)
+            .await
+            .expect("seeding must succeed");
+
+        let entry = config
+            .plugins
+            .entries
+            .iter()
+            .find(|e| e.name == instance_key)
+            .expect("the entry is still seeded");
+        assert!(
+            entry.egress_hosts.is_empty(),
+            "no declaration means no grant: {:?}",
+            entry.egress_hosts
+        );
+    }
+
+    /// The scoping constraint inherited from the typed-instance-config work:
+    /// `installed_plugin_config_entries` derives keys for tool/default bindings
+    /// only, because channel bindings are alias-owned and their key derivation
+    /// is deferred to the alias-aware host path. The ceremony must inherit that
+    /// scope rather than invent a package-level key — so a channel-only package
+    /// yields no entries and seeds nothing at all, even when its manifest
+    /// declares destinations.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn a_channel_only_package_seeds_nothing_rather_than_inventing_a_key() {
+        let manifest = manifest_from_toml(
+            "name = \"chat-bridge\"\n\
+             version = \"1.0.0\"\n\
+             wasm_path = \"plugin.wasm\"\n\
+             capabilities = [\"channel\"]\n\
+             permissions = [\"http_client\"]\n\
+             config_schema = { type = \"object\" }\n\
+             [egress]\n\
+             hosts = [\"api.example.com\"]\n",
+        );
+        let entries = manifest_config_entries(&manifest).expect("derivation must not error");
+        assert!(
+            entries.is_empty(),
+            "a channel-only package has no derivable instance key yet: {entries:?}"
+        );
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        seed_plugin_config_entries(&mut config, "chat-bridge", &entries, &manifest.egress.hosts)
+            .await
+            .expect("seeding nothing must succeed");
+        assert!(
+            config.plugins.entries.is_empty(),
+            "no row may be invented for a channel-only package: {:?}",
+            config
+                .plugins
+                .entries
+                .iter()
+                .map(|e| e.name.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A tool package that declares egress but ships no config schema still
+    /// owns host state — its grant — so it earns an instance row. Master's
+    /// config-schema-only predicate returned nothing for it, which would have
+    /// left the declaration with nowhere to land.
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn an_egress_declaration_alone_earns_an_instance_row() {
+        let declaring = tool_manifest("beacon-tool", &["api.example.com"], false);
+        assert_eq!(
+            manifest_config_entries(&declaring)
+                .expect("derivation must not error")
+                .len(),
+            1,
+            "a declared destination needs a row to be granted on"
+        );
+
+        // No schema, no declaration, no network permission: no host-owned
+        // state, no row.
+        let inert = tool_manifest_with("inert-tool", &[], &["memory_read"], false);
+        assert!(
+            manifest_config_entries(&inert)
+                .expect("derivation must not error")
+                .is_empty(),
+            "a package owning no host state must not get a row"
+        );
+    }
+
+    /// The SECOND grant path: the plugin whose destination is deployment
+    /// configuration (self-hosted Gitea, LAN Nextcloud). Its author cannot
+    /// declare the host, so it ships a network permission with no `[egress]`
+    /// table and no `config_schema`. It must still get an instance row —
+    /// otherwise the operator has nowhere to author the grant.
+    ///
+    /// The second half pins *why* the row is required: without one, the dotted
+    /// path does not resolve, so `zeroclaw config set
+    /// plugins.entries.<key>.egress_hosts` cannot create the grant either.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn a_network_permission_alone_earns_a_row_so_the_operator_can_grant_reach() {
+        for permission in ["http_client", "websocket_client", "socket_client"] {
+            let manifest = tool_manifest_with("gitea-tool", &[], &[permission], false);
+            let entries = manifest_config_entries(&manifest).expect("derivation must not error");
+            assert_eq!(
+                entries.len(),
+                1,
+                "{permission} alone must earn a row the operator can grant on"
+            );
+        }
+
+        let manifest = tool_manifest_with("gitea-tool", &[], &["http_client"], false);
+        let instance_key = expected_instance_key(&manifest);
+        let entries = manifest_config_entries(&manifest).expect("derivation must not error");
+
+        // Before the row exists the grant is unaddressable — this is the
+        // dead-end the widened predicate exists to prevent.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut bare = config_in_dir(tmp.path());
+        assert!(
+            bare.set_prop(
+                &crate::plugins::egress_ceremony::egress_hosts_path(&instance_key),
+                "gitea.internal.example.com",
+            )
+            .is_err(),
+            "without a seeded row the egress path must not resolve"
+        );
+
+        // After install seeds it, the operator's own grant lands on the row.
+        let mut config = config_in_dir(tmp.path());
+        seed_plugin_config_entries(&mut config, "gitea-tool", &entries, &manifest.egress.hosts)
+            .await
+            .expect("seeding must succeed");
+        let entry = config
+            .plugins
+            .entries
+            .iter()
+            .find(|e| e.name == instance_key)
+            .expect("a network-permitted tool must get a row");
+        assert!(
+            entry.egress_hosts.is_empty(),
+            "the row starts deny-everything: {:?}",
+            entry.egress_hosts
+        );
+        config
+            .set_prop(
+                &crate::plugins::egress_ceremony::egress_hosts_path(&instance_key),
+                "gitea.internal.example.com",
+            )
+            .expect("the operator must be able to author the grant on the seeded row");
+        let (granted, _private) = config.plugins.entry_egress(&instance_key);
+        assert_eq!(granted, vec!["gitea.internal.example.com".to_string()]);
+    }
+
+    /// A declaration without a transport never becomes a grant, including
+    /// after a later version adds one. Version 1 declares a host but asks for
+    /// no network permission: install creates its row (the declaration makes
+    /// it host state) and leaves the grant empty. `plugin remove` keeps the
+    /// row, so version 2, which adds `http_client` with the same declaration,
+    /// meets an existing row, and an existing row is never extended. The host
+    /// stays ungranted until the operator grants it.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn a_transportless_declaration_does_not_become_reach_when_a_later_version_adds_http() {
+        use zeroclaw::plugins::host::PluginHost;
+
+        let write_source = |permissions: &str| {
+            let manifest_toml = format!(
+                "name = \"dormant-tool\"\n\
+                 version = \"1.0.0\"\n\
+                 wasm_path = \"plugin.wasm\"\n\
+                 capabilities = [\"tool\"]\n\
+                 permissions = [{permissions}]\n\
+                 [egress]\n\
+                 hosts = [\"api.example.com\"]\n"
+            );
+            let source = tempfile::tempdir().expect("source dir");
+            std::fs::write(source.path().join("manifest.toml"), &manifest_toml)
+                .expect("write manifest");
+            std::fs::write(source.path().join("plugin.wasm"), b"\0asm").expect("write wasm");
+            (source, manifest_from_toml(&manifest_toml))
+        };
+        let grant_of = |config: &crate::config::schema::Config, key: &str| {
+            config
+                .plugins
+                .entries
+                .iter()
+                .find(|e| e.name == key)
+                .map(|e| e.egress_hosts.clone())
+        };
+
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).expect("host");
+
+        // v1: declares a host, no transport.
+        let (v1_source, v1) = write_source("");
+        let key = expected_instance_key(&v1);
+        let admitted = host
+            .admit_source(v1_source.path().to_str().unwrap())
+            .expect("admit v1");
+        Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config,
+            admitted,
+            |_| {},
+        ))
+        .await
+        .expect("install v1");
+        assert_eq!(
+            grant_of(&config, &key),
+            Some(Vec::new()),
+            "v1 gets a row but no grant: it has no transport to use one"
+        );
+
+        // Remove v1; its row stays, as `plugin remove` leaves config alone.
+        host.remove("dormant-tool").expect("remove v1");
+
+        // v2: same declaration, now with http_client.
+        let (v2_source, v2) = write_source("\"http_client\"");
+        assert_eq!(expected_instance_key(&v2), key, "same package, same row");
+        let admitted = host
+            .admit_source(v2_source.path().to_str().unwrap())
+            .expect("admit v2");
+        Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config,
+            admitted,
+            |_| {},
+        ))
+        .await
+        .expect("install v2");
+        assert_eq!(
+            grant_of(&config, &key),
+            Some(Vec::new()),
+            "adding http_client must not turn the earlier declaration into reach"
+        );
+    }
+
+    /// REGRESSION (grant ceremony, rollback half): a fresh `plugin install`
+    /// whose config seeding fails must leave NO package behind. The publish and
+    /// the seed are one transaction, so on a seed failure the just-published
+    /// package is rolled back — the plugins directory and the host's loaded set
+    /// are left clean, and a second install of the same source is a normal
+    /// fresh install rather than an `AlreadyLoaded` dead end forcing a manual
+    /// removal.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn a_failed_seed_rolls_the_published_package_back_so_retry_is_a_fresh_install() {
+        use zeroclaw::plugins::host::PluginHost;
+
+        // A real installable package: a manifest that owns host state (a
+        // declared destination plus a network permission) so seeding creates a
+        // row, and a stub wasm so the copy step runs.
+        let manifest_toml = "name = \"rollback-probe\"\n\
+             version = \"1.0.0\"\n\
+             wasm_path = \"plugin.wasm\"\n\
+             capabilities = [\"tool\"]\n\
+             permissions = [\"http_client\"]\n\
+             [egress]\n\
+             hosts = [\"api.example.com\"]\n";
+        let source = tempfile::tempdir().expect("source dir");
+        std::fs::write(source.path().join("manifest.toml"), manifest_toml).expect("write manifest");
+        std::fs::write(source.path().join("plugin.wasm"), b"\0asm").expect("write wasm");
+        let source_arg = source
+            .path()
+            .to_str()
+            .expect("utf-8 source path")
+            .to_string();
+
+        let manifest = manifest_from_toml(manifest_toml);
+        let instance_key = expected_instance_key(&manifest);
+
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).expect("host");
+
+        // ── First install: force the seed phase to fail ──
+        // A dirty path that resolves against neither live config nor the on-disk
+        // doc makes `save_dirty` fail deterministically at apply time — in
+        // memory, cross-platform, with no unwritable-filesystem trick.
+        let dir1 = tempfile::tempdir().expect("config dir 1");
+        let mut config1 = config_in_dir(dir1.path());
+        config1.mark_dirty("cost.rates.providers.models.openai.ghost-model.input_per_mtok");
+
+        let admitted = host.admit_source(&source_arg).expect("admit the source");
+        let err = Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config1,
+            admitted,
+            |_name| {},
+        ))
+        .await
+        .expect_err("seeding must fail on the poisoned dirty path");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("rolled back"),
+            "the failure must report the rollback: {rendered}"
+        );
+        assert!(
+            !rendered.contains("AlreadyLoaded"),
+            "a fresh install that fails to seed must not surface AlreadyLoaded: {rendered}"
+        );
+
+        // The rollback left nothing behind: no directory, no loaded entry.
+        assert!(
+            !plugins.path().join("rollback-probe").exists(),
+            "the published package directory must be removed on seed failure"
+        );
+        assert!(
+            host.get_plugin("rollback-probe").is_none(),
+            "the loaded set must not retain a rolled-back package"
+        );
+
+        // ── Retry with a clean config: a normal fresh install ──
+        let dir2 = tempfile::tempdir().expect("config dir 2");
+        let mut config2 = config_in_dir(dir2.path());
+        let admitted = host.admit_source(&source_arg).expect("admit the source");
+        Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config2,
+            admitted,
+            |_name| {},
+        ))
+        .await
+        .expect("retry of the same source must be a normal fresh install, not AlreadyLoaded");
+
+        assert!(
+            host.get_plugin("rollback-probe").is_some(),
+            "the retry must publish the package"
+        );
+        assert!(
+            plugins.path().join("rollback-probe").exists(),
+            "the retry must leave the package on disk"
+        );
+        assert!(
+            config2
+                .plugins
+                .entries
+                .iter()
+                .any(|e| e.name == instance_key),
+            "the retry must seed the instance-key row"
+        );
+    }
+
+    /// REGRESSION (unsupported beta config): removing a pre-typed plugin leaves
+    /// its package-name config row behind. Reinstall must refuse before it
+    /// creates a second, canonical row, print the same ordered update guidance
+    /// as `plugin list`, and roll the package publication back. The unsupported
+    /// row remains untouched for the operator to update deliberately.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn reinstall_refuses_a_legacy_row_without_creating_or_mutating_config() {
+        use zeroclaw::plugins::host::PluginHost;
+
+        let manifest_toml = r#"name = "weather-tool"
+version = "1.0.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "config_read"]
+
+[config_schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+additionalProperties = false
+
+[config_schema.properties.api_key]
+type = "string"
+x-secret = true
+
+[egress]
+hosts = ["api.example.com", "api2.example.com"]
+"#;
+        let source = tempfile::tempdir().expect("source dir");
+        std::fs::write(source.path().join("manifest.toml"), manifest_toml).expect("write manifest");
+        std::fs::write(source.path().join("plugin.wasm"), b"\0asm").expect("write wasm");
+        let source_arg = source.path().to_str().expect("utf-8 source path");
+
+        let manifest = manifest_from_toml(manifest_toml);
+        let instance_key = expected_instance_key(&manifest);
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(config_dir.path());
+        let config_path = config.config_path.clone();
+        let operator_host = "gitea.internal.example.com";
+        let mut legacy =
+            legacy_package_named_entry("weather-tool", &["api.example.com", operator_host]);
+        legacy.egress_allow_private = vec![operator_host.to_string()];
+        config.plugins.entries.push(legacy);
+        config.mark_dirty("plugins.entries.weather-tool");
+        Box::pin(config.save_dirty())
+            .await
+            .expect("the legacy row must exist on disk before reinstall");
+        let before = std::fs::read_to_string(&config_path).expect("read legacy config");
+
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).expect("host");
+        let announced = std::cell::Cell::new(false);
+        let admitted = host.admit_source(source_arg).expect("admit the source");
+        let err = Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config,
+            admitted,
+            |_name| announced.set(true),
+        ))
+        .await
+        .expect_err("an unsupported package-name row must refuse reinstall");
+        let rendered = format!("{err:#}");
+        assert!(
+            !announced.get(),
+            "a refused install must never announce success before rolling back"
+        );
+        assert!(
+            rendered.contains(&crate::plugins::egress_ceremony::zeroclaw_invocation_for(
+                crate::plugins::egress_ceremony::ShellDialect::host(),
+                config_dir.path()
+            )),
+            "the printed grant command must address the configuration the install \
+             ran against: {rendered}"
+        );
+
+        assert!(
+            rendered.contains("rolled back"),
+            "the error must say the attempted package publication was undone: {rendered}"
+        );
+        assert!(
+            rendered.contains("weather-tool") && rendered.contains(&instance_key),
+            "the warning must name the unsupported row and canonical key: {rendered}"
+        );
+        let update_at = rendered
+            .find("rename")
+            .expect("the first update step must describe the row rename");
+        let grant_at = rendered
+            .find("config set plugins.entries")
+            .expect("the second update step must carry the grant command");
+        assert!(
+            update_at < grant_at,
+            "the update step must precede the grant command: {rendered}"
+        );
+        assert!(
+            host.get_plugin("weather-tool").is_none(),
+            "the refused install must not leave the package loaded"
+        );
+        assert!(
+            !plugins.path().join("weather-tool").exists(),
+            "the refused install must remove the published package directory"
+        );
+        assert_eq!(
+            config.plugins.entries.len(),
+            1,
+            "refusal must not append a canonical row: {:?}",
+            config
+                .plugins
+                .entries
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect::<Vec<_>>()
+        );
+        let entry = &config.plugins.entries[0];
+        assert_eq!(entry.name, "weather-tool");
+        assert_eq!(
+            entry.config.get("api_key").map(String::as_str),
+            Some("operator-secret"),
+            "private config must remain untouched"
+        );
+        assert_eq!(
+            entry.egress_hosts,
+            vec!["api.example.com".to_string(), operator_host.to_string()],
+            "reinstall must not replace or widen the unsupported row's grant"
+        );
+        assert_eq!(
+            entry.egress_allow_private,
+            vec![operator_host.to_string()],
+            "the private-address carve-out must remain untouched"
+        );
+        assert!(
+            !config
+                .plugins
+                .entries
+                .iter()
+                .any(|candidate| candidate.name == instance_key),
+            "refusal must happen before canonical-row creation"
+        );
+        assert_eq!(
+            config.plugins.entry_egress(&instance_key),
+            (Vec::new(), Vec::new()),
+            "no canonical runtime state may be materialized"
+        );
+
+        let after = std::fs::read_to_string(&config_path).expect("read refused config");
+        assert_eq!(
+            after, before,
+            "the failed install must leave the on-disk beta config byte-identical"
+        );
+    }
+
+    /// REGRESSION (install follows `plugin list`'s deployment contract): a
+    /// stranded package-name row *and* a deployment the runtime refuses
+    /// outright. The legacy-install refusal must report the deployment paths
+    /// once and print no rename-then-grant steps, because no row command can
+    /// take effect until the deployment is fixed. Install is still refused and
+    /// still rolled back, announcing nothing.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn reinstall_under_a_deployment_wide_refusal_reports_the_deployment_once_without_row_steps()
+     {
+        use zeroclaw::plugins::host::PluginHost;
+
+        let manifest_toml = r#"name = "weather-tool"
+version = "1.0.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "config_read"]
+
+[config_schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+additionalProperties = false
+
+[config_schema.properties.api_key]
+type = "string"
+x-secret = true
+
+[egress]
+hosts = ["api.example.com", "api2.example.com"]
+"#;
+        let source = tempfile::tempdir().expect("source dir");
+        std::fs::write(source.path().join("manifest.toml"), manifest_toml).expect("write manifest");
+        std::fs::write(source.path().join("plugin.wasm"), b"\0asm").expect("write wasm");
+        let source_arg = source.path().to_str().expect("utf-8 source path");
+
+        let manifest = manifest_from_toml(manifest_toml);
+        let instance_key = expected_instance_key(&manifest);
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(config_dir.path());
+        let config_path = config.config_path.clone();
+        config.plugins.entries.push(legacy_package_named_entry(
+            "weather-tool",
+            &["api.example.com"],
+        ));
+        config.security.nat64_prefixes = vec!["2001:db8::/97".to_string()];
+        config.mark_dirty("plugins.entries.weather-tool");
+        config.mark_dirty("security.nat64_prefixes");
+        Box::pin(config.save_dirty())
+            .await
+            .expect("the legacy row must exist on disk before reinstall");
+        let before = std::fs::read_to_string(&config_path).expect("read legacy config");
+        assert!(
+            !runtime_accepts_row(&config, &instance_key),
+            "premise: the runtime refuses every policy under a malformed prefix list"
+        );
+
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).expect("host");
+        let announced = std::cell::Cell::new(false);
+        let admitted = host.admit_source(source_arg).expect("admit the source");
+        let err = Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config,
+            admitted,
+            |_name| announced.set(true),
+        ))
+        .await
+        .expect_err("a stranded row must refuse reinstall under a deployment refusal too");
+        let rendered = format!("{err:#}");
+
+        assert!(
+            rendered.contains("security.nat64_prefixes")
+                && rendered.contains("max_connections_per_instance"),
+            "the refusal must name the deployment paths that fix it: {rendered}"
+        );
+        assert!(
+            !rendered.contains("config set plugins.entries") && !rendered.contains("rename"),
+            "no rename or grant step may print under a deployment-wide refusal, \
+             exactly as `plugin list` prints none: {rendered}"
+        );
+        assert!(
+            rendered.contains("rolled back"),
+            "the attempted publish must still be undone: {rendered}"
+        );
+        assert!(
+            !announced.get(),
+            "a refused install must not announce success"
+        );
+        assert!(
+            host.get_plugin("weather-tool").is_none()
+                && !plugins.path().join("weather-tool").exists(),
+            "the refused install must leave no package behind"
+        );
+        assert_eq!(
+            config.plugins.entries.len(),
+            1,
+            "refusal must not append a canonical row"
+        );
+        let after = std::fs::read_to_string(&config_path).expect("read refused config");
+        assert_eq!(after, before, "the on-disk config must be byte-identical");
+
+        // Fix the deployment: the same reinstall now prints the ordered
+        // rename-then-grant steps it always did.
+        config.security.nat64_prefixes.clear();
+        let admitted = host.admit_source(source_arg).expect("admit the source");
+        let err = Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config,
+            admitted,
+            |_name| announced.set(true),
+        ))
+        .await
+        .expect_err("the stranded row still refuses reinstall");
+        let rendered = format!("{err:#}");
+        let rename_at = rendered.find("rename").expect("the rename step returns");
+        let grant_at = rendered
+            .find("zeroclaw --config-dir")
+            .expect("the grant step returns, addressing this configuration");
+        assert!(
+            rename_at < grant_at,
+            "rename precedes the grant: {rendered}"
+        );
+        assert!(!announced.get());
+    }
+
+    /// REGRESSION (two profiles, one canonical key): the printed grant command
+    /// must act on the configuration the operator inspected. `--config-dir` is
+    /// process-local, so a command that omitted it would, pasted into the
+    /// operator's shell, address the ambient profile — and the canonical row
+    /// key is identical across profiles, so it would replace *that* profile's
+    /// allowlist with a list computed from this one. Applying the printed
+    /// command through the real setter against the directory it names changes
+    /// profile A and leaves profile B's grant byte-for-byte intact.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn the_printed_command_targets_the_inspected_profile_and_leaves_the_other_alone() {
+        let manifest = tool_manifest(
+            "weather-tool",
+            &["api.example.com", "api2.example.com"],
+            true,
+        );
+        let instance_key = expected_instance_key(&manifest);
+        let row = |hosts: &[&str]| crate::config::schema::PluginEntryConfig {
+            name: instance_key.clone(),
+            config: std::collections::HashMap::new(),
+            egress_hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
+            egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
+        };
+
+        let dir_a = tempfile::tempdir().expect("profile a");
+        let mut profile_a = config_in_dir(dir_a.path());
+        profile_a.plugins.entries = vec![row(&["api.example.com"])];
+        profile_a.mark_dirty(&format!("plugins.entries.{instance_key}"));
+        Box::pin(profile_a.save_dirty())
+            .await
+            .expect("save profile a");
+
+        let dir_b = tempfile::tempdir().expect("profile b");
+        let mut profile_b = config_in_dir(dir_b.path());
+        profile_b.plugins.entries = vec![row(&["api.example.com", "gitea.b.example.net"])];
+        profile_b.mark_dirty(&format!("plugins.entries.{instance_key}"));
+        Box::pin(profile_b.save_dirty())
+            .await
+            .expect("save profile b");
+        let b_before = std::fs::read_to_string(&profile_b.config_path).expect("read b");
+
+        // Both surfaces that print a grant command for profile A.
+        let install_lines = existing_egress_grant_lines(
+            &profile_a,
+            "weather-tool",
+            &instance_key,
+            &manifest.egress.hosts,
+        );
+        let list_lines =
+            egress_grant_gap_lines(&profile_a, &manifest).expect("gap lines must build");
+        use crate::plugins::egress_ceremony::{ShellDialect, zeroclaw_invocation_for};
+        let invocation_a = zeroclaw_invocation_for(ShellDialect::host(), dir_a.path());
+        let invocation_b = zeroclaw_invocation_for(ShellDialect::host(), dir_b.path());
+        for (surface, lines) in [("install", &install_lines), ("list", &list_lines)] {
+            let command = lines
+                .iter()
+                .find(|line| line.contains("config set"))
+                .unwrap_or_else(|| panic!("{surface} must print the grant command: {lines:?}"));
+            assert!(
+                command.contains(&invocation_a),
+                "{surface}'s command must address profile A's directory: {command}"
+            );
+            assert!(
+                !command.contains(&invocation_b)
+                    && !command.contains(&dir_b.path().to_string_lossy().to_string()),
+                "{surface}'s command must not mention profile B: {command}"
+            );
+            // The directory the command names is exactly the one it was
+            // computed against, so the operator's shell resolves the same
+            // profile this process did.
+            let named = command
+                .split("--config-dir '")
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                .expect("the command carries a quoted --config-dir");
+            assert_eq!(std::path::Path::new(named), dir_a.path());
+        }
+
+        // Apply the printed value through the real setter against the
+        // directory the command names: A grows, B is untouched.
+        let command = install_lines
+            .iter()
+            .find(|line| line.contains("config set"))
+            .expect("install prints the command");
+        profile_a
+            .set_prop(
+                &crate::plugins::egress_ceremony::egress_hosts_path(&instance_key),
+                &printed_command_value(command),
+            )
+            .expect("the printed value must apply through the real setter");
+        Box::pin(profile_a.save_dirty())
+            .await
+            .expect("save profile a");
+        assert_eq!(
+            profile_a.plugins.entry_egress(&instance_key).0,
+            vec![
+                "api.example.com".to_string(),
+                "api2.example.com".to_string()
+            ]
+        );
+        let b_after = std::fs::read_to_string(&profile_b.config_path).expect("read b");
+        assert_eq!(b_after, b_before, "profile B must be byte-identical");
+        assert!(
+            b_after.contains("gitea.b.example.net"),
+            "premise: profile B's operator-only grant is on disk: {b_after}"
         );
     }
 }
