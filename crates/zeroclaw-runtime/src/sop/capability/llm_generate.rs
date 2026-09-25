@@ -215,11 +215,16 @@ impl SopCapability for LlmGenerateCapability {
 pub struct ProviderLlmAdapter {
     provider: Arc<dyn ModelProvider>,
     model: String,
+    temperature: Option<f64>,
 }
 
 impl ProviderLlmAdapter {
-    pub fn new(provider: Arc<dyn ModelProvider>, model: String) -> Self {
-        Self { provider, model }
+    pub fn new(provider: Arc<dyn ModelProvider>, model: String, temperature: Option<f64>) -> Self {
+        Self {
+            provider,
+            model,
+            temperature,
+        }
     }
 }
 
@@ -232,12 +237,13 @@ impl LlmGenerateAdapter for ProviderLlmAdapter {
     fn generate_typed(&self, system: Option<&str>, prompt: &str) -> Result<String> {
         let provider = Arc::clone(&self.provider);
         let model = self.model.clone();
+        let temperature = self.temperature;
         let system = system.map(str::to_string);
         let prompt = prompt.to_string();
         super::bridge::run_bridged_anyhow(
             async move {
                 ProviderDispatch::new(provider)
-                    .chat_with_system(system.as_deref(), &prompt, &model, None)
+                    .chat_with_system(system.as_deref(), &prompt, &model, temperature)
                     .await
             },
             GENERATE_TIMEOUT,
@@ -277,6 +283,10 @@ mod tests {
 
     struct SemanticEmptyProvider;
 
+    struct TemperatureRecordingProvider {
+        temperatures: Arc<Mutex<Vec<Option<f64>>>>,
+    }
+
     #[async_trait::async_trait]
     impl ModelProvider for SemanticEmptyProvider {
         async fn chat_with_system(
@@ -299,6 +309,30 @@ mod tests {
 
         fn alias(&self) -> &str {
             "semantic-empty-sop-provider"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for TemperatureRecordingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            temperature: Option<f64>,
+        ) -> Result<String> {
+            self.temperatures.lock().unwrap().push(temperature);
+            Ok("ok".into())
+        }
+    }
+
+    impl Attributable for TemperatureRecordingProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "temperature-recording-sop-provider"
         }
     }
 
@@ -573,7 +607,7 @@ mod tests {
 
     #[test]
     fn provider_adapter_bridge_preserves_terminal_error_type() {
-        let adapter = ProviderLlmAdapter::new(Arc::new(SemanticEmptyProvider), "test".into());
+        let adapter = ProviderLlmAdapter::new(Arc::new(SemanticEmptyProvider), "test".into(), None);
         let error = adapter
             .generate_typed(None, "prompt")
             .expect_err("the provider's typed terminal error must survive the bridge");
@@ -581,5 +615,17 @@ mod tests {
         assert!(error.chain().any(|cause| {
             cause.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>()
         }));
+    }
+
+    #[test]
+    fn provider_adapter_forwards_configured_temperature() {
+        let temperatures = Arc::new(Mutex::new(Vec::new()));
+        let provider = TemperatureRecordingProvider {
+            temperatures: Arc::clone(&temperatures),
+        };
+        let adapter = ProviderLlmAdapter::new(Arc::new(provider), "test".into(), Some(0.25));
+
+        assert_eq!(adapter.generate_typed(None, "prompt").unwrap(), "ok");
+        assert_eq!(*temperatures.lock().unwrap(), vec![Some(0.25)]);
     }
 }

@@ -258,6 +258,7 @@ async fn resolve_ws_memory_handle(
 /// silently rerouted to an unrelated entry.
 fn ws_consolidation_model(
     config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
     provider_ref: &str,
     model: &str,
 ) -> Option<(
@@ -265,19 +266,11 @@ fn ws_consolidation_model(
     String,
     Option<f64>,
 )> {
-    let (provider_type, provider_alias) = provider_ref.split_once('.')?;
-    let entry = config
-        .providers
-        .models
-        .find(provider_type, provider_alias)?;
-    let (provider, _, resolved_model, _) =
-        zeroclaw_runtime::agent::agent::build_session_model_provider(
-            config,
-            provider_ref,
-            Some(model),
-        )
-        .ok()?;
-    Some((provider, resolved_model, entry.temperature))
+    config.resolve_model_selection(provider_ref)?;
+    let runtime =
+        zeroclaw_runtime::agent::agent::build_model(config, agent_alias, provider_ref, Some(model))
+            .ok()?;
+    Some((runtime.provider, runtime.model_name, runtime.temperature))
 }
 
 async fn handle_ws_sop_frame<S>(
@@ -2139,9 +2132,12 @@ async fn process_chat_message(
                     let live_config = Arc::clone(&state.config);
                     zeroclaw_spawn::spawn!(async move {
                         let config = live_config.read().clone();
-                        let Some((model_provider, model, temperature)) =
-                            ws_consolidation_model(&config, &live_provider_ref, &live_model)
-                        else {
+                        let Some((model_provider, model, temperature)) = ws_consolidation_model(
+                            &config,
+                            &turn_alias,
+                            &live_provider_ref,
+                            &live_model,
+                        ) else {
                             ::zeroclaw_log::record!(
                                 DEBUG,
                                 ::zeroclaw_log::Event::new(
@@ -4263,7 +4259,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         // so its attribution kind is Plugin; the entry alias is what pins
         // the provider to the live reference.
         let (provider, model, temperature) =
-            ws_consolidation_model(&config, "ollama.agent", "llama3")
+            ws_consolidation_model(&config, "worker", "ollama.agent", "llama3")
                 .expect("the switched reference must resolve");
         assert_eq!(model, "llama3");
         assert_eq!(
@@ -4282,8 +4278,9 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         );
 
         // Without a live model (empty), the switched entry's own model is used.
-        let (provider, model, temperature) = ws_consolidation_model(&config, "ollama.agent", "")
-            .expect("the switched reference must resolve");
+        let (provider, model, temperature) =
+            ws_consolidation_model(&config, "worker", "ollama.agent", "")
+                .expect("the switched reference must resolve");
         assert_eq!(model, "agent-entry-model");
         assert_eq!(temperature, Some(0.3));
         assert!(matches!(
@@ -4298,7 +4295,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         // from the switched ollama entry — both must follow their own
         // reference.
         let (provider, model, temperature) =
-            ws_consolidation_model(&config, "openai.install", "install-wide-model")
+            ws_consolidation_model(&config, "worker", "openai.install", "install-wide-model")
                 .expect("the configured reference must resolve");
         assert_eq!(model, "install-wide-model");
         assert_eq!(temperature, Some(0.9));
@@ -4311,8 +4308,8 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         // A reference that no longer resolves — or one that is not a dotted
         // `<family>.<alias>` — skips consolidation instead of falling back
         // to an unrelated entry.
-        assert!(ws_consolidation_model(&config, "ollama.gone", "m").is_none());
-        assert!(ws_consolidation_model(&config, "not-dotted", "m").is_none());
+        assert!(ws_consolidation_model(&config, "worker", "ollama.gone", "m").is_none());
+        assert!(ws_consolidation_model(&config, "worker", "not-dotted", "m").is_none());
     }
 
     #[test]

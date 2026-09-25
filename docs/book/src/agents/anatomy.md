@@ -38,6 +38,8 @@ on-disk side of the join, covered in
 ## Validation
 
 `Config::validate()` fails loud at startup if `model_provider` does not resolve
-to a configured provider entry, or if `risk_profile` does not resolve to a
+to a configured provider entry (or, for a three-segment
+`<type>.<alias>.<model_alias>` ref, to a configured model entry under that
+profile's `models` subtable), or if `risk_profile` does not resolve to a
 configured risk profile. A bad reference is caught before the agent runs, not
 silently ignored.

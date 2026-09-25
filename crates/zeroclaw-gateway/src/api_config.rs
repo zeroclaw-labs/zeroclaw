@@ -9,6 +9,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 use zeroclaw_config::field_visibility;
+use zeroclaw_config::schema::Config;
 use zeroclaw_config::sections::section_for_path;
 use zeroclaw_config::traits::MaskSecrets;
 
@@ -913,6 +914,10 @@ pub async fn handle_list(
             None => true,
         })
         .filter(|info| !field_visibility::is_excluded(&info.name, &excluded))
+        // A migrated profile keeps its legacy `model` for compatibility, but
+        // the runtime resolver selects the nested entry. Do not offer the
+        // shadowed field as a second editable model in the Web form.
+        .filter(|info| effective_model_patch_path(&config, &info.name) == info.name)
         .map(|info| {
             let populated = info.display_value != zeroclaw_config::traits::UNSET_DISPLAY;
             let is_sensitive = info.is_secret || info.derived_from_secret;
@@ -2003,10 +2008,14 @@ pub async fn handle_patch(
     if !override_drift {
         let drifted = compute_drift(&working).await;
         if !drifted.is_empty() {
-            let touched: std::collections::HashSet<String> = ops
-                .iter()
-                .map(|op| json_pointer_to_dotted(&op.path))
-                .collect();
+            let mut touched = std::collections::HashSet::new();
+            for op in &ops {
+                let requested = json_pointer_to_dotted(&op.path);
+                touched.insert(requested.clone());
+                if matches!(op.op.as_str(), "add" | "replace" | "test") {
+                    touched.insert(effective_model_patch_path(&working, &requested));
+                }
+            }
             let conflicts: Vec<&DriftEntry> = drifted
                 .iter()
                 .filter(|d| touched.contains(&d.path))
@@ -2032,7 +2041,12 @@ pub async fn handle_patch(
     let mut results = Vec::with_capacity(ops.len());
 
     for (idx, op) in ops.iter().enumerate() {
-        let path = json_pointer_to_dotted(&op.path);
+        let requested_path = json_pointer_to_dotted(&op.path);
+        let path = if matches!(op.op.as_str(), "add" | "replace" | "test") {
+            effective_model_patch_path(&working, &requested_path)
+        } else {
+            requested_path
+        };
         if matches!(op.op.as_str(), "add" | "replace") && working.ensure_map_key_for_path(&path) {
             // Refused to vivify the reserved `default` agent: surface the same
             // reserved error the explicit create surfaces do, not a generic 404.
@@ -2269,6 +2283,33 @@ fn json_pointer_to_dotted(path: &str) -> String {
     } else {
         path.to_string()
     }
+}
+
+/// Redirect edits of a shadowed legacy provider `model` field to the nested
+/// model entry selected by the same resolver used at runtime. Migration keeps
+/// the legacy field for compatibility, but once `resolve_model_selection`
+/// selects a nested entry, writing the legacy field cannot affect dispatch.
+fn effective_model_patch_path(config: &Config, requested_path: &str) -> String {
+    let Some(profile_path) = requested_path.strip_suffix(".model") else {
+        return requested_path.to_string();
+    };
+    let Some(provider_path) = profile_path.strip_prefix("providers.models.") else {
+        return requested_path.to_string();
+    };
+    let Some((family, alias)) = provider_path.split_once('.') else {
+        return requested_path.to_string();
+    };
+    if family.is_empty() || alias.is_empty() || alias.contains('.') {
+        return requested_path.to_string();
+    }
+    let provider_ref = format!("{family}.{alias}");
+    let Some(model_alias) = config
+        .resolve_model_selection(&provider_ref)
+        .and_then(|selection| selection.model_alias)
+    else {
+        return requested_path.to_string();
+    };
+    format!("{profile_path}.models.{model_alias}.id")
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -3181,6 +3222,104 @@ mod tests {
             zeroclaw_config::policy::SecurityPolicy::from_profiles(profile, None, tmp.path());
         assert!(policy.is_tool_allowed("shell"));
         assert!(!policy.is_tool_allowed("memory_recall"));
+    }
+
+    #[tokio::test]
+    async fn patch_legacy_model_updates_the_runtime_selected_nested_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        let profile = config
+            .providers
+            .models
+            .ensure("openai", "migrated")
+            .expect("openai provider slot exists");
+        profile.model = Some("legacy-model".into());
+        profile.models.insert(
+            "default".into(),
+            zeroclaw_config::schema::ModelEntryConfig {
+                id: Some("effective-before".into()),
+                ..Default::default()
+            },
+        );
+        config.save().await.unwrap();
+        let state = test_state(config);
+
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/providers/models/openai/migrated/model",
+                    "value": "effective-after"
+                }])),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "PATCH failed: {json}");
+        assert_eq!(
+            json["results"][0]["path"],
+            "providers.models.openai.migrated.models.default.id"
+        );
+        {
+            let live = state.config.read();
+            assert_eq!(
+                live.resolve_model_selection("openai.migrated")
+                    .and_then(|selection| selection.model_id)
+                    .as_deref(),
+                Some("effective-after")
+            );
+            assert_eq!(
+                live.providers
+                    .models
+                    .find("openai", "migrated")
+                    .and_then(|profile| profile.model.as_deref()),
+                Some("legacy-model"),
+                "the compatibility field must not become a second synchronized source"
+            );
+        }
+
+        let written = tokio::fs::read_to_string(tmp.path().join("config.toml"))
+            .await
+            .expect("patched config must be saved");
+        let reloaded: zeroclaw_config::schema::Config =
+            toml::from_str(&written).expect("patched config must reload");
+        assert_eq!(
+            reloaded
+                .resolve_model_selection("openai.migrated")
+                .and_then(|selection| selection.model_id)
+                .as_deref(),
+            Some("effective-after")
+        );
+
+        let (list_status, list_json) = response_json(
+            handle_list(
+                State(state),
+                HeaderMap::new(),
+                Query(ListQuery {
+                    prefix: Some("providers.models.openai.migrated".into()),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(list_status, StatusCode::OK);
+        let listed_paths: Vec<&str> = list_json["entries"]
+            .as_array()
+            .expect("config list returns entries")
+            .iter()
+            .filter_map(|entry| entry["path"].as_str())
+            .collect();
+        assert!(
+            !listed_paths.contains(&"providers.models.openai.migrated.model"),
+            "the Web config list must hide the shadowed legacy field"
+        );
+        assert!(
+            listed_paths.contains(&"providers.models.openai.migrated.models.default.id"),
+            "the Web config list must expose the runtime-selected nested field"
+        );
     }
 
     #[tokio::test]

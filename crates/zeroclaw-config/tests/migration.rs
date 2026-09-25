@@ -2428,7 +2428,10 @@ fn generate_v3_channel_breadth_lower_bound() {
     // The V1 fixture covers a wide channel surface. Lower-bound count
     // catches accidental loss of a whole channel during migration.
     // Raise the bound only when adding more channels to the fixture.
-    const MIN_CHANNEL_ALIASES: usize = 25;
+    // The retired `[channels.notion.*]` spelling is intentionally absent;
+    // Twitter and Reddit remain live aliased channels and count toward the
+    // migration breadth guard.
+    const MIN_CHANNEL_ALIASES: usize = 26;
 
     let cfg = migrate_to_current(
         &generate(CURRENT_SCHEMA_VERSION, &GenerateOptions::default())
@@ -2466,7 +2469,7 @@ fn generate_v3_channel_breadth_lower_bound() {
 
     assert!(
         alias_count >= MIN_CHANNEL_ALIASES,
-        "generate(V3) channel breadth dropped: expected ≥ {MIN_CHANNEL_ALIASES} \
+        "generate(current) channel breadth dropped: expected ≥ {MIN_CHANNEL_ALIASES} \
          channel aliases across all types, got {alias_count}. Most likely \
          cause: a V1 channel block got silently dropped during migration."
     );
