@@ -45,7 +45,7 @@ import ToolPicker from "@/components/ToolPicker";
 import ToolPermissionGrid, {
   type ToolPermissionGridValue,
 } from "@/components/ToolPermissionGrid";
-import { profileLevelFromDraft } from "@/components/ToolPermissionGrid.logic";
+import { profileLevelFromDraft, parseOptionalAllowedTools, parseDenyAllToolsDraft, serializeAllowedTools } from "@/components/ToolPermissionGrid.logic";
 import { Badge, Button, ComboBox, Select } from "@/components/ui";
 import type { BadgeTone } from "@/components/ui";
 import { t } from "@/lib/i18n";
@@ -371,7 +371,7 @@ function modelFallbackExample(path: string): string {
 function defaultInputValue(entry: ListResponseEntry): string {
   const v = entry.value;
   if (entry.kind === "string-array" || entry.kind === "object-array") {
-    // API returns the TOML/JSON array form as a string. Keep it as the
+    // API Returns the TOML/JSON array form as a string. Keep it as the
     // canonical draft shape; the row editor parses on render.
     if (typeof v === "string") return v === "<unset>" ? "[]" : v;
     if (Array.isArray(v)) return JSON.stringify(v);
@@ -1215,11 +1215,11 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
     };
 
     // Group sibling `*.allowed_tools` / `*.excluded_tools` / `*.auto_approve`
-    // / `*.always_ask` entries into one ToolPermissionGrid instead of four
-    // independent FieldRows. Matched by parent prefix + leaf name — today
-    // only `risk_profiles.<alias>` has all four as direct siblings, but
-    // nothing here hardcodes that section, same spirit as the single-leaf
-    // `isAllowedToolsField` hook below.
+    // / `*.always_ask` entries (plus the optional `*.deny_all_tools` boolean
+    // sibling) into one ToolPermissionGrid instead of independent FieldRows.
+    // Matched by parent prefix + leaf name — today only `risk_profiles.<alias>`
+    // has all four as direct siblings, but nothing here hardcodes that
+    // section, same spirit as the single-leaf `isAllowedToolsField` hook below.
     const permissionGroups = useMemo(() => {
       const leaves = [
         "allowed_tools",
@@ -1228,29 +1228,42 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
         "always_ask",
       ] as const;
       type Leaf = (typeof leaves)[number];
-      const byParent = new Map<string, Partial<Record<Leaf, ListResponseEntry>>>();
+      const byParent = new Map<
+        string,
+        { arrays: Partial<Record<Leaf, ListResponseEntry>>; denyAll?: ListResponseEntry }
+      >();
       for (const e of entries) {
-        if (e.kind !== "string-array") continue;
         const idx = e.path.lastIndexOf(".");
         if (idx === -1) continue;
         const parent = e.path.slice(0, idx);
-        const leaf = e.path.slice(idx + 1) as Leaf;
-        if (!(leaves as readonly string[]).includes(leaf)) continue;
-        const bucket = byParent.get(parent) ?? {};
-        bucket[leaf] = e;
-        byParent.set(parent, bucket);
+        const leaf = e.path.slice(idx + 1);
+        if (e.kind === "string-array" && (leaves as readonly string[]).includes(leaf)) {
+          const bucket = byParent.get(parent) ?? { arrays: {} };
+          bucket.arrays[leaf as Leaf] = e;
+          byParent.set(parent, bucket);
+        } else if (e.kind === "bool" && leaf === "deny_all_tools") {
+          const bucket = byParent.get(parent) ?? { arrays: {} };
+          bucket.denyAll = e;
+          byParent.set(parent, bucket);
+        }
       }
-      const groups: { parent: string; fields: Record<Leaf, ListResponseEntry> }[] = [];
+      const groups: {
+        parent: string;
+        fields: Record<Leaf, ListResponseEntry>;
+        denyAll: ListResponseEntry | null;
+      }[] = [];
       for (const [parent, bucket] of byParent) {
-        if (bucket.allowed_tools && bucket.excluded_tools && bucket.auto_approve && bucket.always_ask) {
+        const a = bucket.arrays;
+        if (a.allowed_tools && a.excluded_tools && a.auto_approve && a.always_ask) {
           groups.push({
             parent,
             fields: {
-              allowed_tools: bucket.allowed_tools,
-              excluded_tools: bucket.excluded_tools,
-              auto_approve: bucket.auto_approve,
-              always_ask: bucket.always_ask,
+              allowed_tools: a.allowed_tools,
+              excluded_tools: a.excluded_tools,
+              auto_approve: a.auto_approve,
+              always_ask: a.always_ask,
             },
+            denyAll: bucket.denyAll ?? null,
           });
         }
       }
@@ -1270,6 +1283,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
         s.add(g.fields.excluded_tools.path);
         s.add(g.fields.auto_approve.path);
         s.add(g.fields.always_ask.path);
+        if (g.denyAll) s.add(g.denyAll.path);
       }
       return s;
     }, [permissionGroups]);
@@ -1512,7 +1526,15 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
           filterable field list (see `groupedPaths` / `visibleEntries`
           above) so the tool-name search inside the grid never fights the
           field-name search box above it. */}
-        {permissionGroups.map((g) => (
+        {permissionGroups.map((g) => {
+          // `[]` in the array draft is the legacy unrestricted state, same
+          // as omitted; deny-all rides the boolean sibling (with a fallback
+          // reading of the legacy `__none__` sentinel in the array draft).
+          const allowlist = parseOptionalAllowedTools(draft[g.fields.allowed_tools.path] ?? "");
+          const denyAllTools =
+            allowlist.denyAllTools ||
+            (g.denyAll ? parseDenyAllToolsDraft(draft[g.denyAll.path]) : false);
+          return (
           <div
             key={g.parent}
             className="surface-panel p-4"
@@ -1529,20 +1551,28 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
               agent={toolAgent}
               level={profileLevelFromDraft(draft, g.parent)}
               value={{
-                allowedTools: parseArrayRows(draft[g.fields.allowed_tools.path] ?? ""),
+                allowedTools: allowlist.allowedTools,
+                denyAllTools,
                 excludedTools: parseArrayRows(draft[g.fields.excluded_tools.path] ?? ""),
                 autoApprove: parseArrayRows(draft[g.fields.auto_approve.path] ?? ""),
                 alwaysAsk: parseArrayRows(draft[g.fields.always_ask.path] ?? ""),
               }}
               onChange={(next: ToolPermissionGridValue) => {
-                applyFieldValue(g.fields.allowed_tools, JSON.stringify(next.allowedTools));
+                applyFieldValue(g.fields.allowed_tools, serializeAllowedTools(next.allowedTools));
                 applyFieldValue(g.fields.excluded_tools, JSON.stringify(next.excludedTools));
                 applyFieldValue(g.fields.auto_approve, JSON.stringify(next.autoApprove));
                 applyFieldValue(g.fields.always_ask, JSON.stringify(next.alwaysAsk));
+                // Write the explicit deny-all flag only when the backend
+                // exposes the leaf; the array sentinel path above covers
+                // legacy surfaces without it.
+                if (g.denyAll) {
+                  applyFieldValue(g.denyAll, next.denyAllTools ? "true" : "false");
+                }
               }}
             />
           </div>
-        ))}
+          );
+        })}
 
         {/* Sticky footer bar — pinned to the bottom of the scrolling form
           area so Save is always visible without scrolling. Status (unsaved

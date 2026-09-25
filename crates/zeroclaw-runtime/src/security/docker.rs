@@ -14,7 +14,9 @@ pub struct DockerSandbox {
 impl Default for DockerSandbox {
     fn default() -> Self {
         Self {
-            image: "alpine:latest".to_string(),
+            // Read from the config crate so the sandbox default and the
+            // `[security.sandbox].image` serde default cannot drift apart.
+            image: zeroclaw_config::schema::DEFAULT_SANDBOX_IMAGE.to_string(),
             workspace_dir: None,
         }
     }
@@ -149,8 +151,15 @@ mod tests {
     }
 
     #[test]
-    fn docker_sandbox_default_image() {
+    fn docker_sandbox_default_image_tracks_the_config_default() {
+        // Asserting against the constant rather than a literal is the point:
+        // the sandbox default and `[security.sandbox].image` now have one
+        // source, and this fails if someone reintroduces a second one.
         let sandbox = DockerSandbox::default();
+        assert_eq!(
+            sandbox.image,
+            zeroclaw_config::schema::DEFAULT_SANDBOX_IMAGE
+        );
         assert_eq!(sandbox.image, "alpine:latest");
     }
 

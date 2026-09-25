@@ -13,11 +13,12 @@ mod component {
 
     use exports::zeroclaw::plugin::channel::{
         ApprovalRequest, ApprovalResponse, ChannelCapabilities, Guest as Channel, InboundMessage,
-        SendMessage,
+        SendMessage, WebhookRejection, WebhookRequest, WebhookResponse,
     };
     use exports::zeroclaw::plugin::plugin_info::Guest as PluginInfo;
     use zeroclaw::plugin::config::{ConfigError, get as config_get};
     use zeroclaw::plugin::secrets::{SecretError, get as secret_get};
+    use zeroclaw::plugin::state::{StateError, get as state_get, put as state_put};
 
     struct FixtureChannel;
     static SEND_CALL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
@@ -83,6 +84,14 @@ mod component {
             if token.is_empty() {
                 return Err("expected non-empty api_token secret".to_string());
             }
+            let current = state_get("channel-session")
+                .map_err(|_| "expected scoped channel state".to_string())?;
+            let expected = current.as_ref().map(|entry| entry.revision);
+            let revision = state_put("channel-session", token.as_bytes(), expected)
+                .map_err(|_| "expected scoped channel state write".to_string())?;
+            if revision != expected.unwrap_or(0) + 1 {
+                return Err("unexpected channel state revision".to_string());
+            }
 
             Ok(())
         }
@@ -117,6 +126,17 @@ mod component {
             }
             let token = secret_get("api_token")
                 .map_err(|_| "expected api_token during channel operation".to_string())?;
+            let state = state_get("channel-session")
+                .map_err(|_| "expected channel state during operation".to_string())?
+                .ok_or_else(|| "expected configured channel state".to_string())?;
+            if state.value != token.as_bytes() {
+                let next_revision =
+                    state_put("channel-session", token.as_bytes(), Some(state.revision))
+                        .map_err(|_| "expected CAS update after credential rotation".to_string())?;
+                if next_revision != state.revision + 1 {
+                    return Err("unexpected rotated channel state revision".to_string());
+                }
+            }
             if message.content != format!("{epoch}:{token}") {
                 return Err("message did not use one current config revision".to_string());
             }
@@ -155,8 +175,11 @@ mod component {
         fn get_channel_capabilities() -> ChannelCapabilities {
             if matches!(config_get(), Err(ConfigError::Unavailable))
                 && matches!(secret_get("api_token"), Err(SecretError::Unavailable))
+                && matches!(state_get("channel-session"), Err(StateError::Unavailable))
             {
-                ChannelCapabilities::HEALTH_CHECK | ChannelCapabilities::SELF_HANDLE
+                ChannelCapabilities::HEALTH_CHECK
+                    | ChannelCapabilities::SELF_HANDLE
+                    | ChannelCapabilities::WEBHOOK_INGRESS
             } else {
                 ChannelCapabilities::empty()
             }
@@ -173,7 +196,8 @@ mod component {
             // `configure` is replayed so the reconstruction metadata check sees
             // a stable value across a rebuilt instance.
             (matches!(config_get(), Err(ConfigError::Unavailable))
-                && matches!(secret_get("api_token"), Err(SecretError::Unavailable)))
+                && matches!(secret_get("api_token"), Err(SecretError::Unavailable))
+                && matches!(state_get("channel-session"), Err(StateError::Unavailable)))
             .then(|| {
                 CONFIGURED_HANDLE
                     .lock()
@@ -292,6 +316,77 @@ mod component {
 
         fn supports_free_form_ask() -> bool {
             true
+        }
+
+        fn webhook_path() -> Option<String> {
+            Some("fixture".to_string())
+        }
+
+        fn parse_webhook(request: WebhookRequest) -> Result<WebhookResponse, WebhookRejection> {
+            let WebhookRequest {
+                method,
+                query,
+                headers,
+                body,
+            } = request;
+            if body == b"spin" {
+                let mut value = 0_u64;
+                loop {
+                    value = std::hint::black_box(value.wrapping_add(1));
+                }
+            }
+
+            let token = secret_get("api_token").map_err(|_| {
+                WebhookRejection::Unauthorized("scoped webhook secret unavailable".to_string())
+            })?;
+            let supplied = headers
+                .iter()
+                .find(|(name, _)| name == "x-fixture-secret")
+                .map(|(_, value)| value.as_str());
+            if supplied != Some(token.as_str()) {
+                return Err(WebhookRejection::Unauthorized(
+                    "private signature mismatch diagnostic".to_string(),
+                ));
+            }
+
+            if method == "GET" {
+                return Ok(WebhookResponse::Reply(query));
+            }
+            let payload: serde_json::Value = serde_json::from_slice(&body).map_err(|error| {
+                WebhookRejection::BadRequest(format!("private parser detail: {error}"))
+            })?;
+            if let Some(challenge) = payload.get("challenge").and_then(serde_json::Value::as_str) {
+                return Ok(WebhookResponse::Reply(challenge.to_string()));
+            }
+            let field = |name: &str| {
+                payload
+                    .get(name)
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string)
+                    .ok_or_else(|| {
+                        WebhookRejection::BadRequest(format!(
+                            "private parser detail: missing {name}"
+                        ))
+                    })
+            };
+            Ok(WebhookResponse::Messages(vec![InboundMessage {
+                id: field("id")?,
+                sender: field("sender")?,
+                reply_target: field("reply_target")?,
+                content: field("content")?,
+                channel: payload
+                    .get("channel")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("spoofed-channel")
+                    .to_string(),
+                channel_alias: Some("spoofed-alias".to_string()),
+                timestamp: 7,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: Vec::new(),
+                subject: None,
+            }]))
         }
     }
 

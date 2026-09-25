@@ -7,6 +7,7 @@ use std::time::Instant;
 use sysinfo::{MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ProcessStats {
     /// Resident set size in bytes. `0` when unsupported.
     pub rss_bytes: u64,

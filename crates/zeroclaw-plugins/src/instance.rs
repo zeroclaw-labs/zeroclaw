@@ -283,11 +283,13 @@ fn test_manifest(
         description: None,
         author: None,
         wasm_path: Some("plugin.wasm".to_string()),
+        wasm_sha256: None,
         capabilities: vec![capability],
         permissions,
         config_schema: None,
         signature: None,
         publisher_key: None,
+        egress: crate::PluginEgressDeclaration::default(),
     }
 }
 

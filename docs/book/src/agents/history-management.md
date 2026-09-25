@@ -34,19 +34,56 @@ shape are left unchanged.
 
 The token budget comes from `ResolvedRuntime::effective_context_budget()`:
 
+- Existing profiles retain the historical 32,000-token budget when neither
+  `max_context_tokens` nor `context_compact_ratio` is set, capped by the
+  selected model's configured capacity when that capacity is smaller.
+- `max_context_tokens` remains an absolute budget. An explicit value of `0`
+  disables proactive token-budget trimming.
+- Setting `context_compact_ratio` opts into a model-relative budget: the
+  selected provider alias/model's `context_window` (or a 32,000 fallback when
+  its capacity is unknown) multiplied by the ratio. Values outside `(0.0, 1.0]`
+  are treated as unset. When both settings are present, `max_context_tokens`
+  is a downward cap on the ratio-derived budget.
 - When `history_pruning.enabled` is set with a positive
-  `history_pruning.max_tokens`, the budget is the lower of that value and
-  `max_context_tokens`.
-- Otherwise the budget is `max_context_tokens`.
+  `history_pruning.max_tokens`, that value pulls the budget down (never up),
+  letting operators trim earlier.
+- Every positive effective budget is capped by the selected model's capacity.
+  The explicit zero sentinel remains zero and continues to disable proactive
+  trimming.
+
+The effective budget is a proactive trimming target, not a hard request limit.
+After dropping all eligible older turns, the runtime retains the newest complete
+turn even if it remains above that target. It sends the request when the prepared
+messages, images, hooks, and tool schemas fit the resolved model context window.
+A request that still exceeds that capacity fails before provider dispatch; raising
+the proactive target alone cannot make it fit. This capacity check also applies
+when proactive trimming is disabled (`max_context_tokens = 0`) and to the final
+summary request after the tool iteration limit is reached.
+
+Capacity and budget are resolved together for the active provider/model route.
+Classifier hints and explicit session switches use the same route selection as
+provider dispatch, so the next model call, proactive trim, overflow diagnostic,
+cost attribution, and client context meter use the selected provider/model and
+its resolved pair. If the selected model does not match the model configured on
+that provider profile, capacity is treated as unknown instead of borrowing the
+profile's metadata for a different model. The internal 32,000 compatibility
+fallback remains available for safety calculations, but wire clients receive no
+`model_context_window` value for an unknown capacity.
 
 Token counts are estimated by `history::estimate_history_tokens`: roughly four
 characters per token plus four framing tokens per message. This is a heuristic,
-not a provider tokenizer.
+not a provider tokenizer. Loadable `[IMAGE:...]` markers are charged a fixed
+per-image cost only in messages whose images are dispatched: user turns and the
+tool results of the current user turn. Markers that preparation strips from
+older tool results are not charged, and system and assistant text is priced as
+text.
 
-Token-budget trimming runs before the first provider call of a turn when
-history already exceeds the effective budget and at provider-call boundaries
-between tool-loop iterations, including reactively when a provider reports that
-the context window was exceeded. It retains whole turns, so it never splits a
+Proactive token-budget trimming runs before the first provider call of a turn
+when history already exceeds the effective budget and at provider-call
+boundaries between tool-loop iterations. If a provider reports a context-window
+overflow, the existing reactive recovery path retries after trimming to two
+thirds of the current estimated history size. It does not derive a new recovery
+target from model capacity. Both paths retain whole turns, so neither splits a
 tool exchange.
 
 ## Structured message-count limit
@@ -67,6 +104,10 @@ max(50, 2 * max_tool_iterations + 2)
 Each tool iteration can add a tool call and a tool result; the extra two slots
 cover the user message and final assistant response. With the default
 `max_tool_iterations = 10`, the derived limit remains `50`.
+
+Trims refill to a low-water mark rather than to the cap. When the history exceeds the cap, the runtime drops the oldest whole turns until `floor(max_history_messages * history_trim_low_water)` non-system messages remain (at least 1), while still keeping the newest complete turn. `history_trim_low_water` is a runtime-profile fraction in `(0.0, 1.0]` and defaults to `0.7`. The effective cap and fraction resolve together from the agent's current runtime-profile binding at trim time, so profile reloads apply to existing sessions. Because the trigger stays on the cap, the usual pattern is one deeper trim at the cap followed by room for new turns, instead of a trim on every turn near the limit. A value of `1.0` disables hysteresis and refills straight to the cap, which matches the pre-hysteresis behavior.
+
+Range checking depends on the write path. `Config::validate()` rejects out-of-range fractions and runs for `zeroclaw config validate` and gateway config PATCH writes. Boot-time loading is resilient and starts anyway. CLI `zeroclaw config set` and RPC `config/set` persist fractions without running `Config::validate()`. If an invalid fraction reaches the trimmer through one of these paths, it uses the cap, with no hysteresis, until the fraction is repaired. The `trim_target` field on the history-trim debug event shows which target was used.
 
 ## Visible trimming
 

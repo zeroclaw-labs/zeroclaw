@@ -43,11 +43,17 @@ Some legacy labels may remain live during a staged migration. New or manual appl
 
 Live PR label automation is split by source. `pr-path-labeler.yml` runs `actions/labeler` from `.github/labeler.yml` on PR open, reopen, and every pushed update. Because that workflow uses `sync-labels: true`, labels owned by `.github/labeler.yml` are recalculated from the current PR file set: matching path labels are added, and path labels that no longer match are removed.
 
+`pr-size-labeler.yml` owns canonical `size:*` labels. It runs on PR open, reopen, and every pushed update, reads GitHub PR file metadata from the API, and applies the one canonical size label that matches the effective changed-line count. The workflow fetches the classifier script from the trusted workflow/default-branch revision; it must not check out, build, import, source, or execute pull-request code in its elevated label-writing context.
+
 Dependabot also seeds configured labels on its own PRs from `.github/dependabot.yml`: Cargo updates get `dependencies`; GitHub Actions and Docker updates get `ci` and `dependencies`. Those labels are initial Dependabot PR metadata, not the synchronized path-labeler contract.
 
-Today `.github/labeler.yml` owns only path and scope labels such as `docs`, `ci`, `channel`, `provider:openai`, and `tool:file`. It does not own `risk:*`, `size:*`, `type:*`, contributor-tier, status, resolution, stale, or pickup labels.
+Today `.github/labeler.yml` owns only path and scope labels such as `docs`, `ci`, `channel`, `provider:openai`, and `tool:file`. It does not own `risk:*`, `type:*`, contributor-tier, status, resolution, stale, or pickup labels.
 
 Size automation may recalculate on every pushed PR update so labels continue to describe the actual diff under review. #9345 owns the separate risk-classifier rollout. Its risk phase remains report-only until maintainers review the evidence and separately enable mutation. Report-only output must record the proposed risk, matching rule evidence, current risk, `risk:manual` state, and `domain:security` state so maintainers can audit mismatches and security-shaped work that escaped both triggers. Any future risk automation must honor `risk:manual` as a hard freeze: it cannot add, remove, or replace a PR's `risk:*` label until a maintainer removes the override.
+
+## Optional CI execution
+
+`ci:windows` is a maintainer-applied compute switch for advisory Windows tests on a PR, not a review or security approval. It is separate from the automatic `ci` path label. See [when to request Windows execution](./ci-and-actions.md#label-gated-advisory-windows-tests-windows-testsyml) for selection guidance, repeat-run behavior, and how to read the result.
 
 ## Cleanup protocol
 
@@ -105,7 +111,7 @@ Applied automatically by `pr-path-labeler.yml`. Globs live in `.github/labeler.y
 | `dependencies` | `Cargo.toml`, `**/Cargo.toml`, `Cargo.lock`, `**/Cargo.lock`, `deny.toml`, `.github/dependabot.yml` |
 | `ci` | `.github/codeql/**`, `.github/workflows/**`, `.github/*.yaml`, `.github/*.yml`, `.github/*.json`, `.githooks/**` |
 | `core` | `src/*.rs` |
-| `cli` | `src/main.rs`, `src/lib.rs`, `src/commands/**`, `src/alias_cli/**`, `src/cli_input.rs`, `crates/zeroclaw-commands/**`, `crates/zeroclaw-runtime/src/cli_input.rs` |
+| `cli` | `src/main.rs`, `src/lib.rs`, `src/commands/**`, `src/alias_cli/**`, `src/cli_input.rs`, `src/memory/cli.rs` (the `zeroclaw memory` command), `crates/zeroclaw-commands/**`, `crates/zeroclaw-runtime/src/cli_input.rs` |
 | `agent` | `src/agent/**`, `crates/zeroclaw-runtime/src/agent/**` |
 | `channel` | `src/channels/**`, `crates/zeroclaw-channels/src/**` |
 | `gateway` | `src/gateway/**`, `crates/zeroclaw-gateway/src/**` |
@@ -121,7 +127,7 @@ Applied automatically by `pr-path-labeler.yml`. Globs live in `.github/labeler.y
 | `runtime` | `src/runtime/**`, `crates/zeroclaw-runtime/src/**` |
 | `quickstart` | `crates/zeroclaw-runtime/src/quickstart/**`, `crates/zeroclaw-gateway/src/api_quickstart.rs`, `apps/zerocode/src/quickstart_pane.rs`, `web/src/pages/quickstart/**` |
 | `desktop` | `apps/tauri/**` |
-| `hardware` | `src/hardware/**`, `crates/zeroclaw-hardware/**`, `firmware/**` |
+| `hardware` | `src/hardware/**`, `src/peripherals/mod.rs`, `crates/zeroclaw-hardware/**`, `crates/zeroclaw-api/src/peripherals_traits.rs`, `firmware/**` |
 | `web` | `web/**` |
 | `zerocode` | `apps/zerocode/**` |
 | `provider` | `src/providers/**`, `crates/zeroclaw-providers/src/**` |
@@ -165,7 +171,7 @@ Some scoped component labels are manual routing labels rather than synchronized 
 
 `domain:security` identifies an effective authentication, authorization, credential, secret-handling, confinement, tool-permission, security-policy, cryptographic-identity, or untrusted-input boundary. Apply it when the changed behavior crosses that boundary, including outside canonical security paths. Do not apply it only because a PR discusses security, changes security documentation or tests, updates an advisory dependency, or performs generic hardening without changing a trust boundary. The label remains manual because path matching cannot reliably infer this consequence.
 
-`domain:security` is independent from `risk:*`. A PR carrying either `risk:high` or `domain:security` requires deep review and two independent Core Team approvals before merge. Automated review does not count as a Core Team approval.
+`domain:security` is independent from `risk:*`. A PR carrying either `risk:high` or `domain:security` requires deep review and defaults to two independent Core Team approvals before merge. Only the [expedited second-review lane](./pr-workflow.md#expedited-second-review-lane) provides a standing exception, and automated review never counts as a Core Team approval.
 
 The following duplicate domain and product-surface labels are pending retirement. Do not apply them to new work. They remain live only until a separate exact operation packet migrates any remaining open references and deletes the definitions.
 
@@ -284,9 +290,11 @@ Tools are grouped by logical function rather than one label per file.
 
 ## Size labels
 
-Based on effective changed line count, normalized for docs-only and lockfile-heavy PRs. Currently applied **manually**; the size automation that previously computed these was removed during CI simplification. Future size automation should follow the [automation contract](#automation-contract).
+Based on effective changed line count, normalized for docs-only and lockfile-heavy PRs. Applied automatically by `pr-size-labeler.yml` from GitHub PR file metadata.
 
 New or manual applications should use the canonical no-space labels below. Existing legacy open refs may keep spaced labels until the open-reference migration packet handles them; see [Canonical spelling](#canonical-spelling).
+
+Effective changed lines are additions plus deletions after excluding docs-like files and `Cargo.lock`. Docs-like files are paths under `docs/`, Markdown or MDX files, `.github/ISSUE_TEMPLATE/**`, `.github/pull_request_template.md`, `.markdownlint-cli2.yaml`, and `LICENSE`. The size workflow manages only canonical no-space `size:*` labels; it does not delete legacy spaced labels as a side effect.
 
 | Label | Threshold |
 |---|---|
@@ -306,8 +314,8 @@ New or manual applications should use the canonical no-space labels below. Exist
 |---|---|
 | `risk:low` | Documentation, localization, fixtures, generated references, or mechanical metadata with no production, compatibility, build, release, or governance effect |
 | `risk:medium` | Ordinary behavioral production change, including most runtime, gateway, provider, channel, tool, config, application, and CI work |
-| `risk:high` | A concrete trust, credential, compatibility, governance, or release-authority boundary that needs deep review and two independent Core Team approvals |
-| `risk:manual` | Maintainer override that freezes future automated risk replacement; it does not lower review or approval requirements |
+| `risk:high` | A concrete trust, credential, compatibility, governance, or release-authority boundary that needs deep review and defaults to two independent Core Team approvals; see the [expedited second-review lane](./pr-workflow.md#expedited-second-review-lane) |
+| `risk:manual` | Maintainer override that freezes future automated risk replacement; it does not by itself lower review or approval requirements |
 
 `risk:*` describes the actual diff and its consequence, not broad component location. A production-inert test-only change inside a high-risk boundary may be `risk:medium` when the complete test-only boundary is demonstrable; #9530 is authoritative for that exception.
 

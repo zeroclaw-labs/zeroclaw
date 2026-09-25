@@ -12,6 +12,7 @@ pub enum TurnOutcome {
     Completed {
         text: String,
         messages: Vec<ConversationMessage>,
+        safeguard_fallback: Option<zeroclaw_providers::SafeguardFallbackNotice>,
     },
     Cancelled {
         partial_text: String,
@@ -71,6 +72,7 @@ pub async fn execute_turn<F, Fut>(
     cancel: CancellationToken,
     attribution: TurnAttribution,
     cost_context: Option<ToolLoopCostTrackingContext>,
+    connection_activity: Option<crate::rpc::ConnectionActivity>,
     on_event: F,
 ) -> Result<TurnOutcome, TurnError>
 where
@@ -81,7 +83,12 @@ where
     let cancel_clone = cancel.clone();
     let session_key = attribution.session_key.clone();
 
-    let mut turn_handle = zeroclaw_spawn::spawn!(async move {
+    let turn_handle = zeroclaw_spawn::spawn!(async move {
+        // Held inside the task body so the connection stays counted until this
+        // task's future is actually dropped. An abort requested by the caller
+        // only schedules that drop; provider and tool cleanup still runs after
+        // it, and the reload drain must not read zero while it does.
+        let _connection_activity = connection_activity;
         let mut guard = agent.lock().await;
         let sk = attribution.session_key.clone();
         crate::agent::loop_::scope_session_key(attribution.session_key, async move {
@@ -112,6 +119,8 @@ where
         .await
     });
 
+    let mut turn_handle_guard = TurnHandleGuard(Some(turn_handle));
+
     let mut accumulated_text = String::new();
 
     let drain =
@@ -121,25 +130,153 @@ where
 
     match drain {
         DrainOutcome::Completed => {
-            let joined = turn_handle
-                .await
-                .map_err(|e| TurnError::Panicked(format!("{e}")))?;
+            let joined = {
+                let handle = turn_handle_guard.handle()?;
+                handle
+                    .await
+                    .map_err(|e| TurnError::Panicked(format!("{e}")))?
+            };
             outcome_from_task_result(joined, accumulated_text)
         }
         DrainOutcome::ExplicitCancel => {
-            match tokio::time::timeout(CANCEL_GRACE, &mut turn_handle).await {
-                Ok(joined) => outcome_from_task_result(
+            let graced = {
+                let handle = turn_handle_guard.handle()?;
+                join_with_draining_grace(
+                    handle,
+                    &mut event_rx,
+                    &mut accumulated_text,
+                    &on_event,
+                    CANCEL_GRACE,
+                )
+                .await
+            };
+            match graced {
+                Some(joined) => outcome_from_task_result(
                     joined.map_err(|e| TurnError::Panicked(format!("cancelled turn join: {e}")))?,
                     accumulated_text,
                 ),
-                Err(_) => {
-                    turn_handle.abort();
+                None => {
+                    let handle = turn_handle_guard.handle()?;
+                    handle.abort();
+                    // Joined through the guard rather than a moved-out handle:
+                    // if this future is dropped while the abort is still being
+                    // processed, the guard aborts what it still owns instead of
+                    // leaving a detached task behind.
+                    let _ = handle.await;
                     Ok(TurnOutcome::Cancelled {
                         partial_text: accumulated_text,
                         messages: Vec::new(),
                     })
                 }
             }
+        }
+    }
+}
+
+type TurnJoinHandle = tokio::task::JoinHandle<
+    std::result::Result<
+        crate::agent::agent::StreamedTurnSuccess,
+        crate::agent::agent::StreamedTurnError,
+    >,
+>;
+
+/// Owner of the spawned turn task for the whole lifetime of
+/// [`execute_turn`].
+///
+/// The handle is never moved out. Awaiting a moved-out handle detaches the
+/// turn task when the awaiting future is dropped, and a dropped prompt is
+/// exactly what a forced listener teardown produces, so the task would keep
+/// running with nobody holding it. Borrowing the handle out of the guard keeps
+/// [`Drop`] able to abort it on every exit path.
+struct TurnHandleGuard(Option<TurnJoinHandle>);
+
+impl TurnHandleGuard {
+    fn handle(&mut self) -> Result<&mut TurnJoinHandle, TurnError> {
+        self.0.as_mut().ok_or_else(|| {
+            TurnError::Panicked("turn task handle missing from its owner".to_string())
+        })
+    }
+}
+
+impl Drop for TurnHandleGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// After `drain_until_done_or_cancelled` returns `ExplicitCancel`, keep
+/// draining `event_rx` for up to `grace` while racing the turn task instead
+/// of only awaiting it: the cooperative unwind can synthesize one event per
+/// still-pending tool call, and a batch larger than the channel capacity
+/// blocks the task's send once nobody is reading. An un-drained queue
+/// therefore starves the task of the very grace period meant to let it
+/// commit its trimmed history, and every grace window times out into a hard
+/// abort that loses the writeback this repair depends on.
+///
+/// Returns the joined task result if it finishes within `grace`, or `None`
+/// if the grace period elapsed (the caller must abort the handle).
+///
+/// `on_event` delivery is bounded by the *remaining* grace, not left to run
+/// unbounded: `select!` only polls its `sleep` branch between chosen-branch
+/// polls, so an `on_event` call that itself awaits (e.g. an RPC callback
+/// blocked on a full outbound queue with no reader) would otherwise keep the
+/// timer from ever firing and defeat the grace deadline entirely.
+async fn join_with_draining_grace<T, F, Fut>(
+    turn_handle: &mut tokio::task::JoinHandle<T>,
+    event_rx: &mut mpsc::Receiver<TurnEvent>,
+    accumulated: &mut String,
+    on_event: &F,
+    grace: std::time::Duration,
+) -> Option<Result<T, tokio::task::JoinError>>
+where
+    F: Fn(TurnEvent) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let deadline = tokio::time::Instant::now() + grace;
+    let sleep = tokio::time::sleep_until(deadline);
+    tokio::pin!(sleep);
+    let mut event_rx_closed = false;
+    loop {
+        tokio::select! {
+            biased;
+            joined = &mut *turn_handle => {
+                // The task can finish while events it already sent are
+                // still sitting in the channel buffer (a bounded send only
+                // needs buffer space, not a live reader). `biased` gives the
+                // join priority over drain on a tied poll, so without this
+                // the last few buffered events would never reach `on_event`
+                // even though the task committed successfully. The task has
+                // already finished here, so a stuck callback must not block
+                // this return: bound each delivery and stop draining (but
+                // still report the join) once the deadline is reached.
+                while let Ok(event) = event_rx.try_recv() {
+                    if let TurnEvent::Chunk { ref delta } = event {
+                        accumulated.push_str(delta);
+                    }
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if tokio::time::timeout(remaining, on_event(event)).await.is_err() {
+                        break;
+                    }
+                }
+                return Some(joined);
+            }
+            maybe_event = event_rx.recv(), if !event_rx_closed => {
+                match maybe_event {
+                    Some(event) => {
+                        if let TurnEvent::Chunk { ref delta } = event {
+                            accumulated.push_str(delta);
+                        }
+                        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if tokio::time::timeout(remaining, on_event(event)).await.is_err() {
+                            return None;
+                        }
+                    }
+                    None => event_rx_closed = true,
+                }
+            }
+            () = &mut sleep => return None,
         }
     }
 }
@@ -160,9 +297,12 @@ fn outcome_from_task_result(
         Ok(StreamedTurnSuccess {
             response,
             new_messages,
+            safeguard_fallback,
+            ..
         }) => Ok(TurnOutcome::Completed {
             text: response,
             messages: new_messages,
+            safeguard_fallback,
         }),
         Err(StreamedTurnError {
             error,
@@ -239,6 +379,180 @@ mod tests {
 
     fn noop(_e: TurnEvent) -> std::future::Ready<()> {
         std::future::ready(())
+    }
+
+    // ── Matrix test support items (module-level) ──────────────────────────
+
+    use crate::agent::dispatcher::NativeToolDispatcher;
+    use crate::observability::{NoopObserver, Observer};
+    use crate::tools::{Tool, ToolResult};
+    use async_trait::async_trait;
+    use std::sync::Mutex as StdMutex;
+    use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+    use zeroclaw_api::model_provider::ModelProvider;
+    use zeroclaw_memory::Memory;
+    use zeroclaw_providers::ChatRequest;
+    use zeroclaw_providers::traits::TokenUsage;
+    use zeroclaw_providers::{ChatResponse, ToolCall};
+
+    /// Scripted two-call provider: call 1 emits a tool call + usage,
+    /// call 2 emits final text + usage. The drain must process both
+    /// Usage events plus the interleaved tool events without relocking
+    /// the agent (`execute_turn` holds `agent.lock()` for the whole turn).
+    struct TwoCallToolProvider {
+        first: ChatResponse,
+        second: ChatResponse,
+        done: std::sync::atomic::AtomicBool,
+        alias: &'static str,
+    }
+
+    #[async_trait]
+    impl ModelProvider for TwoCallToolProvider {
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            if !self.done.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                Ok(self.first.clone())
+            } else {
+                Ok(self.second.clone())
+            }
+        }
+    }
+
+    impl Attributable for TwoCallToolProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            self.alias
+        }
+    }
+
+    /// Minimal tool the provider can call. Counts invocations so the
+    /// test can assert the tool actually ran exactly once between the
+    /// two Usage events — proving the interleaved flow is real, not a
+    /// degenerate single-call path.
+    struct CountingTool {
+        name: &'static str,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for CountingTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            self.name
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolResult {
+                success: true,
+                output: format!("{}-out", self.name).into(),
+                error: None,
+            })
+        }
+    }
+
+    zeroclaw_api::tool_attribution!(CountingTool, ::zeroclaw_api::attribution::ToolKind::Plugin);
+
+    fn token_usage(input: u64, output: u64) -> TokenUsage {
+        TokenUsage {
+            input_tokens: Some(input),
+            cached_input_tokens: None,
+            output_tokens: Some(output),
+            cache_creation_input_tokens: None,
+        }
+    }
+
+    /// One cell of the `(max_context_tokens × context_window)` matrix.
+    /// Each cell uses a distinct provider alias so they share no registry
+    /// entry. In every cell the resolved window tracks the provider's
+    /// `context_window` and ignores `max_context_tokens` entirely — the
+    /// negative control that proves the legacy 32k stub leak is gone.
+    #[derive(Clone, Copy)]
+    struct MatrixCell {
+        label: &'static str,
+        provider_ref: &'static str,
+        max_context_tokens: Option<usize>,
+        context_window: Option<u64>,
+        expected_resolved: Option<u64>,
+    }
+
+    impl MatrixCell {
+        const ALL: [MatrixCell; 4] = [
+            MatrixCell {
+                label: "(max=some, ctx=some)",
+                provider_ref: "openai.some_some",
+                max_context_tokens: Some(32_000),
+                context_window: Some(200_000),
+                expected_resolved: Some(200_000),
+            },
+            MatrixCell {
+                label: "(max=some, ctx=none)",
+                provider_ref: "openai.some_none",
+                max_context_tokens: Some(32_000),
+                context_window: None,
+                expected_resolved: None,
+            },
+            MatrixCell {
+                label: "(max=none, ctx=some)",
+                provider_ref: "openai.none_some",
+                max_context_tokens: None,
+                context_window: Some(200_000),
+                expected_resolved: Some(200_000),
+            },
+            MatrixCell {
+                label: "(max=none, ctx=none)",
+                provider_ref: "openai.none_none",
+                max_context_tokens: None,
+                context_window: None,
+                expected_resolved: None,
+            },
+        ];
+    }
+
+    /// Bundles the per-cell drain counters so the callback captures a
+    /// single `Arc<DrainCounters>` instead of seven separate `Arc`s.
+    struct DrainCounters {
+        usage_count: StdMutex<usize>,
+        tool_call_seen: StdMutex<bool>,
+        tool_result_seen: StdMutex<bool>,
+        chunk_after_second_usage: StdMutex<bool>,
+        resolved_windows: StdMutex<Vec<Option<u64>>>,
+        provider_refs_seen: StdMutex<Vec<String>>,
+        saw_second_usage: std::sync::atomic::AtomicBool,
+    }
+
+    impl DrainCounters {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                usage_count: StdMutex::new(0),
+                tool_call_seen: StdMutex::new(false),
+                tool_result_seen: StdMutex::new(false),
+                chunk_after_second_usage: StdMutex::new(false),
+                resolved_windows: StdMutex::new(vec![]),
+                provider_refs_seen: StdMutex::new(vec![]),
+                saw_second_usage: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
     }
 
     #[tokio::test]
@@ -340,6 +654,112 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn grace_drain_lets_a_backlog_larger_than_the_channel_finish_within_grace() {
+        // A cooperative unwind synthesizing more events than the channel
+        // capacity blocks on the (capacity+1)th send once nobody is
+        // draining. If the grace window only awaits the task without also
+        // draining, the task can never finish and always times out into a
+        // hard abort. This reproduces that backlog against an 8-slot
+        // channel with 20 events and asserts the task still completes well
+        // inside a generous grace window.
+        const CAPACITY: usize = 8;
+        const EVENTS: usize = CAPACITY * 3;
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(CAPACITY);
+
+        let mut handle = zeroclaw_spawn::spawn!(async move {
+            for i in 0..EVENTS {
+                // Blocks once the channel fills, exactly like a real
+                // cooperative unwind synthesizing one event per pending
+                // tool call after cancellation is observed.
+                let _ = tx
+                    .send(TurnEvent::Chunk {
+                        delta: i.to_string(),
+                    })
+                    .await;
+            }
+            "task-finished"
+        });
+
+        let mut acc = String::new();
+        let joined = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            join_with_draining_grace(
+                &mut handle,
+                &mut rx,
+                &mut acc,
+                &noop,
+                std::time::Duration::from_secs(5),
+            ),
+        )
+        .await
+        .expect("the grace drain itself must not hang");
+
+        assert_eq!(
+            joined
+                .expect("the task must finish within the grace window")
+                .unwrap(),
+            "task-finished",
+            "an un-drained backlog must not starve the task of the grace \
+             period meant to let it commit its cooperative unwind"
+        );
+        assert_eq!(
+            acc.len(),
+            (0..EVENTS).map(|i| i.to_string().len()).sum::<usize>(),
+            "every backlogged event must still be drained and accumulated"
+        );
+    }
+
+    #[tokio::test]
+    async fn grace_drain_returns_within_grace_despite_a_callback_that_never_resolves() {
+        // A callback that permanently blocks (e.g. the outbound RPC queue
+        // is full and nobody is reading) must not be able to keep
+        // join_with_draining_grace parked past its deadline: without a
+        // per-delivery timeout, select! never gets to re-poll the sleep
+        // branch while the chosen branch's on_event().await is still
+        // running, so the grace bound would be defeated entirely.
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+
+        let mut handle = zeroclaw_spawn::spawn!(async move {
+            let _ = tx
+                .send(TurnEvent::Chunk {
+                    delta: "x".to_string(),
+                })
+                .await;
+            // Task itself never finishes on its own within the grace
+            // window; only the deadline should end this test.
+            std::future::pending::<()>().await;
+            "unreachable"
+        });
+
+        fn never_resolves(_e: TurnEvent) -> std::future::Pending<()> {
+            std::future::pending()
+        }
+
+        let mut acc = String::new();
+        let grace = std::time::Duration::from_millis(300);
+        let started = tokio::time::Instant::now();
+        let joined = tokio::time::timeout(
+            grace + std::time::Duration::from_secs(5),
+            join_with_draining_grace(&mut handle, &mut rx, &mut acc, &never_resolves, grace),
+        )
+        .await
+        .expect("a stuck callback must not hang join_with_draining_grace past its own timeout");
+
+        assert!(
+            joined.is_none(),
+            "the task never finishes on its own here, so the grace window \
+             elapsing must report timeout, not a spurious join"
+        );
+        assert!(
+            started.elapsed() < grace + std::time::Duration::from_secs(2),
+            "a callback stuck in on_event().await must not extend the grace \
+             deadline; the caller (execute_turn) depends on this bound to \
+             reach its persistence path"
+        );
+        handle.abort();
+    }
+
     #[test]
     fn cancel_outcome_carries_committed_messages_not_just_partial_text() {
         let msgs = vec![ConversationMessage::Chat(
@@ -374,6 +794,49 @@ mod tests {
                 panic!("a tool-loop cancel must not map to Completed")
             }
         }
+    }
+
+    #[test]
+    fn completed_rpc_outcome_carries_display_only_safeguard_once() {
+        let messages = vec![ConversationMessage::Chat(
+            zeroclaw_providers::ChatMessage::assistant("accepted response"),
+        )];
+        let safeguard = zeroclaw_providers::SafeguardFallbackNotice {
+            kind: zeroclaw_providers::SafeguardFallbackKind::ClientAndServer,
+            requested_model: "requested-model".into(),
+            served_model: "served-model".into(),
+            category: Some("private-category".into()),
+        };
+        let outcome = outcome_from_task_result(
+            Ok(StreamedTurnSuccess {
+                response: "accepted response".into(),
+                new_messages: messages.clone(),
+                provider_name: "requested-provider".into(),
+                model: "requested-model".into(),
+                final_context_limits: None,
+                safeguard_fallback: Some(safeguard),
+            }),
+            "accepted response".into(),
+        )
+        .expect("successful turn maps to RPC completion");
+
+        let TurnOutcome::Completed {
+            text,
+            messages: outcome_messages,
+            safeguard_fallback,
+        } = outcome
+        else {
+            panic!("successful turn must complete");
+        };
+        let display =
+            crate::agent::append_safeguard_fallback_notice(text, safeguard_fallback.as_ref());
+        assert_eq!(display.matches("Safety safeguards").count(), 1);
+        assert!(!display.contains("private-category"));
+        assert_eq!(
+            serde_json::to_value(outcome_messages).unwrap(),
+            serde_json::to_value(messages).unwrap(),
+            "RPC persistence payload must remain undecorated"
+        );
     }
 
     #[test]
@@ -494,6 +957,7 @@ mod tests {
                     usage: Some(zeroclaw_providers::traits::TokenUsage {
                         input_tokens: Some(1_000),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                         output_tokens: Some(200),
                     }),
                     reasoning_content: None,
@@ -567,6 +1031,7 @@ mod tests {
                 channel: "rpc",
             },
             Some(cost_context),
+            None,
             noop,
         )
         .await
@@ -589,6 +1054,898 @@ mod tests {
         assert_eq!(
             agent_summary.request_count, 1,
             "the agent alias must flow through to the persisted cost record"
+        );
+    }
+
+    /// Regression: the drain callback must resolve `model_context_window`
+    /// from the embedded `provider_ref` via config, not by reacquiring the
+    /// agent mutex. `execute_turn` holds `agent.lock()` for the whole turn;
+    /// if the callback tried to lock the agent again the drain would stall
+    /// after the first Usage event.
+    ///
+    /// This test drives the **real `execute_turn` RPC boundary** — the same
+    /// function production dispatch calls — with a Usage-producing provider
+    /// and a callback that reads config + resolves the window. It proves
+    /// both the Usage and Chunk notifications complete while `execute_turn`
+    /// owns the agent lock, and the callback resolves the correct context
+    /// window from config without deadlock.
+    #[tokio::test]
+    async fn execute_turn_drain_callback_resolves_window_without_relocking_agent() {
+        use crate::agent::agent::Agent;
+        use crate::agent::dispatcher::NativeToolDispatcher;
+        use crate::observability::{NoopObserver, Observer};
+        use async_trait::async_trait;
+        use std::sync::Arc;
+        use std::sync::Mutex as StdMutex;
+        use tokio::sync::Mutex;
+        use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+        use zeroclaw_api::model_provider::ModelProvider;
+        use zeroclaw_config::schema::Config;
+        use zeroclaw_memory::Memory;
+        use zeroclaw_providers::ChatRequest;
+
+        // Minimal provider that returns usage on the chat path.
+        struct UsageProvider;
+
+        #[async_trait]
+        impl ModelProvider for UsageProvider {
+            async fn chat_with_system(
+                &self,
+                _system: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok("ok".into())
+            }
+
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("hello world".into()),
+                    tool_calls: vec![],
+                    usage: Some(zeroclaw_providers::traits::TokenUsage {
+                        input_tokens: Some(500),
+                        cached_input_tokens: None,
+                        output_tokens: Some(100),
+                        cache_creation_input_tokens: None,
+                    }),
+                    reasoning_content: None,
+                })
+            }
+        }
+
+        impl Attributable for UsageProvider {
+            fn role(&self) -> Role {
+                Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+            }
+            fn alias(&self) -> &str {
+                "openai.default"
+            }
+        }
+
+        // Build a config with a provider that has context_window set.
+        let mut config = Config::default();
+        let entry = config
+            .providers
+            .models
+            .ensure("openai", "default")
+            .expect("ensure provider");
+        entry.context_window = Some(128_000);
+        entry.model = Some("test-model".to_string());
+        let config: Arc<parking_lot::RwLock<Config>> = Arc::new(config.into());
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+
+        let agent = Agent::builder()
+            .model_provider(Box::new(UsageProvider))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(mem)
+            .observer(Arc::from(NoopObserver {}) as Arc<dyn Observer>)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_name("test-model".into())
+            .model_provider_name("openai.default".into())
+            .agent_alias("rpc-agent".into())
+            .build()
+            .expect("agent builder should succeed");
+
+        // Collect notification-type info from the drain callback.
+        let usage_count = Arc::new(StdMutex::new(0usize));
+        let chunk_count = Arc::new(StdMutex::new(0usize));
+        let resolved_window = Arc::new(StdMutex::new(None::<u64>));
+
+        let cfg_for_cb = Arc::clone(&config);
+        let uc = Arc::clone(&usage_count);
+        let cc = Arc::clone(&chunk_count);
+        let rw = Arc::clone(&resolved_window);
+
+        let outcome = execute_turn(
+            Arc::new(Mutex::new(agent)),
+            "hello".to_string(),
+            CancellationToken::new(),
+            TurnAttribution {
+                session_key: Some("drain-test".into()),
+                agent_alias: "rpc-agent".into(),
+                model_provider: "openai.default".into(),
+                model: "test-model".into(),
+                channel: "rpc",
+            },
+            None,
+            None,
+            move |event| {
+                let cfg = Arc::clone(&cfg_for_cb);
+                let uc = Arc::clone(&uc);
+                let cc = Arc::clone(&cc);
+                let rw = Arc::clone(&rw);
+                async move {
+                    match &event {
+                        TurnEvent::Usage {
+                            provider_ref,
+                            model,
+                            ..
+                        } => {
+                            *uc.lock().unwrap() += 1;
+                            // Resolve model_context_window from the embedded
+                            // provider_ref via config.read() — NOT via the
+                            // agent mutex. This is the drain fix path.
+                            let cfg = cfg.read();
+                            let window = cfg
+                                .model_provider_context_window_opt(provider_ref, model)
+                                .map(|v| v as u64);
+                            *rw.lock().unwrap() = window;
+                        }
+                        TurnEvent::Chunk { .. } => {
+                            *cc.lock().unwrap() += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            },
+        )
+        .await
+        .expect("turn should complete without deadlocking");
+
+        assert!(
+            matches!(outcome, TurnOutcome::Completed { .. }),
+            "turn must complete normally while the drain callback resolves the window from config"
+        );
+        assert_eq!(
+            *usage_count.lock().unwrap(),
+            1,
+            "exactly one Usage event must drain through the callback"
+        );
+        assert!(
+            *chunk_count.lock().unwrap() >= 1,
+            "at least one Chunk event must drain AFTER the Usage event — \
+             proves the callback did not stall the drain by reacquiring the agent mutex"
+        );
+        assert_eq!(
+            *resolved_window.lock().unwrap(),
+            Some(128_000),
+            "the drain callback must resolve model_context_window from the \
+             provider_ref via config, not the agent mutex"
+        );
+    }
+
+    /// Regression: drive the **real `execute_turn` RPC
+    /// boundary** with an interleaved Usage → ToolCall → ToolResult → Usage
+    /// → final Chunk sequence — the exact flow production dispatch sees — and
+    /// assert the drain completes every notification while `execute_turn` owns
+    /// the agent lock, across the full 2×2 matrix of provider configuration:
+    ///
+    ///   (`max_context_tokens` ∈ {Some, None}) × (`context_window` ∈ {Some, None})
+    ///
+    /// The matrix is a negative control on the trim-budget axis: the drain
+    /// callback resolves `model_context_window` from the embedded
+    /// `provider_ref` via config (`model_provider_context_window_opt`), which
+    /// returns the provider's `context_window` and ONLY that. It must never
+    /// substitute the runtime profile's `max_context_tokens` budget — neither
+    /// when the provider has no `context_window` (the legacy 32k stub leak) nor
+    /// when the provider has one (no cross-contamination). The four cells
+    /// prove the resolved window tracks the provider column exclusively,
+    /// independent of the profile row.
+    #[tokio::test]
+    async fn execute_turn_drain_resolves_window_across_provider_config_matrix_through_tool_turn() {
+        use crate::agent::agent::Agent;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        for cell in MatrixCell::ALL {
+            // Build a config with this provider's context_window. Each case
+            // uses a distinct (type, alias) so cell configs never collide.
+            let (type_key, alias_key) = cell
+                .provider_ref
+                .split_once('.')
+                .expect("provider_ref is type.alias");
+            let mut config = zeroclaw_config::schema::Config::default();
+            {
+                let entry = config
+                    .providers
+                    .models
+                    .ensure(type_key, alias_key)
+                    .expect("ensure provider for matrix cell");
+                entry.model = Some("matrix-model".to_string());
+                if let Some(window) = cell.context_window {
+                    entry.context_window = Some(window as usize);
+                }
+            }
+
+            let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+                backend: "none".into(),
+                ..zeroclaw_config::schema::MemoryConfig::default()
+            };
+            let mem: Arc<dyn Memory> = Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                    .expect("memory creation should succeed"),
+            );
+
+            // Two scripted responses: call 1 carries a tool call + usage;
+            // call 2 carries final text + usage. The drain sees the full
+            // interleaved sequence through the real execute_turn boundary.
+            let first = ChatResponse {
+                text: Some(String::new()),
+                tool_calls: vec![ToolCall {
+                    id: "tc-matrix".into(),
+                    name: "echo".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                usage: Some(token_usage(10, 5)),
+                reasoning_content: None,
+            };
+            let second = ChatResponse {
+                text: Some("matrix done".into()),
+                tool_calls: vec![],
+                usage: Some(token_usage(20, 8)),
+                reasoning_content: None,
+            };
+
+            let provider = TwoCallToolProvider {
+                first,
+                second,
+                done: std::sync::atomic::AtomicBool::new(false),
+                alias: cell.provider_ref,
+            };
+
+            let tool_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let agent = Agent::builder()
+                .model_provider(Box::new(provider))
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![Box::new(CountingTool {
+                        name: "echo",
+                        calls: Arc::clone(&tool_calls),
+                    })],
+                ))
+                .memory(mem)
+                .observer(Arc::from(NoopObserver {}) as Arc<dyn Observer>)
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(std::path::PathBuf::from("/tmp"))
+                .model_name("matrix-model".into())
+                .model_provider_name(cell.provider_ref.into())
+                .agent_alias("rpc-matrix".into())
+                .build()
+                .expect("agent builder should succeed");
+
+            let counters = DrainCounters::new();
+            let cfg_for_cb: Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>> =
+                Arc::new(config.into());
+            let cfg_arc = Arc::clone(&cfg_for_cb);
+            let dc = Arc::clone(&counters);
+
+            let outcome = execute_turn(
+                Arc::new(Mutex::new(agent)),
+                "matrix".to_string(),
+                CancellationToken::new(),
+                TurnAttribution {
+                    session_key: Some("drain-matrix-test".into()),
+                    agent_alias: "rpc-matrix".into(),
+                    model_provider: cell.provider_ref.into(),
+                    model: "matrix-model".into(),
+                    channel: "rpc",
+                },
+                None,
+                None,
+                move |event| {
+                    let cfg = Arc::clone(&cfg_arc);
+                    let dc = Arc::clone(&dc);
+                    async move {
+                        match &event {
+                            TurnEvent::Usage {
+                                provider_ref,
+                                model,
+                                ..
+                            } => {
+                                *dc.usage_count.lock().unwrap() += 1;
+                                let before_second = dc
+                                    .saw_second_usage
+                                    .load(std::sync::atomic::Ordering::SeqCst);
+                                dc.saw_second_usage
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                                dc.provider_refs_seen
+                                    .lock()
+                                    .unwrap()
+                                    .push(provider_ref.clone());
+                                let cfg = cfg.read();
+                                let window = cfg
+                                    .model_provider_context_window_opt(provider_ref, model)
+                                    .map(|v| v as u64);
+                                dc.resolved_windows.lock().unwrap().push(window);
+                                if before_second {
+                                    *dc.chunk_after_second_usage.lock().unwrap() = false;
+                                }
+                            }
+                            TurnEvent::ToolCall { id, .. } => {
+                                if id == "tc-matrix" {
+                                    *dc.tool_call_seen.lock().unwrap() = true;
+                                }
+                            }
+                            TurnEvent::ToolResult { id, .. } => {
+                                if id == "tc-matrix" {
+                                    *dc.tool_result_seen.lock().unwrap() = true;
+                                }
+                            }
+                            TurnEvent::Chunk { delta }
+                                if delta.contains("matrix done")
+                                    && dc
+                                        .saw_second_usage
+                                        .load(std::sync::atomic::Ordering::SeqCst) =>
+                            {
+                                *dc.chunk_after_second_usage.lock().unwrap() = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                },
+            )
+            .await
+            .expect("turn should complete without deadlocking across the matrix");
+
+            assert!(
+                matches!(outcome, TurnOutcome::Completed { .. }),
+                "{}: turn must complete normally (TurnOutcome::Completed) \
+                 through execute_turn; got a non-Completed outcome \
+                 (Cancelled or Err) — the drain stalled or errored",
+                cell.label,
+            );
+
+            assert_eq!(
+                *counters.usage_count.lock().unwrap(),
+                2,
+                "{}: exactly two Usage events must drain through the callback \
+                 (one per LLM call); a relock would stall after the first",
+                cell.label,
+            );
+
+            let refs: Vec<String> = counters.provider_refs_seen.lock().unwrap().clone();
+            assert_eq!(
+                refs.len(),
+                2,
+                "{}: expected two provider_ref observations, got {:?}",
+                cell.label,
+                refs,
+            );
+            assert!(
+                refs.iter().all(|r| r == cell.provider_ref),
+                "{}: every Usage event's provider_ref must be `{}`, got {:?}",
+                cell.label,
+                cell.provider_ref,
+                refs,
+            );
+
+            assert!(
+                *counters.tool_call_seen.lock().unwrap(),
+                "{}: ToolCall event must drain through the callback",
+                cell.label,
+            );
+            assert!(
+                *counters.tool_result_seen.lock().unwrap(),
+                "{}: ToolResult event must drain through the callback",
+                cell.label,
+            );
+            assert_eq!(
+                tool_calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{}: the echo tool must run exactly once between the two \
+                 Usage events",
+                cell.label,
+            );
+
+            assert!(
+                *counters.chunk_after_second_usage.lock().unwrap(),
+                "{}: a final Chunk must arrive after the second Usage event, \
+                 proving the drain did not stall at the RPC callback boundary",
+                cell.label,
+            );
+
+            let windows: Vec<Option<u64>> = counters.resolved_windows.lock().unwrap().clone();
+            assert_eq!(
+                windows.len(),
+                2,
+                "{}: expected two resolved-window observations, got {:?}",
+                cell.label,
+                windows,
+            );
+            for (i, w) in windows.iter().enumerate() {
+                assert_eq!(
+                    *w,
+                    cell.expected_resolved,
+                    "{}: Usage #{} resolved model_context_window = {:?}, \
+                     expected {:?} (provider context_window = {:?}, profile \
+                     max_context_tokens = {:?}); the drain callback must \
+                     resolve the live provider window via config, never \
+                     substitute the trim budget when the provider has none, \
+                     and never cross-contaminate when it has one",
+                    cell.label,
+                    i + 1,
+                    w,
+                    cell.expected_resolved,
+                    cell.context_window,
+                    cell.max_context_tokens,
+                );
+            }
+        }
+    }
+
+    /// Regression test for REQ-W1: proves the production RPC forwarding
+    /// boundary (`notification_for_turn_event` → `RpcOutbound::send_raw`)
+    /// correctly serializes the full interleaved event sequence through a
+    /// real outbound writer while `execute_turn` owns the agent lock.
+    ///
+    /// The test constructs a real `RpcOutbound` backed by a bounded mpsc
+    /// channel, spawns a collector task that drains the writer, drives a
+    /// turn with `TwoCallToolProvider` (which yields Usage → ToolCall →
+    /// ToolResult → Usage → Chunk), and asserts the frames arrive in the
+    /// correct order and contain the expected JSON-RPC structure.
+    #[tokio::test]
+    async fn execute_turn_forwards_serialized_notifications_through_real_outbound_writer() {
+        use crate::rpc::dispatch::forward_turn_event;
+        use tokio::sync::mpsc;
+        use zeroclaw_api::jsonrpc::RpcOutbound;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, MemoryConfig};
+
+        // Build a config with a known context_window for the provider.
+        let mut config = Config::default();
+        let provider_entry = config
+            .providers
+            .models
+            .ensure("openai", "default")
+            .expect("ensure provider entry");
+        provider_entry.context_window = Some(128_000);
+        provider_entry.model = Some("w1-model".to_string());
+        config.agents.insert(
+            "rpc-w1".to_string(),
+            AliasedAgentConfig {
+                model_provider: zeroclaw_config::providers::ModelProviderRef::new("openai.default"),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let agent_config = config
+            .resolved_agent_config("rpc-w1")
+            .expect("test agent config should resolve");
+
+        let memory_cfg = MemoryConfig {
+            backend: "none".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+
+        // Build the real outbound: bounded mpsc channel + RpcOutbound.
+        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
+        let rpc = Arc::new(RpcOutbound::new(writer_tx));
+
+        // Spawn receiver: collect all frames into a Vec<String>.
+        let received = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let recv_received = Arc::clone(&received);
+        let collector = zeroclaw_spawn::spawn!(async move {
+            while let Some(frame) = writer_rx.recv().await {
+                recv_received.lock().unwrap().push(frame);
+            }
+        });
+
+        // Two scripted responses: call 1 carries a tool call + usage;
+        // call 2 carries final text + usage. The drain sees the full
+        // interleaved sequence through the real execute_turn boundary.
+        let first = ChatResponse {
+            text: Some(String::new()),
+            tool_calls: vec![ToolCall {
+                id: "tc-w1".into(),
+                name: "echo".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }],
+            usage: Some(token_usage(100, 50)),
+            reasoning_content: None,
+        };
+        let second = ChatResponse {
+            text: Some("w1 done".into()),
+            tool_calls: vec![],
+            usage: Some(token_usage(200, 80)),
+            reasoning_content: None,
+        };
+
+        let provider = TwoCallToolProvider {
+            first,
+            second,
+            done: std::sync::atomic::AtomicBool::new(false),
+            alias: "openai.default",
+        };
+
+        let tool_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let agent = Agent::builder()
+            .model_provider(Box::new(provider))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(CountingTool {
+                    name: "echo",
+                    calls: Arc::clone(&tool_calls),
+                })],
+            ))
+            .memory(mem)
+            .observer(Arc::from(NoopObserver {}) as Arc<dyn Observer>)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_name("w1-model".into())
+            .model_provider_name("openai.default".into())
+            .agent_alias("rpc-w1".into())
+            .config(agent_config)
+            .build()
+            .expect("agent builder should succeed");
+
+        // Drive the turn through execute_turn, forwarding each event
+        // through the real RPC boundary using forward_turn_event.
+        let rpc_for_drop = Arc::clone(&rpc);
+        let outcome = execute_turn(
+            Arc::new(Mutex::new(agent)),
+            "w1".to_string(),
+            CancellationToken::new(),
+            TurnAttribution {
+                session_key: Some("w1-test".into()),
+                agent_alias: "rpc-w1".into(),
+                model_provider: "openai.default".into(),
+                model: "w1-model".into(),
+                channel: "rpc",
+            },
+            None,
+            None,
+            move |event| {
+                let rpc = Arc::clone(&rpc);
+                async move {
+                    // Forward through the real RPC boundary.
+                    forward_turn_event(&rpc, "w1-test", &event).await;
+                }
+            },
+        )
+        .await
+        .expect("turn should complete without deadlocking");
+
+        assert!(
+            matches!(outcome, TurnOutcome::Completed { .. }),
+            "turn must complete normally"
+        );
+
+        // Drop the rpc to close the writer channel, then await collector.
+        drop(rpc_for_drop);
+        let _ = collector.await;
+
+        // Verify the serialized frames.
+        let frames = received.lock().unwrap().clone();
+        assert!(!frames.is_empty(), "at least one frame must be forwarded");
+
+        // Parse each frame as JSON and verify the sequence:
+        // Usage → ToolCall → ToolResult → Usage → Chunk
+        let mut seen_usage_1 = false;
+        let mut seen_tool_call = false;
+        let mut seen_tool_result = false;
+        let mut seen_usage_2 = false;
+        let mut seen_chunk = false;
+
+        for frame in &frames {
+            let v: serde_json::Value = serde_json::from_str(frame)
+                .unwrap_or_else(|_| panic!("frame must be valid JSON: {}", frame));
+
+            // Verify it's a JSON-RPC notification with method "session/update".
+            assert_eq!(
+                v.get("jsonrpc").and_then(|x| x.as_str()),
+                Some("2.0"),
+                "frame must be JSON-RPC 2.0: {}",
+                frame
+            );
+            assert_eq!(
+                v.get("method").and_then(|x| x.as_str()),
+                Some("session/update"),
+                "frame must be session/update notification: {}",
+                frame
+            );
+
+            // Check the params for the specific event type.
+            if let Some(params) = v.get("params")
+                && let Some(update_type) = params.get("type").and_then(|x| x.as_str())
+            {
+                match update_type {
+                    "context_usage" => {
+                        if !seen_usage_1 {
+                            seen_usage_1 = true;
+                            assert!(
+                                params.get("input_tokens").is_some(),
+                                "context_usage must have input_tokens"
+                            );
+                            assert!(
+                                params.get("max_context_tokens").is_some(),
+                                "context_usage must have max_context_tokens"
+                            );
+                            assert!(
+                                params.get("model_context_window").is_some(),
+                                "context_usage must have model_context_window"
+                            );
+                        } else {
+                            seen_usage_2 = true;
+                            assert!(
+                                params.get("input_tokens").is_some(),
+                                "second context_usage must have input_tokens"
+                            );
+                        }
+                    }
+                    "tool_call" => {
+                        seen_tool_call = true;
+                        assert_eq!(
+                            params.get("tool_call_id").and_then(|x| x.as_str()),
+                            Some("tc-w1"),
+                            "tool_call must have correct id"
+                        );
+                        assert_eq!(
+                            params.get("name").and_then(|x| x.as_str()),
+                            Some("echo"),
+                            "tool_call must have correct name"
+                        );
+                    }
+                    "tool_result" => {
+                        seen_tool_result = true;
+                        assert_eq!(
+                            params.get("tool_call_id").and_then(|x| x.as_str()),
+                            Some("tc-w1"),
+                            "tool_result must have correct id"
+                        );
+                    }
+                    "agent_message_chunk" => {
+                        seen_chunk = true;
+                        assert!(
+                            params.get("text").is_some(),
+                            "agent_message_chunk must have text"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Assert the required sequence occurred.
+        assert!(seen_usage_1, "must see first Usage (context_usage)");
+        assert!(seen_tool_call, "must see ToolCall (tool_call)");
+        assert!(seen_tool_result, "must see ToolResult (tool_result)");
+        assert!(seen_usage_2, "must see second Usage (context_usage)");
+        assert!(seen_chunk, "must see Chunk (agent_message_chunk)");
+
+        // Verify the tool actually ran exactly once.
+        assert_eq!(
+            tool_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "echo tool must run exactly once between the two Usage events"
+        );
+    }
+
+    /// A forced listener teardown drops the prompt future while it is joining
+    /// the turn task. The turn task must stay owned across that drop, and the
+    /// connection it belongs to must stay counted until the task's cleanup has
+    /// actually returned.
+    ///
+    /// Without the owning guard the handle is moved out before the join, so the
+    /// drop detaches the task: cleanup never starts and the count never falls.
+    /// Requesting an abort is not enough either, which is why the assertion is
+    /// on cleanup having ended rather than on the abort having been issued.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dropped_prompt_keeps_the_turn_task_owned_until_its_cleanup_ends() {
+        use crate::agent::agent::Agent;
+        use crate::agent::dispatcher::NativeToolDispatcher;
+        use crate::observability::{NoopObserver, Observer};
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+        use zeroclaw_api::model_provider::ModelProvider;
+        use zeroclaw_memory::Memory;
+
+        /// Finite cleanup that outlives the forced deadline: it starts when the
+        /// provider future is dropped and returns only when the test releases
+        /// it, the same shape as the listeners' `HoldOnDrop` fixture.
+        struct HoldOnDrop {
+            unwind_started: Arc<AtomicBool>,
+            unwind_ended: Arc<AtomicBool>,
+            release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        }
+
+        impl Drop for HoldOnDrop {
+            fn drop(&mut self) {
+                self.unwind_started.store(true, Ordering::SeqCst);
+                // Bounded so a failing assertion elsewhere cannot park this
+                // worker thread for the life of the test binary.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                let (lock, cvar) = &*self.release;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return;
+                    }
+                    released = cvar.wait_timeout(released, remaining).unwrap().0;
+                }
+                self.unwind_ended.store(true, Ordering::SeqCst);
+            }
+        }
+
+        struct HeldProvider {
+            started: Arc<AtomicBool>,
+            unwind_started: Arc<AtomicBool>,
+            unwind_ended: Arc<AtomicBool>,
+            release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        }
+
+        #[async_trait]
+        impl ModelProvider for HeldProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                let _cleanup = HoldOnDrop {
+                    unwind_started: Arc::clone(&self.unwind_started),
+                    unwind_ended: Arc::clone(&self.unwind_ended),
+                    release: Arc::clone(&self.release),
+                };
+                self.started.store(true, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+                Ok("unreachable".to_string())
+            }
+        }
+
+        impl Attributable for HeldProvider {
+            fn role(&self) -> Role {
+                Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+            }
+            fn alias(&self) -> &str {
+                "held-provider"
+            }
+        }
+
+        async fn wait_for(label: &str, condition: impl Fn() -> bool) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !condition() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{label}"));
+        }
+
+        let started = Arc::new(AtomicBool::new(false));
+        let unwind_started = Arc::new(AtomicBool::new(false));
+        let unwind_ended = Arc::new(AtomicBool::new(false));
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+        let agent = Agent::builder()
+            .model_provider(Box::new(HeldProvider {
+                started: Arc::clone(&started),
+                unwind_started: Arc::clone(&unwind_started),
+                unwind_ended: Arc::clone(&unwind_ended),
+                release: Arc::clone(&release),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(mem)
+            .observer(Arc::from(NoopObserver {}) as Arc<dyn Observer>)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_name("test-model".into())
+            .model_provider_name("held-provider".into())
+            .agent_alias("rpc-agent".into())
+            .build()
+            .expect("agent builder should succeed");
+
+        let connections = Arc::new(AtomicUsize::new(0));
+        let activity = crate::rpc::ConnectionActivity::new(Arc::clone(&connections));
+        assert_eq!(
+            connections.load(Ordering::Relaxed),
+            1,
+            "the accepted connection must be counted before any prompt runs"
+        );
+
+        let cancel = CancellationToken::new();
+        let turn_cancel = cancel.clone();
+        let prompt_task = zeroclaw_spawn::spawn!(async move {
+            let _ = execute_turn(
+                Arc::new(Mutex::new(agent)),
+                "hold".to_string(),
+                turn_cancel,
+                TurnAttribution {
+                    session_key: Some("forced-drop".into()),
+                    agent_alias: "rpc-agent".into(),
+                    model_provider: "held-provider".into(),
+                    model: "test-model".into(),
+                    channel: "rpc",
+                },
+                None,
+                Some(activity),
+                noop,
+            )
+            .await;
+        });
+
+        wait_for("the prompt must reach the provider", || {
+            started.load(Ordering::SeqCst)
+        })
+        .await;
+
+        // The connection generation ends, then the listener's forced deadline
+        // drops the prompt while it is still joining the turn task.
+        cancel.cancel();
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        prompt_task.abort();
+        let _ = prompt_task.await;
+
+        wait_for(
+            "a dropped prompt must abort the turn task it owns, not detach it",
+            || unwind_started.load(Ordering::SeqCst),
+        )
+        .await;
+        assert!(
+            !unwind_ended.load(Ordering::SeqCst),
+            "the fixture must still be holding cleanup at this point"
+        );
+        assert_eq!(
+            connections.load(Ordering::Relaxed),
+            1,
+            "the connection must stay counted while its turn task unwinds"
+        );
+
+        {
+            let (lock, cvar) = &*release;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+
+        wait_for(
+            "the connection must be released once cleanup returns",
+            || connections.load(Ordering::Relaxed) == 0,
+        )
+        .await;
+        assert!(
+            unwind_ended.load(Ordering::SeqCst),
+            "the count may only reach zero after the turn task's cleanup ended"
         );
     }
 }

@@ -52,10 +52,26 @@ pub enum SectionGroup {
 }
 
 impl SectionGroup {
-    /// UI label. These exact strings are what `ConfigSectionEntry.group`
-    /// carries on the wire and what the dashboard's `GROUP_ORDER`
-    /// (web/src/pages/Config.tsx) and the zerocode Config pane group
-    /// by — change one, change all of them together.
+    /// Stable locale-independent key used for ordering and client-side
+    /// localization. Unlike [`Self::label`], this value is safe on the wire.
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Foundation => "foundation",
+            Self::Agent => "agent",
+            Self::MultiAgent => "multi_agent",
+            Self::Tools => "tools",
+            Self::Integrations => "integrations",
+            Self::Network => "network",
+            Self::Storage => "storage",
+            Self::Operations => "operations",
+            Self::Other => "other",
+        }
+    }
+
+    /// English UI fallback carried in `ConfigSectionEntry.group`. The web
+    /// dashboard and older clients still group by these labels; newer clients
+    /// should use [`Self::key`] for locale-independent identity and ordering.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -116,6 +132,7 @@ pub fn humanize_section_key(key: &str) -> String {
         "providers.models" => return "Model providers".to_string(),
         "providers.tts" => return "TTS providers".to_string(),
         "providers.transcription" => return "Transcription providers".to_string(),
+        "oidc" => return "OIDC".to_string(),
         _ => {}
     }
     let mut s = key.replace(['_', '-', '.'], " ");
@@ -417,6 +434,14 @@ sections! {
                 Mutual opt-in: two agents become peers only when both appear in the \
                 same group's `agents` list.",
     },
+    DecisionModels => {
+        key:   "decision_models",
+        shape: OneTierAliasMap,
+        group: Agent,
+        help:  "Typed-decision models an SOP can select to gate its triggers and \
+                choose each run's execution mode: TypeSafe Jev (hosted), a \
+                self-hosted Laya, or a custom endpoint.",
+    },
     Cron => {
         key:   "cron",
         shape: OneTierAliasMap,
@@ -516,6 +541,7 @@ pub fn section_has_signal(cfg: &crate::schema::Config, section: Section) -> bool
         | Section::RuntimeProfiles
         | Section::PeerGroups
         | Section::Storage
+        | Section::DecisionModels
         | Section::Cron
         | Section::Mcp
         | Section::McpBundles
@@ -599,6 +625,7 @@ mod tests {
         let paths: std::collections::BTreeSet<&str> = sections.iter().map(|s| s.path).collect();
         let alias_map_sections = [
             Section::PeerGroups,
+            Section::DecisionModels,
             Section::Cron,
             Section::McpServers,
             Section::McpBundles,
@@ -739,6 +766,25 @@ mod tests {
             assert_eq!(g.label(), want);
             assert_eq!(g.to_string(), want);
         }
+    }
+
+    #[test]
+    fn section_group_keys_are_stable_and_unique() {
+        let expected = [
+            "foundation",
+            "agent",
+            "multi_agent",
+            "tools",
+            "integrations",
+            "network",
+            "storage",
+            "operations",
+            "other",
+        ];
+        let actual: Vec<_> = SECTION_GROUPS.iter().map(|group| group.key()).collect();
+        assert_eq!(actual, expected);
+        let unique: std::collections::HashSet<_> = actual.iter().copied().collect();
+        assert_eq!(unique.len(), actual.len());
     }
 
     #[test]

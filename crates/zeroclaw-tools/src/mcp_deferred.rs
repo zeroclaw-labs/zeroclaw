@@ -258,10 +258,39 @@ impl Default for ActivatedToolSet {
 
 // ── System prompt helper ─────────────────────────────────────────────────
 
+/// Longest one-line summary the deferred index carries per tool, in chars.
+const DEFERRED_SUMMARY_MAX_CHARS: usize = 200;
+
+/// The one-line summary the index shows for a deferred tool: the first
+/// non-empty line of its description, capped at
+/// [`DEFERRED_SUMMARY_MAX_CHARS`] on a char boundary.
+///
+/// MCP servers routinely ship multi-paragraph docstrings with `Args:` and
+/// `Returns:` blocks. Those still drive `tool_search` keyword matching through
+/// the full [`DeferredMcpToolStub::description`], but they have no place in a
+/// prompt section whose only job is to say which names exist: with a couple
+/// of hundred deferred tools the bodies alone cost more context per turn than
+/// every activated schema combined.
+fn deferred_summary_line(description: &str) -> String {
+    let line = description
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    if line.chars().count() <= DEFERRED_SUMMARY_MAX_CHARS {
+        return line.to_string();
+    }
+    let mut cut: String = line.chars().take(DEFERRED_SUMMARY_MAX_CHARS).collect();
+    cut.push_str("...");
+    cut
+}
+
 /// Build the `<available-deferred-tools>` section for the system prompt.
-/// Lists only tool names so the LLM knows what is available without
-/// consuming context window on full schemas. Includes an instruction
-/// block that tells the LLM to call `tool_search` to activate them.
+/// Lists tool names with a one-line summary each (the first non-empty line
+/// of the description, capped) so the LLM knows what is available without
+/// consuming context window on full schemas or full docstrings. Includes an
+/// instruction block that tells the LLM to call `tool_search` to activate
+/// them.
 pub fn build_deferred_tools_section(deferred: &DeferredMcpToolSet) -> String {
     build_deferred_tools_section_filtered(deferred, None)
 }
@@ -303,7 +332,7 @@ pub fn build_deferred_tools_section_excluding(
         }
         out.push_str(&stub.prefixed_name);
         out.push_str(" - ");
-        out.push_str(&stub.description);
+        out.push_str(&deferred_summary_line(&stub.description));
         out.push('\n');
         count += 1;
     }
@@ -517,6 +546,78 @@ mod tests {
         assert!(section.contains("fs__read_file - Read a file"));
         assert!(section.contains("git__status - Git status"));
         assert!(section.contains("</available-deferred-tools>"));
+    }
+
+    fn make_set(stubs: Vec<DeferredMcpToolStub>) -> DeferredMcpToolSet {
+        DeferredMcpToolSet {
+            stubs,
+            registry: std::sync::Arc::new(
+                tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(McpRegistry::connect_all(&[]))
+                    .unwrap(),
+            ),
+            security: test_security(),
+        }
+    }
+
+    /// A docstring-style description contributes only its first line to the
+    /// index; the `Args:` and `Returns:` body must not reach the prompt.
+    #[test]
+    fn build_deferred_section_uses_first_line_of_multiline_description() {
+        let desc = "Fetch the food diary for a day.\n\n    Args:\n        date: YYYY-MM-DD, defaults to today.\n\n    Returns:\n        Every entry logged for the day.";
+        let set = make_set(vec![make_stub("cronometer__get_diary", desc)]);
+        let section = build_deferred_tools_section(&set);
+        assert!(section.contains("cronometer__get_diary - Fetch the food diary for a day.\n"));
+        assert!(!section.contains("Args:"));
+        assert!(!section.contains("Returns:"));
+        assert!(!section.contains("defaults to today"));
+    }
+
+    /// Leading blank lines and indentation are skipped so a description that
+    /// starts with a newline still yields its real first sentence.
+    #[test]
+    fn build_deferred_section_skips_leading_blank_lines() {
+        let set = make_set(vec![make_stub(
+            "wger__get_routine",
+            "\n\n   Fetch a routine.  \nMore.",
+        )]);
+        let section = build_deferred_tools_section(&set);
+        assert!(section.contains("wger__get_routine - Fetch a routine.\n"));
+        assert!(!section.contains("More."));
+    }
+
+    /// A single very long first line is capped on a char boundary, so a
+    /// multi-byte character straddling the cap cannot split.
+    #[test]
+    fn build_deferred_section_caps_long_first_line_on_char_boundary() {
+        let long: String = "é".repeat(DEFERRED_SUMMARY_MAX_CHARS + 50);
+        let set = make_set(vec![make_stub("fs__read", &long)]);
+        let section = build_deferred_tools_section(&set);
+        let line = section
+            .lines()
+            .find(|l| l.starts_with("fs__read - "))
+            .expect("tool line present");
+        let summary = &line["fs__read - ".len()..];
+        assert!(summary.ends_with("..."));
+        assert_eq!(
+            summary.trim_end_matches("...").chars().count(),
+            DEFERRED_SUMMARY_MAX_CHARS
+        );
+    }
+
+    /// The summary is a rendering concern only: keyword search still matches
+    /// terms that appear solely in the body of a multi-line description.
+    #[test]
+    fn deferred_search_still_matches_description_body() {
+        let set = make_set(vec![make_stub(
+            "cronometer__get_diary",
+            "Fetch the food diary for a day.\n\nReturns:\n    total_target_kcal for the day.",
+        )]);
+        let hits = set.search("target_kcal", 5);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].prefixed_name, "cronometer__get_diary");
+        assert!(!build_deferred_tools_section(&set).contains("target_kcal"));
     }
 
     #[test]

@@ -237,6 +237,23 @@ pub async fn apply_with_surface(
     config: &mut Config,
     surface: Surface,
 ) -> Result<AppliedAgent, Vec<QuickstartError>> {
+    apply_with_surface_checked(submission, config, surface, &|_| Ok(())).await
+}
+
+/// Apply a submission, with `staged_check` given the fully staged
+/// configuration immediately before the first persistent write.
+///
+/// `config.validate_auth()` runs here already, but the daemon's save boundary
+/// applies a strictly stronger test: the accepted authorization policy must
+/// also compile. Without that test running BEFORE the first write, a rejected
+/// policy can reach disk and the caller is then told nothing was saved. The
+/// two production callers pass the resolver's own compile check.
+pub async fn apply_with_surface_checked(
+    submission: BuilderSubmission,
+    config: &mut Config,
+    surface: Surface,
+    staged_check: &(dyn Fn(&Config) -> Result<(), String> + Sync),
+) -> Result<AppliedAgent, Vec<QuickstartError>> {
     let ctx = RunCtx::new(surface);
     let started = std::time::Instant::now();
 
@@ -298,6 +315,29 @@ pub async fn apply_with_surface(
                 &[("err", &err.to_string())],
             )]
         })?;
+    // Quickstart shares the daemon's configuration source of truth. Validate
+    // the auth section before its first persistent write so an RPC response
+    // can never say a rejected policy was not saved after disk has changed.
+    config.validate_auth().map_err(|err| {
+        vec![QuickstartError::for_surface(
+            Some(&ctx),
+            QuickstartStep::Agent,
+            "",
+            format!("authorization config rejected before persistence: {err}"),
+            "cli-quickstart-error-auth-validation",
+            &[("err", &err.to_string())],
+        )]
+    })?;
+    staged_check(config).map_err(|err| {
+        vec![QuickstartError::for_surface(
+            Some(&ctx),
+            QuickstartStep::Agent,
+            "",
+            format!("authorization config rejected before persistence: {err}"),
+            "cli-quickstart-error-auth-validation",
+            &[("err", &err)],
+        )]
+    })?;
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
@@ -1035,6 +1075,24 @@ fn emit_selector_pick(ctx: Option<&RunCtx>, selector: &str, mode: &str, value: &
 
 // ── Model provider ─────────────────────────────────────────────────
 
+/// Quickstart enrichment is best-effort and runs inline with the apply RPC,
+/// so it owns a short deadline instead of changing the shared provider helper's
+/// contract for interactive gateway and doctor callers.
+const CONTEXT_WINDOW_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+async fn fetch_quickstart_context_window(
+    provider_type: &str,
+    provider_config: &zeroclaw_config::schema::ModelProviderConfig,
+) -> Option<usize> {
+    tokio::time::timeout(
+        CONTEXT_WINDOW_FETCH_TIMEOUT,
+        zeroclaw_providers::fetch_context_window(provider_type, provider_config),
+    )
+    .await
+    .ok()
+    .flatten()
+}
+
 fn apply_model_provider(
     config: &mut Config,
     choice: &SelectorChoice<ModelProviderChoice>,
@@ -1252,9 +1310,10 @@ fn apply_model_provider(
                 })
                 .unwrap_or(false)
                 && let Some(ctx) = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(
-                        zeroclaw_providers::fetch_context_window(provider_type, &provider_config),
-                    )
+                    tokio::runtime::Handle::current().block_on(fetch_quickstart_context_window(
+                        provider_type,
+                        &provider_config,
+                    ))
                 })
             {
                 let _ = config
@@ -2906,6 +2965,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quickstart_apply_rejects_an_invalid_auth_policy_before_any_disk_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+        let before = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+
+        let errors = super::apply_with_surface_checked(
+            fresh_submission("bot"),
+            &mut config,
+            Surface::Tui,
+            &|_staged| Err("authorization policy does not compile".to_string()),
+        )
+        .await
+        .expect_err("a rejected staged policy must refuse the apply");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("rejected before persistence")),
+            "{errors:?}"
+        );
+
+        let after = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert_eq!(
+            before, after,
+            "a rejected policy must not reach disk before the caller is told nothing was saved"
+        );
+    }
+
+    #[tokio::test]
+    async fn quickstart_apply_still_persists_a_valid_submission() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+
+        super::apply_with_surface_checked(
+            fresh_submission("bot"),
+            &mut config,
+            Surface::Tui,
+            &|_staged| Ok(()),
+        )
+        .await
+        .expect("an accepted staged policy still applies");
+
+        let reloaded = reload(&dir);
+        assert!(
+            reloaded.agents.contains_key("bot"),
+            "the agent must persist"
+        );
+    }
+
+    #[tokio::test]
     async fn fresh_preset_profiles_persist_to_disk() {
         let (dir, applied) = apply_to_temp(fresh_submission("bot")).await;
         assert!(applied.risk_profiles.contains_key("balanced"));
@@ -3241,6 +3359,35 @@ mod tests {
         let reloaded: Config = toml::from_str(&after).unwrap();
         assert!(!reloaded.agents.contains_key("bot"));
         assert_eq!(reloaded.channels.webhook.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn invalid_auth_config_is_rejected_before_quickstart_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        config.oidc.insert("broken".into(), Default::default());
+        config.save().await.unwrap();
+        let before = std::fs::read_to_string(&config.config_path).unwrap();
+
+        let errors = apply_with_surface(fresh_submission("bot"), &mut config, Surface::Cli)
+            .await
+            .expect_err("invalid auth must prevent Quickstart persistence");
+
+        assert!(errors.iter().any(|error| {
+            error.step == QuickstartStep::Agent
+                && error.message.contains("authorization config rejected")
+        }));
+        let after = std::fs::read_to_string(&config.config_path).unwrap();
+        assert_eq!(
+            after, before,
+            "rejected auth config must not rewrite config.toml"
+        );
+        let reloaded: Config = toml::from_str(&after).unwrap();
+        assert!(!reloaded.agents.contains_key("bot"));
     }
 
     /// A disabled webhook never starts a listener, so it must not block a new
@@ -3654,5 +3801,36 @@ mod tests {
             "dotted `<family>.<alias>` selector must resolve that alias's \
              configured endpoint; got {models:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn quickstart_context_window_enrichment_uses_its_own_short_budget() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(4))
+                    .set_body_json(serde_json::json!({
+                        "data": [{
+                            "id": "slow-model",
+                            "context_length": 8192
+                        }]
+                    })),
+            )
+            .mount(&server)
+            .await;
+        let provider_config = zeroclaw_config::schema::ModelProviderConfig {
+            model: Some("slow-model".into()),
+            uri: Some(server.uri()),
+            ..Default::default()
+        };
+
+        let result = fetch_quickstart_context_window("groq", &provider_config).await;
+
+        assert_eq!(result, None, "slow enrichment should degrade to fallback");
     }
 }

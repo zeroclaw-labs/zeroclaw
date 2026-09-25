@@ -205,7 +205,7 @@ pub(crate) enum InputBarAction {
         text: Option<String>,
         attachments: Vec<PendingAttachment>,
     },
-    /// User requested immediate injection (Ctrl+Enter) — skip the queue.
+    /// User requested immediate injection (platform-primary Enter) — skip the queue.
     Inject {
         text: Option<String>,
         attachments: Vec<PendingAttachment>,
@@ -783,6 +783,17 @@ impl InputBarState {
         &self.pending_attachments
     }
 
+    /// Copy only durable, user-selected attachments for a reconnect snapshot.
+    /// Clipboard attachments point at temporary files owned by this input bar
+    /// and must never cross a transport rebuild.
+    pub(crate) fn reconnect_file_attachments(&self) -> Vec<PendingAttachment> {
+        self.pending_attachments
+            .iter()
+            .filter(|attachment| attachment.source == crate::attachment::AttachmentSource::File)
+            .cloned()
+            .collect()
+    }
+
     #[cfg(test)]
     pub fn clipboard_temps(&self) -> &[PathBuf] {
         &self.clipboard_temps
@@ -1012,6 +1023,27 @@ impl InputBarState {
             self.input.replace_range(prev_start..self.cursor, "");
             self.cursor =
                 crate::text_navigation::normalize_grapheme_cursor(&self.input, prev_start);
+            self.update_autocomplete();
+        }
+    }
+
+    /// Delete the grapheme cluster immediately after the cursor (forward
+    /// delete). A selection deletes the whole range instead; at the end of the
+    /// input there is nothing after the cursor, so it is a no-op rather than a
+    /// cursor move.
+    pub fn delete_next_char(&mut self) {
+        if self.selection.is_some() {
+            self.delete_selection();
+            self.cursor =
+                crate::text_navigation::normalize_grapheme_cursor(&self.input, self.cursor);
+            self.update_autocomplete();
+            return;
+        }
+        if self.cursor < self.input.len() {
+            let next_end = crate::text_navigation::next_grapheme_boundary(&self.input, self.cursor);
+            self.input.replace_range(self.cursor..next_end, "");
+            self.cursor =
+                crate::text_navigation::normalize_grapheme_cursor(&self.input, self.cursor);
             self.update_autocomplete();
         }
     }
@@ -1377,6 +1409,10 @@ impl InputBarState {
                 self.delete_previous_word();
                 return InputBarAction::Consumed;
             }
+            Some(IbWidgetAction::DeleteForward) => {
+                self.delete_next_char();
+                return InputBarAction::Consumed;
+            }
             Some(IbWidgetAction::ClearInput) => {
                 self.clear_input();
                 return InputBarAction::Consumed;
@@ -1385,7 +1421,9 @@ impl InputBarState {
         }
 
         if let KeyCode::Char(c) = key.code
-            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
         {
             self.push_input_char(c);
             return InputBarAction::Consumed;
@@ -2302,21 +2340,38 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_u_clears_input() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    fn primary_u_clears_input() {
+        use crossterm::event::{KeyCode, KeyEvent};
         let mut bar = input_bar_with_shared_commands();
         bar.insert_text("scratch this");
-        let act = bar.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        let act = bar.handle_key(KeyEvent::new(
+            KeyCode::Char('u'),
+            crate::keymap::Chord::primary('u').effective_modifiers(),
+        ));
         assert!(matches!(act, InputBarAction::Consumed));
         assert_eq!(bar.input(), "");
     }
 
     #[test]
-    fn ctrl_w_deletes_previous_word() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    fn unbound_super_modified_character_falls_through_without_typing() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut bar = input_bar_with_shared_commands();
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::SUPER));
+
+        assert!(matches!(action, InputBarAction::NotHandled));
+        assert_eq!(bar.input(), "");
+    }
+
+    #[test]
+    fn primary_w_deletes_previous_word() {
+        use crossterm::event::{KeyCode, KeyEvent};
         let mut bar = input_bar_with_shared_commands();
         bar.insert_text("hello world");
-        let action = bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        let action = bar.handle_key(KeyEvent::new(
+            KeyCode::Char('w'),
+            crate::keymap::Chord::primary('w').effective_modifiers(),
+        ));
         assert!(matches!(action, InputBarAction::Consumed));
         assert_eq!(bar.input(), "hello ");
         assert_eq!(bar.cursor(), 6);
@@ -2324,7 +2379,7 @@ mod tests {
 
     #[test]
     fn alt_backspace_deletes_previous_word() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use crossterm::event::{KeyCode, KeyEvent};
         let mut bar = input_bar_with_shared_commands();
         bar.insert_text("hello world");
 
@@ -2348,6 +2403,66 @@ mod tests {
 
         assert!(matches!(action, InputBarAction::Consumed));
         assert_eq!(bar.input(), "hello worl");
+        assert_eq!(bar.cursor(), bar.input().len());
+    }
+
+    #[test]
+    fn plain_delete_removes_the_grapheme_after_the_cursor() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("hello world");
+        bar.move_cursor_left();
+        bar.move_cursor_left();
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        // Cursor sits between the two `l`s after two steps back from the end.
+        assert_eq!(bar.input(), "hello word");
+        assert_eq!(bar.cursor(), "hello wor".len());
+    }
+
+    #[test]
+    fn plain_delete_at_the_end_of_the_input_is_a_no_op() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("hello");
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "hello");
+        assert_eq!(bar.cursor(), bar.input().len());
+    }
+
+    #[test]
+    fn plain_delete_removes_the_selection_when_one_is_active() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("hello world");
+        bar.selection = Some((6, 11));
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "hello ");
+        assert!(bar.selection.is_none());
+        assert_eq!(bar.cursor(), "hello ".len());
+    }
+
+    #[test]
+    fn plain_delete_removes_whole_grapheme_clusters() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("🇺x🇸");
+        bar.cursor = "🇺".len();
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        // The two regional indicators rejoin into one cluster, so the cursor
+        // has to be renormalized onto the new boundary.
+        assert_eq!(bar.input(), "🇺🇸");
         assert_eq!(bar.cursor(), bar.input().len());
     }
 
@@ -2442,12 +2557,15 @@ mod tests {
 
     #[test]
     fn delete_previous_word_normalizes_cursor_after_joining_emoji_graphemes() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use crossterm::event::{KeyCode, KeyEvent};
         let mut bar = input_bar_with_shared_commands();
         bar.insert_text("🇺x🇸");
         bar.move_cursor_left();
 
-        let action = bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        let action = bar.handle_key(KeyEvent::new(
+            KeyCode::Char('w'),
+            crate::keymap::Chord::primary('w').effective_modifiers(),
+        ));
 
         assert!(matches!(action, InputBarAction::Consumed));
         assert_eq!(bar.input(), "🇺🇸");
@@ -2456,7 +2574,7 @@ mod tests {
 
     #[test]
     fn backspace_normalizes_cursor_after_joining_emoji_graphemes_with_selection() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use crossterm::event::{KeyCode, KeyEvent};
         let mut bar = input_bar_with_shared_commands();
         bar.insert_text("🇺x🇸");
         let selection_start = "🇺".len();
@@ -2471,13 +2589,16 @@ mod tests {
 
     #[test]
     fn delete_previous_word_normalizes_cursor_after_joining_emoji_graphemes_with_selection() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use crossterm::event::{KeyCode, KeyEvent};
         let mut bar = input_bar_with_shared_commands();
         bar.insert_text("🇺x🇸");
         let selection_start = "🇺".len();
         bar.selection = Some((selection_start, selection_start + 1));
 
-        let action = bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        let action = bar.handle_key(KeyEvent::new(
+            KeyCode::Char('w'),
+            crate::keymap::Chord::primary('w').effective_modifiers(),
+        ));
 
         assert!(matches!(action, InputBarAction::Consumed));
         assert_eq!(bar.input(), "🇺🇸");
@@ -2497,65 +2618,83 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_w_deletes_trailing_space_and_word() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    fn primary_w_deletes_trailing_space_and_word() {
+        use crossterm::event::{KeyCode, KeyEvent};
         let mut bar = input_bar_with_shared_commands();
         bar.insert_text("hello world   ");
-        bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        bar.handle_key(KeyEvent::new(
+            KeyCode::Char('w'),
+            crate::keymap::Chord::primary('w').effective_modifiers(),
+        ));
         assert_eq!(bar.input(), "hello ");
         assert_eq!(bar.cursor(), 6);
     }
 
     #[test]
-    fn ctrl_w_deletes_word_before_cursor() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    fn primary_w_deletes_word_before_cursor() {
+        use crossterm::event::{KeyCode, KeyEvent};
         let mut bar = input_bar_with_shared_commands();
         bar.insert_text("hello brave world");
         for _ in 0..5 {
             bar.move_cursor_left();
         }
-        bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        bar.handle_key(KeyEvent::new(
+            KeyCode::Char('w'),
+            crate::keymap::Chord::primary('w').effective_modifiers(),
+        ));
         assert_eq!(bar.input(), "hello world");
         assert_eq!(bar.cursor(), 6);
     }
 
     #[test]
-    fn ctrl_w_deletes_selection() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    fn primary_w_deletes_selection() {
+        use crossterm::event::{KeyCode, KeyEvent};
         let mut bar = input_bar_with_shared_commands();
         bar.insert_text("hello world");
         bar.selection = Some((6, 11));
-        bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        bar.handle_key(KeyEvent::new(
+            KeyCode::Char('w'),
+            crate::keymap::Chord::primary('w').effective_modifiers(),
+        ));
         assert_eq!(bar.input(), "hello ");
         assert_eq!(bar.cursor(), 6);
     }
 
     #[test]
-    fn ctrl_w_deletes_punctuation_run_like_vim() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    fn primary_w_deletes_punctuation_run_like_vim() {
+        use crossterm::event::{KeyCode, KeyEvent};
         let mut bar = input_bar_with_shared_commands();
         bar.insert_text("hello world...");
-        bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        bar.handle_key(KeyEvent::new(
+            KeyCode::Char('w'),
+            crate::keymap::Chord::primary('w').effective_modifiers(),
+        ));
         assert_eq!(bar.input(), "hello world");
         assert_eq!(bar.cursor(), 11);
     }
 
     #[test]
-    fn ctrl_w_deletes_word_after_punctuation_like_vim() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    fn primary_w_deletes_word_after_punctuation_like_vim() {
+        use crossterm::event::{KeyCode, KeyEvent};
         let mut bar = input_bar_with_shared_commands();
         bar.insert_text("hello-world");
-        bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        bar.handle_key(KeyEvent::new(
+            KeyCode::Char('w'),
+            crate::keymap::Chord::primary('w').effective_modifiers(),
+        ));
         assert_eq!(bar.input(), "hello-");
         assert_eq!(bar.cursor(), 6);
     }
 
     #[test]
-    fn ctrl_w_deletes_only_whitespace_before_cursor() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    fn primary_w_deletes_only_whitespace_before_cursor() {
+        use crossterm::event::{KeyCode, KeyEvent};
         let mut bar = input_bar_with_shared_commands();
         bar.insert_text("   ");
-        bar.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        bar.handle_key(KeyEvent::new(
+            KeyCode::Char('w'),
+            crate::keymap::Chord::primary('w').effective_modifiers(),
+        ));
         assert_eq!(bar.input(), "");
         assert_eq!(bar.cursor(), 0);
     }

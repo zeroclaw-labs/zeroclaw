@@ -69,7 +69,8 @@ impl TodoTracker {
     }
 
     /// Replace the plan wholesale. On the first non-empty plan of the
-    /// session, auto-pop into view exactly once (unless master-disabled).
+    /// session, auto-pop into view exactly once (unless master-disabled or the
+    /// user already dismissed the tracker in this session).
     pub(crate) fn set_plan(&mut self, entries: Vec<PlanEntry>) {
         self.entries = entries;
         if self.settings.enabled && !self.has_ever_popped && !self.entries.is_empty() {
@@ -91,6 +92,14 @@ impl TodoTracker {
     pub(crate) fn toggle(&mut self) {
         if self.settings.enabled {
             self.visible = !self.visible;
+        }
+    }
+
+    /// Explicitly hide the tracker while retaining the current plan.
+    pub(crate) fn hide(&mut self) {
+        if self.settings.enabled {
+            self.visible = false;
+            self.has_ever_popped = true;
         }
     }
 
@@ -128,7 +137,11 @@ impl TodoTracker {
         }
     }
 
-    pub(crate) fn render(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+    pub(crate) fn render(
+        &self,
+        frame: &mut ratatui::Frame,
+        area: ratatui::layout::Rect,
+    ) -> Option<ratatui::layout::Rect> {
         use ratatui::style::{Modifier, Style};
         use ratatui::text::{Line, Span};
         use ratatui::widgets::Paragraph;
@@ -145,6 +158,7 @@ impl TodoTracker {
         // every other split-pane in the Code/Chat view. `fill_style`
         // paints the panel interior with the theme background so the
         // tracker never shows the terminal default through.
+        let close_rect = close_hit_rect(area);
         let block = theme::panel_block(&title).style(theme::fill_style());
 
         if self.entries.is_empty() {
@@ -152,7 +166,14 @@ impl TodoTracker {
                 .style(theme::fill_style())
                 .block(block);
             frame.render_widget(placeholder, area);
-            return;
+            if let Some(rect) = close_rect {
+                frame.render_widget(
+                    Paragraph::new(Span::styled("✕", theme::dim_style()))
+                        .style(theme::fill_style()),
+                    rect,
+                );
+            }
+            return close_rect;
         }
 
         let mut lines: Vec<Line> = Vec::with_capacity(self.entries.len());
@@ -183,7 +204,19 @@ impl TodoTracker {
             .style(theme::fill_style())
             .block(block);
         frame.render_widget(para, area);
+        if let Some(rect) = close_rect {
+            frame.render_widget(
+                Paragraph::new(Span::styled("✕", theme::dim_style())).style(theme::fill_style()),
+                rect,
+            );
+        }
+        close_rect
     }
+}
+
+fn close_hit_rect(area: ratatui::layout::Rect) -> Option<ratatui::layout::Rect> {
+    (area.width >= 3 && area.height > 0)
+        .then(|| ratatui::layout::Rect::new(area.x + area.width - 2, area.y, 1, 1))
 }
 
 #[cfg(test)]
@@ -295,6 +328,45 @@ mod tests {
     }
 
     #[test]
+    fn dismissal_before_first_plan_prevents_update_from_reopening() {
+        let mut t = TodoTracker::new(TodoLocation::Right, true, true);
+        t.hide();
+        assert!(!t.is_visible());
+
+        t.set_plan(vec![entry("A", PlanStatus::InProgress)]);
+
+        assert!(!t.is_visible(), "plan updates respect session dismissal");
+        assert_eq!(t.entries()[0].content, "A");
+    }
+
+    #[test]
+    fn keyboard_toggle_before_first_plan_preserves_existing_autopop() {
+        let mut t = TodoTracker::new(TodoLocation::Right, true, true);
+        t.toggle();
+        assert!(!t.is_visible());
+
+        t.set_plan(vec![entry("A", PlanStatus::InProgress)]);
+
+        assert!(
+            t.is_visible(),
+            "Ctrl+P hide does not consume first auto-pop"
+        );
+        assert_eq!(t.entries()[0].content, "A");
+    }
+
+    #[test]
+    fn toggle_reopens_dismissed_plan_unchanged() {
+        let mut t = TodoTracker::new(TodoLocation::Right, true, true);
+        t.set_plan(vec![entry("A", PlanStatus::Pending)]);
+        t.hide();
+
+        t.toggle();
+
+        assert!(t.is_visible());
+        assert_eq!(t.entries()[0].content, "A");
+    }
+
+    #[test]
     fn visible_at_start_when_enabled_at_start_true() {
         let t = TodoTracker::new(TodoLocation::Right, true, true);
         assert!(t.is_visible());
@@ -352,6 +424,23 @@ mod tests {
             "enabled_at_start restores visibility on the new session"
         );
         assert_eq!(t.total(), 0);
+    }
+
+    #[test]
+    fn reset_for_session_clears_dismissal_and_rearms_autopop() {
+        let settings = settings_for(TodoLocation::Right, true, false);
+        let mut t = TodoTracker::from_settings(settings);
+        t.set_plan(vec![entry("old", PlanStatus::Pending)]);
+        t.hide();
+
+        t.reset_for_session(settings);
+        t.set_plan(vec![entry("new", PlanStatus::Pending)]);
+
+        assert!(
+            t.is_visible(),
+            "a reconstructed session auto-shows normally"
+        );
+        assert_eq!(t.entries()[0].content, "new");
     }
 
     #[test]
@@ -426,7 +515,10 @@ mod tests {
     fn render_to_string(t: &TodoTracker, w: u16, h: u16) -> String {
         let backend = TestBackend::new(w, h);
         let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| t.render(f, Rect::new(0, 0, w, h))).unwrap();
+        term.draw(|f| {
+            t.render(f, Rect::new(0, 0, w, h));
+        })
+        .unwrap();
         let buf = term.backend().buffer().clone();
         buf.content().iter().map(|c| c.symbol()).collect::<String>()
     }
@@ -436,7 +528,10 @@ mod tests {
     fn render_to_buffer(t: &TodoTracker, w: u16, h: u16) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(w, h);
         let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| t.render(f, Rect::new(0, 0, w, h))).unwrap();
+        term.draw(|f| {
+            t.render(f, Rect::new(0, 0, w, h));
+        })
+        .unwrap();
         term.backend().buffer().clone()
     }
 
@@ -462,6 +557,23 @@ mod tests {
         assert!(out.contains("Alpha"));
         assert!(out.contains("Beta"));
         assert!(out.contains("Gamma"));
+    }
+
+    #[test]
+    fn rendered_close_control_matches_hit_target() {
+        let t = TodoTracker::new(TodoLocation::Right, true, true);
+        let backend = TestBackend::new(24, 5);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut rendered_close = None;
+
+        term.draw(|f| {
+            rendered_close = t.render(f, Rect::new(0, 0, 24, 5));
+        })
+        .unwrap();
+
+        let close = rendered_close.expect("close target for visible panel");
+        assert_eq!(close, Rect::new(22, 0, 1, 1));
+        assert_eq!(term.backend().buffer()[(close.x, close.y)].symbol(), "✕");
     }
 
     #[test]

@@ -72,7 +72,7 @@ GitHub's default squash-merge:
 - Formats the body inconsistently
 - Doesn't match project conventions
 
-Direct-pushing a squash to master bypasses the PR merge mechanism: the PR shows "Closed" instead of "Merged" (no purple badge, no linked issue auto-close, no merge association). The skill uses `gh pr merge --subject --body` to get both the badge and the correctly formatted commit.
+Direct-pushing a squash to master bypasses the PR merge mechanism: the PR shows "Closed" instead of "Merged" (no purple badge, no linked issue auto-close, no merge association). The skill uses `gh pr merge --subject --body-file` to get both the badge and the correctly formatted commit.
 
 ### Format
 
@@ -88,9 +88,14 @@ The skill stops on:
 2. PR targets a branch other than `master`
 3. Merge conflicts present (user must ask author to rebase)
 4. `CHANGES_REQUESTED` review outstanding
-5. `gh` CLI < 2.17.0 (missing `--subject`/`--body` flags)
+5. `do-not-merge` or `status:blocked` present
+6. `Parking Lot` or `Icebox` milestone present
+7. Future-line placement remains unresolved
+8. `gh` CLI < 2.50.0 (missing required machine-readable check fields)
 
 A `REVIEW_REQUIRED` state prompts confirmation but doesn't block.
+
+The skill also reconciles `release-gate` against the current milestone, body, closing issue, linked tracker, or durable comment. `release-gate` routes that inspection but does not block a merge by itself. Immediately before merging, the skill rereads those public sources, recomputes the release-line disposition, and compares the head, release labels, milestone, sorted closing-issue set, and every placement fact it relied on. A changed or ambiguous release disposition, closing reference, or relied-upon fact invalidates the confirmation packet and restarts preflight; unrelated body wording does not.
 
 ### Invocation
 

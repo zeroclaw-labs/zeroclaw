@@ -1150,23 +1150,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         }
                     }
                 });
-                // Option<T> nested fields delegate with the UNSTRIPPED name
-                // (T carries its own configurable_prefix), so the namespace is
-                // shared with sibling fields: an inner "Unknown property"
-                // falls through so siblings still get their chance, while
-                // real value errors propagate — see
-                // `build_set_prop_delegation_gate` /
-                // `crate::config::is_unknown_property_error`.
-                let option_set_gate = build_set_prop_delegation_gate(
-                    quote! { inner.set_prop(name, value_str) },
-                    quote! { name },
-                    quote! {},
-                );
-                nested_set_prop.push(quote! {
-                    if let Some(inner) = &mut self.#field_ident {
-                        #option_set_gate
-                    }
-                });
                 nested_prop_is_secret.push(quote! {
                     // Extract inner type from Option for static dispatch
                     // We need to know the inner type at compile time
@@ -1175,6 +1158,29 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 // For Option<T> nested, extract inner type for Default::default
                 if let Some(inner_ty) = extract_option_inner(&field.ty) {
                     let inner_ty_tokens = quote! { #inner_ty };
+                    // Option<T> fields share the unstripped dotted namespace
+                    // with their siblings. A missing child must therefore be
+                    // probed transactionally: commit the default only when the
+                    // child accepts the property, preserve None for unrelated
+                    // paths or invalid values, and propagate real value errors.
+                    nested_set_prop.push(quote! {
+                        if let Some(inner) = &mut self.#field_ident {
+                            match inner.set_prop(name, value_str) {
+                                Err(e) if crate::config::is_unknown_property_error(&e, name) => {}
+                                other => return other,
+                            }
+                        } else {
+                            let mut probe = <#inner_ty_tokens as Default>::default();
+                            match probe.set_prop(name, value_str) {
+                                Ok(()) => {
+                                    self.#field_ident = Some(probe);
+                                    return Ok(());
+                                }
+                                Err(e) if crate::config::is_unknown_property_error(&e, name) => {}
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    });
                     init_defaults_ops.push(quote! {
                         if self.#field_ident.is_none() {
                             let child_prefix = <#inner_ty_tokens>::configurable_prefix();
@@ -2681,8 +2687,8 @@ fn extract_credential_class(attrs: &[syn::Attribute]) -> syn::Result<proc_macro2
 }
 
 /// Shared `set_prop` delegation gate for nested sites whose dotted namespace
-/// is (or may be) shared with sibling candidates: serde-flatten fields,
-/// `Option<T>` nested fields, and the two-level dotted-key candidate loop.
+/// is (or may be) shared with sibling candidates: serde-flatten fields and
+/// the two-level dotted-key candidate loop.
 /// `Ok` and real value errors return immediately — the path is
 /// confirmed, so a failure is a value problem that must reach the caller.
 /// The generated "Unknown property" marker
@@ -2716,6 +2722,7 @@ fn build_integration_descriptor_method(
     let mut display_name: Option<String> = None;
     let mut description: Option<String> = None;
     let mut status_field: Option<syn::LitStr> = None;
+    let mut status_method: Option<syn::LitStr> = None;
     let mut found = false;
 
     for attr in attrs {
@@ -2747,6 +2754,7 @@ fn build_integration_descriptor_method(
                 "display_name" => display_name = Some(value.value()),
                 "description" => description = Some(value.value()),
                 "status_field" => status_field = Some(value.clone()),
+                "status_method" => status_method = Some(value.clone()),
                 _ => {}
             }
         }
@@ -2759,9 +2767,33 @@ fn build_integration_descriptor_method(
     let category_lit = category.unwrap_or_default();
     let display_name_lit = display_name.unwrap_or_default();
     let description_lit = description.unwrap_or_default();
-    let status_field_ident = match status_field {
-        Some(name) => name.parse::<syn::Ident>()?,
-        None => syn::Ident::new("enabled", proc_macro2::Span::call_site()),
+    // Two ways to answer "is this integration active?". `status_field` names
+    // a single bool field and stays the default (`enabled`). `status_method`
+    // names a zero-argument `&self -> bool` method, for integrations whose
+    // activation is a predicate over several fields — e.g. a config that
+    // gates two separate tools on two independent flags, where neither flag
+    // alone is the operator-visible status. They are mutually exclusive:
+    // accepting both would give one descriptor two disagreeing sources.
+    let active_expr = match (status_field, status_method) {
+        (Some(_), Some(_)) => {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "`status_field` and `status_method` are mutually exclusive; use \
+                 `status_method` when activation depends on more than one field",
+            ));
+        }
+        (None, Some(method)) => {
+            let ident = method.parse::<syn::Ident>()?;
+            quote! { self.#ident() }
+        }
+        (Some(field), None) => {
+            let ident = field.parse::<syn::Ident>()?;
+            quote! { self.#ident }
+        }
+        (None, None) => {
+            let ident = syn::Ident::new("enabled", proc_macro2::Span::call_site());
+            quote! { self.#ident }
+        }
     };
 
     Ok(quote! {
@@ -2774,7 +2806,7 @@ fn build_integration_descriptor_method(
                 display_name: #display_name_lit,
                 description: #description_lit,
                 category: #category_lit,
-                active: self.#status_field_ident,
+                active: #active_expr,
             }
         }
     })
@@ -2934,5 +2966,77 @@ mod tests {
         }];
 
         assert!(build_integration_descriptor_method(&attrs).is_err());
+    }
+
+    #[test]
+    fn integration_status_method_rejects_invalid_identifier() {
+        let attrs: Vec<syn::Attribute> = vec![parse_quote! {
+            #[integration(
+                category = "ToolsAutomation",
+                display_name = "Browser",
+                description = "Chrome control",
+                status_method = "not-valid"
+            )]
+        }];
+
+        assert!(build_integration_descriptor_method(&attrs).is_err());
+    }
+
+    #[test]
+    fn integration_rejects_status_field_and_status_method_together() {
+        let attrs: Vec<syn::Attribute> = vec![parse_quote! {
+            #[integration(
+                category = "ToolsAutomation",
+                display_name = "Browser",
+                description = "Chrome control",
+                status_field = "enabled",
+                status_method = "integration_active"
+            )]
+        }];
+
+        assert!(
+            build_integration_descriptor_method(&attrs).is_err(),
+            "two status sources for one descriptor must be rejected"
+        );
+    }
+
+    #[test]
+    fn integration_status_method_emits_method_call() {
+        let attrs: Vec<syn::Attribute> = vec![parse_quote! {
+            #[integration(
+                category = "ToolsAutomation",
+                display_name = "Browser",
+                description = "Chrome control",
+                status_method = "integration_active"
+            )]
+        }];
+
+        let tokens = build_integration_descriptor_method(&attrs)
+            .expect("status_method descriptor must build")
+            .to_string();
+        assert!(
+            tokens.contains("active : self . integration_active ()"),
+            "expected a method call for the active field, got: {tokens}"
+        );
+    }
+
+    #[test]
+    fn integration_status_field_emits_field_access() {
+        let attrs: Vec<syn::Attribute> = vec![parse_quote! {
+            #[integration(
+                category = "ToolsAutomation",
+                display_name = "Browser",
+                description = "Chrome control",
+                status_field = "enabled"
+            )]
+        }];
+
+        let tokens = build_integration_descriptor_method(&attrs)
+            .expect("status_field descriptor must build")
+            .to_string();
+        assert!(
+            tokens.contains("active : self . enabled ,"),
+            "expected a plain field read for the active field, got: {tokens}"
+        );
     }
 }

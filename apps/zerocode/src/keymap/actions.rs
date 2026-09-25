@@ -4,6 +4,19 @@ use serde::{Deserialize, Serialize};
 
 use super::chord::Chord;
 
+fn distinct_effective_chords(chords: Vec<Chord>) -> Vec<Chord> {
+    let mut distinct = Vec::with_capacity(chords.len());
+    for chord in chords {
+        if !distinct
+            .iter()
+            .any(|existing: &Chord| existing.same_key(&chord))
+        {
+            distinct.push(chord);
+        }
+    }
+    distinct
+}
+
 macro_rules! keyactions {
     (
         $vis:vis enum $name:ident ( $tag:literal ) {
@@ -16,7 +29,6 @@ macro_rules! keyactions {
             $( $variant ),*
         }
 
-        #[allow(dead_code)]
         impl $name {
             /// Stable per-enum tag namespacing serialized keys
             /// (`"<tag>.<variant>"`).
@@ -50,14 +62,19 @@ macro_rules! keyactions {
 
             /// Compile-time default chords for this variant.
             pub fn default_chords(&self) -> Vec<Chord> {
-                match self {
+                let chords = match self {
                     $( $name::$variant => vec![ $( $chord ),* ] ),*
-                }
+                };
+                distinct_effective_chords(chords)
             }
 
             pub fn bindings() -> Vec<(Chord, $name)> {
                 let mut out: Vec<(Chord, $name)> = Vec::new();
-                $( for c in [ $( $chord ),* ] { out.push((c, $name::$variant)); } )*
+                for action in Self::variants() {
+                    for chord in action.default_chords() {
+                        out.push((chord, *action));
+                    }
+                }
                 out
             }
 
@@ -76,10 +93,10 @@ macro_rules! keyactions {
             /// match in declaration order.
             ///
             /// The claim is tested with `Chord::same_key`, not `==`: dispatch
-            /// compares platform-normalised modifiers, so on darwin an explicit
-            /// `super+a` and a retained `ctrl+a` are one chord there and two
-            /// here. Raw equality left the shadowed default in the table and
-            /// the operator's own binding lost to it.
+            /// compares effective event modifiers, so on darwin an explicit
+            /// `super+a` and a retained `primary+a` are one chord there and
+            /// two here. Raw equality left the shadowed default in the table
+            /// and the operator's own binding lost to it.
             pub fn resolved_bindings() -> Vec<(Chord, $name)> {
                 let Some(over) = super::overrides::lookup(Self::TAG) else {
                     return Self::bindings();
@@ -146,7 +163,8 @@ keyactions! {
         ]                                                              => "help",
         PaneNavLeft  [Chord::with(KeyCode::Left, KeyModifiers::ALT), Chord::with(KeyCode::Char('b'), KeyModifiers::ALT)]  => "prev pane",
         PaneNavRight [Chord::with(KeyCode::Right, KeyModifiers::ALT), Chord::with(KeyCode::Char('f'), KeyModifiers::ALT)] => "next pane",
-        ReloadDaemon [Chord::ctrl('r')]                                 => "reload daemon",
+        ReloadDaemon [Chord::primary('r'), Chord::ctrl('r')]            => "reload daemon",
+        ToggleSidebar [Chord::ctrl('b')]                                => "toggle sidebar",
         ConfirmYes   []                                                 => "confirm",
         ConfirmNo    []                                                 => "cancel",
     }
@@ -158,8 +176,8 @@ keyactions! {
         ScrollDown              [] => "scroll down",
         PageUp                  [Chord::key(KeyCode::PageUp)] => "page up",
         PageDown                [Chord::key(KeyCode::PageDown)] => "page down",
-        JumpStart               [Chord::char('g')] => "jump to start",
-        JumpEnd                 [Chord::char('G')] => "jump to end",
+        JumpStart               [Chord::char('g'), Chord::with(KeyCode::Home, KeyModifiers::CONTROL)] => "jump to start",
+        JumpEnd                 [Chord::char('G'), Chord::with(KeyCode::End, KeyModifiers::CONTROL)] => "jump to end",
         // Use alt+shift+up/down to avoid macOS Mission Control conflict (ctrl+up/down)
         // and queue navigation conflict (alt+up/down).
         BrowseEnter             [
@@ -173,8 +191,8 @@ keyactions! {
         BrowseDownVim           [Chord::char('j')] => "browse next (vim)",
         BrowseSelectExtend      [Chord::shift(KeyCode::Up)] => "extend selection up",
         BrowseSelectExtendDown  [Chord::shift(KeyCode::Down)] => "extend selection down",
-        FastScrollUp            [Chord::with(KeyCode::Up, KeyModifiers::CONTROL.union(KeyModifiers::SHIFT))] => "fast scroll up",
-        FastScrollDown          [Chord::with(KeyCode::Down, KeyModifiers::CONTROL.union(KeyModifiers::SHIFT))] => "fast scroll down",
+        FastScrollUp            [Chord::with_primary(KeyCode::Up, KeyModifiers::SHIFT), Chord::with(KeyCode::Up, KeyModifiers::CONTROL.union(KeyModifiers::SHIFT))] => "fast scroll up",
+        FastScrollDown          [Chord::with_primary(KeyCode::Down, KeyModifiers::SHIFT), Chord::with(KeyCode::Down, KeyModifiers::CONTROL.union(KeyModifiers::SHIFT))] => "fast scroll down",
         BrowseExitSelection     [Chord::key(KeyCode::Esc)] => "exit selection",
         CopySelection           [
             Chord::char('y'),
@@ -182,11 +200,11 @@ keyactions! {
         ] => "copy selection",
         CopyAllVisible          [Chord::with(KeyCode::Char('C'), KeyModifiers::CONTROL.union(KeyModifiers::SHIFT))] => "copy all visible",
         ToggleThoughts          [Chord::char('t')] => "toggle thoughts",
-        TodoToggle              [Chord::ctrl('p')] => "toggle todo tracker",
+        TodoToggle              [Chord::primary('p'), Chord::ctrl('p')] => "toggle todo tracker",
         NewSession              [Chord::ctrl('n')] => "new session",
         SwitchSession           [Chord::ctrl('s')] => "switch session",
         DeleteSession           [] => "delete session",
-        CancelTurn              [Chord::ctrl('d')] => "cancel turn",
+        CancelTurn              [Chord::primary('d'), Chord::ctrl('d')] => "cancel turn",
         ApprovalApprove         [Chord::key(KeyCode::Enter)] => "approve",
         ApprovalDeny            [] => "deny",
         ApprovalApproveAll      [Chord::char('a')] => "approve all",
@@ -224,6 +242,8 @@ keyactions! {
         ToggleFollow     [Chord::char('f')] => "toggle follow",
         BeginSearch      [Chord::char('/')] => "search",
         ClearSearch      [Chord::char('c')] => "clear search",
+        BeginRunFilter   [Chord::char('r')] => "filter by SOP run",
+        ClearRunFilter   [Chord::char('R')] => "clear SOP run filter",
         CopyDetail       [Chord::char('y')] => "copy detail",
         CopySelection    [
             Chord::with(KeyCode::Char('c'), KeyModifiers::SUPER),
@@ -347,20 +367,21 @@ keyactions! {
 keyactions! {
     pub enum InputBarAction ("input_bar") {
         Submit             [Chord::key(KeyCode::Enter)] => "send",
-        Inject             [Chord::with(KeyCode::Enter, KeyModifiers::CONTROL)] => "send now",
+        Inject             [Chord::with_primary(KeyCode::Enter, KeyModifiers::NONE), Chord::with(KeyCode::Enter, KeyModifiers::CONTROL)] => "send now",
         NewLine            [Chord::shift(KeyCode::Enter)] => "new line",
         CursorLeft         [Chord::key(KeyCode::Left)] => "cursor left",
         CursorRight        [Chord::key(KeyCode::Right)] => "cursor right",
         CursorWordLeft     [Chord::with(KeyCode::Left, KeyModifiers::ALT), Chord::with(KeyCode::Char('b'), KeyModifiers::ALT)] => "word left",
         CursorWordRight    [Chord::with(KeyCode::Right, KeyModifiers::ALT), Chord::with(KeyCode::Char('f'), KeyModifiers::ALT)] => "word right",
         CursorStart        [Chord::key(KeyCode::Home)] => "line start",
-        CursorEnd          [Chord::key(KeyCode::End), Chord::ctrl('e')] => "line end",
-        OpenFileBrowser    [Chord::ctrl('a')] => "browse files",
+        CursorEnd          [Chord::key(KeyCode::End), Chord::primary('e'), Chord::ctrl('e')] => "line end",
+        OpenFileBrowser    [Chord::primary('a'), Chord::ctrl('a')] => "browse files",
         Backspace          [Chord::key(KeyCode::Backspace)] => "backspace",
-        DeletePreviousWord [Chord::ctrl('w'), Chord::with(KeyCode::Backspace, KeyModifiers::ALT)] => "delete previous word",
-        ClearInput         [Chord::ctrl('u')] => "clear input",
+        DeletePreviousWord [Chord::primary('w'), Chord::ctrl('w'), Chord::with(KeyCode::Backspace, KeyModifiers::ALT)] => "delete previous word",
+        DeleteForward      [Chord::key(KeyCode::Delete)] => "delete next character",
+        ClearInput         [Chord::primary('u'), Chord::ctrl('u')] => "clear input",
         SelectAll          [] => "select all",
-        Paste              [Chord::ctrl('v')] => "paste",
+        Paste              [Chord::primary('v'), Chord::ctrl('v')] => "paste",
         HistoryPrev        [Chord::key(KeyCode::Up)] => "history prev",
         HistoryNext        [Chord::key(KeyCode::Down)] => "history next",
         AutocompleteNext   [] => "autocomplete next",
@@ -444,6 +465,104 @@ mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
 
+    fn assert_distinct_defaults<A: crate::keymap::RebindableActions>() {
+        for action in A::all() {
+            let defaults = action.defaults();
+            for (index, chord) in defaults.iter().enumerate() {
+                assert!(
+                    defaults[..index]
+                        .iter()
+                        .all(|existing| !existing.same_key(chord)),
+                    "{} advertises the effective chord {} more than once",
+                    action.key(),
+                    chord.wire()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn default_tables_do_not_duplicate_effective_chords() {
+        assert_distinct_defaults::<GlobalAction>();
+        assert_distinct_defaults::<ChatTabAction>();
+        assert_distinct_defaults::<InputBarAction>();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_macos_primary_and_control<A: std::fmt::Debug + Eq + Copy>(
+        code: KeyCode,
+        extra: KeyModifiers,
+        resolve: impl Fn(&KeyEvent) -> Option<A>,
+        expected: A,
+    ) {
+        assert_eq!(
+            resolve(&KeyEvent::new(code, KeyModifiers::SUPER.union(extra))),
+            Some(expected),
+            "platform-primary event must remain accepted"
+        );
+        assert_eq!(
+            resolve(&KeyEvent::new(code, KeyModifiers::CONTROL.union(extra))),
+            Some(expected),
+            "literal-Control compatibility event must be restored"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn primary_defaults_retain_their_pre_10479_control_events_on_macos() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::keymap::overrides::reset();
+
+        assert_macos_primary_and_control(
+            KeyCode::Char('r'),
+            KeyModifiers::NONE,
+            GlobalAction::from_chord,
+            GlobalAction::ReloadDaemon,
+        );
+        assert_macos_primary_and_control(
+            KeyCode::Up,
+            KeyModifiers::SHIFT,
+            ChatTabAction::from_chord,
+            ChatTabAction::FastScrollUp,
+        );
+        assert_macos_primary_and_control(
+            KeyCode::Down,
+            KeyModifiers::SHIFT,
+            ChatTabAction::from_chord,
+            ChatTabAction::FastScrollDown,
+        );
+        assert_macos_primary_and_control(
+            KeyCode::Char('p'),
+            KeyModifiers::NONE,
+            ChatTabAction::from_chord,
+            ChatTabAction::TodoToggle,
+        );
+        assert_macos_primary_and_control(
+            KeyCode::Char('d'),
+            KeyModifiers::NONE,
+            ChatTabAction::from_chord,
+            ChatTabAction::CancelTurn,
+        );
+
+        for (code, expected) in [
+            (KeyCode::Enter, InputBarAction::Inject),
+            (KeyCode::Char('e'), InputBarAction::CursorEnd),
+            (KeyCode::Char('a'), InputBarAction::OpenFileBrowser),
+            (KeyCode::Char('w'), InputBarAction::DeletePreviousWord),
+            (KeyCode::Char('u'), InputBarAction::ClearInput),
+            (KeyCode::Char('v'), InputBarAction::Paste),
+        ] {
+            assert_macos_primary_and_control(
+                code,
+                KeyModifiers::NONE,
+                InputBarAction::from_chord,
+                expected,
+            );
+        }
+    }
+
     #[test]
     fn copy_selection_resolves_from_super_c_and_terminal_fallback() {
         let command_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER);
@@ -467,6 +586,33 @@ mod tests {
         assert_eq!(
             LogsTabAction::from_chord(&terminal_copy),
             Some(LogsTabAction::CopySelection)
+        );
+    }
+
+    #[test]
+    fn long_transcript_navigation_chords_preserve_plain_input_home_and_end() {
+        let home = KeyEvent::new(KeyCode::Home, KeyModifiers::NONE);
+        let end = KeyEvent::new(KeyCode::End, KeyModifiers::NONE);
+        let ctrl_home = KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL);
+        let ctrl_end = KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL);
+
+        assert_eq!(
+            InputBarAction::from_chord(&home),
+            Some(InputBarAction::CursorStart)
+        );
+        assert_eq!(
+            InputBarAction::from_chord(&end),
+            Some(InputBarAction::CursorEnd)
+        );
+        assert_eq!(InputBarAction::from_chord(&ctrl_home), None);
+        assert_eq!(InputBarAction::from_chord(&ctrl_end), None);
+        assert_eq!(
+            ChatTabAction::from_chord(&ctrl_home),
+            Some(ChatTabAction::JumpStart)
+        );
+        assert_eq!(
+            ChatTabAction::from_chord(&ctrl_end),
+            Some(ChatTabAction::JumpEnd)
         );
     }
 }

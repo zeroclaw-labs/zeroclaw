@@ -1,7 +1,6 @@
 //! Local zerocode client configuration: theme and keybindings.
 //! Always read from the local `<config_dir>/zerocode-config.toml`, independent
 //! of the connection target. Layering: defaults -> file -> `ZEROCODE_*` env.
-#![allow(dead_code)]
 
 pub mod keybindings;
 
@@ -43,6 +42,68 @@ impl ChordSpec {
     }
 }
 
+fn migrate_legacy_ctrl_bindings(value: &mut toml::Value) -> bool {
+    let Some(rows) = value.as_table_mut() else {
+        return false;
+    };
+    let mut migrated = false;
+    for (_, value) in rows.iter_mut() {
+        migrated |= migrate_legacy_ctrl_value(value);
+    }
+    migrated
+}
+
+fn migrate_legacy_ctrl_value(value: &mut toml::Value) -> bool {
+    match value {
+        toml::Value::String(wire) => migrate_legacy_ctrl_wire(wire),
+        toml::Value::Array(values) => {
+            let mut migrated = false;
+            for value in values {
+                migrated |= migrate_legacy_ctrl_value(value);
+            }
+            migrated
+        }
+        _ => false,
+    }
+}
+
+fn migrate_legacy_ctrl_wire(wire: &mut String) -> bool {
+    let segments: Vec<&str> = wire.trim().split('+').collect();
+    if segments.len() < 2 {
+        return false;
+    }
+    let Some(key) = segments.last() else {
+        return false;
+    };
+    let replacement = if matches!(
+        key.to_ascii_lowercase().as_str(),
+        "c" | "g" | "k" | "n" | "s" | "f1"
+    ) {
+        "control"
+    } else {
+        "primary"
+    };
+    let mut found_legacy = false;
+    let migrated = segments
+        .iter()
+        .map(|segment| {
+            if segment.eq_ignore_ascii_case("ctrl") {
+                found_legacy = true;
+                replacement
+            } else {
+                segment
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("+");
+    if found_legacy && migrated != wire.trim() {
+        *wire = migrated;
+        true
+    } else {
+        false
+    }
+}
+
 fn migrate_legacy_help_binding(rows: &mut HashMap<String, ChordSpec>) -> bool {
     use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -76,6 +137,23 @@ fn migrate_legacy_copy_binding(rows: &mut HashMap<String, ChordSpec>) -> bool {
         key,
         ChordSpec::Many(ChatTabAction::CopySelection.default_chords()),
     );
+    true
+}
+
+fn migrate_legacy_chat_jump_binding(
+    rows: &mut HashMap<String, ChordSpec>,
+    action: ChatTabAction,
+    legacy: Chord,
+) -> bool {
+    let key = action.action_key();
+    let Some(ChordSpec::Many(chords)) = rows.get(&key) else {
+        return false;
+    };
+    if chords.as_slice() != std::slice::from_ref(&legacy) {
+        return false;
+    }
+
+    rows.insert(key, ChordSpec::Many(action.default_chords()));
     true
 }
 
@@ -120,10 +198,47 @@ impl ConnectionSection {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Hand-written so `auth_token` cannot reach a log, a panic message or a
+/// diagnostic dump. Every other field is ordinary connection metadata and is
+/// printed as usual.
+impl std::fmt::Debug for WssSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WssSection")
+            .field("uri", &self.uri)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("auth_token_file", &self.auth_token_file)
+            .field("auth_provider", &self.auth_provider)
+            .field("tls", &self.tls)
+            .field("relay_url", &self.relay_url)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct WssSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
+    /// Bearer presented as `auth_token` in the initialize handshake (a
+    /// gateway pairing token, or an OIDC access token together with
+    /// `auth_provider`). Remote daemons require it since the RFC 7141
+    /// enforcement boundary. The `ZEROCLAW_AUTH_TOKEN` environment
+    /// variable overrides this value, so the token can stay out of the
+    /// config file entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
+    /// Path to a file holding the bearer, as an alternative to writing it
+    /// into this file. The file must be readable by its owner only; a
+    /// group- or world-readable one is refused rather than used. Takes
+    /// precedence over `auth_token` and yields to `ZEROCLAW_AUTH_TOKEN`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token_file: Option<String>,
+    /// Provider selection for `auth_token` (e.g. `oidc.corp`). Defaults
+    /// to the daemon's `native` pairing provider when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_provider: Option<String>,
     #[serde(default, skip_serializing_if = "WssTlsSection::is_empty")]
     pub tls: WssTlsSection,
     /// Reach the daemon through a nominated relay at this `host:port` instead of
@@ -156,6 +271,9 @@ impl WssSection {
             && self.direct_attempts.is_none()
             && self.direct_timeout_secs.is_none()
             && self.reprobe_secs.is_none()
+            && self.auth_token.is_none()
+            && self.auth_token_file.is_none()
+            && self.auth_provider.is_none()
     }
 }
 
@@ -195,6 +313,27 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// The `[sidebar]` section: the shell-level agent sidebar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SidebarSection {
+    /// Whether the agent sidebar is shown. Toggled at runtime and persisted.
+    #[serde(default = "default_sidebar_visible")]
+    pub visible: bool,
+    /// Sidebar width in terminal columns. Clamped to the widget's supported
+    /// range at render time; edited on disk only (no runtime writer).
+    #[serde(default = "default_sidebar_width")]
+    pub width: u16,
+}
+
+impl Default for SidebarSection {
+    fn default() -> Self {
+        Self {
+            visible: default_sidebar_visible(),
+            width: default_sidebar_width(),
+        }
+    }
+}
+
 // ── Todo tracker ──────────────────────────────────────────────────────────────
 
 /// Where the todo tracker renders inside the Code pane.
@@ -232,6 +371,14 @@ impl Default for TodoTrackerSection {
             max_height: default_todotracker_max_height(),
         }
     }
+}
+
+fn default_sidebar_visible() -> bool {
+    true
+}
+
+fn default_sidebar_width() -> u16 {
+    24
 }
 
 impl TodoTrackerSection {
@@ -350,6 +497,8 @@ pub(crate) struct ZerocodeConfig {
     pub theme: ThemeSection,
     #[serde(default, skip_serializing_if = "ConnectionSection::is_empty")]
     pub connection: ConnectionSection,
+    #[serde(default)]
+    pub sidebar: SidebarSection,
     /// Sparse keybinding overrides keyed `"<tag>.<variant>"`. Absent
     /// entries fall back to compile-time defaults.
     #[serde(default)]
@@ -364,6 +513,7 @@ impl Default for ZerocodeConfig {
             locale: default_locale(),
             theme: ThemeSection::default(),
             connection: ConnectionSection::default(),
+            sidebar: SidebarSection::default(),
             keybindings: HashMap::new(),
             todotracker: TodoTrackerSection::default(),
         }
@@ -549,10 +699,17 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
 
     let path = config_path(config_dir);
     if !path.exists() {
+        // Another writer may save a real config between the check above and
+        // this write, so the default is only ever created, never swapped in
+        // over a file that appeared meanwhile.
         let default = ZerocodeConfig::default();
         let body = toml::to_string_pretty(&default).context("serializing default config")?;
-        std::fs::write(&path, body)
+        crate::secure_file::create_private_if_absent(&path, body.as_bytes())
             .with_context(|| format!("writing default {}", path.display()))?;
+    } else {
+        // An existing file may predate the owner-only rule, and reading it
+        // does not go through the write funnel.
+        crate::secure_file::restrict_to_owner(&path, config_dir)?;
     }
 
     let mut doc = load_document(&path)?;
@@ -582,8 +739,30 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
             ),
         }
     }
+    if let Some(v) = doc.get("sidebar") {
+        match v.clone().try_into::<SidebarSection>() {
+            Ok(section) => config.sidebar = section,
+            Err(e) => eprintln!(
+                "zerocode: ignoring [sidebar] in {} ({e}); using default",
+                path.display()
+            ),
+        }
+    }
     if let Some(v) = doc.get("keybindings") {
-        match v.clone().try_into::<HashMap<String, ChordSpec>>() {
+        let mut migrated_value = v.clone();
+        let migrated_legacy = migrate_legacy_ctrl_bindings(&mut migrated_value);
+        if migrated_legacy {
+            // Rewrite legacy spellings before parsing the rows. A malformed,
+            // unrelated row must not leave otherwise valid legacy values in
+            // the file indefinitely; the tolerant loader still falls back to
+            // defaults for the malformed section below.
+            doc.insert("keybindings".to_string(), migrated_value.clone());
+            migrated_keybindings = true;
+        }
+        match migrated_value
+            .clone()
+            .try_into::<HashMap<String, ChordSpec>>()
+        {
             Ok(mut rows) => {
                 if migrate_legacy_help_binding(&mut rows) {
                     let key = GlobalAction::Help.action_key();
@@ -605,6 +784,23 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
                         ChatTabAction::CopySelection.default_chords(),
                     ))
                     .context("serializing migrated Copy binding")?;
+                    let bindings = doc
+                        .get_mut("keybindings")
+                        .and_then(toml::Value::as_table_mut)
+                        .context("accessing parsed keybindings table")?;
+                    bindings.insert(key, value);
+                    migrated_keybindings = true;
+                }
+                for (action, legacy) in [
+                    (ChatTabAction::JumpStart, Chord::char('g')),
+                    (ChatTabAction::JumpEnd, Chord::char('G')),
+                ] {
+                    if !migrate_legacy_chat_jump_binding(&mut rows, action, legacy) {
+                        continue;
+                    }
+                    let key = action.action_key();
+                    let value = toml::Value::try_from(ChordSpec::Many(action.default_chords()))
+                        .context("serializing migrated chat jump binding")?;
                     let bindings = doc
                         .get_mut("keybindings")
                         .and_then(toml::Value::as_table_mut)
@@ -640,8 +836,17 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
 /// Load the on-disk file as a raw `toml::Table`. A missing or empty file
 /// yields an empty table; any other section the running struct does not
 /// model is carried through untouched so a partial write never clobbers it.
+///
+/// Any other read failure is an error, not an empty table: every persist
+/// rebuilds the whole file from this document and publishes it by rename, so
+/// treating an unreadable file as empty would replace the user's config,
+/// its `[connection.wss]` bearer included, with whatever is being saved.
 fn load_document(path: &Path) -> Result<toml::Table> {
-    let raw = std::fs::read_to_string(path).unwrap_or_default();
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
     if raw.trim().is_empty() {
         return Ok(toml::Table::new());
     }
@@ -649,9 +854,17 @@ fn load_document(path: &Path) -> Result<toml::Table> {
 }
 
 /// Serialize a mutated document table back to disk.
+///
+/// The configuration file carries a hand-written `[connection.wss]
+/// auth_token` whenever the operator uses the persistent path instead of
+/// `ZEROCLAW_AUTH_TOKEN`, and every persist here rewrites the whole file. So
+/// this is the one funnel that decides the file's mode, and it writes
+/// owner-only and atomically: a partial rewrite cannot lose a token that was
+/// already there, and a file that predates this is repaired rather than left
+/// world-readable.
 fn write_document(path: &Path, doc: &toml::Table) -> Result<()> {
     let body = toml::to_string_pretty(doc).context("serializing config")?;
-    std::fs::write(path, body).with_context(|| format!("writing {}", path.display()))
+    crate::secure_file::write_private_atomic(path, body.as_bytes())
 }
 
 /// Mutable borrow of `key`'s sub-table, inserting an empty one when absent.
@@ -660,6 +873,14 @@ fn section_mut<'a>(doc: &'a mut toml::Table, key: &str) -> Result<&'a mut toml::
         .or_insert_with(|| toml::Value::Table(toml::Table::new()))
         .as_table_mut()
         .ok_or_else(|| anyhow::Error::msg(format!("'{key}' is not a table")))
+}
+
+/// Persist the sidebar visibility toggle, writing only `[sidebar].visible`.
+pub(crate) fn persist_sidebar_visible(config_dir: &Path, visible: bool) -> Result<()> {
+    let path = config_path(config_dir);
+    let mut doc = load_document(&path)?;
+    section_mut(&mut doc, "sidebar")?.insert("visible".to_string(), toml::Value::Boolean(visible));
+    write_document(&path, &doc)
 }
 
 /// Persist the selected theme name, editing only the `[theme]` section.
@@ -747,6 +968,7 @@ pub(crate) fn persist_wss_route_ack(config_dir: &Path, uri: &str) -> Result<()> 
 /// the file — so validating the *candidate* alone is not enough. Only the
 /// latest document, which this function already loads, can answer whether the
 /// value about to be overwritten is the user's invalid canonical data.
+#[cfg(test)]
 pub(crate) fn persist_todotracker(config_dir: &Path, section: &TodoTrackerSection) -> Result<()> {
     persist_todotracker_with_intent(config_dir, section, TrackerWriteIntent::PreserveInvalid)
         .map(|_| ())
@@ -1283,6 +1505,24 @@ mod tests {
     }
 
     #[test]
+    fn a_config_that_cannot_be_read_is_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        // Not valid UTF-8, so the read fails for a reason other than absence.
+        let bytes: &[u8] = b"[connection.wss]\nauth_token = \"keep-me\"\n\xff\xfe\n";
+        std::fs::write(config_path(dir.path()), bytes).unwrap();
+
+        assert!(
+            persist_theme(dir.path(), "gruvbox").is_err(),
+            "a persist must not treat an unreadable config as empty"
+        );
+        assert_eq!(
+            std::fs::read(config_path(dir.path())).unwrap(),
+            bytes,
+            "the unreadable config must be left as it was"
+        );
+    }
+
+    #[test]
     fn persist_theme_preserves_unmodeled_sections() {
         let dir = tempfile::tempdir().unwrap();
         seed(
@@ -1317,6 +1557,25 @@ mod tests {
                 .unwrap()
                 .contains_key("dashboard.up")
         );
+    }
+
+    #[test]
+    fn persist_keybind_row_emits_only_canonical_modifier_wires() {
+        let dir = tempfile::tempdir().unwrap();
+        persist_keybind_row(
+            dir.path(),
+            "input_bar.clear_input",
+            vec![Chord::ctrl('c'), Chord::primary('u')],
+        )
+        .unwrap();
+
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        let row = doc["keybindings"]["input_bar.clear_input"]
+            .as_array()
+            .unwrap();
+        assert_eq!(row[0].as_str(), Some("control+c"));
+        assert_eq!(row[1].as_str(), Some("primary+u"));
+        assert!(!read(dir.path()).contains("ctrl+"));
     }
 
     #[test]
@@ -1404,7 +1663,7 @@ mod tests {
     }
 
     #[test]
-    fn customized_help_binding_is_not_migrated() {
+    fn customized_help_binding_migrates_legacy_primary() {
         // Reads the environment via `ensure_and_load`; serialize against the
         // env-mutating tests so a stray override cannot leak in.
         let _guard = env_test_lock();
@@ -1418,9 +1677,102 @@ mod tests {
         let resolved = cfg.resolve_keybindings().unwrap();
         assert_eq!(
             resolved["global"]["help"],
-            vec![Chord::char('?'), Chord::ctrl('h')]
+            vec![Chord::char('?'), Chord::primary('h')]
         );
-        assert!(read(dir.path()).contains("ctrl+h"));
+        assert!(read(dir.path()).contains("primary+h"));
+        assert!(!read(dir.path()).contains("ctrl+h"));
+    }
+
+    #[test]
+    fn legacy_ctrl_migration_preserves_scalar_array_and_unrelated_config() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "locale = \"en\"\n\n[keybindings]\n\"input_bar.clear_input\" = \"ctrl+u\"\n\"global.help\" = [\"ctrl+c\", \"ctrl+f1\"]\n\n[future]\nkeep = true\n",
+        );
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        let resolved = cfg.resolve_keybindings().unwrap();
+        assert_eq!(
+            resolved["input_bar"]["clear_input"],
+            vec![Chord::primary('u')]
+        );
+        assert_eq!(
+            resolved["global"]["help"],
+            vec![
+                Chord::ctrl('c'),
+                Chord::with(KeyCode::F(1), KeyModifiers::CONTROL),
+            ]
+        );
+
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["locale"].as_str(), Some("en"));
+        assert_eq!(doc["future"]["keep"].as_bool(), Some(true));
+        assert_eq!(
+            doc["keybindings"]["input_bar.clear_input"].as_str(),
+            Some("primary+u")
+        );
+        let global = doc["keybindings"]["global.help"].as_array().unwrap();
+        assert_eq!(global[0].as_str(), Some("control+c"));
+        assert_eq!(global[1].as_str(), Some("control+f1"));
+    }
+
+    #[test]
+    fn legacy_ctrl_migration_uses_the_frozen_key_split() {
+        for key in ["c", "g", "k", "n", "s", "f1"] {
+            let mut wire = format!("ctrl+{key}");
+            assert!(migrate_legacy_ctrl_wire(&mut wire));
+            assert_eq!(wire, format!("control+{key}"));
+        }
+        for key in [
+            "a", "d", "e", "h", "p", "r", "u", "v", "w", "x", "enter", "up",
+        ] {
+            let mut wire = format!("ctrl+{key}");
+            assert!(migrate_legacy_ctrl_wire(&mut wire));
+            assert_eq!(wire, format!("primary+{key}"));
+        }
+        let mut canonical = "control+c".to_string();
+        assert!(!migrate_legacy_ctrl_wire(&mut canonical));
+        assert_eq!(canonical, "control+c");
+    }
+
+    #[test]
+    fn legacy_ctrl_migration_rewrites_before_tolerant_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[keybindings]\n\"input_bar.clear_input\" = \"ctrl+u\"\n\"broken\" = [42]\n\n[future]\nkeep = true\n",
+        );
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert!(
+            cfg.keybindings.is_empty(),
+            "malformed rows still use defaults"
+        );
+
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(
+            doc["keybindings"]["input_bar.clear_input"].as_str(),
+            Some("primary+u")
+        );
+        assert_eq!(doc["keybindings"]["broken"][0].as_integer(), Some(42));
+        assert_eq!(doc["future"]["keep"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn canonical_keybindings_reload_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[keybindings]\n\"input_bar.clear_input\" = \"primary+u\"\n\n[future]\nkeep = 1\n",
+        );
+
+        let _ = ensure_and_load(dir.path()).unwrap();
+        let first = read(dir.path());
+        let _ = ensure_and_load(dir.path()).unwrap();
+        assert_eq!(read(dir.path()), first);
     }
 
     #[test]
@@ -1494,11 +1846,230 @@ mod tests {
     }
 
     #[test]
+    fn legacy_chat_jump_defaults_migrate_without_touching_other_config() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[keybindings]\n\"chat.jump_start\" = [\"g\"]\n\"chat.jump_end\" = [\"G\"]\n\"dashboard.up\" = [\"k\"]\n\n[future]\nkeep = 1\n",
+        );
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        let resolved = cfg.resolve_keybindings().unwrap();
+        assert_eq!(
+            resolved["chat"]["jump_start"],
+            ChatTabAction::JumpStart.default_chords()
+        );
+        assert_eq!(
+            resolved["chat"]["jump_end"],
+            ChatTabAction::JumpEnd.default_chords()
+        );
+        assert_eq!(resolved["dashboard"]["up"], vec![Chord::char('k')]);
+
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["future"]["keep"].as_integer(), Some(1));
+    }
+
+    #[test]
+    fn customized_chat_jump_bindings_are_not_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[keybindings]\n\"chat.jump_start\" = [\"alt+home\"]\n\"chat.jump_end\" = \"G\"\n",
+        );
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        let resolved = cfg.resolve_keybindings().unwrap();
+        assert_eq!(
+            resolved["chat"]["jump_start"],
+            vec!["alt+home".parse::<Chord>().unwrap()]
+        );
+        assert_eq!(resolved["chat"]["jump_end"], vec![Chord::char('G')]);
+    }
+
+    #[test]
     fn persist_theme_creates_file_when_absent() {
         let dir = tempfile::tempdir().unwrap();
         persist_theme(dir.path(), "gruvbox").unwrap();
         let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
         assert_eq!(doc["theme"]["name"].as_str(), Some("gruvbox"));
+    }
+
+    // ── The config file is owner-only and written atomically ─────────
+    //
+    // The operator may keep the WSS bearer in `[connection.wss] auth_token`
+    // rather than `ZEROCLAW_AUTH_TOKEN`, and every persist rewrites the whole
+    // file, so this one funnel decides the file's mode and its atomicity.
+
+    #[cfg(unix)]
+    #[test]
+    fn write_document_creates_the_config_file_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        persist_theme(dir.path(), "gruvbox").unwrap();
+
+        let file_mode = std::fs::metadata(config_path(dir.path()))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let dir_mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600, "a fresh config file must be owner-only");
+        assert_eq!(dir_mode, 0o700, "the config dir must be owner-only");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_document_repairs_a_world_readable_config_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[connection.wss]\nuri = \"wss://daemon.example:8443\"\nauth_token = \"hand-written-bearer\"\n",
+        );
+        std::fs::set_permissions(
+            config_path(dir.path()),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        persist_theme(dir.path(), "gruvbox").unwrap();
+
+        let mode = std::fs::metadata(config_path(dir.path()))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "an existing world-readable file must be repaired"
+        );
+        let body = read(dir.path());
+        assert!(
+            body.contains("hand-written-bearer"),
+            "repairing the mode must not lose the operator's token:\n{body}"
+        );
+    }
+
+    #[test]
+    fn write_document_is_atomic_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        persist_theme(dir.path(), "gruvbox").unwrap();
+        persist_locale(dir.path(), "fr").unwrap();
+
+        let entries: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![FILE_NAME.to_string()],
+            "the publish must leave no staging file behind: {entries:?}"
+        );
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["theme"]["name"].as_str(), Some("gruvbox"));
+        assert_eq!(doc["locale"].as_str(), Some("fr"));
+    }
+
+    #[test]
+    fn persisted_auth_token_survives_unrelated_section_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[connection.wss]\nuri = \"wss://daemon.example:8443\"\nauth_token = \"hand-written-bearer\"\n",
+        );
+
+        persist_locale(dir.path(), "fr").unwrap();
+
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(
+            doc["connection"]["wss"]["auth_token"].as_str(),
+            Some("hand-written-bearer"),
+            "an unrelated persist must carry the token through untouched"
+        );
+        assert_eq!(doc["locale"].as_str(), Some("fr"));
+    }
+
+    #[test]
+    fn wss_section_debug_redacts_the_bearer() {
+        let section = WssSection {
+            uri: Some("wss://daemon.example:8443".into()),
+            auth_token: Some("super-secret-bearer".into()),
+            auth_provider: Some("oidc.corp".into()),
+            ..WssSection::default()
+        };
+        let rendered = format!("{section:?}");
+        assert!(
+            !rendered.contains("super-secret-bearer"),
+            "the bearer must never reach a diagnostic: {rendered}"
+        );
+        assert!(rendered.contains("REDACTED"), "{rendered}");
+        assert!(
+            rendered.contains("oidc.corp"),
+            "ordinary connection metadata still prints: {rendered}"
+        );
+    }
+
+    #[test]
+    fn sidebar_section_round_trips() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "[sidebar]\nvisible = false\nwidth = 30\n");
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert!(!cfg.sidebar.visible);
+        assert_eq!(cfg.sidebar.width, 30);
+    }
+
+    #[test]
+    fn sidebar_partial_section_fills_field_defaults() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "[sidebar]\nvisible = false\n");
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert!(!cfg.sidebar.visible);
+        assert_eq!(cfg.sidebar.width, 24, "unset width falls back to default");
+    }
+
+    #[test]
+    fn bad_sidebar_does_not_blank_theme() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[theme]\nname = \"dracula\"\n\n[sidebar]\nvisible = \"nope\"\n",
+        );
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert_eq!(cfg.theme.name, "dracula");
+        assert!(cfg.sidebar.visible, "bad [sidebar] drops to default");
+    }
+
+    #[test]
+    fn default_config_serializes_sidebar_for_env_overrides() {
+        let body = toml::to_string_pretty(&ZerocodeConfig::default()).unwrap();
+        assert!(
+            body.contains("[sidebar]") && body.contains("visible = true"),
+            "the default document must materialize [sidebar] so schema-mirror env overrides resolve; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn persist_sidebar_visible_preserves_other_sections() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[theme]\nname = \"nord\"\n\n[future]\nkeep = true\n",
+        );
+        persist_sidebar_visible(dir.path(), false).unwrap();
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["sidebar"]["visible"].as_bool(), Some(false));
+        assert_eq!(doc["theme"]["name"].as_str(), Some("nord"));
+        assert_eq!(doc["future"]["keep"].as_bool(), Some(true));
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert!(!cfg.sidebar.visible);
+        persist_sidebar_visible(dir.path(), true).unwrap();
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert!(cfg.sidebar.visible);
     }
 
     #[test]
@@ -1514,6 +2085,19 @@ mod tests {
         assert_eq!(
             back.connection.wss.tls.skip_verify_routes,
             vec!["wss://host:9781"]
+        );
+    }
+
+    #[test]
+    fn a_token_file_alone_keeps_the_connection_section() {
+        let mut c = ZerocodeConfig::default();
+        c.connection.wss.auth_token_file = Some("/etc/zeroclaw/zerocode-bearer".to_string());
+        let body = toml::to_string_pretty(&c).unwrap();
+        let back: ZerocodeConfig = toml::from_str(&body).unwrap();
+        assert_eq!(
+            back.connection.wss.auth_token_file.as_deref(),
+            Some("/etc/zeroclaw/zerocode-bearer"),
+            "got:\n{body}"
         );
     }
 
@@ -1929,6 +2513,19 @@ mod tests {
 
         let cfg = ensure_and_load(dir.path()).unwrap();
         assert_eq!(cfg.resolve_todo_tracker().width, 41);
+    }
+
+    #[test]
+    fn canonical_env_spelling_overrides_default_sidebar_field() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _v = EnvVarGuard::set("ZEROCODE_sidebar__visible", "false");
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert!(
+            !cfg.sidebar.visible,
+            "a default config must materialize [sidebar] before schema-mirror overrides apply"
+        );
     }
 
     #[test]

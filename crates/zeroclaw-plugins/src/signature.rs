@@ -73,6 +73,32 @@ fn hex_encode(data: &[u8]) -> String {
     data.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Compute a lowercase hexadecimal SHA-256 digest.
+#[must_use]
+pub fn sha256_hex(data: &[u8]) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, data);
+    hex_encode(digest.as_ref())
+}
+
+/// Validate the manifest representation of a SHA-256 digest.
+pub fn validate_sha256_hex(expected: &str) -> Result<(), PluginError> {
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(PluginError::PayloadDigestInvalid(expected.to_string()));
+    }
+    Ok(())
+}
+
+/// Verify bytes against a manifest-provided SHA-256 digest.
+pub fn verify_payload_digest(data: &[u8], expected: &str) -> Result<(), PluginError> {
+    validate_sha256_hex(expected)?;
+    let expected = expected.to_ascii_lowercase();
+    let actual = sha256_hex(data);
+    if actual != expected {
+        return Err(PluginError::PayloadDigestMismatch { expected, actual });
+    }
+    Ok(())
+}
+
 // ── Canonical manifest bytes ──
 
 /// Compute the canonical bytes of a manifest for signing/verification.
@@ -329,6 +355,28 @@ type = "string"
     }
 
     #[test]
+    fn payload_digest_verification_accepts_exact_bytes() {
+        let bytes = b"signed component bytes";
+        let digest = sha256_hex(bytes);
+        verify_payload_digest(bytes, &digest).expect("exact payload digest matches");
+        verify_payload_digest(bytes, &digest.to_ascii_uppercase())
+            .expect("hex digest comparison is case-insensitive");
+    }
+
+    #[test]
+    fn payload_digest_verification_rejects_tampering_and_invalid_shape() {
+        let digest = sha256_hex(b"original");
+        assert!(matches!(
+            verify_payload_digest(b"tampered", &digest),
+            Err(PluginError::PayloadDigestMismatch { .. })
+        ));
+        assert!(matches!(
+            verify_payload_digest(b"original", "not-a-sha256"),
+            Err(PluginError::PayloadDigestInvalid(_))
+        ));
+    }
+
+    #[test]
     fn test_canonical_manifest_without_signature_fields() {
         let canonical = canonical_manifest_bytes(TEST_MANIFEST).unwrap();
         let canonical_str = String::from_utf8(canonical).unwrap();
@@ -358,6 +406,66 @@ type = "string"
         let trusted_keys = vec![pub_hex.clone()];
         let result = verify_manifest(&tampered, &sig, &pub_hex, &trusted_keys);
         assert!(matches!(result, VerificationResult::Invalid { .. }));
+    }
+
+    /// The `[egress]` declaration must be signature-covered content.
+    ///
+    /// `canonical_manifest_bytes` strips only the two root signature fields, so
+    /// coverage of a new field is automatic rather than opt-in — but "automatic"
+    /// is exactly the kind of claim that quietly stops being true if the strip
+    /// rule is ever broadened. This pins it: editing a declared destination must
+    /// break an existing signature.
+    #[test]
+    fn egress_declaration_is_signature_covered() {
+        const DECLARED: &str = r#"
+name = "test-plugin"
+version = "0.1.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+permissions = ["http_client"]
+
+[egress]
+hosts = ["api.example.com"]
+"#;
+        let (pkcs8, pub_hex) = generate_test_keypair();
+        let sig = sign_manifest(DECLARED, &pkcs8).unwrap();
+        let trusted_keys = vec![pub_hex.clone()];
+        assert!(
+            verify_manifest(DECLARED, &sig, &pub_hex, &trusted_keys).is_valid(),
+            "the declaration as signed must verify"
+        );
+
+        for (label, edited) in [
+            (
+                "retargeting a declared destination",
+                DECLARED.replace("api.example.com", "evil.example.net"),
+            ),
+            (
+                "appending a destination",
+                DECLARED.replace(
+                    r#"hosts = ["api.example.com"]"#,
+                    r#"hosts = ["api.example.com", "evil.example.net"]"#,
+                ),
+            ),
+            (
+                "deleting the declaration",
+                DECLARED.replace("[egress]\nhosts = [\"api.example.com\"]\n", ""),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    verify_manifest(&edited, &sig, &pub_hex, &trusted_keys),
+                    VerificationResult::Invalid { .. }
+                ),
+                "{label} must invalidate the publisher's signature"
+            );
+        }
+
+        // And canonicalization keeps the table, rather than treating `[egress]`
+        // or `hosts` as another strippable root field.
+        let canonical = String::from_utf8(canonical_manifest_bytes(DECLARED).unwrap()).unwrap();
+        assert!(canonical.contains("[egress]"), "{canonical}");
+        assert!(canonical.contains("api.example.com"), "{canonical}");
     }
 
     #[test]

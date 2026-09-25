@@ -1,7 +1,6 @@
 //! ZeroClaw TUI colour palette and style helpers.
 //! Shared between the onboarding UI (lib target) and the main chat TUI (binary
 //! target). Not every helper is used by both targets.
-#![allow(dead_code)]
 
 use std::sync::{LazyLock, RwLock};
 
@@ -183,6 +182,7 @@ pub(crate) fn selection_bg() -> Color {
 
 /// The active theme's canvas colour. `Color::Reset` means "inherit the
 /// terminal" — the app-level backdrop skips painting in that case.
+#[cfg(test)]
 pub(crate) fn background() -> Color {
     active().background
 }
@@ -234,6 +234,30 @@ pub(crate) fn warn_style() -> Style {
 /// themes (matching the CLI's green-for-free convention).
 pub(crate) fn success_style() -> Style {
     Style::default().fg(Color::Green)
+}
+
+// Agent-session status dots (sidebar). Like `success_style`, these use ANSI
+// base colors rather than palette roles so the traffic-light semantics stay
+// stable across themes and inherit the user's terminal palette.
+
+/// Session is idle and ready for input.
+pub(crate) fn status_ready_style() -> Style {
+    Style::default().fg(Color::Green)
+}
+
+/// Session has a turn in flight.
+pub(crate) fn status_running_style() -> Style {
+    Style::default().fg(Color::Blue)
+}
+
+/// Session is blocked on a human (approval or elicitation).
+pub(crate) fn status_attention_style() -> Style {
+    Style::default().fg(Color::Yellow)
+}
+
+/// Session hit an error (failed turn or lost session).
+pub(crate) fn status_error_style() -> Style {
+    Style::default().fg(Color::Red)
 }
 
 pub(crate) fn selected_style() -> Style {

@@ -2,9 +2,9 @@ name: Rust cache (provider-aware)
 description: >
   Restore/save the Rust build cache using Blacksmith's sticky-disk cache when
   the job runs on a Blacksmith runner, otherwise Swatinem/rust-cache on a
-  GitHub-hosted runner. This preserves the CI_USE_BLACKSMITH fail-safe: any
-  non-'true' value (including unset) selects Swatinem, so GitHub-hosted jobs
-  stay fully cached and the toggle can be flipped off with no loss of caching.
+  GitHub-hosted runner. Callers pass a checked-in constant that matches the
+  runner label they pin; any non-'true' value selects Swatinem, so a job moved
+  back to GitHub-hosted keeps its cache by flipping that one input with it.
 
 inputs:
   use-blacksmith:

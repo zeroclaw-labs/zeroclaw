@@ -28,11 +28,12 @@ pub mod heartbeat;
 pub mod hooks;
 pub mod i18n;
 pub mod integrations;
-pub mod nodes;
 pub mod observability;
 pub mod peers;
 pub mod platform;
 pub mod plugin_runtime;
+#[cfg(feature = "plugins-wasm")]
+pub(crate) mod plugin_state;
 pub mod process_stats;
 pub mod quickstart;
 pub mod rag;

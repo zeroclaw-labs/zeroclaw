@@ -1,7 +1,7 @@
-//! `cargo generate installers` - render install surfaces from canonical route
-//! semantics and deterministic renderer bodies. The spec owns route policy;
-//! renderers own generated surface content; content outside generated zones is
-//! hand-authored. Every tracked surface is registered below and drift-checked.
+//! Maintainer surface generation. `cargo generate installers` renders install
+//! surfaces from canonical route semantics; `cargo generate review-docs`
+//! materializes repeated PR-review policy. Typed specs own policy, renderers
+//! own generated content, and text outside generated zones stays hand-authored.
 
 pub mod container;
 pub mod container_base;
@@ -10,6 +10,7 @@ pub mod docs;
 pub mod flake;
 pub mod install_sh;
 pub mod packaging;
+pub mod review_docs;
 pub mod runtime_locales;
 pub mod setup_bat;
 pub mod sop_syntax;
@@ -105,6 +106,14 @@ fn registry() -> Vec<Surface> {
             name: "dockerfile-alpine",
             file: "Dockerfile.alpine",
             render: |root, cur| render_docker_arg(root, cur),
+        },
+        // Base-image pins only: the relay builds `-p zerorelay` with no feature
+        // selection, so it carries no `docker-features-arg` zone and must not go
+        // through `render_docker_arg`.
+        Surface {
+            name: "dockerfile-zerorelay",
+            file: "apps/zerorelay/Dockerfile",
+            render: |root, cur| container_base::splice_zones(root, cur),
         },
         Surface {
             name: "pkgbuild",

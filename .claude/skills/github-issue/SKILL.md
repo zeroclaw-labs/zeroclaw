@@ -23,7 +23,7 @@ Read `.github/ISSUE_TEMPLATE/config.yml` first. It is contact-link metadata, not
 
 Discover the issue forms from the current repository. Enumerate `.github/ISSUE_TEMPLATE/*.yml` excluding `config.yml`, then parse each form's `name`, `description`, `title`, `labels`, and `body`.
 
-Choose the best form from the parsed inventory. If the type is unclear, use AskUserQuestion with the parsed form names and descriptions. Do not collapse unclear issues to bug or feature by default.
+Choose the best form from the parsed inventory. First distinguish ordinary tracked work from an RFC: unless the request clearly crosses one of the four triggers accepted in [#9496](https://github.com/zeroclaw-labs/zeroclaw/issues/9496), keep it on the ordinary issue or PR path. Then choose the ordinary form by intent: bug, feature, docs, support, tracker, or contributor task. Do not collapse every non-RFC into a Feature Request. When the ordinary type is unclear, use AskUserQuestion with the parsed form names and descriptions. Do not ask the user to self-adjudicate an uncertain architecture boundary; record a possible trigger in the selected form so a maintainer can promote it.
 
 Then read the selected issue template to understand the required fields:
 
@@ -89,7 +89,7 @@ If the user requests changes, update the draft and re-present. Iterate until the
 Before final submission, analyze the collected content for scope creep:
 - Does the bug report describe multiple independent defects?
 - Does the feature request bundle unrelated changes?
-- Is an RFC/design proposal being filed as an ordinary feature request?
+- Is an RFC/design proposal being filed as an ordinary feature request? Check the reverse too, which is the more common error: ordinary features, schema or data migrations, configuration field and default changes, and bounded refactors are **not** RFCs. Route to the RFC form only when the proposal crosses one of the four triggers accepted in [#9496](https://github.com/zeroclaw-labs/zeroclaw/issues/9496); when unsure, file the feature request and note why it might cross one.
 - Is an active coordination surface being filed as one ordinary bug or feature instead of a roadmap/tracker?
 - Is a docs-only gap being mixed with a behavior change that should have its own bug or feature issue?
 
@@ -132,25 +132,32 @@ For checkbox fields, render each option as:
 
 Show the final constructed issue (title + labels + full body) for one last confirmation. If the selected template has no labels, show `Labels: none` and omit `--label` from the create command.
 
-Then submit using a HEREDOC for the body to preserve formatting:
+Create a private scratch directory outside the checkout and save the final body constructed in Step 5 to `$BODY_FILE` using a quoted heredoc. Replace the placeholder with the body; choose a delimiter that does not occur on a line by itself in the body. The quoted delimiter preserves shell-looking text literally:
 
 ```bash
-gh issue create --title "<title prefix><user title>" --label "<label1>,<label2>" --body "$(cat <<'ISSUE_EOF'
+umask 077
+BODY_DIR=$(mktemp -d /tmp/zeroclaw-issue.XXXXXX) || exit 1
+BODY_FILE="$BODY_DIR/body.md"
+cat > "$BODY_FILE" <<'ISSUE_EOF' || exit 1
 <body content>
 ISSUE_EOF
-)"
+```
+
+Use the trusted system temporary directory on your platform if `/tmp` is unavailable; never substitute a checkout-controlled directory. Preview the saved file for confirmation and reread it immediately before submission. If its contents changed, obtain confirmation again. This avoids predictable checkout paths and other-user writes, not interference by a malicious process running as your user.
+
+Submit the confirmed file unchanged:
+
+```bash
+gh issue create --title "<title prefix><user title>" --label "<label1>,<label2>" --body-file "$BODY_FILE"
 ```
 
 When the selected template has no labels:
 
 ```bash
-gh issue create --title "<title prefix><user title>" --body "$(cat <<'ISSUE_EOF'
-<body content>
-ISSUE_EOF
-)"
+gh issue create --title "<title prefix><user title>" --body-file "$BODY_FILE"
 ```
 
-Return the resulting issue URL to the user.
+Return the resulting issue URL to the user. After successful submission, remove only `$BODY_FILE` and its empty `$BODY_DIR`; retain the file on failure so it can be inspected.
 
 ### Important Rules
 

@@ -1,8 +1,8 @@
 # FND-003: Team Organization, Project Governance, and Contribution Pipeline
 
-> Starting v0.7.0 · Type: Governance · Rev. 16
+> Starting v0.7.0 · Type: Governance · Rev. 18
 >
-> **Canonical reference** · Ratified by the team · Rev. 16
+> **Canonical reference** · Ratified by the team · Rev. 18
 > Original governance discussion: [#5577](https://github.com/zeroclaw-labs/zeroclaw/issues/5577)
 > Follow-up work-lane and label-governance policy: [#6808](https://github.com/zeroclaw-labs/zeroclaw/issues/6808)
 
@@ -34,6 +34,8 @@
 | 14 | 2026-07-25 | Retired the `CONTRIBUTORS.md` membership record and the `zeroclaw-core`/`zeroclaw-contributors` team names, none of which were ever created; §5.3 now names the `core-contributors` GitHub team, CODEOWNERS, and the Communication maintainer table as the real records ([#9388](https://github.com/zeroclaw-labs/zeroclaw/pull/9388)) |
 | 15 | 2026-08-10 | Narrowed the RFC trigger to four project-level categories and named the ordinary work that does not require an RFC; replaced the seven-day discussion period with 48h ordinary / 72h exceptional; defined the 72-hour vote against an immutable snapshot, the 30-day active electorate, two-ballot quorum, silence-as-approval after quorum, non-vetoing `REVISE`, and outcome precedence; made two-thirds the default threshold and reserved unanimity for expensive or irreversible decisions; retired the nonexistent parallel `rfc:*` label family; added the GitHub bridge record for Core meeting decisions ([#9499](https://github.com/zeroclaw-labs/zeroclaw/pull/9499)) |
 | 16 | 2026-08-22 | Calibrated consequence-based PR risk routing, retained `risk:manual` as an automation freeze, and required two independent Core Team approvals for `risk:high` or `domain:security` PRs ([#10192](https://github.com/zeroclaw-labs/zeroclaw/pull/10192)) |
+| 17 | 2026-08-23 | Defined deferred RFC vote handling for unchanged snapshots: no-quorum and missing-threshold or explicit-unanimity cases enter another recorded 72-hour cycle on the same vote, existing explicit ballots count toward quorum and outcome until replaced, and material revisions return the proposal to discussion rather than renewing the unchanged snapshot ([#10288](https://github.com/zeroclaw-labs/zeroclaw/pull/10288)) |
+| 18 | 2026-09-08 | Implemented the accepted second-review exception with one non-author Core approval, clean exact-head advisory evidence, green required CI, and no unresolved holds or findings; added a five-business-date waiting condition ([RFC #10366](https://github.com/zeroclaw-labs/zeroclaw/issues/10366), [#10677](https://github.com/zeroclaw-labs/zeroclaw/pull/10677)) |
 
 ---
 
@@ -444,7 +446,7 @@ Configure the following branch protection rules for `master`:
 | Rule | Setting | Reason |
 |---|---|---|
 | Require a pull request before merging | Enabled | No direct pushes to master, ever |
-| Require approvals | At least 1 GitHub approval; `risk:high` or `domain:security` requires 2 independent Core Team approvals before merge | CODEOWNERS routes review; the conditional two-approval rule is an explicit merge requirement |
+| Require approvals | At least 1 GitHub approval in branch protection; `risk:high` or `domain:security` defaults to 2 independent Core Team approvals before merge, subject to the explicit expedited exception below | CODEOWNERS routes review; the conditional two-approval rule and its narrow exception are explicit merge requirements |
 | Require status checks to pass | `cargo fmt`, `cargo clippy`, `cargo test` | CI must be green before merge |
 | Require branches to be up to date | Enabled | Prevents merging stale code |
 | Require conversation resolution | Enabled | All review comments must be resolved |
@@ -453,6 +455,8 @@ Configure the following branch protection rules for `master`:
 | Allow deletions | Disabled | Protect the branch |
 
 **Why admins cannot bypass:** One of the most common mistakes in small team projects is treating branch protection as "for other people." When an admin can bypass, they will, under time pressure, in an emergency, "just this once." Then it becomes the norm. The rule must apply to everyone for it to mean anything. If there is a genuine emergency, the right response is to follow the process faster, not to skip it.
+
+The [expedited second-review lane](../maintainers/pr-workflow.md#expedited-second-review-lane) is the only standing exception to the two-Core default. It implements the accepted evidence-based second-review exception and adds a waiting condition based on this document's five-business-day review responsibility. The lane is not automatic, automated review is not an approval, and broad governance, security-floor, release, migration, and irreversible architecture changes continue to default to two human approvals. The maintainer PR workflow owns the full eligibility and accountability rules.
 
 GitHub's native approval count is configured per protected branch or ruleset target, not conditionally by PR label. Until a separately approved technical enforcement design has a machine-readable authority for Core Team approval, maintainers must apply the `risk:high OR domain:security` requirement through the documented merge checklist and retain an auditable review record. `risk:manual` freezes future automatic risk replacement only; it cannot lower this requirement.
 
@@ -584,21 +588,31 @@ Ordinary author revisions and clarifications during discussion do not restart th
      APPROVE  accept the snapshot as written
      REVISE   request changes, withhold approval, do not veto
      REJECT   blocking objection, with a specific reason
-   A member's latest ballot before the deadline supersedes their earlier one.
+   A member's latest ballot before the recorded deadline for the current vote cycle supersedes their earlier one.
            |
 5. OUTCOME, applied in this precedence order:
-     a. Fewer than two explicit ballots        -> DEFERRED
-     b. Quorum met and any final ballot REJECT -> REJECTED
-     c. Quorum met, no REJECT, two-thirds
-        approving explicitly or by silence     -> ACCEPTED
-     d. Otherwise                              -> RETURNED TO DISCUSSION
+     a. Proposal body materially changed, or
+        author asks to revise                 -> RETURNED TO DISCUSSION
+     b. Fewer than two explicit ballots        -> DEFERRED
+     c. Quorum met and any final ballot REJECT -> REJECTED
+     d. Quorum met, no REJECT, and the
+        applicable threshold or required explicit
+        approvals remain missing              -> DEFERRED
+     e. Quorum met, no REJECT, applicable
+        threshold satisfied                    -> ACCEPTED
 ```
 
-Accepted RFCs carry `status:accepted`, and the closing record addresses every `REVISE` concern rather than discarding it. Rejected RFCs are closed with the blocking objection recorded and a link to any issue where the underlying problem continues; rejection ends the current proposal, not necessarily the problem. Deferred proposals stay open with the condition for another vote recorded, and an unchanged deferred proposal may return to a new 72-hour vote without repeating discussion.
+Accepted RFCs carry `status:accepted`, and the closing record addresses every `REVISE` concern rather than discarding it. Rejected RFCs are closed with the blocking objection recorded and a link to any issue where the underlying problem continues; rejection ends the current proposal, not necessarily the problem.
+
+Deferred proposals enter another recorded 72-hour cycle against the same immutable snapshot when the vote deadline arrives with fewer than two explicit ballots, or with no `REJECT` and the applicable threshold or explicit approvals still missing. A renewal is the same vote on the same snapshot, not a new vote on a new proposal. It does not recompute the assigned active electorate. The final electorate remains the active electorate assigned when the vote first opened, plus any current Core Team member who ballots in any cycle for that same snapshot. Existing explicit ballots count toward quorum and outcome in the renewed cycle, and carry forward until replaced by a later ballot, so voters do not need to recast unchanged ballots.
+
+The closing or status record for a deferred cycle must state the missing condition and link to a new cycle-opening record. The cycle-opening record names the carried snapshot, carried ballots, electorate so far, threshold, missing condition, `opened_at`, and `deadline = opened_at + 72 hours`. The recorded deadline is the ballot cutoff. At the next cycle deadline, the same snapshot can be accepted, rejected, or deferred again.
+
+A proposal returns to discussion when the body materially changes or the author asks to revise before a decision. Returning to discussion creates or awaits a new stable snapshot and uses the applicable discussion or vote handling for that changed proposal.
 
 Use the live `type:rfc` and `status:accepted` labels. There is no parallel `rfc:*` status label family.
 
-Rev. 15 applies to RFC votes opened after ratification. It does not automatically invalidate earlier accepted RFCs; historical-process audit and correction work remain tracked separately.
+Rev. 15 and later apply to RFC votes opened after ratification. They do not automatically invalidate earlier accepted RFCs; historical-process audit and correction work remain tracked separately.
 
 A vote may close early only when every member of the final active electorate has explicitly approved and no otherwise inactive Core contributor has asked for the full window. The closing record must say why it closed before the deadline. An exceptional unanimous vote may close early only on explicit approval from every assigned voter.
 
@@ -705,7 +719,7 @@ Use `#f1f5f9` (light gray) for all component labels to distinguish them visually
 |---|---|---|
 | `risk:low` | `#dcfce7` | Documentation, fixtures, generated references, and mechanical metadata with no production, compatibility, build, release, or governance effect |
 | `risk:medium` | `#fef9c3` | Ordinary behavioral production work, including most runtime, gateway, provider, channel, tool, config, application, and CI changes |
-| `risk:high` | `#fee2e2` | Concrete trust, credential, compatibility, governance, or release-authority boundary requiring deep review and two independent Core Team approvals |
+| `risk:high` | `#fee2e2` | Concrete trust, credential, compatibility, governance, or release-authority boundary requiring deep review and defaulting to two independent Core Team approvals; see the [expedited second-review lane](../maintainers/pr-workflow.md#expedited-second-review-lane) |
 
 ### `status:` Where is this in the process?
 
@@ -791,7 +805,7 @@ Configure these in the Project's built-in automation settings:
 
 **Auto-label by changed files:**
 
-The active path labeler applies scope labels to PRs based on changed files. Risk and size labels are currently maintainer-applied; the maintainer label guide is the live source for label names, automation status, and risk semantics.
+The active path labeler applies scope labels to PRs based on changed files, and the active size labeler recalculates canonical `size:*` labels from PR file metadata. Risk labels remain maintainer-applied; the maintainer label guide is the live source for label names, automation status, and risk semantics.
 
 **Auto-request CODEOWNERS review (built into CODEOWNERS: no Action needed):**
 
@@ -801,9 +815,9 @@ GitHub enforces CODEOWNERS automatically when the file exists and branch protect
 
 No GitHub Actions stale workflow is currently configured in the repository. Maintainers run stale passes to prevent inactive issues from accumulating while preserving a defined response window for the affected community. The [issue stale policy](../maintainers/labels.md#issue-stale-policy) is the sole operational source for timing, qualifying activity, exclusions, and re-engagement; the issue-triage protocol carries only the execution mechanics.
 
-**PR size labeling (future/optional):**
+**PR size labeling (active):**
 
-If size automation is added later, it should follow the maintainer label guide's live names (`size:XS` through `size:XL`) and recalculate on pushed updates so the label describes the diff under review. Until then, size labels are maintainer-applied.
+The size labeler follows the maintainer label guide's live names (`size:XS` through `size:XL`) and recalculates on PR open, reopen, and pushed updates so the label describes the diff under review. It reads GitHub PR metadata and executes only the trusted classifier from the workflow revision; it does not check out or execute pull-request code.
 
 **Milestone check on PR merge (`.github/workflows/milestone-check.yml`):**
 
@@ -862,7 +876,7 @@ Establish the full workflow and populate the backlog from the accepted RFCs.
 
 As the plugin system becomes usable, external contributors will start arriving. The contribution infrastructure must be ready.
 
-- [ ] Implement the PR size labeling workflow
+- [x] Implement the PR size labeling workflow
 - [ ] Create the first batch of `good first issue` items (minimum 5) for the plugin SDK work
 - [ ] Add the `Good First Issue Index` as a pinned issue with links to current good first issues
 - [ ] Establish the idea promotion threshold and promote the first Discussion idea to an issue

@@ -14,7 +14,12 @@ const DEL_BG: Color = Color::Rgb(55, 0, 0);
 const SEP_FG: Color = Color::Rgb(70, 70, 70);
 
 const DIFF_CONTEXT: usize = 3;
-const MAX_WRITE_LINES: usize = 60;
+#[derive(Debug)]
+pub struct RenderedLines {
+    pub lines: Vec<Line<'static>>,
+    pub omitted: usize,
+    pub total: usize,
+}
 
 /// Decimal digit count of the largest line number in a diff, used to size
 /// the gutter so the `|` separator aligns on every row.
@@ -246,17 +251,20 @@ fn plain_line_spans_no_bg(text: &str, fg: Color) -> Vec<Vec<Span<'static>>> {
 
 // ── Public diff API ──────────────────────────────────────────────
 
-pub fn diff_lines(
+pub fn diff_lines_limited(
     old: &str,
     new: &str,
     lang: Option<&str>,
-    start_line: usize,
-) -> Vec<Line<'static>> {
-    let start_line = start_line.max(1);
+    start_line: Option<usize>,
+    limit: Option<usize>,
+) -> RenderedLines {
+    let start_line = start_line.map(|line| line.max(1));
     let diff = TextDiff::from_lines(old, new);
     let mut out: Vec<Line<'static>> = Vec::new();
+    let show = limit.unwrap_or(usize::MAX);
+    let mut total = 0usize;
 
-    let max_lineno = start_line.saturating_add(
+    let max_lineno = start_line.unwrap_or(1).saturating_add(
         old.lines()
             .count()
             .max(new.lines().count())
@@ -264,9 +272,15 @@ pub fn diff_lines(
     );
     let width = gutter_width(max_lineno);
 
-    // Pre-highlight both sides in full so multi-line token state is correct.
+    // Full view preserves multi-line syntax state. Preview bounds highlighting
+    // and row allocation; diff computation still counts every omitted row.
     let (del_fg, add_fg) = (del_fg(), add_fg());
-    let (del_hl, add_hl) = match lang.and_then(ext_to_language) {
+    let full_language = if limit.is_none() {
+        lang.and_then(ext_to_language)
+    } else {
+        None
+    };
+    let (del_hl, add_hl) = match full_language {
         Some(language) => (
             Some(highlight_all(old, language, DEL_BG, del_fg)),
             Some(highlight_all(new, language, ADD_BG, add_fg)),
@@ -276,13 +290,20 @@ pub fn diff_lines(
 
     for (gi, group) in diff.grouped_ops(DIFF_CONTEXT).iter().enumerate() {
         if gi > 0 {
-            out.push(Line::from(Span::styled(
-                "  \u{22ef}".to_string(),
-                Style::default().fg(SEP_FG),
-            )));
+            total += 1;
+            if out.len() < show {
+                out.push(Line::from(Span::styled(
+                    "  \u{22ef}".to_string(),
+                    Style::default().fg(SEP_FG),
+                )));
+            }
         }
         for op in group {
             for change in diff.iter_changes(op) {
+                total += 1;
+                if out.len() >= show {
+                    continue;
+                }
                 let text = change.value().trim_end_matches('\n').to_string();
                 let line = match change.tag() {
                     ChangeTag::Delete => {
@@ -293,9 +314,9 @@ pub fn diff_lines(
                             .unwrap_or_else(|| {
                                 vec![Span::styled(text, Style::default().bg(DEL_BG).fg(del_fg))]
                             });
-                        let lineno = change
-                            .old_index()
-                            .map(|n| gutter(n + start_line, width))
+                        let lineno = start_line
+                            .zip(change.old_index())
+                            .map(|(start, n)| gutter(n + start, width))
                             .unwrap_or_else(|| gutter_blank(width));
                         let mut spans = vec![Span::styled(
                             lineno + "- ",
@@ -315,9 +336,9 @@ pub fn diff_lines(
                             .unwrap_or_else(|| {
                                 vec![Span::styled(text, Style::default().bg(ADD_BG).fg(add_fg))]
                             });
-                        let lineno = change
-                            .new_index()
-                            .map(|n| gutter(n + start_line, width))
+                        let lineno = start_line
+                            .zip(change.new_index())
+                            .map(|(start, n)| gutter(n + start, width))
                             .unwrap_or_else(|| gutter_blank(width));
                         let mut spans = vec![Span::styled(
                             lineno + "+ ",
@@ -330,9 +351,9 @@ pub fn diff_lines(
                         Line::from(spans).style(Style::default().bg(ADD_BG))
                     }
                     ChangeTag::Equal => {
-                        let lineno = change
-                            .old_index()
-                            .map(|n| gutter(n + start_line, width))
+                        let lineno = start_line
+                            .zip(change.old_index())
+                            .map(|(start, n)| gutter(n + start, width))
                             .unwrap_or_else(|| gutter_blank(width));
                         Line::from(Span::styled(
                             format!("{lineno}  {text}"),
@@ -345,28 +366,40 @@ pub fn diff_lines(
         }
     }
 
-    if out.is_empty() {
-        out.push(Line::from(Span::styled(
-            "  (no changes)".to_string(),
-            Style::default().fg(SEP_FG),
-        )));
+    if total == 0 {
+        total = 1;
+        if show > 0 {
+            out.push(Line::from(Span::styled(
+                "  (no changes)".to_string(),
+                Style::default().fg(SEP_FG),
+            )));
+        }
     }
 
-    out
+    RenderedLines {
+        omitted: total.saturating_sub(out.len()),
+        lines: out,
+        total,
+    }
 }
 
-pub fn write_lines(content: &str, lang: Option<&str>) -> Vec<Line<'static>> {
-    let all: Vec<&str> = content.lines().collect();
-    let show = all.len().min(MAX_WRITE_LINES);
+pub fn write_lines_limited(
+    content: &str,
+    lang: Option<&str>,
+    limit: Option<usize>,
+) -> RenderedLines {
+    let total = content.lines().count();
+    let show = limit.map_or(total, |limit| total.min(limit));
     let width = gutter_width(show);
+    let preview = content.lines().take(show).collect::<Vec<_>>().join("\n");
 
     let add_fg = add_fg();
     let hl = lang
         .and_then(ext_to_language)
-        .map(|language| highlight_all(content, language, ADD_BG, add_fg));
-    let mut out: Vec<Line<'static>> = Vec::with_capacity(show + 1);
+        .map(|language| highlight_all(&preview, language, ADD_BG, add_fg));
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(show);
 
-    for (i, item) in all.iter().enumerate().take(show) {
+    for (i, item) in content.lines().take(show).enumerate() {
         let content_spans = hl
             .as_ref()
             .and_then(|v| v.get(i))
@@ -388,19 +421,29 @@ pub fn write_lines(content: &str, lang: Option<&str>) -> Vec<Line<'static>> {
         out.push(Line::from(spans).style(Style::default().bg(ADD_BG)));
     }
 
-    if all.len() > MAX_WRITE_LINES {
-        out.push(Line::from(Span::styled(
-            format!("  \u{22ef} {} more lines", all.len() - MAX_WRITE_LINES),
-            Style::default().fg(SEP_FG),
-        )));
+    RenderedLines {
+        lines: out,
+        omitted: total.saturating_sub(show),
+        total,
     }
-
-    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn diff_lines(
+        old: &str,
+        new: &str,
+        lang: Option<&str>,
+        start_line: usize,
+    ) -> Vec<Line<'static>> {
+        diff_lines_limited(old, new, lang, Some(start_line), None).lines
+    }
+
+    fn write_lines(content: &str, lang: Option<&str>) -> Vec<Line<'static>> {
+        write_lines_limited(content, lang, None).lines
+    }
 
     #[test]
     fn diff_produces_add_and_delete_lines() {
@@ -432,18 +475,27 @@ mod tests {
     }
 
     #[test]
-    fn write_lines_caps_at_max() {
+    fn write_lines_limit_reports_omitted_rows() {
         let content: String = (0..100).map(|i| format!("line {i}\n")).collect();
-        let lines = write_lines(&content, None);
-        let last: String = lines
-            .last()
-            .unwrap()
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
-        assert!(last.contains("more lines"), "expected trailer, got: {last}");
-        assert_eq!(lines.len(), MAX_WRITE_LINES + 1);
+        let rendered = write_lines_limited(&content, None, Some(6));
+        assert_eq!(rendered.lines.len(), 6);
+        assert_eq!(rendered.omitted, 94);
+        assert_eq!(write_lines(&content, None).len(), 100);
+    }
+
+    #[test]
+    fn diff_limit_counts_omitted_rows_without_full_highlighting() {
+        let old: String = (0..100).map(|i| format!("fn old_{i}() {{}}\n")).collect();
+        let new: String = (0..100).map(|i| format!("fn new_{i}() {{}}\n")).collect();
+        let rendered = diff_lines_limited(&old, &new, Some("rs"), None, Some(6));
+
+        assert_eq!(rendered.lines.len(), 6);
+        assert!(rendered.total > rendered.lines.len());
+        assert_eq!(rendered.omitted, rendered.total - rendered.lines.len());
+        assert!(
+            rendered.lines.iter().all(|line| line.spans.len() <= 2),
+            "preview rows should use bounded plain styling"
+        );
     }
 
     #[test]

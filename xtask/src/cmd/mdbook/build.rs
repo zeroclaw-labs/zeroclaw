@@ -42,7 +42,7 @@ pub fn build_locales(root: &std::path::Path, tag: Option<&str>) -> anyhow::Resul
     );
     prepare_generated_book_inputs(root, &entries)?;
     let mdbook = mdbook_program()?;
-    let preprocessor_env = peer_groups_preprocessor_env();
+    let preprocessor_env = mdbook_xtask_preprocessor_env();
     let tag_dir = tag.unwrap_or(DEFAULT_TAG);
     let primary_locale = entries.first().map(|e| e.code.clone());
     for entry in &entries {
@@ -54,12 +54,53 @@ pub fn build_locales(root: &std::path::Path, tag: Option<&str>) -> anyhow::Resul
         if Some(&entry.code) != primary_locale.as_ref() {
             cmd.env("MDBOOK_OUTPUT__HTML__SEARCH__ENABLE", "false");
         }
-        if let Some((key, value)) = &preprocessor_env {
-            cmd.env(key, value);
+        if let Some(env) = &preprocessor_env {
+            cmd.envs(env.iter().map(|(key, value)| (key, value)));
         }
         run_cmd(&mut cmd)?;
     }
+    if let Some(primary) = primary_locale.as_deref() {
+        build_llms(root, tag, primary)?;
+    }
     Ok(())
+}
+
+/// Emit `llms.txt` and `llms-full.txt` beside the primary locale's HTML by
+/// running mdBook once more with only the in-tree `llms` backend. The
+/// preprocessors that support that renderer (gettext, peer-groups,
+/// placeholders) run again so the text matches the rendered pages; mermaid
+/// serves the HTML renderer only, so diagram source stays fenced. No HTML
+/// backend runs, so the output already in `dest` is untouched. `serve` does
+/// not call this, and an HTML watch rebuild of `dest` discards the pair.
+pub fn build_llms(root: &Path, tag: Option<&str>, locale: &str) -> anyhow::Result<()> {
+    use crate::cmd::mdbook::llms;
+    let tag_dir = tag.unwrap_or(DEFAULT_TAG);
+    let dest = format!("book/{tag_dir}/{locale}");
+    println!(
+        "==> Writing {} and {} for {locale}",
+        llms::INDEX_FILE,
+        llms::FULL_FILE
+    );
+    let exe = std::env::current_exe().context("resolve xtask binary for the llms backend")?;
+    let mut cmd = Command::new(mdbook_program()?);
+    cmd.args(["build", "-d", &dest])
+        .env("MDBOOK_BOOK__LANGUAGE", locale)
+        .env("MDBOOK_OUTPUT", llms_output_table(&exe.to_string_lossy()))
+        .env(llms::BASE_URL_ENV, llms::base_url_for(tag_dir, locale))
+        .current_dir(book_dir(root));
+    if let Some(env) = mdbook_xtask_preprocessor_env() {
+        cmd.envs(env.iter().map(|(key, value)| (key, value)));
+    }
+    run_cmd(&mut cmd)
+}
+
+/// JSON for `MDBOOK_OUTPUT`: replaces the whole `output` table from
+/// `book.toml` so this pass runs the `llms` backend alone. With a single
+/// backend mdBook writes straight into `-d`, not `<dest>/llms/`.
+fn llms_output_table(helper_path: &str) -> String {
+    let quoted =
+        shlex::try_quote(helper_path).map_or_else(|_| helper_path.to_string(), |q| q.into_owned());
+    serde_json::json!({ "llms": { "command": format!("{quoted} llms") } }).to_string()
 }
 
 /// Generate every gitignored input that mdBook sources or hashes while
@@ -316,7 +357,19 @@ pub fn extract_shared_chrome(version_dir: &Path, shared_dir: &Path) -> anyhow::R
 
 #[cfg(test)]
 mod tests {
-    use super::{strip_chrome_hash, strip_source_anchors};
+    use super::{llms_output_table, strip_chrome_hash, strip_source_anchors};
+
+    #[test]
+    fn llms_output_table_names_only_the_llms_backend() {
+        let table: serde_json::Value =
+            serde_json::from_str(&llms_output_table("/t/x task")).unwrap();
+        assert_eq!(table["llms"]["command"], "'/t/x task' llms");
+        assert_eq!(
+            table.as_object().unwrap().len(),
+            1,
+            "html must not run in this pass"
+        );
+    }
 
     #[test]
     fn strips_single_extension_hash() {

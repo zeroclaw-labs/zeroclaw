@@ -189,6 +189,9 @@ pub fn host_matches_allowlist(host: &str, allowed: &[String]) -> bool {
 /// - a bare `*`. There is no "everything" pattern; deny-by-default has no
 ///   escape hatch at the grammar level.
 /// - empty or whitespace-bearing entries.
+/// - a host name that is not letters, digits and hyphens in dot-separated
+///   labels (`a'b.example.com`, `a.com,b.com`): no request host can take that
+///   shape, so the entry could only ever mislead.
 /// - anything carrying a scheme, path, query, fragment, or userinfo (`/`, `@`,
 ///   `?`, `#`, `\`), so an entry is never a URL that silently loses its path.
 /// - a `*` anywhere other than the leading `*.` (no `a*.b`, no `*.*.c`).
@@ -273,6 +276,18 @@ pub fn normalize_egress_pattern(raw: &str) -> Result<String, String> {
     if canonical != host && format!("[{canonical}]") != host {
         return Err(format!(
             "entry {input:?} is not in canonical form (write {canonical:?})"
+        ));
+    }
+
+    // `normalize_domain` goes through a URL parser, which accepts host bytes
+    // no request host can carry (quotes, commas, `;`, `$`, braces). Such an
+    // entry could never match a request, yet it is written into config and
+    // echoed into printed shell commands, and a comma splits it into several
+    // grants when it is stored as a comma-joined list. Hold grant entries to
+    // the letters-digits-hyphen shape the request side enforces.
+    if canonical.parse::<std::net::IpAddr>().is_err() && !is_ldh_hostname(&canonical) {
+        return Err(format!(
+            "entry {input:?} is not a valid host name: labels may contain only letters, digits and '-'"
         ));
     }
 
@@ -857,6 +872,13 @@ fn nat64_metadata_block_error(
 /// destination is reachable, so the answer is rejected when any one of them is
 /// denied rather than accepted on the first that happens to be acceptable.
 ///
+/// Metadata is decoded only for *evidenced* translators: the well-known
+/// `64:ff9b::/96` prefix (which the address-class predicates decode
+/// unconditionally) and any prefix the operator declared in `nat64_prefixes`.
+/// An undeclared prefix is not synthesized, because nothing in the address
+/// proves the deployment routes it and doing so would deny legitimate global
+/// IPv6 whose bytes coincidentally embed a metadata address under some layout.
+///
 /// # DNS pinning
 ///
 /// This function validates only the supplied DNS answer. After it succeeds,
@@ -898,6 +920,17 @@ pub fn validate_resolved_ips_are_public(
                     );
                 }
             }
+
+            // Metadata decoding is tied to evidenced translators only: the
+            // well-known 64:ff9b::/96 prefix (already handled by the
+            // is_cloud_metadata_ip check above) and the operator-declared
+            // prefixes (the loop above). An operator whose network routes a
+            // network-specific NAT64 prefix must declare it in
+            // security.nat64_prefixes; that config key is the mechanism.
+            // Synthesizing all six RFC 6052 layouts for undeclared prefixes is
+            // deliberately not done: nothing in the answer proves the prefix is
+            // routed here, and doing so denies legitimate global IPv6 whose
+            // bytes coincidentally embed a metadata address under some layout.
         }
 
         let non_global = match ip {
@@ -921,7 +954,9 @@ pub fn validate_resolved_ips_are_public(
 /// inside one of `nat64_prefixes` is rejected when the IPv4 address it embeds
 /// is a metadata address. Overlapping prefixes decode one answer to several
 /// destinations; the answer is rejected when any of them is a metadata
-/// address.
+/// address. Metadata is decoded only for evidenced translators — the well-known
+/// `64:ff9b::/96` prefix and the operator-declared `nat64_prefixes`; an
+/// undeclared prefix is not synthesized (see [`validate_resolved_ips_are_public`]).
 ///
 /// # DNS pinning
 ///
@@ -957,6 +992,15 @@ pub fn validate_resolved_ips_exclude_metadata(
                     return Err(nat64_metadata_block_error(host, *v6, prefix, embedded));
                 }
             }
+
+            // As in validate_resolved_ips_are_public, metadata is decoded only
+            // for evidenced translators: the well-known 64:ff9b::/96 prefix
+            // (handled by the is_cloud_metadata_ip check above) and the
+            // operator-declared prefixes (the loop above). An operator whose
+            // network routes a network-specific NAT64 prefix must declare it in
+            // security.nat64_prefixes. Undeclared RFC 6052 layouts are not
+            // synthesized, since that would deny legitimate global IPv6 whose
+            // bytes coincidentally embed a metadata address under some layout.
         }
     }
 
@@ -1093,7 +1137,16 @@ fn normalize_request_host(host: &str) -> Option<String> {
     }
 
     let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
-    let valid = !host.is_empty()
+    is_ldh_hostname(&host).then_some(host)
+}
+
+/// Whether `host` is a letters-digits-hyphen DNS name: dot-separated labels of
+/// 1-63 ASCII alphanumerics or hyphens, no label starting or ending with a
+/// hyphen, 253 bytes at most. This is the only shape a request host can take,
+/// so it is also the only shape a grant entry may take (see
+/// [`normalize_egress_pattern`]).
+fn is_ldh_hostname(host: &str) -> bool {
+    !host.is_empty()
         && host.len() <= 253
         && host.split('.').all(|label| {
             !label.is_empty()
@@ -1103,8 +1156,7 @@ fn normalize_request_host(host: &str) -> Option<String> {
                 && label
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        });
-    valid.then_some(host)
+        })
 }
 
 /// The trust classes one answer address can land in: `(reaches_global,
@@ -1385,6 +1437,36 @@ mod tests {
                 "{entry} must be rejected"
             );
         }
+    }
+
+    /// A URL parser accepts these host bytes and hands them back unchanged, so
+    /// only an explicit label rule keeps them out. A publisher-declared entry is
+    /// seeded into config and echoed into shell commands; a quote would break
+    /// out of their quoting and a comma would split into two grants.
+    #[test]
+    fn egress_pattern_rejects_host_names_outside_letters_digits_hyphens() {
+        for entry in [
+            "a'b.example.com",
+            "a\"b.example.com",
+            "api.example.com,evil.example.net",
+            "a;b.example.com",
+            "$(x).example.com",
+            "a{b}.example.com",
+            "*.a'b.example.com",
+            "-lead.example.com",
+            "under_score.example.com",
+        ] {
+            let err = normalize_egress_pattern(entry).unwrap_err();
+            assert!(
+                err.contains("letters, digits and '-'"),
+                "{entry} must be rejected by the label rule, got: {err}"
+            );
+        }
+        assert_eq!(
+            normalize_egress_pattern("xn--bcher-kva.example").as_deref(),
+            Ok("xn--bcher-kva.example"),
+            "punycode labels are letters, digits and hyphens"
+        );
     }
 
     #[test]
@@ -2432,11 +2514,15 @@ mod tests {
     }
 
     #[test]
-    fn network_specific_nat64_addresses_pass_when_no_prefix_is_configured() {
+    fn network_specific_private_nat64_addresses_pass_when_no_prefix_is_configured() {
         // Honest boundary documentation: without the operator declaring the
-        // prefix, nothing in these addresses marks them as NAT64, and both
-        // validators accept them. This is the hole the config key closes, and
-        // the reason the key exists at all.
+        // prefix, nothing in this address marks it as NAT64 to a private host,
+        // so both validators accept it. This is the hole the config key closes
+        // for general private routing, and the reason the key exists at all.
+        // Metadata is decoded only for evidenced translators (the well-known
+        // 64:ff9b::/96 and declared prefixes), never synthesized for an
+        // undeclared one; see
+        // `global_ipv6_that_resembles_metadata_under_a_synthetic_layout_is_allowed`.
         let private_behind_global_prefix = [ip("2001:67c:2b0:db32:0:1:a00:1")];
         assert!(
             validate_resolved_ips_are_public("attacker.test", &private_behind_global_prefix, &[])
@@ -2450,16 +2536,41 @@ mod tests {
             )
             .is_ok()
         );
+    }
 
-        let metadata_behind_doc_prefix = [ip("2001:db8:122:344::a9fe:a9fe")];
-        assert!(
-            validate_resolved_ips_exclude_metadata(
-                "metadata.test",
-                &metadata_behind_doc_prefix,
-                &[]
-            )
-            .is_ok()
-        );
+    #[test]
+    fn global_ipv6_that_resembles_metadata_under_a_synthetic_layout_is_allowed() {
+        // Metadata is decoded only for *evidenced* translators: the well-known
+        // 64:ff9b::/96 (always) and any prefix the operator declared in
+        // `security.nat64_prefixes` (when configured). It is never synthesized
+        // for a prefix the deployment gave no evidence it routes. A genuinely
+        // global IPv6 whose bytes happen to read as 169.254.169.254 under some
+        // synthetic RFC 6052 length is therefore accepted, not denied as
+        // metadata. This is the negative control the earlier over-block failed.
+        //
+        // 2606:4700:a9fe:a9fe:: is Cloudflare-space global unicast; under a
+        // synthetic /32 layout its bytes 4-7 read as 169.254.169.254. The second
+        // address carries the same bytes at the /96 offset. With no declared
+        // prefix both are ordinary global answers and pass both validators.
+        for address in ["2606:4700:a9fe:a9fe::", "2606:4700:4700::a9fe:a9fe"] {
+            let ips = [ip(address)];
+            assert!(
+                !is_cloud_metadata_ip(ips[0]),
+                "{address} is not itself a metadata address"
+            );
+            assert!(
+                !is_non_global_v6(address.parse::<Ipv6Addr>().unwrap()),
+                "{address} is a global unicast address"
+            );
+            assert!(
+                validate_resolved_ips_are_public("cdn.test", &ips, &[]).is_ok(),
+                "{address} must pass are_public with no declared prefix"
+            );
+            assert!(
+                validate_resolved_ips_exclude_metadata("cdn.test", &ips, &[]).is_ok(),
+                "{address} must pass exclude_metadata with no declared prefix"
+            );
+        }
     }
 
     #[test]

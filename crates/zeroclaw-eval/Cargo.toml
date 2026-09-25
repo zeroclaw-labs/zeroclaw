@@ -4,7 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Agent evaluation harness for ZeroClaw — Phase 0: deterministic replay of LLM trace fixtures through the real agent loop."
-publish = false
+repository.workspace = true
+homepage.workspace = true
+publish = true
+# The suite gate replays the workspace fixture corpus at evals/regression, which
+# lives outside this package, so keep it repository-only rather than shipping a
+# test that cannot run for a consumer.
+exclude = ["tests/regression_suite.rs"]
 
 [dependencies]
 zeroclaw-api.workspace = true

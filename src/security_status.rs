@@ -3,7 +3,9 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use zeroclaw_config::config::CredentialSurfaceClass;
 use zeroclaw_config::policy::SecurityPolicy;
-use zeroclaw_config::schema::{RiskProfileConfig, SandboxBackend, SandboxConfig};
+use zeroclaw_config::schema::{
+    DEFAULT_SANDBOX_IMAGE, RiskProfileConfig, SandboxBackend, SandboxConfig,
+};
 
 use crate::config::Config;
 
@@ -79,7 +81,7 @@ pub fn build_report(config: &Config, agent_alias: &str) -> Result<SecurityStatus
     };
     let sandbox = zeroclaw_runtime::security::sandbox_posture(
         &sandbox_config,
-        config.runtime.kind.as_wire(),
+        config.runtime.kind,
         Some(&resolved.policy.workspace_dir),
         &sandbox_extra_roots,
     );
@@ -96,11 +98,20 @@ pub fn build_report(config: &Config, agent_alias: &str) -> Result<SecurityStatus
             "agent is disabled",
         ));
     }
-    if sandbox_config.enabled == Some(false) {
-        warnings.push(crate::t(
-            "cli-security-status-warning-sandbox-disabled",
-            "sandboxing is disabled for this agent risk profile",
-        ));
+    if sandbox_config.enabled == Some(false)
+        || matches!(sandbox_config.backend, SandboxBackend::None)
+    {
+        if sandbox.active_backend == "docker-runtime" {
+            warnings.push(crate::t(
+                "cli-security-status-warning-optional-sandbox-disabled-docker-runtime",
+                "additional OS sandboxing is disabled; Docker runtime containment remains active",
+            ));
+        } else {
+            warnings.push(crate::t(
+                "cli-security-status-warning-sandbox-disabled",
+                "sandboxing is disabled for this agent risk profile",
+            ));
+        }
     }
     if sandbox.active_backend == "none" {
         warnings.push(crate::t(
@@ -396,6 +407,13 @@ fn sandbox_config_from_policy(policy: &SecurityPolicy) -> SandboxConfig {
             .map(parse_sandbox_backend)
             .unwrap_or_default(),
         firejail_args: policy.firejail_args.clone(),
+        image: policy
+            .sandbox_image
+            .as_deref()
+            .map(str::trim)
+            .filter(|image| !image.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| DEFAULT_SANDBOX_IMAGE.to_string()),
     }
 }
 
@@ -612,6 +630,165 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("public bind without TLS"))
+        );
+    }
+
+    #[test]
+    fn docker_runtime_with_explicit_docker_backend_reports_runtime_containment() {
+        let profile = RiskProfileConfig {
+            sandbox_backend: Some("docker".to_string()),
+            ..RiskProfileConfig::default()
+        };
+        let mut config = config_with_agent("ops", "ops-risk", profile);
+        config.runtime.kind = zeroclaw_config::schema::RuntimeKind::Docker;
+
+        let report = build_report(&config, "ops").expect("agent report");
+
+        assert_eq!(report.sandbox.requested_backend, "docker");
+        assert_eq!(report.sandbox.active_backend, "docker-runtime");
+        assert!(
+            !report.sandbox.fallback,
+            "runtime-owned containment must not be reported as a lost fallback"
+        );
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("application-layer")),
+            "runtime-owned containment must not be reported as application-layer only: {:?}",
+            report.warnings
+        );
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("fell back")),
+            "unexpected fallback warning: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn docker_runtime_with_auto_backend_never_reports_application_layer_only() {
+        let mut config = config_with_agent("ops", "ops-risk", RiskProfileConfig::default());
+        config.runtime.kind = zeroclaw_config::schema::RuntimeKind::Docker;
+
+        let report = build_report(&config, "ops").expect("agent report");
+
+        // Auto-detection may pick an OS-native backend on some hosts, but on a
+        // Docker runtime the posture must never degrade to "none" (containment
+        // is owned by the runtime container) nor nest a second Docker layer.
+        assert_ne!(report.sandbox.active_backend, "none");
+        assert_ne!(report.sandbox.active_backend, "docker");
+        assert!(!report.sandbox.fallback);
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("application-layer")),
+            "runtime-owned containment must not be reported as application-layer only: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn docker_runtime_with_disabled_optional_sandbox_reports_both_facts() {
+        let profile = RiskProfileConfig {
+            sandbox_enabled: Some(false),
+            ..RiskProfileConfig::default()
+        };
+        let mut config = config_with_agent("ops", "ops-risk", profile);
+        config.runtime.kind = zeroclaw_config::schema::RuntimeKind::Docker;
+
+        let report = build_report(&config, "ops").expect("agent report");
+
+        assert_eq!(report.sandbox.requested_enabled, Some(false));
+        assert_eq!(report.sandbox.active_backend, "docker-runtime");
+        assert!(!report.sandbox.fallback);
+        assert!(
+            report.warnings.iter().any(|warning| {
+                warning.contains("sandboxing is disabled")
+                    && warning.contains("Docker runtime containment remains active")
+            }),
+            "disabled optional layer must remain visible: {:?}",
+            report.warnings
+        );
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("application-layer")),
+            "runtime-owned containment must not be erased: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn docker_runtime_with_no_optional_sandbox_reports_runtime_containment() {
+        let profile = RiskProfileConfig {
+            sandbox_backend: Some("none".to_string()),
+            ..RiskProfileConfig::default()
+        };
+        let mut config = config_with_agent("ops", "ops-risk", profile);
+        config.runtime.kind = zeroclaw_config::schema::RuntimeKind::Docker;
+
+        let report = build_report(&config, "ops").expect("agent report");
+
+        assert_eq!(report.sandbox.requested_backend, "none");
+        assert_eq!(report.sandbox.active_backend, "docker-runtime");
+        assert!(!report.sandbox.fallback);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("sandboxing is disabled")),
+            "absent optional layer must remain visible: {:?}",
+            report.warnings
+        );
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("application-layer")),
+            "runtime-owned containment must not be erased: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn docker_runtime_with_unavailable_explicit_backend_reports_containment_and_fallback() {
+        #[cfg(target_os = "macos")]
+        let unavailable_backend = "landlock";
+        #[cfg(not(target_os = "macos"))]
+        let unavailable_backend = "sandbox-exec";
+
+        let profile = RiskProfileConfig {
+            sandbox_backend: Some(unavailable_backend.to_string()),
+            ..RiskProfileConfig::default()
+        };
+        let mut config = config_with_agent("ops", "ops-risk", profile);
+        config.runtime.kind = zeroclaw_config::schema::RuntimeKind::Docker;
+
+        let report = build_report(&config, "ops").expect("agent report");
+
+        assert_eq!(report.sandbox.requested_backend, unavailable_backend);
+        assert_eq!(report.sandbox.active_backend, "docker-runtime");
+        assert!(report.sandbox.fallback);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("fell back")),
+            "unavailable optional backend must remain visible: {:?}",
+            report.warnings
+        );
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("application-layer")),
+            "runtime-owned containment must not be erased: {:?}",
+            report.warnings
         );
     }
 

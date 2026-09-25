@@ -859,12 +859,6 @@ impl Observer for OtelObserver {
                 self.errors
                     .add(1, &[KeyValue::new("component", component.clone())]);
             }
-            ObserverEvent::DeploymentStarted { .. }
-            | ObserverEvent::DeploymentCompleted { .. }
-            | ObserverEvent::DeploymentFailed { .. }
-            | ObserverEvent::RecoveryCompleted { .. } => {
-                // DORA deployment events: OTel pass-through not yet implemented.
-            }
             // `ObserverEvent` is `#[non_exhaustive]` — silently ignore any
             // future variant added by upstream `zeroclaw-api`.
             _ => {}
@@ -884,9 +878,6 @@ impl Observer for OtelObserver {
             }
             ObserverMetric::QueueDepth(d) => {
                 self.queue_depth.record(*d, &[]);
-            }
-            ObserverMetric::DeploymentLeadTime(_) | ObserverMetric::RecoveryTime(_) => {
-                // DORA metrics: OTel pass-through not yet implemented.
             }
         }
     }
@@ -922,6 +913,7 @@ impl Observer for OtelObserver {
                 "OTel metric flush failed"
             );
         }
+        zeroclaw_log::flush_log_exporter();
     }
 
     fn name(&self) -> &str {

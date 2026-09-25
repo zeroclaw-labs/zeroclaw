@@ -14,18 +14,27 @@ export interface TabIndicator {
 
 export type WorkspaceLayout = 'tabs' | 'split';
 
+/** One tab as the bar renders it: identity, agent, and display label. */
+export interface ChatTabView {
+  /** Stable pane identity. An agent open twice yields two keys, one alias. */
+  key: string;
+  alias: string;
+  /** Alias, numbered when the same agent is open more than once. */
+  label: string;
+}
+
 export interface ChatTabBarProps {
-  /** Open chat aliases, in tab order. */
-  openChats: string[];
-  /** Currently active (visible, in `tabs` layout) alias. */
-  activeAlias: string;
-  /** Per-alias streaming / unread indicators. */
+  /** Open panes, in tab order. */
+  tabs: ChatTabView[];
+  /** Currently active (visible, in `tabs` layout) pane key. */
+  activeKey: string;
+  /** Per-pane streaming / unread indicators, keyed by tab key. */
   indicators: Record<string, TabIndicator>;
   layout: WorkspaceLayout;
   /** When true the layout toggle is disabled and forced to `tabs` (mobile). */
   splitDisabled: boolean;
-  onSelect: (alias: string) => void;
-  onClose: (alias: string) => void;
+  onSelect: (key: string) => void;
+  onClose: (key: string) => void;
   onOpen: (alias: string) => void;
   onToggleLayout: () => void;
 }
@@ -33,14 +42,18 @@ export interface ChatTabBarProps {
 /**
  * Tab bar for the multi-agent ChatWorkspace.
  *
- * One tab per open chat (agent name + live status dot + close affordance), a
- * `+` agent picker that lists agents not already open, and a layout toggle that
- * flips between stacked tabs and a side-by-side split. Fully keyboard
- * navigable: `role="tablist"` with arrow-key movement between tabs.
+ * One tab per open pane (agent name + live status dot + close affordance), a
+ * `+` agent picker, and a layout toggle that flips between stacked tabs and a
+ * side-by-side split. Fully keyboard navigable: `role="tablist"` with arrow-key
+ * movement between tabs.
+ *
+ * Tabs are identified by pane key rather than alias, so the same agent can be
+ * open several times over different conversations; the picker therefore offers
+ * every configured agent, including ones already open.
  */
 export function ChatTabBar({
-  openChats,
-  activeAlias,
+  tabs,
+  activeKey,
   indicators,
   layout,
   splitDisabled,
@@ -82,29 +95,31 @@ export function ChatTabBar({
       .finally(() => setPickerLoading(false));
   }
 
+  function focusTab(tab: ChatTabView | undefined) {
+    if (!tab) return;
+    onSelect(tab.key);
+    tabRefs.current[tab.key]?.focus();
+  }
+
   function handleTabKeyDown(e: React.KeyboardEvent, idx: number) {
     if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
       e.preventDefault();
       const dir = e.key === 'ArrowRight' ? 1 : -1;
-      const next = openChats[(idx + dir + openChats.length) % openChats.length];
-      if (next) {
-        onSelect(next);
-        tabRefs.current[next]?.focus();
-      }
+      focusTab(tabs[(idx + dir + tabs.length) % tabs.length]);
     } else if (e.key === 'Home') {
       e.preventDefault();
-      const first = openChats[0];
-      if (first) { onSelect(first); tabRefs.current[first]?.focus(); }
+      focusTab(tabs[0]);
     } else if (e.key === 'End') {
       e.preventDefault();
-      const last = openChats[openChats.length - 1];
-      if (last) { onSelect(last); tabRefs.current[last]?.focus(); }
+      focusTab(tabs[tabs.length - 1]);
     }
   }
 
-  // Agents available to open = configured agents not already open as a tab.
-  const closableLast = openChats.length <= 1;
-  const availableToOpen = allAgents.filter((a) => !openChats.includes(a));
+  const closableLast = tabs.length <= 1;
+  // Every configured agent is offered: choosing one already open adds a second
+  // pane for it rather than being unavailable.
+  const openCounts = new Map<string, number>();
+  for (const tb of tabs) openCounts.set(tb.alias, (openCounts.get(tb.alias) ?? 0) + 1);
 
   return (
     <div className="relative z-20 flex items-stretch border-b border-pc-border bg-pc-surface">
@@ -114,19 +129,19 @@ export function ChatTabBar({
         aria-orientation="horizontal"
         className="flex items-stretch gap-1 overflow-x-auto px-2 py-1.5 flex-1 min-w-0"
       >
-        {openChats.map((alias, idx) => {
-          const active = alias === activeAlias;
-          const ind = indicators[alias];
+        {tabs.map((tab, idx) => {
+          const active = tab.key === activeKey;
+          const ind = indicators[tab.key];
           return (
             <button
-              key={alias}
-              ref={(el) => { tabRefs.current[alias] = el; }}
+              key={tab.key}
+              ref={(el) => { tabRefs.current[tab.key] = el; }}
               role="tab"
-              id={`chat-tab-${alias}`}
+              id={`chat-tab-${tab.key}`}
               aria-selected={active}
-              aria-controls={`chat-panel-${alias}`}
+              aria-controls={`chat-panel-${tab.key}`}
               tabIndex={active ? 0 : -1}
-              onClick={() => onSelect(alias)}
+              onClick={() => onSelect(tab.key)}
               onKeyDown={(e) => handleTabKeyDown(e, idx)}
               className={[
                 'group flex items-center gap-2 h-8 pl-2.5 pr-1.5 rounded-[var(--radius-md)]',
@@ -139,7 +154,7 @@ export function ChatTabBar({
             >
               <StatusDot streaming={ind?.streaming} unread={ind?.unread} active={active} />
               <Bot className="h-3.5 w-3.5 shrink-0" aria-hidden />
-              <span className="max-w-[160px] truncate">{alias}</span>
+              <span className="max-w-[160px] truncate">{tab.label}</span>
               <span
                 role="button"
                 tabIndex={-1}
@@ -148,7 +163,7 @@ export function ChatTabBar({
                 aria-disabled={closableLast}
                 onClick={(e) => {
                   e.stopPropagation();
-                  if (!closableLast) onClose(alias);
+                  if (!closableLast) onClose(tab.key);
                 }}
                 className={[
                   'inline-flex items-center justify-center h-5 w-5 rounded-[var(--radius-sm)] shrink-0',
@@ -196,21 +211,31 @@ export function ChatTabBar({
               {!pickerLoading && pickerError && (
                 <div className="px-3 py-2 text-xs text-status-error">{t('workspace.picker_error')}</div>
               )}
-              {!pickerLoading && !pickerError && availableToOpen.length === 0 && (
-                <div className="px-3 py-2 text-xs text-pc-text-muted">{t('workspace.no_more_agents')}</div>
+              {!pickerLoading && !pickerError && allAgents.length === 0 && (
+                <div className="px-3 py-2 text-xs text-pc-text-muted">{t('workspace.no_agents')}</div>
               )}
-              {!pickerLoading && !pickerError && availableToOpen.map((alias) => (
-                <button
-                  key={alias}
-                  type="button"
-                  role="menuitem"
-                  onClick={() => { onOpen(alias); setPickerOpen(false); }}
-                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-pc-text transition-colors hover:bg-[var(--pc-hover)] focus-visible:outline-none focus-visible:bg-[var(--pc-hover)]"
-                >
-                  <Bot className="h-3.5 w-3.5 text-pc-accent shrink-0" aria-hidden />
-                  <span className="truncate">{alias}</span>
-                </button>
-              ))}
+              {!pickerLoading && !pickerError && allAgents.map((alias) => {
+                const openCount = openCounts.get(alias) ?? 0;
+                return (
+                  <button
+                    key={alias}
+                    type="button"
+                    role="menuitem"
+                    onClick={() => { onOpen(alias); setPickerOpen(false); }}
+                    className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-pc-text transition-colors hover:bg-[var(--pc-hover)] focus-visible:outline-none focus-visible:bg-[var(--pc-hover)]"
+                  >
+                    <Bot className="h-3.5 w-3.5 text-pc-accent shrink-0" aria-hidden />
+                    <span className="truncate">{alias}</span>
+                    {/* Say what picking this will do, so choosing an agent that
+                        is already open does not look like a no-op. */}
+                    {openCount > 0 && (
+                      <span className="ml-auto shrink-0 text-[11px] text-pc-text-muted">
+                        {t('workspace.open_another')}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
             </div>
           )}
         </div>

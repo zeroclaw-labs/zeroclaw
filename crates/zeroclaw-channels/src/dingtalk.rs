@@ -124,11 +124,7 @@ impl DingTalkChannel {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("gateway registration failed ({status}): {err}");
-        }
+        let resp = crate::util::ensure_success(resp, "gateway registration").await?;
 
         let gw: GatewayResponse = resp.json().await?;
         Ok(gw)
@@ -188,11 +184,7 @@ impl Channel for DingTalkChannel {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("webhook reply failed ({status}): {err}");
-        }
+        crate::util::ensure_success(resp, "webhook reply").await?;
 
         Ok(())
     }

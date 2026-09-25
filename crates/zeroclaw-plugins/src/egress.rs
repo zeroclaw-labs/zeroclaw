@@ -2,8 +2,9 @@
 //!
 //! Transport adapters submit an [`EgressRequest`], then dial only the pinned
 //! addresses returned by [`AuthorizedEgress`]. Policy is resolved at each
-//! request, while live-connection accounting is shared across every transport
-//! and store belonging to the same logical plugin instance.
+//! request, while live-connection accounting is shared process-wide by every
+//! transport, store, service, and tool registry that represents the same
+//! logical plugin instance.
 //!
 //! Linkers expose only the imports selected by an admitted instance's effective
 //! grants. This service repeats that grant check at the operation boundary, then
@@ -22,15 +23,28 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use zeroclaw_infra::net_guard::{
     Nat64Prefix, NetworkGuardError, PrivateNetworkAccess, ResolvedDestination, egress_host_matches,
     egress_pattern_contains, normalize_egress_patterns, normalize_host, parse_nat64_prefixes,
 };
 
+#[cfg(feature = "plugins-wasmtime")]
+use rustls::pki_types::pem::PemObject;
+use zeroclaw_api::plugin_egress::is_valid_tls_profile_name;
+use zeroclaw_api::plugin_key::SecretPropertyRef;
+
 use crate::PluginPermission;
 use crate::instance::{PluginInstanceId, PluginInstanceScope};
+
+/// Deadline shared by outbound connection establishment and a TLS handshake.
+///
+/// Host policy, not operator configuration. It sits beside the shared
+/// authorization boundary so transport adapters cannot drift onto different
+/// connect budgets.
+#[cfg(feature = "plugins-wasmtime")]
+pub(crate) const EGRESS_CONNECT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Protocol family and confidentiality mode requested by a plugin adapter.
 ///
@@ -59,6 +73,243 @@ impl EgressTransport {
             Self::Tcp | Self::Tls | Self::StartTls => PluginPermission::SocketClient,
         }
     }
+
+    /// Whether this transport can carry TLS, and so can use a TLS profile.
+    fn uses_tls(self) -> bool {
+        matches!(
+            self,
+            Self::Http { encrypted: true }
+                | Self::WebSocket { encrypted: true }
+                | Self::Tls
+                | Self::StartTls
+        )
+    }
+}
+
+/// Validated operator-facing name of a TLS profile.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TlsProfileName(String);
+
+impl TlsProfileName {
+    /// Parse a profile slug (see
+    /// [`zeroclaw_api::plugin_egress::is_valid_tls_profile_name`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EgressError::InvalidTlsProfileName`] for an invalid slug.
+    pub fn new(name: impl Into<String>) -> Result<Self, EgressError> {
+        let name = name.into();
+        if !is_valid_tls_profile_name(&name) {
+            return Err(EgressError::InvalidTlsProfileName(name));
+        }
+        Ok(Self(name))
+    }
+
+    /// Canonical profile slug.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Secret references for one TLS client certificate chain and its key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TlsClientIdentity {
+    certificate: SecretPropertyRef,
+    private_key: SecretPropertyRef,
+}
+
+impl TlsClientIdentity {
+    /// Pair a certificate-chain property with its private-key property.
+    #[must_use]
+    pub fn new(certificate: SecretPropertyRef, private_key: SecretPropertyRef) -> Self {
+        Self {
+            certificate,
+            private_key,
+        }
+    }
+
+    /// PEM certificate-chain secret reference.
+    #[must_use]
+    pub fn certificate(&self) -> &SecretPropertyRef {
+        &self.certificate
+    }
+
+    /// PEM private-key secret reference.
+    #[must_use]
+    pub fn private_key(&self) -> &SecretPropertyRef {
+        &self.private_key
+    }
+}
+
+/// Named TLS trust and optional client-identity profile for one instance.
+///
+/// A profile selects certificates; it never grants a destination. Its hosts
+/// must each be inside the instance's `egress_hosts` grant, which
+/// [`EgressPolicy::with_tls_profiles`] enforces, and a request that selects it
+/// still passes the ordinary grant check first. The profile holds references
+/// into the instance's secret config, never PEM bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TlsProfile {
+    name: TlsProfileName,
+    hosts: Vec<String>,
+    system_roots: bool,
+    custom_ca: Option<SecretPropertyRef>,
+    client_identity: Option<TlsClientIdentity>,
+}
+
+impl TlsProfile {
+    /// Create a named TLS profile.
+    ///
+    /// `hosts` uses the strict egress grammar of `egress_hosts`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EgressError`] if no destination is bound, a host pattern is
+    /// invalid, or neither system roots nor a custom CA supplies trust anchors.
+    pub fn new(
+        name: TlsProfileName,
+        hosts: &[String],
+        system_roots: bool,
+        custom_ca: Option<SecretPropertyRef>,
+        client_identity: Option<TlsClientIdentity>,
+    ) -> Result<Self, EgressError> {
+        if hosts.is_empty() {
+            return Err(EgressError::TlsProfileWithoutHosts(
+                name.as_str().to_string(),
+            ));
+        }
+        let hosts = normalize_egress_patterns(
+            hosts,
+            &format!("plugins.entries.tls_profiles.{}.hosts", name.as_str()),
+        )
+        .map_err(|error| EgressError::InvalidHostPattern(error.to_string()))?;
+        if !system_roots && custom_ca.is_none() {
+            return Err(EgressError::InvalidTlsProfile {
+                profile: name.as_str().to_string(),
+                reason: "at least one of system roots or a custom CA is required".to_string(),
+            });
+        }
+        Ok(Self {
+            name,
+            hosts,
+            system_roots,
+            custom_ca,
+            client_identity,
+        })
+    }
+
+    /// Profile name a transport selects.
+    #[must_use]
+    pub fn name(&self) -> &TlsProfileName {
+        &self.name
+    }
+
+    /// Whether the roots plugin HTTPS trusts are included.
+    #[must_use]
+    pub fn uses_system_roots(&self) -> bool {
+        self.system_roots
+    }
+
+    /// Optional instance-secret property containing PEM CA certificates.
+    #[must_use]
+    pub fn custom_ca(&self) -> Option<&SecretPropertyRef> {
+        self.custom_ca.as_ref()
+    }
+
+    /// Optional instance-secret properties forming a client identity.
+    #[must_use]
+    pub fn client_identity(&self) -> Option<&TlsClientIdentity> {
+        self.client_identity.as_ref()
+    }
+
+    fn allows_host(&self, host: &str) -> bool {
+        egress_host_matches(host, &self.hosts)
+    }
+}
+
+/// Build one rustls client configuration from an authorized TLS profile.
+///
+/// `system_roots` is the root store plugin HTTPS already trusts, supplied by
+/// the caller so every plugin transport shares one trust decision. It is used
+/// when `profile` is `None` or the profile keeps system roots. `resolve_secret`
+/// is called only for references the profile actually uses, at the operation
+/// boundary, so no adapter holds a parallel copy of TLS material.
+///
+/// # Errors
+///
+/// Returns [`EgressError`] when a referenced secret is unavailable, PEM is
+/// malformed or empty, a CA certificate cannot be added, or a client
+/// certificate and key do not form a valid identity.
+#[cfg(feature = "plugins-wasmtime")]
+pub fn build_tls_client_config(
+    profile: Option<&TlsProfile>,
+    system_roots: &rustls::RootCertStore,
+    mut resolve_secret: impl FnMut(&SecretPropertyRef) -> Result<String, EgressError>,
+) -> Result<Arc<rustls::ClientConfig>, EgressError> {
+    let profile_name = profile
+        .map(|profile| profile.name().as_str())
+        .unwrap_or("system-roots")
+        .to_string();
+    let mut roots = if profile.is_none_or(TlsProfile::uses_system_roots) {
+        system_roots.clone()
+    } else {
+        rustls::RootCertStore::empty()
+    };
+    if let Some(custom_ca) = profile.and_then(TlsProfile::custom_ca) {
+        let pem = resolve_secret(custom_ca)?;
+        for certificate in parse_pem_certificates(&pem, &profile_name, "custom CA")? {
+            roots
+                .add(certificate)
+                .map_err(|_| EgressError::InvalidTlsMaterial {
+                    profile: profile_name.clone(),
+                    part: "custom CA certificate".to_string(),
+                })?;
+        }
+    }
+
+    let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+    let config = if let Some(identity) = profile.and_then(TlsProfile::client_identity) {
+        let certificate_pem = resolve_secret(identity.certificate())?;
+        let certificates =
+            parse_pem_certificates(&certificate_pem, &profile_name, "client certificate")?;
+        let private_key_pem = resolve_secret(identity.private_key())?;
+        let invalid_key = || EgressError::InvalidTlsMaterial {
+            profile: profile_name.clone(),
+            part: "client private key".to_string(),
+        };
+        let private_key =
+            rustls::pki_types::PrivateKeyDer::from_pem_slice(private_key_pem.as_bytes())
+                .map_err(|_| invalid_key())?;
+        builder
+            .with_client_auth_cert(certificates, private_key)
+            .map_err(|_| EgressError::InvalidTlsMaterial {
+                profile: profile_name.clone(),
+                part: "client certificate/private-key pair".to_string(),
+            })?
+    } else {
+        builder.with_no_client_auth()
+    };
+    Ok(Arc::new(config))
+}
+
+#[cfg(feature = "plugins-wasmtime")]
+fn parse_pem_certificates(
+    pem: &str,
+    profile: &str,
+    part: &str,
+) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, EgressError> {
+    let invalid = || EgressError::InvalidTlsMaterial {
+        profile: profile.to_string(),
+        part: part.to_string(),
+    };
+    let certificates = rustls::pki_types::CertificateDer::pem_slice_iter(pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| invalid())?;
+    if certificates.is_empty() {
+        return Err(invalid());
+    }
+    Ok(certificates)
 }
 
 impl fmt::Display for EgressTransport {
@@ -89,6 +340,7 @@ impl fmt::Display for EgressTransport {
 pub struct EgressPolicy {
     hosts: Vec<String>,
     allow_private: Vec<String>,
+    tls_profiles: HashMap<TlsProfileName, TlsProfile>,
     nat64_prefixes: Vec<Nat64Prefix>,
     max_connections_per_instance: usize,
 }
@@ -139,9 +391,42 @@ impl EgressPolicy {
         Ok(Self {
             hosts,
             allow_private,
+            tls_profiles: HashMap::new(),
             nat64_prefixes,
             max_connections_per_instance,
         })
+    }
+
+    /// Attach the instance's TLS profiles (`plugins.entries[].tls_profiles`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EgressError::DuplicateTlsProfile`] for a repeated name and
+    /// [`EgressError::TlsProfileHostNotGranted`] when a profile names a host the
+    /// grant does not contain: a profile selects certificates for a granted
+    /// destination, it never grants one.
+    pub fn with_tls_profiles(
+        mut self,
+        profiles: impl IntoIterator<Item = TlsProfile>,
+    ) -> Result<Self, EgressError> {
+        for profile in profiles {
+            if let Some(host) = profile.hosts.iter().find(|host| {
+                !self
+                    .hosts
+                    .iter()
+                    .any(|grant| egress_pattern_contains(grant, host))
+            }) {
+                return Err(EgressError::TlsProfileHostNotGranted {
+                    profile: profile.name.as_str().to_string(),
+                    host: host.clone(),
+                });
+            }
+            let name = profile.name.clone();
+            if self.tls_profiles.insert(name.clone(), profile).is_some() {
+                return Err(EgressError::DuplicateTlsProfile(name.as_str().to_string()));
+            }
+        }
+        Ok(self)
     }
 
     /// A policy that grants nothing. The state an unconfigured instance is in.
@@ -164,6 +449,16 @@ impl EgressPolicy {
             PrivateNetworkAccess::Deny
         }
     }
+}
+
+/// The two operator-authored lists an instance's grant is made of, as the
+/// canonical config currently resolves them.
+// Gated like its only consumer, the `wasi_http` denial path.
+#[cfg(feature = "plugins-wasmtime")]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GrantLists {
+    pub(crate) hosts: Vec<String>,
+    pub(crate) allow_private: Vec<String>,
 }
 
 type ResolveEgress =
@@ -211,6 +506,7 @@ pub struct EgressRequest {
     transport: EgressTransport,
     host: String,
     port: u16,
+    tls_profile: Option<TlsProfileName>,
 }
 
 impl EgressRequest {
@@ -234,11 +530,35 @@ impl EgressRequest {
             transport,
             host,
             port,
+            tls_profile: None,
         })
+    }
+
+    /// Select a named TLS profile for this request. Without one, the request
+    /// uses the roots plugin HTTPS trusts and no client certificate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EgressError::InvalidTlsProfileName`] for a malformed name and
+    /// [`EgressError::TlsProfileOnPlaintext`] for a transport that never
+    /// carries TLS.
+    pub fn with_tls_profile(mut self, name: &str) -> Result<Self, EgressError> {
+        let name = TlsProfileName::new(name)?;
+        if !self.transport.uses_tls() {
+            return Err(EgressError::TlsProfileOnPlaintext(self.transport));
+        }
+        self.tls_profile = Some(name);
+        Ok(self)
     }
 
     /// Host-issued logical instance identity.
     #[must_use]
+    /// The scope this request was made under.
+    #[cfg(feature = "plugins-wasmtime")]
+    pub(crate) fn scope(&self) -> &PluginInstanceScope {
+        &self.scope
+    }
+
     pub fn instance_id(&self) -> &PluginInstanceId {
         self.scope.id()
     }
@@ -260,49 +580,120 @@ impl EgressRequest {
     pub fn port(&self) -> u16 {
         self.port
     }
+
+    /// Selected TLS profile, if any.
+    #[must_use]
+    pub fn tls_profile(&self) -> Option<&TlsProfileName> {
+        self.tls_profile.as_ref()
+    }
 }
 
+/// Live connection accounting for every plugin instance in this process.
+///
+/// # Why this state is process-global
+///
+/// A live connection is *runtime* state: the socket this instance holds open
+/// right now either exists or it does not, and there is exactly one truth about
+/// that per process. This is deliberately not the same kind of fact as an
+/// admission or policy decision, which is derived from canonical config every
+/// time it is asked and therefore must never acquire a global counter. Nothing
+/// about the operator's policy is cached here — only how many slots are
+/// currently held. The ceiling those counts are compared against is still read
+/// live from the resolver on every acquire, so lowering it applies to the next
+/// connection.
+///
+/// # Why per-service counting was wrong
+///
+/// `EgressHostService` used to own its counts, so a clone shared them but an
+/// independently built service did not. Production builds a *fresh* service per
+/// `all_tools_with_runtime` call, and the same canonical instance is registered
+/// by several independent paths — the agent loop, the gateway, the channels
+/// orchestrator, and the delegate tool. Each registry therefore handed the same
+/// instance a full budget, and N registries multiplied the operator's ceiling by
+/// N. Keying on the canonical [`PluginInstanceId`] puts every one of those
+/// registries on the same count.
+#[derive(Clone, Default)]
+struct ConnectionRegistry {
+    by_instance: Arc<Mutex<HashMap<PluginInstanceId, Arc<InstanceConnections>>>>,
+}
+
+impl ConnectionRegistry {
+    /// The one registry every service built by [`EgressHostService::new`] uses.
+    fn shared() -> Self {
+        static SHARED: OnceLock<ConnectionRegistry> = OnceLock::new();
+        SHARED.get_or_init(ConnectionRegistry::default).clone()
+    }
+
+    /// This instance's counter, created on first use.
+    ///
+    /// The map holds a strong reference for the life of the process, and that
+    /// is the point rather than an oversight. A `Weak` map would be tidier but
+    /// unsound here: no counter outlives the request that acquired against it,
+    /// so every entry would drop between connections and quietly reset the
+    /// ceiling to zero — a leak of budget rather than of memory. Growth is
+    /// bounded by the number of distinct instance identities the host admits,
+    /// which is the operator's installed plugin set; a guest cannot mint one.
+    fn counter(&self, instance: &PluginInstanceId) -> Arc<InstanceConnections> {
+        Arc::clone(self.lock().entry(instance.clone()).or_default())
+    }
+
+    fn acquire(
+        &self,
+        instance: &PluginInstanceId,
+        limit: usize,
+    ) -> Result<ConnectionLease, EgressError> {
+        self.counter(instance).acquire(instance, limit)
+    }
+
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<PluginInstanceId, Arc<InstanceConnections>>> {
+        self.by_instance
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    #[cfg(all(test, feature = "plugins-wasmtime"))]
+    fn live(&self, instance: &PluginInstanceId) -> usize {
+        self.lock()
+            .get(instance)
+            .map_or(0, |connections| *connections.lock())
+    }
+}
+
+/// One instance's live connection count, shared by every service that
+/// represents that instance.
 #[derive(Default)]
-struct ConnectionCounts {
-    by_instance: Mutex<HashMap<PluginInstanceId, usize>>,
+struct InstanceConnections {
+    live: Mutex<usize>,
 }
 
-impl ConnectionCounts {
+impl InstanceConnections {
     fn acquire(
         self: &Arc<Self>,
         instance: &PluginInstanceId,
         limit: usize,
     ) -> Result<ConnectionLease, EgressError> {
-        let mut counts = self
-            .by_instance
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let count = counts.entry(instance.clone()).or_default();
-        if *count >= limit {
+        let mut live = self.lock();
+        if *live >= limit {
             return Err(EgressError::ConnectionLimitReached {
                 instance: instance_label(instance),
                 limit,
             });
         }
-        *count += 1;
+        *live += 1;
         Ok(ConnectionLease {
-            counts: Arc::clone(self),
-            instance: instance.clone(),
+            connections: Arc::clone(self),
         })
     }
 
-    fn release(&self, instance: &PluginInstanceId) {
-        let mut counts = self
-            .by_instance
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let remove = counts.get_mut(instance).is_some_and(|count| {
-            *count = count.saturating_sub(1);
-            *count == 0
-        });
-        if remove {
-            counts.remove(instance);
-        }
+    fn release(&self) {
+        let mut live = self.lock();
+        *live = live.saturating_sub(1);
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, usize> {
+        self.live.lock().unwrap_or_else(|error| error.into_inner())
     }
 }
 
@@ -317,21 +708,18 @@ fn instance_label(instance: &PluginInstanceId) -> String {
 
 // Dropping the authorized token returns capacity to the shared budget.
 struct ConnectionLease {
-    counts: Arc<ConnectionCounts>,
-    instance: PluginInstanceId,
+    connections: Arc<InstanceConnections>,
 }
 
 impl fmt::Debug for ConnectionLease {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ConnectionLease")
-            .field("instance", &self.instance)
-            .finish_non_exhaustive()
+        f.debug_struct("ConnectionLease").finish_non_exhaustive()
     }
 }
 
 impl Drop for ConnectionLease {
     fn drop(&mut self) {
-        self.counts.release(&self.instance);
+        self.connections.release();
     }
 }
 
@@ -345,6 +733,7 @@ impl Drop for ConnectionLease {
 pub struct AuthorizedEgress {
     request: EgressRequest,
     destination: ResolvedDestination,
+    tls_profile: Option<TlsProfile>,
     _lease: ConnectionLease,
 }
 
@@ -362,13 +751,40 @@ impl AuthorizedEgress {
     pub fn destination(&self) -> &ResolvedDestination {
         &self.destination
     }
+
+    /// The TLS profile the request selected, resolved from the same policy
+    /// view that authorized it; `None` means system roots without a client
+    /// certificate.
+    #[must_use]
+    pub fn tls_profile(&self) -> Option<&TlsProfile> {
+        self.tls_profile.as_ref()
+    }
 }
 
+/// Test-only stand-in for `tokio::net::lookup_host`.
+///
+/// A deterministic closure from a requested host and port to an address set,
+/// used only to model a resolver whose answer changes between calls (DNS
+/// rebinding) without depending on real DNS or resolver ordering. Production
+/// has no equivalent and never installs one.
+#[cfg(test)]
+type TestAddressResolver = Arc<dyn Fn(&str, u16) -> Vec<SocketAddr> + Send + Sync>;
+
 /// Shared service injected into plugin stores and cloned across transports.
+///
+/// Policy is per service, because a service is built around one resolver.
+/// Connection accounting is not: it comes from the process-wide
+/// connection registry, so two services built independently for the same
+/// canonical instance spend one budget rather than one each.
 #[derive(Clone)]
 pub struct EgressHostService {
     resolver: EgressPolicyResolver,
-    counts: Arc<ConnectionCounts>,
+    connections: ConnectionRegistry,
+    /// Test-only DNS override. `None` in every production build (the field
+    /// does not exist there at all), so the resolve path stays the shipped
+    /// `lookup_host` call.
+    #[cfg(test)]
+    resolver_override: Option<TestAddressResolver>,
 }
 
 impl fmt::Debug for EgressHostService {
@@ -379,11 +795,61 @@ impl fmt::Debug for EgressHostService {
 
 impl EgressHostService {
     /// Construct one service around a live canonical policy resolver.
+    ///
+    /// The connection budget it enforces is the process-wide one for each
+    /// instance it sees, so an operator's ceiling holds no matter how many tool
+    /// registries end up representing the same instance.
     #[must_use]
     pub fn new(resolver: EgressPolicyResolver) -> Self {
         Self {
             resolver,
-            counts: Arc::new(ConnectionCounts::default()),
+            connections: ConnectionRegistry::shared(),
+            #[cfg(test)]
+            resolver_override: None,
+        }
+    }
+
+    /// A service whose connection accounting is private to it.
+    ///
+    /// Test-only. Tests share one process with the real registry, so a test
+    /// holding a lease would otherwise be able to exhaust another test's
+    /// ceiling. Tests that are *about* the sharing use
+    /// [`EgressHostService::new`] with an instance identity unique to that
+    /// test, which is the only way to observe the shared registry without
+    /// depending on what else is running.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_private_connection_accounting(resolver: EgressPolicyResolver) -> Self {
+        Self {
+            resolver,
+            connections: ConnectionRegistry::default(),
+            resolver_override: None,
+        }
+    }
+
+    /// A service whose DNS resolution is replaced by a deterministic closure.
+    ///
+    /// Test-only. The override stands in for `tokio::net::lookup_host`, so a
+    /// test can pin one answer and then observe that a *different* later answer
+    /// is never dialed — the DNS-rebinding / TOCTOU property, made deterministic
+    /// and free of any dependence on resolver ordering. Accounting is private to
+    /// the caller for the same reason [`Self::with_private_connection_accounting`]
+    /// is. Production has no equivalent constructor and never sets the override.
+    ///
+    /// The gate matches the *caller's*: the only caller is in [`crate::wasi_http`]'s
+    /// tests, and that module exists only under `plugins-wasmtime`. A wider gate
+    /// makes this dead code on the default feature surface, which the `default
+    /// features, all targets` CI row compiles with `-D warnings`.
+    #[cfg(all(test, feature = "plugins-wasmtime"))]
+    #[must_use]
+    pub(crate) fn with_test_resolver(
+        resolver: EgressPolicyResolver,
+        addresses: impl Fn(&str, u16) -> Vec<SocketAddr> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            resolver,
+            connections: ConnectionRegistry::default(),
+            resolver_override: Some(Arc::new(addresses)),
         }
     }
 
@@ -399,6 +865,15 @@ impl EgressHostService {
     /// or connection-budget acquisition fails.
     pub async fn authorize(&self, request: EgressRequest) -> Result<AuthorizedEgress, EgressError> {
         let policy = self.resolve_policy(&request)?;
+        // Test-only DNS override. Production never installs one, so under
+        // `not(test)` this block compiles to nothing and the resolution below is
+        // exactly the shipped `lookup_host` path. Under test it lets a case pin
+        // the first answer and prove a later, different answer is never dialed.
+        #[cfg(test)]
+        if let Some(resolver) = &self.resolver_override {
+            let addresses = resolver(request.host(), request.port());
+            return self.authorize_with_policy(request, addresses, &policy);
+        }
         let addresses = tokio::net::lookup_host((request.host(), request.port()))
             .await
             .map_err(|error| EgressError::DnsFailed {
@@ -428,6 +903,39 @@ impl EgressHostService {
         self.authorize_with_policy(request, addresses, &policy)
     }
 
+    /// Live connection count held for one instance.
+    ///
+    /// Test-only: the budget is observable in production solely through
+    /// [`EgressError::ConnectionLimitReached`], and adapters must not be able to
+    /// read or reset it. Tests that prove a failed dial returns its slot need to
+    /// see the count itself, not just that a later acquire happened to succeed.
+    ///
+    /// The gate matches the *caller's*, not just `test`: the only caller is in
+    /// [`crate::wasi_http`]'s tests, and that module exists only under
+    /// `plugins-wasmtime`. A wider gate makes this dead code on the default
+    /// feature surface, which is exactly what the `default features, all
+    /// targets` CI row compiles with `-D warnings`.
+    #[cfg(all(test, feature = "plugins-wasmtime"))]
+    pub(crate) fn live_connections(&self, instance: &PluginInstanceId) -> usize {
+        self.connections.live(instance)
+    }
+
+    /// The instance's current operator grant: the `egress_hosts` and
+    /// `egress_allow_private` lists the canonical config resolves to right now.
+    ///
+    /// A denial remedy uses this so the command it prints carries every entry
+    /// the operator already has: `config set` replaces a whole list, so a
+    /// remedy built from the denied host alone would silently revoke the rest.
+    /// `None` when the policy cannot be resolved; the caller must then avoid
+    /// printing a replacement list at all.
+    #[cfg(feature = "plugins-wasmtime")]
+    pub(crate) fn current_grant(&self, scope: &PluginInstanceScope) -> Option<GrantLists> {
+        self.resolver.resolve(scope).ok().map(|policy| GrantLists {
+            hosts: policy.hosts,
+            allow_private: policy.allow_private,
+        })
+    }
+
     fn resolve_policy(&self, request: &EgressRequest) -> Result<EgressPolicy, EgressError> {
         let permission = request.transport.required_permission();
         if !request.scope.grants().allows(permission) {
@@ -442,6 +950,18 @@ impl EgressHostService {
                 instance: instance_label(request.instance_id()),
                 host: request.host.clone(),
             });
+        }
+        if let Some(name) = request.tls_profile.as_ref() {
+            let profile = policy
+                .tls_profiles
+                .get(name)
+                .ok_or_else(|| EgressError::UnknownTlsProfile(name.as_str().to_string()))?;
+            if !profile.allows_host(&request.host) {
+                return Err(EgressError::TlsProfileHostDenied {
+                    profile: name.as_str().to_string(),
+                    host: request.host.clone(),
+                });
+            }
         }
         Ok(policy)
     }
@@ -459,12 +979,21 @@ impl EgressHostService {
             policy.private_access(&request.host),
             &policy.nat64_prefixes,
         )?;
+        // The ceiling comes from the policy this request just resolved, never
+        // from a value cached alongside the count: an operator who lowers
+        // `max_connections_per_instance` binds the next connection.
         let lease = self
-            .counts
+            .connections
             .acquire(request.instance_id(), policy.max_connections_per_instance)?;
+        let tls_profile = request
+            .tls_profile
+            .as_ref()
+            .and_then(|name| policy.tls_profiles.get(name))
+            .cloned();
         Ok(AuthorizedEgress {
             request,
             destination,
+            tls_profile,
             _lease: lease,
         })
     }
@@ -599,6 +1128,41 @@ pub enum EgressError {
     /// The destination is not in this instance's operator-granted allowlist.
     #[error("plugin instance {instance} is not granted egress to {host:?}")]
     DestinationNotGranted { instance: String, host: String },
+    /// Invalid TLS profile slug.
+    #[error("invalid TLS profile name: {0:?}")]
+    InvalidTlsProfileName(String),
+    /// Incoherent TLS profile definition.
+    #[error("invalid TLS profile {profile:?}: {reason}")]
+    InvalidTlsProfile { profile: String, reason: String },
+    /// Two profiles on one instance share a name.
+    #[error("duplicate TLS profile name: {0:?}")]
+    DuplicateTlsProfile(String),
+    /// A TLS profile binds no destination.
+    #[error("TLS profile {0:?} must name at least one host")]
+    TlsProfileWithoutHosts(String),
+    /// A TLS profile names a host the instance's grant does not contain.
+    #[error(
+        "TLS profile {profile:?} names {host:?}, which the instance's egress_hosts does not grant"
+    )]
+    TlsProfileHostNotGranted { profile: String, host: String },
+    /// A transport that never carries TLS selected a TLS profile.
+    #[error("a TLS profile cannot be selected for plaintext {0} egress")]
+    TlsProfileOnPlaintext(EgressTransport),
+    /// The selected TLS profile is not configured on this instance.
+    #[error("unknown plugin TLS profile: {0:?}")]
+    UnknownTlsProfile(String),
+    /// The selected TLS profile does not cover this destination.
+    #[error("plugin TLS profile {profile:?} is not configured for host {host:?}")]
+    TlsProfileHostDenied { profile: String, host: String },
+    /// A selected TLS profile's certificate material is missing or invalid.
+    #[error("plugin TLS profile {profile:?} has invalid {part}")]
+    InvalidTlsMaterial { profile: String, part: String },
+    /// An adapter used an authorization issued to a different instance.
+    #[error("plugin egress authorization does not belong to this plugin instance")]
+    AuthorizationScopeMismatch,
+    /// A selected TLS profile names a secret this instance cannot resolve.
+    #[error("plugin TLS profile {profile:?} cannot resolve secret property {property:?}")]
+    TlsSecretUnavailable { profile: String, property: String },
     /// DNS resolution failed before policy could pin an address set.
     #[error("DNS resolution for {host}:{port} failed: {reason}")]
     DnsFailed {
@@ -622,13 +1186,14 @@ pub enum EgressError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use crate::{PluginCapability, PluginManifest, PluginPermission};
 
     use super::*;
 
-    fn scope_with_grants(
+    fn scope_in_package(
+        package: &str,
         binding: &str,
         grants: impl IntoIterator<Item = PluginPermission>,
     ) -> PluginInstanceScope {
@@ -638,30 +1203,40 @@ mod tests {
             PluginPermission::SocketClient,
         ];
         let manifest = PluginManifest {
-            name: "egress-fixture".to_string(),
+            name: package.to_string(),
             version: "0.0.0-test".to_string(),
             description: None,
             author: None,
             wasm_path: None,
+            wasm_sha256: None,
             capabilities: vec![PluginCapability::Channel],
             permissions,
             config_schema: None,
             signature: None,
             publisher_key: None,
+            egress: Default::default(),
         };
         PluginInstanceScope::from_manifest(&manifest, PluginCapability::Channel, binding, grants)
             .unwrap()
     }
 
+    fn scope_with_grants(
+        binding: &str,
+        grants: impl IntoIterator<Item = PluginPermission>,
+    ) -> PluginInstanceScope {
+        scope_in_package("egress-fixture", binding, grants)
+    }
+
+    fn all_grants() -> [PluginPermission; 3] {
+        [
+            PluginPermission::HttpClient,
+            PluginPermission::WebSocketClient,
+            PluginPermission::SocketClient,
+        ]
+    }
+
     fn scope(binding: &str) -> PluginInstanceScope {
-        scope_with_grants(
-            binding,
-            [
-                PluginPermission::HttpClient,
-                PluginPermission::WebSocketClient,
-                PluginPermission::SocketClient,
-            ],
-        )
+        scope_with_grants(binding, all_grants())
     }
 
     fn addr(ip: &str, port: u16) -> SocketAddr {
@@ -676,12 +1251,210 @@ mod tests {
         EgressPolicy::new(&owned(hosts), &owned(allow_private), &[], limit).unwrap()
     }
 
+    /// A service with accounting private to the test that built it.
+    ///
+    /// Everything below except the sharing regressions is about policy, and
+    /// policy is per service. Isolating the counts keeps concurrently running
+    /// tests from spending each other's ceilings through the process registry.
     fn service(policy: EgressPolicy) -> EgressHostService {
+        EgressHostService::with_private_connection_accounting(EgressPolicyResolver::new(
+            move |_| Ok(policy.clone()),
+        ))
+    }
+
+    /// A service built exactly the way production builds one: bound to the
+    /// process-wide connection registry.
+    fn shared_service(policy: EgressPolicy) -> EgressHostService {
         EgressHostService::new(EgressPolicyResolver::new(move |_| Ok(policy.clone())))
     }
 
     fn request(binding: &str, transport: EgressTransport, host: &str, port: u16) -> EgressRequest {
         EgressRequest::new(scope(binding), transport, host, port).unwrap()
+    }
+
+    #[cfg(feature = "plugins-wasmtime")]
+    fn secret(name: &str) -> SecretPropertyRef {
+        SecretPropertyRef::parse(name.to_string()).unwrap()
+    }
+
+    fn profile(name: &str, hosts: &[&str]) -> TlsProfile {
+        TlsProfile::new(
+            TlsProfileName::new(name).unwrap(),
+            &owned(hosts),
+            true,
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_tls_profile_cannot_name_a_host_the_grant_does_not_contain() {
+        let base = policy(&["imap.example.com", "*.mail.example.com"], &[], 2);
+        assert!(
+            base.clone()
+                .with_tls_profiles([profile(
+                    "corp",
+                    &["imap.example.com", "*.eu.mail.example.com"]
+                )])
+                .is_ok()
+        );
+        assert!(matches!(
+            base.clone()
+                .with_tls_profiles([profile("corp", &["smtp.example.com"])]),
+            Err(EgressError::TlsProfileHostNotGranted { .. })
+        ));
+        assert!(matches!(
+            base.with_tls_profiles([
+                profile("same", &["imap.example.com"]),
+                profile("same", &["imap.example.com"])
+            ]),
+            Err(EgressError::DuplicateTlsProfile(_))
+        ));
+    }
+
+    #[test]
+    fn a_tls_profile_is_refused_on_a_plaintext_transport() {
+        for plaintext in [
+            EgressTransport::Tcp,
+            EgressTransport::Http { encrypted: false },
+            EgressTransport::WebSocket { encrypted: false },
+        ] {
+            assert!(matches!(
+                request("main", plaintext, "imap.example.com", 143).with_tls_profile("corp"),
+                Err(EgressError::TlsProfileOnPlaintext(_))
+            ));
+        }
+        assert!(matches!(
+            request("main", EgressTransport::Tls, "imap.example.com", 993).with_tls_profile("Bad"),
+            Err(EgressError::InvalidTlsProfileName(_))
+        ));
+    }
+
+    #[test]
+    fn authorization_resolves_the_selected_profile_and_never_widens_the_grant() {
+        let service = service(
+            policy(&["imap.example.com", "smtp.example.com"], &[], 4)
+                .with_tls_profiles([profile("corp", &["imap.example.com"])])
+                .unwrap(),
+        );
+        let with_profile = |host: &str, name: &str| {
+            request("main", EgressTransport::Tls, host, 993)
+                .with_tls_profile(name)
+                .unwrap()
+        };
+
+        let authorized = service
+            .authorize_addresses(
+                with_profile("imap.example.com", "corp"),
+                [addr("1.1.1.1", 993)],
+            )
+            .expect("profile covers a granted host");
+        assert_eq!(
+            authorized.tls_profile().map(|p| p.name().as_str()),
+            Some("corp")
+        );
+        let plain = service
+            .authorize_addresses(
+                request("main", EgressTransport::Tls, "imap.example.com", 993),
+                [addr("1.1.1.1", 993)],
+            )
+            .expect("no profile is the default trust");
+        assert!(plain.tls_profile().is_none());
+
+        assert!(matches!(
+            service.authorize_addresses(
+                with_profile("imap.example.com", "absent"),
+                [addr("1.1.1.1", 993)]
+            ),
+            Err(EgressError::UnknownTlsProfile(_))
+        ));
+        assert!(matches!(
+            service.authorize_addresses(
+                with_profile("smtp.example.com", "corp"),
+                [addr("1.1.1.1", 993)]
+            ),
+            Err(EgressError::TlsProfileHostDenied { .. })
+        ));
+        // The grant is checked first: a profile never reaches past it.
+        assert!(matches!(
+            service.authorize_addresses(
+                with_profile("evil.example.net", "corp"),
+                [addr("1.1.1.1", 993)]
+            ),
+            Err(EgressError::DestinationNotGranted { .. })
+        ));
+    }
+
+    #[cfg(feature = "plugins-wasmtime")]
+    #[test]
+    fn tls_builder_materializes_custom_ca_and_client_identity_from_secrets() {
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params =
+            rcgen::CertificateParams::new(vec!["Plugin Test CA".to_string()]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_certificate = ca_params.self_signed(&ca_key).unwrap();
+        let client_key = rcgen::KeyPair::generate().unwrap();
+        let client_certificate = rcgen::CertificateParams::new(vec!["client.example".to_string()])
+            .unwrap()
+            .signed_by(&client_key, &ca_certificate, &ca_key)
+            .unwrap();
+
+        let mtls = TlsProfile::new(
+            TlsProfileName::new("private-mtls").unwrap(),
+            &owned(&["service.example"]),
+            false,
+            Some(secret("ca_pem")),
+            Some(TlsClientIdentity::new(
+                secret("client_cert_pem"),
+                secret("client_key_pem"),
+            )),
+        )
+        .unwrap();
+        let mut resolved = Vec::new();
+        let config =
+            build_tls_client_config(Some(&mtls), &rustls::RootCertStore::empty(), |reference| {
+                resolved.push(reference.as_str().to_string());
+                match reference.as_str() {
+                    "ca_pem" => Ok(ca_certificate.pem()),
+                    "client_cert_pem" => Ok(client_certificate.pem()),
+                    "client_key_pem" => Ok(client_key.serialize_pem()),
+                    property => Err(EgressError::TlsSecretUnavailable {
+                        profile: "private-mtls".to_string(),
+                        property: property.to_string(),
+                    }),
+                }
+            });
+        assert!(config.is_ok(), "{config:?}");
+        assert!(config.unwrap().client_auth_cert_resolver.has_certs());
+        assert_eq!(resolved, ["ca_pem", "client_cert_pem", "client_key_pem"]);
+    }
+
+    #[cfg(feature = "plugins-wasmtime")]
+    #[test]
+    fn tls_builder_rejects_empty_material_and_resolves_nothing_it_does_not_use() {
+        let ca_only = TlsProfile::new(
+            TlsProfileName::new("private-ca").unwrap(),
+            &owned(&["service.example"]),
+            false,
+            Some(secret("ca_pem")),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            build_tls_client_config(Some(&ca_only), &rustls::RootCertStore::empty(), |_| Ok(String::new())),
+            Err(EgressError::InvalidTlsMaterial { part, .. }) if part == "custom CA"
+        ));
+
+        // Without a profile the caller's system roots are used as-is and no
+        // secret is ever read.
+        let config = build_tls_client_config(None, &rustls::RootCertStore::empty(), |reference| {
+            panic!(
+                "no secret may be read without a profile, got {}",
+                reference.as_str()
+            )
+        });
+        assert!(config.is_ok());
     }
 
     #[test]
@@ -1017,6 +1790,95 @@ mod tests {
                 .authorize_addresses(second(), [addr("1.1.1.1", 6667)])
                 .is_ok()
         );
+    }
+
+    /// The sharing regression.
+    ///
+    /// Production never clones one service around the process. It builds a
+    /// fresh [`EgressHostService`] per `all_tools_with_runtime` call, and the
+    /// agent loop, the gateway, the channels orchestrator, and the delegate
+    /// tool each register the same canonical instance through a registry of
+    /// their own. When the count lived in the service, every one of those
+    /// registries handed that instance a full budget. These two services share
+    /// nothing but the instance identity.
+    #[test]
+    fn one_budget_is_shared_by_services_built_independently_for_one_instance() {
+        // Packages unique to this test. The registry is process-wide, so the
+        // instance identity is what keeps the assertions deterministic under a
+        // parallel test runner.
+        const INSTANCE: &str = "egress-shared-ceiling-fixture";
+        const OTHER: &str = "egress-other-ceiling-fixture";
+
+        let granted = policy(&["api.example.com"], &[], 1);
+        let first_registry = shared_service(granted.clone());
+        let second_registry = shared_service(granted);
+
+        let authorize = |service: &EgressHostService, package: &str| {
+            let request = EgressRequest::new(
+                scope_in_package(package, "main", all_grants()),
+                EgressTransport::Tls,
+                "api.example.com",
+                443,
+            )
+            .unwrap();
+            service.authorize_addresses(request, [addr("1.1.1.1", 443)])
+        };
+
+        let held = authorize(&first_registry, INSTANCE).unwrap();
+        assert!(
+            matches!(
+                authorize(&second_registry, INSTANCE),
+                Err(EgressError::ConnectionLimitReached { limit: 1, .. })
+            ),
+            "a second registry must not grant the same instance a second budget"
+        );
+        assert!(
+            authorize(&second_registry, OTHER).is_ok(),
+            "the ceiling is shared per instance, not seized process-wide"
+        );
+
+        drop(held);
+        assert!(
+            authorize(&second_registry, INSTANCE).is_ok(),
+            "a slot released in one registry must come back in every registry"
+        );
+    }
+
+    /// The count is shared; the ceiling it is compared against is not cached
+    /// with it. An operator who lowers `max_connections_per_instance` binds the
+    /// next connection rather than the next restart.
+    #[test]
+    fn the_connection_ceiling_is_re_read_from_policy_on_every_acquire() {
+        let ceiling = Arc::new(AtomicUsize::new(2));
+        let configured = Arc::clone(&ceiling);
+        let service = EgressHostService::with_private_connection_accounting(
+            EgressPolicyResolver::new(move |_| {
+                EgressPolicy::new(
+                    &owned(&["api.example.com"]),
+                    &[],
+                    &[],
+                    configured.load(Ordering::SeqCst),
+                )
+            }),
+        );
+        let authorize = || {
+            service.authorize_addresses(
+                request("main", EgressTransport::Tls, "api.example.com", 443),
+                [addr("1.1.1.1", 443)],
+            )
+        };
+
+        let held = authorize().unwrap();
+        ceiling.store(1, Ordering::SeqCst);
+        assert!(
+            matches!(
+                authorize(),
+                Err(EgressError::ConnectionLimitReached { limit: 1, .. })
+            ),
+            "a lowered ceiling must bind the next acquire"
+        );
+        drop(held);
+        assert!(authorize().is_ok());
     }
 
     #[test]

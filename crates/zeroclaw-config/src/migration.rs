@@ -236,7 +236,14 @@ pub fn migrate_to_current_resilient(input: &str) -> Config {
 /// a malformed one to its `Default` may grant a broader posture than intended.
 /// Salvage still drops them (so the daemon boots) but logs ERROR and reports
 /// them in [`ResilientLoad::dropped_security`] for exposure gating.
-pub const SECURITY_CRITICAL_KEYS: &[&str] = &["security", "risk_profiles", "peer_groups"];
+pub const SECURITY_CRITICAL_KEYS: &[&str] = &[
+    "security",
+    "risk_profiles",
+    "peer_groups",
+    "users",
+    "oidc",
+    "permission_profiles",
+];
 
 pub const WHOLE_CONFIG_SENTINEL: &str = "<entire-config>";
 
@@ -375,8 +382,9 @@ fn deserialize_resilient(value: toml::Value) -> ResilientLoad {
                 "SECURITY-CRITICAL config section `{path}` is invalid and was reset to \
                  its default so the daemon can boot; the running posture may be WEAKER \
                  than intended — repair `{path}` and reload before trusting this instance. \
-                 Run `zeroclaw config migrate` to see the precise parse error, or fix it \
-                 via the gateway config editor at `/api/config`"
+                 Use the same executable that started this process with `config migrate` \
+                 to see the precise parse error, or fix it via the gateway config editor \
+                 at `/api/config`"
             )
         );
     }
@@ -834,8 +842,15 @@ fn run_chain_until(value: toml::Value, from: u32, target: u32) -> Result<toml::V
     let mut cur = value;
     for step in &MIGRATION_STEPS[from as usize..target as usize] {
         cur = step(cur)?;
+        strip_retired_node_transport(&mut cur);
     }
     Ok(cur)
+}
+
+fn strip_retired_node_transport(value: &mut toml::Value) {
+    if let Some(root) = value.as_table_mut() {
+        let _ = root.remove("node_transport");
+    }
 }
 
 pub(crate) fn sync_table(doc: &mut toml_edit::Table, new: &toml::Table) {
@@ -3032,6 +3047,27 @@ from_address = "a@example.com"
         assert!(
             migrate_to_current(raw).is_err(),
             "strict path must surface the defect for repair tooling"
+        );
+    }
+
+    #[test]
+    fn broken_users_roster_is_reported_as_security_degraded() {
+        // A malformed [users] roster salvaged to an empty roster is
+        // indistinguishable from an intentional no-roster config, which
+        // re-opens the shared-operator fallback. It must surface as a
+        // security-critical drop so exposure gating can react.
+        let raw = r#"
+schema_version = 3
+
+[users.alice]
+uid = "not-an-integer"
+permission_profiles = ["operator"]
+"#;
+        let load = migrate_to_current_salvaged(raw);
+        assert!(
+            load.dropped_security.iter().any(|p| p == "users"),
+            "malformed [users] must be a security-critical drop, got: {:?}",
+            load.dropped_security
         );
     }
 

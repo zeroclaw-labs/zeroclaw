@@ -78,8 +78,46 @@ fn token_usage(input: u64, output: u64) -> TokenUsage {
     TokenUsage {
         input_tokens: Some(input),
         cached_input_tokens: None,
+        cache_creation_input_tokens: None,
         output_tokens: Some(output),
     }
+}
+
+/// Build a cost-tracking context keyed on the serving provider's pricing.
+/// Mirrors ws.rs::process_chat_message — the pricing map keys ONLY the
+/// serving provider so a coherent Usage tuple yields the correct cost,
+/// while a misattributed tuple resolves empty pricing → cost 0.
+pub(super) fn build_cost_context(
+    serving_provider: &str,
+    serving_model: &str,
+    input_rate: f64,
+    output_rate: f64,
+) -> (
+    Arc<crate::cost::CostTracker>,
+    crate::agent::cost::ToolLoopCostTrackingContext,
+) {
+    use crate::agent::cost::ToolLoopCostTrackingContext;
+    use crate::cost::CostTracker;
+    use std::collections::HashMap;
+
+    let tmpdir = tempfile::TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig::default(),
+            tmpdir.path(),
+        )
+        .expect("CostTracker::new"),
+    );
+    let pricing_map = HashMap::from([(
+        serving_provider.to_string(),
+        HashMap::from([
+            (format!("{serving_model}.input"), input_rate),
+            (format!("{serving_model}.output"), output_rate),
+            (format!("{serving_model}.cached_input"), 0.0_f64),
+        ]),
+    )]);
+    let cost_ctx = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(pricing_map));
+    (tracker, cost_ctx)
 }
 
 /// Returns scripted responses in order; "done" once the script is exhausted.
@@ -209,6 +247,71 @@ fn build_agent_with_runtime(
     }
 }
 
+/// Test tool that queues a pending model switch when executed, standing in
+/// for the real `model_switch` tool during a streamed turn.
+struct ModelSwitchTriggerTool {
+    target_provider: String,
+    target_model: String,
+}
+
+zeroclaw_api::tool_attribution!(
+    ModelSwitchTriggerTool,
+    ::zeroclaw_api::attribution::ToolKind::Plugin
+);
+
+#[async_trait]
+impl Tool for ModelSwitchTriggerTool {
+    fn name(&self) -> &str {
+        "model_switch_trigger"
+    }
+    fn description(&self) -> &str {
+        "test tool: queues a pending model switch"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+        let state = crate::agent::turn::current_model_switch_state()?;
+        *state.lock().unwrap() = Some((self.target_provider.clone(), self.target_model.clone()));
+        Ok(crate::tools::ToolResult {
+            success: true,
+            output: "model switch queued".into(),
+            error: None,
+        })
+    }
+}
+
+/// Test agent with an explicit serving identity and alias on `/tmp` (no
+/// managed workspace). `switch_cfg` is `Some` for in-turn-switch tests,
+/// `None` otherwise. Tests needing post-build mutation (e.g.
+/// `multimodal_config`) keep an inline builder.
+fn build_aliased_agent(
+    provider: Box<dyn ModelProvider>,
+    tools_vec: Vec<Box<dyn Tool>>,
+    provider_name: &str,
+    model: &str,
+    alias: &str,
+    switch_cfg: Option<crate::agent::agent::ProviderSwitchConfig>,
+) -> Agent {
+    let builder = Agent::builder()
+        .model_provider(provider)
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            tools_vec,
+        ))
+        .memory(mem_none(std::path::Path::new("/tmp")))
+        .observer(Arc::from(observability::NoopObserver {}) as Arc<dyn Observer>)
+        .tool_dispatcher(Box::new(NativeToolDispatcher))
+        .workspace_dir(std::path::PathBuf::from("/tmp"))
+        .model_provider_name(provider_name.into())
+        .model_name(model.into())
+        .agent_alias(alias.into());
+    let builder = match switch_cfg {
+        Some(cfg) => builder.provider_switch_config(cfg),
+        None => builder,
+    };
+    builder.build().expect("agent builder should succeed")
+}
+
 // ── seam 1: dedup is OFF on the streaming and Agent::turn engines ───────
 // E1 dedups identical calls per iteration; E2/E3 never did. RPC retry and
 // polling patterns depend on the second identical call executing.
@@ -334,12 +437,20 @@ async fn safety_net_streaming_event_sequence_for_tool_turn() {
         pos_tool_call < pos_tool_result,
         "ToolCall must precede its ToolResult"
     );
-    let (call_id, result_id) = match (&events[pos_tool_call], &events[pos_tool_result]) {
-        (TurnEvent::ToolCall { id: c, .. }, TurnEvent::ToolResult { id: r, .. }) => {
-            (c.clone(), r.clone())
-        }
-        _ => unreachable!(),
-    };
+    let call_id = events
+        .iter()
+        .find_map(|event| match event {
+            TurnEvent::ToolCall { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .expect("a ToolCall event must carry an id");
+    let result_id = events
+        .iter()
+        .find_map(|event| match event {
+            TurnEvent::ToolResult { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .expect("a ToolResult event must carry an id");
     assert_eq!(call_id, "tc-1");
     assert_eq!(
         call_id, result_id,
@@ -466,35 +577,50 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
     let turn_id = uuid::Uuid::new_v4().to_string();
     let result = crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
         parent_agent_alias: None,
+        served_route_sink: None,
         sop_reassembly: None,
-        exec: crate::agent::loop_::ResolvedAgentExecution {
-            model_access: crate::agent::loop_::ResolvedModelAccess {
+        exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
+            crate::agent::loop_::ResolvedModelAccess {
                 model_provider: &provider,
                 provider_name: "mock",
                 model: "mock-model",
+                dispatch_model: "mock-model",
                 temperature: None,
             },
-            tools_registry: &tools_registry,
-            observer: &observability::NoopObserver {},
-            silent: true,
-            approval: None,
-            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
-            config: None,
-            max_tool_iterations: 5,
-            hooks: None,
-            excluded_tools: &[],
-            dedup_exempt_tools: &[],
-            activated_tools: None,
-            model_switch_callback: None,
-            pacing: &zeroclaw_config::schema::PacingConfig::default(),
-            strict_tool_parsing: false,
-            parallel_tools: false,
-            max_tool_result_chars: 30_000,
-            context_token_budget: 100_000,
-            receipt_generator: None,
-            knobs: &crate::agent::loop_::LoopKnobs::default(),
-        },
+            crate::agent::loop_::ResolvedIo {
+                tools_registry: &tools_registry,
+                observer: &observability::NoopObserver {},
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                hooks: None,
+                activated_tools: None,
+                model_switch_callback: None,
+                receipt_generator: None,
+            },
+            crate::agent::loop_::ResolvedRuntimeKnobs {
+                max_tool_iterations: 5,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 30_000,
+                context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                    model_context_window: 100_000,
+                    context_token_budget: 100_000,
+                    model_context_window_source:
+                        zeroclaw_config::schema::ModelContextWindowSource::Configured,
+                },
+                context_limits_resolver: None,
+                knobs: &crate::agent::loop_::LoopKnobs::default(),
+            },
+        ),
         history: &mut history,
+        // Test transcripts start fresh: no prior trim, no crumb.
+        history_has_trim_breadcrumb: &mut false,
+        injected_memory_preamble: &mut None,
         channel_name: "cli",
         channel_reply_target: None,
         cancellation_token: None,
@@ -529,7 +655,8 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
             crate::agent::loop_::StreamDelta::Reasoning(t) => t,
             crate::agent::loop_::StreamDelta::ToolStart { .. }
             | crate::agent::loop_::StreamDelta::ToolComplete { .. }
-            | crate::agent::loop_::StreamDelta::Lifecycle(_) => continue,
+            | crate::agent::loop_::StreamDelta::Lifecycle(_)
+            | crate::agent::loop_::StreamDelta::FlushBarrier(_) => continue,
         };
         assert!(
             !body.contains("SECRET"),
@@ -665,7 +792,8 @@ async fn safety_net_streaming_approval_deny_with_edit_round_trip() {
         _workspace: workspace,
     };
 
-    let handle: tools::PerToolChannelHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+    let handle: tools::PerToolChannelHandle =
+        Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
     agent.channel_handles.ask_user = Some(Arc::clone(&handle));
     agent.channel_handles().register_channel(
         "edit-channel",
@@ -863,35 +991,50 @@ async fn safety_net_task_locals_probe_per_entry_path() {
         crate::agent::loop_::scope_session_key(Some("session-1".into()), async {
             crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
                 parent_agent_alias: None,
+                served_route_sink: None,
                 sop_reassembly: None,
-                exec: crate::agent::loop_::ResolvedAgentExecution {
-                    model_access: crate::agent::loop_::ResolvedModelAccess {
+                exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
+                    crate::agent::loop_::ResolvedModelAccess {
                         model_provider: &provider,
                         provider_name: "mock",
                         model: "mock-model",
+                        dispatch_model: "mock-model",
                         temperature: None,
                     },
-                    tools_registry: &tools_registry,
-                    observer: &observability::NoopObserver {},
-                    silent: true,
-                    approval: None,
-                    multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
-                    config: None,
-                    max_tool_iterations: 5,
-                    hooks: None,
-                    excluded_tools: &[],
-                    dedup_exempt_tools: &[],
-                    activated_tools: None,
-                    model_switch_callback: None,
-                    pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                    strict_tool_parsing: false,
-                    parallel_tools: false,
-                    max_tool_result_chars: 30_000,
-                    context_token_budget: 100_000,
-                    receipt_generator: None,
-                    knobs: &crate::agent::loop_::LoopKnobs::default(),
-                },
+                    crate::agent::loop_::ResolvedIo {
+                        tools_registry: &tools_registry,
+                        observer: &observability::NoopObserver {},
+                        silent: true,
+                        approval: None,
+                        multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                        config: None,
+                        hooks: None,
+                        activated_tools: None,
+                        model_switch_callback: None,
+                        receipt_generator: None,
+                    },
+                    crate::agent::loop_::ResolvedRuntimeKnobs {
+                        max_tool_iterations: 5,
+                        excluded_tools: &[],
+                        dedup_exempt_tools: &[],
+                        pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                        strict_tool_parsing: false,
+                        parallel_tools: false,
+                        max_tool_result_chars: 30_000,
+                        context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                            model_context_window: 100_000,
+                            context_token_budget: 100_000,
+                            model_context_window_source:
+                                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+                        },
+                        context_limits_resolver: None,
+                        knobs: &crate::agent::loop_::LoopKnobs::default(),
+                    },
+                ),
                 history: &mut history,
+                // Test transcripts start fresh: no prior trim, no crumb.
+                history_has_trim_breadcrumb: &mut false,
+                injected_memory_preamble: &mut None,
                 channel_name: "cli",
                 channel_reply_target: None,
                 cancellation_token: None,
@@ -1157,7 +1300,8 @@ async fn safety_net_turn_survives_in_loop_history_pruning() {
     let filler = "x".repeat(400);
     let runtime = zeroclaw_config::schema::ResolvedRuntime {
         // ~40 seeded messages × (100 tokens content + 4 framing) ≫ 500.
-        max_context_tokens: 500,
+        // Explicit absolute budget keeps proactive trimming at 500.
+        max_context_tokens: Some(500),
         ..zeroclaw_config::schema::ResolvedRuntime::default()
     };
 
@@ -1856,7 +2000,7 @@ fn approval_agent(
     let mut agent = builder.build().expect("agent builder should succeed");
     if let Some(ch) = channel {
         let handle: tools::PerToolChannelHandle =
-            Arc::new(parking_lot::RwLock::new(HashMap::new()));
+            Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
         agent.channel_handles.ask_user = Some(handle);
         agent.channel_handles().register_channel("acp", ch);
     }
@@ -2113,5 +2257,1655 @@ async fn safety_net_loop_cron_add_does_not_trust_model_supplied_approved_arg() {
     assert_eq!(
         args["approved"], false,
         "model-supplied approved=true must be stripped even with no approval gate"
+    );
+}
+
+// ── seam: pre-tool narration must reach event consumers in order ────────
+// ACP and other event-driven channels render message content exclusively
+// from `TurnEvent::Chunk`. Narration that accompanies a tool-call response
+// must be emitted as a Chunk before that round's ToolCall event, or the
+// client drops it and only the text after the last tool call renders.
+
+type StreamScriptItem =
+    zeroclaw_api::model_provider::StreamResult<zeroclaw_api::model_provider::StreamEvent>;
+
+/// Streams one scripted event list per provider call; the non-streaming
+/// `chat` path answers with a marker so a test that expected the streaming
+/// engine fails loudly instead of silently changing subject.
+struct ScriptedStreamProvider {
+    scripts: parking_lot::Mutex<VecDeque<Vec<StreamScriptItem>>>,
+}
+
+impl ScriptedStreamProvider {
+    fn new(scripts: Vec<Vec<StreamScriptItem>>) -> Self {
+        Self {
+            scripts: parking_lot::Mutex::new(scripts.into()),
+        }
+    }
+}
+
+#[async_trait]
+impl ModelProvider for ScriptedStreamProvider {
+    async fn chat_with_system(
+        &self,
+        _: Option<&str>,
+        _: &str,
+        _: &str,
+        _: Option<f64>,
+    ) -> Result<String> {
+        Ok("ok".into())
+    }
+    async fn chat(&self, _: ChatRequest<'_>, _: &str, _: Option<f64>) -> Result<ChatResponse> {
+        Ok(text_response("unexpected non-streamed fallback"))
+    }
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+    fn supports_streaming_tool_events(&self) -> bool {
+        true
+    }
+    fn stream_chat(
+        &self,
+        _: ChatRequest<'_>,
+        _: &str,
+        _: Option<f64>,
+        _: zeroclaw_providers::traits::StreamOptions,
+    ) -> futures_util::stream::BoxStream<'static, StreamScriptItem> {
+        use futures_util::StreamExt as _;
+        let script = self
+            .scripts
+            .lock()
+            .pop_front()
+            .unwrap_or_else(|| vec![Ok(zeroclaw_api::model_provider::StreamEvent::Final)]);
+        futures_util::stream::iter(script).boxed()
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for ScriptedStreamProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        "ScriptedStreamProvider"
+    }
+}
+
+fn narrated_tool_response(narration: &str, id: &str, name: &str) -> ChatResponse {
+    let mut response = tool_response(vec![tool_call(id, name)]);
+    response.text = Some(narration.into());
+    response
+}
+
+#[tokio::test]
+async fn safety_net_pretool_narration_chunk_precedes_tool_call_events() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = build_agent(
+        Box::new(ScriptedProvider::new(vec![
+            narrated_tool_response("let me check that for you", "tc-1", "echo"),
+            text_response("all done"),
+        ])),
+        vec![Box::new(CountingTool {
+            name: "echo",
+            calls,
+        })],
+    );
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let handle = zeroclaw_spawn::spawn!(async move {
+        agent
+            .turn_streamed_with_steering_state("narrate then act", tx, None, None)
+            .await
+    });
+    let mut events = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        events.push(ev);
+    }
+    handle
+        .await
+        .expect("task join")
+        .expect("streamed turn should succeed");
+
+    let pos_narration = events
+        .iter()
+        .position(|e| {
+            matches!(e, TurnEvent::Chunk { delta } if delta.contains("let me check that for you"))
+        })
+        .expect("pre-tool narration must be emitted as a Chunk");
+    let pos_tool_call = events
+        .iter()
+        .position(|e| matches!(e, TurnEvent::ToolCall { id, .. } if id == "tc-1"))
+        .expect("ToolCall event must be emitted");
+    let pos_tool_result = events
+        .iter()
+        .position(|e| matches!(e, TurnEvent::ToolResult { id, .. } if id == "tc-1"))
+        .expect("ToolResult event must be emitted");
+    let pos_final = events
+        .iter()
+        .rposition(|e| matches!(e, TurnEvent::Chunk { delta } if delta.contains("all done")))
+        .expect("final response text must be emitted as a Chunk");
+
+    assert!(
+        pos_narration < pos_tool_call,
+        "narration Chunk must precede that round's ToolCall event"
+    );
+    assert!(
+        pos_tool_call < pos_tool_result,
+        "ToolCall must precede its ToolResult"
+    );
+    assert!(
+        pos_tool_result < pos_final,
+        "final-round Chunk must follow the ToolResult"
+    );
+    let narration_chunks = events
+        .iter()
+        .filter(|e| {
+            matches!(e, TurnEvent::Chunk { delta } if delta.contains("let me check that for you"))
+        })
+        .count();
+    assert_eq!(
+        narration_chunks, 1,
+        "narration must be emitted exactly once"
+    );
+}
+
+#[tokio::test]
+async fn safety_net_live_streamed_tool_turn_does_not_duplicate_narration_chunk() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = build_agent(
+        Box::new(ScriptedStreamProvider::new(vec![
+            vec![
+                text_delta("thinking aloud"),
+                Ok(zeroclaw_api::model_provider::StreamEvent::ToolCall(
+                    tool_call("tc-1", "echo"),
+                )),
+                Ok(zeroclaw_api::model_provider::StreamEvent::Final),
+            ],
+            vec![
+                text_delta("all done"),
+                Ok(zeroclaw_api::model_provider::StreamEvent::Final),
+            ],
+        ])),
+        vec![Box::new(CountingTool {
+            name: "echo",
+            calls,
+        })],
+    );
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let handle = zeroclaw_spawn::spawn!(async move {
+        agent
+            .turn_streamed_with_steering_state("stream narrate then act", tx, None, None)
+            .await
+    });
+    let mut events = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        events.push(ev);
+    }
+    handle
+        .await
+        .expect("task join")
+        .expect("streamed turn should succeed");
+
+    let narration_chunks = events
+        .iter()
+        .filter(|e| matches!(e, TurnEvent::Chunk { delta } if delta.contains("thinking aloud")))
+        .count();
+    assert_eq!(
+        narration_chunks, 1,
+        "live-streamed narration must appear exactly once (no post-hoc duplicate)"
+    );
+    let pos_narration = events
+        .iter()
+        .position(|e| matches!(e, TurnEvent::Chunk { delta } if delta.contains("thinking aloud")))
+        .expect("live narration Chunk must be emitted");
+    let pos_tool_call = events
+        .iter()
+        .position(|e| matches!(e, TurnEvent::ToolCall { id, .. } if id == "tc-1"))
+        .expect("ToolCall event must be emitted");
+    assert!(
+        pos_narration < pos_tool_call,
+        "live narration Chunk must precede that round's ToolCall event"
+    );
+}
+
+/// Round 1 streams a live prefix, then a delta whose trailing `<tool` is held
+/// by the stream guard as a possible incomplete protocol opener; the guard
+/// releases it at `finish()` and the release still streams live, so the
+/// remainder the tool-call branch computes is empty on this path. This pins
+/// that the event consumer receives the complete narration exactly once,
+/// before the round's `ToolCall`, and that the branch does not replay text the
+/// live stream already delivered.
+#[tokio::test]
+async fn safety_net_guard_held_narration_suffix_reaches_event_consumer_live_before_tool_call() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = build_agent(
+        Box::new(ScriptedStreamProvider::new(vec![
+            vec![
+                text_delta("About to "),
+                text_delta("check the <tool"),
+                Ok(zeroclaw_api::model_provider::StreamEvent::ToolCall(
+                    tool_call("tc-1", "echo"),
+                )),
+                Ok(zeroclaw_api::model_provider::StreamEvent::Final),
+            ],
+            vec![
+                text_delta("all done"),
+                Ok(zeroclaw_api::model_provider::StreamEvent::Final),
+            ],
+        ])),
+        vec![Box::new(CountingTool {
+            name: "echo",
+            calls: Arc::clone(&calls),
+        })],
+    );
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let handle = zeroclaw_spawn::spawn!(async move {
+        agent
+            .turn_streamed_with_steering_state("guard-held suffix", tx, None, None)
+            .await
+    });
+    let mut events = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        events.push(ev);
+    }
+    handle
+        .await
+        .expect("task join")
+        .expect("streamed turn should succeed");
+
+    let pos_tool_call = events
+        .iter()
+        .position(|e| matches!(e, TurnEvent::ToolCall { id, .. } if id == "tc-1"))
+        .expect("ToolCall event must be emitted");
+    let pos_tool_result = events
+        .iter()
+        .position(|e| matches!(e, TurnEvent::ToolResult { id, .. } if id == "tc-1"))
+        .expect("ToolResult event must be emitted");
+
+    let chunk_text = |slice: &[TurnEvent]| -> String {
+        slice
+            .iter()
+            .filter_map(|e| match e {
+                TurnEvent::Chunk { delta } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    assert_eq!(
+        chunk_text(&events[..pos_tool_call]),
+        "About to check the <tool",
+        "pre-ToolCall Chunks must concatenate to the full narration, live, exactly once"
+    );
+    assert!(
+        !events[pos_tool_call..pos_tool_result]
+            .iter()
+            .any(|e| matches!(e, TurnEvent::Chunk { .. })),
+        "no Chunk may be emitted between the round's ToolCall and its ToolResult"
+    );
+    assert_eq!(
+        chunk_text(&events[pos_tool_result..]),
+        "all done",
+        "post-ToolResult Chunks must concatenate to the final-round text"
+    );
+    assert_eq!(
+        chunk_text(&events).matches("About to ").count(),
+        1,
+        "the live-streamed prefix must occur exactly once across the whole turn"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the tool must run exactly once"
+    );
+}
+
+#[tokio::test]
+async fn safety_net_protocol_suppressed_tool_turn_emits_no_narration_chunk() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    // Round 1 streams visible narration followed by an internal tool-protocol
+    // envelope. The stream text guard withholds the envelope (and everything
+    // after it), so the turn is protocol-suppressed: the withheld bytes must
+    // never surface as a Chunk, and the already-forwarded narration must not
+    // gain a post-hoc duplicate.
+    let mut agent = build_agent(
+        Box::new(ScriptedStreamProvider::new(vec![
+            vec![
+                text_delta("thinking aloud"),
+                text_delta("<tool_call>{\"name\": \"echo\", \"arguments\": {}}</tool_call>"),
+                Ok(zeroclaw_api::model_provider::StreamEvent::ToolCall(
+                    tool_call("tc-1", "echo"),
+                )),
+                Ok(zeroclaw_api::model_provider::StreamEvent::Final),
+            ],
+            vec![
+                text_delta("all done"),
+                Ok(zeroclaw_api::model_provider::StreamEvent::Final),
+            ],
+        ])),
+        vec![Box::new(CountingTool {
+            name: "echo",
+            calls,
+        })],
+    );
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let handle = zeroclaw_spawn::spawn!(async move {
+        agent
+            .turn_streamed_with_steering_state("suppressed envelope", tx, None, None)
+            .await
+    });
+    let mut events = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        events.push(ev);
+    }
+    handle
+        .await
+        .expect("task join")
+        .expect("streamed turn should succeed");
+
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            TurnEvent::Chunk { delta } if delta.contains("tool_call")
+        )),
+        "protocol-suppressed bytes must never surface as a Chunk"
+    );
+    let narration_chunks = events
+        .iter()
+        .filter(|e| matches!(e, TurnEvent::Chunk { delta } if delta.contains("thinking aloud")))
+        .count();
+    assert_eq!(
+        narration_chunks, 1,
+        "protocol-suppressed turn must not duplicate the already-forwarded narration"
+    );
+}
+
+#[tokio::test]
+async fn safety_net_narration_reaches_both_draft_and_event_channels_once() {
+    let exec_count = Arc::new(AtomicUsize::new(0));
+    let provider = ScriptedProvider::new(vec![
+        narrated_tool_response("let me check that for you", "tc-1", "echo"),
+        text_response("all done"),
+    ]);
+    let tools_registry =
+        crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(CountingTool {
+            name: "echo",
+            calls: Arc::clone(&exec_count),
+        })]);
+    let mut history = vec![ChatMessage::user("hi")];
+    let (dtx, mut drx) = mpsc::channel(256);
+    let (etx, mut erx) = mpsc::channel(256);
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+        parent_agent_alias: None,
+        sop_reassembly: None,
+        exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
+            crate::agent::loop_::ResolvedModelAccess {
+                model_provider: &provider,
+                provider_name: "mock",
+                model: "mock-model",
+                dispatch_model: "mock-model",
+                temperature: None,
+            },
+            crate::agent::loop_::ResolvedIo {
+                tools_registry: &tools_registry,
+                observer: &observability::NoopObserver {},
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                hooks: None,
+                activated_tools: None,
+                model_switch_callback: None,
+                receipt_generator: None,
+            },
+            crate::agent::loop_::ResolvedRuntimeKnobs {
+                max_tool_iterations: 5,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 30_000,
+                context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+                context_limits_resolver: None,
+                knobs: &crate::agent::loop_::LoopKnobs::default(),
+            },
+        ),
+        history: &mut history,
+        history_has_trim_breadcrumb: &mut false,
+        injected_memory_preamble: &mut None,
+        channel_name: "cli",
+        channel_reply_target: None,
+        cancellation_token: None,
+        on_delta: Some(dtx),
+        shared_budget: None,
+        channel: None,
+        collected_receipts: None,
+        event_tx: Some(etx),
+        steering: None,
+        new_messages_out: None,
+        image_cache: None,
+        memory: None,
+        ingress: IngressContext::sub_turn(),
+        agent_alias: None,
+        turn_id: &turn_id,
+        served_route_sink: None,
+    })
+    .await
+    .expect("loop should succeed");
+
+    let mut draft_narration = 0;
+    while let Ok(delta) = drx.try_recv() {
+        if let crate::agent::loop_::StreamDelta::Text(t) = &delta
+            && t.contains("let me check that for you")
+        {
+            draft_narration += 1;
+        }
+    }
+    assert_eq!(
+        draft_narration, 1,
+        "draft channel must receive the narration exactly once"
+    );
+
+    let mut event_narration = 0;
+    while let Some(ev) = erx.recv().await {
+        if let TurnEvent::Chunk { delta } = &ev
+            && delta.contains("let me check that for you")
+        {
+            event_narration += 1;
+        }
+    }
+    assert_eq!(
+        event_narration, 1,
+        "event channel must receive the narration exactly once"
+    );
+}
+
+#[tokio::test]
+async fn safety_net_terminal_malformed_fallback_reaches_event_consumer_after_tool() {
+    // A narrated valid tool round, then the malformed-protocol retry budget
+    // exhausts. The terminal fallback is the turn's last word on the event
+    // channel: it must be emitted as a Chunk after the ToolResult, because a
+    // client that already flushed streamed narration hides the TurnComplete
+    // payload and would otherwise settle the turn with no explanation.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = build_agent(
+        Box::new(ScriptedProvider::new(vec![
+            narrated_tool_response("let me check that for you", "tc-1", "echo"),
+            text_response(r#"{"toolcalls":[{"call_id":"call_1","arguments":{"value":"X"}}]}"#),
+            text_response(r#"{"toolcalls":[{"call_id":"call_2","arguments":{"value":"Y"}}]}"#),
+            text_response(r#"{"toolcalls":[{"call_id":"call_3","arguments":{"value":"Z"}}]}"#),
+        ])),
+        vec![Box::new(CountingTool {
+            name: "echo",
+            calls: Arc::clone(&calls),
+        })],
+    );
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let handle = zeroclaw_spawn::spawn!(async move {
+        agent
+            .turn_streamed_with_steering_state("narrate then break", tx, None, None)
+            .await
+    });
+    let mut events = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        events.push(ev);
+    }
+    handle
+        .await
+        .expect("task join")
+        .expect("turn should end with the safe fallback");
+
+    let fallback_text =
+        crate::i18n::get_english_cli_string_with_args("channel-runtime-malformed-tool-output", &[]);
+    let pos_narration = events
+        .iter()
+        .position(|e| {
+            matches!(e, TurnEvent::Chunk { delta } if delta.contains("let me check that for you"))
+        })
+        .expect("pre-tool narration must be emitted as a Chunk");
+    let pos_tool_call = events
+        .iter()
+        .position(|e| matches!(e, TurnEvent::ToolCall { id, .. } if id == "tc-1"))
+        .expect("the valid tool call must emit its ToolCall event");
+    let pos_tool_result = events
+        .iter()
+        .position(|e| matches!(e, TurnEvent::ToolResult { id, .. } if id == "tc-1"))
+        .expect("the valid tool call must emit its ToolResult event");
+    let pos_fallback = events
+        .iter()
+        .rposition(|e| matches!(e, TurnEvent::Chunk { delta } if delta.contains(&fallback_text)))
+        .expect("terminal malformed-output fallback must reach the event consumer as a Chunk");
+
+    assert!(
+        pos_narration < pos_tool_call,
+        "narration Chunk must precede that round's ToolCall event"
+    );
+    assert!(
+        pos_tool_result < pos_fallback,
+        "the terminal fallback must follow the tool result"
+    );
+    let fallback_chunks = events
+        .iter()
+        .filter(|e| matches!(e, TurnEvent::Chunk { delta } if delta.contains(&fallback_text)))
+        .count();
+    assert_eq!(
+        fallback_chunks, 1,
+        "the terminal fallback must be emitted exactly once"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the valid tool round must have executed exactly once"
+    );
+}
+
+#[tokio::test]
+async fn safety_net_text_parsed_tool_call_emits_no_narration_chunk() {
+    // A provider that conveys the tool call inside the text (no native tool
+    // calls): the parser strips the markup, so the display residue is not
+    // separable narration. Parity with the on_delta relay: neither consumer
+    // emits a Chunk for it before the ToolCall event.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = build_agent(
+        Box::new(ScriptedProvider::new(vec![
+            text_response(
+                "Working on it.<tool_call>{\"name\": \"echo\", \"arguments\": {}}</tool_call>",
+            ),
+            text_response("all done"),
+        ])),
+        vec![Box::new(CountingTool {
+            name: "echo",
+            calls: Arc::clone(&calls),
+        })],
+    );
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let handle = zeroclaw_spawn::spawn!(async move {
+        agent
+            .turn_streamed_with_steering_state("markup tool call", tx, None, None)
+            .await
+    });
+    let mut events = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        events.push(ev);
+    }
+    handle
+        .await
+        .expect("task join")
+        .expect("streamed turn should succeed");
+
+    let pos_tool_call = events
+        .iter()
+        .position(|e| matches!(e, TurnEvent::ToolCall { name, .. } if name == "echo"))
+        .expect("the text-parsed tool call must emit its ToolCall event");
+    assert!(
+        !events[..pos_tool_call]
+            .iter()
+            .any(|e| matches!(e, TurnEvent::Chunk { .. })),
+        "no narration Chunk may precede the ToolCall event for a text-parsed call"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, TurnEvent::Chunk { delta } if delta.contains("Working on it."))),
+        "the markup-stripped residue must not surface as a narration Chunk"
+    );
+    let pos_tool_result = events
+        .iter()
+        .position(|e| matches!(e, TurnEvent::ToolResult { name, .. } if name == "echo"))
+        .expect("the text-parsed tool call must emit its ToolResult event");
+    let pos_final = events
+        .iter()
+        .rposition(|e| matches!(e, TurnEvent::Chunk { delta } if delta.contains("all done")))
+        .expect("final response text must be emitted as a Chunk");
+    assert!(
+        pos_tool_result < pos_final,
+        "final-round Chunk must follow the ToolResult"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the text-parsed tool call must have executed exactly once"
+    );
+}
+
+#[tokio::test]
+async fn usage_event_coherent_tuple_vision_route() {
+    use crate::agent::agent::ProviderSwitchConfig;
+    use crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use zeroclaw_config::schema::MultimodalConfig;
+
+    // Two cells: vision provider with and without an explicit context_window.
+    // Vision routing must emit Usage with the vision provider's ref + model,
+    // the resolved window must track the vision provider's context_window, and
+    // the BASE provider's window must not cross-contaminate.
+    for vision_window in [Some(200_000_u64), None] {
+        let (input_tokens, output_tokens) = (50_u64, 10_u64);
+        let (input_rate, output_rate) = (1.5_f64, 3.0_f64);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "vision analysis complete"}],
+                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+                "stop_reason": "end_turn",
+                "model": "claude-3-opus"
+            })))
+            .mount(&server)
+            .await;
+
+        let mut cfg = Config::default();
+        let base = cfg
+            .providers
+            .models
+            .ensure("openai", "default")
+            .expect("ensure base");
+        base.context_window = Some(128_000); // must remain on the BASE provider only
+        base.model = Some("gpt-4o-mini".into());
+        let vision = cfg
+            .providers
+            .models
+            .ensure("anthropic", "vision")
+            .expect("ensure vision provider");
+        if let Some(w) = vision_window {
+            vision.context_window = Some(w as usize);
+        }
+        vision.vision = Some(true);
+        vision.api_key = Some("test-key".into());
+        vision.uri = Some(server.uri());
+        vision.model = Some("claude-3-opus".into());
+        vision
+            .pricing
+            .insert("claude-3-opus.input".into(), input_rate);
+        vision
+            .pricing
+            .insert("claude-3-opus.output".into(), output_rate);
+        vision
+            .pricing
+            .insert("claude-3-opus.cached_input".into(), 0.0);
+
+        let cfg_arc = Arc::new(cfg.clone());
+        let switch_cfg = ProviderSwitchConfig {
+            config: Some(cfg_arc.clone()),
+            live: None,
+        };
+        let mut base_resp = text_response("base response");
+        base_resp.usage = Some(token_usage(1, 1));
+        let provider = ScriptedProvider::new(vec![base_resp]);
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(provider))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(mem_none(std::path::Path::new("/tmp")))
+            .observer(Arc::from(observability::NoopObserver {}) as Arc<dyn Observer>)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_provider_name("openai.default".into())
+            .model_name("gpt-4o-mini".into())
+            .provider_switch_config(switch_cfg)
+            .build()
+            .expect("agent builder should succeed");
+        agent.multimodal_config = MultimodalConfig {
+            vision_model_provider: Some("anthropic.vision".into()),
+            vision_model: Some("claude-3-opus".into()),
+            ..Default::default()
+        };
+
+        // Wire a real CostTracker + provider-keyed pricing map so cost_usd
+        // is computed (mirrors ws.rs::process_chat_message). The pricing map
+        // keys the SERVING provider (anthropic.vision) only, so a coherent
+        // tuple yields Some(expected_cost) and a misattributed tuple yields 0.
+        let (_tracker, cost_ctx) =
+            build_cost_context("anthropic.vision", "claude-3-opus", input_rate, output_rate);
+
+        // Vision routing triggers on an image marker in the prompt. Write a
+        // temp image and rewrite the prompt; clean up after the turn so the
+        // second cell iteration doesn't pile up temp files.
+        let img_path = std::env::temp_dir()
+            .join(format!("matrix_vision_{vision_window:?}.png").replace(['(', ')', ' '], "_"));
+        std::fs::write(&img_path, b"fake-png-data").expect("write temp image");
+        let prompt = format!("Analyze this image: [IMAGE:{}]", img_path.display());
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
+        let mut capture_agent = agent;
+        let handle = zeroclaw_spawn::spawn!(async move {
+            TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(
+                    Some(cost_ctx.clone()),
+                    capture_agent.turn_streamed_with_steering_state(&prompt, tx, None, None),
+                )
+                .await
+        });
+        let mut events: Vec<TurnEvent> = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        let _ = handle
+            .await
+            .expect("task join")
+            .expect("turn should succeed");
+        let _ = std::fs::remove_file(img_path);
+
+        // Find the (single) Usage event from the vision-serving call.
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                TurnEvent::Usage {
+                    provider_ref,
+                    model,
+                    input_tokens,
+                    output_tokens,
+                    cost_usd,
+                    ..
+                } => Some((
+                    provider_ref.clone(),
+                    model.clone(),
+                    *input_tokens,
+                    *output_tokens,
+                    *cost_usd,
+                )),
+                _ => None,
+            })
+            .expect("vision-routed Usage event must be emitted");
+
+        assert_eq!(
+            usage.0, "anthropic.vision",
+            "Usage.provider_ref must be the vision provider"
+        );
+        assert_eq!(
+            usage.1, "claude-3-opus",
+            "Usage.model must be the vision model"
+        );
+
+        let resolved = cfg
+            .model_provider_context_window_opt(&usage.0, &usage.1)
+            .map(|v| v as u64);
+        assert_eq!(
+            resolved, vision_window,
+            "resolved window must track the vision provider's context_window, never the base's"
+        );
+
+        // Negative control: the BASE provider's window must NOT have leaked.
+        let base_resolved = cfg
+            .model_provider_context_window_opt("openai.default", "gpt-4o-mini")
+            .map(|v| v as u64);
+        assert_eq!(
+            base_resolved,
+            Some(128_000),
+            "base provider's window must remain 128_000 (no cross-contamination)"
+        );
+
+        let expected_cost = (input_tokens as f64) * input_rate / 1_000_000.0
+            + (output_tokens as f64) * output_rate / 1_000_000.0;
+        let observed = usage.4.expect("Usage.cost_usd must be Some(_)");
+        let diff = (observed - expected_cost).abs();
+        let tol = expected_cost.max(1e-9) * 1e-6;
+        assert!(
+            diff <= tol,
+            "Usage.cost_usd ({observed}) must match vision pricing × tokens ({expected_cost})"
+        );
+
+        assert_eq!(
+            usage.2,
+            Some(input_tokens),
+            "input_tokens must flow through"
+        );
+        assert_eq!(
+            usage.3,
+            Some(output_tokens),
+            "output_tokens must flow through"
+        );
+    }
+}
+
+#[tokio::test]
+async fn usage_event_coherent_tuple_in_turn_model_switch() {
+    use crate::agent::agent::ProviderSwitchConfig;
+    use crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Two cells: switched-to provider with and without an explicit context_window.
+    for switch_window in [Some(200_000_u64), None] {
+        let (input_tokens, output_tokens) = (10_u64, 5_u64);
+        let (input_rate, output_rate) = (1.5_f64, 3.0_f64);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "switched call served"}],
+                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+                "stop_reason": "end_turn",
+                "model": "claude-3-opus"
+            })))
+            .mount(&server)
+            .await;
+
+        let mut cfg = Config::default();
+        cfg.providers
+            .models
+            .ensure("openai", "primary")
+            .expect("ensure primary")
+            .context_window = Some(128_000);
+        let provider_b = cfg
+            .providers
+            .models
+            .ensure("anthropic", "provider-b")
+            .expect("ensure provider B (switched-to)");
+        if let Some(w) = switch_window {
+            provider_b.context_window = Some(w as usize);
+        }
+        provider_b.api_key = Some("test-key".into());
+        provider_b.uri = Some(server.uri());
+        provider_b.model = Some("claude-3-opus".into());
+        provider_b
+            .pricing
+            .insert("claude-3-opus.input".into(), input_rate);
+        provider_b
+            .pricing
+            .insert("claude-3-opus.output".into(), output_rate);
+        provider_b
+            .pricing
+            .insert("claude-3-opus.cached_input".into(), 0.0);
+
+        // The model route forces credential resolution to look up provider B's
+        // config entry (api_key/uri) instead of falling back to the primary's.
+        cfg.model_routes
+            .push(zeroclaw_config::schema::ModelRouteConfig {
+                hint: "matrix-switch".into(),
+                model_provider: "anthropic.provider-b".into(),
+                model: "claude-3-opus".into(),
+                api_key: None,
+            });
+
+        let cfg_arc = Arc::new(cfg.clone());
+        let switch_cfg = ProviderSwitchConfig {
+            config: Some(cfg_arc.clone()),
+            live: None,
+        };
+
+        // The ScriptedProvider returns a tool_call on its first (and only)
+        // call.  The trigger tool queues the switch; the turn loop detects
+        // it, rebuilds the provider from ProviderSwitchConfig, and the next
+        // call goes to the wiremock-backed switched-to provider.
+        let provider = ScriptedProvider::new(vec![tool_response(vec![tool_call(
+            "1",
+            "model_switch_trigger",
+        )])]);
+
+        let agent = build_aliased_agent(
+            Box::new(provider),
+            vec![Box::new(ModelSwitchTriggerTool {
+                target_provider: "anthropic.provider-b".into(),
+                target_model: "claude-3-opus".into(),
+            })],
+            "openai.primary",
+            "gpt-4o-mini",
+            "matrix-test",
+            Some(switch_cfg),
+        );
+
+        // Wire a real CostTracker + provider-keyed pricing map so cost_usd
+        // is computed (mirrors ws.rs::process_chat_message). The pricing map
+        // keys the SERVING provider only, so a coherent tuple yields
+        // Some(expected_cost) and a misattributed tuple with no pricing
+        // entries yields Some(0.0) — the assertion catches both.
+        let (_tracker, cost_ctx) = build_cost_context(
+            "anthropic.provider-b",
+            "claude-3-opus",
+            input_rate,
+            output_rate,
+        );
+
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
+        let prompt = "complete the task".to_string();
+        let mut agent = agent;
+        let (turn_result, events) = tokio::join!(
+            TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                Some(cost_ctx.clone()),
+                agent.turn_streamed_with_steering_state(&prompt, tx, None, None)
+            ),
+            async {
+                let mut evs = Vec::new();
+                while let Some(ev) = rx.recv().await {
+                    evs.push(ev);
+                }
+                evs
+            },
+        );
+        let _ = turn_result.expect("turn should succeed");
+
+        // Find the post-switch Usage event the serving call emitted. The
+        // pre-switch call (ScriptedProvider tool_call) carries no usage, so
+        // the only Usage event comes from the wiremock-backed call with the
+        // expected token counts (10, 5).
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                TurnEvent::Usage {
+                    provider_ref,
+                    model,
+                    input_tokens: it,
+                    output_tokens: ot,
+                    cost_usd,
+                    ..
+                } if *it == Some(input_tokens) && *ot == Some(output_tokens) => {
+                    Some((provider_ref.clone(), model.clone(), *it, *ot, cost_usd))
+                }
+                _ => None,
+            })
+            .expect("a Usage event must be emitted by the serving call");
+
+        // ASSERTION 1: provider_ref reflects the SERVING provider
+        assert_eq!(
+            usage.0, "anthropic.provider-b",
+            "Usage.provider_ref must be the switched-to provider",
+        );
+
+        // ASSERTION 2: model reflects the SERVING model
+        assert_eq!(
+            usage.1, "claude-3-opus",
+            "Usage.model must be the switched-to model",
+        );
+
+        // ASSERTION 3: resolve_live_model_context_window follows the
+        // SERVING provider's config_window, never the trim budget.
+        let resolved = cfg
+            .model_provider_context_window_opt(&usage.0, &usage.1)
+            .map(|v| v as u64);
+        assert_eq!(
+            resolved, switch_window,
+            "resolved window must track the switched provider's context_window",
+        );
+
+        // ASSERTION 4: cost_usd matches the serving tuple's pricing
+        let expected_cost = (input_tokens as f64) * input_rate / 1_000_000.0
+            + (output_tokens as f64) * output_rate / 1_000_000.0;
+        let observed_cost = usage.4.expect("Usage.cost_usd must be Some(_)");
+        let cost_diff = (observed_cost - expected_cost).abs();
+        let cost_tolerance = expected_cost.max(1e-9) * 1e-6;
+        assert!(
+            cost_diff <= cost_tolerance,
+            "Usage.cost_usd ({observed_cost}) must match the serving tuple's pricing × tokens ({expected_cost}) within tolerance ±{cost_tolerance}; a misattributed tuple would resolve empty pricing and compute zero",
+        );
+
+        // ASSERTION 5: token counts flow through from the serving call
+        assert_eq!(usage.2, Some(input_tokens), "input_tokens mismatch");
+        assert_eq!(usage.3, Some(output_tokens), "output_tokens mismatch");
+    }
+}
+
+#[tokio::test]
+async fn usage_by_provider_breakdown_after_in_turn_model_switch() {
+    // REQ-B2: per-provider usage breakdown after an in-turn model switch.
+    // Both providers emit usage; the resulting usage_by_provider map must
+    // contain separate entries with correct identity, tokens, and cost.
+    // last_serving_provider_ref / last_serving_model must reflect the
+    // switched-to provider, and aggregate totals must equal the sum of
+    // per-provider entries.
+    use crate::agent::agent::ProviderSwitchConfig;
+    use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let (input_tokens_a, output_tokens_a) = (25_u64, 10_u64);
+    let (input_tokens_b, output_tokens_b) = (15_u64, 8_u64);
+    let (input_rate_a, output_rate_a) = (1.0_f64, 2.0_f64);
+    let (input_rate_b, output_rate_b) = (1.5_f64, 3.0_f64);
+
+    // wiremock for switched-to provider B
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "content": [{"type": "text", "text": "switched call served"}],
+            "usage": {"input_tokens": input_tokens_b, "output_tokens": output_tokens_b},
+            "stop_reason": "end_turn",
+            "model": "claude-3-opus"
+        })))
+        .mount(&server)
+        .await;
+
+    // two-provider config
+    let mut cfg = Config::default();
+    cfg.providers
+        .models
+        .ensure("openai", "primary")
+        .expect("ensure primary")
+        .context_window = Some(128_000);
+    let provider_b = cfg
+        .providers
+        .models
+        .ensure("anthropic", "provider-b")
+        .expect("ensure provider B");
+    provider_b.context_window = Some(200_000);
+    provider_b.api_key = Some("test-key".into());
+    provider_b.uri = Some(server.uri());
+    provider_b.model = Some("claude-3-opus".into());
+    provider_b
+        .pricing
+        .insert("claude-3-opus.input".into(), input_rate_b);
+    provider_b
+        .pricing
+        .insert("claude-3-opus.output".into(), output_rate_b);
+    provider_b
+        .pricing
+        .insert("claude-3-opus.cached_input".into(), 0.0);
+
+    cfg.model_routes
+        .push(zeroclaw_config::schema::ModelRouteConfig {
+            hint: "req-b2-switch".into(),
+            model_provider: "anthropic.provider-b".into(),
+            model: "claude-3-opus".into(),
+            api_key: None,
+        });
+
+    let cfg_arc = Arc::new(cfg.clone());
+    let switch_cfg = ProviderSwitchConfig {
+        config: Some(cfg_arc),
+        live: None,
+    };
+
+    // Provider A: ScriptedProvider returns tool_call WITH usage data.
+    let mut resp_a = tool_response(vec![tool_call("1", "model_switch_trigger")]);
+    resp_a.usage = Some(token_usage(input_tokens_a, output_tokens_a));
+
+    let provider = ScriptedProvider::new(vec![resp_a]);
+
+    let agent = build_aliased_agent(
+        Box::new(provider),
+        vec![Box::new(ModelSwitchTriggerTool {
+            target_provider: "anthropic.provider-b".into(),
+            target_model: "claude-3-opus".into(),
+        })],
+        "openai.primary",
+        "gpt-4o-mini",
+        "req-b2-test",
+        Some(switch_cfg),
+    );
+
+    // cost context with pricing for BOTH providers
+    let tmpdir = tempfile::TempDir::new().unwrap();
+    let tracker = Arc::new(
+        crate::cost::CostTracker::new(
+            zeroclaw_config::schema::CostConfig::default(),
+            tmpdir.path(),
+        )
+        .expect("CostTracker::new"),
+    );
+    let pricing_map = std::collections::HashMap::from([
+        (
+            "openai.primary".to_string(),
+            std::collections::HashMap::from([
+                ("gpt-4o-mini.input".to_string(), input_rate_a),
+                ("gpt-4o-mini.output".to_string(), output_rate_a),
+                ("gpt-4o-mini.cached_input".to_string(), 0.0_f64),
+            ]),
+        ),
+        (
+            "anthropic.provider-b".to_string(),
+            std::collections::HashMap::from([
+                ("claude-3-opus.input".to_string(), input_rate_b),
+                ("claude-3-opus.output".to_string(), output_rate_b),
+                ("claude-3-opus.cached_input".to_string(), 0.0_f64),
+            ]),
+        ),
+    ]);
+    let cost_ctx = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(pricing_map));
+
+    // drive the turn, collect ALL events
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
+    let prompt = "complete the task".to_string();
+    let mut agent = agent;
+    let (turn_result, events) = tokio::join!(
+        TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+            Some(cost_ctx),
+            agent.turn_streamed_with_steering_state(&prompt, tx, None, None),
+        ),
+        async {
+            let mut evs = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                evs.push(ev);
+            }
+            evs
+        },
+    );
+    let _ = turn_result.expect("turn should succeed");
+
+    // reconstruct usage_by_provider from events (mirrors process_chat_message)
+    // Keyed by (provider_ref, model) to match production aggregation.
+    let mut usage_map: std::collections::HashMap<(String, String), (u64, u64, u64, f64)> =
+        std::collections::HashMap::new();
+
+    for event in &events {
+        if let TurnEvent::Usage {
+            provider_ref,
+            model,
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            cost_usd,
+            ..
+        } = event
+        {
+            let key = (provider_ref.clone(), model.clone());
+            let entry = usage_map.entry(key).or_default();
+            if let Some(it) = input_tokens {
+                entry.0 = entry.0.saturating_add(*it);
+            }
+            if let Some(ot) = output_tokens {
+                entry.1 = entry.1.saturating_add(*ot);
+            }
+            if let Some(ct) = cached_input_tokens {
+                entry.2 = entry.2.saturating_add(*ct);
+            }
+            if let Some(cu) = cost_usd {
+                entry.3 += cu;
+            }
+        }
+    }
+
+    // Sort by (provider_ref, model) (same as process_chat_message)
+    let mut sorted_entries: Vec<_> = usage_map.into_iter().collect();
+    sorted_entries.sort_by(|(a, _), (b, _)| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+    // ASSERTION 1: two entries — one per provider (this test uses two providers)
+    assert_eq!(
+        sorted_entries.len(),
+        2,
+        "usage_by_provider must have 2 entries (one per provider)"
+    );
+
+    // ASSERTION 2: sort order matches production (provider_ref, then model ascending).
+    assert_eq!(sorted_entries[0].0.0, "anthropic.provider-b");
+    assert_eq!(sorted_entries[0].0.1, "claude-3-opus");
+    assert_eq!(sorted_entries[1].0.0, "openai.primary");
+    assert_eq!(sorted_entries[1].0.1, "gpt-4o-mini");
+
+    // Entry 0: Provider B (anthropic.provider-b — alphabetically first)
+    let ((ref_b, model_b), (input_b, output_b, cached_b, cost_b)) = &sorted_entries[0];
+    assert_eq!(ref_b, "anthropic.provider-b");
+    assert_eq!(model_b, "claude-3-opus");
+    assert_eq!(*input_b, input_tokens_b);
+    assert_eq!(*output_b, output_tokens_b);
+    assert_eq!(*cached_b, 0);
+    let expected_cost_b = input_tokens_b as f64 * input_rate_b / 1_000_000.0
+        + output_tokens_b as f64 * output_rate_b / 1_000_000.0;
+    let diff_b = (*cost_b - expected_cost_b).abs();
+    assert!(
+        diff_b <= expected_cost_b.max(1e-9) * 1e-6,
+        "Provider B cost {cost_b} must match pricing × tokens ({expected_cost_b})"
+    );
+
+    // Entry 1: Provider A (openai.primary — alphabetically second)
+    let ((ref_a, model_a), (input_a, output_a, cached_a, cost_a)) = &sorted_entries[1];
+    assert_eq!(ref_a, "openai.primary");
+    assert_eq!(model_a, "gpt-4o-mini");
+    assert_eq!(*input_a, input_tokens_a);
+    assert_eq!(*output_a, output_tokens_a);
+    assert_eq!(*cached_a, 0);
+    let expected_cost_a = input_tokens_a as f64 * input_rate_a / 1_000_000.0
+        + output_tokens_a as f64 * output_rate_a / 1_000_000.0;
+    let diff_a = (*cost_a - expected_cost_a).abs();
+    assert!(
+        diff_a <= expected_cost_a.max(1e-9) * 1e-6,
+        "Provider A cost {cost_a} must match pricing × tokens ({expected_cost_a})"
+    );
+
+    // ASSERTION 3: aggregate totals equal the sum of per-provider entries.
+    // Catches double-counting or dropped entries that a per-entry-only check misses.
+    let agg_input: u64 = sorted_entries.iter().map(|(_, (i, _, _, _))| *i).sum();
+    let agg_output: u64 = sorted_entries.iter().map(|(_, (_, o, _, _))| *o).sum();
+    let agg_cost: f64 = sorted_entries.iter().map(|(_, (_, _, _, c))| *c).sum();
+    assert_eq!(
+        agg_input,
+        input_tokens_a + input_tokens_b,
+        "aggregate input_tokens must equal sum of per-provider entries"
+    );
+    assert_eq!(
+        agg_output,
+        output_tokens_a + output_tokens_b,
+        "aggregate output_tokens must equal sum of per-provider entries"
+    );
+    let expected_agg_cost = expected_cost_a + expected_cost_b;
+    let agg_cost_diff = (agg_cost - expected_agg_cost).abs();
+    assert!(
+        agg_cost_diff <= expected_agg_cost.max(1e-9) * 1e-6,
+        "aggregate cost {agg_cost} must equal sum of per-provider costs ({expected_agg_cost})"
+    );
+
+    // last_serving_provider_ref and last_serving_model reflect Provider B
+    let last_usage = events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            TurnEvent::Usage {
+                provider_ref,
+                model,
+                ..
+            } => Some((provider_ref.clone(), model.clone())),
+            _ => None,
+        })
+        .expect("at least one Usage event");
+    assert_eq!(
+        last_usage.0, "anthropic.provider-b",
+        "last_serving_provider_ref must be the switched-to provider"
+    );
+    assert_eq!(
+        last_usage.1, "claude-3-opus",
+        "last_serving_model must be the switched-to model"
+    );
+
+    // context_window resolved from Provider B's config
+    let resolved_b = cfg
+        .model_provider_context_window_opt("anthropic.provider-b", "claude-3-opus")
+        .map(|v| v as u64);
+    assert_eq!(resolved_b, Some(200_000));
+}
+
+#[tokio::test]
+async fn usage_event_emitted_even_without_usage_data() {
+    // Regression: REQ-B1 — a provider call that succeeds without usage
+    // must still emit TurnEvent::Usage (with None token fields) so the
+    // gateway propagates the serving identity to the done frame.
+
+    let (input_rate, output_rate) = (1.5_f64, 3.0_f64);
+
+    // Provider response with usage: None (simulates OpenAI Codex,
+    // cached responses, or any API path that omits usage)
+    let mut resp = text_response("no usage data");
+    resp.usage = None;
+
+    let provider = ScriptedProvider::new(vec![resp]);
+
+    let agent = build_aliased_agent(
+        Box::new(provider),
+        vec![],
+        "openai.default",
+        "gpt-4o-mini",
+        "req-b1-test",
+        None,
+    );
+
+    let (_tracker, cost_ctx) =
+        build_cost_context("openai.default", "gpt-4o-mini", input_rate, output_rate);
+
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
+    let prompt = "hello".to_string();
+    let mut agent = agent;
+    let handle = zeroclaw_spawn::spawn!(async move {
+        crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(cost_ctx),
+                agent.turn_streamed_with_steering_state(&prompt, tx, None, None),
+            )
+            .await
+    });
+
+    let mut events: Vec<TurnEvent> = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        events.push(ev);
+    }
+    let _ = handle
+        .await
+        .expect("task join")
+        .expect("turn should succeed");
+
+    // Find a Usage event — must exist even though the response had no usage data
+    let usage = events
+        .iter()
+        .find_map(|e| match e {
+            TurnEvent::Usage {
+                provider_ref,
+                model,
+                input_tokens,
+                output_tokens,
+                cost_usd,
+                ..
+            } => Some((
+                provider_ref.as_str(),
+                model.as_str(),
+                *input_tokens,
+                *output_tokens,
+                *cost_usd,
+            )),
+            _ => None,
+        })
+        .expect("TurnEvent::Usage must be emitted even without usage data");
+
+    // ASSERTION 1: Identity reflects the serving provider/model
+    assert_eq!(usage.0, "openai.default");
+    assert_eq!(usage.1, "gpt-4o-mini");
+
+    // ASSERTION 2: Token fields are None (no usage data from provider)
+    assert_eq!(
+        usage.2, None,
+        "input_tokens must be None when no usage data"
+    );
+    assert_eq!(
+        usage.3, None,
+        "output_tokens must be None when no usage data"
+    );
+
+    // ASSERTION 3: Cost is None (no usage → no cost computation)
+    assert_eq!(usage.4, None, "cost_usd must be None when no usage data");
+}
+
+#[tokio::test]
+async fn usage_identity_updates_on_subsequent_calls_without_usage() {
+    // REQ-B1 full path: Provider A emits usage → switch to B →
+    // B succeeds without usage → last Usage event shows B's identity.
+
+    // ScriptedProvider: first call has usage, second call has no usage
+    let mut resp_a = text_response("call with usage");
+    resp_a.usage = Some(token_usage(10, 5));
+    let mut resp_b = text_response("call without usage");
+    resp_b.usage = None;
+
+    let provider = ScriptedProvider::new(vec![resp_a, resp_b]);
+
+    let agent = build_aliased_agent(
+        Box::new(provider),
+        vec![],
+        "openai.default",
+        "gpt-4o-mini",
+        "req-b1-test",
+        None,
+    );
+
+    let (_tracker, cost_ctx) = build_cost_context("openai.default", "gpt-4o-mini", 1.5, 3.0);
+
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
+    let prompt = "hello".to_string();
+    let mut agent = agent;
+    let handle = zeroclaw_spawn::spawn!(async move {
+        crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(cost_ctx),
+                agent.turn_streamed_with_steering_state(&prompt, tx, None, None),
+            )
+            .await
+    });
+
+    let mut events: Vec<TurnEvent> = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        events.push(ev);
+    }
+    let _ = handle
+        .await
+        .expect("task join")
+        .expect("turn should succeed");
+
+    // Find the LAST Usage event
+    let last_usage = events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            TurnEvent::Usage {
+                provider_ref,
+                model,
+                ..
+            } => Some((provider_ref.as_str(), model.as_str())),
+            _ => None,
+        })
+        .expect("at least one Usage event");
+
+    // Identity MUST reflect the most recent provider call
+    // (ScriptedProvider uses the same provider_ref for all calls, so this
+    // verifies the event is emitted for each call with the correct identity)
+    assert_eq!(
+        last_usage.0, "openai.default",
+        "last Usage identity must reflect the most recent provider call"
+    );
+    assert_eq!(
+        last_usage.1, "gpt-4o-mini",
+        "last Usage model must reflect the most recent provider call"
+    );
+}
+
+/// Cross-provider boundary: Provider A reports usage → Provider B (different
+/// provider_ref) succeeds without usage. Verifies the final Usage event
+/// identity and ceiling reflect B, not A. This exercises REQ-B2 boundary.
+#[tokio::test]
+async fn usage_identity_crosses_provider_boundary_without_usage() {
+    use zeroclaw_providers::reliable::ReliableModelProvider;
+
+    // Provider A: fails on first call (simulating rejection)
+    struct FailingProvider;
+    #[async_trait]
+    impl ModelProvider for FailingProvider {
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            Err(anyhow::Error::msg("provider A failed"))
+        }
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Err(anyhow::Error::msg("provider A failed"))
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for FailingProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "FailingProvider"
+        }
+    }
+
+    // Provider B: returns no usage (success without usage)
+    let mut resp_b = text_response("call without usage from B");
+    resp_b.usage = None;
+    let provider_b = ScriptedProvider::new(vec![resp_b]);
+
+    // Wrap in ReliableModelProvider with two different provider_refs
+    let reliable = ReliableModelProvider::new(
+        "test-reliable",
+        vec![
+            (
+                "provider-a".to_string(),
+                Box::new(FailingProvider) as Box<dyn ModelProvider>,
+            ),
+            (
+                "provider-b".to_string(),
+                Box::new(provider_b) as Box<dyn ModelProvider>,
+            ),
+        ],
+        0, // no retries
+        1,
+    );
+
+    let agent = build_aliased_agent(
+        Box::new(reliable),
+        vec![],
+        "test-reliable",
+        "model-a", // initial model
+        "cross-provider-test",
+        None,
+    );
+
+    let (_tracker, cost_ctx) = build_cost_context("provider-a", "model-a", 1.5, 3.0);
+
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
+    let prompt = "hello".to_string();
+    let mut agent = agent;
+    let handle = zeroclaw_spawn::spawn!(async move {
+        crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(cost_ctx),
+                agent.turn_streamed_with_steering_state(&prompt, tx, None, None),
+            )
+            .await
+    });
+
+    let mut events: Vec<TurnEvent> = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        events.push(ev);
+    }
+    let _ = handle
+        .await
+        .expect("task join")
+        .expect("turn should succeed");
+
+    // Find the LAST Usage event
+    let last_usage = events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            TurnEvent::Usage {
+                provider_ref,
+                model,
+                ..
+            } => Some((provider_ref.as_str(), model.as_str())),
+            _ => None,
+        })
+        .expect("at least one Usage event");
+
+    // Identity MUST reflect the most recent provider call (provider-b)
+    // even though provider-a had usage and provider-b had no usage
+    assert_eq!(
+        last_usage.0, "provider-b",
+        "last Usage provider_ref must reflect the most recent provider call (B), not A"
+    );
+    assert_eq!(
+        last_usage.1, "model-a",
+        "last Usage model must reflect the most recent provider call"
+    );
+}
+
+// ── model_switch through a poisoned callback ────────────────────────────
+
+/// Regression: `ModelSwitchTool::handle_set` writes the pending switch through
+/// a poisoned guard, so the loop's per-iteration check must read through one
+/// too. Under the old `let Ok(guard) = callback.lock()` chain a poisoned
+/// callback short-circuited the check and the requested switch was dropped
+/// silently after the tool had already reported success.
+#[tokio::test]
+async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
+    use crate::agent::loop_::{
+        LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
+        ToolLoop, is_model_switch_requested, run_tool_call_loop,
+    };
+
+    let callback: Arc<std::sync::Mutex<Option<(String, String)>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    // Poison the mutex the only way it can happen in production: a panic while
+    // the guard is held, after the pending switch has been written.
+    let poisoner = Arc::clone(&callback);
+    let poisoning_thread = std::thread::spawn(move || {
+        let mut guard = poisoner
+            .lock()
+            .expect("a fresh lock cannot be poisoned yet");
+        *guard = Some((
+            "switched-provider".to_string(),
+            "switched-model".to_string(),
+        ));
+        panic!("poison the model-switch callback on purpose");
+    })
+    .join();
+    assert!(poisoning_thread.is_err(), "the poisoning thread must panic");
+    assert!(
+        callback.is_poisoned(),
+        "the callback mutex must be poisoned"
+    );
+
+    let provider = ScriptedProvider::new(vec![text_response("never reached")]);
+    let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+    let mut history = vec![ChatMessage::user("hi")];
+    let (dtx, _drx) = mpsc::channel(256);
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    let result = run_tool_call_loop(ToolLoop {
+        parent_agent_alias: None,
+        sop_reassembly: None,
+        exec: ResolvedAgentExecution::resolve(
+            ResolvedModelAccess {
+                model_provider: &provider,
+                provider_name: "mock",
+                model: "mock-model",
+                dispatch_model: "mock-model",
+                temperature: None,
+            },
+            ResolvedIo {
+                tools_registry: &tools_registry,
+                observer: &observability::NoopObserver {},
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                hooks: None,
+                activated_tools: None,
+                model_switch_callback: Some(Arc::clone(&callback)),
+                receipt_generator: None,
+            },
+            ResolvedRuntimeKnobs {
+                max_tool_iterations: 5,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 30_000,
+                context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(
+                    100_000,
+                ),
+                context_limits_resolver: None,
+                knobs: &LoopKnobs::default(),
+            },
+        ),
+        history: &mut history,
+        history_has_trim_breadcrumb: &mut false,
+        injected_memory_preamble: &mut None,
+        channel_name: "cli",
+        channel_reply_target: None,
+        cancellation_token: None,
+        on_delta: Some(dtx),
+        shared_budget: None,
+        channel: None,
+        collected_receipts: None,
+        event_tx: None,
+        steering: None,
+        new_messages_out: None,
+        image_cache: None,
+        ingress: IngressContext::sub_turn(),
+        memory: None,
+        agent_alias: None,
+        turn_id: &turn_id,
+        served_route_sink: None,
+    })
+    .await;
+
+    let err = result.expect_err("a pending switch must surface as ModelSwitchRequested");
+    assert_eq!(
+        is_model_switch_requested(&err),
+        Some((
+            "switched-provider".to_string(),
+            "switched-model".to_string()
+        )),
+        "a switch written through the poisoned guard must be observed by the loop"
     );
 }

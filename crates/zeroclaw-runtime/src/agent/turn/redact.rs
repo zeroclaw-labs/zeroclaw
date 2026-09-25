@@ -1,12 +1,17 @@
 //! Credential redaction for the rendering layer (logs, observer events, and
-//! UI-facing turn events). This never runs on the data path: tool results fed
-//! back to the model and signed by HMAC receipts always carry raw bytes.
+//! UI-facing turn events). The success data path is untouched: a successful
+//! tool result fed back to the model and signed by an HMAC receipt carries
+//! raw bytes. The one data-path exception is the failure arms of
+//! `execute_one_tool`, which fold a tool's detailed error body into the
+//! model-visible text and scrub that combined string first, so a reflected
+//! token in a 4xx/5xx body is not forwarded to the model provider.
 
 use regex::Regex;
 use std::sync::LazyLock;
 
-static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(authorization|token|api[_-]?key|password|secret|user[_-]?key|bearer|credential|set[_-]?cookie|cookie)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\./+=]{8,}))"#).unwrap()
+pub(crate) static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)(authorization|token|api[_-]?key|password|secret|user[_-]?key|bearer|credential|set[_-]?cookie|cookie)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\./+=]{8,}))"#)
+        .expect("static sensitive key-value regex must compile")
 });
 
 pub fn scrub_credentials(input: &str) -> String {
@@ -52,8 +57,9 @@ pub fn scrub_credentials(input: &str) -> String {
         .to_string()
 }
 
-static SENSITIVE_KEY_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(authorization|token|api[_-]?key|password|secret|user[_-]?key|bearer|credential|set[_-]?cookie|cookie)"#).unwrap()
+pub(crate) static SENSITIVE_KEY_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)(authorization|token|api[_-]?key|password|secret|user[_-]?key|bearer|credential|set[_-]?cookie|cookie)"#)
+        .expect("static sensitive-key regex must compile")
 });
 const REDACTED_CREDENTIAL_VALUE: &str = "[REDACTED]";
 
@@ -109,6 +115,41 @@ mod tests {
             assert!(is_credential_key(key), "expected credential key: {key}");
         }
         assert!(!is_credential_key("status"));
+    }
+
+    /// The shape the RPC run-detail response leans on: tool arguments are
+    /// arbitrary JSON, so a secret under a credential-named key is routinely
+    /// carried by a descendant that names nothing sensitive. A key-based walk
+    /// that recursed would leave every one of these intact. Sibling coverage in
+    /// `scrub_credentials_value_replaces_every_credential_value_shape` takes the
+    /// nested-object, numeric, and boolean shapes; this one adds the array and
+    /// `null` cases and asserts no seeded secret reaches the wire.
+    #[test]
+    fn a_credential_key_redacts_its_value_whatever_the_shape() {
+        let value = serde_json::json!({
+            "api_key": {"value": "NESTEDSECRET"},
+            "token": ["ARRAYSECRET"],
+            "password": 12345678,
+            "secret": true,
+            "credential": null,
+        });
+
+        let scrubbed = scrub_credentials_value(value);
+        let wire = serde_json::to_string(&scrubbed).expect("serializable");
+
+        for secret in ["NESTEDSECRET", "ARRAYSECRET", "12345678"] {
+            assert!(
+                !wire.contains(secret),
+                "{secret} must not survive scrubbing"
+            );
+        }
+        for key in ["api_key", "token", "password", "secret"] {
+            assert_eq!(scrubbed[key], "[REDACTED]", "{key} must be replaced whole");
+        }
+        // Even `null` is replaced rather than preserved: the marker is what
+        // tells a reader the key was withheld, and a surviving `null` would
+        // read as a value the run genuinely had.
+        assert_eq!(scrubbed["credential"], "[REDACTED]");
     }
 
     #[test]

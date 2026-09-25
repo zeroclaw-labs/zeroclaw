@@ -1,4 +1,6 @@
-//! Shared read-only context for the per-iteration turn step functions.
+//! Shared context for the per-iteration turn step functions. Most fields are
+//! immutable for the turn; `serving_provider_name` and `serving_model` are
+//! mutated per iteration when vision routing selects a different provider.
 
 use super::events::DraftEvent;
 use crate::approval::ApprovalManager;
@@ -8,12 +10,13 @@ use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::channel::Channel;
-use zeroclaw_config::schema::{PacingConfig, StreamReasoningMode};
+use zeroclaw_config::schema::{PacingConfig, ResolvedContextLimits, StreamReasoningMode};
 
 pub(crate) struct TurnCtx<'a> {
     pub(crate) observer: &'a dyn Observer,
     pub(crate) provider_name: &'a str,
     pub(crate) model: &'a str,
+    pub(crate) context_limits: ResolvedContextLimits,
     pub(crate) temperature: Option<f64>,
     pub(crate) approval: Option<&'a ApprovalManager>,
     pub(crate) channel_name: &'a str,
@@ -34,6 +37,19 @@ pub(crate) struct TurnCtx<'a> {
     /// the EFFECTIVE agent whose policy/tools execute; this keeps the parent
     /// correlation on every emitted record. `None` for ordinary turns.
     pub(crate) parent_agent_alias: Option<&'a str>,
+    /// Per-iteration override for the provider that served the current LLM
+    /// call when vision routing resolved a different provider. Owned `String`
+    /// because the vision-resolved name's lifetime is the iteration scope.
+    /// This is only used for vision routing without Reliable wrapping;
+    /// when Reliable produces an AcceptedRoute, the AcceptedRoute tuple is
+    /// the authoritative identity and this field is ignored.
+    pub(crate) serving_provider_name: Option<String>,
+    /// Per-iteration override for the model that served the current LLM call
+    /// when vision routing selected a different model. This is only used for
+    /// vision routing without Reliable wrapping; when Reliable produces an
+    /// AcceptedRoute, the AcceptedRoute tuple is the authoritative identity
+    /// and this field is ignored.
+    pub(crate) serving_model: Option<String>,
 }
 
 /// Lightweight metadata for turn-level event emission.
@@ -49,6 +65,45 @@ pub struct TurnMeta<'a> {
 }
 
 impl<'a> TurnCtx<'a> {
+    /// Materialize the route-specific view for one provider call. The base
+    /// context remains the turn metadata owner; provider/model/limits are
+    /// resolved at the call boundary so a vision override cannot inherit the
+    /// starting text route's policy or attribution.
+    pub(crate) fn for_route<'b>(
+        &'b self,
+        provider_name: &'b str,
+        model: &'b str,
+        context_limits: ResolvedContextLimits,
+    ) -> TurnCtx<'b>
+    where
+        'a: 'b,
+    {
+        TurnCtx {
+            observer: self.observer,
+            provider_name,
+            model,
+            context_limits,
+            temperature: self.temperature,
+            approval: self.approval,
+            channel_name: self.channel_name,
+            channel_reply_target: self.channel_reply_target,
+            cancellation_token: self.cancellation_token,
+            on_delta: self.on_delta,
+            event_tx: self.event_tx,
+            hooks: self.hooks,
+            dedup_exempt_tools: self.dedup_exempt_tools,
+            pacing: self.pacing,
+            strict_tool_parsing: self.strict_tool_parsing,
+            channel: self.channel,
+            draft_reasoning: self.draft_reasoning,
+            turn_id: self.turn_id,
+            agent_alias: self.agent_alias,
+            parent_agent_alias: self.parent_agent_alias,
+            serving_provider_name: Some(provider_name.to_string()),
+            serving_model: Some(model.to_string()),
+        }
+    }
+
     pub(crate) fn meta(&self) -> TurnMeta<'a> {
         TurnMeta {
             agent_alias: self.agent_alias,

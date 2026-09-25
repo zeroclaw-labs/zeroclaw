@@ -22,8 +22,8 @@ pub use schema::{
     LinkedInConfig, LinkedInContentConfig, LinkedInImageConfig, LocalWhisperConfig, MatrixConfig,
     McpConfig, McpServerConfig, McpTransport, MediaPipelineConfig, MemoryConfig,
     MemoryPolicyConfig, Microsoft365Config, ModelRouteConfig, MqttConfig, MultimodalConfig,
-    NextcloudTalkConfig, NodeTransportConfig, NodesConfig, NotionConfig, ObservabilityConfig,
-    OpenAiSttConfig, OpenCodeCliConfig, OpenVpnTunnelConfig, OtpConfig, OtpMethod, PacingConfig,
+    NextcloudTalkConfig, NodesConfig, NotionConfig, ObservabilityConfig, OpenAiSttConfig,
+    OpenCodeCliConfig, OpenVpnTunnelConfig, OtpConfig, OtpMethod, PacingConfig,
     PeripheralBoardConfig, PeripheralsConfig, PipelineConfig, PluginsConfig, PostgresStorageConfig,
     ProjectIntelConfig, ProxyConfig, ProxyScope, QdrantStorageConfig, QueryClassificationConfig,
     ReliabilityConfig, RiskProfileConfig, RuntimeConfig, SandboxBackend, SandboxConfig,
@@ -36,8 +36,18 @@ pub use schema::{
     apply_runtime_proxy_to_builder, build_channel_proxy_client,
     build_channel_proxy_client_with_timeouts, build_runtime_proxy_client,
     build_runtime_proxy_client_with_timeouts, runtime_proxy_config, set_runtime_proxy_config,
-    ws_connect_with_proxy,
 };
+
+#[cfg(any(
+    feature = "channel-dingtalk",
+    feature = "channel-discord",
+    feature = "channel-lark",
+    feature = "channel-mattermost",
+    feature = "channel-qq",
+    feature = "channel-slack",
+    feature = "channel-wecom-ws"
+))]
+pub use schema::ws_connect_with_proxy;
 
 pub use schema::ModelProviderConfig;
 // Per-family model model_provider configs (typed split — Re-exported here
@@ -97,8 +107,11 @@ mod tests {
             api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
+            multi_message_delay_ms: 800,
             interrupt_on_new_message: false,
             mention_only: false,
+            per_user_session: true,
+            passive_group_context: false,
             ack_reactions: None,
             proxy_url: None,
             approval_timeout_secs: 120,

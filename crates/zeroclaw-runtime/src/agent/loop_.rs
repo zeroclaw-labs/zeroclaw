@@ -150,13 +150,21 @@ pub use super::cost::{
 // History management moved to `super::history`.
 pub use super::history::{
     append_or_merge_system_message, canonicalize_tool_result_media_markers,
-    estimate_history_tokens, load_interactive_session_history, normalize_system_messages,
-    save_interactive_session_history, trim_history, truncate_tool_result,
+    estimate_history_tokens, load_interactive_session_history,
+    load_interactive_session_history_with_crumb, normalize_system_messages,
+    save_interactive_session_history, save_interactive_session_history_with_crumb, trim_history,
+    truncate_tool_result,
 };
 
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
+
+fn interactive_context_recovery_budget(
+    context_limits: zeroclaw_config::schema::ResolvedContextLimits,
+) -> usize {
+    context_limits.model_context_window.saturating_mul(9) / 10
+}
 
 /// The single autosave decision for a turn's user-side text, shared by both
 /// store sites in this file so the gates cannot drift apart.
@@ -248,6 +256,35 @@ fn glob_match(pattern: &str, name: &str) -> bool {
                 && name.ends_with(suffix)
                 && name.len() >= prefix.len() + suffix.len()
         }
+    }
+}
+
+/// The approval manager an `agent::run` turn enforces, if any.
+///
+/// An interactive run prompts the operator through the CLI. A headless SOP step
+/// turn has nobody to prompt, and it is the non-interactive run this entry point
+/// executes on an unattended trigger: cron, channel ingress, an approval
+/// resume. With no manager at all the approval gate reads every tool as not
+/// requiring approval, so a tool the owning agent's risk profile lists in
+/// `always_ask` ran unattended on exactly that surface. A headless step
+/// therefore gets the fail-closed non-interactive manager built from the owning
+/// agent's own profile: that policy still applies in full, and anything it would
+/// put in front of a person is denied because no person can answer. This is
+/// the same manager channel-driven turns already run under.
+///
+/// Other non-interactive callers keep their existing behavior; this only closes
+/// the unattended SOP step surface.
+fn run_approval_manager(
+    interactive: bool,
+    headless_sop_step: bool,
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+) -> Option<ApprovalManager> {
+    if interactive {
+        Some(ApprovalManager::from_risk_profile(risk_profile))
+    } else if headless_sop_step {
+        Some(ApprovalManager::for_non_interactive(risk_profile))
+    } else {
+        None
     }
 }
 
@@ -506,6 +543,32 @@ pub(crate) fn compute_excluded_mcp_tools(
         .collect()
 }
 
+/// Merge a headless SOP step's scope exclusions into one exclusion set.
+///
+/// Resolved against the tools callable at the moment of the call, never once at
+/// registry assembly: `tool_search` can activate MCP tools mid-run, and an
+/// `allow`-scoped step must narrow those too. This call shapes the turn's
+/// prompt-visible tool surface; the turn loop re-runs the same merge per
+/// iteration for enforcement, so a tool activated mid-turn is narrowed before
+/// it can be called. No-op for ordinary agent runs, which carry no step scope.
+pub(crate) fn merge_sop_step_exclusions(
+    excluded: &mut Vec<String>,
+    tools_registry: &[Box<dyn Tool>],
+    activated_tools: Option<&Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    sop_step_scope: Option<&crate::sop::active_scope::HeadlessStepScope>,
+) {
+    let Some(scope) = sop_step_scope else {
+        return;
+    };
+    let registry_names =
+        crate::agent::turn::collect_callable_tool_names(tools_registry, activated_tools);
+    for tool in scope.excluded(&registry_names) {
+        if !excluded.iter().any(|e| e.eq_ignore_ascii_case(&tool)) {
+            excluded.push(tool);
+        }
+    }
+}
+
 pub fn native_tool_specs_present_for_turn(
     model_provider: &dyn ModelProvider,
     model: &str,
@@ -539,8 +602,9 @@ pub fn native_tool_specs_present_for_turn(
     Ok(activated.tool_names().iter().any(|name| !is_excluded(name)))
 }
 
-static IMAGE_DATA_URI_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\[IMAGE:data:[^\]]*\]").unwrap());
+pub(crate) static IMAGE_DATA_URI_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\[IMAGE:data:[^\]]*\]").expect("static image data URI regex must compile")
+});
 
 fn elide_image_data(content: &str) -> String {
     IMAGE_DATA_URI_REGEX
@@ -648,22 +712,25 @@ pub(crate) fn build_system_prompt_for_turn(
         &mut turn_tool_descs,
         &mut turn_deferred_section,
     );
-    let mut system_prompt = crate::agent::system_prompt::build_system_prompt_with_mode_and_autonomy(
-        agent_workspace,
-        model_name,
-        &turn_tool_descs,
-        skills,
-        identity_config,
-        bootstrap_max_chars,
-        Some(risk_profile),
-        native_tool_specs_present,
-        skills_prompt_mode,
-        compact_context,
-        max_system_prompt_chars,
-        inject_memory,
-        show_tool_calls,
-        shell_profile,
-    );
+    let skill_tools_protocol_exposed = expose_text_tool_protocol || native_tool_specs_present;
+    let mut system_prompt =
+        crate::agent::system_prompt::build_system_prompt_with_mode_and_effective_tools(
+            agent_workspace,
+            model_name,
+            &turn_tool_descs,
+            |name| skill_tools_protocol_exposed && effective_tool_names.contains(name),
+            skills,
+            identity_config,
+            bootstrap_max_chars,
+            Some(risk_profile),
+            native_tool_specs_present,
+            skills_prompt_mode,
+            compact_context,
+            0,
+            inject_memory,
+            show_tool_calls,
+            shell_profile,
+        );
 
     if expose_text_tool_protocol {
         system_prompt.push_str(&build_tool_instructions_for_names(
@@ -679,7 +746,10 @@ pub(crate) fn build_system_prompt_for_turn(
         system_prompt = format!("{prefix}\n\n{system_prompt}");
     }
 
-    Ok(system_prompt)
+    Ok(crate::agent::system_prompt::finalize_system_prompt(
+        system_prompt,
+        max_system_prompt_chars,
+    ))
 }
 
 pub fn make_query_summary(raw: &str) -> Option<String> {
@@ -787,6 +857,16 @@ pub async fn agent_turn(
     config: Option<&zeroclaw_config::schema::Config>,
     model_provider: &dyn ModelProvider,
     history: &mut Vec<ChatMessage>,
+    // Authoritative record that `history` carries the synthetic trim
+    // breadcrumb after its leading system messages; kept beside the buffer
+    // instead of being inferred from localized text. Set to true when a trim
+    // path inserts a crumb during the turn.
+    history_has_trim_breadcrumb: &mut bool,
+    // Out-param the loop writes through when it injects a recalled-memory
+    // preamble onto the last user message: the exact byte length injected,
+    // so the caller can strip precisely that block before persisting —
+    // see `ToolLoop::injected_memory_preamble`.
+    injected_memory_preamble: &mut Option<String>,
     tools_registry: &scoped::ScopedToolRegistry,
     observer: &dyn Observer,
     provider_name: &str,
@@ -816,6 +896,8 @@ pub async fn agent_turn(
         config,
         model_provider,
         history,
+        history_has_trim_breadcrumb,
+        injected_memory_preamble,
         tools_registry,
         observer,
         provider_name,
@@ -850,6 +932,10 @@ async fn agent_turn_with_sop_reassembly(
     config: Option<&zeroclaw_config::schema::Config>,
     model_provider: &dyn ModelProvider,
     history: &mut Vec<ChatMessage>,
+    // Authoritative breadcrumb provenance for `history` — see `agent_turn`.
+    history_has_trim_breadcrumb: &mut bool,
+    // See `agent_turn`.
+    injected_memory_preamble: &mut Option<String>,
     tools_registry: &scoped::ScopedToolRegistry,
     observer: &dyn Observer,
     provider_name: &str,
@@ -900,13 +986,33 @@ async fn agent_turn_with_sop_reassembly(
         agent_alias.map(str::to_string),
         Some(turn_id.clone()),
     );
-    let result = run_tool_call_loop(ToolLoop {
+    let resolved_capacity = config.map_or(
+        zeroclaw_config::schema::ResolvedModelContextWindow {
+            tokens: zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+            source: zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
+        },
+        |config| config.resolved_model_context_window_for_route(provider_name, model),
+    );
+    let context_token_budget = if context_token_budget == 0 {
+        0
+    } else {
+        context_token_budget.min(resolved_capacity.tokens)
+    };
+    let context_limits = zeroclaw_config::schema::ResolvedContextLimits {
+        model_context_window: resolved_capacity.tokens,
+        context_token_budget,
+        model_context_window_source: resolved_capacity.source,
+    };
+    let result = Box::pin(run_tool_call_loop(ToolLoop {
         sop_reassembly,
+        history_has_trim_breadcrumb,
+        injected_memory_preamble,
         exec: ResolvedAgentExecution::resolve(
             ResolvedModelAccess {
                 model_provider,
                 provider_name,
                 model,
+                dispatch_model: model,
                 temperature,
             },
             ResolvedIo {
@@ -929,7 +1035,8 @@ async fn agent_turn_with_sop_reassembly(
                 strict_tool_parsing,
                 parallel_tools,
                 max_tool_result_chars,
-                context_token_budget,
+                context_limits,
+                context_limits_resolver: None,
                 knobs: &LoopKnobs::default(),
             },
         ),
@@ -952,8 +1059,9 @@ async fn agent_turn_with_sop_reassembly(
         ingress: IngressContext::from_origin(origin),
         agent_alias,
         parent_agent_alias: None,
+        served_route_sink: None,
         turn_id: &turn_id,
-    })
+    }))
     .await;
     // Snapshot token usage from the task-local cost context when the caller
     // scoped one around this call (the gateway scopes both
@@ -986,20 +1094,20 @@ async fn agent_turn_with_sop_reassembly(
 // file per step (run sheet in agent/turn/mod.rs). `crate::agent::loop_`
 // stays the canonical public path via these re-exports.
 pub(crate) use super::turn::StreamCancelledAfterOutput;
+pub use super::turn::{
+    ContextLimitsResolver, DRAFT_PLACEHOLDER, DraftEvent, LoopKnobs, MaxIterationBehavior,
+    ModelSwitchCallback, ModelSwitchRequested, PROGRESS_MIN_INTERVAL_MS, ProgressEvent,
+    REASONING_FULL_PREFIX, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
+    ResolvedRuntimeKnobs, ServedRoute, ServedRouteSink, SopStepReassembly, StreamDelta,
+    THINKING_STATUS_PREFIX, ToolLoop, ToolLoopCancelled, drain_steering_messages,
+    is_model_switch_requested, is_thinking_status_text, is_tool_loop_cancelled, run_tool_call_loop,
+    scrub_credentials, thinking_status_label_round, thinking_status_round, thinking_status_text,
+};
 #[cfg(test)]
 pub(crate) use super::turn::{
     DEFAULT_MAX_TOOL_ITERATIONS, MAX_MALFORMED_TOOL_PROTOCOL_RETRIES,
     build_native_assistant_history, consume_provider_streaming_response,
     maybe_inject_channel_delivery_defaults, resolve_display_text,
-};
-pub use super::turn::{
-    DRAFT_PLACEHOLDER, DraftEvent, LoopKnobs, MaxIterationBehavior, ModelSwitchCallback,
-    ModelSwitchRequested, PROGRESS_MIN_INTERVAL_MS, ProgressEvent, REASONING_FULL_PREFIX,
-    ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
-    SopStepReassembly, StreamDelta, THINKING_STATUS_PREFIX, ToolLoop, ToolLoopCancelled,
-    drain_steering_messages, is_model_switch_requested, is_thinking_status_text,
-    is_tool_loop_cancelled, run_tool_call_loop, scrub_credentials, thinking_status_label_round,
-    thinking_status_round, thinking_status_text,
 };
 
 /// Build the tool instruction block for the system prompt so the LLM knows
@@ -1028,18 +1136,11 @@ fn build_tool_instructions_for_tools<'a>(tools: impl IntoIterator<Item = &'a dyn
         return String::new();
     }
 
-    let mut instructions = String::new();
-    instructions.push_str("\n## Tool Use Protocol\n\n");
-    instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
-    instructions.push_str("```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n");
-    instructions.push_str(
-        "CRITICAL: Output actual <tool_call> tags—never describe steps or give examples.\n\n",
-    );
-    instructions.push_str("Example: User says \"what's the date?\". You MUST respond with:\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"date\"}}\n</tool_call>\n\n");
-    instructions.push_str("You may use multiple tool calls in a single response. ");
-    instructions.push_str("After tool execution, results appear in <tool_result> tags. ");
-    instructions
-        .push_str("Continue reasoning with the results until you can give a final answer.\n\n");
+    // The tool-call formatting guidance has one home: `agent::tool_call_format`.
+    // Do not re-type it here; layer builder-specific material (the tool
+    // listing below) around it instead.
+    let mut instructions = String::from("\n");
+    instructions.push_str(crate::agent::tool_call_format::TOOL_CALL_PROTOCOL_INSTRUCTIONS);
     instructions.push_str("### Available Tools\n\n");
 
     for tool in tools {
@@ -1098,6 +1199,14 @@ pub struct AgentRunOverrides {
     /// (CLI / one-shot), which is correct for callers that have no
     /// cross-turn reuse contract.
     pub mcp_registry: Option<Arc<crate::tools::McpRegistry>>,
+    /// Tool-scope contract for a SOP step executed headlessly (cron and the
+    /// other non-agent-loop trigger surfaces). `Some` narrows every turn of
+    /// this run to the step's active scope and removes the SOP control tools,
+    /// matching what the live nested-step driver enforces inside an enclosing
+    /// turn. Also `Some` on a child run started from inside such a step, which
+    /// inherits the step's boundary rather than rebuilding the agent's full
+    /// surface. `None` for every ordinary agent run.
+    pub sop_step_scope: Option<crate::sop::active_scope::HeadlessStepScope>,
 }
 
 fn agent_provider_composite(
@@ -1245,7 +1354,6 @@ pub async fn run(
         let eff_max_history_messages = agent.resolved.max_history_messages;
         let eff_compact_context = agent.resolved.compact_context;
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
-        let eff_model_context_window = agent.resolved.model_context_window;
         let eff_prompt_injection_mode = agent.resolved.prompt_injection_mode;
         let base_observer = observability::create_observer(&config.observability);
         let observer: Arc<dyn Observer> = Arc::from(base_observer);
@@ -1272,6 +1380,7 @@ pub async fn run(
         let is_subagent_caller = overrides.is_subagent;
         let suppress_memory_inject = overrides.suppress_memory_inject;
         let memory_free = overrides.memory_free;
+        let sop_step_scope = overrides.sop_step_scope.clone();
         let security = match overrides.security {
             Some(sec) => sec,
             None => Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?),
@@ -1335,6 +1444,7 @@ pub async fn run(
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
             let (engine, audit) = crate::sop::build_sop_engine(
                 config.sop.clone(),
+                &config.decision_models,
                 &config.data_dir,
                 &config.install_root_dir(),
                 sop_mem,
@@ -1367,7 +1477,7 @@ pub async fn run(
             sop_engine,
             sop_audit,
             None,
-        );
+        )?;
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         // Route the per-agent tool registry through the one gated seam
         // (peripherals -> built-in filter -> MCP scope+gate -> skills), identical
@@ -1468,6 +1578,8 @@ pub async fn run(
              [providers.models.{provider_name}.<alias>].model is unset and --model was not passed"
             ),
         };
+        let mut context_limits =
+            config.resolved_context_limits_for_route(agent_alias, &provider_name, &model_name);
 
         {
             let span = zeroclaw_log::Span::current();
@@ -1682,17 +1794,26 @@ pub async fn run(
         } else {
             None
         };
-        let prompt_excluded_tools = message
-            .as_deref()
-            .map(|msg| {
-                compute_excluded_mcp_tools(
-                    &tools_registry,
-                    &agent.resolved.tool_filter_groups,
-                    msg,
-                    &mcp_tool_names,
-                )
-            })
-            .unwrap_or_default();
+        let prompt_excluded_tools = {
+            let mut excluded = message
+                .as_deref()
+                .map(|msg| {
+                    compute_excluded_mcp_tools(
+                        &tools_registry,
+                        &agent.resolved.tool_filter_groups,
+                        msg,
+                        &mcp_tool_names,
+                    )
+                })
+                .unwrap_or_default();
+            merge_sop_step_exclusions(
+                &mut excluded,
+                &tools_registry,
+                activated_handle.as_ref(),
+                sop_step_scope.as_ref(),
+            );
+            excluded
+        };
         let agent_workspace = config.agent_workspace_dir(agent_alias);
         let mut system_prompt = build_system_prompt_for_turn(
             &agent_workspace,
@@ -1718,11 +1839,8 @@ pub async fn run(
         )?;
 
         // ── Approval manager (supervised mode) ───────────────────────
-        let approval_manager = if interactive {
-            Some(ApprovalManager::from_risk_profile(&risk_profile))
-        } else {
-            None
-        };
+        let approval_manager =
+            run_approval_manager(interactive, sop_step_scope.is_some(), &risk_profile);
         let memory_session_id = session_state_file.as_deref().and_then(|path| {
             let raw = path.to_string_lossy().trim().to_string();
             if raw.is_empty() {
@@ -1783,12 +1901,21 @@ pub async fn run(
             // Compute per-turn excluded MCP tools from tool_filter_groups before
             // building the turn prompt so tool availability matches the specs
             // sent to the provider.
-            let excluded_tools = compute_excluded_mcp_tools(
-                &tools_registry,
-                &agent.resolved.tool_filter_groups,
-                &effective_msg,
-                &mcp_tool_names,
-            );
+            let excluded_tools = {
+                let mut excluded = compute_excluded_mcp_tools(
+                    &tools_registry,
+                    &agent.resolved.tool_filter_groups,
+                    &effective_msg,
+                    &mcp_tool_names,
+                );
+                merge_sop_step_exclusions(
+                    &mut excluded,
+                    &tools_registry,
+                    activated_handle.as_ref(),
+                    sop_step_scope.as_ref(),
+                );
+                excluded
+            };
             system_prompt = build_system_prompt_for_turn(
                 &agent_workspace,
                 &model_name,
@@ -1894,14 +2021,25 @@ pub async fn run(
                 ChatMessage::system(&system_prompt),
                 ChatMessage::user(&enriched),
             ];
+            // One-shot transcript: no prior trim ran, so no crumb exists.
+            let mut history_has_trim_breadcrumb = false;
 
             // Compute per-turn excluded MCP tools from tool_filter_groups.
-            let excluded_tools = compute_excluded_mcp_tools(
-                &tools_registry,
-                &agent.resolved.tool_filter_groups,
-                &effective_msg,
-                &mcp_tool_names,
-            );
+            let excluded_tools = {
+                let mut excluded = compute_excluded_mcp_tools(
+                    &tools_registry,
+                    &agent.resolved.tool_filter_groups,
+                    &effective_msg,
+                    &mcp_tool_names,
+                );
+                merge_sop_step_exclusions(
+                    &mut excluded,
+                    &tools_registry,
+                    activated_handle.as_ref(),
+                    sop_step_scope.as_ref(),
+                );
+                excluded
+            };
 
             #[allow(unused_assignments)]
             let mut response = String::new();
@@ -1943,6 +2081,7 @@ pub async fn run(
                                         model_provider: model_provider.as_ref(),
                                         provider_name: &provider_name,
                                         model: &model_name,
+                                        dispatch_model: &model_name,
                                         temperature: effective_temperature,
                                     },
                                     ResolvedIo {
@@ -1965,13 +2104,14 @@ pub async fn run(
                                         strict_tool_parsing: agent.resolved.strict_tool_parsing,
                                         parallel_tools: agent.resolved.parallel_tools,
                                         max_tool_result_chars: agent.resolved.max_tool_result_chars,
-                                        context_token_budget: agent
-                                            .resolved
-                                            .effective_context_budget(),
+                                        context_limits,
+                                        context_limits_resolver: None,
                                         knobs: &LoopKnobs::default(),
                                     },
                                 ),
                                 history: &mut history,
+                                history_has_trim_breadcrumb: &mut history_has_trim_breadcrumb,
+                                injected_memory_preamble: &mut None,
                                 channel_name,
                                 channel_reply_target: None,
                                 cancellation_token: None,
@@ -2000,6 +2140,7 @@ pub async fn run(
                                 agent_alias: Some(agent_alias),
                                 parent_agent_alias: None,
                                 turn_id: &turn_id,
+                                served_route_sink: None,
                                 sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                     config: &config,
                                 }),
@@ -2054,12 +2195,22 @@ pub async fn run(
 
                             provider_name = new_model_provider;
                             model_name = new_model;
+                            context_limits = config.resolved_context_limits_for_route(
+                                agent_alias,
+                                &provider_name,
+                                &model_name,
+                            );
 
                             turn_guard.set_model_route(provider_name.clone(), model_name.clone());
 
                             continue;
                         }
-                        return Err(project_cli_terminal_completion_error(e));
+                        // Cron owns its terminal projection and needs the typed cause.
+                        return Err(if origin == TurnOrigin::Cron {
+                            e
+                        } else {
+                            project_cli_terminal_completion_error(e)
+                        });
                     }
                 }
             }
@@ -2165,7 +2316,7 @@ pub async fn run(
                             &config.multimodal,
                             &config.pacing,
                             agent.resolved.max_tool_result_chars,
-                            agent.resolved.max_context_tokens,
+                            agent.resolved.effective_context_budget(),
                             None, // cancellation_token — no parent token in single-shot run
                             Some(agent_alias),
                         ),
@@ -2179,12 +2330,15 @@ pub async fn run(
                 "CLI channel factory not registered — call register_cli_channel_fn at startup",
             )();
 
-            // Persistent conversation history across turns
-            let mut history = if let Some(path) = session_state_file.as_deref() {
-                load_interactive_session_history(path, &system_prompt)?
-            } else {
-                vec![ChatMessage::system(&system_prompt)]
-            };
+            // Persistent conversation history across turns, with explicit
+            // breadcrumb provenance. Legacy v1 files are migrated by inspecting
+            // the restored history for a leading breadcrumb.
+            let (mut history, mut history_has_trim_breadcrumb) =
+                if let Some(path) = session_state_file.as_deref() {
+                    load_interactive_session_history_with_crumb(path, &system_prompt)?
+                } else {
+                    (vec![ChatMessage::system(&system_prompt)], false)
+                };
 
             loop {
                 print!("> ");
@@ -2250,6 +2404,7 @@ pub async fn run(
 
                         history.clear();
                         history.push(ChatMessage::system(&system_prompt));
+                        history_has_trim_breadcrumb = false;
                         // Clear conversation and daily memory
                         let mut cleared = 0;
                         for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
@@ -2266,7 +2421,11 @@ pub async fn run(
                             println!("Conversation cleared.\n");
                         }
                         if let Some(path) = session_state_file.as_deref() {
-                            save_interactive_session_history(path, &history)?;
+                            save_interactive_session_history_with_crumb(
+                                path,
+                                &history,
+                                history_has_trim_breadcrumb,
+                            )?;
                         }
                         continue;
                     }
@@ -2309,12 +2468,21 @@ pub async fn run(
                 // Compute per-turn excluded MCP tools from tool_filter_groups
                 // before the provider call; the system prompt is rebuilt from
                 // this same set immediately before each attempt.
-                let excluded_tools = compute_excluded_mcp_tools(
-                    &tools_registry,
-                    &agent.resolved.tool_filter_groups,
-                    &effective_input,
-                    &mcp_tool_names,
-                );
+                let excluded_tools = {
+                    let mut excluded = compute_excluded_mcp_tools(
+                        &tools_registry,
+                        &agent.resolved.tool_filter_groups,
+                        &effective_input,
+                        &mcp_tool_names,
+                    );
+                    merge_sop_step_exclusions(
+                        &mut excluded,
+                        &tools_registry,
+                        activated_handle.as_ref(),
+                        sop_step_scope.as_ref(),
+                    );
+                    excluded
+                };
 
                 let excluded_tool_names: HashSet<&str> =
                     excluded_tools.iter().map(String::as_str).collect();
@@ -2436,6 +2604,11 @@ pub async fn run(
                                 print!("{text}");
                                 let _ = std::io::stdout().flush();
                             }
+                            StreamDelta::FlushBarrier(ack) => {
+                                // CLI prints deltas immediately; nothing is
+                                // buffered, so release the barrier right away.
+                                StreamDelta::ack_flush_barrier(&ack);
+                            }
                             StreamDelta::Reasoning(_) => {}
                             tool_event @ (StreamDelta::ToolStart { .. }
                             | StreamDelta::ToolComplete { .. }) => {
@@ -2499,6 +2672,7 @@ pub async fn run(
                                             model_provider: model_provider.as_ref(),
                                             provider_name: &provider_name,
                                             model: &model_name,
+                                            dispatch_model: &model_name,
                                             temperature: turn_temperature,
                                         },
                                         ResolvedIo {
@@ -2525,13 +2699,15 @@ pub async fn run(
                                             max_tool_result_chars: agent
                                                 .resolved
                                                 .max_tool_result_chars,
-                                            context_token_budget: agent
-                                                .resolved
-                                                .effective_context_budget(),
+                                            context_limits,
+                                            context_limits_resolver: None,
                                             knobs: &LoopKnobs::default(),
                                         },
                                     ),
                                     history: &mut history,
+                                    history_has_trim_breadcrumb:
+                                        &mut history_has_trim_breadcrumb,
+                                    injected_memory_preamble: &mut None,
                                     channel_name,
                                     channel_reply_target: None,
                                     cancellation_token: Some(cancel_token.clone()),
@@ -2560,6 +2736,7 @@ pub async fn run(
                                     agent_alias: Some(agent_alias),
                                     parent_agent_alias: None,
                                     turn_id: &turn_id,
+                                    served_route_sink: None,
                                     sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                         config: &config,
                                     }),
@@ -2616,6 +2793,11 @@ pub async fn run(
 
                                 provider_name = new_model_provider;
                                 model_name = new_model;
+                                context_limits = config.resolved_context_limits_for_route(
+                                    agent_alias,
+                                    &provider_name,
+                                    &model_name,
+                                );
 
                                 turn_guard
                                     .set_model_route(provider_name.clone(), model_name.clone());
@@ -2635,19 +2817,25 @@ pub async fn run(
                                     "Context overflow in interactive loop, attempting recovery"
                                 );
                                 let taken = std::mem::take(&mut history);
-                                let recovery_budget = eff_model_context_window * 9 / 10;
-                                let result = crate::agent::history_trim::trim_to_recent_turns(
-                                    taken,
-                                    recovery_budget,
-                                );
+                                let recovery_budget = interactive_context_recovery_budget(context_limits);
+                                let crumb_present_before_recovery = history_has_trim_breadcrumb;
+                                let result =
+                                    crate::agent::history_trim::trim_to_recent_turns_with_crumb(
+                                        taken,
+                                        recovery_budget,
+                                        crumb_present_before_recovery,
+                                    );
                                 if result.trimmed {
                                     let mut trimmed = result.history;
-                                    let system_count =
-                                        trimmed.iter().take_while(|m| m.role == "system").count();
-                                    trimmed.insert(
-                                        system_count,
-                                        crate::agent::history_trim::breadcrumb(),
-                                    );
+                                    // Owner-aware insertion: does not stack a
+                                    // second marker when the existing
+                                    // breadcrumb (protected from drop above)
+                                    // is still present.
+                                    history_has_trim_breadcrumb =
+                                        crate::agent::history_trim::insert_breadcrumb_deduped(
+                                            &mut trimmed,
+                                            crumb_present_before_recovery,
+                                        );
                                     history = trimmed;
                                     {
                                         let __zc_trim_span = ::zeroclaw_log::info_span!(
@@ -2678,9 +2866,7 @@ pub async fn run(
                                 history = result.history;
                                 let system_floor =
                                     crate::agent::history::estimate_system_floor_tokens(&history);
-                                let context_token_budget =
-                                    agent.resolved.effective_context_budget();
-                                let floor_exceeds_budget = system_floor >= context_token_budget;
+                                let floor_exceeds_budget = system_floor >= recovery_budget;
                                 {
                                     let __zc_trim_span = ::zeroclaw_log::info_span!(
                                         target: "zeroclaw_log_internal_scope",
@@ -2700,12 +2886,12 @@ pub async fn run(
                                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                                             .with_attrs(::serde_json::json!({
                                                 "system_floor": system_floor,
-                                                "budget": context_token_budget,
+                                                "budget": recovery_budget,
                                                 "error_key": "context_floor_exceeds_budget",
                                             })),
                                             crate::agent::history::context_floor_remediation(
                                                 system_floor,
-                                                context_token_budget,
+                                                recovery_budget,
                                             )
                                         );
                                     } else {
@@ -2727,7 +2913,7 @@ pub async fn run(
                                         "\nError: {e}\n{}\n",
                                         crate::agent::history::context_floor_remediation(
                                             system_floor,
-                                            context_token_budget,
+                                            recovery_budget,
                                         )
                                     );
                                     break String::new();
@@ -2764,7 +2950,7 @@ pub async fn run(
                     let usage = ctx.snapshot_turn_usage();
                     let effective_input_tokens = usage.last_input_tokens;
                     if effective_input_tokens > 0 || usage.output_tokens > 0 {
-                        let max_ctx = eff_model_context_window as u64;
+                        let max_ctx = context_limits.model_context_window as u64;
                         let pct = if max_ctx > 0 {
                             (effective_input_tokens as f64 / max_ctx as f64 * 100.0).min(100.0)
                         } else {
@@ -2810,7 +2996,11 @@ pub async fn run(
                 }
 
                 if let Some(path) = session_state_file.as_deref() {
-                    save_interactive_session_history(path, &history)?;
+                    save_interactive_session_history_with_crumb(
+                        path,
+                        &history,
+                        history_has_trim_breadcrumb,
+                    )?;
                 }
             }
         }
@@ -2840,6 +3030,20 @@ pub async fn run(
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
 pub async fn process_message(
     config: Config,
+    agent_alias: &str,
+    message: &str,
+    session_id: Option<&str>,
+    origin: TurnOrigin,
+) -> Result<String> {
+    process_message_shared(Arc::new(config), agent_alias, message, session_id, origin).await
+}
+
+/// Shared-snapshot implementation for callers that already own the canonical
+/// config behind an [`Arc`]. Keeping that allocation through the whole turn
+/// avoids placing or cloning the large [`Config`] value in detached task
+/// futures.
+pub(crate) async fn process_message_shared(
+    config: Arc<Config>,
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
@@ -2947,6 +3151,7 @@ pub async fn process_message(
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
             let (engine, audit) = crate::sop::build_sop_engine(
                 config.sop.clone(),
+                &config.decision_models,
                 &config.data_dir,
                 &config.install_root_dir(),
                 sop_mem,
@@ -2958,7 +3163,7 @@ pub async fn process_message(
         };
 
         let all_tools_result_pm = tools::all_tools_with_runtime(
-            Arc::new(config.clone()),
+            Arc::clone(&config),
             &security,
             &risk_profile,
             agent_alias,
@@ -2981,7 +3186,7 @@ pub async fn process_message(
             sop_engine,
             sop_audit,
             None,
-        );
+        )?;
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
             config: &config,
@@ -3061,10 +3266,11 @@ pub async fn process_message(
             provider_name,
             provider_alias.as_str(),
         );
+        let model_provider_ref = format!("{provider_name}.{provider_alias}");
         let model_provider: Box<dyn ModelProvider> =
             zeroclaw_providers::create_routed_model_provider_with_options(
                 &config,
-                &format!("{provider_name}.{provider_alias}"),
+                &model_provider_ref,
                 agent_model_provider
                     .as_ref()
                     .and_then(|e| e.api_key.as_deref()),
@@ -3207,12 +3413,14 @@ pub async fn process_message(
             &mut tool_descs,
             &mut deferred_section,
         );
+        let skill_tools_protocol_exposed = expose_text_tool_protocol || native_tool_specs_present;
         let agent_workspace = config.agent_workspace_dir(agent_alias);
         let mut system_prompt =
-            crate::agent::system_prompt::build_system_prompt_with_mode_and_autonomy(
+            crate::agent::system_prompt::build_system_prompt_with_mode_and_effective_tools(
                 &agent_workspace,
                 &model_name,
                 &tool_descs,
+                |name| skill_tools_protocol_exposed && effective_tool_names.contains(name),
                 &skills,
                 Some(&agent.identity),
                 bootstrap_max_chars,
@@ -3220,7 +3428,7 @@ pub async fn process_message(
                 native_tool_specs_present,
                 eff_prompt_injection_mode,
                 eff_compact_context,
-                eff_max_system_prompt_chars,
+                0,
                 false,
                 config.channels.show_tool_calls,
                 runtime.shell_profile().as_ref(),
@@ -3273,6 +3481,10 @@ pub async fn process_message(
         if let Some(ref prefix) = thinking_params.system_prompt_prefix {
             system_prompt = format!("{prefix}\n\n{system_prompt}");
         }
+        system_prompt = crate::agent::system_prompt::finalize_system_prompt(
+            system_prompt,
+            eff_max_system_prompt_chars,
+        );
 
         let effective_msg_ref = effective_message.as_str();
         let runtime_capability_names: Vec<&str> = effective_tool_names.iter().copied().collect();
@@ -3327,6 +3539,8 @@ pub async fn process_message(
             ChatMessage::system(&system_prompt),
             ChatMessage::user(&enriched),
         ];
+        // One-shot transcript: no prior trim ran, so no crumb exists.
+        let mut history_has_trim_breadcrumb = false;
         let mut excluded_tools = compute_excluded_mcp_tools(
             &tools_registry,
             &agent.resolved.tool_filter_groups,
@@ -3356,9 +3570,11 @@ pub async fn process_message(
                     Some(&config),
                     model_provider.as_ref(),
                     &mut history,
+                    &mut history_has_trim_breadcrumb,
+                    &mut None,
                     &tools_registry,
                     observer.as_ref(),
-                    provider_name,
+                    &model_provider_ref,
                     &model_name,
                     effective_temperature,
                     true,
@@ -3374,7 +3590,13 @@ pub async fn process_message(
                     agent.resolved.strict_tool_parsing,
                     agent.resolved.parallel_tools,
                     agent.resolved.max_tool_result_chars,
-                    agent.resolved.max_context_tokens,
+                    config
+                        .resolved_context_limits_for_route(
+                            agent_alias,
+                            &model_provider_ref,
+                            &model_name,
+                        )
+                        .context_token_budget,
                     // Cross-channel HITL: a route-only approval bridge when the
                     // profile sets `approval_route` and channels are live, else
                     // `None` (today's channel-less auto-deny). See above.
@@ -3481,6 +3703,17 @@ mod tests {
     use zeroclaw_providers::{ChatMessage, ToolCall};
     use zeroclaw_tool_call_parser::parse_tool_calls;
 
+    fn test_context_limits(
+        context_token_budget: usize,
+    ) -> zeroclaw_config::schema::ResolvedContextLimits {
+        zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+            context_token_budget,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
+        }
+    }
+
     fn extract_sop_started_run_id(content: &str) -> Option<String> {
         content
             .split("SOP run started: ")
@@ -3509,6 +3742,7 @@ mod tests {
     }
 
     zeroclaw_api::mock_tool_attribution!(
+        ActivatingTool,
         CountingTool,
         CredentialOutputTool,
         EmptySuccessTool,
@@ -3815,6 +4049,7 @@ mod tests {
         let payload = serde_json::to_string_pretty(&InteractiveSessionState {
             version: 1,
             history: vec![ChatMessage::user("orphan")],
+            history_has_trim_breadcrumb: false,
         })
         .unwrap();
         std::fs::write(&path, payload).unwrap();
@@ -3839,6 +4074,7 @@ mod tests {
                 ChatMessage::system("late loop-detection guidance"),
                 ChatMessage::user("follow-up"),
             ],
+            history_has_trim_breadcrumb: false,
         })
         .unwrap();
         std::fs::write(&path, payload).unwrap();
@@ -3880,6 +4116,7 @@ mod tests {
                 ChatMessage::user("follow-up"),
                 ChatMessage::system(""),
             ],
+            history_has_trim_breadcrumb: false,
         })
         .unwrap();
         std::fs::write(&path, payload).unwrap();
@@ -3909,6 +4146,7 @@ mod tests {
                 orphan_tool,
                 ChatMessage::user("next question"),
             ],
+            history_has_trim_breadcrumb: false,
         })
         .unwrap();
         std::fs::write(&path, payload).unwrap();
@@ -4125,6 +4363,9 @@ mod tests {
         assert!(outcome.error_reason.is_none());
     }
 
+    // Success path only. The failure arms of `execute_one_tool` do scrub the
+    // model-visible `output` (they fold in a tool's detailed error body); see
+    // the failure-output tests in `agent::tool_execution::tests`.
     #[tokio::test]
     async fn execute_one_tool_keeps_data_path_raw_and_scrubs_only_observer() {
         struct CapturingResults {
@@ -4522,6 +4763,79 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "RecordingModelProvider"
+        }
+    }
+
+    struct MutatingImageProvider {
+        calls: Arc<AtomicUsize>,
+        image_path: std::path::PathBuf,
+        original_data_uri: String,
+        replacement_bytes: Vec<u8>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for MutatingImageProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                vision: true,
+                ..ProviderCapabilities::default()
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in image-cache tests");
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            assert!(
+                request
+                    .messages
+                    .iter()
+                    .any(|message| message.content.contains(&self.original_data_uri)),
+                "every iteration must reuse the first prepared image bytes"
+            );
+
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let text = if call == 0 {
+                std::fs::write(&self.image_path, &self.replacement_bytes)?;
+                r#"<tool_call>
+{"name":"probe","arguments":{"value":"ok"}}
+</tool_call>"#
+            } else {
+                "done"
+            };
+
+            Ok(ChatResponse {
+                text: Some(text.to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for MutatingImageProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "MutatingImageProvider"
         }
     }
 
@@ -4927,6 +5241,119 @@ mod tests {
         }
     }
 
+    /// A headless SOP step runs non-interactively on an unattended trigger. It
+    /// must still enforce the owning agent's approval policy: a tool that policy
+    /// lists in `always_ask` is denied before its implementation runs, because
+    /// no operator can answer the prompt. Full autonomy isolates the rule under
+    /// test, so the only thing that can stop the guarded tool is `always_ask`,
+    /// and an unguarded tool in the same turn still runs.
+    #[tokio::test]
+    async fn a_headless_sop_step_denies_an_always_ask_tool_before_it_runs() {
+        let profile = zeroclaw_config::schema::RiskProfileConfig {
+            level: zeroclaw_config::policy::AutonomyLevel::Full,
+            always_ask: vec!["guarded_write".to_string()],
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
+        };
+        assert!(
+            run_approval_manager(false, false, &profile).is_none(),
+            "ordinary non-interactive runs keep their existing behavior"
+        );
+        let manager = run_approval_manager(false, true, &profile)
+            .expect("a headless SOP step turn must carry an approval manager");
+        assert!(
+            manager.is_non_interactive(),
+            "a headless step has nobody to prompt, so its manager must fail closed"
+        );
+
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"guarded_write","arguments":{"value":"x"}}
+</tool_call>"#,
+            r#"<tool_call>
+{"name":"plain_read","arguments":{"value":"y"}}
+</tool_call>"#,
+            "done",
+        ]);
+        let guarded = Arc::new(AtomicUsize::new(0));
+        let plain = Arc::new(AtomicUsize::new(0));
+        let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+            Box::new(CountingTool::new("guarded_write", Arc::clone(&guarded))),
+            Box::new(CountingTool::new("plain_read", Arc::clone(&plain))),
+        ]);
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run the step"),
+        ];
+        let observer = NoopObserver;
+
+        run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            served_route_sink: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    dispatch_model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: Some(&manager),
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 4,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+            channel_name: "sop",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("the turn completes with the guarded tool denied");
+
+        assert_eq!(
+            guarded.load(Ordering::SeqCst),
+            0,
+            "an always_ask tool must be denied before its implementation executes"
+        );
+        assert_eq!(
+            plain.load(Ordering::SeqCst),
+            1,
+            "a tool the policy does not guard still runs under the fail-closed manager"
+        );
+    }
+
     struct CountingTool {
         name: String,
         invocations: Arc<AtomicUsize>,
@@ -5108,12 +5535,14 @@ mod tests {
 
         let _ = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -5132,11 +5561,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "acp",
             channel_reply_target: Some("operator"),
             cancellation_token: None,
@@ -5202,6 +5635,73 @@ mod tests {
                 content.contains("no operator decision was available"),
                 "{source:?} should state that no operator decided: {content}"
             );
+        }
+    }
+
+    /// The operator-denial result has to carry its own meaning, because the
+    /// model will otherwise supply one. Handed the bare three-word form, it
+    /// reported the decline correctly on one run and offered three invented
+    /// causes on the next, none of them what happened.
+    ///
+    /// Three separate obligations, asserted separately so a regression names
+    /// which one broke: the call did not run, the operator is named as the
+    /// one who declined, and the model is told not to guess at a reason.
+    #[tokio::test]
+    async fn operator_deny_states_the_outcome_and_forbids_inventing_a_cause() {
+        let content =
+            tool_results_for_denying_channel(::zeroclaw_api::channel::ApprovalSource::Operator)
+                .await;
+
+        assert!(
+            content.contains("the call did not run"),
+            "the result must say the tool did not execute: {content}"
+        );
+        assert!(
+            content.contains("operator was asked to approve") && content.contains("declined"),
+            "the result must attribute the decision to the operator: {content}"
+        );
+        assert!(
+            content.contains("do not speculate about why"),
+            "the result must forbid inventing a cause: {content}"
+        );
+    }
+
+    /// A denial the model is invited to retry is a denial that does not hold.
+    /// The gate is the only place that knows the operator has already answered,
+    /// so the instruction against retrying belongs in its result rather than in
+    /// the system prompt, which cannot see this turn.
+    #[tokio::test]
+    async fn operator_deny_tells_the_model_not_to_retry_the_call() {
+        let content =
+            tool_results_for_denying_channel(::zeroclaw_api::channel::ApprovalSource::Operator)
+                .await;
+        assert!(
+            content.contains("Do not retry this call"),
+            "the result must tell the model not to retry: {content}"
+        );
+    }
+
+    /// The result is read by the MODEL, so it must not hand it the vocabulary
+    /// for lobbying its way past the gate. `auto_approve` bypasses operator
+    /// approval for one tool and `level = "full"` removes the gate for every
+    /// tool and drops workspace confinement; naming either invites the model to
+    /// argue for expanding its own privileges. The operator gets that advice
+    /// through the WARN record and the UI, where the decision is theirs.
+    #[tokio::test]
+    async fn no_denial_result_names_a_setting_that_would_permit_the_call() {
+        for source in [
+            ::zeroclaw_api::channel::ApprovalSource::Operator,
+            ::zeroclaw_api::channel::ApprovalSource::TimedOut,
+            ::zeroclaw_api::channel::ApprovalSource::Unreachable,
+            ::zeroclaw_api::channel::ApprovalSource::Unavailable,
+        ] {
+            let content = tool_results_for_denying_channel(source).await;
+            for forbidden in ["auto_approve", "level = \"full\"", "risk profile"] {
+                assert!(
+                    !content.contains(forbidden),
+                    "{source:?} denial names `{forbidden}` to the model: {content}"
+                );
+            }
         }
     }
 
@@ -5449,12 +5949,14 @@ mod tests {
 
         let err = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -5473,11 +5975,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -5527,12 +6033,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -5551,11 +6059,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -5593,6 +6105,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_tool_call_loop_reuses_fallback_image_cache_across_iterations() {
+        let temp = tempfile::tempdir().unwrap();
+        let uploads = temp.path().join("uploads");
+        std::fs::create_dir(&uploads).unwrap();
+        let image_path = uploads.join("cached.png");
+        let original_bytes = [
+            0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 1, 2, 3, 4,
+        ];
+        let replacement_bytes = vec![
+            0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 5, 6, 7, 8,
+        ];
+        std::fs::write(&image_path, original_bytes).unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = MutatingImageProvider {
+            calls: Arc::clone(&calls),
+            image_path: image_path.clone(),
+            original_data_uri: format!("data:image/png;base64,{}", STANDARD.encode(original_bytes)),
+            replacement_bytes,
+        };
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("probe", Arc::clone(&invocations)),
+            )]);
+        let mut history = vec![ChatMessage::user(format!(
+            "inspect [IMAGE:{}]",
+            image_path.display()
+        ))];
+        let observer = NoopObserver;
+        let turn_id = uuid::Uuid::new_v4().to_string();
+
+        let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    dispatch_model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 3,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            // Test transcript starts fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            served_route_sink: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("fallback cache should survive every tool-loop iteration");
+
+        assert_eq!(result, "done");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn run_tool_call_loop_degrades_carried_over_image_on_non_vision_provider() {
         let model_provider = RecordingModelProvider::new();
         let recorded_requests = Arc::clone(&model_provider.requests);
@@ -5612,12 +6218,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -5636,11 +6244,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -5680,7 +6292,7 @@ mod tests {
             "carried-over image marker must be stripped, got: {sent_blob}"
         );
         assert!(
-            sent_blob.contains("[media attachment]"),
+            sent_blob.contains(zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER),
             "stripped marker should become the text placeholder, got: {sent_blob}"
         );
     }
@@ -5702,12 +6314,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -5726,11 +6340,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -5777,12 +6395,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -5801,11 +6421,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -5855,12 +6479,14 @@ mod tests {
 
         let err = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -5879,11 +6505,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -5934,12 +6564,14 @@ mod tests {
         // should succeed because there are no image markers to trigger routing.
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "scripted",
                     model: "scripted-model",
+                    dispatch_model: "scripted-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -5958,11 +6590,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -6000,12 +6636,14 @@ mod tests {
 
             run_tool_call_loop(ToolLoop {
                 parent_agent_alias: None,
+                served_route_sink: None,
                 sop_reassembly: None,
                 exec: ResolvedAgentExecution {
                     model_access: ResolvedModelAccess {
                         model_provider: &model_provider,
                         provider_name: "scripted",
                         model: "scripted-model",
+                        dispatch_model: "scripted-model",
                         temperature: Some(0.0),
                     },
                     tools_registry: &tools_registry,
@@ -6024,11 +6662,15 @@ mod tests {
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
-                    context_token_budget: 0,
+                    context_limits: test_context_limits(0),
+                    context_limits_resolver: None,
                     receipt_generator: None,
                     knobs: &LoopKnobs::default(),
                 },
                 history: &mut history,
+                // Test transcripts start fresh: no prior trim, no crumb.
+                history_has_trim_breadcrumb: &mut false,
+                injected_memory_preamble: &mut None,
                 channel_name: "cli",
                 channel_reply_target: None,
                 cancellation_token: None,
@@ -6187,12 +6829,14 @@ mod tests {
 
             run_tool_call_loop(ToolLoop {
                 parent_agent_alias: None,
+                served_route_sink: None,
                 sop_reassembly: None,
                 exec: ResolvedAgentExecution {
                     model_access: ResolvedModelAccess {
                         model_provider: &model_provider,
                         provider_name: "scripted",
                         model: "scripted-model",
+                        dispatch_model: "scripted-model",
                         temperature: Some(0.0),
                     },
                     tools_registry: &tools_registry,
@@ -6211,11 +6855,15 @@ mod tests {
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 0,
-                    context_token_budget: 0,
+                    context_limits: test_context_limits(0),
+                    context_limits_resolver: None,
                     receipt_generator: None,
                     knobs: &LoopKnobs::default(),
                 },
                 history: &mut history,
+                // Test transcripts start fresh: no prior trim, no crumb.
+                history_has_trim_breadcrumb: &mut false,
+                injected_memory_preamble: &mut None,
                 channel_name: "cli",
                 channel_reply_target: None,
                 cancellation_token: None,
@@ -6313,12 +6961,14 @@ mod tests {
 
         let err = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -6337,11 +6987,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -6391,12 +7045,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "scripted",
                     model: "scripted-model",
+                    dispatch_model: "scripted-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -6415,11 +7071,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -6468,12 +7128,14 @@ mod tests {
 
         let err = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -6492,11 +7154,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -6630,12 +7296,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -6654,11 +7322,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -6755,6 +7427,7 @@ mod tests {
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         };
         let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
         engine.replace_sops_for_test(vec![sop]);
@@ -6772,12 +7445,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -6796,11 +7471,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "agent",
             channel_reply_target: None,
             cancellation_token: None,
@@ -6903,6 +7582,7 @@ mod tests {
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         };
         let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig {
             step_scope_enforce: true,
@@ -6933,12 +7613,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -6957,11 +7639,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "agent",
             channel_reply_target: None,
             cancellation_token: None,
@@ -7000,6 +7686,261 @@ mod tests {
         assert_eq!(run.status, crate::sop::SopRunStatus::Completed);
         assert_eq!(run.step_results.len(), 1);
         assert_eq!(run.step_results[0].output, "step recovered");
+    }
+
+    /// Activates a deferred tool into the shared set when called, standing in
+    /// for `tool_search` without the MCP machinery.
+    struct ActivatingTool {
+        activated: Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>,
+        activates: String,
+    }
+
+    #[async_trait]
+    impl Tool for ActivatingTool {
+        fn name(&self) -> &str {
+            "activator"
+        }
+
+        fn description(&self) -> &str {
+            "Activates a deferred tool mid-turn"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            let late: Arc<dyn Tool> = Arc::new(CountingTool::new(
+                &self.activates,
+                Arc::new(AtomicUsize::new(0)),
+            ));
+            self.activated
+                .lock()
+                .expect("activated set lock")
+                .activate(self.activates.clone(), late);
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "activated".into(),
+                error: None,
+            })
+        }
+    }
+
+    /// Scripted provider that also records the tool names it was offered on
+    /// each call, so a test can assert what the *second* iteration saw.
+    struct OfferedToolsRecorder {
+        responses: Arc<Mutex<VecDeque<ChatResponse>>>,
+        offered: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for OfferedToolsRecorder {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: true,
+                ..ProviderCapabilities::default()
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system unused")
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.offered.lock().expect("offered lock").push(
+                request
+                    .tools
+                    .map(|tools| tools.iter().map(|t| t.name.clone()).collect())
+                    .unwrap_or_default(),
+            );
+            self.responses
+                .lock()
+                .expect("responses lock")
+                .pop_front()
+                .ok_or_else(|| anyhow::Error::msg("scripted provider exhausted responses"))
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for OfferedToolsRecorder {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "OfferedToolsRecorder"
+        }
+    }
+
+    /// Run one turn that activates a deferred tool on its first iteration, and
+    /// report the tool names offered on the second.
+    async fn offered_after_mid_turn_activation(
+        step_scope: Option<crate::sop::active_scope::HeadlessStepScope>,
+    ) -> Vec<String> {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let activated = Arc::new(std::sync::Mutex::new(crate::tools::ActivatedToolSet::new()));
+        let offered = Arc::new(Mutex::new(Vec::new()));
+        let model_provider = OfferedToolsRecorder {
+            responses: Arc::new(Mutex::new(VecDeque::from(vec![
+                ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "activate".to_string(),
+                        name: "activator".to_string(),
+                        arguments: "{}".to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ]))),
+            offered: Arc::clone(&offered),
+        };
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                ActivatingTool {
+                    activated: Arc::clone(&activated),
+                    activates: "late_tool".to_string(),
+                },
+            )]);
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("activate then use"),
+        ];
+        let observer = NoopObserver;
+        // Bound rather than inlined below: these outlive the future the
+        // `ToolLoop` literal borrows them into.
+        let multimodal = zeroclaw_config::schema::MultimodalConfig::default();
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let knobs = LoopKnobs::default();
+        let mut history_has_trim_breadcrumb = false;
+        let mut injected_memory_preamble = None;
+
+        let run = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            served_route_sink: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    dispatch_model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &multimodal,
+                config: None,
+                max_tool_iterations: 4,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: Some(&activated),
+                model_switch_callback: None,
+                pacing: &pacing,
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &knobs,
+            },
+            history: &mut history,
+            history_has_trim_breadcrumb: &mut history_has_trim_breadcrumb,
+            injected_memory_preamble: &mut injected_memory_preamble,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: Some("test-agent"),
+            turn_id: &turn_id,
+        });
+        let result = crate::sop::active_scope::with_inherited_headless_step_scope(step_scope, run)
+            .await
+            .expect("turn should complete");
+        assert_eq!(result, "done");
+
+        let offered = offered.lock().expect("offered lock");
+        assert_eq!(
+            offered.len(),
+            2,
+            "the turn should have made two provider calls, got {offered:?}"
+        );
+        offered[1].clone()
+    }
+
+    /// A step's scope is resolved by name, so it can only narrow tools that
+    /// exist when it is resolved. `tool_search` activates deferred MCP tools
+    /// mid-turn: resolving once per turn would leave a tool activated on
+    /// iteration 1 callable on iteration 2, which is exactly how a scoped step
+    /// that may search could reach a tool its scope excludes.
+    #[tokio::test]
+    async fn scoped_step_narrows_tools_activated_mid_turn() {
+        let unscoped = offered_after_mid_turn_activation(None).await;
+        assert!(
+            unscoped.iter().any(|name| name == "late_tool"),
+            "control: an unscoped turn should be offered the activated tool, got {unscoped:?}"
+        );
+
+        let scope = crate::sop::active_scope::HeadlessStepScope {
+            run_id: "run-1".into(),
+            step: crate::sop::SopStep {
+                number: 1,
+                scope: Some(crate::sop::StepToolScope {
+                    allow: Some(vec!["activator".into()]),
+                    deny: Vec::new(),
+                }),
+                ..crate::sop::SopStep::default()
+            },
+            config: zeroclaw_config::schema::SopConfig {
+                step_scope_enforce: true,
+                ..zeroclaw_config::schema::SopConfig::default()
+            },
+        };
+        let scoped = offered_after_mid_turn_activation(Some(scope)).await;
+        assert!(
+            !scoped.iter().any(|name| name == "late_tool"),
+            "a tool activated mid-turn must be narrowed on the next iteration, got {scoped:?}"
+        );
+        assert!(
+            scoped.iter().any(|name| name == "activator"),
+            "the step's allowed tool must survive, got {scoped:?}"
+        );
     }
 
     #[tokio::test]
@@ -7051,12 +7992,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -7075,11 +8018,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: true,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -7224,12 +8171,14 @@ mod tests {
 
         let _ = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -7248,11 +8197,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: true,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: Some(token.clone()),
@@ -7333,12 +8286,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -7357,11 +8312,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: Some("chat-42"),
             cancellation_token: None,
@@ -7426,12 +8385,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -7450,11 +8411,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: Some("chat-42"),
             cancellation_token: None,
@@ -7511,12 +8476,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -7535,11 +8502,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "lark",
             channel_reply_target: Some("chat-99"),
             cancellation_token: None,
@@ -7604,12 +8575,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -7628,11 +8601,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "feishu",
             channel_reply_target: Some("chat-77"),
             cancellation_token: None,
@@ -7700,12 +8677,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -7724,11 +8703,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -7802,12 +8785,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -7826,11 +8811,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -7896,12 +8885,14 @@ mod tests {
 
         let _ = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -7920,11 +8911,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -8016,12 +9011,14 @@ mod tests {
 
         let err = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -8040,11 +9037,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &knobs,
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "acp",
             channel_reply_target: Some("operator"),
             cancellation_token: None,
@@ -8114,12 +9115,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -8138,11 +9141,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "acp",
             channel_reply_target: Some("operator"),
             cancellation_token: None,
@@ -8217,12 +9224,14 @@ mod tests {
 
         let err = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -8241,11 +9250,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "acp",
             channel_reply_target: Some("operator"),
             cancellation_token: None,
@@ -8310,12 +9323,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -8334,11 +9349,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -8407,12 +9426,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -8431,11 +9452,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -8506,12 +9531,14 @@ mod tests {
 
         let _result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -8530,11 +9557,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -8591,12 +9622,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -8615,11 +9648,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -8680,12 +9717,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -8704,11 +9743,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -8764,12 +9807,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -8788,11 +9833,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -8846,12 +9895,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -8870,11 +9921,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -8931,12 +9986,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -8955,11 +10012,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9014,12 +10075,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -9038,11 +10101,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9108,6 +10175,7 @@ mod tests {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -9126,7 +10194,8 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
@@ -9139,6 +10208,7 @@ mod tests {
             channel: None,
             collected_receipts: None,
             event_tx: Some(event_tx),
+            served_route_sink: None,
             steering: None,
             new_messages_out: Some(&mut new_messages_out),
             image_cache: None,
@@ -9146,6 +10216,8 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
         })
         .await
         .expect_err("visible stream failure must remain an interruption error");
@@ -9193,12 +10265,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -9217,11 +10291,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9267,12 +10345,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -9291,11 +10371,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9342,12 +10426,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -9366,11 +10452,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9417,12 +10507,14 @@ mod tests {
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -9441,11 +10533,15 @@ mod tests {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9494,12 +10590,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -9518,11 +10616,15 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9575,12 +10677,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -9599,11 +10703,15 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9668,12 +10776,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -9692,11 +10802,15 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9745,12 +10859,14 @@ Done."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -9769,11 +10885,15 @@ Done."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9825,12 +10945,14 @@ Done."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -9849,11 +10971,15 @@ Done."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9903,12 +11029,14 @@ Done."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -9927,11 +11055,15 @@ Done."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -9982,12 +11114,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -10006,11 +11140,15 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10118,12 +11256,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -10142,11 +11282,15 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10205,12 +11349,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -10229,11 +11375,15 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10295,12 +11445,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -10319,11 +11471,15 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10408,12 +11564,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -10432,11 +11590,15 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10491,6 +11653,7 @@ This is an example, not an invocation."#;
                 StreamDelta::ToolStart { .. }
                 | StreamDelta::ToolComplete { .. }
                 | StreamDelta::Lifecycle(_) => true,
+                StreamDelta::FlushBarrier(_) => true,
             }),
             "draft deltas must not expose inline think tags: {deltas:?}"
         );
@@ -10533,12 +11696,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -10557,11 +11722,15 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10586,7 +11755,9 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
+                StreamDelta::Status(_)
+                | StreamDelta::Lifecycle(_)
+                | StreamDelta::FlushBarrier(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -10627,12 +11798,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -10651,11 +11824,15 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -10680,7 +11857,9 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
+                StreamDelta::Status(_)
+                | StreamDelta::Lifecycle(_)
+                | StreamDelta::FlushBarrier(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -10732,12 +11911,14 @@ This is an example, not an invocation."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -10756,11 +11937,15 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -11626,12 +12811,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -11650,11 +12837,15 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -11679,7 +12870,9 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
+                StreamDelta::Status(_)
+                | StreamDelta::Lifecycle(_)
+                | StreamDelta::FlushBarrier(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -11733,12 +12926,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -11757,11 +12952,15 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -11837,12 +13036,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -11861,11 +13062,15 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -11941,12 +13146,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -11965,11 +13172,15 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -12102,12 +13313,14 @@ This is an example, not an invocation."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &router,
                     provider_name: "router",
                     model: "hint:fast",
+                    dispatch_model: "hint:fast",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -12126,11 +13339,15 @@ This is an example, not an invocation."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -12155,7 +13372,9 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
+                StreamDelta::Status(_)
+                | StreamDelta::Lifecycle(_)
+                | StreamDelta::FlushBarrier(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -12220,6 +13439,8 @@ This is an example, not an invocation."#;
                 None,
                 &model_provider,
                 &mut history,
+                &mut false,
+                &mut None,
                 &tools_registry,
                 &observer,
                 "mock-provider",
@@ -12294,6 +13515,8 @@ This is an example, not an invocation."#;
                 None,
                 &model_provider,
                 &mut history,
+                &mut false,
+                &mut None,
                 &tools_registry,
                 &observer,
                 "mock-provider",
@@ -12425,6 +13648,8 @@ This is an example, not an invocation."#;
                 None,
                 &model_provider,
                 &mut history,
+                &mut false,
+                &mut None,
                 &tools_registry,
                 &observer,
                 "mock-provider",
@@ -12506,6 +13731,8 @@ This is an example, not an invocation."#;
                 None,
                 &model_provider,
                 &mut history,
+                &mut false,
+                &mut None,
                 &tools_registry,
                 &observer,
                 "mock-provider",
@@ -12603,6 +13830,32 @@ This is an example, not an invocation."#;
         assert!(instructions.contains("shell"));
         assert!(instructions.contains("file_read"));
         assert!(instructions.contains("file_write"));
+    }
+
+    /// The tool-call guidance lives in `agent::tool_call_format` and
+    /// must be embedded verbatim here, not re-typed. The sibling assertion
+    /// for the XML dispatcher lives in `agent::tests`; both are re-checked
+    /// together in `agent::tool_call_format`.
+    #[test]
+    fn build_tool_instructions_embeds_shared_tool_call_guidance() {
+        use crate::agent::tool_call_format::TOOL_CALL_PROTOCOL_INSTRUCTIONS;
+        use crate::security::SecurityPolicy;
+
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            std::path::Path::new("/tmp"),
+        ));
+        let tools = tools::default_tools(security);
+        let instructions = build_tool_instructions(&tools);
+
+        assert!(
+            instructions.contains(TOOL_CALL_PROTOCOL_INSTRUCTIONS),
+            "loop_ tool instructions drifted from the shared block:\n{instructions}"
+        );
+        assert!(
+            instructions.contains("### Available Tools\n\n"),
+            "loop_ tool instructions must still layer the tool listing on top"
+        );
     }
 
     #[test]
@@ -13446,6 +14699,42 @@ Let me check the result."#;
     }
 
     #[test]
+    fn turn_prompt_budget_applies_after_deferred_and_thinking_sections() {
+        use zeroclaw_config::schema::{RiskProfileConfig, SkillsPromptInjectionMode};
+
+        let workspace = tempdir().expect("tempdir");
+        let provider = ScriptedModelProvider::from_text_responses(vec!["ok"]);
+        let prompt = super::build_system_prompt_for_turn(
+            workspace.path(),
+            "test-model",
+            &[],
+            &format!("## Deferred\n\n{}", "界".repeat(300)),
+            &[],
+            None,
+            None,
+            &RiskProfileConfig::default(),
+            &provider,
+            &[],
+            &[],
+            None,
+            false,
+            SkillsPromptInjectionMode::Full,
+            false,
+            512,
+            true,
+            false,
+            Some("THINKING_PREFIX"),
+            None,
+        )
+        .expect("turn prompt");
+
+        assert_eq!(prompt.chars().count(), 512);
+        assert!(prompt.starts_with("THINKING_PREFIX"));
+        assert!(prompt.ends_with(crate::agent::prompt::TIMESTAMP_ORIENTATION));
+        assert!(!prompt.contains("System prompt truncated"));
+    }
+
+    #[test]
     fn interactive_turn_system_prompt_uses_effective_dynamic_mcp_specs() {
         use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
         use zeroclaw_config::schema::{
@@ -13565,6 +14854,172 @@ Let me check the result."#;
         .expect("tools turn prompt should build");
         assert!(tools_turn_prompt.contains(NATIVE_TOOLS_TASK_FRAMING));
         assert!(!tools_turn_prompt.contains(NO_TOOLS_TASK_FRAMING));
+    }
+
+    #[tokio::test]
+    async fn turn_prompt_skill_callable_names_follow_assembled_registry() {
+        use zeroclaw_config::schema::{RiskProfileConfig, SkillsPromptInjectionMode};
+
+        let workspace = tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.security.nat64_prefixes = vec!["not-a-prefix".into()];
+        let security = Arc::new(TestPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            ..TestPolicy::default()
+        });
+        let risk_profile = RiskProfileConfig::default();
+        let built = crate::tools::AllToolsResult {
+            tools: vec![mock_tool("shell")],
+            delegate_handle: None,
+            ask_user_handle: None,
+            reaction_handle: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            poll_handle: None,
+            escalate_handle: None,
+            channel_room_handle: None,
+            unfiltered_tool_arcs: Vec::new(),
+            delegate_tool: None,
+        };
+        let skill = crate::skills::Skill {
+            name: "ops".into(),
+            description: "Operations helpers".into(),
+            description_localizations: Default::default(),
+            version: "1".into(),
+            author: None,
+            tags: Vec::new(),
+            tools: vec![
+                crate::skills::SkillTool {
+                    name: "run".into(),
+                    description: "Run an operation".into(),
+                    kind: "shell".into(),
+                    command: "echo ok".into(),
+                    args: Default::default(),
+                    target: None,
+                    locked_args: Default::default(),
+                    timeout_secs: None,
+                },
+                crate::skills::SkillTool {
+                    name: "fetch".into(),
+                    description: "Fetch an operation status".into(),
+                    kind: "http".into(),
+                    command: "https://example.com/status".into(),
+                    args: Default::default(),
+                    target: None,
+                    locked_args: Default::default(),
+                    timeout_secs: None,
+                },
+            ],
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        };
+        let assembled = crate::tools::scoped::ScopedToolRegistry::assemble(
+            crate::tools::scoped::ScopedAssembly {
+                config: &config,
+                agent_alias: "test",
+                security: &security,
+                built,
+                skills: std::slice::from_ref(&skill),
+                runtime: Arc::new(crate::platform::NativeRuntime::new()),
+                caller_allowed: None,
+                connect_mcp: false,
+                connect_peripherals: false,
+                exclude_memory: false,
+                acp_delivery: false,
+                list_deferred_mcp_specs: false,
+                emit_assembly_logs: false,
+                mcp_registry: None,
+            },
+        )
+        .await;
+        let assembled_names: HashSet<&str> =
+            assembled.registry.iter().map(|tool| tool.name()).collect();
+        assert!(assembled_names.contains("ops__run"));
+        assert!(!assembled_names.contains("ops__fetch"));
+
+        let provider = ScriptedModelProvider::from_text_responses(vec!["ok"]);
+        let prompt = super::build_system_prompt_for_turn(
+            workspace.path(),
+            "test-model",
+            &[],
+            "",
+            std::slice::from_ref(&skill),
+            None,
+            None,
+            &risk_profile,
+            &provider,
+            &assembled.registry,
+            &[],
+            None,
+            false,
+            SkillsPromptInjectionMode::Full,
+            false,
+            usize::MAX,
+            true,
+            false,
+            None,
+            None,
+        )
+        .expect("turn prompt should build");
+
+        let callable_start = prompt
+            .find("<callable_tools")
+            .expect("callable skill tools should be rendered");
+        let callable_end = callable_start
+            + prompt[callable_start..]
+                .find("</callable_tools>")
+                .expect("callable skill tools should close")
+            + "</callable_tools>".len();
+        let callable_names: HashSet<&str> = prompt[callable_start..callable_end]
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("<name>")
+                    .and_then(|name| name.strip_suffix("</name>"))
+            })
+            .collect();
+        let expected_callable_names: HashSet<&str> = ["ops__run", "ops__fetch"]
+            .into_iter()
+            .filter(|name| assembled_names.contains(*name))
+            .collect();
+        assert_eq!(callable_names, expected_callable_names);
+
+        let tools_start = prompt.find("<tools>").expect("HTTP metadata should remain");
+        let tools_end = tools_start
+            + prompt[tools_start..]
+                .find("</tools>")
+                .expect("HTTP metadata should close")
+            + "</tools>".len();
+        let descriptive_tools = &prompt[tools_start..tools_end];
+        assert!(descriptive_tools.contains("<name>fetch</name>"));
+        assert!(descriptive_tools.contains("<kind>http</kind>"));
+
+        let strict_prompt = super::build_system_prompt_for_turn(
+            workspace.path(),
+            "test-model",
+            &[],
+            "",
+            std::slice::from_ref(&skill),
+            None,
+            None,
+            &risk_profile,
+            &provider,
+            &assembled.registry,
+            &[],
+            None,
+            true,
+            SkillsPromptInjectionMode::Full,
+            false,
+            usize::MAX,
+            true,
+            false,
+            None,
+            None,
+        )
+        .expect("strict turn prompt should build");
+        assert!(!strict_prompt.contains("<callable_tools"));
+        assert!(strict_prompt.contains("<name>run</name>"));
+        assert!(strict_prompt.contains("<name>fetch</name>"));
     }
 
     #[test]
@@ -14477,11 +15932,21 @@ Let me check the result."#;
     }
 
     #[test]
-    fn cli_outer_recovery_trims_below_model_window_with_headroom() {
+    fn cli_outer_recovery_uses_capacity_headroom_not_proactive_budget() {
         use crate::agent::history_trim::trim_to_recent_turns;
 
-        let model_context_window: usize = 32_000;
-        let recovery_budget = model_context_window * 9 / 10; // 28_800
+        let context_limits = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: 32_000,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            context_token_budget: 7_200,
+        };
+        let recovery_budget = interactive_context_recovery_budget(context_limits);
+        assert_eq!(recovery_budget, 28_800);
+        assert_ne!(
+            recovery_budget, context_limits.context_token_budget,
+            "reactive recovery must not reuse the positive proactive trim budget"
+        );
 
         let big = "x".repeat(4000);
         let mut history = vec![ChatMessage::system("sys")];
@@ -14491,7 +15956,7 @@ Let me check the result."#;
         }
         let tokens_before = super::estimate_history_tokens(&history);
         assert!(
-            tokens_before > model_context_window,
+            tokens_before > context_limits.model_context_window,
             "fixture must overflow the window: got {tokens_before}"
         );
 
@@ -14509,7 +15974,7 @@ Let me check the result."#;
         // Headroom must leave us strictly below the model's true window,
         // so the retried request has room for the reply + next user turn.
         assert!(
-            result.tokens_after < model_context_window,
+            result.tokens_after < context_limits.model_context_window,
             "headroom must leave us strictly below the model window: got {}",
             result.tokens_after
         );
@@ -14543,12 +16008,14 @@ Let me check the result."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -14567,11 +16034,15 @@ Let me check the result."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "telegram",
             channel_reply_target: None,
             cancellation_token: None,
@@ -14608,6 +16079,7 @@ Let me check the result."#;
                     d.legacy_status().unwrap_or_default()
                 }
                 StreamDelta::Lifecycle(_) => String::new(),
+                StreamDelta::FlushBarrier(_) => String::new(),
             })
             .collect();
 
@@ -14701,6 +16173,7 @@ Let me check the result."#;
                     input_tokens: Some(1_000),
                     output_tokens: Some(200),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             }]))),
@@ -14726,12 +16199,14 @@ Let me check the result."#;
                 Some(ctx),
                 run_tool_call_loop(ToolLoop {
                     parent_agent_alias: None,
+                    served_route_sink: None,
                     sop_reassembly: None,
                     exec: ResolvedAgentExecution {
                         model_access: ResolvedModelAccess {
                             model_provider: &model_provider,
                             provider_name: "mock-provider",
                             model: "mock-model",
+                            dispatch_model: "mock-model",
                             temperature: Some(0.0),
                         },
                         tools_registry:
@@ -14751,11 +16226,15 @@ Let me check the result."#;
                         strict_tool_parsing: false,
                         parallel_tools: false,
                         max_tool_result_chars: 0,
-                        context_token_budget: 0,
+                        context_limits: test_context_limits(0),
+                        context_limits_resolver: None,
                         receipt_generator: None,
                         knobs: &LoopKnobs::default(),
                     },
                     history: &mut history,
+                    // Test transcripts start fresh: no prior trim, no crumb.
+                    history_has_trim_breadcrumb: &mut false,
+                    injected_memory_preamble: &mut None,
                     channel_name: "test",
                     channel_reply_target: None,
                     cancellation_token: None,
@@ -14804,6 +16283,7 @@ Let me check the result."#;
                 input_tokens: Some(80),
                 output_tokens: Some(5),
                 cached_input_tokens: None,
+                cache_creation_input_tokens: None,
             }),
             reasoning_content: None,
         };
@@ -14814,6 +16294,7 @@ Let me check the result."#;
                 input_tokens: Some(80),
                 output_tokens: Some(7),
                 cached_input_tokens: None,
+                cache_creation_input_tokens: None,
             }),
             reasoning_content: None,
         };
@@ -14846,11 +16327,13 @@ Let me check the result."#;
                 run_tool_call_loop(ToolLoop {
                     parent_agent_alias: None,
                     sop_reassembly: None,
+                    served_route_sink: None,
                     exec: ResolvedAgentExecution {
                         model_access: ResolvedModelAccess {
                             model_provider: &provider,
                             provider_name: "reliable-test",
                             model: "test-model",
+                            dispatch_model: "test-model",
                             temperature: Some(0.0),
                         },
                         tools_registry: &tools_registry,
@@ -14869,11 +16352,24 @@ Let me check the result."#;
                         strict_tool_parsing: false,
                         parallel_tools: false,
                         max_tool_result_chars: 0,
-                        context_token_budget: 100,
+                        // The reported-budget enforcement projects the NEXT
+                        // request from the durable history at the calibration
+                        // ratio (reported 80 / estimated ~30 ≈ 2.7), which lands
+                        // just over a 100-token budget for the 5-message
+                        // post-response history. The budget here must sit above
+                        // that projected next request so the accepted 80-token
+                        // context fill does not force a projection-driven trim;
+                        // the `must not trim` contract below stays meaningful.
+                        context_limits:
+                            zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(120),
+                        context_limits_resolver: None,
                         receipt_generator: None,
                         knobs: &LoopKnobs::default(),
                     },
                     history: &mut history,
+                    // Test transcripts start fresh: no prior trim, no crumb.
+                    history_has_trim_breadcrumb: &mut false,
+                    injected_memory_preamble: &mut None,
                     channel_name: "test",
                     channel_reply_target: None,
                     cancellation_token: None,
@@ -14938,10 +16434,202 @@ Let me check the result."#;
                 _ => {}
             }
         }
-        assert_eq!(usage_events, vec![(Some(80), Some(7))]);
+        // Both the rejected attempt (80 in, 5 out) and the accepted attempt
+        // (80 in, 7 out) now emit Usage events.
+        assert_eq!(usage_events, vec![(Some(80), Some(5)), (Some(80), Some(7))]);
         assert!(
             !history_trimmed,
             "recovered rejected usage must not trim history"
+        );
+    }
+
+    /// A malformed-protocol iteration settles billable attempts and retries
+    /// with a fresh vec: the gateway ledger must still see the rejected
+    /// attempt. Regression for the rejected-projection gap on the
+    /// malformed-retry path (the error-recovery path shares the helper).
+    #[tokio::test]
+    async fn malformed_retry_projects_rejected_usage_before_accepted_response() {
+        use super::{
+            TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoop, ToolLoopCostTrackingContext,
+            run_tool_call_loop,
+        };
+        use zeroclaw_api::agent::TurnEvent;
+        use zeroclaw_providers::reliable::ReliableModelProvider;
+
+        struct ShellProbeTool;
+        zeroclaw_api::tool_attribution!(
+            ShellProbeTool,
+            ::zeroclaw_api::attribution::ToolKind::Plugin
+        );
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for ShellProbeTool {
+            fn name(&self) -> &str {
+                "shell"
+            }
+            fn description(&self) -> &str {
+                "probe tool"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(
+                &self,
+                _args: serde_json::Value,
+            ) -> anyhow::Result<crate::tools::ToolResult> {
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: "ok".into(),
+                    error: None,
+                })
+            }
+        }
+
+        // Body is broken JSON naming an unknown tool: no parser fallback can
+        // produce a valid call from it (so the iteration can never execute),
+        // while the `<tool_call>` envelope shape unconditionally flags a
+        // parse issue regardless of the known-tool set.
+        let malformed = ChatResponse {
+            text: Some(
+                "<tool_call>{\"name\": \"nonexistent_tool_xyz\", BROKEN!!!</tool_call>".to_string(),
+            ),
+            tool_calls: Vec::new(),
+            usage: Some(zeroclaw_providers::traits::TokenUsage {
+                input_tokens: Some(60),
+                output_tokens: Some(4),
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
+            }),
+            reasoning_content: None,
+        };
+        let accepted = ChatResponse {
+            text: Some("accepted response".to_string()),
+            tool_calls: Vec::new(),
+            usage: Some(zeroclaw_providers::traits::TokenUsage {
+                input_tokens: Some(80),
+                output_tokens: Some(7),
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
+            }),
+            reasoning_content: None,
+        };
+        let provider = ReliableModelProvider::new(
+            "reliable-test",
+            vec![(
+                "scripted".to_string(),
+                Box::new(ScriptedModelProvider {
+                    responses: Arc::new(Mutex::new(VecDeque::from([malformed, accepted]))),
+                    capabilities: ProviderCapabilities::default(),
+                }) as Box<dyn ModelProvider>,
+            )],
+            1,
+            1,
+        );
+        let observer = CapturingObserver::default();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let usage_ctx = ToolLoopCostTrackingContext::usage_only();
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("earlier question"),
+            ChatMessage::assistant("earlier answer"),
+            ChatMessage::user("current question"),
+        ];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                ShellProbeTool,
+            )
+                as Box<dyn crate::tools::Tool>]);
+
+        let result = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(usage_ctx.clone()),
+                run_tool_call_loop(ToolLoop {
+                    parent_agent_alias: None,
+                    sop_reassembly: None,
+                    exec: ResolvedAgentExecution {
+                        model_access: ResolvedModelAccess {
+                            model_provider: &provider,
+                            provider_name: "reliable-test",
+                            model: "test-model",
+                            dispatch_model: "test-model",
+                            temperature: Some(0.0),
+                        },
+                        tools_registry: &tools_registry,
+                        observer: &observer,
+                        silent: true,
+                        approval: None,
+                        multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                        config: None,
+                        max_tool_iterations: 2,
+                        hooks: None,
+                        excluded_tools: &[],
+                        dedup_exempt_tools: &[],
+                        activated_tools: None,
+                        model_switch_callback: None,
+                        pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                        strict_tool_parsing: false,
+                        parallel_tools: false,
+                        max_tool_result_chars: 0,
+                        context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                            model_context_window: 100,
+                            context_token_budget: 100,
+                            model_context_window_source:
+                                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+                        },
+                        context_limits_resolver: None,
+                        receipt_generator: None,
+                        knobs: &LoopKnobs::default(),
+                    },
+                    history: &mut history,
+                    history_has_trim_breadcrumb: &mut false,
+                    injected_memory_preamble: &mut None,
+                    channel_name: "test",
+                    channel_reply_target: None,
+                    cancellation_token: None,
+                    on_delta: None,
+                    shared_budget: None,
+                    channel: None,
+                    collected_receipts: None,
+                    event_tx: Some(event_tx),
+                    steering: None,
+                    new_messages_out: None,
+                    image_cache: None,
+                    memory: None,
+                    ingress: IngressContext::sub_turn(),
+                    agent_alias: None,
+                    turn_id: "malformed-usage-test",
+                    served_route_sink: None,
+                }),
+            )
+            .await
+            .expect("malformed retry should recover into the accepted response");
+
+        assert_eq!(result, "accepted response");
+        let usage = usage_ctx.snapshot_turn_usage();
+        assert_eq!(usage.input_tokens, 140, "both billed attempts are retained");
+        assert_eq!(usage.output_tokens, 11);
+        assert_eq!(
+            usage.last_input_tokens, 80,
+            "only the accepted response may set the context-window fill"
+        );
+
+        let mut usage_events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let TurnEvent::Usage {
+                input_tokens,
+                output_tokens,
+                accepted,
+                ..
+            } = event
+            {
+                usage_events.push((input_tokens, output_tokens, accepted));
+            }
+        }
+        // The malformed iteration's billable attempt (60 in, 4 out) is
+        // projected as rejected even though its iteration never accepted,
+        // followed by the accepted attempt (80 in, 7 out).
+        assert_eq!(
+            usage_events,
+            vec![(Some(60), Some(4), false), (Some(80), Some(7), true),]
         );
     }
 
@@ -14961,12 +16649,14 @@ Let me check the result."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &provider,
                     provider_name: "recording-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
@@ -14987,11 +16677,15 @@ Let me check the result."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -15082,12 +16776,14 @@ Let me check the result."#;
                 Some(ctx),
                 run_tool_call_loop(ToolLoop {
                     parent_agent_alias: None,
+                    served_route_sink: None,
                     sop_reassembly: None,
                     exec: ResolvedAgentExecution {
                         model_access: ResolvedModelAccess {
                             model_provider: &model_provider,
                             provider_name: "mock-provider",
                             model: "mock-model",
+                            dispatch_model: "mock-model",
                             temperature: Some(0.0),
                         },
                         tools_registry:
@@ -15107,11 +16803,15 @@ Let me check the result."#;
                         strict_tool_parsing: false,
                         parallel_tools: false,
                         max_tool_result_chars: 0,
-                        context_token_budget: 0,
+                        context_limits: test_context_limits(0),
+                        context_limits_resolver: None,
                         receipt_generator: None,
                         knobs: &LoopKnobs::default(),
                     },
                     history: &mut history,
+                    // Test transcripts start fresh: no prior trim, no crumb.
+                    history_has_trim_breadcrumb: &mut false,
+                    injected_memory_preamble: &mut None,
                     channel_name: "test",
                     channel_reply_target: None,
                     cancellation_token: None,
@@ -15165,6 +16865,7 @@ Let me check the result."#;
                     input_tokens: Some(500),
                     output_tokens: Some(100),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             }]))),
@@ -15175,12 +16876,14 @@ Let me check the result."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
@@ -15201,11 +16904,15 @@ Let me check the result."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -15266,12 +16973,14 @@ Let me check the result."#;
 
         let _ = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "anthropic.personal",
                     model: "claude-opus-4-8",
+                    dispatch_model: "claude-opus-4-8",
                     temperature: Some(0.0),
                 },
                 tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
@@ -15292,11 +17001,15 @@ Let me check the result."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 50,
+                context_limits: test_context_limits(50),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -15392,6 +17105,7 @@ Let me check the result."#;
                     input_tokens: Some(800),
                     output_tokens: Some(120),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             }]))),
@@ -15463,6 +17177,7 @@ Let me check the result."#;
                     input_tokens: Some(800),
                     output_tokens: Some(120),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             }]))),
@@ -15584,6 +17299,7 @@ Let me check the result."#;
                         input_tokens: Some(1_000_000),
                         output_tokens: Some(10),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                     }),
                     reasoning_content: None,
                 },
@@ -15653,6 +17369,7 @@ Let me check the result."#;
                     input_tokens: Some(800),
                     output_tokens: Some(120),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             }]))),
@@ -16545,7 +18262,8 @@ Let me check the result."#;
             None,
             false,
             None,
-        );
+        )
+        .expect("tool registry builds");
 
         let before = tool_names(&built.tools);
         assert!(
@@ -16746,12 +18464,14 @@ Let me check the result."#;
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
+            served_route_sink: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
                     provider_name: "mock-provider",
                     model: "mock-model",
+                    dispatch_model: "mock-model",
                     temperature: Some(0.0),
                 },
                 tools_registry: &tools_registry,
@@ -16770,11 +18490,15 @@ Let me check the result."#;
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
-                context_token_budget: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
             },
             history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token: None,
@@ -16798,6 +18522,1628 @@ Let me check the result."#;
 
         let events = capturing.events.lock();
         assert_all_events_share_turn_id(&events, Some("test-agent"), Some("cli"));
+    }
+
+    #[tokio::test]
+    async fn reported_budget_calibrates_against_the_post_hook_request_population() {
+        // Regression for the request-seam contract: `reported_population_estimated`
+        // must be snapshotted from the POST-hook `provider_request_messages` (the
+        // request actually passed to the provider), not the pre-hook
+        // `prepared_messages`. A `before_llm_call` hook that grows the request
+        // changes the population the provider reports `input_tokens` for; if the
+        // calibration denominator came from the smaller pre-hook population, the
+        // ratio (and therefore the emitted calibrated `tokens_after`) would be
+        // inflated. The provider below reports `input_tokens` proportional to the
+        // messages it actually received, so the emitted accounting must be tied to
+        // that post-hook population.
+        use crate::hooks::{HookHandler, HookResult, HookRunner};
+
+        struct GrowingRequestHook;
+
+        #[async_trait]
+        impl HookHandler for GrowingRequestHook {
+            fn name(&self) -> &str {
+                "grow-request"
+            }
+
+            async fn before_llm_call(
+                &self,
+                messages: &mut Vec<ChatMessage>,
+                _model: &mut String,
+            ) -> HookResult<()> {
+                messages.push(ChatMessage::assistant("z".repeat(3000)));
+                HookResult::Continue(())
+            }
+        }
+
+        struct PostHookReportingProvider {
+            received: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+        }
+
+        #[async_trait]
+        impl ModelProvider for PostHookReportingProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("chat_with_system should not be used in this test");
+            }
+
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                let post_hook_estimate = estimate_history_tokens(request.messages);
+                self.received
+                    .lock()
+                    .expect("received lock should be valid")
+                    .push(request.messages.to_vec());
+                Ok(ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: Some(zeroclaw_providers::traits::TokenUsage {
+                        input_tokens: Some(post_hook_estimate as u64 * 4),
+                        output_tokens: Some(10),
+                        cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
+                    }),
+                    reasoning_content: None,
+                })
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for PostHookReportingProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "PostHookReportingProvider"
+            }
+        }
+
+        let mut hooks = HookRunner::new();
+        hooks.register(Box::new(GrowingRequestHook));
+
+        let provider = PostHookReportingProvider {
+            received: Arc::new(Mutex::new(Vec::new())),
+        };
+        let received = Arc::clone(&provider.received);
+        let observer = NoopObserver;
+        // The OLDEST turn carries deliberately large content so the durable
+        // history's own raw size dominates the reported-budget trim target
+        // below; a droppable turn must exist and dropping it must matter,
+        // or the post-response enforcement seam under test never fires (see
+        // budget derivation below).
+        let big_first_turn = "x".repeat(4000);
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(format!("first request {big_first_turn}").as_str()),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::user("second request"),
+            ChatMessage::assistant("second answer"),
+        ];
+        // The preflight iteration-0 trim AND the pre-dispatch gate both run
+        // against `context_token_budget` before the reported-budget seam
+        // under test ever fires, so the budget must cover the FULL post-hook
+        // population (durable history plus the hook's growth) — otherwise
+        // the pre-dispatch gate fails the turn on a genuine floor before any
+        // request is dispatched. The provider then reports `input_tokens` at
+        // 4x that same post-hook population (`ratio == 4`), so the
+        // reported-budget trim target scales down to `budget / 4`. That
+        // target must still land BELOW the durable history's own raw size
+        // (dominated by `big_first_turn`) after the response, or nothing is
+        // left to trim and the seam under test never fires; the oldest turn
+        // is large enough that this holds with a comfortable margin.
+        let retained_estimate = estimate_history_tokens(&history);
+        let hook_growth_estimate =
+            estimate_history_tokens(&[ChatMessage::assistant("z".repeat(3000).as_str())]);
+        let budget = retained_estimate + hook_growth_estimate + 20;
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
+        let turn_id = uuid::Uuid::new_v4().to_string();
+
+        run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    dispatch_model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    Vec::new(),
+                ),
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 2,
+                hooks: Some(&hooks),
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_limits: test_context_limits(budget),
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: Some(event_tx),
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+            served_route_sink: None,
+        })
+        .await
+        .expect("tool loop should succeed");
+
+        // The hook grew the request, so the provider must have seen a materially
+        // larger population than the durable history alone.
+        let post_hook_estimate = received
+            .lock()
+            .expect("received lock should be valid")
+            .first()
+            .map(|messages| estimate_history_tokens(messages))
+            .expect("the provider must have received at least one request");
+        assert!(
+            post_hook_estimate > estimate_history_tokens(&history),
+            "the hook must have grown the request population for this regression \
+             (post-hook {post_hook_estimate} vs retained {})",
+            estimate_history_tokens(&history)
+        );
+
+        // The reported-budget trim must be tied to the post-hook population: the
+        // provider reported `4 * post_hook_estimate`, and the runtime's
+        // calibration denominator is the same post-hook population, so the emitted
+        // `tokens_after` is `estimate_history_tokens(retained) * 4`. If the
+        // denominator were the smaller pre-hook population, the ratio would be
+        // inflated and `tokens_after` would not match.
+        let mut trimmed_event = None;
+        while let Ok(event) = event_rx.try_recv() {
+            if let zeroclaw_api::agent::TurnEvent::HistoryTrimmed { .. } = event {
+                trimmed_event = Some(event);
+            }
+        }
+        let trimmed = trimmed_event
+            .expect("the reported-budget enforcement must emit a HistoryTrimmed event");
+        let tokens_after = match trimmed {
+            zeroclaw_api::agent::TurnEvent::HistoryTrimmed { tokens_after, .. } => {
+                tokens_after.expect("reported-budget trim must carry token accounting")
+            }
+            other => panic!("expected HistoryTrimmed, got {other:?}"),
+        };
+        let expected = (estimate_history_tokens(&history) as f64 * 4.0).round() as u64;
+        assert_eq!(
+            tokens_after, expected,
+            "tokens_after must be calibrated against the post-hook request population \
+             (expected estimate(retained) * 4 = {expected})"
+        );
+    }
+
+    /// A provider that records every dispatched request and answers with a
+    /// scripted XML tool call on the first dispatch (when `script_tool_call`)
+    /// and plain text after.
+    struct DispatchRecordingProvider {
+        dispatched: Arc<Mutex<Vec<(bool, String)>>>,
+        script_tool_call: bool,
+    }
+
+    #[async_trait]
+    impl ModelProvider for DispatchRecordingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in this test");
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let dispatch_index = {
+                let mut guard = self
+                    .dispatched
+                    .lock()
+                    .expect("dispatched lock should be valid");
+                guard.push((request.tools.is_some(), model.to_string()));
+                guard.len()
+            };
+            let text = if self.script_tool_call && dispatch_index == 1 {
+                r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"X"}}
+</tool_call>"#
+            } else {
+                "done"
+            };
+            Ok(ChatResponse {
+                text: Some(text.to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for DispatchRecordingProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "DispatchRecordingProvider"
+        }
+    }
+
+    #[tokio::test]
+    async fn stateful_before_llm_call_hook_runs_once_per_dispatched_request() {
+        // A modifying `before_llm_call` hook must be observed exactly once per
+        // dispatched request. The dispatch seam runs it before each provider
+        // call; budget enforcement never executes it as an estimation step.
+        use crate::hooks::{HookHandler, HookResult, HookRunner};
+
+        struct CountingHook(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl HookHandler for CountingHook {
+            fn name(&self) -> &str {
+                "count-before-llm"
+            }
+            async fn before_llm_call(
+                &self,
+                _messages: &mut Vec<ChatMessage>,
+                _model: &mut String,
+            ) -> HookResult<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                HookResult::Continue(())
+            }
+        }
+
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let mut hooks = HookRunner::new();
+        hooks.register(Box::new(CountingHook(Arc::clone(&hook_calls))));
+
+        let provider = DispatchRecordingProvider {
+            dispatched: Arc::new(Mutex::new(Vec::new())),
+            script_tool_call: true,
+        };
+        let dispatched = Arc::clone(&provider.dispatched);
+        let observer = NoopObserver;
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("run the tool once"),
+        ];
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&tool_calls)),
+            )]);
+        let (event_tx, _event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
+        let turn_id = uuid::Uuid::new_v4().to_string();
+
+        run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    dispatch_model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 3,
+                hooks: Some(&hooks),
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: Some(event_tx),
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+            served_route_sink: None,
+        })
+        .await
+        .expect("tool loop should succeed");
+
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            hook_calls.load(Ordering::SeqCst),
+            2,
+            "the stateful hook must run exactly once per dispatched request"
+        );
+        assert_eq!(hook_calls.load(Ordering::SeqCst), {
+            let guard = dispatched.lock().unwrap();
+            guard.len()
+        });
+    }
+
+    #[tokio::test]
+    async fn terminal_response_never_invokes_before_llm_call_for_estimation() {
+        // A terminal response dispatches exactly one request; no later budget
+        // projection may execute a `before_llm_call` hook for a request that
+        // will never be sent.
+        use crate::hooks::{HookHandler, HookResult, HookRunner};
+
+        struct CountingHook(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl HookHandler for CountingHook {
+            fn name(&self) -> &str {
+                "count-before-llm-terminal"
+            }
+            async fn before_llm_call(
+                &self,
+                _messages: &mut Vec<ChatMessage>,
+                _model: &mut String,
+            ) -> HookResult<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                HookResult::Continue(())
+            }
+        }
+
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let mut hooks = HookRunner::new();
+        hooks.register(Box::new(CountingHook(Arc::clone(&hook_calls))));
+
+        let provider = DispatchRecordingProvider {
+            dispatched: Arc::new(Mutex::new(Vec::new())),
+            script_tool_call: false,
+        };
+        let observer = NoopObserver;
+        let mut history = vec![ChatMessage::system("system"), ChatMessage::user("hello")];
+        let (event_tx, _event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
+        let turn_id = uuid::Uuid::new_v4().to_string();
+
+        let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    dispatch_model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    Vec::new(),
+                ),
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 2,
+                hooks: Some(&hooks),
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_limits: test_context_limits(100_000),
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: Some(event_tx),
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+            served_route_sink: None,
+        })
+        .await
+        .expect("tool loop should succeed");
+
+        assert_eq!(result, "done");
+        assert_eq!(
+            hook_calls.load(Ordering::SeqCst),
+            1,
+            "a single-shot turn must invoke the hook only for its one dispatched request"
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum HookBudgetScenario {
+        NativeToPlain,
+        NativeToPlainWithCalibration,
+        PlainToNativeTrim,
+        PlainToNativeFloor,
+        SameModelCalibrated,
+        SummaryTrim,
+        SummaryCalibrated,
+        SummaryFloor,
+    }
+
+    async fn assert_hook_selected_request_budget(
+        scenario: HookBudgetScenario,
+        allow_soft_floor: bool,
+    ) {
+        use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
+        use crate::agent::turn::{ToolProtocolPrompts, scope_tool_protocol_prompts};
+        use crate::hooks::{HookHandler, HookResult, HookRunner};
+
+        struct SelectNextModel {
+            calls: Arc<AtomicUsize>,
+            next_model: &'static str,
+        }
+
+        #[async_trait]
+        impl HookHandler for SelectNextModel {
+            fn name(&self) -> &str {
+                "select-next-model"
+            }
+
+            async fn before_llm_call(
+                &self,
+                _messages: &mut Vec<ChatMessage>,
+                model: &mut String,
+            ) -> HookResult<()> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) >= 1 {
+                    *model = self.next_model.to_string();
+                }
+                HookResult::Continue(())
+            }
+        }
+
+        struct LargeSchemaTool {
+            result_chars: usize,
+        }
+
+        #[async_trait]
+        impl crate::tools::Tool for LargeSchemaTool {
+            fn name(&self) -> &str {
+                "budget_tool"
+            }
+            fn description(&self) -> &str {
+                "Return a bounded result"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "value": {"type": "string", "description": "schema".repeat(1000)}
+                    }
+                })
+            }
+            async fn execute(
+                &self,
+                _args: serde_json::Value,
+            ) -> anyhow::Result<crate::tools::ToolResult> {
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: "r".repeat(self.result_chars).into(),
+                    error: None,
+                })
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for LargeSchemaTool {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+            }
+            fn alias(&self) -> &str {
+                "budget_tool"
+            }
+        }
+
+        struct RecordedRequest {
+            model: String,
+            messages: Vec<ChatMessage>,
+            schema_tokens: usize,
+        }
+
+        struct ReportingProvider {
+            requests: Arc<Mutex<Vec<RecordedRequest>>>,
+            usage_multiplier: u64,
+        }
+
+        #[async_trait]
+        impl ModelProvider for ReportingProvider {
+            fn capabilities_for_model(&self, model: &str) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    native_tool_calling: model == "native-model",
+                    ..ProviderCapabilities::default()
+                }
+            }
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("test must exercise chat requests")
+            }
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                let schema_tokens = request
+                    .tools
+                    .map_or(0, crate::agent::history::estimate_tool_schema_tokens);
+                let estimated = estimate_history_tokens(request.messages) + schema_tokens;
+                let mut requests = self.requests.lock().unwrap();
+                let first = requests.is_empty();
+                requests.push(RecordedRequest {
+                    model: model.to_string(),
+                    messages: request.messages.to_vec(),
+                    schema_tokens,
+                });
+                let native_call = first && request.tools.is_some();
+                Ok(ChatResponse {
+                    text: if native_call {
+                        None
+                    } else if first {
+                        Some(
+                            r#"<tool_call>{"name":"budget_tool","arguments":{}}</tool_call>"#
+                                .to_string(),
+                        )
+                    } else {
+                        Some("done".to_string())
+                    },
+                    tool_calls: if native_call {
+                        vec![ToolCall {
+                            id: "budget-call".to_string(),
+                            name: "budget_tool".to_string(),
+                            arguments: "{}".to_string(),
+                            extra_content: None,
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    usage: first.then_some(zeroclaw_providers::traits::TokenUsage {
+                        input_tokens: Some(estimated as u64 * self.usage_multiplier),
+                        output_tokens: Some(10),
+                        cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
+                    }),
+                    reasoning_content: None,
+                })
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for ReportingProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::System
+            }
+            fn alias(&self) -> &str {
+                "budget-provider"
+            }
+        }
+
+        let (first_model, next_model, usage_multiplier) = match scenario {
+            HookBudgetScenario::NativeToPlain => ("native-model", "plain-model", 1),
+            HookBudgetScenario::NativeToPlainWithCalibration => ("native-model", "plain-model", 4),
+            HookBudgetScenario::PlainToNativeTrim | HookBudgetScenario::PlainToNativeFloor => {
+                ("plain-model", "native-model", 1)
+            }
+            HookBudgetScenario::SameModelCalibrated => ("plain-model", "plain-model", 2),
+            HookBudgetScenario::SummaryTrim | HookBudgetScenario::SummaryFloor => {
+                ("plain-model", "plain-model", 1)
+            }
+            HookBudgetScenario::SummaryCalibrated => ("plain-model", "plain-model", 2),
+        };
+        let summary = matches!(
+            scenario,
+            HookBudgetScenario::SummaryTrim
+                | HookBudgetScenario::SummaryCalibrated
+                | HookBudgetScenario::SummaryFloor
+        );
+        let calibrated = matches!(
+            scenario,
+            HookBudgetScenario::SameModelCalibrated | HookBudgetScenario::SummaryCalibrated
+        );
+        let native_prompt = format!("system\n{NATIVE_TOOLS_TASK_FRAMING}\n\n## Safety\nsafe");
+        let text_prompt =
+            format!("system\n{NO_TOOLS_TASK_FRAMING}\n\n## Tools\nbudget_tool\n\n## Safety\nsafe");
+        let mut history = vec![
+            ChatMessage::system(if first_model == "native-model" {
+                &native_prompt
+            } else {
+                &text_prompt
+            }),
+            ChatMessage::user(format!("retained older turn {}", "o".repeat(2400))),
+            ChatMessage::assistant("older answer"),
+            ChatMessage::user("run the tool once"),
+        ];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                LargeSchemaTool {
+                    result_chars: if matches!(scenario, HookBudgetScenario::SummaryFloor) {
+                        4000
+                    } else {
+                        1600
+                    },
+                },
+            )]);
+        let schema_tokens =
+            crate::agent::history::estimate_tool_schema_tokens(&[tools_registry[0].spec()]);
+        let initial_tokens = estimate_history_tokens(&history);
+        let result_tokens = estimate_history_tokens(&[ChatMessage::assistant("r".repeat(1600))]);
+        let budget = match scenario {
+            HookBudgetScenario::NativeToPlain
+            | HookBudgetScenario::NativeToPlainWithCalibration => {
+                initial_tokens + schema_tokens + 100
+            }
+            HookBudgetScenario::PlainToNativeTrim => schema_tokens + result_tokens + 200,
+            HookBudgetScenario::PlainToNativeFloor => schema_tokens - 1,
+            HookBudgetScenario::SameModelCalibrated => initial_tokens + result_tokens + 200,
+            HookBudgetScenario::SummaryTrim | HookBudgetScenario::SummaryFloor => {
+                initial_tokens + 50
+            }
+            HookBudgetScenario::SummaryCalibrated => initial_tokens + result_tokens + 300,
+        };
+        let over_soft_budget = matches!(
+            scenario,
+            HookBudgetScenario::PlainToNativeFloor | HookBudgetScenario::SummaryFloor
+        );
+        let floor = over_soft_budget && !allow_soft_floor;
+        let capacity = if floor { budget } else { 32_768 };
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let mut hooks = HookRunner::new();
+        hooks.register(Box::new(SelectNextModel {
+            calls: Arc::clone(&hook_calls),
+            next_model,
+        }));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = ReportingProvider {
+            requests: Arc::clone(&requests),
+            usage_multiplier,
+        };
+        let mut crumb_present = false;
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let result = scope_tool_protocol_prompts(
+            Arc::new(ToolProtocolPrompts::new(native_prompt, text_prompt)),
+            run_tool_call_loop(ToolLoop {
+                parent_agent_alias: None,
+                sop_reassembly: None,
+                exec: ResolvedAgentExecution {
+                    model_access: ResolvedModelAccess {
+                        model_provider: &provider,
+                        provider_name: "budget-provider",
+                        model: first_model,
+                        dispatch_model: first_model,
+                        temperature: Some(0.0),
+                    },
+                    tools_registry: &tools_registry,
+                    observer: &NoopObserver,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    config: None,
+                    max_tool_iterations: if summary { 1 } else { 3 },
+                    hooks: Some(&hooks),
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 0,
+                    context_limits: test_context_limits(budget),
+                    context_limits_resolver: Some(Arc::new(move |_, selected_model| {
+                        zeroclaw_config::schema::ResolvedContextLimits {
+                            model_context_window: if summary || selected_model == next_model {
+                                capacity
+                            } else {
+                                32_768
+                            },
+                            ..test_context_limits(budget)
+                        }
+                    })),
+                    receipt_generator: None,
+                    knobs: &LoopKnobs::default(),
+                },
+                history: &mut history,
+                history_has_trim_breadcrumb: &mut crumb_present,
+                injected_memory_preamble: &mut None,
+                channel_name: "test",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: Some(event_tx),
+                steering: None,
+                new_messages_out: None,
+                image_cache: None,
+                memory: None,
+                ingress: IngressContext::sub_turn(),
+                agent_alias: None,
+                turn_id: &turn_id,
+                served_route_sink: None,
+            }),
+        )
+        .await;
+
+        let untrimmed = matches!(
+            scenario,
+            HookBudgetScenario::NativeToPlain | HookBudgetScenario::NativeToPlainWithCalibration
+        );
+        if floor {
+            let error = result.expect_err("a model-capacity floor must fail");
+            let exceeded = crate::agent::context_window_exceeded_from_error(&error)
+                .expect("capacity failure must retain its typed cause");
+            assert_eq!(exceeded.model_context_window, capacity);
+            assert!(exceeded.estimated_tokens > capacity);
+        } else {
+            let text = result.expect("request must fit");
+            if summary {
+                assert!(text.starts_with("done"));
+            } else {
+                assert_eq!(text, "done");
+            }
+        }
+        assert_eq!(
+            hook_calls.load(Ordering::SeqCst),
+            if summary { 1 } else { 2 },
+            "one hook per preparation"
+        );
+        let captured = requests.lock().unwrap();
+        assert_eq!(captured.len(), if floor { 1 } else { 2 });
+        assert_eq!(captured[0].model, first_model);
+        for request in captured.iter() {
+            let tokens = estimate_history_tokens(&request.messages) + request.schema_tokens;
+            assert!(
+                tokens <= if allow_soft_floor { capacity } else { budget },
+                "an oversized request reached the provider"
+            );
+        }
+        if !floor {
+            let next = &captured[1];
+            assert_eq!(next.model, next_model);
+            assert_eq!(next.schema_tokens > 0, next_model == "native-model");
+            assert_eq!(
+                next.messages
+                    .iter()
+                    .any(|m| m.content.starts_with("retained older turn")),
+                untrimmed,
+            );
+            let framing = if next_model == "native-model" {
+                NATIVE_TOOLS_TASK_FRAMING
+            } else {
+                NO_TOOLS_TASK_FRAMING
+            };
+            assert!(next.messages[0].content.contains(framing));
+            if calibrated {
+                assert!(
+                    (estimate_history_tokens(&next.messages) + next.schema_tokens) * 2 <= budget,
+                    "same-model usage must still constrain the next request"
+                );
+            }
+            if untrimmed {
+                assert!(
+                    estimate_history_tokens(&next.messages) + schema_tokens > budget,
+                    "the stale native-schema projection must exceed this test's budget"
+                );
+            }
+            if summary {
+                assert_eq!(next.schema_tokens, 0, "the summary is tools-free");
+                assert!(
+                    next.messages
+                        .last()
+                        .unwrap()
+                        .content
+                        .starts_with("You have reached")
+                );
+                assert!(
+                    next.messages
+                        .iter()
+                        .any(|m| m.content == "run the tool once")
+                );
+                assert!(
+                    next.messages
+                        .iter()
+                        .any(|m| m.content.contains(&"r".repeat(1600)))
+                );
+            }
+        }
+        assert!(
+            history.iter().any(|m| m.content == "run the tool once"),
+            "keep the newest real turn"
+        );
+        if summary && floor {
+            assert!(
+                history
+                    .iter()
+                    .any(|m| m.content.contains(&"r".repeat(4000)))
+            );
+            assert!(
+                !history
+                    .iter()
+                    .any(|m| m.content.starts_with("You have reached")),
+                "failed summary must not append a synthetic user turn"
+            );
+        }
+        assert_eq!(
+            history
+                .iter()
+                .any(|m| m.content.starts_with("retained older turn")),
+            untrimmed,
+        );
+        assert_eq!(crumb_present, !untrimmed);
+        let mut trims = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                tokens_after,
+                tokens_after_source,
+                unsatisfiable_floor,
+                ..
+            } = event
+            {
+                trims.push((tokens_after, tokens_after_source, unsatisfiable_floor));
+            }
+        }
+        assert_eq!(trims.len(), usize::from(!untrimmed));
+        if let Some((tokens_after, source, unsatisfiable)) = trims.first() {
+            assert_eq!(*unsatisfiable, floor.then_some(true));
+            assert_eq!(tokens_after.unwrap() > budget as u64, over_soft_budget);
+            let expected_source = if calibrated {
+                zeroclaw_api::agent::TokenCountSource::Calibrated
+            } else {
+                zeroclaw_api::agent::TokenCountSource::Estimated
+            };
+            assert_eq!(*source, Some(expected_source));
+            if summary && !floor {
+                let actual =
+                    estimate_history_tokens(&captured[1].messages) as u64 * usage_multiplier;
+                assert_eq!(
+                    *tokens_after,
+                    Some(actual),
+                    "trim event must count the summary prompt too"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_native_to_plain_preserves_history_not_needed_for_schemas() {
+        assert_hook_selected_request_budget(HookBudgetScenario::NativeToPlain, false).await;
+        assert_hook_selected_request_budget(
+            HookBudgetScenario::NativeToPlainWithCalibration,
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn hook_plain_to_native_trims_the_actual_next_request() {
+        assert_hook_selected_request_budget(HookBudgetScenario::PlainToNativeTrim, false).await;
+    }
+
+    #[tokio::test]
+    async fn hook_plain_to_native_floor_never_dispatches_oversized_request() {
+        assert_hook_selected_request_budget(HookBudgetScenario::PlainToNativeFloor, false).await;
+    }
+
+    #[tokio::test]
+    async fn next_request_keeps_same_model_reported_usage_calibration() {
+        assert_hook_selected_request_budget(HookBudgetScenario::SameModelCalibrated, false).await;
+    }
+
+    #[tokio::test]
+    async fn max_iteration_summary_trims_the_prepared_request() {
+        assert_hook_selected_request_budget(HookBudgetScenario::SummaryTrim, false).await;
+        assert_hook_selected_request_budget(HookBudgetScenario::SummaryCalibrated, false).await;
+    }
+
+    #[tokio::test]
+    async fn max_iteration_summary_floor_preserves_the_latest_real_turn() {
+        assert_hook_selected_request_budget(HookBudgetScenario::SummaryFloor, false).await;
+    }
+
+    #[tokio::test]
+    async fn hook_selected_native_schema_soft_floor_still_dispatches() {
+        assert_hook_selected_request_budget(HookBudgetScenario::PlainToNativeFloor, true).await;
+    }
+
+    #[tokio::test]
+    async fn max_iteration_summary_soft_floor_still_dispatches() {
+        assert_hook_selected_request_budget(HookBudgetScenario::SummaryFloor, true).await;
+    }
+
+    #[tokio::test]
+    async fn stateful_varying_growth_hook_fails_the_turn_instead_of_dispatching_oversized_request()
+    {
+        // A STATEFUL `before_llm_call` hook whose growth varies by iteration:
+        // it adds nothing to the first request and a materially large message
+        // to the second. The pre-dispatch gate measures the EXACT population
+        // about to be sent at each seam; a genuine floor on the second
+        // dispatch must surface the explicit unsatisfiable-floor outcome AND
+        // fail the turn instead of sending the request the gate just
+        // declared unsatisfiable.
+        use crate::agent::turn::{ToolProtocolPrompts, scope_tool_protocol_prompts};
+        use crate::hooks::{HookHandler, HookResult, HookRunner};
+
+        struct GrowOnSecondCall(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl HookHandler for GrowOnSecondCall {
+            fn name(&self) -> &str {
+                "grow-on-second-call"
+            }
+            async fn before_llm_call(
+                &self,
+                messages: &mut Vec<ChatMessage>,
+                _model: &mut String,
+            ) -> HookResult<()> {
+                if self.0.fetch_add(1, Ordering::SeqCst) >= 1 {
+                    messages.push(ChatMessage::assistant("y".repeat(30_000)));
+                }
+                HookResult::Continue(())
+            }
+        }
+
+        #[derive(Default)]
+        struct CapturingProvider {
+            requests: Arc<Mutex<Vec<Vec<String>>>>,
+        }
+
+        #[async_trait]
+        impl ModelProvider for CapturingProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("chat_with_system should not be used in this test");
+            }
+
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                self.requests
+                    .lock()
+                    .expect("requests lock should be valid")
+                    .push(request.messages.iter().map(|m| m.content.clone()).collect());
+                let count = self.requests.lock().unwrap().len();
+                let text = if count == 1 {
+                    r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"X"}}
+</tool_call>"#
+                } else {
+                    "done"
+                };
+                Ok(ChatResponse {
+                    text: Some(text.to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for CapturingProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "CapturingProvider"
+            }
+        }
+
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let mut hooks = HookRunner::new();
+        hooks.register(Box::new(GrowOnSecondCall(Arc::clone(&hook_calls))));
+
+        let provider = CapturingProvider::default();
+        let requests = Arc::clone(&provider.requests);
+        let observer = NoopObserver;
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("run the tool once"),
+        ];
+        let mut crumb_present = false;
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&tool_calls)),
+            )]);
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let prompts = Arc::new(ToolProtocolPrompts::new(
+            "native prompt".to_string(),
+            "text prompt".to_string(),
+        ));
+
+        scope_tool_protocol_prompts(
+            prompts,
+            run_tool_call_loop(ToolLoop {
+                parent_agent_alias: None,
+                sop_reassembly: None,
+                exec: ResolvedAgentExecution {
+                    model_access: ResolvedModelAccess {
+                        model_provider: &provider,
+                        provider_name: "mock-provider",
+                        model: "plain-model",
+                        dispatch_model: "plain-model",
+                        temperature: Some(0.0),
+                    },
+                    tools_registry: &tools_registry,
+                    observer: &observer,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    config: None,
+                    max_tool_iterations: 3,
+                    hooks: Some(&hooks),
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 0,
+                    // Tight enough that the second request's hook-grown
+                    // population exceeds it, but comfortable for the first.
+                    context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                        model_context_window: 2_000,
+                        ..test_context_limits(2_000)
+                    },
+                    context_limits_resolver: None,
+                    receipt_generator: None,
+                    knobs: &LoopKnobs::default(),
+                },
+                history: &mut history,
+                history_has_trim_breadcrumb: &mut crumb_present,
+                injected_memory_preamble: &mut None,
+                channel_name: "test",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: Some(event_tx),
+                steering: None,
+                new_messages_out: None,
+                image_cache: None,
+                memory: None,
+                ingress: IngressContext::sub_turn(),
+                agent_alias: None,
+                turn_id: &turn_id,
+                served_route_sink: None,
+            }),
+        )
+        .await
+        .expect_err("a genuine floor must fail the turn instead of dispatching");
+
+        let captured = requests.lock().unwrap().clone();
+        assert_eq!(
+            captured.len(),
+            1,
+            "the oversized second request must never reach the provider"
+        );
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 2);
+        assert!(
+            !captured[0].iter().any(|content| content.starts_with("yyy")),
+            "the first request must not carry the hook growth"
+        );
+
+        let mut saw_floor = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if let zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                unsatisfiable_floor: Some(true),
+                token_budget: Some(2_000),
+                ..
+            } = event
+            {
+                saw_floor = true;
+            }
+        }
+        assert!(
+            saw_floor,
+            "the suppressed oversized dispatch must still emit the explicit floor outcome"
+        );
+    }
+
+    async fn assert_context_floor_dispatch(
+        context_token_budget: usize,
+        model_context_window: usize,
+        mut history: Vec<ChatMessage>,
+        should_dispatch: bool,
+        streaming: bool,
+    ) {
+        // Both the fixed prompt and newest turn exceed the soft threshold.
+        // Neither may be discarded to make that threshold fit.
+        use crate::agent::turn::{ToolProtocolPrompts, scope_tool_protocol_prompts};
+
+        let provider = RecordingModelProvider::new().with_vision_support();
+        let stream_provider =
+            StreamingNativeToolEventModelProvider::with_turns(vec![NativeStreamTurn::Text(
+                "done".into(),
+            )]);
+        let observer = NoopObserver;
+        let retained: Vec<_> = history
+            .iter()
+            .map(|message| (message.role.clone(), message.content.clone()))
+            .collect();
+        let mut crumb_present = false;
+        let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]);
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let prompts = Arc::new(ToolProtocolPrompts::new(
+            "native prompt".to_string(),
+            "text prompt".to_string(),
+        ));
+
+        let result = scope_tool_protocol_prompts(
+            prompts,
+            run_tool_call_loop(ToolLoop {
+                parent_agent_alias: None,
+                sop_reassembly: None,
+                exec: ResolvedAgentExecution {
+                    model_access: ResolvedModelAccess {
+                        model_provider: if streaming {
+                            &stream_provider
+                        } else {
+                            &provider
+                        },
+                        provider_name: "mock-provider",
+                        model: "plain-model",
+                        dispatch_model: "plain-model",
+                        temperature: Some(0.0),
+                    },
+                    tools_registry: &tools_registry,
+                    observer: &observer,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    config: None,
+                    max_tool_iterations: 3,
+                    hooks: None,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 0,
+                    context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                        model_context_window,
+                        ..test_context_limits(context_token_budget)
+                    },
+                    context_limits_resolver: None,
+                    receipt_generator: None,
+                    knobs: &LoopKnobs::default(),
+                },
+                history: &mut history,
+                history_has_trim_breadcrumb: &mut crumb_present,
+                injected_memory_preamble: &mut None,
+                channel_name: "test",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: Some(event_tx),
+                steering: None,
+                new_messages_out: None,
+                image_cache: None,
+                memory: None,
+                ingress: IngressContext::sub_turn(),
+                agent_alias: None,
+                turn_id: &turn_id,
+                served_route_sink: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            provider.requests.lock().unwrap().len(),
+            usize::from(should_dispatch && !streaming)
+        );
+        assert_eq!(
+            stream_provider.stream_calls.load(Ordering::SeqCst),
+            usize::from(should_dispatch && streaming),
+            "only requests within model capacity may reach stream_chat",
+        );
+        assert_eq!(stream_provider.chat_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            !crumb_present,
+            "a floor cannot claim to have dropped a turn"
+        );
+        let after: Vec<_> = history
+            .iter()
+            .take(retained.len())
+            .map(|message| (message.role.clone(), message.content.clone()))
+            .collect();
+        assert_eq!(
+            after, retained,
+            "the complete newest turn must remain intact"
+        );
+        let mut saw_floor = false;
+        let mut delivered = String::new();
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                    unsatisfiable_floor: Some(true),
+                    dropped_messages: 0,
+                    ..
+                } => saw_floor = true,
+                zeroclaw_api::agent::TurnEvent::Chunk { delta } => delivered.push_str(&delta),
+                _ => {}
+            }
+        }
+        assert_eq!(delivered, if should_dispatch { "done" } else { "" });
+        assert_eq!(saw_floor, !should_dispatch);
+        if should_dispatch {
+            result.expect("a soft floor within model capacity must reach the provider");
+            if !streaming {
+                let requests = provider.requests.lock().unwrap();
+                assert!(estimate_history_tokens(&requests[0]) <= model_context_window);
+            }
+        } else {
+            let error =
+                result.expect_err("a true model-capacity floor must not reach the provider");
+            let exceeded = crate::agent::context_window_exceeded_from_error(&error)
+                .expect("capacity failure must retain its typed cause");
+            assert_eq!(exceeded.model_context_window, model_context_window);
+            assert!(exceeded.estimated_tokens > model_context_window);
+        }
+    }
+
+    fn context_floor_history() -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::system(format!("text prompt {}", "s".repeat(4000))),
+            ChatMessage::user("x".repeat(20_000)),
+        ]
+    }
+
+    #[tokio::test]
+    async fn soft_context_floor_dispatches_the_complete_latest_turn() {
+        assert_context_floor_dispatch(100, 32_768, context_floor_history(), true, false).await;
+        let history = context_floor_history();
+        let exact_capacity = estimate_history_tokens(&history);
+        assert_context_floor_dispatch(100, exact_capacity, history, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn genuine_floor_with_no_droppable_turn_never_dispatches() {
+        assert_context_floor_dispatch(100, 100, context_floor_history(), false, false).await;
+        assert_context_floor_dispatch(100_000, 100, context_floor_history(), false, false).await;
+    }
+
+    #[tokio::test]
+    async fn disabled_soft_budget_still_enforces_model_capacity() {
+        assert_context_floor_dispatch(0, 100, context_floor_history(), false, false).await;
+        assert_context_floor_dispatch(0, 32_768, context_floor_history(), true, false).await;
+    }
+
+    #[tokio::test]
+    async fn prepared_image_capacity_is_enforced_with_soft_trimming_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("shot.png");
+        let mut image_bytes = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        image_bytes.extend(std::iter::repeat_n(0u8, 3_000));
+        std::fs::write(&image_path, image_bytes).unwrap();
+        let history = vec![
+            ChatMessage::system("text prompt"),
+            ChatMessage::user(format!("inspect [IMAGE:{}]", image_path.display())),
+        ];
+        assert!(
+            estimate_history_tokens(&history) > 100,
+            "the image's fixed token cost must exceed model capacity"
+        );
+        assert_context_floor_dispatch(0, 100, history, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn streaming_context_floor_uses_model_capacity_not_the_soft_budget() {
+        assert_context_floor_dispatch(100, 32_768, context_floor_history(), true, true).await;
+        assert_context_floor_dispatch(100, 100, context_floor_history(), false, true).await;
+        assert_context_floor_dispatch(0, 100, context_floor_history(), false, true).await;
+    }
+
+    #[tokio::test]
+    async fn dropping_an_old_multimodal_turn_does_not_report_a_false_floor() {
+        // The pre-dispatch gate's internal trim loop measures a raw
+        // marker-based estimate for durable history but reserves a "growth"
+        // delta computed against the ACTUAL post-preparation population
+        // (which expands `[IMAGE:...]` markers into real base64 payloads).
+        // When the image-bearing turn is the one dropped, that delta is
+        // stale: the image is gone, but the heuristic still reserves its
+        // size and can internally conclude the request is an unsatisfiable
+        // floor. The caller must re-measure the actually-rebuilt request
+        // (which no longer contains the dropped image) and must NOT surface
+        // a floor that the real, smaller request does not hit.
+
+        #[derive(Default)]
+        struct CapturingVisionProvider {
+            requests: Arc<Mutex<Vec<Vec<String>>>>,
+        }
+
+        #[async_trait]
+        impl ModelProvider for CapturingVisionProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("chat_with_system should not be used in this test");
+            }
+
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                self.requests
+                    .lock()
+                    .expect("requests lock should be valid")
+                    .push(request.messages.iter().map(|m| m.content.clone()).collect());
+                Ok(ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+
+            fn supports_vision(&self) -> bool {
+                // A vision-capable provider: the image marker is expanded in
+                // place rather than routed to a separate vision provider or
+                // stripped, matching the common case this bug affects.
+                true
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for CapturingVisionProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "CapturingVisionProvider"
+            }
+        }
+
+        use crate::agent::turn::{ToolProtocolPrompts, scope_tool_protocol_prompts};
+
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("shot.png");
+        // PNG signature plus filler bytes so the base64-expanded payload is
+        // large enough to dwarf the raw `[IMAGE:...]` marker text — the
+        // exact mismatch the gate's heuristic must not misattribute after
+        // the carrying turn is dropped.
+        let mut image_bytes = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        image_bytes.extend(std::iter::repeat_n(0u8, 3_000));
+        std::fs::write(&image_path, &image_bytes).unwrap();
+        let marker = format!("[IMAGE:{}]", image_path.display());
+
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(format!("old turn with an attachment {marker}")),
+            ChatMessage::assistant("ok".to_string()),
+            ChatMessage::user("run once, no attachment this time".to_string()),
+        ];
+        let mut crumb_present = false;
+        let mut image_cache = zeroclaw_providers::multimodal::LocalImageCache::new();
+
+        let provider = CapturingVisionProvider::default();
+        let requests = Arc::clone(&provider.requests);
+        let observer = NoopObserver;
+        let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]);
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let prompts = Arc::new(ToolProtocolPrompts::new(
+            "native prompt".to_string(),
+            "text prompt".to_string(),
+        ));
+
+        scope_tool_protocol_prompts(
+            prompts,
+            run_tool_call_loop(ToolLoop {
+                parent_agent_alias: None,
+                sop_reassembly: None,
+                exec: ResolvedAgentExecution {
+                    model_access: ResolvedModelAccess {
+                        model_provider: &provider,
+                        provider_name: "mock-provider",
+                        model: "plain-model",
+                        dispatch_model: "plain-model",
+                        temperature: Some(0.0),
+                    },
+                    tools_registry: &tools_registry,
+                    observer: &observer,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    config: None,
+                    max_tool_iterations: 3,
+                    hooks: None,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 0,
+                    // Between the image-expanded population (well over
+                    // 1,000 estimated tokens for a ~3KB attachment) and the
+                    // real rebuilt population once that turn is dropped
+                    // (well under 100 tokens for two short text messages).
+                    context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                        model_context_window: 500,
+                        ..test_context_limits(0)
+                    },
+                    context_limits_resolver: None,
+                    receipt_generator: None,
+                    knobs: &LoopKnobs::default(),
+                },
+                history: &mut history,
+                history_has_trim_breadcrumb: &mut crumb_present,
+                injected_memory_preamble: &mut None,
+                channel_name: "test",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: Some(event_tx),
+                steering: None,
+                new_messages_out: None,
+                image_cache: Some(&mut image_cache),
+                memory: None,
+                ingress: IngressContext::sub_turn(),
+                agent_alias: None,
+                turn_id: &turn_id,
+                served_route_sink: None,
+            }),
+        )
+        .await
+        .expect("tool loop should succeed");
+
+        let captured = requests.lock().unwrap().clone();
+        assert_eq!(captured.len(), 1, "one iteration must dispatch one request");
+        assert!(
+            !captured[0]
+                .iter()
+                .any(|content| content.contains("old turn with an attachment")),
+            "the dispatched request must not contain the dropped old turn"
+        );
+
+        let mut saw_trim = false;
+        let mut saw_false_floor = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if let zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                unsatisfiable_floor,
+                dropped_messages,
+                ..
+            } = event
+            {
+                if dropped_messages > 0 {
+                    saw_trim = true;
+                }
+                if unsatisfiable_floor == Some(true) {
+                    saw_false_floor = true;
+                }
+            }
+        }
+        assert!(
+            saw_trim,
+            "the old image-bearing turn must actually be dropped"
+        );
+        assert!(
+            !saw_false_floor,
+            "the rebuilt request no longer carries the dropped image and fits \
+             the budget, so it must not be reported as an unsatisfiable floor"
+        );
     }
 
     #[tokio::test]
@@ -16826,6 +20172,8 @@ Let me check the result."#;
             None,
             &model_provider,
             &mut history,
+            &mut false,
+            &mut None,
             &tools_registry,
             observer.as_ref(),
             "mock-provider",
@@ -16880,6 +20228,8 @@ Let me check the result."#;
             None, // config: configless test
             &model_provider,
             &mut history,
+            &mut false,
+            &mut None,
             &tools_registry,
             capturing.as_ref(),
             "mock-provider",
@@ -16951,6 +20301,8 @@ Let me check the result."#;
             None, // config
             &model_provider,
             &mut history,
+            &mut false,
+            &mut None,
             &tools_registry,
             capturing.as_ref(),
             "mock-provider",

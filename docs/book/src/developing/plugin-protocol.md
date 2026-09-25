@@ -1,7 +1,7 @@
 ---
 type: reference
 status: accepted
-last-reviewed: 2026-07-17
+last-reviewed: 2026-09-07
 relates-to:
   - FND-001
   - ADR-003
@@ -47,10 +47,14 @@ omits the compiled component.
 - **Sandboxed by default.** The host loads each plugin into a WASI context with
   no filesystem preopens and no ambient network. A plugin cannot quietly reach
   the host; it gets exactly the host functions wired into its world and nothing
-  more. Outbound HTTP is the one network surface that can be opened, and only
-  when the manifest grants `http_client` and that capability adapter explicitly
-  enables its tested HTTP boundary. Tool and channel adapters do; memory does
-  not yet.
+  more. Outbound HTTP, raw sockets, and WebSocket are the network surfaces that
+  can be opened, and each is governed in two layers: the manifest grant
+  (`http_client`, `socket_client`, or `websocket_client`) selects whether the
+  adapter links that *surface*, and the operator's per-instance
+  `plugins.entries.<key>.egress_hosts` grant selects the *reach*, shared by all
+  three. The tool and channel adapters link the surfaces; memory currently
+  withholds them. With no egress grant the reach is deny-all, so a linked
+  surface alone sends nothing.
 - **Verifiable provenance.** Manifests can be Ed25519-signed, and an operator
   can require signatures from trusted publishers before any plugin loads.
 
@@ -59,22 +63,33 @@ omits the compiled component.
 These are real limits of the current host, not style preferences. Know them
 before you design around a capability that is not there.
 
-- **`logging`, typed config, instance-scoped secrets, `http_client`, and host-fed
-  inbound are wired.** Of the permissions a manifest can declare,
-  `config_read` exposes the plugin's own schema-validated public config. A tool
-  or channel schema can designate secrets withheld from public config and
-  resolved in authorized service calls. An `http_client` grant is necessary
-  for outbound `wasi:http`, but the capability adapter must also opt into that
-  host surface. Tool and channel adapters do; memory intentionally remains
-  HTTP-free until its network boundary has component-level coverage. Filesystem
-  and
+- **`logging`, typed config, instance-scoped secrets and durable state,
+  `http_client`, and host-fed inbound are wired.** Of the permissions a
+  manifest can declare, `config_read` exposes the plugin's own schema-validated
+  public config. A tool or channel schema can designate secrets withheld from
+  public config and resolved in authorized service calls. `state_read` and
+  `state_write` gate encrypted, compare-and-swap state owned by the exact
+  admitted instance. An `http_client` grant is necessary for outbound
+  `wasi:http`, but it is not sufficient: the capability adapter must link that
+  host surface (tool and channel do; memory intentionally remains HTTP-free
+  until its network boundary has component-level coverage), and the operator
+  must grant destinations through `egress_hosts`. Without that grant every
+  destination is refused before a packet leaves or a name is resolved.
+  `socket_client` and `websocket_client` link the `sockets` and `websocket`
+  imports on the same terms: the same grant, address-class rules, and
+  per-instance connection budget. A grant names hosts, not ports: with
+  `socket_client`, a granted host is reachable over raw TCP on any port, so
+  grant only hosts the plugin may speak any protocol to. Filesystem and
   memory-access permissions are still accepted by the manifest schema but
   inert: their host functions are not yet registered in the linker. See
   Permissions and Host imports below.
 - **No ambient host network or filesystem.** The WASI context has no preopens and
   no ambient network, so a plugin cannot open raw sockets or read host files
   through ambient WASI. A tool or channel plugin with an `http_client` grant
-  gets outbound `wasi:http` because those adapters opt in; it cannot listen.
+  gets outbound `wasi:http`, and one with `socket_client` or
+  `websocket_client` gets host-mediated TCP/TLS/STARTTLS or WebSocket
+  connections, all reaching only the destinations its operator egress grant
+  lists; memory plugins currently get none of these. No plugin can listen.
   Channel plugins that must receive inbound traffic do not open a listener
   themselves: the host runs the listener and feeds messages through the
   `inbound` import, which the plugin drains from its `poll-message` export.
@@ -123,16 +138,17 @@ hold a warm store guarded by an async mutex for the lifetime of the plugin.
 
 Tool plugins are discovered and registered end to end: the runtime walks
 `channel_plugin_details()`'s tool counterpart and builds a `WasmTool` for each.
-The channel host adapter (`WasmChannel`, its `wasi:http` gating, point-of-use
-config services, and host-fed `inbound` queue) is complete and unit-covered, and
+The channel host adapter (`WasmChannel`, its grant-gated `wasi:http` surface
+behind the host-owned egress policy, point-of-use config services, and host-fed
+`inbound` queue) is complete and covered by a real-component egress test, and
 `PluginHost::channel_plugin_details()` exposes the wasm-backed channel plugins
 to register. The runtime now resolves an explicitly declared
 `[channels.plugin.<alias>]` binding, constructs its `WasmChannel`, and registers
 it from the configured alias; that alias-aware construction and runtime config
 resolution landed in
-[#10146](https://github.com/zeroclaw-labs/zeroclaw/pull/10146). The remaining
-follow-up is the per-vendor host listener that drains each transport into the
-channel's `inbound` queue. The memory bridge
+[#10146](https://github.com/zeroclaw-labs/zeroclaw/pull/10146). A channel can
+also opt into the generic gateway-owned POST webhook ingress described below;
+vendor tunnels, polling clients, and other transports remain follow-ups. The memory bridge
 (`WasmMemory`) is in the same position one step earlier: the adapter implements
 the full `Memory` trait against the `memory-plugin` world, but the host does not
 yet expose a memory counterpart to `channel_plugin_details()` and the runtime
@@ -169,10 +185,29 @@ zeroclaw plugin install team-calendar --registry https://example.invalid/registr
 plugin names and descriptions. It does not install, enable, or execute plugin
 code.
 
+The fetched index is cached. `zeroclaw plugin list` reads that cache and shows
+one package row alongside the host-admitted installed record, without fetching
+or treating registry metadata as proof that code was installed.
+
 `zeroclaw plugin install <name>` resolves the name from the registry, downloads
 the selected zip archive, verifies the optional SHA-256 digest, safely extracts
-the archive, and then hands the extracted plugin directory to the existing
-`PluginHost::install` path. Local path installs are unchanged:
+the archive, and then hands the extracted plugin directory to the same
+admission path a local install uses. Admission (`PluginHost::admit_source`)
+parses and signature-checks the manifest, validates its shape and config,
+refuses a name that is already installed, and reads the component once: the
+path must stay inside the package with no symlink on it, the read is capped at
+64 MiB and refused from the file's metadata when it is larger, and the
+optional `wasm_sha256` digest is checked. The CLI then runs the install-time
+load check against those admitted bytes: the same instantiation the
+daemon performs at startup, so a component built against a drifted WIT fails
+at install with its full diagnostic instead of being skipped silently later.
+`plugin install --no-verify` skips the load check entirely (nothing is
+compiled) and prints a note; it does not bypass admission. A host built
+without a WASM backend has nothing to instantiate against and installs without
+the check. Installation (`PluginHost::install_admitted`) then persists the
+admitted manifest bytes and writes the admitted component bytes, so what
+was verified is byte for byte what the daemon will load. Local path installs
+follow the same sequence:
 
 When no version is pinned, ZeroClaw chooses the last matching entry in the
 registry index, so registry publishers should order repeated names
@@ -199,7 +234,7 @@ Registry entries use this shape:
   "plugins": [
     {
       "name": "team-calendar",
-      "version": "0.8.4",
+      "version": "0.8.5",
       "description": "Schedule meetings on a team calendar",
       "author": "Example Team",
       "capabilities": ["tool"],
@@ -275,7 +310,8 @@ bundle (`validate_manifest_shape` in `host.rs`).
 `crates/zeroclaw-plugins/src/lib.rs`. Read the enum for the canonical set.
 
 Be aware of the gap between declared and enforced: in the component host today
-`config_read` and `http_client` have behavioral effect. Requesting
+`config_read`, `http_client`, `state_read`, and `state_write` have behavioral
+effect. Requesting
 `config_read` requires a `config_schema`, and declaring that schema without the
 permission is also rejected. Before a tool or channel component is used, the
 host resolves its effective grant, materializes the plugin's operator values to
@@ -288,9 +324,20 @@ through `config.get` and secrets through `secrets.get` during `configure` and
 operational calls, while instantiation and static metadata discovery remain
 unavailable. `http_client` is a necessary grant, not a complete authority
 decision: the capability adapter must also construct the HTTP context and link
-`wasi:http`. Tool and channel adapters opt in after grant validation. The
-memory adapter deliberately does not, so granting `http_client` to a memory
-scope alone adds no network surface. The remaining variants
+`wasi:http`, and the host-owned egress policy must permit the destination. The
+tool and channel adapters link the surface after grant validation; the memory
+adapter deliberately does not, so granting `http_client` to a memory scope adds
+no network surface. For tools and channels the surface still reaches nothing
+until the operator lists destinations under
+`plugins.entries.<key>.egress_hosts`; the policy refuses every other host. A
+granted host that resolves to a loopback, private, or link-local address is
+still refused unless the operator also lists it under
+`plugins.entries.<key>.egress_allow_private`, a carveout that relaxes the
+address class for an already-granted destination and never grants one (see
+[Plugins](../plugins/index.md) for the operator side). The state permissions
+independently gate the `state.get` and `state.put`/`delete` imports for tool
+and channel service frames. Package, capability, and binding come only from the
+admitted host scope; a guest supplies no namespace. The remaining variants
 (`file_read`, `file_write`, `memory_read`, `memory_write`) are accepted by the
 manifest schema but are not yet wired to a host import: declaring them grants
 nothing on its own. They reserve the names for the host functions that will
@@ -310,8 +357,13 @@ signatures.
 `wit/v0/` defines three worlds, bound by `bindgen!` in `component.rs`. Each
 imports `logging` (host) and exports `plugin-info` plus its primary interface:
 `tool-plugin` exports `tool`, `channel-plugin` exports `channel`, and
-`memory-plugin` exports `memory`. Tool also imports `secrets`; channel imports
-`config`, `secrets`, and `inbound`. The required (no-default) exports for each
+`memory-plugin` exports `memory`. Tool also imports `secrets` and `state`;
+channel imports `config`, `secrets`, `state`, and `inbound`. Tool and channel
+additionally import `sockets` and `websocket` behind their own features
+(`plugins-wit-v0-sockets`, `plugins-wit-v0-websocket`); the host links each only
+for an instance holding the matching grant, so a component that imports one
+without the grant fails to instantiate. The required
+(no-default) exports for each
 world are listed in the world's doc comment in its `.wit` file.
 
 ### `tool` interface
@@ -364,10 +416,12 @@ world's linker wires `logging` (via the host impl in `component_logging.rs`,
 linked alongside `add_wasi` in `component.rs`). Tool and channel link the
 instance-scoped `secrets` service. Channel also imports `config` for its typed
 public object and `inbound` for the host-fed message queue it drains from
-`poll-message`. Tool and channel adapters link outbound `wasi:http` only after
-the admitted scope grants `http_client` (`PluginStoreSpec::with_granted_http`
-and `add_wasi_http` in `component.rs`). Memory withholds both the context and
-linker surface. The filesystem and memory-access permissions remain inert: the
+`poll-message`. The tool and channel adapters link outbound `wasi:http` only
+after the admitted scope grants `http_client` (`PluginStoreSpec::with_granted_http`
+and `add_wasi_http` in `component.rs`), and both compose the host-owned reach
+policy (`PluginStoreSpec::with_egress_policy`) so the guest never gets
+Wasmtime's unrestricted default hooks. Memory withholds both the context and
+the linker surface. The filesystem and memory-access permissions remain inert: the
 host functions that would gate them are not yet wired into the linker. A
 plugin's ambient authority is the WASI context (no preopens, no ambient network)
 plus exactly the host imports its grants and adapter opt-ins jointly enable.
@@ -394,6 +448,63 @@ inbound-pending: func() -> u32;
 
 The host side owns an `InboundQueue` per channel; `WasmChannel::inbound` hands a
 clone to the listener task so enqueued traffic is visible to the plugin's drain.
+
+### Channel webhook ingress
+
+A channel component can add `webhook-ingress` to its returned
+`channel-capabilities` and implement `webhook-path` plus `parse-webhook`. The
+host then mounts a GET/POST route at `/plugin/<path>`. The path is a runtime
+claim, not config: it must contain 1–64 ASCII letters, digits, hyphens, or
+underscores. The channel instance is rejected when the claim is empty, invalid,
+or duplicated. All claims are resolved before the daemon replaces its route
+map, so manifest iteration order cannot select a winner and a failed rebuild
+cannot publish a partial generation. Publication carries a generation lease;
+a retiring older channel supervisor cannot clear a newer route set.
+
+Webhook ingress requires the component's effective `config_read` grant. For
+each request, the gateway passes a typed `webhook-request` containing the HTTP
+method, raw query, lowercase UTF-8 headers, and exact body bytes to
+`parse-webhook` in a disposable configured store. The guest resolves
+its current scoped config and secrets in that call, verifies platform
+authenticity, and returns `webhook-response.messages`, `webhook-response.reply`,
+or a typed `unauthorized` / `bad-request` rejection. Cancelling or timing out the HTTP
+request drops that disposable store; it never strands the warm store used by
+polling and outbound channel calls.
+
+A verified challenge returns `reply(body)`: the gateway responds with HTTP 200
+and that text, without sender authorization, idempotency, or agent delivery.
+The host accepts at most 4096 UTF-8 bytes at both the component and HTTP
+boundaries; excess returns the fixed `502 invalid webhook response`. Method
+and query come from the request fields, never reserved headers. A message's
+channel name has no response-control meaning. `HEAD` and other unsupported
+methods return `405` with `Allow: GET, POST` before reaching the component.
+
+The unauthenticated edge remains host-governed:
+
+- The canonical trusted-forwarded-aware webhook rate limiter runs before route
+  lookup. Request bodies use the gateway's 64 KiB ceiling, each route has a
+  64-request queue, and parse plus delivery has a 10-second deadline.
+- Public responses are fixed: success is `200`; guest authentication and
+  payload rejections are opaque `401` and `400`; host, component, or downstream
+  failures are opaque `503`; timeout is `504`; queue or rate saturation is
+  `429`. Guest and Wasmtime diagnostics are bounded, attributed, and remain in
+  host logs; guest diagnostics must never contain credentials or raw secrets.
+- After guest authentication, the host stamps the admitted `plugin.<alias>`
+  identity and resolves `[peer_groups.*].external_peers` for that channel live.
+  Plugin sender matching is exact (`"*"` remains the explicit allow-all entry).
+  Denied senders never reserve an idempotency key or reach the channel queue.
+  The same live, default-deny gate applies to messages returned by
+  `poll-message`, so every plugin inbound bridge shares one host policy.
+- Non-empty guest message IDs are deduplicated in a namespace derived from the
+  route. An in-flight duplicate waits for the owning delivery to commit or roll
+  back; generation-scoped ownership tokens prevent a stale owner from erasing
+  a replacement reservation. Failed or cancelled delivery rolls back, so a
+  provider retry can become the new owner.
+
+This changes the unfrozen experimental `wit/v0` channel world. Every channel
+component, including one that does not serve webhooks, must be rebuilt against
+the WIT shipped by the target host and export the documented capability-gated
+stubs. The frozen-version compatibility window does not apply yet.
 
 ### `logging`
 
@@ -462,8 +573,8 @@ The host derives package, capability, binding, and effective grants from the
 admitted `PluginInstanceScope`; none are guest inputs. Only direct top-level
 string properties marked `x-secret: true` in the manifest schema are readable.
 Tools can read them while the host dispatches `execute`. Channels can read them
-during `configure` and operational calls such as send, poll, health, and
-capability-gated actions. Component initialization and static metadata exports
+during `configure` and operational calls such as send, poll, webhook parsing,
+health, and capability-gated actions. Component initialization and static metadata exports
 return `unavailable` without resolving config. Within one channel service frame,
 every `config.get` and `secrets.get` uses one resolved canonical config revision;
 that frame is dropped on every exit path. A compliant plugin therefore observes
@@ -475,6 +586,83 @@ egress proxy that keeps the value hidden from plugin code. A compliant channel
 plugin **must** resolve secrets at each point of use and must not retain a second
 copy in warm state. The host cannot enforce non-retention after returning the
 plaintext.
+
+Secret property names use the same portable plugin-local grammar as state keys:
+1–128 ASCII bytes containing only letters, digits, `_`, `-`, or `.`. URI, path,
+namespace, control, and non-ASCII syntax is rejected during manifest admission.
+
+### `state`
+
+`wit/v0/state.wit` is imported by the tool and channel worlds. It provides
+encrypted durable byte values owned by the exact admitted package, capability,
+and binding:
+
+```wit
+get: func(key: string) -> result<option<state-entry>, state-error>;
+put: func(key: string, value: list<u8>, expected-revision: option<u64>)
+    -> result<u64, state-error>;
+delete: func(key: string, expected-revision: u64) -> result<_, state-error>;
+```
+
+`state_read` permits `get`; `state_write` permits `put` and `delete`. `none` on
+`put` is an absent-key compare-and-swap, while `some(revision)` must match the
+current revision exactly. Writes return the new revision. Revisions are opaque
+and never reused within an instance, so a key deleted and recreated cannot
+satisfy a stale compare-and-swap. Keys use the portable
+plugin-local grammar above and cannot select another instance. State is
+available only during tool execution and channel service frames; static calls,
+host-call budget exhaustion, storage/key failures, and integrity failures return
+closed errors. Fixed per-instance entry, value, and total-size quotas return
+`quota-exceeded` rather than partially committing a write.
+
+The runtime stores one authenticated envelope per value in
+`data/plugin-state.db`, encrypted with the install's existing `.secret_key`.
+The database contains only keyed blind indexes and `enc2:` ciphertext. Missing
+or replaced install keys fail closed and are never silently regenerated while
+durable rows exist. Back up the database and `.secret_key` together.
+
+### `sockets`
+
+Host-mediated outbound TCP. `connect` takes a host, port, mode, and optional
+TLS profile, and returns a `connection` resource:
+
+- `plaintext`: raw TCP. Reachable wherever the operator granted the host;
+  there is no separate plaintext exception (ADR-014).
+- `direct-tls`: TLS is established before `connect` returns.
+- `start-tls`: the connection starts in a negotiation phase where only
+  `send-negotiation` and `receive-negotiation` work. `upgrade-tls` commits the
+  stream to TLS in place; failure closes it, and there is no plaintext retry.
+
+The host resolves the destination once, dials only the checked addresses, and
+holds the instance's connection lease until the resource is dropped. TLS
+verifies against the same roots as plugin HTTPS unless the request names a TLS
+profile. `receive` never blocks; it returns `idle` when nothing is buffered.
+Failures are the typed `socket-error` cases.
+
+### `websocket`
+
+Host-mediated outbound WebSocket. `connect` takes a plaintext (`ws`) or TLS
+(`wss`) WebSocket URL,
+extra headers, offered subprotocols, and an optional TLS profile, and returns a
+`connection` resource with `send`, `receive`, `close`, and
+`negotiated-subprotocol`. The host owns DNS, the destination decision, TLS, the
+upgrade handshake, and bounded queues; headers that belong to the handshake
+(`Host`, `Connection`, `Upgrade`, `Sec-WebSocket-*`) are refused. `receive`
+never blocks, and once the terminal `closed` or `failed` event has been
+drained it returns the `closed` error rather than `none`. Dropping the resource closes the socket and releases the
+connection lease.
+
+### TLS profiles
+
+A `sockets` or `websocket` request may name a TLS profile the operator
+configured on the instance (`[[plugins.entries.tls_profiles]]`). A profile
+selects which certificate authorities to trust and, optionally, a client
+certificate for mutual TLS, read from the instance's `x-secret` properties. It
+never grants a destination: the request must first pass `egress_hosts`, and
+the profile must also cover the host. Naming a profile on a plaintext
+connection is an invalid request. The properties a profile references are
+host-only: `secrets.get` returns `access-denied` for them, so the plugin never
+holds the private key it authenticates with.
 
 ### Per-plugin config (`__config` and `config.get`)
 
@@ -543,6 +731,55 @@ the same logical binding does not.
 Tool and channel are the current config consumers. The memory world has no
 config import yet, so memory plugins must not request `config_read` until that
 ABI and runtime wiring land.
+
+### Declared egress (`[egress]`)
+
+**Applies to:** any plugin requesting a transport permission (`http_client`)
+
+A manifest may carry an optional `[egress]` table naming the destinations the
+plugin declares it needs:
+
+```toml
+[egress]
+hosts = ["api.example.com", "*.cdn.example.com"]
+```
+
+Entries use the strict egress grammar: exact hosts or explicit `*.suffix`
+patterns, with no allow-all form. Invalid grammar rejects the whole manifest at
+discovery and at install. The table is part of the canonical manifest bytes, so
+a signed manifest covers it and changing it requires re-signing.
+
+This is an attestation of intent, never a grant. The allowlist the host
+enforces is the operator's `plugins.entries.<instance-key>.egress_hosts`, on the
+same `zpi1_…` row that carries the instance's private `config` map, resolved
+from live config per request rather than snapshotted into the store. A
+component shipping its own `[egress]` table without an operator grant reaches
+nothing. On this release the grant alone governs that check: the declaration is
+not additionally intersected with it at request time, so declaring a host
+neither grants it nor bounds a grant the operator authored. Intersecting the
+two is later rollout work under
+[#8850](https://github.com/zeroclaw-labs/zeroclaw/issues/8850).
+
+What the declaration buys is the install ceremony. `zeroclaw plugin install`
+seeds it into the `[[plugins.entries]]` row it creates, so a first install of a
+plugin that declares its destinations works without the operator transcribing
+hosts, and the seeded values are printed. It never extends a row that already
+exists: an upgrade whose declaration grew prints the difference plus the exact
+`zeroclaw config set` command, and the operator applies it. `zeroclaw plugin
+list` reports the same gap as a standing diagnostic. Declare the destinations
+your code actually contacts, and treat a growing declaration as something every
+operator has to approve on every upgrade.
+
+If reinstall finds an unsupported pre-typed-config row keyed by the package
+name, install refuses before creating the derived `zpi1_…` row and prints the
+same ordered update steps as `plugin list`. The package install rolls back and
+the old private config and both egress lists stay untouched until the operator
+updates the beta configuration and retries.
+
+Plugins whose destination is deployment configuration (a self-hosted Gitea, a
+LAN Nextcloud) should declare nothing here. The operator authors that grant
+directly on the instance row, and a manifest that declares nothing is never
+reported as having lost destinations.
 
 ## WASI Component Host
 

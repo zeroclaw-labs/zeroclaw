@@ -72,7 +72,9 @@ pub fn resolve(
     }
 
     if config.skill_bundles.len() == 1 {
-        let bundle_alias = config.skill_bundles.keys().next().unwrap().clone();
+        let Some(bundle_alias) = config.skill_bundles.keys().next().cloned() else {
+            return Err(SkillRefError::NoBundles);
+        };
         return Ok(SkillRef::new_unchecked(bundle_alias, name.to_string()));
     }
 

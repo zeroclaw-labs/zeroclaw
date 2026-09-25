@@ -214,7 +214,10 @@ pub(crate) fn raw_value_for_path(source: &Config, path: &str) -> Option<String> 
     }
     Some(match current {
         toml::Value::String(s) => s.clone(),
-        other => other.to_string(),
+        // `set_prop` accepts raw strings for scalar fields, but structured
+        // fields must be restored in the same JSON grammar used by the
+        // override setter. TOML inline tables are not valid input there.
+        other => serde_json::to_string(other).ok()?,
     })
 }
 
@@ -223,15 +226,9 @@ pub fn mask_env_overrides_for_save(
     snapshots: &HashMap<String, String>,
 ) -> Result<()> {
     for (path, value) in snapshots {
-        if let Err(err) = config_to_save.set_prop(path, value) {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"path": path, "error": format!("{}", err)})),
-                "Save-mask reset failed; field retains default"
-            );
-        }
+        config_to_save
+            .set_prop(path, value)
+            .with_context(|| format!("failed to restore env-overridden path {path} before save"))?;
     }
     Ok(())
 }
@@ -245,7 +242,8 @@ pub(crate) async fn env_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::Config;
+    use crate::multi_agent::MemoryGrant;
+    use crate::schema::{AliasedAgentConfig, Config};
 
     struct EnvVarGuard(&'static str);
     impl EnvVarGuard {
@@ -354,6 +352,35 @@ mod tests {
         assert_eq!(
             entry.base.model.as_deref(),
             Some("anthropic/claude-sonnet-4-6"),
+        );
+    }
+
+    #[tokio::test]
+    async fn walker_preserves_legacy_memory_grant_input_and_mixed_json() {
+        let _guard = super::env_test_lock().await;
+        let _v = EnvVarGuard::set(
+            "ZEROCLAW_agents__alpha__workspace__read_memory_from",
+            r#"["beta", {"agent":"gamma", "categories":["facts"]}]"#,
+        );
+
+        let mut config = Config::default();
+        config
+            .agents
+            .insert("alpha".into(), AliasedAgentConfig::default());
+        let applied = apply_env_overrides(&mut config).expect("apply succeeds");
+
+        assert!(
+            applied
+                .paths
+                .contains("agents.alpha.workspace.read_memory_from")
+        );
+        let grants = &config.agents["alpha"].workspace.read_memory_from;
+        assert_eq!(grants.len(), 2);
+        assert!(matches!(grants[0], MemoryGrant::Agent(_)));
+        assert_eq!(grants[1].as_str(), "gamma");
+        assert_eq!(
+            grants[1].categories(),
+            Some(["facts".to_string()].as_slice())
         );
     }
 
@@ -484,6 +511,46 @@ mod tests {
                 .and_then(|c| c.base.api_key.as_deref()),
             Some("**** (encrypted)"),
             "must not corrupt the field with the display mask",
+        );
+    }
+
+    #[tokio::test]
+    async fn mask_restores_structured_memory_grant_snapshot() {
+        let _guard = super::env_test_lock().await;
+        let _v = EnvVarGuard::set(
+            "ZEROCLAW_agents__alpha__workspace__read_memory_from",
+            "beta",
+        );
+
+        let mut config = Config::default();
+        for alias in ["alpha", "beta", "gamma"] {
+            config
+                .agents
+                .insert(alias.to_string(), AliasedAgentConfig::default());
+        }
+        config
+            .agents
+            .get_mut("alpha")
+            .expect("alpha agent")
+            .workspace
+            .read_memory_from = vec![MemoryGrant::Scoped {
+            agent: crate::multi_agent::AgentAlias::new("gamma"),
+            categories: Some(vec!["facts".to_string()]),
+        }];
+
+        let applied = apply_env_overrides(&mut config).expect("apply succeeds");
+        let path = "agents.alpha.workspace.read_memory_from";
+        assert!(applied.snapshots[path].starts_with('['));
+
+        let mut to_save = config.clone();
+        mask_env_overrides_for_save(&mut to_save, &applied.snapshots)
+            .expect("structured snapshot restores");
+        assert_eq!(
+            to_save.agents["alpha"].workspace.read_memory_from,
+            vec![MemoryGrant::Scoped {
+                agent: crate::multi_agent::AgentAlias::new("gamma"),
+                categories: Some(vec!["facts".to_string()]),
+            }]
         );
     }
 

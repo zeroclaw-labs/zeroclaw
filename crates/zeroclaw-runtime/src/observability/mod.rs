@@ -1,4 +1,3 @@
-pub mod dora;
 pub mod log;
 pub mod multi;
 pub mod noop;
@@ -6,6 +5,8 @@ pub mod noop;
 pub mod otel;
 #[cfg(feature = "observability-otel")]
 pub mod otel_config;
+#[cfg(feature = "observability-otel")]
+mod otel_logs;
 #[cfg(feature = "observability-prometheus")]
 pub mod prometheus;
 pub mod runtime_trace;

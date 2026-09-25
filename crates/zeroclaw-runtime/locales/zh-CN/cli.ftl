@@ -15,6 +15,24 @@ cli-models-about = 管理提供商模型目录
 cli-providers-about = 列出支持的 AI 提供商
 cli-channel-about = 管理通信渠道
 cli-integrations-about = 浏览 50+ 个集成
+cli-integrations-unknown = 未知的集成：{$name}。请查看 README 了解支持的集成，或运行 {$quickstart} 配置模型提供商，然后运行 {$channel_config} 配置渠道。
+cli-integrations-category-heading = 类别
+cli-integrations-category-chat = 聊天提供商
+cli-integrations-category-ai-model = AI 模型
+cli-integrations-category-tools-automation = 工具与自动化
+cli-integrations-category-platform = 平台
+cli-integrations-status-heading = 状态
+cli-integrations-status-active = 已启用
+cli-integrations-status-available = 可用
+cli-integrations-setup-heading = 配置
+cli-integrations-setup-macos-heading = macOS 专用配置
+cli-integrations-builtin-heading = 内置
+cli-integrations-chat-telegram-prepare = 在 {$channel} 上向 {$botfather} 发送消息，创建机器人并获取令牌。
+cli-integrations-chat-discord-prepare = 在 {$url} 创建机器人，获取令牌并启用 {$intent} 意图。
+cli-integrations-chat-slack-prepare = 在 {$url} 创建应用，配置机器人的权限范围，启用 Socket Mode 并创建应用级令牌，然后安装应用以获取机器人令牌。
+cli-integrations-chat-configure = 运行 {$command}，打开配置，设置 {$channel} 实例及其凭据。
+cli-integrations-chat-bind = 将频道别名绑定到智能体，并检查对等组的访问权限。
+cli-integrations-chat-enable = 确认设置和访问权限后，再启用频道实例。
 cli-skills-about = 管理技能（用户自定义能力）
 cli-sop-about = 管理标准操作程序（SOPs）
 cli-migrate-about = 从其他智能体运行时迁移数据
@@ -61,6 +79,8 @@ cli-wechat-login-confirmed-missing-field = 登录已确认，但缺少 {$field}�
 cli-wechat-connected = ✅ WeChat 已连接！
 cli-wechat-bound-success = ✅ WeChat 账号绑定成功。现在可以和 ZeroClaw 对话了。
 cli-wechat-invalid-bind-code = ❌ 绑定码无效。请重试。
+cli-wechat-bind-denied = ❌ 该账号被配置中的 `ignore` 条目阻止。请联系运维人员删除后使用同一代码重试。
+cli-wechat-bind-not-saved = ❌ 无法保存绑定，未做任何更改。你的代码仍然有效；请联系运维人员检查配置文件后重试。
 cli-skills-list-about = 列出所有已安装的技能
 cli-skills-audit-about = 审计技能源目录或已安装的技能名称
 cli-skills-audit-failed = 技能审核失败。
@@ -71,6 +91,18 @@ cli-skills-review-summary = { "  " }💾 技能审查：{$summary}
 cli-skills-install-start = 正在安装技能来源：{$source}
 cli-skills-install-resolving-registry = { "  " }正在从技能注册表解析 '{$source}'...
 cli-skills-install-resolving-extra-registry = { "  " }正在从注册表 '{$registry}' 解析 '{$source}'...
+cli-skills-install-skill-requires-git = --skill <name> 需要以 git 仓库 URL 作为源（收到 '{$source}'）
+cli-skills-install-catalog-failed = 从目录 {$source} 安装技能 '{$skill}' 失败
+cli-skills-install-invalid-skill-name = 无效的 --skill 名称 '{$skill}'：请使用不带路径的技能名称（字母、数字、'-'、'_'）
+cli-skills-install-catalog-clone-failed = 克隆技能目录 {$url} 失败
+cli-skills-install-skill-not-in-catalog-empty = 在 {$url} 中未找到技能 '{$skill}'：没有 skills/ 目录，或该目录为空
+cli-skills-install-skill-not-in-catalog =
+    在 {$url} 中未找到技能 '{$skill}'。
+    可用技能：{$available}
+cli-skills-install-catalog-root-symlink = 技能目录 {$url} 包含符号链接形式的 skills/ 目录；拒绝检查该目录
+cli-skills-install-catalog-root-escapes = 技能目录 {$url} 的 skills/ 目录解析后位于克隆目录之外；拒绝检查该目录
+cli-skills-install-catalog-skill-symlink = {$url} 中的技能 '{$skill}' 是符号链接；目录中的技能必须是仓库内的真实目录
+cli-skills-install-catalog-skill-escapes = {$url} 中的技能 '{$skill}' 解析后位于克隆目录之外；拒绝安装
 cli-skills-install-git-failed = 安装 git 技能源失败：{$source}
 cli-skills-install-registry-failed = 从注册表安装技能失败：{$source}
 cli-skills-install-extra-registry-failed = 从额外注册表安装技能失败：{$source}
@@ -147,6 +179,7 @@ cli-sop-list-about = 列出已加载的 SOP
 cli-sop-validate-about = 验证 SOP 定义
 cli-sop-show-about = 显示 SOP 的详细信息
 cli-migrate-openclaw-about = 将 OpenClaw 工作区中的记忆导入到此 ZeroClaw 工作区
+cli-migrate-openclaw-qdrant-unsupported = Qdrant 当前不支持作为 OpenClaw 迁移目标。请将 memory.backend 设置为 sqlite、lucid 或 markdown，然后重试。
 cli-agent-long-about =
     启动 AI 代理循环。
 
@@ -175,6 +208,7 @@ cli-acp-long-about =
 
     示例：
     zeroclaw acp                        # 启动 ACP 服务器
+    zeroclaw acp --agent fable         # 将新会话的默认智能体设为 fable
     zeroclaw acp --max-sessions 5       # 限制并发会话数
 cli-daemon-long-about =
     启动长期运行的自主守护进程。
@@ -371,6 +405,8 @@ channel-whatsapp-web-delivery-failure-note-many = （注意：我无法传送 {$
 channel-line-bind-success = ✅ 已配对！现在可以聊天了。
 channel-line-bind-invalid-code = ❌ 代码无效。请重试。
 channel-line-bind-rate-limited = ⏳ 尝试次数过多。请在 { $secs }s 后重试。
+channel-line-bind-denied = ❌ 该账号被 `ignore` 条目阻止。请联系运维人员删除后重试。
+channel-line-bind-not-saved = ❌ 无法保存绑定，未做任何更改。你的代码仍然有效；请联系运维人员检查配置文件后重试。
 channel-telegram-cmd-new-desc = 开始新的对话会话
 channel-telegram-cmd-clear-desc = 清除此对话会话
 channel-telegram-cmd-stop-desc = 取消当前进行中的任务
@@ -507,6 +543,11 @@ cli-no-command = 未提供命令。
 cli-press-enter = 按 Enter 退出...
 cli-quickstart-title = Quickstart — 端到端创建一个可用的 agent。
 cli-quickstart-needs-tty = Quickstart 是交互式流程，需要 stdin 和 stderr 连接到终端。请从交互式 shell 中运行，或使用 `zeroclaw config set <path> <value>` 进行无头配置。
+cli-quickstart-terminal-size-unknown = Quickstart 无法确定终端尺寸，因此无法验证清单能否完整显示。请在会报告尺寸的终端中运行，或使用 `zeroclaw config set <path> <value>` 进行无头配置。
+cli-quickstart-terminal-too-narrow = Quickstart 需要终端宽度至少为 {$min_width} 列；当前终端宽度为 {$width} 列。请加宽终端后重试。
+cli-quickstart-terminal-too-short = Quickstart 需要终端高度至少为 {$min_height} 行；当前终端高度为 {$height} 行。请增高终端后重试。
+cli-quickstart-terminal-resized = Quickstart 清单打开期间，终端从 {$initial_width}x{$initial_height} 变为 {$current_width}x{$current_height}。请重新打开清单以继续。
+cli-quickstart-empty-checklist = Quickstart 无法打开空清单。
 cli-quickstart-cancelled = 已取消 quickstart。未写入配置。
 cli-quickstart-incomplete = {"  "}尚未填写所有选择器。
 cli-quickstart-create-agent = ── 创建 agent
@@ -628,11 +669,25 @@ cli-otp-enrollment-uri = 注册 URI：{$uri}
 cli-otp-received = {"  "}✓ OTP 已接收
 cli-secret-captured = {"  "}● 已接收输入 — 按 Enter 保存
 cli-secret-received = {"  "}✓ 密钥已接收
+cli-secret-needs-tty = 机密输入要求 stdin 和 stderr 均为终端。
+cli-secret-empty = 值不能为空。
 cli-pairing-enabled = 🔐 已启用 gateway 配对。
 cli-pairing-use-code = {"  "}使用此一次性代码配对新设备：
 cli-pairing-post = {"    "}POST /pair，附带请求头 X-Pairing-Code: {$code}
 cli-pairing-restart = {"   "}重启 gateway 以生成新的配对码。
 cli-pairing-disabled = ⚠️  配置中已禁用 gateway 配对。
+cli-pairing-fetch-failed = ❌ 无法从 gateway 获取配对码：{$endpoint}
+cli-pairing-no-code = 🔐 gateway 配对已启用，但当前没有可用的活动配对码。
+cli-pairing-requests-accepted = 所有请求都将在没有身份验证的情况下接受。
+cli-pairing-enable-config = 要启用配对，请设置 [gateway] require_pairing = true。
+cli-pairing-show-only = `zeroclaw gateway get-paircode` 只显示现有的活动配对码，不会生成新配对码。
+cli-pairing-pair-another = 要配对另一台设备，请运行：
+cli-pairing-revoke-replace = 要撤销现有配对并生成替换配对码，请运行：
+cli-pairing-new-code-unavailable = gateway 未生成新的配对码。可能已有配对码待处理，或需要重置配对。
+cli-pairing-retry-or-rotate = 请稍后重试，或撤销现有配对并生成替换配对码：
+cli-pairing-rotate-no-code = 轮换请求已完成，但没有返回替换配对码。
+cli-pairing-check-enabled = 请确认配对已启用，然后请求新的设备配对码：
+cli-pairing-inspect = 要检查正在运行的 gateway：
 cli-gateway-running-q = {"   "}gateway 是否正在运行？使用以下命令启动它：
 cli-status-title = 🦀 ZeroClaw 状态
 cli-security-status-title = ZeroClaw 安全状态
@@ -643,6 +698,7 @@ cli-security-status-risk-profile = 风险配置文件：{$v}
 cli-security-status-autonomy = 自主性：   {$v}
 cli-security-status-approvals = 审批：  需要中风险审批：{$medium}，已阻止高风险命令：{$high}
 cli-security-status-sandbox = 沙箱：    已请求 {$requested}，已激活 {$active}（{$description}）
+cli-security-status-sandbox-description-docker-runtime = Docker 运行时容器隔离（runtime.kind = "docker"；无额外沙箱包装器）
 cli-security-status-workspace = 工作区：  {$dir}；仅工作区：{$workspace_only}；读写根目录：{$read_write_roots}；只读根目录：{$read_only_roots}；只写根目录：{$write_only_roots}；环境变量透传：{$env_passthrough}
 cli-security-status-credentials = 凭据：加密：{$encryption}；已设置密钥：{$secrets_set}/{$secrets_total}；已分类字段：{$classified_total}；类别：{$classification_summary}
 cli-security-status-credentials-classes-none = 无
@@ -651,6 +707,7 @@ cli-security-status-warnings = 警告：   {$v}
 cli-security-status-warnings-none = 警告：   无
 cli-security-status-warning-agent-disabled = agent 已禁用
 cli-security-status-warning-sandbox-disabled = 此 agent 风险配置文件已禁用沙箱
+cli-security-status-warning-optional-sandbox-disabled-docker-runtime = 其他操作系统沙箱已禁用；Docker 运行时隔离仍处于启用状态
 cli-security-status-warning-sandbox-none = 激活的沙箱仅为应用层
 cli-security-status-warning-sandbox-fallback = 请求的沙箱后端 `{$requested}` 已回退到 `{$active}`
 cli-security-status-warning-workspace-not-restricted = 仅工作区文件系统策略已禁用
@@ -679,7 +736,11 @@ cli-status-model = {"   "}模型：         {$model}
 cli-status-observability = 📊 可观测性：  {$v}
 cli-status-trace-storage = 🧾 跟踪存储：  {$mode}（{$path}）
 cli-status-agents = 🛡️  Agents:        {$v}
+cli-status-agent-risk-profile = {$alias}={$level}
+cli-status-agent-no-risk-profile-summary = {$alias}=<无 risk_profile>
 cli-status-runtime = ⚙️  运行时：       {$v}
+cli-status-web-ui-found = 🌐 Web UI：        已找到（{$path}）
+cli-status-web-ui-missing = 🌐 Web UI：        缺失
 cli-status-heartbeat = 💓 心跳：      {$v}
 cli-status-heartbeat-every-minutes = 每 {$minutes} 分钟
 cli-status-memory = 🧠 内存：         {$backend}（自动保存：{$auto_save}）
@@ -707,6 +768,8 @@ cli-status-word-off = 关闭
 cli-status-word-none = （无）
 cli-status-word-configured = 已配置
 cli-status-word-not-configured = 未配置
+cli-status-channel-configured = ✅ {$status}
+cli-status-channel-not-configured = ❌ {$status}
 cli-status-channel-not-compiled = 🚫 已配置，未编译
 cli-desktop-not-installed = 未安装 ZeroClaw 配套应用。
 cli-desktop-blurb1 = 该配套应用是一个轻量级菜单栏应用，
@@ -726,8 +789,35 @@ cli-plugin-installed-name-version = 已安装插件 {$name} v{$version}
 cli-plugin-config-entry-seeded = 已为 '{$name}' 创建 [[plugins.entries]]。使用 `zeroclaw config set plugins.entries.{$name}.config.<key>` 设置插件配置值。
 cli-plugin-config-entry-key = 配置条目键（{$capability}）：{$key}
 cli-plugin-config-entry-seed-skipped = 警告：已跳过为 '{$name}' 创建配置条目：磁盘上的 [plugins] 部分格式不正确。请修复它，添加带有 `name = "{$name}"` 的 [[plugins.entries]] 块，然后使用 `zeroclaw config set plugins.entries.{$name}.config.<key>` 设置值。
+cli-plugin-egress-seeded = 已根据清单声明为“{$name}”授予出站目标（{$count} 个）：
+cli-plugin-egress-destination = → {$host}
+cli-plugin-egress-edit-command = 之后可用以下命令修改该授权：{$command}
+cli-plugin-egress-declared-not-granted = 插件“{$name}”声明了 {$count} 个其现有配置条目未授予的目标：
+cli-plugin-egress-added = + {$host}
+cli-plugin-egress-apply-command = 如需明确授予，请运行：{$command}
+cli-plugin-egress-granted-not-declared = 插件“{$name}”的配置条目授予了 {$count} 个清单不再声明的目标（保持不变）：
+cli-plugin-egress-removed = - {$host}
+cli-plugin-egress-never-extended = “{$name}”的现有出站授权未被修改：安装软件包绝不会扩展条目的允许列表。
+cli-plugin-egress-inherited = 插件“{$name}”未声明出站目标，但其现有配置条目仍授权 {$grants}。已安装的软件包将继承该授权；请在 plugins.entries.{$key} 下编辑或删除。
+cli-plugin-egress-gap = {$name}：声明了 {$hosts}，但其配置条目未授予 — 发往这些目标的请求会被拒绝。授予命令：{$command}
+cli-plugin-egress-gap-legacy = {$name}：声明了 {$hosts}，但其配置条目未授予 — 发往这些目标的请求会被拒绝。其配置行仍使用 1.0 之前的键格式，请先迁移该行再授予：
+cli-plugin-egress-migrate-step = 1) 迁移配置行：在配置文件中把名为“{$legacy}”的 [[plugins.entries]] 行重命名为“{$key}”，然后保存。该键可用 `zeroclaw plugin info {$name}` 查看。
+cli-plugin-egress-grant-step = 2) 授予：{$command}
+cli-plugin-egress-legacy-inert = {$name}：其配置行仍使用 1.0 之前的键格式，运行时不会读取该行 — 其出站授权未生效，请求会被拒绝。请在配置文件中把名为“{$legacy}”的 [[plugins.entries]] 行重命名为“{$key}”，然后保存。该键可用 `zeroclaw plugin info {$name}` 查看。
+cli-plugin-egress-invalid-grant = {$name}：运行时拒绝其出站授权（{$reason}）— 在修复之前所有请求都会被拒绝。请用以下命令替换授权：{$command}
+cli-plugin-egress-invalid-grant-legacy = {$name}：运行时拒绝其出站授权（{$reason}）— 在修复之前所有请求都会被拒绝。其配置行仍使用 1.0 之前的键格式，请先迁移该行，然后替换授权：
+cli-plugin-egress-repair-incomplete = {$name}：执行打印的命令后，运行时仍会拒绝该授权（{$reason}）。请修正 `plugins.entries.{$key}.egress_allow_private` 使其与已授权的主机一致，或删除该例外。
+cli-plugin-egress-deployment-rejected = 运行时拒绝此部署中所有插件的出站策略（{$reason}），在修复之前任何插件的授权都无法生效。请检查 `security.nat64_prefixes` 和 `plugins.limits.max_connections_per_instance`。
+cli-plugin-install-verify-failed = 安装失败：'{$name}' 无法在此主机上加载：{$error} — 请使用此主机的 WIT（参见 wit/v0）重新构建插件，或使用 --no-verify 强制安装。
+cli-plugin-install-verify-bypassed = 注意：跳过 '{$name}' 的安装时加载检查（--no-verify）；若无法在此主机上加载，将在启动时被跳过
+cli-plugin-list-entry-loads = {$name} v{$version} — {$description}（可加载）
+cli-plugin-list-entry-failed = {$name} v{$version} — {$description}（无法加载：{$error}）
+cli-plugin-list-entry-no-component = {$name} v{$version} — {$description}（没有可加载的组件）
 cli-config-section-degraded = 警告：{$path} 中的配置部分 `{$section}` 格式不正确，本次运行已重置为默认值。该部分中的值不会生效。请运行 `zeroclaw config migrate` 查看解析错误，然后修复文件。
+cli-config-section-retired-wati = 警告：已弃用的 WATI 频道配置部分 `{$section}` 将被忽略，因为 WATI 支持已移除。请使用 Cloud API 或 WhatsApp Web 迁移到 `[channels.whatsapp.<alias>]`，然后撤销未使用的 WATI API 令牌。
+cli-config-section-retired-node-transport = 警告：已弃用的 `[node_transport]` 配置将被忽略，因为旧版 HMAC 节点传输已移除。请从 config.toml 中删除该部分。
 cli-plugin-removed = 已移除插件“{$name}”。
+cli-plugin-removed-grant-kept = 其配置条目“{$key}”及其出站授权（{$grants}）会被保留：之后以“{$name}”安装的软件包将继承它。删除名为“{$key}”的 [[plugins.entries]] 行即可撤销该授权。
 cli-plugin-not-found = 未找到插件“{$name}”。
 cli-plugin-legacy-detected = 注意：位于旧位置（{$path}）的插件未被代理加载。请运行 `zeroclaw plugin migrate` 将其移动到 {$target}。
 cli-plugin-migrated = 已将 {$count} 个插件从 {$path} 移动到 {$target}。
@@ -754,6 +844,12 @@ cli-plugin-capabilities = 功能：{$v}
 cli-plugin-permissions = 权限：{$v}
 cli-plugin-wasm = WASM：{$path}
 cli-plugin-wasm-none = WASM：（仅技能插件）
+cli-plugin-info-load-ok = 加载：可以。该组件能在此主机的 WIT 世界中实例化。
+cli-plugin-info-load-failed =
+    加载：不可以。{$error}
+    请使用此主机附带的 WIT（参见 wit/v0）重新构建插件并重新安装。
+cli-plugin-info-load-not-applicable = 加载：不适用。这是仅技能插件，没有可实例化的组件。
+cli-plugin-info-load-failed-exit = 插件“{$name}”无法在此主机上加载
 cli-estop-domains-none = {"  "}domain_blocks:  （无）
 cli-estop-domains = {"  "}domain_blocks:  {$v}
 cli-estop-tools-none = {"  "}tool_freeze:    （无）
@@ -808,10 +904,14 @@ cli-models-status-none = 未配置默认模型。
 turn-interrupted-by-user = [被用户中断]
 turn-cancelled-client-rpc = [已通过客户端取消回合]
 turn-stream-interrupted = [流已中断]
+turn-failed = [回合失败]
+turn-failed-attachment-omitted = [附件已省略：提供方在失败的回合中拒绝了它]
 turn-model-fallback-notice = ⚡ { $requested_model }（{ $requested_provider }）不可用；此回复由 { $actual_model }（{ $actual_provider }）生成。
+turn-max-iterations-reached = *轮次已停止：已达到最大工具迭代次数（{ $max_iterations }）。*
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
 history-trim-reason-message-cap = 已超出历史消息数量限制
+history-trim-reason-recovery = 上下文窗口溢出恢复
 history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor} tokens) alone meet or exceed the context budget ({$budget} tokens); raise [runtime_profiles.<name>] max_context_tokens or reduce the tool surface by disabling unused integrations
 turn-ingress-dropped = 此请求未被处理：{ $reason }
 turn-tool-interrupted-before-result = [在此工具产生结果前被用户中断]
@@ -822,9 +922,12 @@ channel-runtime-progress-waiting-on-model = 正在等待模型
 channel-runtime-progress-running-tool = 正在运行工具
 channel-runtime-progress-compacting-context = 正在压缩上下文
 channel-runtime-progress-finalizing-response = 正在完成回复
+channel-runtime-matrix-progress-item-too-large = ⚠️ 此行太大，无法放入单条 Matrix 消息中。⚠️
 channel-runtime-new-session = 对话历史已清除。重新开始。
 channel-runtime-stop-sent = 已发送停止信号。
 channel-runtime-stop-no-task = 此发送者范围内没有正在执行的任务。
+channel-runtime-stop-folded-followup = 这里没有可停止的内容：这条回复已合并到仍在处理的上一条消息中。请在该会话中发送 /stop 取消。
+channel-runtime-conversation-busy = 此会话待处理的消息过多，本条消息已被丢弃。请等待回复，或发送 /stop 清空您排队中的请求。
 channel-runtime-model-empty = 模型 ID 不能为空。请使用 `/model <model-id>`。
 channel-runtime-model-switched = 已切换到模型 `{ $model }`（model_provider：`{ $provider }`）。上下文已保留。
 channel-runtime-agent-scope-rejected = 发送者 `{ $sender }` 无权在 agent `{ $agent }` 上执行 `/model --agent`。请改用 `/model --user { $model }`（仅本次会话生效），或请管理员将 peer group 的 `admin_for_agent_scope` 设为 `true` 并将你列为成员。
@@ -885,6 +988,10 @@ channel-runtime-provider-turn-init-failed =
 channel-runtime-fallback-footer =
     ⚡ `{ $requested }` 不可用 — 已由 **{ $actual }**（`{ $model }`）响应
     切换模型：/models
+delegate-provider-fallback-warning = 警告：委派的代理已通过提供商回退机制恢复。提供商故障详细信息已记录日志，未包含在此结果中。
+turn-tool-protocol-strict-mixed-error = 严格工具解析无法运行混合 native-tool 和 text-only 候选项的回退链。请将每个可到达的候选项配置为使用相同的工具协议，或将 strict_tool_parsing 设置为 false。
+delegate-provider-fallback-header = [代理 '{ $agent }'（请求：{ $requested_provider }/{ $requested_model }；提供：{ $actual_provider }/{ $actual_model }）]
+delegate-provider-fallback-header-agentic = [代理 '{ $agent }'（请求：{ $requested_provider }/{ $requested_model }；提供：{ $actual_provider }/{ $actual_model }，代理式）]
 cli-alias-list-empty = （{$section} 下无条目）
 cli-alias-created = 已创建 {$section}.{$alias}
 cli-alias-exists = {$section}.{$alias} 已存在（未更改）
@@ -925,15 +1032,11 @@ cli-bundle-warn-archive = 警告：bundle 目录归档失败：{$error}
 cli-bundle-deleted = 已删除 skill_bundles.{$alias}（已从 {$count} 个 agent 中移除）
 cli-bundle-warn-move = 警告：bundle 目录移动失败：{$error}
 cli-bundle-renamed = 已重命名 skill_bundles.{$from} → skill_bundles.{$to}
-
-# ── Web 仪表盘重启提示 — 应用内升级后显示的 RestartInfo.hint（PR #8173）──
-# 前四个是按原样展示的 shell 命令模板，不作翻译。
 cli-gateway-restart-hint-kubernetes = kubectl rollout restart deployment/zeroclaw
 cli-gateway-restart-hint-container = docker compose restart
 cli-gateway-restart-hint-systemd = systemctl restart zeroclaw
 cli-gateway-restart-hint-launchd = launchctl kickstart -k <your-zeroclaw-label>
 cli-gateway-restart-hint-process = 重启 `zeroclaw daemon` 进程
-
 cli-daemon-gateway-already-running = ZeroClaw gateway 已在 {$host}:{$port} 运行。daemon 会管理自己的 gateway，不会在同一地址启动第二个 gateway。请停止该 gateway（或使用 `zeroclaw config set gateway.port <port>` 将 daemon 指向空闲端口），然后重新运行 daemon。
 cli-daemon-gateway-port-occupied = Gateway 地址 {$host}:{$port} 已被另一个进程占用。请释放该端口或将 daemon 指向空闲端口（`zeroclaw config set gateway.port <port>`），然后重新运行 daemon。
 cli-daemon-starting-title = 🧠 ZeroClaw daemon 正在启动…
@@ -943,74 +1046,35 @@ cli-daemon-started-gateway = Gateway:  {$url}
 cli-daemon-started-socket = Socket:   {$path}
 cli-daemon-started-pairing = 配对：已启用（当前状态请查看上方 gateway 输出）
 cli-daemon-started-stop = 按 Ctrl+C 或发送 SIGTERM 停止
-cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
-cli-agent-context-bar-unknown = ctx: 未知 / {$max}
-cli-doctor-ctxwin-already-set = {$provider_ref}: 已有 context_window = {$ctx}
-cli-doctor-ctxwin-no-model = {$provider_ref}: 未配置模型，跳过
-cli-doctor-ctxwin-would-set = {$provider_ref}: 将设置 context_window = {$ctx} (试运行)
-cli-doctor-ctxwin-set = {$provider_ref}: 已设置 context_window = {$ctx}
-cli-doctor-ctxwin-not-found = {$provider_ref}: 找不到要更新的条目
-cli-doctor-ctxwin-fetch-failed = {$provider_ref}: 提供商未暴露上下文窗口或获取失败
-cli-doctor-ctxwin-saved = 已保存 {$updated} 项更新到 config.toml
-cli-doctor-ctxwin-dry-run = 试运行完成 — 未写入更改。去掉 --dry-run 以应用。
-cli-doctor-ctxwin-none = 无需更新。
-cli-doctor-ctxwin-write-failed = {$provider_ref}: 写入 context_window 失败: {$error}
-cli-doctor-context-window-ok = {$provider_ref}：上下文窗口：{$context_window} 个令牌
-cli-doctor-context-window-zero = {$provider_ref}：context_window 为 0（无效；请设置为模型的实际上下文上限）
-cli-doctor-context-window-unset = {$provider_ref}：未设置 context_window — 选择此配置时将使用 {$fallback} 个令牌的回退值；该值可能远低于模型的实际上限；请在此配置中设置 context_window
-
-# Doctor probe timeout warning — shown when model probing times out but prior
-# diagnostics (config, workspace, daemon) are preserved and returned.
-cli-doctor-probe-timeout-message = 模型探测超时。部分提供商目录可能无法访问。您可以重新运行 Doctor 来刷新。
-
-# ── Degraded config sections (doctor diagnose, #8835) ──
-cli-doctor-degraded-security = 安全关键配置节 `{$path}` 无效，已重置为默认值以便守护进程启动；当前运行的安全态势可能弱于预期。运行 `zeroclaw config migrate` 查看解析错误，然后修复该文件。
-cli-doctor-degraded-section = 配置节 `{$path}` 格式错误，已重置为默认值；该节中的值当前不生效。运行 `zeroclaw config migrate` 查看解析错误，然后修复该文件。
-sop-approval-deferred-at-capacity = 执行槽位已满，无法恢复运行 {$run_id}。审批仍处于等待状态；请在槽位释放后重试。
-sop-approval-policy-unavailable = 无法使用暂停的 SOP 步骤，审批失败：{$reason}。运行仍处于等待状态。
-sop-rpc-decision-invalid-state = 运行 {$run_id} 无法在当前状态下完成决策。
-sop-rpc-decision-unauthorized = RPC 主体无权对该 SOP 步骤作出决策。
-sop-rpc-policy-missing = 未配置 SOP 审批策略“{$name}”。
-sop-rpc-policy-unavailable = 暂停的 SOP 策略不可用：{$reason}。
-
-# ── 终端工具审批 ──
-# ASCII 快捷键与 Rust 响应解析器保持一致。
-cli-approval-request = 🔧 代理想要执行：{$tool}
-cli-approval-prompt = { "   " }[Y] 是 / [N] 否 / [A] 始终允许 {$tool}：{ " " }
-
-# ── Tool approval (channels, #9409) ──
-# Human-visible copy for the operator-facing tool-approval prompt, shared
-# across the button adapters (Telegram, Discord, Slack) and the text-reply
-# adapters (Matrix, Signal, WhatsApp, Slack polling fallback). Approval
-# TOKENS, `callback_data`/`custom_id`/`action_id` values, and the reply
-# KEYWORDS parsed by `util::parse_approval_reply` (yes/y/approve, no/n/deny,
-# always) stay hardcoded ASCII in Rust — only the surrounding prose is
-# localized here.
-channel-approval-heading = 需要工具批准
-channel-approval-heading-shout = 需要批准
-channel-approval-tool-label = 工具
-channel-approval-args-label = 参数
-channel-approval-btn-approve = 批准
-channel-approval-btn-deny = 拒绝
-channel-approval-btn-always = 始终
-channel-approval-tap-instruction = 点击下方按钮：
-channel-approval-reply-instruction-yesno = 回复：“{ $yes_command }”、“{ $no_command }” 或 “{ $always_command }”
-channel-approval-reply-instruction-approve-deny = 回复 `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`。
-channel-approval-group-visibility-warning =
-    这是群聊，因此这里的所有人都能看到此代码和上面显示的工具参数。只有该通道的授权对等方才能回复。
-channel-telegram-approval-ack-approved = 已批准
-channel-telegram-approval-ack-always-approved = 已始终批准
-channel-telegram-approval-ack-denied = 已拒绝
-channel-telegram-approval-ack-unknown = 未知操作
-channel-telegram-approval-ack-already-resolved = 审批已被处理
-channel-discord-approval-btn-allow-once = 仅本次允许
-channel-discord-approval-btn-allow-session = 本会话允许
-channel-discord-approval-btn-allow-always = 始终允许
-channel-approval-title = 批准 { $tool }？
-channel-approval-opt-allow-once = 仅本次允许
-channel-approval-opt-allow-always = 始终允许
-channel-approval-opt-reject = 拒绝
-channel-approval-opt-reject-with-edit = 编辑后拒绝
+cli-relay-rotation-requested = 已请求轮换中继 node-id。正在运行的守护进程将在 ~{$secs}s 内完成轮换；新 ID 将在客户端下次续订证书时通过带内方式传达。
+cli-mtls-issued-client-cert = 已为 '{$name}' 签发客户端证书：
+cli-mtls-issued-cert-path = {"  "}证书: {$path}
+cli-mtls-issued-key-path = {"  "}密钥:  {$path}
+cli-mtls-issued-ca-path = {"  "}CA:   {$path}
+cli-mtls-dropin-line-1 = 直接使用：此目录是一个可直接使用的客户端 TLS 目录（ca.crt / client.crt /
+cli-mtls-dropin-line-2 = {"  "}client.key）。将其复制到客户端的 <config-dir>/tls，zerocode 会发现
+cli-mtls-dropin-line-3 = {"  "}这些材料，无需 --tls-* 参数即可自动使用。
+cli-mtls-relay-connect-header = 通过其配置的中继访问此守护进程：
+cli-mtls-relay-ca-note-1 = {"  "}（--relay-ca 是 RELAY 的 CA——请将其从中继端复制到客户端；
+cli-mtls-relay-ca-note-2 = {"   "}--tls-ca-cert 是 DAEMON 的 CA，已在捆绑包中。）
+cli-mtls-direct-connect-header = 使用 zerocode（直接）连接：
+cli-mtls-revoked-certificate = 已撤销证书 {$fingerprint}。
+cli-mtls-revoke-no-active-fingerprint = 没有指纹为 {$fingerprint} 的有效证书（已撤销或从未签发）。
+cli-mtls-revoked-device-certs = 已为设备 '{$device}' 撤销 {$count} 个有效证书。
+cli-mtls-revoked-list-updated = 已更新 {$path}；守护进程将在下次连接时拒绝已撤销的证书。
+cli-mtls-list-no-active-certs = 此守护进程的 CA 未签发任何有效的客户端证书。
+cli-mtls-list-active-header = 有效客户端证书（{$count}）：
+cli-enroll-endpoint-ready = 注册端点已在 {$bind}:{$port} 上就绪。要注册客户端，请向其提供
+cli-enroll-confirm-sas-line-1 = 此一次性配对码和短认证字符串（SAS）
+cli-enroll-confirm-sas-line-2 = 在信任守护进程之前，请确认两端显示的内容一致：
+cli-enroll-pairing-code = {"    "}配对码 : {$code}
+cli-enroll-sas = {"    "}SAS          : {$sas}
+cli-delegate-error-invalid-semantic-completion = 代理 '{$agent_name}' 失败：模型提供商返回了无效的语义完成结果。
+cli-agent-error-invalid-semantic-completion = 模型提供商返回了无效的语义完成结果。
+cli-delegate-error-incomplete-after-provider-tools = 代理 '{$agent_name}' 失败：模型提供商执行工具后未返回最终响应便结束了。
+cli-agent-error-incomplete-after-provider-tools = 模型提供商执行工具后未返回最终响应便结束了。
+cli-agent-vision-unsupported-by-fallback = 收到 {$marker_count} 个图像标记，但回退 model_provider={$fallback_name} 不支持视觉输入
+cli-agent-vision-unsupported-by-provider = 收到 {$marker_count} 个图像标记，但此 model_provider 不支持视觉输入
 cli-agent-error-provider-context-window = 请求超过了所选模型的上下文窗口。请缩短对话或选择上下文窗口更大的模型。
 cli-agent-error-provider-credentials-missing = 所选模型提供商未配置凭据。请添加其 API 密钥或选择其他提供商。
 cli-agent-error-provider-credentials-missing-named = 模型提供商 {$provider} 未配置凭据。请添加其 API 密钥或选择其他提供商。
@@ -1025,7 +1089,67 @@ cli-agent-error-provider-connection-remote = 无法连接到 {$endpoint} 上的�
 cli-agent-error-provider-connection = 无法连接到所选模型提供商。请检查网络访问或选择其他提供商。
 cli-agent-error-provider-timeout = 所选模型提供商超时。请重试或选择其他提供商。
 cli-agent-error-provider-generic = 所选模型提供商失败。请检查提供商配置或选择其他提供商。
-cli-delegate-error-invalid-semantic-completion = 代理 '{$agent_name}' 失败：模型提供商返回了无效的语义完成结果。
-cli-agent-error-invalid-semantic-completion = 模型提供商返回了无效的语义完成结果。
-cli-delegate-error-incomplete-after-provider-tools = 代理 '{$agent_name}' 失败：模型提供商执行工具后未返回最终响应便结束了。
-cli-agent-error-incomplete-after-provider-tools = 模型提供商执行工具后未返回最终响应便结束了。
+cli-doctor-context-window-ok = {$provider_ref}：上下文窗口：{$context_window} 个令牌
+cli-doctor-context-window-zero = {$provider_ref}：context_window 为 0（无效；请设置为模型的实际上下文上限）
+cli-doctor-context-window-unset = {$provider_ref}：未设置 context_window — 选择此配置时将使用 {$fallback} 个令牌的回退值；该值可能远低于模型的实际上限；请在此配置中设置 context_window
+cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
+cli-agent-context-bar-unknown = ctx: 未知 / {$max}
+cli-doctor-ctxwin-already-set = {$provider_ref}: 已有 context_window = {$ctx}
+cli-doctor-ctxwin-no-model = {$provider_ref}: 未配置模型，跳过
+cli-doctor-ctxwin-would-set = {$provider_ref}: 将设置 context_window = {$ctx} (试运行)
+cli-doctor-ctxwin-set = {$provider_ref}: 已设置 context_window = {$ctx}
+cli-doctor-ctxwin-not-found = {$provider_ref}: 找不到要更新的条目
+cli-doctor-ctxwin-fetch-failed = {$provider_ref}: 提供商未暴露上下文窗口或获取失败
+cli-doctor-ctxwin-saved = 已保存 {$updated} 项更新到 config.toml
+cli-doctor-ctxwin-dry-run = 试运行完成 — 未写入更改。去掉 --dry-run 以应用。
+cli-doctor-ctxwin-none = 无需更新。
+cli-doctor-ctxwin-write-failed = {$provider_ref}: 写入 context_window 失败: {$error}
+cli-doctor-cache-write-failed = 无法持久化模型缓存：{$error}
+cli-doctor-probe-timeout-message = 模型探测超时。部分提供商目录可能无法访问。您可以重新运行 Doctor 来刷新。
+cli-doctor-degraded-security = 安全关键配置节 `{$path}` 无效，已重置为默认值以便守护进程启动；当前运行的安全态势可能弱于预期。运行 `zeroclaw config migrate` 查看解析错误，然后修复该文件。
+cli-doctor-degraded-section = 配置节 `{$path}` 格式错误，已重置为默认值；该节中的值当前不生效。运行 `zeroclaw config migrate` 查看解析错误，然后修复该文件。
+cli-doctor-verifiable-intent-tool-withheld = verifiable_intent.enabled 已设置，但在凭证链验证器存在之前，vi_verify 工具会从模型可见注册表中隐藏。启用此配置段并不会启用对商务工具调用的凭证验证。签发和验证库路径不受影响。
+sop-approval-deferred-at-capacity = 执行槽位已满，无法恢复运行 {$run_id}。审批仍处于等待状态；请在槽位释放后重试。
+sop-approval-policy-unavailable = 无法使用暂停的 SOP 步骤，审批失败：{$reason}。运行仍处于等待状态。
+sop-rpc-decision-invalid-state = 运行 {$run_id} 无法在当前状态下完成决策。
+sop-rpc-decision-unauthorized = RPC 主体无权对该 SOP 步骤作出决策。
+sop-rpc-policy-missing = 未配置 SOP 审批策略“{$name}”。
+sop-rpc-policy-unavailable = 暂停的 SOP 策略不可用：{$reason}。
+tool-runtime-command-build-failed = 无法构建运行时命令：{$error}
+tool-runtime-command-docker-workspace-path = 无法构建运行时命令：无法规范化 Docker 工作区路径 {$path}：{$cause}
+tool-runtime-command-docker-allowed-root = 构建运行时命令失败：无法规范化 Docker 工作区根目录 {$path}：{$cause}
+cli-approval-request = 🔧 代理想要执行：{$tool}
+cli-approval-prompt = { "   " }[Y] 是 / [N] 否 / [A] 始终允许 {$tool}：{ " " }
+channel-approval-heading = 需要工具批准
+channel-approval-heading-shout = 需要批准
+channel-approval-tool-label = 工具
+channel-approval-args-label = 参数
+channel-approval-btn-approve = 批准
+channel-approval-btn-deny = 拒绝
+channel-approval-btn-always = 始终
+channel-approval-tap-instruction = 点击下方按钮：
+channel-approval-position = 第 { $index } 个工具调用，共 { $total } 个
+channel-approval-reply-instruction-yesno = 回复：“{ $yes_command }”、“{ $no_command }” 或 “{ $always_command }”
+channel-approval-reply-instruction-approve-deny = 回复 `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`。
+channel-approval-group-visibility-warning = 这是群聊，因此这里的所有人都能看到此代码和上面显示的工具参数。只有该通道的授权对等方才能回复。
+channel-telegram-approval-ack-approved = 已批准
+channel-telegram-approval-ack-always-approved = 已始终批准
+channel-telegram-approval-ack-denied = 已拒绝
+channel-telegram-approval-ack-not-accepted = 审批未被接受
+channel-telegram-approval-ack-unknown = 未知操作
+channel-telegram-approval-ack-already-resolved = 审批已被处理
+channel-telegram-voice-drop-too-long = ⚠️ 已跳过音频消息：时长超过 { $limit_secs } 秒的上限。请发送更短的录音，或分段发送。
+channel-telegram-voice-drop-file-unavailable = ⚠️ 已跳过音频消息：无法从 Telegram 获取该文件——可能文件过大或已不可用。请尝试更小或更短的文件。
+channel-telegram-voice-drop-empty-transcript = ⚠️ 已跳过音频消息：未能从录音中识别出任何内容。请用更清晰的录音重试。
+channel-discord-approval-btn-allow-once = 仅本次允许
+channel-discord-approval-btn-allow-session = 本会话允许
+channel-discord-approval-btn-allow-always = 始终允许
+channel-approval-title = 批准 { $tool }？
+channel-approval-opt-allow-once = 仅本次允许
+channel-approval-opt-allow-always = 始终允许
+channel-approval-opt-reject = 拒绝
+channel-approval-opt-reject-with-edit = 编辑后拒绝
+tool-git-operations-error-docker-runtime-write-unsupported = Git 写入命令在 Docker 运行时中不可用，因为无法将其限制在其容器内。
+
+turn-context-window-exceeded-error = 本次请求超过所选模型的上下文容量。请减少请求内容或启用的工具，或选择上下文容量更大的模型。
+cron-agent-job-failed = 定时任务未能完成，请重试或联系管理员查看日志。

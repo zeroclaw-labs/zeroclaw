@@ -57,6 +57,7 @@ pub async fn handle_openapi_json() -> Response {
 
 #[cfg(feature = "schema-export")]
 pub fn build_spec() -> serde_json::Value {
+    use crate::api::StatusResponse;
     use crate::api_config::{
         DriftEntry, DriftResponse, InitQuery, InitResponse, ListResponse, MigrateResponse, PatchOp,
         PatchResponse, PropPutBody, PropResponse, ReloadStatusResponse, SecretResponse,
@@ -69,6 +70,14 @@ pub fn build_spec() -> serde_json::Value {
 
     fn schema_value<T: JsonSchema>() -> serde_json::Value {
         serde_json::to_value(schema_for!(T)).unwrap_or(serde_json::Value::Null)
+    }
+
+    fn response_schema_value<T: JsonSchema>() -> serde_json::Value {
+        let generator = schemars::generate::SchemaSettings::default()
+            .for_serialize()
+            .into_generator();
+        serde_json::to_value(generator.into_root_schema_for::<T>())
+            .unwrap_or(serde_json::Value::Null)
     }
 
     let components = serde_json::json!({
@@ -99,6 +108,7 @@ pub fn build_spec() -> serde_json::Value {
             "ApprovalDecision": schema_value::<zeroclaw_runtime::sop::ApprovalDecision>(),
             "TriggerSourceRegistry": schema_value::<zeroclaw_runtime::sop::TriggerSourceRegistry>(),
             "SlashOptionKindsResult": schema_value::<crate::api_skills::SlashOptionKindsResult>(),
+            "StatusResponse": response_schema_value::<StatusResponse>(),
         },
         "securitySchemes": {
             "bearerAuth": {
@@ -157,6 +167,14 @@ pub fn build_spec() -> serde_json::Value {
         "description": "Scope the status read to a specific upgrade run (404 on mismatch)."
     });
 
+    let status_agent_param = serde_json::json!({
+        "name": "agent",
+        "in": "query",
+        "required": false,
+        "schema": { "type": "string" },
+        "description": "Optional configured agent alias to resolve model and memory status for.",
+    });
+
     let version_error = |description: &str| {
         serde_json::json!({
             "description": description,
@@ -201,6 +219,20 @@ pub fn build_spec() -> serde_json::Value {
     });
 
     let paths = serde_json::json!({
+        "/api/status": {
+            "get": {
+                "tags": ["status"],
+                "summary": "Read gateway status",
+                "description": "Returns the authenticated gateway status snapshot.",
+                "parameters": [status_agent_param],
+                "responses": {
+                    "200": {
+                        "description": "Current gateway status.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StatusResponse" } } }
+                    }
+                }
+            }
+        },
         "/api/config/prop": {
             "get": {
                 "tags": ["config"],
@@ -405,8 +437,9 @@ pub fn build_spec() -> serde_json::Value {
     #[cfg(feature = "a2a")]
     augment_spec_with_a2a(
         &mut spec,
-        schema_value::<crate::a2a::JsonRpcRequest>(),
-        schema_value::<crate::a2a::OutTask>(),
+        schema_value::<zeroclaw_api::a2a_wire::JsonRpcRequest>(),
+        schema_value::<zeroclaw_api::a2a_wire::Task>(),
+        schema_value::<zeroclaw_api::a2a_wire::Message>(),
     );
     flatten_defs_into_components(&mut spec);
     spec
@@ -420,6 +453,7 @@ fn augment_spec_with_a2a(
     spec: &mut serde_json::Value,
     task_request_schema: serde_json::Value,
     task_schema: serde_json::Value,
+    message_schema: serde_json::Value,
 ) {
     if let Some(schemas) = spec
         .pointer_mut("/components/schemas")
@@ -427,6 +461,60 @@ fn augment_spec_with_a2a(
     {
         schemas.insert("A2aTaskRequest".to_string(), task_request_schema);
         schemas.insert("A2aTask".to_string(), task_schema);
+        schemas.insert("A2aMessage".to_string(), message_schema);
+        // The success `result` is the flat A2A oneof shape
+        // (`{"task": {...}}` / `{"message": {...}}`). The `SendMessageResponse`
+        // enum's derived JsonSchema would emit an externally-tagged
+        // `oneOf` with `Task`/`Message` branches each wrapping an extra
+        // `task`/`message` property, which does not match the custom
+        // serializer's wire shape and would make a schema-generated client
+        // reject real responses. Describe the flat union explicitly.
+        schemas.insert(
+            "A2aSendMessageResponse".to_string(),
+            serde_json::json!({
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "required": ["task"],
+                        "additionalProperties": false,
+                        "properties": {
+                            "task": { "$ref": "#/components/schemas/A2aTask" }
+                        }
+                    },
+                    {
+                        "type": "object",
+                        "required": ["message"],
+                        "additionalProperties": false,
+                        "properties": {
+                            "message": { "$ref": "#/components/schemas/A2aMessage" }
+                        }
+                    }
+                ]
+            }),
+        );
+        // JSON-RPC 2.0 envelope whose `result` is the Task/Message union the
+        // handler actually returns (matches the checked-in fixtures): not a
+        // bare A2aTask. `result` is absent on a JSON-RPC error response.
+        schemas.insert(
+            "A2aJsonRpcResponse".to_string(),
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "jsonrpc": { "type": "string" },
+                    "id": {},
+                    "result": { "$ref": "#/components/schemas/A2aSendMessageResponse" },
+                    "error": {
+                        "type": "object",
+                        "properties": {
+                            "code": { "type": "integer" },
+                            "message": { "type": "string" },
+                            "data": {}
+                        }
+                    }
+                },
+                "required": ["jsonrpc", "id"]
+            }),
+        );
     }
     if let Some(paths) = spec.pointer_mut("/paths").and_then(|v| v.as_object_mut()) {
         paths.insert(
@@ -435,22 +523,31 @@ fn augment_spec_with_a2a(
                 "post": {
                     "tags": ["a2a"],
                     "summary": "Send a task to a published A2A agent",
-                    "description": "JSON-RPC 2.0 endpoint for one published agent. Only `message/send` is handled: the message `parts` of kind `text` are joined into the agent prompt, the agent runs one turn, and a completed A2A `Task` carrying the reply as an artifact is returned. Requires a pairing-derived bearer token (the turn is tool-enabled, so it is never served unauthenticated). Unpublished or disabled aliases return 404. The server must be enabled (`[a2a.server] enabled`) and the alias published (`[agents.<alias>.a2a] published`).",
-                    "parameters": [{
-                        "name": "alias",
-                        "in": "path",
-                        "required": true,
-                        "schema": { "type": "string" },
-                        "description": "Published agent alias, as listed in the discovery catalog."
-                    }],
+                    "description": "JSON-RPC 2.0 endpoint for one published agent. Only the v1 `SendMessage` method is handled (the request must carry `A2A-Version: 1.0`): the message `parts` carrying a `text` branch are joined into the agent prompt, the agent runs one turn, and a `SendMessageResponse` whose `task` branch carries the completed A2A `Task` is returned. Requires a pairing-derived bearer token (the turn is tool-enabled, so it is never served unauthenticated). Unpublished or disabled aliases return 404. The server must be enabled (`[a2a.server] enabled`) and the alias published (`[agents.<alias>.a2a] published`).",
+                    "parameters": [
+                        {
+                            "name": "alias",
+                            "in": "path",
+                            "required": true,
+                            "schema": { "type": "string" },
+                            "description": "Published agent alias, as listed in the discovery catalog."
+                        },
+                        {
+                            "name": "A2A-Version",
+                            "in": "header",
+                            "required": true,
+                            "schema": { "type": "string" },
+                            "description": "A2A protocol version. This server only accepts `1.0`; any other value returns a `VERSION_NOT_SUPPORTED` error."
+                        }
+                    ],
                     "requestBody": {
                         "required": true,
                         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/A2aTaskRequest" } } }
                     },
                     "responses": {
                         "200": {
-                            "description": "JSON-RPC response. On success `result` is a completed A2A Task; on a JSON-RPC error (unknown method, bad params) `error` carries the code and message.",
-                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/A2aTask" } } }
+                            "description": "JSON-RPC response. On success `result` is a `SendMessageResponse` whose `task` branch carries the completed A2A `Task` or whose `message` branch carries a direct reply; on a JSON-RPC error (unknown method, bad params, unsupported version) `error` carries the code, message, and (for A2A-specific errors) a `data.reason` field.",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/A2aJsonRpcResponse" } } }
                         },
                         "401": {
                             "description": "Missing or invalid bearer token while pairing is required."
@@ -571,6 +668,7 @@ mod tests {
         let spec = build_spec();
         let paths = spec.get("paths").unwrap();
         assert!(paths.get("/api/config/prop").is_some());
+        assert!(paths.get("/api/status").is_some());
         assert!(paths.get("/api/config/list").is_some());
         assert!(paths.get("/api/config").is_some());
         assert!(paths.get("/api/config/init").is_some());
@@ -601,6 +699,107 @@ mod tests {
         // Refs must be rewritten to point at the hoisted component, not `$defs`.
         let spec_str = serde_json::to_string(&spec).unwrap();
         assert!(!spec_str.contains("#/$defs/"));
+    }
+
+    #[cfg(feature = "schema-export")]
+    #[test]
+    fn status_contract_schema_is_nullable_and_path_is_query_scoped() {
+        let spec = build_spec();
+        let schemas = spec.pointer("/components/schemas").unwrap();
+        let status = schemas.get("StatusResponse").expect("status schema");
+        let status_required = status
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .expect("StatusResponse required fields");
+        for field in ["model_provider", "temperature", "agent_alias"] {
+            assert!(
+                status_required
+                    .iter()
+                    .any(|value| value.as_str() == Some(field)),
+                "StatusResponse.{field} must remain present even when null"
+            );
+            let schema = status
+                .pointer(&format!("/properties/{field}"))
+                .unwrap_or_else(|| panic!("missing StatusResponse.{field}"));
+            let encoded = serde_json::to_string(schema).unwrap();
+            assert!(
+                encoded.contains("null"),
+                "StatusResponse.{field} must remain nullable: {schema}"
+            );
+        }
+
+        let process = schemas.get("ProcessStats").expect("process schema");
+        let process_required = process
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .expect("ProcessStats required fields");
+        assert!(
+            process_required
+                .iter()
+                .any(|value| value.as_str() == Some("cpu_percent")),
+            "ProcessStats.cpu_percent must remain present even when null"
+        );
+        let cpu_percent = process
+            .pointer("/properties/cpu_percent")
+            .expect("ProcessStats.cpu_percent schema");
+        assert!(
+            serde_json::to_string(cpu_percent).unwrap().contains("null"),
+            "ProcessStats.cpu_percent must remain nullable: {cpu_percent}"
+        );
+
+        let mdns_peer = schemas.get("MdnsPeerSnapshot").expect("mDNS peer schema");
+        let mdns_required = mdns_peer
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .expect("MdnsPeerSnapshot required fields");
+        assert!(
+            mdns_required
+                .iter()
+                .any(|value| value.as_str() == Some("path_prefix")),
+            "MdnsPeerSnapshot.path_prefix must remain present even when null"
+        );
+        let path_prefix = mdns_peer
+            .pointer("/properties/path_prefix")
+            .expect("MdnsPeerSnapshot.path_prefix schema");
+        assert!(
+            serde_json::to_string(path_prefix).unwrap().contains("null"),
+            "MdnsPeerSnapshot.path_prefix must remain nullable: {path_prefix}"
+        );
+
+        let component_health = schemas
+            .get("ComponentHealth")
+            .expect("component health schema");
+        let component_required = component_health
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .expect("ComponentHealth required fields");
+        for field in ["last_ok", "last_error"] {
+            assert!(
+                component_required
+                    .iter()
+                    .any(|value| value.as_str() == Some(field)),
+                "ComponentHealth.{field} must remain present even when null"
+            );
+            let schema = component_health
+                .pointer(&format!("/properties/{field}"))
+                .unwrap_or_else(|| panic!("missing ComponentHealth.{field}"));
+            assert!(
+                serde_json::to_string(schema).unwrap().contains("null"),
+                "ComponentHealth.{field} must remain nullable: {schema}"
+            );
+        }
+
+        let status_get = spec.pointer("/paths/~1api~1status/get").unwrap();
+        assert_eq!(
+            status_get.pointer("/parameters/0/name"),
+            Some(&serde_json::Value::String("agent".into()))
+        );
+        assert_eq!(
+            status_get.pointer("/responses/200/content/application~1json/schema/$ref"),
+            Some(&serde_json::Value::String(
+                "#/components/schemas/StatusResponse".into()
+            ))
+        );
     }
 
     #[cfg(feature = "schema-export")]
@@ -646,6 +845,61 @@ mod tests {
         let schemas = spec.pointer("/components/schemas").unwrap();
         assert!(schemas.get("A2aTaskRequest").is_some());
         assert!(schemas.get("A2aTask").is_some());
+        // W2: the 200 response must describe the JSON-RPC envelope whose
+        // `result` is the Task/Message union, not a bare A2aTask.
+        assert!(schemas.get("A2aSendMessageResponse").is_some());
+        // The union component must describe the flat A2A oneof shape
+        // (`{"task":...}` / `{"message":...}`), not the derived enum's
+        // externally-tagged `Task`/`Message` wrapper branches.
+        let union = schemas
+            .get("A2aSendMessageResponse")
+            .expect("union component")
+            .clone();
+        let branches = union["oneOf"].as_array().expect("flat oneOf union");
+        let branch_paths: Vec<_> = branches
+            .iter()
+            .map(|b| {
+                format!(
+                    "{}->{}",
+                    b["required"][0].as_str().unwrap(),
+                    b["properties"][b["required"][0].as_str().unwrap()]["$ref"]
+                        .as_str()
+                        .unwrap_or_default()
+                )
+            })
+            .collect();
+        assert_eq!(
+            branch_paths.len(),
+            2,
+            "exactly two branches: {branch_paths:?}"
+        );
+        assert!(
+            branch_paths
+                .iter()
+                .any(|p| p == "task->#/components/schemas/A2aTask"),
+            "task branch must reference A2aTask: {branch_paths:?}"
+        );
+        assert!(
+            branch_paths
+                .iter()
+                .any(|p| p == "message->#/components/schemas/A2aMessage"),
+            "message branch must reference A2aMessage: {branch_paths:?}"
+        );
+        let envelope = schemas
+            .get("A2aJsonRpcResponse")
+            .expect("envelope component")
+            .clone();
+        assert_eq!(
+            envelope["properties"]["result"]["$ref"],
+            "#/components/schemas/A2aSendMessageResponse"
+        );
+        let resp_schema = spec
+            .pointer(
+                "/paths/~1a2a~1{alias}/post/responses/200/content/application~1json/schema/$ref",
+            )
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert_eq!(resp_schema, "#/components/schemas/A2aJsonRpcResponse");
     }
 
     #[cfg(feature = "schema-export")]
