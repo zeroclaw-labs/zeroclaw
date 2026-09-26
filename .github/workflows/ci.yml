@@ -823,6 +823,40 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      # Informational until the gateway starts calling the core over RPC: the
+      # golden-frame replay compares the gateway's WebSocket, SSE, webhook and
+      # ACP output with recorded fixtures and reports drift without failing
+      # the job. It reuses the workspace build above (same package set and
+      # features), so it adds no compile.
+      - name: Golden-frame replay (informational)
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: |
+          set +e
+          cargo nextest run --locked --workspace --exclude zeroclaw-desktop \
+            --run-ignored only --no-fail-fast \
+            -E 'package(zeroclaw-gateway) & binary(golden_frames)' 2>&1 | tee golden-frames.log
+          status=${PIPESTATUS[0]}
+          {
+            echo "### Golden-frame replay (informational)"
+            if [ "$status" -eq 0 ]; then
+              echo "All gateway golden-frame scenarios match their fixtures."
+            else
+              echo "Gateway output drifted from the recorded fixtures. This does not fail CI."
+              echo "Re-record intended changes with \`ZEROCLAW_GOLDEN_RECORD=1\` (see \`crates/zeroclaw-gateway/tests/golden_frames.rs\`)."
+              echo
+              echo '```text'
+              grep -E '^\s+(FAIL|PASS) |golden-frame mismatch|^[+-] {0,3}[0-9]+ ' golden-frames.log | head -200
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" -ne 0 ]; then
+            echo "::warning title=Golden-frame drift::Gateway output differs from tests/golden fixtures (informational)."
+          fi
+          exit "$status"
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
   # Feature configurations keep their original defaults and test filters.
   # In particular, Lark runs without defaults and QQ excludes live-auth tests.

@@ -1,0 +1,38 @@
+{
+  "frames": [
+    {
+      "channel": "http",
+      "dir": "send",
+      "payload": {
+        "body": {
+          "message": "Reply to this webhook."
+        },
+        "headers": {
+          "X-Session-Id": "golden-webhook-json"
+        },
+        "method": "POST",
+        "path": "/webhook?agent=web"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "recv",
+      "payload": {
+        "body": {
+          "model": "fixture-model",
+          "response": "Webhook reply from the fixture."
+        },
+        "content_type": "application/json",
+        "status": 200
+      }
+    },
+    {
+      "channel": "provider",
+      "dir": "meta",
+      "payload": {
+        "requests": 1
+      }
+    }
+  ],
+  "scenario": "webhook_json_turn"
+}
