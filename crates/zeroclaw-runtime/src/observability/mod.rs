@@ -337,6 +337,31 @@ fn warn_otel_content_policy(config: OtelContentConfig) {
 }
 
 /// Factory: create the right observer from config
+/// Content type of the Prometheus text exposition.
+pub const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+
+/// What a scrape returns when the Prometheus backend is not in use.
+pub const PROMETHEUS_DISABLED_HINT: &str =
+    "# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n";
+
+/// The Prometheus text exposition under `config`. The Prometheus backend is
+/// one shared registry per process, the one [`create_observer`] hands every
+/// observer it builds for that backend, so this is the same text the
+/// gateway's `/metrics` serves. Without the backend, configured or compiled
+/// in, it is [`PROMETHEUS_DISABLED_HINT`].
+#[must_use]
+pub fn prometheus_exposition(config: &ObservabilityConfig) -> String {
+    #[cfg(feature = "observability-prometheus")]
+    {
+        if matches!(config.backend, ObservabilityBackend::Prometheus) {
+            return PrometheusObserver::shared().encode();
+        }
+    }
+    #[cfg(not(feature = "observability-prometheus"))]
+    let _ = config;
+    PROMETHEUS_DISABLED_HINT.to_string()
+}
+
 pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
     Box::new(TeeObserver {
         primary: create_primary_observer(config),

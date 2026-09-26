@@ -488,121 +488,33 @@ pub async fn handle_api_channel_bind(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-
-    // Serialize the whole read-mutate-swap section: acquired before the
-    // read-for-modify below and held through the swap at the end of this
-    // handler, so a concurrent config writer can't land between this
-    // handler's read and its `save()`/swap.
-    let _cfg_guard = Arc::clone(&state.config_write_lock).lock_owned().await;
-    let channel_type = body.channel_type.trim();
-    let alias = body.alias.trim();
-
-    // Closed-set gate: only telegram/wechat/line have an operator-bind surface.
-    if zeroclaw_channels::orchestrator::channel_identity_normalizer(channel_type).is_none() {
-        return error_response(ConfigApiError::new(
-            ConfigApiCode::ValidationFailed,
-            format!(
-                "channel type `{channel_type}` does not support identity binding \
-                 (supported: telegram, wechat, line)"
-            ),
-        ));
-    }
-
-    let mut working = state.config.read().clone();
-
-    // The daemon gives the gateway, the RPC path and the channels separate
-    // `Config` copies of the same file, so `_cfg_guard` alone is not enough:
-    // this handle's `peer_groups` can be older than what another writer has
-    // already saved. Without the refresh, an `ignore` persisted through RPC is
-    // both invisible to the bind check below and overwritten by the save.
-    match zeroclaw_config::schema::persisted_peer_groups(&working.config_path).await {
-        Ok(Some(persisted)) => working.peer_groups = persisted,
-        Ok(None) => {}
-        Err(e) => {
-            return error_response(ConfigApiError::new(
-                ConfigApiCode::ReloadFailed,
-                format!("could not read the persisted peer policy: {e}"),
-            ));
-        }
-    }
-
-    // Reject a phantom alias loudly (404) rather than minting a peer group the
-    // runtime never reads.
-    if !zeroclaw_channels::orchestrator::channel_alias_configured(&working, channel_type, alias) {
-        return error_response(ConfigApiError::new(
-            ConfigApiCode::PathNotFound,
-            format!("channel `{channel_type}.{alias}` is not configured"),
-        ));
-    }
-
-    let target = match zeroclaw_channels::orchestrator::bind_channel_identity_into(
-        &mut working,
-        channel_type,
-        alias,
+    match zeroclaw_channels::control::bind(
+        &state.config,
+        &state.config_write_lock,
+        &body.channel_type,
+        &body.alias,
         &body.identity,
-    ) {
-        Ok(target) => target,
-        Err(e) => {
-            return error_response(ConfigApiError::new(
-                ConfigApiCode::ValidationFailed,
-                e.to_string(),
-            ));
+    )
+    .await
+    {
+        Ok(result) => {
+            if result["saved"] == serde_json::Value::Bool(true) {
+                state
+                    .pending_reload
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            Json(result).into_response()
         }
-    };
-
-    let channel = format!("{channel_type}.{alias}");
-
-    // The writer picks its target by the group's `channel` field, so the
-    // destination may be any key, not the conventional `<type>_<alias>`.
-    // Reporting the conventional name would name a group that need not exist.
-    let Some(group) = target else {
-        // Name the group that actually carries the grant, including a bare
-        // type-wide one. Falling back to the conventional `<type>_<alias>` key
-        // named a block that need not exist and sent operators to edit it.
-        let source = zeroclaw_channels::orchestrator::channel_authorizing_group_key(
-            &working,
-            channel_type,
-            alias,
-            &body.identity,
-        )
-        .or_else(|| {
-            zeroclaw_channels::orchestrator::channel_peer_group_key(&working, channel_type, alias)
-        });
-        return Json(serde_json::json!({
-            "saved": false,
-            "already_bound": true,
-            "group": source,
-            "channel": channel,
-        }))
-        .into_response();
-    };
-
-    // Incremental: only `peer_groups` is applied onto the current on-disk
-    // document, so the rest of this snapshot, which is still whatever this
-    // handle last saw, cannot drop another writer's keys. A full `save` here
-    // wrote the whole stale snapshot back. A direct peer-group mutation is not
-    // dirty-tracked, so the explicit `mark_dirty` is what makes `save_dirty`
-    // write it at all, and it materializes a brand-new table the same way.
-    // Then swap the shared in-memory config so the channel authorizes live.
-    working.mark_dirty("peer_groups");
-    if let Err(e) = working.save_dirty().await {
-        return error_response(ConfigApiError::new(
-            ConfigApiCode::ReloadFailed,
-            format!("save failed: {e}"),
-        ));
+        Err(failure) => {
+            use zeroclaw_channels::control::BindFailureKind;
+            let code = match failure.kind {
+                BindFailureKind::ValidationFailed => ConfigApiCode::ValidationFailed,
+                BindFailureKind::PathNotFound => ConfigApiCode::PathNotFound,
+                BindFailureKind::ReloadFailed => ConfigApiCode::ReloadFailed,
+            };
+            error_response(ConfigApiError::new(code, failure.message))
+        }
     }
-    *state.config.write() = working;
-    state
-        .pending_reload
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-
-    Json(serde_json::json!({
-        "saved": true,
-        "already_bound": false,
-        "group": group,
-        "channel": channel,
-    }))
-    .into_response()
 }
 
 /// Fields the gateway owns end-to-end (mints, rotates, persists itself).

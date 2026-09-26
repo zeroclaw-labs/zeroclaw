@@ -36,6 +36,8 @@ pub struct BrowseResult {
 pub enum BrowseError {
     #[error(transparent)]
     Escape(#[from] RootEscapeError),
+    #[error("'{0}' is not an agent alias")]
+    InvalidAgent(String),
     #[error("path '{0}' does not exist")]
     NotFound(String),
     #[error("path '{0}' is not a directory")]
@@ -131,16 +133,14 @@ pub fn make_directory(config: &Config, raw: &str) -> Result<(), BrowseError> {
 /// to remove protected top-level entries (skills/, skill-bundles/,
 /// knowledge/) or the shared root itself. Rejects path traversal.
 pub fn remove_directory(config: &Config, raw: &str) -> Result<(), BrowseError> {
-    let trimmed = raw.trim_matches('/');
-    if trimmed.is_empty() {
+    let shared = config.shared_workspace_dir();
+    let (resolved, relative) = resolve_relative(&shared, raw)?;
+    if relative.is_empty() {
         return Err(BrowseError::Protected("shared".to_string()));
     }
-    let top = trimmed.split('/').next().unwrap_or("");
-    if PROTECTED_SHARED_TOP_LEVEL.contains(&top) && !trimmed.contains('/') {
-        return Err(BrowseError::Protected(format!("shared/{top}")));
+    if PROTECTED_SHARED_TOP_LEVEL.contains(&relative.as_str()) {
+        return Err(BrowseError::Protected(format!("shared/{relative}")));
     }
-    let shared = config.shared_workspace_dir();
-    let resolved: PathBuf = resolve_under(&shared, raw)?;
     let metadata = match std::fs::metadata(&resolved) {
         Ok(m) => m,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -174,8 +174,38 @@ const AGENT_WORKSPACE_PROTECTED_FILES: &[&str] = &[
 /// session history.
 const AGENT_WORKSPACE_PROTECTED_DIRS: &[&str] = &["sessions"];
 
-fn agent_root(config: &Config, agent_alias: &str) -> PathBuf {
-    config.agent_workspace_dir(agent_alias)
+/// Resolve `raw` under `root` and return the resolved path together with its
+/// normalized path relative to `root`: `/`-separated, and empty for the root
+/// itself.
+///
+/// Every check on what an operation may touch runs on that relative form,
+/// never on the raw input. `resolve_under` folds `..` lexically, so a raw
+/// path such as `x/..` or `x/../SOUL.md` passes a check on its own text
+/// while resolving to the root or a protected entry.
+fn resolve_relative(root: &std::path::Path, raw: &str) -> Result<(PathBuf, String), BrowseError> {
+    let resolved = resolve_under(root, raw)?;
+    let normalized_root = resolve_under(root, "")?;
+    let relative = resolved
+        .strip_prefix(&normalized_root)
+        .unwrap_or(resolved.as_path())
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
+    Ok((resolved, relative))
+}
+
+/// The workspace root for `agent_alias`. The alias becomes a path component
+/// under `<install>/agents/`, so it must be exactly one plain component:
+/// `..`, a separator, or an absolute path would otherwise select a directory
+/// outside the agents tree, which `PathBuf::join` would happily produce.
+fn agent_root(config: &Config, agent_alias: &str) -> Result<PathBuf, BrowseError> {
+    use std::path::Component;
+    let mut components = std::path::Path::new(agent_alias).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(config.agent_workspace_dir(agent_alias)),
+        _ => Err(BrowseError::InvalidAgent(agent_alias.to_string())),
+    }
 }
 
 fn protected_file(rel: &str) -> bool {
@@ -194,7 +224,7 @@ pub fn list_agent_workspace(
     agent_alias: &str,
     raw: &str,
 ) -> Result<BrowseResult, BrowseError> {
-    let mut result = list_under_root(&agent_root(config, agent_alias), raw)?;
+    let mut result = list_under_root(&agent_root(config, agent_alias)?, raw)?;
     if raw.trim_matches('/').is_empty() {
         for entry in &mut result.entries {
             entry.protected = match entry.kind {
@@ -216,15 +246,14 @@ pub fn make_agent_workspace_directory(
     agent_alias: &str,
     raw: &str,
 ) -> Result<(), BrowseError> {
-    let trimmed = raw.trim_matches('/');
-    if trimmed.is_empty() {
+    let root = agent_root(config, agent_alias)?;
+    let (resolved, relative) = resolve_relative(&root, raw)?;
+    if relative.is_empty() {
         return Err(BrowseError::NotFound(raw.to_string()));
     }
-    if protected_file(trimmed) {
-        return Err(BrowseError::ProtectedFile(trimmed.to_string()));
+    if protected_file(&relative) {
+        return Err(BrowseError::ProtectedFile(relative));
     }
-    let root = agent_root(config, agent_alias);
-    let resolved: PathBuf = resolve_under(&root, raw)?;
     if let Ok(meta) = std::fs::metadata(&resolved) {
         if meta.is_dir() {
             return Ok(());
@@ -246,6 +275,58 @@ pub struct FileReadResult {
     pub is_text: bool,
 }
 
+/// A directory listing as it goes over the wire. The dashboard's HTTP
+/// adapter and the `workspace/list` RPC method both serialize this, so the
+/// two bodies cannot drift apart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BrowseListing {
+    pub path: String,
+    pub entries: Vec<BrowseEntry>,
+}
+
+impl From<BrowseResult> for BrowseListing {
+    fn from(result: BrowseResult) -> Self {
+        Self {
+            path: result.path,
+            entries: result.entries,
+        }
+    }
+}
+
+/// A single-file read as it goes over the wire, shared by the HTTP adapter
+/// and the `fs/read` RPC method.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FileReadBody {
+    pub path: String,
+    pub size: u64,
+    pub is_text: bool,
+    /// UTF-8 text when `is_text` is true, base64 when false, so a client can
+    /// render inline without a second round-trip for a binary preview.
+    pub content: String,
+    pub encoding: &'static str,
+}
+
+impl From<FileReadResult> for FileReadBody {
+    fn from(result: FileReadResult) -> Self {
+        use base64::Engine;
+        let (content, encoding) = if result.is_text {
+            (String::from_utf8(result.bytes).unwrap_or_default(), "utf8")
+        } else {
+            (
+                base64::engine::general_purpose::STANDARD.encode(&result.bytes),
+                "base64",
+            )
+        };
+        Self {
+            path: result.path,
+            size: result.size,
+            is_text: result.is_text,
+            content,
+            encoding,
+        }
+    }
+}
+
 /// Read a file from the agent's workspace. Refuses paths that don't
 /// resolve to a regular file; enforces the size cap.
 pub fn read_agent_workspace_file(
@@ -253,7 +334,7 @@ pub fn read_agent_workspace_file(
     agent_alias: &str,
     raw: &str,
 ) -> Result<FileReadResult, BrowseError> {
-    let root = agent_root(config, agent_alias);
+    let root = agent_root(config, agent_alias)?;
     let resolved: PathBuf = resolve_under(&root, raw)?;
     let metadata = match std::fs::metadata(&resolved) {
         Ok(m) => m,
@@ -289,22 +370,21 @@ pub fn delete_agent_workspace_path(
     agent_alias: &str,
     raw: &str,
 ) -> Result<(), BrowseError> {
-    let trimmed = raw.trim_matches('/');
-    if trimmed.is_empty() {
+    let root = agent_root(config, agent_alias)?;
+    let (resolved, relative) = resolve_relative(&root, raw)?;
+    if relative.is_empty() {
         return Err(BrowseError::Protected(format!(
             "agents/{agent_alias}/workspace"
         )));
     }
-    if protected_file(trimmed) {
-        return Err(BrowseError::ProtectedFile(trimmed.to_string()));
+    if protected_file(&relative) {
+        return Err(BrowseError::ProtectedFile(relative));
     }
-    if protected_dir(trimmed) {
+    if protected_dir(&relative) {
         return Err(BrowseError::Protected(format!(
-            "agents/{agent_alias}/workspace/{trimmed}"
+            "agents/{agent_alias}/workspace/{relative}"
         )));
     }
-    let root = agent_root(config, agent_alias);
-    let resolved: PathBuf = resolve_under(&root, raw)?;
     let metadata = match std::fs::metadata(&resolved) {
         Ok(m) => m,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -329,8 +409,10 @@ pub fn move_agent_workspace_path(
     from: &str,
     to: &str,
 ) -> Result<(), BrowseError> {
-    let from_trimmed = from.trim_matches('/');
-    let to_trimmed = to.trim_matches('/');
+    let root = agent_root(config, agent_alias)?;
+    let (src, from_trimmed) = resolve_relative(&root, from)?;
+    let (dst, to_trimmed) = resolve_relative(&root, to)?;
+    let (from_trimmed, to_trimmed) = (from_trimmed.as_str(), to_trimmed.as_str());
     if from_trimmed.is_empty() || to_trimmed.is_empty() {
         return Err(BrowseError::NotFound(from.to_string()));
     }
@@ -354,9 +436,6 @@ pub fn move_agent_workspace_path(
             }
         )));
     }
-    let root = agent_root(config, agent_alias);
-    let src: PathBuf = resolve_under(&root, from)?;
-    let dst: PathBuf = resolve_under(&root, to)?;
     if !src.exists() {
         return Err(BrowseError::NotFound(from.to_string()));
     }
@@ -388,6 +467,144 @@ mod tests {
             ..Config::default()
         };
         (dir, cfg)
+    }
+
+    /// An alias is spliced into `<install>/agents/<alias>/workspace`, so any
+    /// alias that is not one plain component would select a directory outside
+    /// the agents tree. A `workspace` directory is planted where each escape
+    /// would land; every operation must refuse the alias before touching it.
+    #[test]
+    fn agent_workspace_operations_refuse_an_alias_that_escapes_the_agents_tree() {
+        let (dir, cfg) = fixture();
+        let outside = dir.path().join("elsewhere");
+        std::fs::create_dir_all(outside.join("workspace")).unwrap();
+        std::fs::write(outside.join("workspace/secret.txt"), b"s3cret").unwrap();
+        std::fs::create_dir_all(dir.path().join("workspace")).unwrap();
+        std::fs::write(dir.path().join("workspace/secret.txt"), b"s3cret").unwrap();
+
+        let absolute = outside.to_string_lossy().to_string();
+        for alias in ["..", "../elsewhere", "a/b", ".", "", absolute.as_str()] {
+            assert!(
+                matches!(
+                    list_agent_workspace(&cfg, alias, ""),
+                    Err(BrowseError::InvalidAgent(_))
+                ),
+                "list must refuse alias {alias:?}"
+            );
+            assert!(
+                matches!(
+                    read_agent_workspace_file(&cfg, alias, "secret.txt"),
+                    Err(BrowseError::InvalidAgent(_))
+                ),
+                "read must refuse alias {alias:?}"
+            );
+            assert!(
+                matches!(
+                    delete_agent_workspace_path(&cfg, alias, "secret.txt"),
+                    Err(BrowseError::InvalidAgent(_))
+                ),
+                "delete must refuse alias {alias:?}"
+            );
+            assert!(
+                matches!(
+                    move_agent_workspace_path(&cfg, alias, "secret.txt", "moved.txt"),
+                    Err(BrowseError::InvalidAgent(_))
+                ),
+                "move must refuse alias {alias:?}"
+            );
+            assert!(
+                matches!(
+                    make_agent_workspace_directory(&cfg, alias, "made"),
+                    Err(BrowseError::InvalidAgent(_))
+                ),
+                "mkdir must refuse alias {alias:?}"
+            );
+        }
+        assert!(outside.join("workspace/secret.txt").exists());
+        assert!(dir.path().join("workspace/secret.txt").exists());
+        assert!(!outside.join("workspace/made").exists());
+
+        // A plain alias still resolves under the agents tree.
+        std::fs::create_dir_all(dir.path().join("agents/alpha/workspace")).unwrap();
+        assert!(list_agent_workspace(&cfg, "alpha", "").is_ok());
+    }
+
+    /// Guards run on the path as resolved, not as written: `..` folded into a
+    /// path must not reach the root or a protected entry that the same path
+    /// written plainly is refused.
+    #[test]
+    fn mutations_check_the_resolved_path_not_the_raw_one() {
+        let (dir, cfg) = fixture();
+        std::fs::create_dir_all(dir.path().join("shared/knowledge")).unwrap();
+        let workspace = dir.path().join("agents/alpha/workspace");
+        std::fs::create_dir_all(workspace.join("notes")).unwrap();
+        std::fs::create_dir_all(workspace.join("sessions")).unwrap();
+        std::fs::write(workspace.join("SOUL.md"), b"soul").unwrap();
+
+        // Shared area: the root and protected top-level directories.
+        for raw in [
+            "skills/..",
+            "x/..",
+            "x/../skills",
+            "skills/alpha/../..",
+            "./knowledge",
+        ] {
+            assert!(
+                matches!(remove_directory(&cfg, raw), Err(BrowseError::Protected(_))),
+                "rmdir {raw:?}"
+            );
+        }
+        assert!(dir.path().join("shared/skills/alpha").exists());
+        assert!(dir.path().join("shared/knowledge").exists());
+
+        // Agent workspace: the root, a protected file and a protected directory.
+        for raw in ["notes/..", "x/..", "./"] {
+            assert!(
+                matches!(
+                    delete_agent_workspace_path(&cfg, "alpha", raw),
+                    Err(BrowseError::Protected(_))
+                ),
+                "delete {raw:?}"
+            );
+        }
+        assert!(matches!(
+            delete_agent_workspace_path(&cfg, "alpha", "notes/../SOUL.md"),
+            Err(BrowseError::ProtectedFile(_))
+        ));
+        assert!(matches!(
+            delete_agent_workspace_path(&cfg, "alpha", "notes/../sessions"),
+            Err(BrowseError::Protected(_))
+        ));
+        assert!(workspace.join("SOUL.md").exists());
+        assert!(workspace.join("sessions").exists());
+
+        // Move: from or to the root, or onto or off a protected name.
+        assert!(move_agent_workspace_path(&cfg, "alpha", "notes/..", "moved").is_err());
+        assert!(matches!(
+            move_agent_workspace_path(&cfg, "alpha", "notes/../SOUL.md", "soul-copy.md"),
+            Err(BrowseError::ProtectedFile(_))
+        ));
+        assert!(matches!(
+            move_agent_workspace_path(&cfg, "alpha", "notes", "x/../SOUL.md"),
+            Err(BrowseError::ProtectedFile(_))
+        ));
+        assert!(matches!(
+            move_agent_workspace_path(&cfg, "alpha", "notes", "x/../sessions"),
+            Err(BrowseError::Protected(_))
+        ));
+        assert!(workspace.join("notes").exists());
+        assert!(workspace.join("SOUL.md").exists());
+
+        // mkdir cannot squat a protected file name through `..` either.
+        assert!(matches!(
+            make_agent_workspace_directory(&cfg, "alpha", "notes/../SOUL.md"),
+            Err(BrowseError::ProtectedFile(_))
+        ));
+
+        // Ordinary nested paths still work.
+        std::fs::create_dir_all(dir.path().join("shared/scratch/inner")).unwrap();
+        remove_directory(&cfg, "scratch/inner/..").unwrap();
+        assert!(!dir.path().join("shared/scratch").exists());
     }
 
     #[test]

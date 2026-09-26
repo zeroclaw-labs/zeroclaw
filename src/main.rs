@@ -7670,6 +7670,12 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     })
                 }));
 
+                // The one canvas store the gateway and channels draw on also
+                // reaches the RPC context, so RPC-built agents and `canvas/*`
+                // see the same canvases.
+                registry.set_canvas_store(canvas_store.clone());
+                // Channel listing, relink and identity binding for `channels/*`.
+                registry.set_channel_control(Arc::new(zeroclaw_channels::control::ChannelsControl));
                 // Pass the shared SOP engine through the registry so
                 // RpcContext (RPC/TUI agent sessions) can share it.
                 registry.set_sop_engine(

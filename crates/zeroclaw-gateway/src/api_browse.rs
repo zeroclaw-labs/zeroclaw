@@ -6,11 +6,10 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use base64::Engine;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use zeroclaw_runtime::browse::{
-    BrowseEntry, BrowseError, delete_agent_workspace_path, list_agent_workspace, list_directory,
-    make_agent_workspace_directory, make_directory, move_agent_workspace_path,
+    BrowseError, BrowseListing, FileReadBody, delete_agent_workspace_path, list_agent_workspace,
+    list_directory, make_agent_workspace_directory, make_directory, move_agent_workspace_path,
     read_agent_workspace_file, remove_directory,
 };
 
@@ -22,12 +21,6 @@ pub struct BrowseQuery {
     /// Path relative to `<install>/shared/`. Empty / unset = shared/ root.
     #[serde(default)]
     pub path: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct BrowseResponse {
-    pub path: String,
-    pub entries: Vec<BrowseEntry>,
 }
 
 /// `GET /api/browse?path=<relative-to-shared>`
@@ -42,11 +35,7 @@ pub async fn handle_browse(
     let config = state.config.read().clone();
     let raw = q.path.unwrap_or_default();
     match list_directory(&config, &raw) {
-        Ok(result) => Json(BrowseResponse {
-            path: result.path,
-            entries: result.entries,
-        })
-        .into_response(),
+        Ok(result) => Json(BrowseListing::from(result)).into_response(),
         Err(err) => browse_error_response(err),
     }
 }
@@ -54,6 +43,7 @@ pub async fn handle_browse(
 fn browse_error_response(err: BrowseError) -> Response {
     let status = match &err {
         BrowseError::Escape(_) => StatusCode::BAD_REQUEST,
+        BrowseError::InvalidAgent(_) => StatusCode::BAD_REQUEST,
         BrowseError::NotFound(_) => StatusCode::NOT_FOUND,
         BrowseError::NotADirectory(_) => StatusCode::BAD_REQUEST,
         BrowseError::Protected(_) => StatusCode::FORBIDDEN,
@@ -122,25 +112,9 @@ pub async fn handle_agent_workspace_list(
     let config = state.config.read().clone();
     let raw = q.path.unwrap_or_default();
     match list_agent_workspace(&config, &alias, &raw) {
-        Ok(result) => Json(BrowseResponse {
-            path: result.path,
-            entries: result.entries,
-        })
-        .into_response(),
+        Ok(result) => Json(BrowseListing::from(result)).into_response(),
         Err(err) => browse_error_response(err),
     }
-}
-
-#[derive(Debug, Serialize)]
-pub struct FileReadResponse {
-    pub path: String,
-    pub size: u64,
-    pub is_text: bool,
-    /// UTF-8 text when `is_text` is true, base64 when false. Lets the
-    /// dashboard render inline without a second round-trip for binary
-    /// previews.
-    pub content: String,
-    pub encoding: &'static str,
 }
 
 /// `GET /api/agents/{alias}/workspace/read?path=<rel>` — read a single
@@ -157,24 +131,7 @@ pub async fn handle_agent_workspace_read(
     let config = state.config.read().clone();
     let raw = q.path.unwrap_or_default();
     match read_agent_workspace_file(&config, &alias, &raw) {
-        Ok(result) => {
-            let (content, encoding) = if result.is_text {
-                (String::from_utf8(result.bytes).unwrap_or_default(), "utf8")
-            } else {
-                (
-                    base64::engine::general_purpose::STANDARD.encode(&result.bytes),
-                    "base64",
-                )
-            };
-            Json(FileReadResponse {
-                path: result.path,
-                size: result.size,
-                is_text: result.is_text,
-                content,
-                encoding,
-            })
-            .into_response()
-        }
+        Ok(result) => Json(FileReadBody::from(result)).into_response(),
         Err(err) => browse_error_response(err),
     }
 }

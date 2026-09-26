@@ -552,6 +552,149 @@ pub struct SopRenameRequest {
     pub to: String,
 }
 
+/// Request payload for `tools/list`: the tools agent `agent` would see, or the
+/// default agent's (the smallest enabled alias) without one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ToolsListRequest {
+    #[serde(default)]
+    pub agent: Option<String>,
+}
+
+/// Request payload for `system/upgrade`: upgrade via `zeroclaw update` to
+/// `version` (latest when absent), then, with `auto_restart`, exit so the
+/// detected supervisor relaunches the new binary.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SystemUpgradeRequest {
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub auto_restart: bool,
+}
+
+/// Request payload for `system/upgrade-status`. A `handoff_id` that names
+/// another upgrade is refused.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SystemUpgradeStatusRequest {
+    #[serde(default)]
+    pub handoff_id: Option<String>,
+}
+
+/// Request payload for `system/restart`. `component` is what to restart;
+/// `daemon` reloads the daemon in place, as `/admin/reload` does.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemRestartRequest {
+    pub component: String,
+}
+
+/// Request payload for `channels/relink`. `channel` is the composite
+/// `<type>.<alias>` name `channels/list` reports.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelsRelinkRequest {
+    pub channel: String,
+}
+
+/// Request payload for `channels/bind`: authorize an operator-named identity
+/// on one channel alias, as `zeroclaw channel bind-<type>` does.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelsBindRequest {
+    pub channel_type: String,
+    pub alias: String,
+    pub identity: String,
+}
+
+/// Request payload for `pairing/revoke`: revoke one paired device's bearer
+/// token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairingRevokeRequest {
+    pub device_id: String,
+}
+
+/// Request payload for `pairing/new-code`: mint a one-time pairing code,
+/// first revoking every paired token (`rotate: "all"`) or one device's
+/// (`rotate: <device id>`) when given.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PairingNewCodeRequest {
+    #[serde(default)]
+    pub rotate: Option<String>,
+}
+
+/// Request payload for `canvas/get`, `canvas/history` and `canvas/clear`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanvasIdRequest {
+    pub canvas_id: String,
+}
+
+/// Request payload for `canvas/render`: push content to a canvas.
+/// `content_type` defaults to `html`; it must be one the canvas tool accepts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanvasRenderRequest {
+    pub canvas_id: String,
+    #[serde(default)]
+    pub content_type: Option<String>,
+    pub content: String,
+}
+
+/// Request payload for `a2a/identity`. With `agent`, the per-alias A2A agent
+/// card; without it, the discovery catalog card listing every published
+/// agent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct A2aIdentityRequest {
+    #[serde(default)]
+    pub agent: Option<String>,
+}
+
+/// Request payload for `workspace/list`: one directory level.
+///
+/// With `agent`, `path` is relative to that agent's workspace; without it,
+/// `path` is relative to the shared area under `<install>/shared/` that every
+/// agent reads. An empty or absent `path` lists the root.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceListRequest {
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// Request payload for `fs/mkdir`. `agent` selects the agent workspace as in
+/// [`WorkspaceListRequest`]; absent targets the shared area.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsMkdirRequest {
+    #[serde(default)]
+    pub agent: Option<String>,
+    pub path: String,
+}
+
+/// Request payload for `fs/rmdir`: recursively remove a directory in the
+/// shared area. Agent-workspace entries are removed with `fs/delete`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsRmdirRequest {
+    pub path: String,
+}
+
+/// Request payload for `fs/read`: read one file from an agent workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsReadRequest {
+    pub agent: String,
+    pub path: String,
+}
+
+/// Request payload for `fs/delete`: remove a file or directory from an agent
+/// workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsDeleteRequest {
+    pub agent: String,
+    pub path: String,
+}
+
+/// Request payload for `fs/move`: move or rename within an agent workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsMoveRequest {
+    pub agent: String,
+    pub from: String,
+    pub to: String,
+}
+
 /// Request payload for `fs.list_dir`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FsListDirRequest {

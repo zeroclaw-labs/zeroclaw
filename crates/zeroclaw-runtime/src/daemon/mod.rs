@@ -677,6 +677,8 @@ pub async fn run(
 
     // Extract shared SOP engine from registry for RpcContext.
     let (sop_engine, sop_audit, sop_driver_handles) = registry.take_sop_engine();
+    let canvas_store = registry.take_canvas_store();
+    let channel_control = registry.take_channel_control();
 
     let rpc_ctx = if need_rpc_ctx {
         use crate::rpc::context::RpcContext;
@@ -840,6 +842,8 @@ pub async fn run(
             sop_audit,
             sop_driver_handles,
             hooks,
+            canvas_store,
+            channel_control,
             cert_audit,
             auth: rpc_auth,
         }))

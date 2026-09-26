@@ -9,25 +9,17 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use zeroclaw_config::schema::{ChannelAliasInfo, Config};
+#[cfg(test)]
+use zeroclaw_channels::control::{
+    CHANNEL_LISTENER_HEALTH_MAX_AGE_SECS, ChannelReadinessState, channel_readiness,
+    channel_readiness_summary, compiled_readiness_key_for_alias,
+};
 use zeroclaw_memory::MemoryEntry;
 
 const MEMORY_API_CONTENT_MAX_CHARS: usize = 4096;
 
-fn integration_entry_json(
-    entry: &zeroclaw_runtime::integrations::IntegrationEntry,
-) -> serde_json::Value {
-    serde_json::json!({
-        "name": &entry.name,
-        "description": &entry.description,
-        "category": entry.category,
-        "category_label": entry.category.label(),
-        "status": entry.status,
-        // Canonical config map key (provider family key / ChannelsConfig map
-        // key) for deep links; null when the entry has no config section.
-        "key": &entry.key,
-    })
-}
+#[cfg(test)]
+use zeroclaw_runtime::rpc::catalog::integration_entry_json;
 
 // ── Bearer token auth extractor ─────────────────────────────────
 
@@ -413,25 +405,7 @@ pub async fn handle_api_tools(
         .and_then(|alias| state.tools_registry_by_agent.get(alias).cloned())
         .unwrap_or_else(|| std::sync::Arc::clone(&state.tools_registry));
 
-    let tools: Vec<serde_json::Value> = registry
-        .iter()
-        .map(|spec| {
-            let mut tool = serde_json::json!({
-                "name": spec.name,
-                "description": spec.description,
-                "parameters": spec.parameters,
-            });
-            if let Some(output) = &spec.output {
-                tool["output"] = output.clone();
-            }
-            if !spec.param_domains.is_empty() {
-                tool["param_domains"] = serde_json::json!(spec.param_domains);
-            }
-            tool
-        })
-        .collect();
-
-    Json(serde_json::json!({"tools": tools})).into_response()
+    Json(zeroclaw_runtime::rpc::catalog::tools_body(&registry)).into_response()
 }
 
 /// GET /api/cron — list cron jobs
@@ -914,11 +888,7 @@ pub async fn handle_api_integrations(
     }
 
     let config = state.config.read().clone();
-    let entries = zeroclaw_runtime::integrations::registry::all_integrations(&config);
-
-    let integrations: Vec<serde_json::Value> = entries.iter().map(integration_entry_json).collect();
-
-    Json(serde_json::json!({"integrations": integrations})).into_response()
+    Json(zeroclaw_runtime::rpc::catalog::integrations_body(&config)).into_response()
 }
 
 /// GET /api/integrations/settings — return per-integration settings (enabled + category)
@@ -1247,29 +1217,7 @@ pub async fn handle_api_cli_tools(
         return e.into_response();
     }
 
-    // `discover_cli_tools` spawns child processes and blocks; keep it off the
-    // async executor so a slow PATH scan can't stall other gateway requests.
-    let tools = match tokio::task::spawn_blocking(|| {
-        zeroclaw_tools::cli_discovery::discover_cli_tools(&[], &[])
-    })
-    .await
-    {
-        Ok(tools) => tools,
-        Err(e) => {
-            // The blocking task panicked; degrade to an empty list rather
-            // than failing the request, but record why it was empty.
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                "cli-tools discovery task failed; returning empty list"
-            );
-            Vec::new()
-        }
-    };
-
-    Json(serde_json::json!({"cli_tools": tools})).into_response()
+    Json(zeroclaw_runtime::rpc::catalog::cli_tools_body().await).into_response()
 }
 
 /// GET /api/channels — list configured channels with status
@@ -1282,39 +1230,11 @@ pub async fn handle_api_channels(
     }
 
     let config = state.config.read().clone();
-    let health = zeroclaw_runtime::health::snapshot();
-    // One entry per `[channels.<type>.<alias>]` block. Owning
-    // agent comes from the agents.<alias>.channels reverse lookup.
-    let channels: Vec<serde_json::Value> = config
-        .channels_by_alias()
-        .into_iter()
-        .map(|info| {
-            let composite = format!("{}.{}", info.channel_type, info.alias);
-            let compiled_key = compiled_readiness_key_for_alias(&config, &info);
-            let compiled = zeroclaw_channels::listing::is_channel_type_compiled(compiled_key);
-            let readiness = channel_readiness(&config, &info, &health, &state);
-            let (status, health_status) = if compiled {
-                channel_readiness_summary(&readiness)
-            } else {
-                ("not_compiled", "unavailable")
-            };
-            serde_json::json!({
-                "name": composite,
-                "type": info.channel_type,
-                "alias": info.alias,
-                "owning_agent": info.owning_agent,
-                "enabled": info.enabled,
-                "compiled": compiled,
-                "status": status,
-                "message_count": 0,
-                "last_message_at": null,
-                "health": health_status,
-                "readiness": readiness,
-            })
-        })
-        .collect();
-
-    Json(serde_json::json!({ "channels": channels })).into_response()
+    Json(zeroclaw_channels::control::channels_body(
+        &config,
+        &state.pairing,
+    ))
+    .into_response()
 }
 
 /// POST /api/channels/{channel}/relink — replace a QR channel's pairing.
@@ -1349,74 +1269,11 @@ pub async fn handle_api_channel_relink(
     }
 
     let config = state.config.read().clone();
-    let Some(info) = config
-        .channels_by_alias()
-        .into_iter()
-        .find(|info| format!("{}.{}", info.channel_type, info.alias) == channel)
-    else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": format!("unknown channel {channel} — use the composite name from GET /api/channels"),
-            })),
-        )
-            .into_response();
-    };
-
-    // Resolve the string key to the typed QR-pairing channel once; probe
-    // and relink dispatch on the same enum. `None` means the channel type
-    // has no relink hook or its feature is not compiled — an explicit
-    // no-op conflict where nothing is touched.
-    let compiled_key = compiled_readiness_key_for_alias(&config, &info);
-    let Some(qr_channel) = zeroclaw_channels::listing::qr_pairing_channel(compiled_key) else {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "channel": channel,
-                "outcome": "unsupported",
-                "error": format!(
-                    "channel type {} has no relink operation (it does not use QR-pairing sessions) \
-                     or the feature is not compiled into this binary; nothing was changed",
-                    info.channel_type
-                ),
-            })),
-        )
-            .into_response();
-    };
-
-    match zeroclaw_channels::login_relink::relink(qr_channel, &config, &info.alias) {
-        Ok(zeroclaw_channels::login_relink::RelinkOutcome::Cleared { removed }) => {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"channel": channel, "removed": removed})),
-                "channel persisted login cleared for relink"
-            );
-            Json(serde_json::json!({
-                "channel": channel,
-                "outcome": "cleared",
-                "removed": removed,
-                "restart_required": true,
-                "note": "restart the channel (POST /admin/reload) to begin the fresh QR pairing",
-            }))
-            .into_response()
-        }
-        Ok(zeroclaw_channels::login_relink::RelinkOutcome::NothingToClear) => {
-            Json(serde_json::json!({
-                "channel": channel,
-                "outcome": "nothing_to_clear",
-                "removed": [],
-                "restart_required": false,
-                "note": "no persisted login was stored; the next channel start already begins a fresh QR pairing",
-            }))
-            .into_response()
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "channel": channel,
-                "error": format!("failed to clear persisted login: {e}"),
-            })),
+    match zeroclaw_channels::control::relink(&config, &channel) {
+        Ok(body) => Json(body).into_response(),
+        Err(failure) => (
+            StatusCode::from_u16(failure.http_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            Json(failure.body),
         )
             .into_response(),
     }
@@ -1450,224 +1307,6 @@ pub async fn handle_api_tuis(
         .unwrap_or_default();
 
     Json(serde_json::json!({ "tuis": tuis })).into_response()
-}
-
-fn compiled_readiness_key_for_alias<'a>(config: &'a Config, info: &'a ChannelAliasInfo) -> &'a str {
-    if info.channel_type == "whatsapp"
-        && config
-            .channels
-            .whatsapp
-            .get(&info.alias)
-            .is_some_and(|whatsapp| whatsapp.backend_type() == "web")
-    {
-        "whatsapp-web"
-    } else {
-        info.channel_type.as_str()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum ChannelReadinessState {
-    Ready,
-    Missing,
-    Unknown,
-}
-
-const CHANNEL_LISTENER_HEALTH_MAX_AGE_SECS: i64 = 30;
-
-#[derive(Debug, Clone, Serialize)]
-struct ChannelReadiness {
-    enabled: ChannelReadinessState,
-    bound_to_agent: ChannelReadinessState,
-    authenticated: ChannelReadinessState,
-    listening: ChannelReadinessState,
-    requirements: Vec<String>,
-    notes: Vec<String>,
-}
-
-fn channel_readiness(
-    config: &zeroclaw_config::schema::Config,
-    info: &zeroclaw_config::schema::ChannelAliasInfo,
-    health: &zeroclaw_runtime::health::HealthSnapshot,
-    state: &AppState,
-) -> ChannelReadiness {
-    let mut readiness = ChannelReadiness {
-        enabled: if info.enabled {
-            ChannelReadinessState::Ready
-        } else {
-            ChannelReadinessState::Missing
-        },
-        bound_to_agent: if info.owning_agent.is_some() {
-            ChannelReadinessState::Ready
-        } else {
-            ChannelReadinessState::Missing
-        },
-        authenticated: ChannelReadinessState::Unknown,
-        listening: ChannelReadinessState::Unknown,
-        requirements: Vec::new(),
-        notes: Vec::new(),
-    };
-
-    if readiness.enabled == ChannelReadinessState::Missing {
-        readiness
-            .requirements
-            .push("Enable this channel alias.".to_string());
-    }
-    if readiness.bound_to_agent == ChannelReadinessState::Missing {
-        readiness
-            .requirements
-            .push("Bind this channel to an enabled agent.".to_string());
-    }
-
-    if readiness.enabled == ChannelReadinessState::Ready
-        && readiness.bound_to_agent == ChannelReadinessState::Ready
-    {
-        if info.channel_type == "webhook" {
-            apply_webhook_readiness(config, &info.alias, health, state, &mut readiness);
-        } else {
-            apply_persisted_login_readiness(config, info, &mut readiness);
-        }
-    }
-
-    readiness
-}
-
-/// Fill `readiness.authenticated` from the channel-owned persisted-login
-/// probe (`zeroclaw_channels::login_probe`). The probe resolves the same
-/// on-disk session signal each QR-pairing channel uses at startup to decide
-/// between resuming a session and minting a fresh QR code; nothing is
-/// cached and nothing is written. Channel types without a typed QR-pairing
-/// key (no probe, or feature not compiled) keep `authenticated: unknown`
-/// and the existing "not checked yet" note.
-fn apply_persisted_login_readiness(
-    config: &zeroclaw_config::schema::Config,
-    info: &zeroclaw_config::schema::ChannelAliasInfo,
-    readiness: &mut ChannelReadiness,
-) {
-    use zeroclaw_channels::login_probe::PersistedLogin;
-
-    // Resolve the string key to the typed QR-pairing channel once; all
-    // downstream dispatch is on the enum.
-    let compiled_key = compiled_readiness_key_for_alias(config, info);
-    let Some(channel) = zeroclaw_channels::listing::qr_pairing_channel(compiled_key) else {
-        readiness.notes.push(format!(
-            "Live readiness is not checked for `{}` channels yet.",
-            info.channel_type
-        ));
-        return;
-    };
-
-    match zeroclaw_channels::login_probe::persisted_login(channel, config, &info.alias) {
-        PersistedLogin::Present => {
-            readiness.authenticated = ChannelReadinessState::Ready;
-            readiness.notes.push(format!(
-                "Live listener readiness is not checked for `{}` channels yet.",
-                info.channel_type
-            ));
-        }
-        PersistedLogin::Absent => {
-            readiness.authenticated = ChannelReadinessState::Missing;
-            readiness.requirements.push(
-                "Pair this channel: no persisted login session was found on disk.".to_string(),
-            );
-        }
-    }
-}
-
-fn channel_readiness_summary(readiness: &ChannelReadiness) -> (&'static str, &'static str) {
-    if readiness.enabled == ChannelReadinessState::Missing
-        || readiness.bound_to_agent == ChannelReadinessState::Missing
-    {
-        return ("inactive", "degraded");
-    }
-
-    if readiness.authenticated == ChannelReadinessState::Missing
-        || readiness.listening == ChannelReadinessState::Missing
-    {
-        return ("error", "down");
-    }
-
-    if readiness.authenticated == ChannelReadinessState::Ready
-        && readiness.listening == ChannelReadinessState::Ready
-    {
-        ("active", "healthy")
-    } else {
-        // At least one probe is Unknown and none reported Missing: not
-        // enough signal to call the channel either healthy or down.
-        ("unknown", "degraded")
-    }
-}
-
-fn apply_webhook_readiness(
-    config: &zeroclaw_config::schema::Config,
-    alias: &str,
-    health: &zeroclaw_runtime::health::HealthSnapshot,
-    state: &AppState,
-    readiness: &mut ChannelReadiness,
-) {
-    let Some(webhook) = config.channels.webhook.get(alias) else {
-        readiness.authenticated = ChannelReadinessState::Missing;
-        readiness.listening = ChannelReadinessState::Missing;
-        readiness
-            .requirements
-            .push("Webhook config block is missing.".to_string());
-        return;
-    };
-
-    if state.pairing.require_pairing() && !state.pairing.is_paired() {
-        readiness.authenticated = ChannelReadinessState::Missing;
-        readiness
-            .requirements
-            .push("Pair the gateway before using the webhook endpoint.".to_string());
-    } else {
-        readiness.authenticated = ChannelReadinessState::Ready;
-    }
-
-    let component = format!("channel:webhook.{alias}");
-    let component_health = health.components.get(&component);
-    let component_status = component_health.map(|component| component.status.as_str());
-    let supervised_listener_ok = component_health.is_some_and(component_health_ok_and_fresh);
-    let listen_path = normalized_webhook_path(webhook.listen_path.as_deref());
-
-    if supervised_listener_ok {
-        readiness.listening = ChannelReadinessState::Ready;
-    } else if component_status == Some("error") {
-        readiness.listening = ChannelReadinessState::Missing;
-        readiness.requirements.push(format!(
-            "Resolve the listener error for `webhook.{alias}` before using this channel."
-        ));
-    } else {
-        readiness.listening = ChannelReadinessState::Missing;
-        readiness.requirements.push(format!(
-            "Start a channel listener for `webhook.{alias}` on port {}{}.",
-            webhook.port, listen_path
-        ));
-    }
-}
-
-fn component_health_ok_and_fresh(component: &zeroclaw_runtime::health::ComponentHealth) -> bool {
-    if component.status != "ok" {
-        return false;
-    }
-
-    let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(&component.updated_at) else {
-        return false;
-    };
-    let age = chrono::Utc::now().signed_duration_since(updated_at.with_timezone(&chrono::Utc));
-    age >= chrono::Duration::zero()
-        && age <= chrono::Duration::seconds(CHANNEL_LISTENER_HEALTH_MAX_AGE_SECS)
-}
-
-fn normalized_webhook_path(path: Option<&str>) -> String {
-    let trimmed = path.unwrap_or("/webhook").trim();
-    if trimmed.is_empty() {
-        "/webhook".to_string()
-    } else if trimmed.starts_with('/') {
-        trimmed.to_string()
-    } else {
-        format!("/{trimmed}")
-    }
 }
 
 /// GET /api/health — component health snapshot
@@ -3261,7 +2900,7 @@ pub(crate) mod tests {
         let state = test_state(config.clone());
         let health = zeroclaw_runtime::health::snapshot();
         let info = first_channel_info(&config);
-        let readiness = channel_readiness(&config, &info, &health, &state);
+        let readiness = channel_readiness(&config, &info, &health, &state.pairing);
 
         assert_eq!(readiness.authenticated, ChannelReadinessState::Ready);
         assert_eq!(readiness.listening, ChannelReadinessState::Missing);
@@ -3280,7 +2919,7 @@ pub(crate) mod tests {
         let state = test_state(config.clone());
         let health = zeroclaw_runtime::health::snapshot();
         let info = first_channel_info(&config);
-        let readiness = channel_readiness(&config, &info, &health, &state);
+        let readiness = channel_readiness(&config, &info, &health, &state.pairing);
 
         assert_eq!(readiness.authenticated, ChannelReadinessState::Ready);
         assert_eq!(readiness.listening, ChannelReadinessState::Missing);
@@ -3300,7 +2939,7 @@ pub(crate) mod tests {
         let state = test_state(config.clone());
         let health = zeroclaw_runtime::health::snapshot();
         let info = first_channel_info(&config);
-        let readiness = channel_readiness(&config, &info, &health, &state);
+        let readiness = channel_readiness(&config, &info, &health, &state.pairing);
 
         assert_eq!(readiness.listening, ChannelReadinessState::Ready);
         assert_eq!(channel_readiness_summary(&readiness), ("active", "healthy"));
@@ -3330,7 +2969,7 @@ pub(crate) mod tests {
         };
         let state = test_state(config.clone());
         let info = first_channel_info(&config);
-        let readiness = channel_readiness(&config, &info, &health, &state);
+        let readiness = channel_readiness(&config, &info, &health, &state.pairing);
 
         assert_eq!(readiness.listening, ChannelReadinessState::Missing);
         assert_eq!(channel_readiness_summary(&readiness), ("error", "down"));
@@ -3348,7 +2987,7 @@ pub(crate) mod tests {
         ));
         let health = zeroclaw_runtime::health::snapshot();
         let info = first_channel_info(&config);
-        let readiness = channel_readiness(&config, &info, &health, &state);
+        let readiness = channel_readiness(&config, &info, &health, &state.pairing);
 
         assert_eq!(readiness.authenticated, ChannelReadinessState::Missing);
         assert_eq!(readiness.listening, ChannelReadinessState::Ready);
@@ -3361,7 +3000,7 @@ pub(crate) mod tests {
         let state = test_state(config.clone());
         let health = zeroclaw_runtime::health::snapshot();
         let info = first_channel_info(&config);
-        let readiness = channel_readiness(&config, &info, &health, &state);
+        let readiness = channel_readiness(&config, &info, &health, &state.pairing);
 
         assert_eq!(readiness.enabled, ChannelReadinessState::Ready);
         assert_eq!(readiness.bound_to_agent, ChannelReadinessState::Ready);
@@ -3386,7 +3025,7 @@ pub(crate) mod tests {
         let state = test_state(config.clone());
         let health = zeroclaw_runtime::health::snapshot();
         let info = first_channel_info(&config);
-        let readiness = channel_readiness(&config, &info, &health, &state);
+        let readiness = channel_readiness(&config, &info, &health, &state.pairing);
 
         assert_eq!(readiness.bound_to_agent, ChannelReadinessState::Missing);
         assert_eq!(readiness.listening, ChannelReadinessState::Unknown);

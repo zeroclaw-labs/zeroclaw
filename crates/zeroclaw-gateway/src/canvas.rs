@@ -12,12 +12,25 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+use zeroclaw_runtime::rpc::canvas::{self as canvas_rpc, CanvasFailure};
 
 /// POST /api/canvas/:id request body.
 #[derive(Deserialize)]
 pub struct CanvasPostBody {
     pub content_type: Option<String>,
     pub content: String,
+}
+
+/// A canvas refusal as the dashboard sees it: the failure's own status and
+/// an `{"error": message}` body, the same message `canvas/*` returns over RPC.
+fn canvas_failure_response(failure: CanvasFailure) -> axum::response::Response {
+    let status =
+        StatusCode::from_u16(failure.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (
+        status,
+        Json(serde_json::json!({ "error": failure.message() })),
+    )
+        .into_response()
 }
 
 /// GET /api/canvas — list all active canvases.
@@ -28,9 +41,7 @@ pub async fn handle_canvas_list(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-
-    let ids = state.canvas_store.list();
-    Json(serde_json::json!({ "canvases": ids })).into_response()
+    Json(canvas_rpc::list_body(&state.canvas_store)).into_response()
 }
 
 /// GET /api/canvas/:id — get current canvas content.
@@ -42,18 +53,9 @@ pub async fn handle_canvas_get(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-
-    match state.canvas_store.snapshot(&id) {
-        Some(frame) => Json(serde_json::json!({
-            "canvas_id": id,
-            "frame": frame,
-        }))
-        .into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": format!("Canvas '{}' not found", id) })),
-        )
-            .into_response(),
+    match canvas_rpc::get_body(&state.canvas_store, &id) {
+        Ok(body) => Json(body).into_response(),
+        Err(failure) => canvas_failure_response(failure),
     }
 }
 
@@ -66,13 +68,7 @@ pub async fn handle_canvas_history(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-
-    let history = state.canvas_store.history(&id);
-    Json(serde_json::json!({
-        "canvas_id": id,
-        "frames": history,
-    }))
-    .into_response()
+    Json(canvas_rpc::history_body(&state.canvas_store, &id)).into_response()
 }
 
 /// POST /api/canvas/:id — push content to a canvas.
@@ -85,54 +81,14 @@ pub async fn handle_canvas_post(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-
-    let content_type = body.content_type.as_deref().unwrap_or("html");
-
-    // Validate content_type against allowed set (prevent injecting "eval" frames via REST).
-    if !zeroclaw_runtime::tools::ALLOWED_CONTENT_TYPES.contains(&content_type) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": format!(
-                    "Invalid content_type '{}'. Allowed: {:?}",
-                    content_type,
-                    zeroclaw_runtime::tools::ALLOWED_CONTENT_TYPES
-                )
-            })),
-        )
-            .into_response();
-    }
-
-    // Enforce content size limit (same as tool-side validation).
-    if body.content.len() > zeroclaw_runtime::tools::MAX_CONTENT_SIZE {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({
-                "error": format!(
-                    "Content exceeds maximum size of {} bytes",
-                    zeroclaw_runtime::tools::MAX_CONTENT_SIZE
-                )
-            })),
-        )
-            .into_response();
-    }
-
-    match state.canvas_store.render(&id, content_type, &body.content) {
-        Some(frame) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "canvas_id": id,
-                "frame": frame,
-            })),
-        )
-            .into_response(),
-        None => (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(serde_json::json!({
-                "error": "Maximum canvas count reached. Clear unused canvases first."
-            })),
-        )
-            .into_response(),
+    match canvas_rpc::render_body(
+        &state.canvas_store,
+        &id,
+        body.content_type.as_deref(),
+        &body.content,
+    ) {
+        Ok(rendered) => (StatusCode::CREATED, Json(rendered)).into_response(),
+        Err(failure) => canvas_failure_response(failure),
     }
 }
 
@@ -145,13 +101,7 @@ pub async fn handle_canvas_clear(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-
-    state.canvas_store.clear(&id);
-    Json(serde_json::json!({
-        "canvas_id": id,
-        "status": "cleared",
-    }))
-    .into_response()
+    Json(canvas_rpc::clear_body(&state.canvas_store, &id)).into_response()
 }
 
 /// WS /ws/canvas/:id — real-time canvas updates.

@@ -104,7 +104,7 @@ default = ["schema-export", "a2a"]
 # [a2a.server] enabled = false. Pure-serde cards on the existing axum stack,
 # no a2a-rs/protobuf footprint.
 a2a = []
-plugins-wasm = ["dep:zeroclaw-plugins"]
+plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-runtime/plugins-wasm"]
 webauthn = ["zeroclaw-runtime/webauthn"]
 observability-prometheus = ["zeroclaw-runtime/observability-prometheus"]
 channel-acp-server = ["zeroclaw-channels/channel-acp-server"]

@@ -2080,6 +2080,7 @@ impl Agent {
             sop_engine,
             sop_audit,
             None,
+            None,
         )
         .await
     }
@@ -2096,6 +2097,7 @@ impl Agent {
         tui_env: Option<std::collections::HashMap<String, String>>,
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
+        canvas_store: Option<tools::CanvasStore>,
         principal_allowed_tools: Option<Vec<String>>,
     ) -> Result<Self> {
         // Stack-budget boundary for the daemon-backed construction paths
@@ -2128,7 +2130,7 @@ impl Agent {
                 tui_env,
                 sop_engine,
                 sop_audit,
-                None,
+                canvas_store,
                 None,
                 Some(Arc::clone(&live_config)),
                 Some(live_config),
@@ -2142,6 +2144,7 @@ impl Agent {
     /// Build a daemon-backed ACP TUI Agent with access to the shared durable
     /// session store. The store is a read view for session tools; TUI turns do
     /// not gain ACP file-delivery authority.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn from_live_config_with_tui_env_and_acp_sessions(
         live_config: Arc<parking_lot::RwLock<Config>>,
         agent_alias: &str,
@@ -2151,6 +2154,7 @@ impl Agent {
         tui_env: Option<std::collections::HashMap<String, String>>,
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
+        canvas_store: Option<tools::CanvasStore>,
         acp_session_store: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
         principal_allowed_tools: Option<Vec<String>>,
     ) -> Result<Self> {
@@ -2170,7 +2174,7 @@ impl Agent {
                 tui_env,
                 sop_engine,
                 sop_audit,
-                None,
+                canvas_store,
                 Some(acp_session_store),
                 Some(Arc::clone(&live_config)),
                 Some(live_config),

@@ -94,6 +94,9 @@ pub enum Resource {
     /// Standard Operating Procedure authoring, execution, and decision
     /// surfaces.
     Sops,
+    /// Live Canvas (A2UI) content: listing, reading, rendering and clearing
+    /// canvases.
+    Canvas,
 }
 
 /// What may be done to a [`Resource`].
