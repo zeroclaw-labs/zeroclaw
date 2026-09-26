@@ -7,6 +7,7 @@ pub mod microsoft365;
 pub mod util_helpers;
 
 pub mod a2a_client;
+pub mod agy_cli;
 pub mod ask_user;
 pub mod backup_tool;
 pub mod browser;

@@ -119,6 +119,11 @@ const KNOWN_CLIS: &[KnownCli] = &[
         category: CliCategory::AiAgent,
     },
     KnownCli {
+        name: "agy",
+        version_args: &["--version"],
+        category: CliCategory::AiAgent,
+    },
+    KnownCli {
         name: "kilo",
         version_args: &["--version"],
         category: CliCategory::AiAgent,

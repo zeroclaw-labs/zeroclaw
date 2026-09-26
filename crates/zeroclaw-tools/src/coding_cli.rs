@@ -215,6 +215,7 @@ pub(crate) fn add_coding_cli_env(command: &mut CodingCliCommand, passthrough: &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agy_cli::AgyCliTool;
     use crate::claude_code::ClaudeCodeTool;
     use crate::codex_cli::CodexCliTool;
     use crate::gemini_cli::GeminiCliTool;
@@ -224,7 +225,7 @@ mod tests {
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
     use zeroclaw_config::schema::{
-        ClaudeCodeConfig, CodexCliConfig, GeminiCliConfig, OpenCodeCliConfig,
+        AgyCliConfig, ClaudeCodeConfig, CodexCliConfig, GeminiCliConfig, OpenCodeCliConfig,
     };
 
     #[derive(Default)]
@@ -369,6 +370,14 @@ mod tests {
                 },
                 recorder.clone(),
             )),
+            Box::new(AgyCliTool::new_with_executor(
+                security.clone(),
+                AgyCliConfig {
+                    env_passthrough: passthrough.clone(),
+                    ..AgyCliConfig::default()
+                },
+                recorder.clone(),
+            )),
             Box::new(OpenCodeCliTool::new_with_executor(
                 security,
                 OpenCodeCliConfig {
@@ -395,7 +404,7 @@ mod tests {
                 .iter()
                 .map(|command| command.program.clone())
                 .collect::<Vec<_>>(),
-            ["claude", "codex", "gemini", "opencode"]
+            ["claude", "codex", "gemini", "agy", "opencode"]
                 .map(OsString::from)
                 .to_vec()
         );
