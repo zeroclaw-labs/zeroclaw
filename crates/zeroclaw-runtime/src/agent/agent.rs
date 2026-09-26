@@ -425,6 +425,10 @@ pub struct Agent {
     /// and stored here for lookup during tool execution.
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     tool_search: Option<Arc<crate::tools::ToolSearchTool>>,
+    /// The principal whose private memory plane `memory` is pinned to, set by
+    /// `route_memory_to_principal` at session construction. `None` = the
+    /// shared/legacy handle (the shared operator's sessions).
+    memory_principal: Option<String>,
     /// MCP pinned resources, read once at construction from each server's
     /// `pinned_resources` and provenance-wrapped (`trust="untrusted-external"`).
     /// Kept as attributed blocks rather than pre-rendered text so a later
@@ -1158,6 +1162,7 @@ impl AgentBuilder {
             shell_profile: self.shell_profile,
             activated_tools: self.activated_tools,
             tool_search: None,
+            memory_principal: None,
             mcp_pinned: self.mcp_pinned,
             mcp_deferred_section: self.mcp_deferred_section.unwrap_or_default(),
             hook_runner: self.hook_runner,
@@ -1676,6 +1681,43 @@ impl Agent {
         if let Ok(sys) = self.build_system_prompt() {
             self.history[0] = ConversationMessage::Chat(ChatMessage::system(sys));
         }
+    }
+
+    /// Pin this session's memory to its OWNER's private plane (RFC 7141).
+    ///
+    /// Called once at session construction with the session owner's scope,
+    /// never with a later caller's: an administrator prompting another
+    /// principal's session must not re-route that session's memory. Every
+    /// memory operation the session's tools and loop issue afterwards goes to
+    /// the backend's principal-scoped forms; a backend without private support
+    /// fails them closed. The shared operator (no owner) keeps the legacy
+    /// shared handle. Idempotent: a second call with the same owner is a no-op,
+    /// and a call with a different owner is refused.
+    pub fn route_memory_to_principal(
+        &mut self,
+        scope: zeroclaw_api::memory_traits::PrincipalScope,
+    ) -> anyhow::Result<()> {
+        if let Some(current) = &self.memory_principal {
+            if *current == scope.principal_id {
+                return Ok(());
+            }
+            anyhow::bail!(
+                "session memory is already pinned to principal {current:?}; refusing to re-route it"
+            );
+        }
+        let routed: Arc<dyn Memory> = Arc::new(zeroclaw_memory::PrincipalPlaneMemory::new(
+            Arc::clone(&self.memory),
+            scope.clone(),
+        ));
+        self.memory = routed;
+        self.memory_principal = Some(scope.principal_id);
+        Ok(())
+    }
+
+    /// The principal whose private plane this session's memory is pinned to,
+    /// if any.
+    pub fn memory_principal(&self) -> Option<&str> {
+        self.memory_principal.as_deref()
     }
 
     /// Apply a current principal tool ceiling to an existing session. This is
@@ -12474,6 +12516,7 @@ mod tests {
                 _: Option<&str>,
             ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
                 Ok(vec![zeroclaw_memory::MemoryEntry {
+                    principal_id: None,
                     id: "deploy".into(),
                     key: "deploy".into(),
                     content: self.content.clone(),
