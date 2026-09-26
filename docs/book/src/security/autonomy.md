@@ -53,6 +53,7 @@ By default an approval prompt is delivered through whichever channel initiated t
 approver_channel = "matrix.ops"     # a channel registry key, NOT the originator
 on_no_approver   = "deny"           # default; or "inherit-originator"
 timeout_secs     = 120              # default; bounds the approver's response window
+recipient        = "!ops:example.org" # optional; the room or chat on the approver channel
 ```
 
 - `approver_channel` is the channel registry key that receives the approval request. Keys are platform-qualified, `<channel>.<alias>` (for example `matrix.ops` or `telegram.default`); a bare platform name (e.g. `matrix`) resolves only when it is the single channel of that platform. An alias on its own is not a registry key and will fail closed. When the route is set, the approval gate asks **only** that channel, not the originating one.
@@ -60,10 +61,13 @@ timeout_secs     = 120              # default; bounds the approver's response wi
   - `deny` (the default) fails closed and denies the tool call.
   - `inherit-originator` falls back to the originating-channel prompt (today's behavior).
 - `timeout_secs` (default 120) bounds how long the gate waits for the approver before applying `on_no_approver`, so a hung approver channel cannot stall a turn.
+- `recipient` names where on `approver_channel` the prompt goes: a Discord channel id, a Telegram chat id, a Matrix room. When it is absent the approver receives the originating turn's recipient, which suits session-addressed approvers (ACP, TUI) but not room channels, where that recipient is the room the request came from.
 
 When `approval_route` is absent (the default), approvals behave exactly as described above: delivered through whichever channel initiated the conversation. The fail-closed default means a misconfigured or unreachable approver denies rather than silently self-approving.
 
 > **Scope.** `approval_route` is honored on both turn paths: the interactive, channel-driven path (a turn that carries a live channel handle, e.g. a streamed agent chat) and the non-interactive path that runs without an originating channel (gateway chat/webhook dispatch and agent-to-agent peer messages). On the non-interactive path the approver must be a **live, registered channel** in the running daemon (it is resolved through the daemon's channel registry); if that registry is unavailable (for example a one-shot CLI run with no channels started) or the named approver is not live, the gate falls back to the profile's non-interactive default, which fails closed (denies) under the default `on_no_approver = "deny"`.
+
+**Messaging-channel turns.** Turns the channel orchestrator runs for Discord, Telegram, Matrix and the other messaging channels ask the room the message came from; they do not read the agent's own `approval_route`. The exception is a turn narrowed by a [sender role](../channels/peer-groups.md#sender-roles): when the role's profile sets `approval_route`, that turn's prompts go only to the route, and an approver that is missing, silent, or answers `inherit-originator` denies instead of falling back to the room.
 
 ## Command allow list
 

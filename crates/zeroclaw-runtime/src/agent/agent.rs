@@ -163,6 +163,7 @@ pub(crate) async fn resolve_routed_approval(
             // `Some(Deny)` (its inner timeout firing before this outer one), that
             // is a runtime denial and must not be relabelled as the approver's
             // decision just because a response came back.
+            let recipient = route.recipient_or(recipient);
             match tokio::time::timeout(dur, channel.request_approval_attributed(recipient, request))
                 .await
             {
@@ -234,13 +235,17 @@ pub(crate) async fn resolve_routed_approval(
     }
 }
 
-pub(crate) struct RoutedApprovalChannel {
+/// An approval-only channel that sends every prompt to a risk profile's
+/// `approval_route` approver and applies its fail-closed policy. It never
+/// falls back to an originating channel: `InheritOriginator` yields no
+/// decision, so the gate applies its non-interactive default (deny).
+pub struct RoutedApprovalChannel {
     handles: tools::PerToolChannelHandle,
     route: zeroclaw_config::autonomy::ApprovalRoute,
 }
 
 impl RoutedApprovalChannel {
-    pub(crate) fn new(
+    pub fn new(
         handles: tools::PerToolChannelHandle,
         route: zeroclaw_config::autonomy::ApprovalRoute,
     ) -> Self {
@@ -275,8 +280,9 @@ impl zeroclaw_api::channel::Channel for RoutedApprovalChannel {
     }
 
     /// Non-attributed entry point: delegates to
-    /// [`Self::request_approval_attributed`] and drops the attribution so the
-    /// routing decision lives in exactly one place.
+    /// [`request_approval_attributed`](zeroclaw_api::channel::Channel::request_approval_attributed)
+    /// and drops the attribution so the routing decision lives in exactly one
+    /// place.
     async fn request_approval(
         &self,
         recipient: &str,
@@ -16805,6 +16811,7 @@ mod approval_route_tests {
             approver_channel: approver.into(),
             on_no_approver: policy,
             timeout_secs: 1,
+            recipient: None,
         }
     }
 

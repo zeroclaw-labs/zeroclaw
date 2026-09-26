@@ -28,6 +28,7 @@ A `[peer_groups.<name>]` block carries:
 | `ignore` | Per-group blocklist; travels with the resolved peer set and overrides any grant, including a wildcard. Applied by the channel, under that channel's identity rules. |
 | `output_modality` | Preferred reply modality for the group: `mirror` (input-driven, default), `voice` (always reply and deliver proactive messages as TTS notes on audio-capable channels), or `text` (always text). |
 | `admin_for_agent_scope` | When `true`, the group's `external_peers` are authorized to issue `/model --agent <model>` on the bound agent. Default `false` (deny-by-default). See [Admin agent-scope authorization](#admin-agent-scope-authorization). |
+| `risk_profile` | Sender role: a `[risk_profiles.<alias>]` that narrows turns the group's `external_peers` start on the group's agents. Unset by default. See [Sender roles](#sender-roles). |
 
 ## Resolution
 
@@ -153,3 +154,70 @@ path. If a `/model --agent` invocation reports "not authorized" for a
 sender you expected to be in scope, restart the daemon after editing
 `admin_for_agent_scope` and re-issue the command from a fresh client
 session before drawing further conclusions.
+
+## Sender roles
+
+By default every sender a channel admits gets the same agent, tools, and
+approvals. `risk_profile` lets one agent treat senders in a shared room
+differently: owners keep the agent's profile, everyone else runs narrowed.
+
+```toml
+[agents.helper]
+risk_profile = "owner"            # what the agent itself may do
+
+[risk_profiles.guest]             # identical to "owner" except:
+excluded_tools = ["shell", "file_write", "delegate"]
+always_ask = ["http_request"]
+
+[risk_profiles.guest.approval_route]
+approver_channel = "discord.ops"
+recipient = "123456789012345678"  # the admins' channel id on discord.ops
+
+[peer_groups.everyone]
+channel = "discord.main"
+external_peers = ["*"]
+risk_profile = "guest"
+
+[peer_groups.owners]
+channel = "discord.main"
+external_peers = ["111111111111111111"]
+risk_profile = "owner"
+```
+
+Resolution, per message:
+
+- A group applies when its `channel` matches and its `agents` list is empty
+  or names the agent. A group whose `ignore` names the sender does not apply
+  to them.
+- A sender named in `external_peers` outranks a `"*"` entry, so the owners
+  above are not guests.
+- A sender matching two groups of the same rank that name different profiles
+  is refused with a message, and the turn does not run. Nothing is guessed.
+- No matching role group means the agent's own profile, exactly as before.
+
+A role only narrows the agent's profile, and only in the four fields a turn
+can change: `excluded_tools` and `always_ask` are added, `auto_approve` keeps
+only what both profiles allow, and `approval_route` is the role's own. The
+role's exclusions apply even when the agent runs at `full`. Every other field
+of the role profile must equal the agent's; validation rejects one that
+differs, because sandbox, command, and autonomy settings are fixed when the
+agent's tools are built.
+
+With an `approval_route`, a role's approval prompts go only to the approver,
+never to the room, so a guest cannot approve their own request. Without one,
+prompts go to the room as before, where the channel decides who may answer
+(on Discord, anyone it admits). Give guest roles a route, or exclude the tools you would otherwise
+gate. A role turn also starts with an empty "Always" list, so an owner's
+"Always" answer never carries over to guests.
+
+Current limits:
+
+- A role cannot restrict to an allowlist (`allowed_tools`, `deny_all_tools`);
+  list what to remove in `excluded_tools`. Remember nested execution:
+  `delegate`, `spawn_subagent`, and SOP tools run other agents under their
+  own profiles.
+- Roles narrow tools and approvals only. They add no memory isolation: what
+  a guest turn can recall is whatever the agent's memory scoping already
+  allows. Exclude `memory_recall` for guests if that matters.
+- Like `admin_for_agent_scope`, roles are read from the config snapshot the
+  runtime started with; edits take effect after a restart.

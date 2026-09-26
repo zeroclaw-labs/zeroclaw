@@ -70,7 +70,7 @@ impl ::zeroclaw_api::attribution::Attributable for AgentAttribution<'_> {
 }
 
 #[allow(unused_imports)]
-pub use agent::{Agent, AgentBuilder, TurnEvent};
+pub use agent::{Agent, AgentBuilder, RoutedApprovalChannel, TurnEvent};
 #[allow(unused_imports)]
 pub use loop_::{process_message, run};
 

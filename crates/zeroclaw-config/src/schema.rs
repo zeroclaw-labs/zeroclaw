@@ -13616,6 +13616,78 @@ fn default_always_ask() -> Vec<String> {
 }
 
 impl RiskProfileConfig {
+    /// Fields a sender role (`[peer_groups.<name>] risk_profile`) may set
+    /// differently from its agent's own profile. The channel orchestrator
+    /// applies these per turn; every other field is fixed when the agent's
+    /// tools and security policy are built, so a role cannot change it.
+    pub const SENDER_ROLE_TURN_FIELDS: [&'static str; 4] = [
+        "excluded_tools",
+        "always_ask",
+        "auto_approve",
+        "approval_route",
+    ];
+
+    /// Fields where `role` differs from this (agent) profile outside
+    /// [`Self::SENDER_ROLE_TURN_FIELDS`], sorted. Non-empty means `role`
+    /// cannot be applied per turn as written.
+    #[must_use]
+    pub fn sender_role_fixed_field_mismatches(&self, role: &RiskProfileConfig) -> Vec<String> {
+        let fields = |profile: &RiskProfileConfig| match serde_json::to_value(profile) {
+            Ok(serde_json::Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        let agent = fields(self);
+        let role = fields(role);
+        let mut keys: Vec<&String> = agent.keys().chain(role.keys()).collect();
+        keys.sort();
+        keys.dedup();
+        keys.into_iter()
+            .filter(|key| !Self::SENDER_ROLE_TURN_FIELDS.contains(&key.as_str()))
+            .filter(|key| agent.get(*key) != role.get(*key))
+            .cloned()
+            .collect()
+    }
+
+    /// This (agent) profile narrowed by a sender role's profile, for one turn.
+    ///
+    /// Only [`Self::SENDER_ROLE_TURN_FIELDS`] move, and only toward less
+    /// authority: `excluded_tools` and `always_ask` are unions,
+    /// `auto_approve` keeps the entries both profiles allow (`"*"` on one
+    /// side defers to the other side's list), and `approval_route` is the
+    /// role's own, so a role without a route falls back to the originating
+    /// channel exactly as the agent's turns do.
+    #[must_use]
+    pub fn narrowed_for_sender_role(&self, role: &RiskProfileConfig) -> RiskProfileConfig {
+        fn union(base: &[String], extra: &[String]) -> Vec<String> {
+            let mut out = base.to_vec();
+            for item in extra {
+                if !out.contains(item) {
+                    out.push(item.clone());
+                }
+            }
+            out
+        }
+        let wildcard = |list: &[String]| list.iter().any(|t| t.trim() == "*");
+        let auto_approve = if wildcard(&self.auto_approve) {
+            role.auto_approve.clone()
+        } else if wildcard(&role.auto_approve) {
+            self.auto_approve.clone()
+        } else {
+            self.auto_approve
+                .iter()
+                .filter(|tool| role.auto_approve.contains(tool))
+                .cloned()
+                .collect()
+        };
+        RiskProfileConfig {
+            excluded_tools: union(&self.excluded_tools, &role.excluded_tools),
+            always_ask: union(&self.always_ask, &role.always_ask),
+            auto_approve,
+            approval_route: role.approval_route.clone(),
+            ..self.clone()
+        }
+    }
+
     /// Legacy serialized marker used by older operators to represent an
     /// explicit deny-all profile before `deny_all_tools` existed.
     pub const LEGACY_DENY_ALL_TOOLS_SENTINEL: &'static str = "__none__";
@@ -21883,6 +21955,27 @@ enum PeerGroupChannelRef {
     },
 }
 
+/// The sender role a channel message resolved to: the peer group that
+/// granted it and the risk profile that narrows the sender's turns. See
+/// [`Config::channel_sender_role`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SenderRole {
+    /// The `[peer_groups.<name>]` entry the sender matched.
+    pub group: String,
+    /// The `[risk_profiles.<alias>]` that entry names.
+    pub risk_profile: String,
+}
+
+/// A sender matched role groups of equal rank that name different risk
+/// profiles. Callers refuse the turn instead of choosing one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SenderRoleConflict {
+    /// The matching groups, sorted.
+    pub groups: Vec<String>,
+    /// The distinct profiles they name, sorted.
+    pub risk_profiles: Vec<String>,
+}
+
 impl Config {
     /// The resolved peer policy for `<channel_type>.<alias>`: every granted
     /// entry, plus every `ignore` entry as a `PEER_DENY_PREFIX` marker.
@@ -22103,6 +22196,100 @@ impl Config {
         }
         out.sort();
         out
+    }
+
+    /// The sender role for a message on `<channel_type>.<alias>` handled by
+    /// `agent_alias`: which `[peer_groups.<name>]` carrying a `risk_profile`
+    /// the sender belongs to.
+    ///
+    /// Identity comparison belongs to the channel, so the caller passes
+    /// `is_sender`, which answers whether one configured peer entry names
+    /// this sender. `"*"` entries are handled here and never reach it.
+    ///
+    /// A group applies when its `channel` matches (type-wide or dotted) and
+    /// its `agents` list is empty or names `agent_alias`. A group whose
+    /// `ignore` names the sender (or is `"*"`) does not apply to them. A
+    /// by-name `external_peers` match outranks a `"*"` match. When the best
+    /// matches name different profiles the sender is ambiguous and the
+    /// result is a conflict, which callers must refuse rather than resolve.
+    /// `Ok(None)` means no role: the agent's own profile applies.
+    ///
+    /// Reads `self.peer_groups` directly, with no cache.
+    pub fn channel_sender_role(
+        &self,
+        channel_type: &str,
+        alias: &str,
+        agent_alias: &str,
+        is_sender: impl Fn(&str) -> bool,
+    ) -> std::result::Result<Option<SenderRole>, SenderRoleConflict> {
+        let is_wildcard = |peer: &str| peer.trim() == "*";
+        let mut names: Vec<&String> = self.peer_groups.keys().collect();
+        names.sort();
+        let mut best_rank = 0u8;
+        let mut best: Vec<SenderRole> = Vec::new();
+        for name in names {
+            let group = &self.peer_groups[name];
+            let Some(profile) = group
+                .risk_profile
+                .as_deref()
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+            else {
+                continue;
+            };
+            let channel_matches = match group.channel.split_once('.') {
+                Some((ty, al)) => ty == channel_type && al == alias,
+                None => group.channel == channel_type,
+            };
+            if !channel_matches {
+                continue;
+            }
+            if !group.agents.is_empty() && !group.agents.iter().any(|a| a.as_str() == agent_alias) {
+                continue;
+            }
+            if group
+                .ignore
+                .iter()
+                .any(|peer| is_wildcard(peer.as_str()) || is_sender(peer.as_str()))
+            {
+                continue;
+            }
+            let rank = if group
+                .external_peers
+                .iter()
+                .any(|peer| !is_wildcard(peer.as_str()) && is_sender(peer.as_str()))
+            {
+                2
+            } else if group
+                .external_peers
+                .iter()
+                .any(|peer| is_wildcard(peer.as_str()))
+            {
+                1
+            } else {
+                continue;
+            };
+            if rank > best_rank {
+                best_rank = rank;
+                best.clear();
+            }
+            if rank == best_rank {
+                best.push(SenderRole {
+                    group: name.clone(),
+                    risk_profile: profile.to_string(),
+                });
+            }
+        }
+        let mut profiles: Vec<String> = best.iter().map(|r| r.risk_profile.clone()).collect();
+        profiles.sort();
+        profiles.dedup();
+        if profiles.len() > 1 {
+            return Err(SenderRoleConflict {
+                groups: best.into_iter().map(|r| r.group).collect(),
+                risk_profiles: profiles,
+            });
+        }
+        Ok(best.into_iter().next())
     }
 
     /// Collect the `IntegrationDescriptor` from every nested config that
@@ -25297,6 +25484,59 @@ impl Config {
                     );
                 }
             }
+            // A sender role must name a real profile, and that profile may
+            // differ from each agent it applies to only in the fields the
+            // orchestrator narrows per turn. Anything else would be silently
+            // ignored at runtime, so refuse it here.
+            if let Some(role_alias) = group.risk_profile.as_deref().map(str::trim) {
+                let Some(role_profile) = self.risk_profiles.get(role_alias) else {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("peer_groups.{group_name}.risk_profile"),
+                        "peer_groups.{group_name}.risk_profile = {role_alias:?} but risk_profiles.{role_alias} is not configured",
+                    );
+                };
+                let mut applies_to: Vec<&str> = if group.agents.is_empty() {
+                    self.agents
+                        .iter()
+                        .filter(|(_, agent)| {
+                            agent.channels.iter().any(|ch| {
+                                let ch_str = ch.as_str();
+                                match group_channel_alias {
+                                    Some(alias) => {
+                                        ch_str == format!("{group_channel_type}.{alias}")
+                                    }
+                                    None => ch_str.starts_with(&format!("{group_channel_type}.")),
+                                }
+                            })
+                        })
+                        .map(|(alias, _)| alias.as_str())
+                        .collect()
+                } else {
+                    group.agents.iter().map(|a| a.as_str()).collect()
+                };
+                applies_to.sort_unstable();
+                for agent_alias in applies_to {
+                    let Some(agent_profile) = self.risk_profile_for_agent(agent_alias) else {
+                        continue;
+                    };
+                    let mismatched = agent_profile.sender_role_fixed_field_mismatches(role_profile);
+                    if !mismatched.is_empty() {
+                        let agent_profile_alias = self
+                            .agents
+                            .get(agent_alias)
+                            .map(|agent| agent.risk_profile.trim().to_string())
+                            .unwrap_or_default();
+                        let mismatched = mismatched.join(", ");
+                        let turn_fields = RiskProfileConfig::SENDER_ROLE_TURN_FIELDS.join(", ");
+                        validation_bail!(
+                            InvalidFormat,
+                            format!("peer_groups.{group_name}.risk_profile"),
+                            "peer_groups.{group_name}.risk_profile = {role_alias:?} differs from agents.{agent_alias}'s profile {agent_profile_alias:?} in {mismatched}; a sender role may only change {turn_fields}",
+                        );
+                    }
+                }
+            }
         }
 
         if self.plugins.max_active_instances == 0 {
@@ -27571,6 +27811,229 @@ impl HasPropKind for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    fn sender_role_config() -> super::Config {
+        toml::from_str(
+            r#"
+            [peer_groups.everyone]
+            channel = "discord"
+            external_peers = ["*"]
+            risk_profile = "guest"
+
+            [peer_groups.owners]
+            channel = "discord.main"
+            external_peers = ["alice"]
+            risk_profile = "owner"
+
+            [peer_groups.plain]
+            channel = "discord"
+            external_peers = ["bob"]
+            "#,
+        )
+        .expect("sender-role config should parse")
+    }
+
+    fn role(group: &str, profile: &str) -> super::SenderRole {
+        super::SenderRole {
+            group: group.to_string(),
+            risk_profile: profile.to_string(),
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_sender_role_prefers_a_named_member_over_the_wildcard() {
+        let config = sender_role_config();
+        assert_eq!(
+            config.channel_sender_role("discord", "main", "bot", |p| p == "alice"),
+            Ok(Some(role("owners", "owner")))
+        );
+        // Everyone else falls through to the wildcard group, including a
+        // sender another group lists without a role.
+        assert_eq!(
+            config.channel_sender_role("discord", "main", "bot", |p| p == "bob"),
+            Ok(Some(role("everyone", "guest")))
+        );
+        // The dotted owners group does not reach another alias.
+        assert_eq!(
+            config.channel_sender_role("discord", "other", "bot", |p| p == "alice"),
+            Ok(Some(role("everyone", "guest")))
+        );
+        // No role group on the channel: the agent's own profile applies.
+        assert_eq!(
+            config.channel_sender_role("telegram", "main", "bot", |p| p == "alice"),
+            Ok(None)
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_sender_role_never_hands_the_wildcard_to_the_matcher() {
+        let config = sender_role_config();
+        let resolved = config.channel_sender_role("discord", "main", "bot", |p| {
+            assert_ne!(p.trim(), "*", "the resolver owns wildcard semantics");
+            false
+        });
+        assert_eq!(resolved, Ok(Some(role("everyone", "guest"))));
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_sender_role_refuses_equal_rank_groups_with_different_profiles() {
+        let mut config = sender_role_config();
+        config.peer_groups.insert(
+            "helpers".to_string(),
+            crate::multi_agent::PeerGroupConfig {
+                channel: "discord".into(),
+                external_peers: vec![crate::multi_agent::PeerUsername::new("alice")],
+                risk_profile: Some("helper".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            config.channel_sender_role("discord", "main", "bot", |p| p == "alice"),
+            Err(super::SenderRoleConflict {
+                groups: vec!["helpers".to_string(), "owners".to_string()],
+                risk_profiles: vec!["helper".to_string(), "owner".to_string()],
+            })
+        );
+        // Two groups naming the same profile agree, so there is no conflict.
+        config
+            .peer_groups
+            .get_mut("helpers")
+            .expect("helpers group")
+            .risk_profile = Some("owner".to_string());
+        assert_eq!(
+            config.channel_sender_role("discord", "main", "bot", |p| p == "alice"),
+            Ok(Some(role("helpers", "owner")))
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_sender_role_honors_ignore_and_the_agents_list() {
+        let mut config = sender_role_config();
+        {
+            let owners = config.peer_groups.get_mut("owners").expect("owners group");
+            owners.agents = vec![crate::multi_agent::AgentAlias::new("bot")];
+        }
+        // Scoped to `bot`: another agent on the same channel sees only the
+        // wildcard group.
+        assert_eq!(
+            config.channel_sender_role("discord", "main", "other_bot", |p| p == "alice"),
+            Ok(Some(role("everyone", "guest")))
+        );
+        // A group's own ignore list takes its members out of the role.
+        config
+            .peer_groups
+            .get_mut("everyone")
+            .expect("everyone group")
+            .ignore = vec![crate::multi_agent::PeerUsername::new("mallory")];
+        assert_eq!(
+            config.channel_sender_role("discord", "main", "bot", |p| p == "mallory"),
+            Ok(None)
+        );
+        // A blank profile name is no role at all.
+        config
+            .peer_groups
+            .get_mut("everyone")
+            .expect("everyone group")
+            .risk_profile = Some("  ".to_string());
+        assert_eq!(
+            config.channel_sender_role("discord", "main", "bot", |p| p == "carol"),
+            Ok(None)
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn narrowed_for_sender_role_only_removes_authority() {
+        let agent = super::RiskProfileConfig {
+            excluded_tools: vec!["browser_open".into()],
+            always_ask: vec!["file_write".into()],
+            auto_approve: vec!["file_read".into(), "memory_recall".into()],
+            allowed_commands: vec!["git".into()],
+            ..Default::default()
+        };
+        let route = crate::autonomy::ApprovalRoute {
+            approver_channel: "discord.ops".into(),
+            recipient: Some("42".into()),
+            ..Default::default()
+        };
+        let guest = super::RiskProfileConfig {
+            excluded_tools: vec!["shell".into(), "browser_open".into()],
+            always_ask: vec!["http_request".into()],
+            auto_approve: vec!["memory_recall".into(), "shell".into()],
+            allowed_commands: vec!["rm".into()],
+            approval_route: Some(route),
+            ..Default::default()
+        };
+        let turn = agent.narrowed_for_sender_role(&guest);
+        assert_eq!(turn.excluded_tools, vec!["browser_open", "shell"]);
+        assert_eq!(turn.always_ask, vec!["file_write", "http_request"]);
+        // Only what both sides auto-approve survives; the role cannot add
+        // `shell` to the agent's list.
+        assert_eq!(turn.auto_approve, vec!["memory_recall"]);
+        assert_eq!(
+            turn.approval_route
+                .as_ref()
+                .map(|r| r.approver_channel.as_str()),
+            Some("discord.ops")
+        );
+        // Fields outside the turn set stay the agent's.
+        assert_eq!(turn.allowed_commands, vec!["git"]);
+
+        // A wildcard on one side defers to the other side's list.
+        let open_agent = super::RiskProfileConfig {
+            auto_approve: vec!["*".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            open_agent.narrowed_for_sender_role(&guest).auto_approve,
+            vec!["memory_recall", "shell"]
+        );
+        let open_role = super::RiskProfileConfig {
+            auto_approve: vec!["*".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            agent.narrowed_for_sender_role(&open_role).auto_approve,
+            vec!["file_read", "memory_recall"]
+        );
+        // A role without a route does not inherit the agent's.
+        let routed_agent = super::RiskProfileConfig {
+            approval_route: guest.approval_route.clone(),
+            ..Default::default()
+        };
+        assert!(
+            routed_agent
+                .narrowed_for_sender_role(&super::RiskProfileConfig::default())
+                .approval_route
+                .is_none()
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn sender_role_fixed_field_mismatches_ignores_only_turn_fields() {
+        let agent = super::RiskProfileConfig::default();
+        let narrowing = super::RiskProfileConfig {
+            excluded_tools: vec!["shell".into()],
+            always_ask: vec!["*".into()],
+            auto_approve: vec![],
+            approval_route: Some(crate::autonomy::ApprovalRoute::default()),
+            ..Default::default()
+        };
+        assert!(
+            agent
+                .sender_role_fixed_field_mismatches(&narrowing)
+                .is_empty()
+        );
+
+        let widening = super::RiskProfileConfig {
+            level: crate::autonomy::AutonomyLevel::Full,
+            allowed_commands: vec!["rm".into()],
+            ..narrowing
+        };
+        assert_eq!(
+            agent.sender_role_fixed_field_mismatches(&widening),
+            vec!["allowed_commands".to_string(), "level".to_string()]
+        );
+    }
+
     #[::core::prelude::v1::test]
     fn channel_external_peers_carries_every_ignore_across_matching_groups() {
         let config: super::Config = toml::from_str(
@@ -45577,6 +46040,109 @@ allowed_users = []
             err.to_string().contains("peer_groups.team_chat.agents[1]"),
             "expected indexed field path, got: {err}"
         );
+    }
+
+    fn sender_role_test_config(role: RiskProfileConfig) -> Config {
+        let mut config = multi_agent_test_config();
+        config.risk_profiles.insert("guest".to_string(), role);
+        config.peer_groups.insert(
+            "everyone".to_string(),
+            crate::multi_agent::PeerGroupConfig {
+                channel: "telegram".into(),
+                external_peers: vec![crate::multi_agent::PeerUsername::new("*")],
+                risk_profile: Some("guest".to_string()),
+                ..crate::multi_agent::PeerGroupConfig::default()
+            },
+        );
+        config
+    }
+
+    #[test]
+    async fn validate_accepts_a_sender_role_that_only_narrows_turn_fields() {
+        let config = sender_role_test_config(RiskProfileConfig {
+            excluded_tools: vec!["shell".into()],
+            always_ask: vec!["file_write".into()],
+            approval_route: Some(crate::autonomy::ApprovalRoute {
+                approver_channel: "telegram.draft".into(),
+                recipient: Some("-100123".into()),
+                ..Default::default()
+            }),
+            ..RiskProfileConfig::default()
+        });
+        config
+            .validate()
+            .expect("a role that differs only in turn fields must validate");
+    }
+
+    #[test]
+    async fn validate_rejects_a_sender_role_naming_a_missing_profile() {
+        let mut config = sender_role_test_config(RiskProfileConfig::default());
+        config.risk_profiles.remove("guest");
+        let err = config
+            .validate()
+            .expect_err("a dangling role profile must fail validation");
+        assert!(
+            err.to_string()
+                .contains("peer_groups.everyone.risk_profile = \"guest\" but risk_profiles.guest is not configured"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_a_sender_role_that_changes_fixed_fields() {
+        let config = sender_role_test_config(RiskProfileConfig {
+            level: crate::autonomy::AutonomyLevel::Full,
+            excluded_tools: vec!["shell".into()],
+            ..RiskProfileConfig::default()
+        });
+        let err = config
+            .validate()
+            .expect_err("a role that changes a fixed field must fail validation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("differs from agents.alpha's profile \"default\" in level;"),
+            "only the fixed field is reported, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_checks_a_sender_role_against_every_agent_on_its_channel() {
+        let mut config = sender_role_test_config(RiskProfileConfig {
+            excluded_tools: vec!["shell".into()],
+            ..RiskProfileConfig::default()
+        });
+        config.risk_profiles.insert(
+            "strict".to_string(),
+            RiskProfileConfig {
+                allowed_commands: vec!["git".into()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        let beta = AliasedAgentConfig {
+            channels: vec![crate::providers::ChannelRef::new("telegram.draft")],
+            model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
+            risk_profile: "strict".into(),
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("beta".to_string(), beta);
+        let err = config
+            .validate()
+            .expect_err("an unscoped role must fit every agent on the channel");
+        assert!(
+            err.to_string()
+                .contains("differs from agents.beta's profile \"strict\" in allowed_commands;"),
+            "got: {err}"
+        );
+
+        // Scoping the group to alpha leaves beta out of the role.
+        config
+            .peer_groups
+            .get_mut("everyone")
+            .expect("everyone group")
+            .agents = vec![crate::multi_agent::AgentAlias::new("alpha")];
+        config
+            .validate()
+            .expect("a role scoped to alpha is checked only against alpha");
     }
 
     #[test]

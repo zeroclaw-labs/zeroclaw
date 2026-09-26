@@ -179,6 +179,25 @@ pub struct PeerGroupConfig {
     /// duplicate sender list.
     #[serde(default)]
     pub admin_for_agent_scope: bool,
+    /// Sender role: the `[risk_profiles.<alias>]` that narrows turns this
+    /// group's `external_peers` start on the agents this group lists (every
+    /// agent bound to `channel` when `agents` is empty). `None` (default)
+    /// gives the group no role, and its members run under the agent's own
+    /// profile.
+    ///
+    /// A role only narrows. For the turn it adds the role profile's
+    /// `excluded_tools` and `always_ask`, keeps only the `auto_approve`
+    /// entries both profiles share, and sends approval prompts to the role
+    /// profile's `approval_route` when it sets one. Every other field of the
+    /// role profile must equal the agent's own profile; config validation
+    /// rejects one that differs, because those settings are fixed when the
+    /// agent's tools are built and cannot change per turn.
+    ///
+    /// A sender listed by name outranks a `"*"` entry. A sender matching two
+    /// role groups of the same rank that name different profiles is refused
+    /// rather than guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_profile: Option<String>,
 }
 
 /// Inbound A2A discovery server configuration.
