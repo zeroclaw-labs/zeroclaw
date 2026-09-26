@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Promote an existing release by changing exactly three gh-pages root files.
+"""Promote an existing release by updating root metadata and the llms pair.
 
 Master's committed pointer is policy; GitHub Latest and the deployed source
 receipt prove eligibility. No builds, pruning, tag writes, or publication here.
@@ -14,6 +14,10 @@ import re
 import subprocess
 import sys
 import tomllib
+
+
+# Root pair agents fetch by fixed URL; promoted as one unit with the metadata.
+LLMS_FILES = ("llms.txt", "llms-full.txt")
 
 
 def require(condition, message):
@@ -42,6 +46,20 @@ def github_file(repo, name, sha):
 def read_file(path):
     require(path.is_file() and not path.is_symlink(), f"Expected a regular file: {path}")
     return path.read_text(encoding="utf-8")
+
+
+def root_llms(pages, tag):
+    """Desired root llms files for the promoted release: text per name, or None
+    to withdraw that file.
+
+    Mirrors xtask's `sync-root-llms` copy-or-remove unit: the root pair mirrors
+    the release `/` redirects to, a release carrying only one of the two files
+    publishes neither, and master's own pair is never promoted in its place.
+    """
+    source = pages / tag / "en"
+    if not all((source / name).is_file() for name in LLMS_FILES):
+        return dict.fromkeys(LLMS_FILES)
+    return {name: read_file(source / name) for name in LLMS_FILES}
 
 
 def promote(*, pages, repo, master_sha, tag, workflow_ref, minimum, check_only=False):
@@ -95,6 +113,7 @@ def promote(*, pages, repo, master_sha, tag, workflow_ref, minimum, check_only=F
     require(tag in tags and current in tags and len(set(tags)) == len(tags),
             "Missing or duplicate version entries; run a normal docs deploy first")
     read_file(pages / "index.html")  # Check every output before writing any.
+    llms = root_llms(pages, tag)
     for entry in entries:
         if entry["tag"] == current:
             entry["label"] = current
@@ -111,6 +130,14 @@ def promote(*, pages, repo, master_sha, tag, workflow_ref, minimum, check_only=F
         (pages / "stable-version.txt").write_text(tag + "\n", encoding="utf-8")
         (pages / "versions.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         (pages / "index.html").write_text(index, encoding="utf-8")
+        for name, text in llms.items():
+            published = pages / name
+            if text is None:
+                published.unlink(missing_ok=True)
+                continue
+            staged = pages / f"{name}.tmp"
+            staged.write_text(text, encoding="utf-8")
+            staged.replace(published)
     print(f"{'Validated' if check_only else 'Promoted'} {tag} ({tag_sha}) from master {master_sha}")
 
 

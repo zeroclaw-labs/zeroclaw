@@ -125,6 +125,52 @@ class PromotionTest(unittest.TestCase):
         self.promote()  # Retry is idempotent.
         self.assertEqual(self.snapshot(), after)
 
+    def test_publishes_the_release_llms_pair_over_the_old_root_pair(self):
+        self.write("llms.txt", "v0.9.0 llms")
+        self.write("llms-full.txt", "v0.9.0 llms-full")
+        self.write(f"{TAG}/en/llms.txt", "v0.10.0 llms")
+        self.write(f"{TAG}/en/llms-full.txt", "v0.10.0 llms-full")
+        self.promote()
+        self.assertEqual((self.pages / "llms.txt").read_text(), "v0.10.0 llms")
+        self.assertEqual((self.pages / "llms-full.txt").read_text(), "v0.10.0 llms-full")
+        self.assertFalse((self.pages / "llms.txt.tmp").exists())
+        self.assertFalse((self.pages / "llms-full.txt.tmp").exists())
+
+    def test_creates_a_root_llms_pair_the_release_now_carries(self):
+        self.write(f"{TAG}/en/llms.txt", "v0.10.0 llms")
+        self.write(f"{TAG}/en/llms-full.txt", "v0.10.0 llms-full")
+        self.promote()
+        self.assertEqual((self.pages / "llms.txt").read_text(), "v0.10.0 llms")
+        self.assertEqual((self.pages / "llms-full.txt").read_text(), "v0.10.0 llms-full")
+
+    def test_withdraws_the_root_llms_pair_when_the_release_has_none(self):
+        self.write("llms.txt", "v0.9.0 llms")
+        self.write("llms-full.txt", "v0.9.0 llms-full")
+        self.write("master/en/llms.txt", "master llms")
+        self.write("master/en/llms-full.txt", "master llms-full")
+        self.promote()
+        self.assertFalse((self.pages / "llms.txt").exists())
+        self.assertFalse((self.pages / "llms-full.txt").exists())
+        self.assertEqual((self.pages / "master/en/llms.txt").read_text(), "master llms")
+        self.assertEqual((self.pages / "master/en/llms-full.txt").read_text(), "master llms-full")
+
+    def test_incomplete_release_pair_withdraws_the_whole_root_pair(self):
+        self.write("llms.txt", "v0.9.0 llms")
+        self.write("llms-full.txt", "v0.9.0 llms-full")
+        self.write(f"{TAG}/en/llms.txt", "v0.10.0 llms")
+        self.promote()
+        self.assertFalse((self.pages / "llms.txt").exists())
+        self.assertFalse((self.pages / "llms-full.txt").exists())
+
+    def test_check_only_leaves_the_root_llms_pair_alone(self):
+        self.write("llms.txt", "v0.9.0 llms")
+        self.write("llms-full.txt", "v0.9.0 llms-full")
+        self.write(f"{TAG}/en/llms.txt", "v0.10.0 llms")
+        self.write(f"{TAG}/en/llms-full.txt", "v0.10.0 llms-full")
+        before = self.snapshot()
+        self.promote(check_only=True)
+        self.assertEqual(self.snapshot(), before)
+
     def test_check_only_validates_without_writes(self):
         before = self.snapshot()
         self.promote(check_only=True)
@@ -279,63 +325,88 @@ class PromotionTest(unittest.TestCase):
         self.write("versions.json", "not json")
         self.rejected("Expecting value")
 
-    def test_actual_workflow_publishes_only_metadata_to_local_git_remote(self):
+    def run_workflow(self):
         # Run the workflow's actual shell and CLI against a disposable local
         # remote. Only gh's HTTP boundary is replaced; no Pages deployment.
-        with tempfile.TemporaryDirectory() as workspace:
-            root = Path(workspace)
-            remote = root / "remote.git"
-            source = root / "source"
-            source.mkdir()
-            git_env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
+        workspace = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
+        root = Path(workspace)
+        remote = root / "remote.git"
+        source = root / "source"
+        source.mkdir()
+        git_env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
 
-            def git(cwd, *args):
-                return subprocess.run(["git", *args], cwd=cwd, check=True,
-                                      env=git_env, capture_output=True, text=True).stdout.strip()
+        def git(cwd, *args):
+            return subprocess.run(["git", *args], cwd=cwd, check=True,
+                                  env=git_env, capture_output=True, text=True).stdout.strip()
 
-            git(root, "init", "--bare", str(remote))
-            for checkout in [self.pages, source]:
-                git(checkout, "init", "-b", "master")
-                git(checkout, "config", "user.name", "Docs Test")
-                git(checkout, "config", "user.email", "docs-test@example.invalid")
-                git(checkout, "remote", "add", "origin", str(remote))
-            git(self.pages, "add", "--all")
-            git(self.pages, "commit", "-m", "existing site")
-            before_sha = git(self.pages, "rev-parse", "HEAD")
-            git(self.pages, "push", "origin", "HEAD:refs/heads/gh-pages")
-            helper_path = source / "scripts/docs/promote_stable.py"
-            helper_path.parent.mkdir(parents=True)
-            shutil.copyfile(REPO / "scripts/docs/promote_stable.py", helper_path)
-            git(source, "add", "--all")
-            git(source, "commit", "-m", "workflow source")
-            master_sha = git(source, "rev-parse", "HEAD")
-            self.responses["branches/master"]["commit"]["sha"] = master_sha
-            self.responses[f"contents/docs/book/stable-version.txt?ref={master_sha}"] = content(TAG)
-            fixtures = root / "api.json"
-            fixtures.write_text(json.dumps(self.responses))
-            executable_dir = root / "bin"
-            executable_dir.mkdir()
-            gh = executable_dir / "gh"
-            gh.write_text('#!/usr/bin/env python3\nimport json, os, sys\n'
-                          'with open(os.environ["DOCS_TEST_API"]) as f: data = json.load(f)\n'
-                          'endpoint = sys.argv[-1].removeprefix("repos/zeroclaw-labs/zeroclaw/")\n'
-                          'print(json.dumps(data[endpoint]))\n')
-            gh.chmod(0o755)
-            workflow = (REPO / ".github/workflows/docs-deploy.yml").read_text()
-            body = workflow.split("      - name: Promote deployed stable docs\n", 1)[1].split("        run: |\n", 1)[1]
-            script = "\n".join(line[10:] for line in body.splitlines())
-            env = {**git_env, "PATH": str(executable_dir) + os.pathsep + os.environ["PATH"],
-                   "DOCS_TEST_API": str(fixtures), "TMPDIR": str(root),
-                   "GITHUB_REPOSITORY": "zeroclaw-labs/zeroclaw", "GITHUB_SHA": master_sha,
-                   "GITHUB_REF": "refs/heads/master", "TAG": TAG, "DOCS_MIN_VERSION": "v0.7.5"}
-            result = subprocess.run(["bash", "-c", script], cwd=source, env=env,
-                                    capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(git(remote, "rev-list", "--count", "gh-pages"), "1")
-            changed = git(remote, "diff", "--name-only", before_sha, "gh-pages").splitlines()
-            self.assertEqual(changed, ["index.html", "stable-version.txt", "versions.json"])
-            self.assertEqual(git(remote, "show", "gh-pages:stable-version.txt"), TAG)
-            self.assertEqual(git(source, "rev-parse", "HEAD"), master_sha)
+        git(root, "init", "--bare", str(remote))
+        for checkout in [self.pages, source]:
+            git(checkout, "init", "-b", "master")
+            git(checkout, "config", "user.name", "Docs Test")
+            git(checkout, "config", "user.email", "docs-test@example.invalid")
+            git(checkout, "remote", "add", "origin", str(remote))
+        git(self.pages, "add", "--all")
+        git(self.pages, "commit", "-m", "existing site")
+        before_sha = git(self.pages, "rev-parse", "HEAD")
+        git(self.pages, "push", "origin", "HEAD:refs/heads/gh-pages")
+        helper_path = source / "scripts/docs/promote_stable.py"
+        helper_path.parent.mkdir(parents=True)
+        shutil.copyfile(REPO / "scripts/docs/promote_stable.py", helper_path)
+        git(source, "add", "--all")
+        git(source, "commit", "-m", "workflow source")
+        master_sha = git(source, "rev-parse", "HEAD")
+        self.responses["branches/master"]["commit"]["sha"] = master_sha
+        self.responses[f"contents/docs/book/stable-version.txt?ref={master_sha}"] = content(TAG)
+        fixtures = root / "api.json"
+        fixtures.write_text(json.dumps(self.responses))
+        executable_dir = root / "bin"
+        executable_dir.mkdir()
+        gh = executable_dir / "gh"
+        gh.write_text('#!/usr/bin/env python3\nimport json, os, sys\n'
+                      'with open(os.environ["DOCS_TEST_API"]) as f: data = json.load(f)\n'
+                      'endpoint = sys.argv[-1].removeprefix("repos/zeroclaw-labs/zeroclaw/")\n'
+                      'print(json.dumps(data[endpoint]))\n')
+        gh.chmod(0o755)
+        workflow = (REPO / ".github/workflows/docs-deploy.yml").read_text()
+        body = workflow.split("      - name: Promote deployed stable docs\n", 1)[1].split("        run: |\n", 1)[1]
+        script = "\n".join(line[10:] for line in body.splitlines())
+        env = {**git_env, "PATH": str(executable_dir) + os.pathsep + os.environ["PATH"],
+               "DOCS_TEST_API": str(fixtures), "TMPDIR": str(root),
+               "GITHUB_REPOSITORY": "zeroclaw-labs/zeroclaw", "GITHUB_SHA": master_sha,
+               "GITHUB_REF": "refs/heads/master", "TAG": TAG, "DOCS_MIN_VERSION": "v0.7.5"}
+        result = subprocess.run(["bash", "-c", script], cwd=source, env=env,
+                                capture_output=True, text=True)
+        return result, git, remote, source, before_sha, master_sha
+
+    def test_actual_workflow_publishes_metadata_and_llms_to_local_git_remote(self):
+        self.write(f"{TAG}/en/llms.txt", "v0.10.0 llms")
+        self.write(f"{TAG}/en/llms-full.txt", "v0.10.0 llms-full")
+        result, git, remote, source, before_sha, master_sha = self.run_workflow()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(git(remote, "rev-list", "--count", "gh-pages"), "1")
+        changed = git(remote, "diff", "--name-only", before_sha, "gh-pages").splitlines()
+        self.assertEqual(changed, ["index.html", "llms-full.txt", "llms.txt",
+                                   "stable-version.txt", "versions.json"])
+        self.assertEqual(git(remote, "show", "gh-pages:stable-version.txt"), TAG)
+        self.assertEqual(git(remote, "show", "gh-pages:llms.txt"), "v0.10.0 llms")
+        self.assertEqual(git(remote, "show", "gh-pages:llms-full.txt"), "v0.10.0 llms-full")
+        self.assertEqual(git(source, "rev-parse", "HEAD"), master_sha)
+
+    def test_workflow_publishes_a_root_llms_pair_created_as_untracked_files(self):
+        # Metadata is already at the target, so the only change is the untracked
+        # root pair; the workflow's no-op check has to notice it.
+        self.write(f"{TAG}/en/llms.txt", "v0.10.0 llms")
+        self.write(f"{TAG}/en/llms-full.txt", "v0.10.0 llms-full")
+        self.promote()
+        (self.pages / "llms.txt").unlink()
+        (self.pages / "llms-full.txt").unlink()
+        result, git, remote, source, before_sha, master_sha = self.run_workflow()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        changed = git(remote, "diff", "--name-only", before_sha, "gh-pages").splitlines()
+        self.assertEqual(changed, ["llms-full.txt", "llms.txt"])
+        self.assertEqual(git(remote, "show", "gh-pages:llms.txt"), "v0.10.0 llms")
+        self.assertEqual(git(remote, "show", "gh-pages:llms-full.txt"), "v0.10.0 llms-full")
 
 
 class TransportTest(unittest.TestCase):
