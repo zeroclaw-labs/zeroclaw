@@ -9,6 +9,18 @@ name: Pub crates.io
 # The gate sits *after* preflight so the approver sees a green dry run before
 # approving. crates.io versions can be yanked but never replaced or deleted, so
 # an approval here is the last reversible moment.
+#
+# The stable release calls this workflow twice, through the `stage` input, so
+# that verification happens before anything irreversible:
+#
+#   stage: preflight — beside the binary builds, before the GitHub Release
+#                      exists. Verifies release_sha, which the tag does not
+#                      point at yet. Never uploads.
+#   stage: publish   — after the GitHub Release. Requires the tag to resolve to
+#                      the same commit, skips re-verification, and uploads the
+#                      dashboard bundle the preflight stage recorded.
+#
+# stage: all (the default, and the only manual path) runs both in one call.
 
 on:
   workflow_call:
@@ -26,10 +38,27 @@ on:
         required: false
         default: false
         type: boolean
+      stage:
+        description: "all: preflight then publish. preflight: verify release_sha before the tag exists; never uploads. publish: upload what an earlier preflight stage in this run verified"
+        required: false
+        default: all
+        type: string
+      verified_web_dist_digest:
+        description: "stage publish only: the web_dist_digest output of the earlier preflight stage"
+        required: false
+        default: ""
+        type: string
+    outputs:
+      web_dist_digest:
+        description: "Digest of the web/dist bundle preflight verified and uploaded as crates-io-web-dist"
+        value: ${{ jobs.preflight.outputs.web_dist_digest }}
     secrets:
+      # Not required: the preflight stage is called without it, so the token
+      # never reaches a run that cannot publish. The publish step fails closed
+      # when it is empty.
       CARGO_REGISTRY_TOKEN:
         description: "Repository-scoped crates.io token; referenced only by the protected publish job"
-        required: true
+        required: false
   workflow_dispatch:
     inputs:
       release_tag:
@@ -42,8 +71,11 @@ on:
         default: true
         type: boolean
 
+# Uploads are serialised across every run. A preflight-only call cannot upload,
+# so it gets a group of its own: sharing the publish group would let it queue
+# behind a long upload or, as the newer pending entry, cancel a pending one.
 concurrency:
-  group: crates-io-publish
+  group: ${{ inputs.stage == 'preflight' && format('crates-io-preflight-{0}', github.run_id) || 'crates-io-publish' }}
   cancel-in-progress: false
 
 permissions:
@@ -61,73 +93,46 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       sha: ${{ steps.meta.outputs.sha }}
       msrv: ${{ steps.meta.outputs.msrv }}
+      # The publish stage skips the build and forwards the digest the earlier
+      # preflight stage recorded; resolve_crates_release.sh has already
+      # rejected a missing or malformed one.
+      web_dist_digest: ${{ steps.web_digest.outputs.digest || inputs.verified_web_dist_digest }}
     steps:
+      # The release commit when the caller names one, since the preflight stage
+      # runs before the tag exists. Full history brings every tag, and the
+      # resolver checks that the tag, when present, is this same commit.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ inputs.release_tag }}
+          ref: ${{ inputs.release_sha || inputs.release_tag }}
           fetch-depth: 0
 
+      # Pins the exact commit preflight verified. The publish job checks that
+      # out rather than re-resolving the tag, so a tag moved between the two
+      # jobs cannot cause an unverified commit to be published with the token.
       - name: Validate tag and resolve version
         id: meta
         shell: bash
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
           RELEASE_SHA: ${{ inputs.release_sha }}
+          STAGE: ${{ inputs.stage }}
+          VERIFIED_WEB_DIST_DIGEST: ${{ inputs.verified_web_dist_digest }}
         run: |
           set -euo pipefail
+          resolved="$(bash scripts/release/resolve_crates_release.sh)"
+          printf '%s\n' "$resolved" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$resolved"
 
-          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::release_tag must be vX.Y.Z format. Got: ${RELEASE_TAG}"
-            exit 1
-          fi
-
-          version="${RELEASE_TAG#v}"
-          cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
-          msrv="$(sed -n 's/^rust-version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
-
-          if [[ "$cargo_version" != "$version" ]]; then
-            echo "::error::Tag ${RELEASE_TAG} does not match workspace version ${cargo_version}."
-            exit 1
-          fi
-          if [[ ! "$msrv" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
-            echo "::error::Could not read [workspace.package] rust-version (got '${msrv}')."
-            exit 1
-          fi
-
-          # The format check above only proves the string looks like a tag. A
-          # branch of the same name would resolve too, so confirm it really is a
-          # tag before anything downstream trusts it.
-          if ! git rev-parse -q --verify "refs/tags/${RELEASE_TAG}^{commit}" >/dev/null; then
-            echo "::error::${RELEASE_TAG} is not a tag in this repository."
-            exit 1
-          fi
-
-          # Pin the exact commit preflight verified. The publish job checks this
-          # out rather than re-resolving the tag, so a tag moved between the two
-          # jobs cannot cause an unverified commit to be published with the token.
-          sha="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
-
-          # When the caller knows which commit the release was built from, refuse
-          # to publish anything else. Without this, the tag could be moved between
-          # building the binaries and publishing the crates, and the two would
-          # describe different trees under one version number.
-          if [[ -n "${RELEASE_SHA:-}" && "$sha" != "$RELEASE_SHA" ]]; then
-            echo "::error::Tag ${RELEASE_TAG} resolves to ${sha}, but the release was built from ${RELEASE_SHA}."
-            exit 1
-          fi
-
-          {
-            echo "version=$version"
-            echo "sha=$sha"
-            echo "msrv=$msrv"
-          } >> "$GITHUB_OUTPUT"
-          echo "Preflight pinned ${RELEASE_TAG} to ${sha}"
-
+      # Everything from here to the upload is verification. The publish stage
+      # already has it from the preflight stage earlier in the same run.
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        if: steps.meta.outputs.stage != 'publish'
         with:
           toolchain: ${{ steps.meta.outputs.msrv }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.meta.outputs.stage != 'publish'
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: steps.meta.outputs.stage != 'publish'
         with:
           node-version-file: '.nvmrc'
           cache: npm
@@ -136,7 +141,9 @@ jobs:
       # The root crate's `include` ships `/web/dist/**/*`, and those files are
       # gitignored build output, so a checkout alone leaves only logo.png. Build
       # it here exactly as the release workflow's `web` job does, so the
-      # published tarball is complete rather than half-empty.
+      # published tarball is complete rather than half-empty. This is the only
+      # build: the publish job restores this tree from an artifact and checks
+      # its digest, so the bundle uploaded is the bundle verified here.
       #
       # Note what this does NOT do: `cargo install` copies executables into
       # ~/.cargo/bin and does not install packaged data files, and the gateway
@@ -147,12 +154,25 @@ jobs:
       # which `embedded-web` cannot currently do from a registry build. Tracked
       # as follow-up; the install script and packaged builds are unaffected.
       - name: Build web dashboard
+        if: steps.meta.outputs.stage != 'publish'
         run: cargo web build
 
+      - name: Record web dashboard digest
+        id: web_digest
+        if: steps.meta.outputs.stage != 'publish'
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest="$(bash scripts/release/web_dist_digest.sh web/dist)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "web/dist digest: $digest"
+
       - name: Validate crates.io publish contract
+        if: steps.meta.outputs.stage != 'publish'
         run: cargo test --locked --test architecture publish_contract
 
       - name: Preflight
+        if: steps.meta.outputs.stage != 'publish'
         shell: bash
         # Registry packages are keyed by name/version. Reusing a cached target
         # across source revisions of the same unreleased version can preserve
@@ -160,7 +180,22 @@ jobs:
         # the earlier contract test still benefits from rust-cache.
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/crates-io-package-target
+          WEB_DIST_DIGEST: ${{ steps.web_digest.outputs.digest }}
         run: ./scripts/release/publish-crates.sh "${{ steps.meta.outputs.version }}"
+
+      # Uploaded only after the dry run passed, so the artifact is the tree that
+      # was packaged and compiled. The name must not collide with the release
+      # workflow's `web-dist`: a called workflow shares its caller's run.
+      # Retention covers the longest a pending `crates-io` review can wait, so a
+      # late approval or a re-run of the failed publish job still finds it.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.meta.outputs.stage != 'publish'
+        with:
+          name: crates-io-web-dist
+          path: web/dist/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Summarize
         if: always()
@@ -169,18 +204,25 @@ jobs:
           VERSION: ${{ steps.meta.outputs.version }}
           TAG: ${{ inputs.release_tag }}
           DRY_RUN: ${{ inputs.dry_run }}
+          STAGE: ${{ steps.meta.outputs.stage }}
+          SHA: ${{ steps.meta.outputs.sha }}
+          WEB_DIST_DIGEST: ${{ steps.web_digest.outputs.digest || inputs.verified_web_dist_digest }}
         run: |
           {
             echo "### crates.io preflight"
+            echo "- stage: \`${STAGE}\`"
             echo "- tag: \`${TAG}\`"
+            echo "- commit: \`${SHA}\`"
             echo "- version: \`${VERSION}\`"
             echo "- dry_run: \`${DRY_RUN}\`"
+            echo "- web/dist digest: \`${WEB_DIST_DIGEST}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
   publish:
     name: Publish to crates.io
     needs: [preflight]
-    if: ${{ inputs.dry_run == false }}
+    # Called by workflow_dispatch, `inputs.stage` is empty and means `all`.
+    if: ${{ inputs.dry_run == false && inputs.stage != 'preflight' }}
     runs-on: ubuntu-latest
     timeout-minutes: 350
     # v0.8.5 creates the relay protocol, shared TLS, and ZeroRelay crate names.
@@ -203,14 +245,13 @@ jobs:
         with:
           toolchain: ${{ needs.preflight.outputs.msrv }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version-file: '.nvmrc'
-          cache: npm
-          cache-dependency-path: web/package-lock.json
 
-      - name: Build web dashboard
-        run: cargo web build
+      # No rebuild here. Restore the dashboard preflight packaged and verified;
+      # the publisher recomputes its digest and refuses to upload on mismatch.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: crates-io-web-dist
+          path: web/dist/
 
       - name: Publish
         id: publish
@@ -218,8 +259,14 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           VERSION: ${{ needs.preflight.outputs.version }}
+          WEB_DIST_DIGEST: ${{ needs.preflight.outputs.web_dist_digest }}
         run: |
           set -euo pipefail
+          # An empty digest would silently skip the bundle check in the script.
+          if [[ ! "${WEB_DIST_DIGEST:-}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Preflight did not record a web/dist digest; refusing to publish an unverified bundle."
+            exit 1
+          fi
           if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
             echo "::error::The repository secret CARGO_REGISTRY_TOKEN is required to publish."
             echo "::error::Mint one at https://crates.io/settings/tokens. A crate that does not"

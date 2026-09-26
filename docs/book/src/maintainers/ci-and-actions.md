@@ -235,6 +235,10 @@ authoritative automation.
 
 Docker images push to GHCR using the automatic `GITHUB_TOKEN`; there is no separate registry token. Store `CARGO_REGISTRY_TOKEN` as a repository secret and map only that named secret into the reusable publisher. The called workflow references it only in the irreversible publish step, whose job requires approval through the `crates-io` environment; the tokenless preflight neither references nor exports it. The preflight packages the same immutable release commit before an approver can start the publish job.
 
+Release Stable calls the publisher twice through its `stage` input. The `crates-preflight` job runs `stage: preflight` beside the binary builds, with no secret. A dispatched release has no tag yet, so it verifies the run's commit directly. The GitHub Release `publish` job needs it, so a crates failure stops the release before anything is public. After the GitHub Release, the `crates` job runs `stage: publish` with the token. That stage requires the new tag to resolve to the same commit, skips re-verification, and uploads the dashboard bundle whose digest the preflight stage recorded. A manual dispatch of `pub-crates.yml` still runs both halves in one call.
+
+The root crate ships the generated dashboard under `web/dist`. The preflight builds it once, records a digest of every file path and its content, verifies the packages with that tree, and uploads it as the `crates-io-web-dist` artifact. The publish job does not rebuild the dashboard. It restores that artifact, and `publish-crates.sh` refuses to reach crates.io unless the restored tree matches the recorded digest. The artifact is kept for 30 days so a late approval or a re-run of the failed publish job still finds it.
+
 Most crates in the coordinated release set already exist and are eligible for
 crates.io trusted publishing. The v0.8.5 release additionally creates
 `zerorelay`, `zeroclaw-relay-proto`, and `zeroclaw-tls`, so its bootstrap token
