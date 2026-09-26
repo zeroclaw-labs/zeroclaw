@@ -69,3 +69,5 @@ are untouched.
 
 For the runtime internals, the permission model, the memory model, and the
 agent loop, see [Runtime internals](./internals.md).
+
+For a complete configuration walkthrough, see [Multi-agent setup](./multi-agent-setup.md).

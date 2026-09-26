@@ -5,7 +5,7 @@ section: how the runtime enforces per-agent permissions, scopes memory, and
 attributes logs. For configuring and running agents, start at
 [Agents](./overview.md); for the schema-level field reference, see
 [Config](../reference/config.md); for live setup steps, see
-[Multi-agent setup](../contributing/multi-agent-setup.md).
+[Multi-agent setup](./multi-agent-setup.md).
 
 ## Permissions model
 
