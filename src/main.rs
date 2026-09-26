@@ -5584,6 +5584,101 @@ async fn fetch_locales(locale: &str, catalog: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// One-shot report commands whose output operators and agents routinely pipe
+/// into `head`, `grep -m`, or a pager that exits early. Rust ignores `SIGPIPE`
+/// at startup, so once the reader is gone every `println!` fails with `EPIPE`
+/// and panics; the release profile's `panic = "abort"` then turns that panic
+/// into a `SIGABRT` core. `zeroclaw cron list | head` dumped core on every run
+/// this way while printing output that looked complete.
+///
+/// For these commands the conventional Unix behaviour, terminating quietly on
+/// `SIGPIPE`, is the right one. Commands that stay resident or drive the agent
+/// runtime (daemon, gateway, ACP, an interactive agent, eval) keep the ignored
+/// disposition on purpose: they write to child processes and stdio protocols,
+/// where a vanished peer must surface as an error they already handle rather
+/// than as a fatal signal. This is an allow-list so that a command left out
+/// keeps today's behaviour instead of gaining a new way to die.
+#[cfg(unix)]
+fn restores_default_sigpipe(command: &Commands) -> bool {
+    match command {
+        Commands::Status { .. }
+        | Commands::Doctor { .. }
+        | Commands::Browse { .. }
+        | Commands::Integrations { .. }
+        | Commands::Completions { .. }
+        | Commands::MarkdownHelp
+        | Commands::MarkdownSchema => true,
+        Commands::Cron { cron_command } => matches!(cron_command, CronCommands::List),
+        Commands::Channel { channel_command } => {
+            matches!(channel_command, ChannelCommands::List)
+        }
+        Commands::Channels { channels_command } => {
+            matches!(channels_command, ChannelsCommands::List { .. })
+        }
+        Commands::Agents { agents_command } => {
+            matches!(agents_command, AgentsCommands::List)
+        }
+        Commands::Providers { providers_command } => {
+            matches!(
+                providers_command,
+                None | Some(ProvidersCommands::List { .. })
+            )
+        }
+        Commands::Models { model_command } => matches!(
+            model_command,
+            ModelCommands::List { .. } | ModelCommands::Status
+        ),
+        Commands::Skills { skill_command } => matches!(skill_command, SkillCommands::List { .. }),
+        Commands::Sop { sop_command } => matches!(
+            sop_command,
+            SopCommands::List
+                | SopCommands::Show { .. }
+                | SopCommands::Pending
+                | SopCommands::Logs { .. }
+                | SopCommands::Graph { .. }
+        ),
+        Commands::Memory { memory_command } => matches!(
+            memory_command,
+            MemoryCommands::List { .. } | MemoryCommands::Get { .. } | MemoryCommands::Stats
+        ),
+        Commands::Config { config_command } => matches!(
+            config_command,
+            ConfigCommands::Schema { .. }
+                | ConfigCommands::List { .. }
+                | ConfigCommands::Get { .. }
+                | ConfigCommands::Docs
+        ),
+        Commands::Auth { auth_command } => {
+            matches!(auth_command, AuthCommands::List | AuthCommands::Status)
+        }
+        #[cfg(feature = "agent-runtime")]
+        Commands::Security { security_command } => matches!(
+            security_command,
+            SecurityCommands::Status { .. } | SecurityCommands::ListClientCerts { .. }
+        ),
+        #[cfg(feature = "plugins-wasm")]
+        Commands::Plugin { plugin_command } => matches!(
+            plugin_command,
+            PluginCommands::List { .. }
+                | PluginCommands::Search { .. }
+                | PluginCommands::Info { .. }
+        ),
+        _ => false,
+    }
+}
+
+/// Restore the default `SIGPIPE` disposition so a closed stdout terminates the
+/// process quietly instead of aborting it. See [`restores_default_sigpipe`].
+#[cfg(unix)]
+fn restore_default_sigpipe() {
+    // SAFETY: `signal` with `SIG_DFL` only changes the process-wide disposition
+    // of `SIGPIPE`; it installs no handler that could run on any thread, and it
+    // is called once before the selected command writes anything.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 fn main() -> Result<()> {
     let command = Cli::command();
 
@@ -6133,6 +6228,11 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
     }
 
     let cli = Cli::from_arg_matches(&cmd.get_matches()).map_err(|e| e.exit())?;
+
+    #[cfg(unix)]
+    if restores_default_sigpipe(&cli.command) {
+        restore_default_sigpipe();
+    }
 
     if let Some(config_dir) = &cli.config_dir
         && config_dir.trim().is_empty()
@@ -12404,6 +12504,47 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::net::TcpListener;
+
+    #[cfg(unix)]
+    #[test]
+    fn report_commands_restore_default_sigpipe() {
+        for args in [
+            &["zeroclaw", "cron", "list"][..],
+            &["zeroclaw", "status"],
+            &["zeroclaw", "doctor"],
+            &["zeroclaw", "channel", "list"],
+            &["zeroclaw", "agents", "list"],
+            &["zeroclaw", "providers"],
+            &["zeroclaw", "memory", "stats"],
+            &["zeroclaw", "config", "get", "gateway.port"],
+            &["zeroclaw", "markdown-help"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            assert!(
+                restores_default_sigpipe(&cli.command),
+                "{args:?} should exit quietly when its reader closes early"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resident_and_runtime_commands_keep_sigpipe_ignored() {
+        for args in [
+            &["zeroclaw", "daemon"][..],
+            &["zeroclaw", "gateway"],
+            &["zeroclaw", "agent", "--agent", "fable", "--message", "hi"],
+            &["zeroclaw", "channel", "start"],
+            &["zeroclaw", "cron", "pause", "job-1"],
+            &["zeroclaw", "memory", "clear"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            assert!(
+                !restores_default_sigpipe(&cli.command),
+                "{args:?} must keep SIGPIPE ignored so a vanished peer is an error, not a signal"
+            );
+        }
+    }
 
     #[cfg(feature = "agent-runtime")]
     struct SelectorTestTerminal {
