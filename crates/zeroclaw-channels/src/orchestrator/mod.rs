@@ -959,10 +959,11 @@ impl IngressTaskTracker {
     }
 
     fn spawn(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
-        self.tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .spawn(future);
+        let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        while let Some(result) = tasks.try_join_next() {
+            log_worker_join_result(result);
+        }
+        tasks.spawn(future);
     }
 
     async fn wait_drained(&self) {
@@ -18454,6 +18455,33 @@ fn channel_trim_resync_preserves_a_concurrent_workers_later_turn_across_eviction
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ingress_task_tracker_reaps_completed_tasks_before_spawning() {
+        let tracker = IngressTaskTracker::new();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        tracker.spawn(async move {
+            let _ = completed_tx.send(());
+        });
+        completed_rx.await.unwrap();
+
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        tracker.spawn(async move {
+            let _ = release_rx.await;
+        });
+        assert_eq!(
+            tracker
+                .tasks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            1,
+            "a completed task must not remain alongside the live task"
+        );
+
+        release_tx.send(()).unwrap();
+        tracker.wait_drained().await;
+    }
 
     #[test]
     fn shared_room_history_keeps_the_speaker_for_any_channel() {
