@@ -268,12 +268,43 @@ async fn write_bundle(plan: &mut ExportPlan, out: &Path, force: bool) -> Result<
 /// a symlink. Canonicalizing the whole destination here would replace the name
 /// with its target before the no-follow admission check ever sees it.
 fn resolve_destination_path(path: &Path) -> Result<PathBuf> {
-    let absolute = std::path::absolute(path)
-        .with_context(|| format!("failed to resolve {}", path.display()))?;
+    let absolute = absolute_export_path(path)?;
     let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name()) else {
         return Ok(absolute);
     };
     Ok(resolve_path(parent)?.join(name))
+}
+
+/// Check traversed parents before platform normalization can erase them.
+fn absolute_export_path(path: &Path) -> Result<PathBuf> {
+    // Windows absolute-path resolution collapses `missing/..` without touching
+    // the filesystem. Validate each directory before `..` while it is still
+    // present, so source and destination admission cannot mistake that path for
+    // one whose ancestors exist. Configured ancestor symlinks remain allowed;
+    // the later handle-bound opens enforce the source and destination boundaries.
+    let mut prefix = PathBuf::new();
+    for component in path.components() {
+        if component == std::path::Component::ParentDir {
+            let traversed = if prefix.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                prefix.as_path()
+            };
+            std::fs::metadata(traversed)
+                .and_then(|metadata| {
+                    if metadata.is_dir() {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::from(std::io::ErrorKind::NotADirectory))
+                    }
+                })
+                .with_context(|| {
+                    format!("failed to resolve {} before `..`", traversed.display())
+                })?;
+        }
+        prefix.push(component.as_os_str());
+    }
+    std::path::absolute(path).with_context(|| format!("failed to resolve {}", path.display()))
 }
 
 /// Resolve `path` to an absolute, symlink-free form.
@@ -284,8 +315,7 @@ fn resolve_destination_path(path: &Path) -> Result<PathBuf> {
 /// symlinked ancestor (`/tmp` → `/private/tmp` on macOS, an operator's
 /// symlinked data dir anywhere) would otherwise hide an overlap.
 fn resolve_path(path: &Path) -> Result<PathBuf> {
-    let absolute = std::path::absolute(path)
-        .with_context(|| format!("failed to resolve {}", path.display()))?;
+    let absolute = absolute_export_path(path)?;
     let mut below: Vec<std::ffi::OsString> = Vec::new();
     let mut cursor = absolute.as_path();
     loop {
@@ -868,8 +898,7 @@ fn open_configured_root(path: &Path) -> Result<SourceRoot> {
             )
         );
     }
-    let absolute = std::path::absolute(path)
-        .with_context(|| format!("failed to resolve {}", path.display()))?;
+    let absolute = absolute_export_path(path)?;
     let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name()) else {
         // Unreachable after the check above; kept as the same refusal so a
         // platform surprise fails closed rather than publishing.
