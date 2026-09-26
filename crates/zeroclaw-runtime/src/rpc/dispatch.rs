@@ -4634,13 +4634,16 @@ impl RpcDispatcher {
             .apply_model_provider(
                 session_id,
                 session_generation,
-                provider,
-                provider_name,
-                model,
-                resolver,
-                dispatcher,
-                config_generation,
-                Some(temperature),
+                crate::rpc::session::ModelProviderUpdate {
+                    model_provider: provider,
+                    model_provider_name: provider_name,
+                    model_name: model,
+                    model_route_resolver: resolver,
+                    tool_dispatcher: dispatcher,
+                    config_generation: Arc::clone(&config_generation),
+                    temperature: Some(temperature),
+                    multimodal_config: config_generation.multimodal.clone(),
+                },
             )
             .await
     }
@@ -5581,15 +5584,18 @@ impl RpcDispatcher {
                 .apply_model_provider(
                     &req.session_id,
                     session_generation,
-                    model_provider,
-                    model_provider_name,
-                    model_name,
-                    model_route_resolver,
-                    tool_dispatcher,
-                    config_generation,
-                    // Temperature is already committed through
-                    // `set_overrides_gated` on this path.
-                    None,
+                    crate::rpc::session::ModelProviderUpdate {
+                        model_provider,
+                        model_provider_name,
+                        model_name,
+                        model_route_resolver,
+                        tool_dispatcher,
+                        config_generation: Arc::clone(&config_generation),
+                        // Temperature is already committed through
+                        // `set_overrides_gated` on this path.
+                        temperature: None,
+                        multimodal_config: config_generation.multimodal.clone(),
+                    },
                 )
                 .await
                 .then_some(())
@@ -6675,17 +6681,18 @@ impl RpcDispatcher {
                 .apply_model_provider(
                     &session_id,
                     session_generation,
-                    model_provider,
-                    model_provider_name,
-                    model_name,
-                    model_route_resolver,
-                    tool_dispatcher,
-                    Arc::clone(&config_generation),
-                    // Temperature travels in the same state transition as the
-                    // provider box rather than a follow-up `set_temperature`,
-                    // so a session cannot briefly show the new provider with
-                    // the old profile temperature.
-                    Some(temperature),
+                    crate::rpc::session::ModelProviderUpdate {
+                        model_provider,
+                        model_provider_name,
+                        model_name,
+                        model_route_resolver,
+                        tool_dispatcher,
+                        config_generation: Arc::clone(&config_generation),
+                        // Temperature travels in the same state transition as
+                        // the provider box rather than a follow-up setter.
+                        temperature: Some(temperature),
+                        multimodal_config: config_generation.multimodal.clone(),
+                    },
                 )
                 .await;
             if applied {
@@ -9292,6 +9299,7 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<St
         },
         TurnEvent::HistoryTrimmed {
             dropped_messages,
+            dropped_turns,
             kept_turns,
             reason,
             token_budget,
@@ -9303,6 +9311,7 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<St
         } => SessionUpdateEvent::HistoryTrimmed {
             session_id: session_id.to_string(),
             dropped_messages: *dropped_messages,
+            dropped_turns: *dropped_turns,
             kept_turns: *kept_turns,
             reason: reason.clone(),
             token_budget: *token_budget,
@@ -18754,6 +18763,7 @@ mod tests {
     fn history_trimmed_notification() {
         let event = TurnEvent::HistoryTrimmed {
             dropped_messages: 12,
+            dropped_turns: 4,
             kept_turns: 1,
             reason: "context token budget exceeded".into(),
             token_budget: Some(500_000),
@@ -18769,6 +18779,7 @@ mod tests {
         assert_eq!(v["params"]["type"], "history_trimmed");
         assert_eq!(v["params"]["session_id"], "s1");
         assert_eq!(v["params"]["dropped_messages"], 12);
+        assert_eq!(v["params"]["dropped_turns"], 4);
         assert_eq!(v["params"]["kept_turns"], 1);
         assert_eq!(v["params"]["reason"], "context token budget exceeded");
         assert_eq!(v["params"]["token_budget"], 500_000);
@@ -18785,6 +18796,7 @@ mod tests {
         // keep resolving the provenance label.
         let event = TurnEvent::HistoryTrimmed {
             dropped_messages: 4,
+            dropped_turns: 1,
             kept_turns: 2,
             reason: "context token budget exceeded".into(),
             token_budget: Some(10_000),
@@ -21031,6 +21043,7 @@ mod tests {
         let (dispatcher, mut rx, _sessions) = make_dispatcher_with_capture(config);
         let event = TurnEvent::HistoryTrimmed {
             dropped_messages: 4,
+            dropped_turns: 2,
             kept_turns: 1,
             reason: "message cap".into(),
             token_budget: None,
@@ -21551,16 +21564,26 @@ mod tests {
             ConversationMessage::Chat(ChatMessage::assistant("new answer")),
         ];
 
+        // The limit counts complete turns: keeping one turn retains the
+        // newest exchange and drops the older tool-bearing turn whole.
         let active = crate::agent::history_trim::trim_conversation_to_recent_turns(
             durable.clone(),
-            2,
-            crate::agent::history_trim::history_trim_target(2, 1.0),
+            1,
             false,
         );
         assert!(active.trimmed);
         assert!(!active.history.iter().any(|message| matches!(
             message,
             ConversationMessage::Chat(chat) if chat.content == "old question"
+        )));
+        assert!(!active.history.iter().any(|message| matches!(
+            message,
+            ConversationMessage::ToolResults(results)
+                if results.iter().any(|result| result.tool_call_id == "old-call")
+        )));
+        assert!(active.history.iter().any(|message| matches!(
+            message,
+            ConversationMessage::Chat(chat) if chat.content == "new question"
         )));
 
         let transcript = conversation_message_entries(&durable);
@@ -23906,7 +23929,7 @@ mod tests {
             .runtime_profiles
             .get_mut("reloadable")
             .expect("runtime profile exists")
-            .max_history_messages = Some(2);
+            .max_history_messages = Some(1);
 
         let agent = dispatcher
             .ctx
@@ -23936,194 +23959,6 @@ mod tests {
                 if chat.content == "new assistant"
         )));
     }
-
-    #[tokio::test]
-    async fn existing_session_uses_reloaded_history_trim_low_water() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut config = make_model_refresh_test_config(&tmp);
-        config
-            .agents
-            .get_mut("test-agent")
-            .expect("test agent exists")
-            .runtime_profile = "reloadable".into();
-        config.runtime_profiles.insert(
-            "reloadable".into(),
-            zeroclaw_config::schema::RuntimeProfileConfig {
-                max_history_messages: Some(4),
-                ..Default::default()
-            },
-        );
-
-        let dispatcher = make_config_set_test_dispatcher(config);
-        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
-        dispatcher
-            .ctx
-            .config
-            .write()
-            .runtime_profiles
-            .get_mut("reloadable")
-            .expect("runtime profile exists")
-            .history_trim_low_water = Some(1.0);
-
-        let agent = dispatcher
-            .ctx
-            .sessions
-            .get_agent(&session_id)
-            .await
-            .expect("session agent exists");
-        let mut agent = agent.lock().await;
-        let event = agent.seed_history_with_event(&[
-            ChatMessage::user("old user"),
-            ChatMessage::assistant("old answer"),
-            ChatMessage::user("middle user"),
-            ChatMessage::assistant("middle answer"),
-            ChatMessage::user("new user"),
-            ChatMessage::assistant("new answer"),
-        ]);
-
-        let Some(TurnEvent::HistoryTrimmed {
-            dropped_messages,
-            kept_turns,
-            ..
-        }) = event
-        else {
-            panic!("an existing session must observe the reloaded low-water fraction");
-        };
-        assert_eq!(dropped_messages, 2, "legacy 1.0 refills to the cap of 4");
-        assert_eq!(kept_turns, 2, "legacy 1.0 retains the newest two turns");
-        let breadcrumb = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
-        let history = agent.history();
-        assert_eq!(
-            history.len(),
-            6,
-            "synthesized system prompt plus breadcrumb plus the retained body"
-        );
-        assert!(!history.iter().any(|message| matches!(
-            message,
-            zeroclaw_providers::ConversationMessage::Chat(chat)
-                if chat.content == "old user" || chat.content == "old answer"
-        )));
-        for retained in ["middle user", "middle answer", "new user", "new answer"] {
-            assert!(
-                history.iter().any(|message| matches!(
-                    message,
-                    zeroclaw_providers::ConversationMessage::Chat(chat)
-                        if chat.content == retained
-                )),
-                "fraction 1.0 loaded after construction must retain {retained}"
-            );
-        }
-        assert_eq!(
-            history
-                .iter()
-                .filter(|message| matches!(
-                    message,
-                    zeroclaw_providers::ConversationMessage::Chat(chat)
-                        if chat.role == "user" && chat.content == breadcrumb
-                ))
-                .count(),
-            1,
-            "exactly one synthetic breadcrumb accompanies the retained turns"
-        );
-    }
-
-    #[tokio::test]
-    async fn config_set_persists_history_trim_low_water_and_trims_existing_session() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut config = make_model_refresh_test_config(&tmp);
-        config
-            .agents
-            .get_mut("test-agent")
-            .expect("test agent exists")
-            .runtime_profile = "reloadable".into();
-        config.runtime_profiles.insert(
-            "reloadable".into(),
-            zeroclaw_config::schema::RuntimeProfileConfig {
-                max_history_messages: Some(4),
-                history_trim_low_water: None,
-                ..Default::default()
-            },
-        );
-
-        let dispatcher = make_config_set_test_dispatcher(config);
-        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
-
-        let set = dispatcher
-            .handle_config_set(&json!({
-                "prop": "runtime_profiles.reloadable.history_trim_low_water",
-                "value": 1.0
-            }))
-            .await;
-        assert!(
-            set.is_ok(),
-            "config/set must accept the low-water fraction: {set:?}"
-        );
-
-        let config_path = tmp.path().join("config.toml");
-        let disk = std::fs::read_to_string(&config_path).unwrap();
-        let reloaded: zeroclaw_config::schema::Config = toml::from_str(&disk)
-            .unwrap_or_else(|e| panic!("config must reload after the fraction write: {e}\n{disk}"));
-        assert_eq!(
-            reloaded
-                .runtime_profiles
-                .get("reloadable")
-                .and_then(|profile| profile.history_trim_low_water),
-            Some(1.0),
-            "the RPC write must persist the exact fraction to disk"
-        );
-
-        let agent = dispatcher
-            .ctx
-            .sessions
-            .get_agent(&session_id)
-            .await
-            .expect("session agent exists");
-        let mut agent = agent.lock().await;
-        let event = agent.seed_history_with_event(&[
-            ChatMessage::user("old user"),
-            ChatMessage::assistant("old answer"),
-            ChatMessage::user("middle user"),
-            ChatMessage::assistant("middle answer"),
-            ChatMessage::user("new user"),
-            ChatMessage::assistant("new answer"),
-        ]);
-
-        let Some(TurnEvent::HistoryTrimmed {
-            dropped_messages,
-            kept_turns,
-            ..
-        }) = event
-        else {
-            panic!("an existing session must observe the persisted low-water fraction");
-        };
-        assert_eq!(
-            dropped_messages, 2,
-            "fraction 1.0 written via config/set refills to the cap of 4"
-        );
-        assert_eq!(kept_turns, 2, "fraction 1.0 retains the newest two turns");
-        let history = agent.history();
-        assert_eq!(
-            history.len(),
-            6,
-            "synthesized system prompt plus breadcrumb plus the retained body"
-        );
-        assert!(!history.iter().any(|message| matches!(
-            message,
-            zeroclaw_providers::ConversationMessage::Chat(chat)
-                if chat.content == "old user" || chat.content == "old answer"
-        )));
-        for retained in ["middle user", "middle answer", "new user", "new answer"] {
-            assert!(
-                history.iter().any(|message| matches!(
-                    message,
-                    zeroclaw_providers::ConversationMessage::Chat(chat)
-                        if chat.content == retained
-                )),
-                "fraction 1.0 persisted via config/set must retain {retained}"
-            );
-        }
-    }
-
     #[tokio::test]
     async fn config_set_provider_model_refreshes_matching_live_session() {
         let tmp = tempfile::TempDir::new().unwrap();

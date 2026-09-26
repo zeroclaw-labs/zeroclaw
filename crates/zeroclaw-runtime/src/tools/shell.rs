@@ -1506,6 +1506,68 @@ mod tests {
         })
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shell_preserves_inherited_powershell_cache_path() {
+        const CHILD: &str = "ZEROCLAW_SHELL_CACHE_TEST_CHILD";
+        const KEY: &str = "PSModuleAnalysisCachePath";
+        const VALUE: &str = r"C:\synthetic cache\ModuleAnalysisCache";
+
+        if let Ok(case) = std::env::var(CHILD) {
+            let expected = match case.as_str() {
+                "present" => Some(VALUE),
+                "absent" => None,
+                _ => panic!("unknown cache forwarding test case"),
+            };
+            assert_eq!(std::env::var(KEY).ok().as_deref(), expected);
+            let tool = ShellTool::new(
+                test_security_with_env_cmd(),
+                Arc::new(NativeRuntime::with_shell("cmd".into())),
+            );
+            let result = tool
+                .execute(json!({"command": format!("set {KEY}"), "approved": true}))
+                .await
+                .unwrap();
+            if let Some(value) = expected {
+                assert!(result.success, "{:?}", result.error);
+                assert_eq!(result.output.trim(), format!("{KEY}={value}"));
+            } else {
+                assert!(!result.success);
+                assert!(result.output.trim().is_empty());
+                assert!(result.error.as_deref().unwrap_or_default().contains(KEY));
+            }
+            return;
+        }
+
+        // Set the inherited value only on a separate harness process, never on
+        // the shared test process. cmd reads it without touching a cache file.
+        for case in ["present", "absent"] {
+            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "tools::shell::tests::shell_preserves_inherited_powershell_cache_path",
+                ])
+                .env(CHILD, case)
+                .kill_on_drop(true);
+            if case == "present" {
+                child.env(KEY, VALUE);
+            } else {
+                child.env_remove(KEY);
+            }
+            let output = tokio::time::timeout(std::time::Duration::from_secs(120), child.output())
+                .await
+                .expect("isolated cache test timed out")
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(), "{case}: {stdout}");
+            assert!(
+                stdout.contains("1 passed;"),
+                "exact child test was not executed: {stdout}"
+            );
+        }
+    }
+
     #[cfg(target_os = "windows")]
     fn env_print_command() -> &'static str {
         "set"

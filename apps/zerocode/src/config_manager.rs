@@ -2518,6 +2518,33 @@ impl App {
 
     // ── Composite tab helpers ──────────────────────────────────────
 
+    /// Drop the cached composite-tab data for a section prefix, without
+    /// issuing any request. A save inside a composite section can retarget
+    /// the data its Skills or Personality tab shows (a bundle's directory,
+    /// an agent's workspace.path); clearing the cached list lets
+    /// on_tab_switched refetch it on the next tab entry, so no request is
+    /// issued unless the user goes there. Invalidate on every successful
+    /// save in the section rather than only when the saved field is the
+    /// retargeting one: a field-name check is brittle, and the cost of a
+    /// wrong guess is one lazy list request.
+    fn invalidate_composite_state(&mut self, prefix: &str) {
+        if prefix.starts_with("agents.") {
+            self.personality_files.clear();
+            self.personality_active_file = None;
+            self.personality_cursor = 0;
+            self.personality_content.clear();
+            self.personality_loaded.clear();
+        } else if prefix.starts_with("skill-bundles.") {
+            self.skills_list.clear();
+            self.skills_active = None;
+            self.skills_cursor = 0;
+            self.skills_body.clear();
+            self.skills_body_loaded.clear();
+            self.skills_frontmatter = Default::default();
+            self.skills_frontmatter_loaded = Default::default();
+        }
+    }
+
     /// Called after ←/→ tab switch — loads data for composite tabs.
     async fn on_tab_switched(&mut self, term: &mut Term) -> Result<()> {
         // Silent refresh of the underlying field list so values stay
@@ -3308,12 +3335,8 @@ impl App {
                     self.edit_buf.pop();
                 }
                 Some(ConfigEditorAction::Save) => {
-                    if let Screen::FieldEdit {
-                        prefix, field_idx, ..
-                    } = &self.screen
-                    {
+                    if let Screen::FieldEdit { field_idx, .. } = &self.screen {
                         let prop = self.fields[*field_idx].path.clone();
-                        let prefix = prefix.clone();
                         let entries: Vec<String> = self
                             .edit_buf
                             .lines()
@@ -3330,7 +3353,6 @@ impl App {
                                     "zc-config-status-field-set",
                                     &[("prop", &prop)],
                                 ));
-                                self.load_fields(&prefix).await?;
                                 self.pop_to_field_list_keep_cursor().await?;
                             }
                             Err(e) => {
@@ -3359,10 +3381,7 @@ impl App {
                 self.pop_to_field_list().await?;
             }
             Some(ConfigEditorAction::Confirm) => {
-                if let Screen::FieldEdit {
-                    prefix, field_idx, ..
-                } = &self.screen
-                {
+                if let Screen::FieldEdit { field_idx, .. } = &self.screen {
                     let field = &self.fields[*field_idx];
                     if let Some(status) =
                         scalar_validation_status(field.kind, &self.edit_buf, &field.path)
@@ -3372,14 +3391,12 @@ impl App {
                     }
                     let prop = field.path.clone();
                     let value = serde_json::Value::String(self.edit_buf.clone());
-                    let prefix = prefix.clone();
                     match self.rpc.config_set(&prop, value).await {
                         Ok(()) => {
                             self.status_msg = Some(crate::i18n::t_args(
                                 "zc-config-status-field-set",
                                 &[("prop", &prop)],
                             ));
-                            self.load_fields(&prefix).await?;
                             self.pop_to_field_list_keep_cursor().await?;
                         }
                         Err(e) => {
@@ -3457,20 +3474,16 @@ impl App {
 
     async fn commit_select(&mut self, orig_idx: usize) -> Result<()> {
         if let Some(chosen) = self.select_items.get(orig_idx)
-            && let Screen::FieldEdit {
-                prefix, field_idx, ..
-            } = &self.screen
+            && let Screen::FieldEdit { field_idx, .. } = &self.screen
         {
             let prop = self.fields[*field_idx].path.clone();
             let value = serde_json::Value::String(chosen.clone());
-            let prefix = prefix.clone();
             match self.rpc.config_set(&prop, value).await {
                 Ok(()) => {
                     self.status_msg = Some(crate::i18n::t_args(
                         "zc-config-status-field-set",
                         &[("prop", &prop)],
                     ));
-                    self.load_fields(&prefix).await?;
                     self.pop_to_field_list_keep_cursor().await?;
                 }
                 Err(e) => {
@@ -3511,8 +3524,13 @@ impl App {
             field_idx,
         } = std::mem::replace(&mut self.screen, Screen::SectionList)
         {
-            // Silent refresh — preserves cursor below.
+            // This silent reload is the only refresh after a successful save.
+            // Callers must not run load_fields() first: it resets active_tab
+            // and the composite-tab state and issues a second config/list.
+            // The composite-tab state is invalidated right after it for the
+            // same reason: the removed load_fields() call used to clear it.
             self.reload_fields_silent(&prefix).await;
+            self.invalidate_composite_state(&prefix);
             self.field_cursor = field_idx.min(self.fields.len().saturating_sub(1));
             self.screen = Screen::FieldList {
                 section_idx,
@@ -5362,6 +5380,352 @@ mod tests {
         assert_eq!(
             mgr.edit_buf, "<unset>",
             "populated scalar values must be preserved verbatim"
+        );
+    }
+
+    /// Manager wired to a responder task that records every request method
+    /// and answers config/set and config/list. List responses echo the
+    /// two-field tabbed fixture, applying the saved value to a.second.
+    fn responding_manager() -> (App, Arc<std::sync::Mutex<Vec<String>>>) {
+        use crate::jsonrpc::RpcOutbound;
+        use tokio::sync::mpsc;
+        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(16);
+        let outbound = Arc::new(RpcOutbound::new(writer_tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        let manager = App::new(rpc, std::path::Path::new("/tmp"));
+        let calls: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls_for_task = Arc::clone(&calls);
+        let outbound_for_task = Arc::clone(&outbound);
+        tokio::spawn(async move {
+            let mut saved: Option<(String, serde_json::Value)> = None;
+            while let Some(raw) = writer_rx.recv().await {
+                let Ok(req) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                    continue;
+                };
+                let method = req["method"].as_str().unwrap_or_default().to_string();
+                calls_for_task
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(method.clone());
+                let id = req["id"].as_str().unwrap_or_default().to_string();
+                let result = if method == crate::client::method::CONFIG_SET {
+                    saved = Some((
+                        req["params"]["prop"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                        req["params"]["value"].clone(),
+                    ));
+                    serde_json::json!({})
+                } else if method == crate::client::method::CONFIG_LIST {
+                    let mut first = field("a.first");
+                    first.tab = ConfigTab::Connection;
+                    let mut second = field("a.second");
+                    second.tab = ConfigTab::Advanced;
+                    if let Some((prop, value)) = &saved
+                        && prop == "a.second"
+                    {
+                        second.value = Some(value.clone());
+                        second.populated = true;
+                    }
+                    serde_json::json!({ "entries": [
+                        serde_json::to_value(&first).unwrap(),
+                        serde_json::to_value(&second).unwrap(),
+                    ] })
+                } else {
+                    serde_json::json!({})
+                };
+                outbound_for_task.dispatch_response(&id, Some(result), None);
+            }
+        });
+        (manager, calls)
+    }
+
+    #[tokio::test]
+    async fn scalar_save_refreshes_once_and_keeps_tab_and_cursor() {
+        let (mut manager, calls) = responding_manager();
+        let mut first = field("a.first");
+        first.tab = ConfigTab::Connection;
+        let mut second = field("a.second");
+        second.tab = ConfigTab::Advanced;
+        manager.fields = vec![first, second];
+        manager.tab_names = vec![ConfigTab::Connection, ConfigTab::Advanced];
+        manager.active_tab = 1;
+        manager.field_cursor = 1;
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "a".into(),
+            breadcrumb: vec!["a".into()],
+            field_idx: 1,
+        };
+        manager.prepare_edit_at(1);
+        manager.edit_buf = "new".into();
+
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec!["config/set", "config/list"],
+            "a scalar save must issue exactly one set and one list request"
+        );
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        assert_eq!(manager.active_tab, 1, "the active tab must survive a save");
+        assert_eq!(manager.field_cursor, 1, "the cursor must survive a save");
+        assert!(
+            manager.tab_field_indices().contains(&manager.field_cursor),
+            "the restored cursor must be visible on the active tab"
+        );
+        assert_eq!(manager.fields[1].value, Some(serde_json::json!("new")));
+    }
+
+    #[tokio::test]
+    async fn multiline_save_refreshes_once_and_keeps_tab_and_cursor() {
+        let (mut manager, calls) = responding_manager();
+        let mut first = field("a.first");
+        first.tab = ConfigTab::Connection;
+        let mut second = field("a.second");
+        second.kind = PropKind::StringArray;
+        second.tab = ConfigTab::Advanced;
+        manager.fields = vec![first, second];
+        manager.tab_names = vec![ConfigTab::Connection, ConfigTab::Advanced];
+        manager.active_tab = 1;
+        manager.field_cursor = 1;
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "a".into(),
+            breadcrumb: vec!["a".into()],
+            field_idx: 1,
+        };
+        manager.prepare_edit_at(1);
+        manager.edit_buf = "x\ny".into();
+
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec!["config/set", "config/list"],
+            "a multiline save must issue exactly one set and one list request"
+        );
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        assert_eq!(manager.active_tab, 1, "the active tab must survive a save");
+        assert_eq!(manager.field_cursor, 1, "the cursor must survive a save");
+        assert!(
+            manager.tab_field_indices().contains(&manager.field_cursor),
+            "the restored cursor must be visible on the active tab"
+        );
+        assert_eq!(manager.fields[1].value, Some(serde_json::json!(["x", "y"])));
+    }
+
+    #[tokio::test]
+    async fn choice_save_refreshes_once_and_keeps_tab_and_cursor() {
+        let (mut manager, calls) = responding_manager();
+        let mut first = field("a.first");
+        first.tab = ConfigTab::Connection;
+        let mut second = field("a.second");
+        second.kind = PropKind::Enum;
+        second.tab = ConfigTab::Advanced;
+        manager.fields = vec![first, second];
+        manager.tab_names = vec![ConfigTab::Connection, ConfigTab::Advanced];
+        manager.active_tab = 1;
+        manager.field_cursor = 1;
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "a".into(),
+            breadcrumb: vec!["a".into()],
+            field_idx: 1,
+        };
+        manager.select_items = vec!["one".into(), "two".into()];
+
+        manager.commit_select(1).await.unwrap();
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec!["config/set", "config/list"],
+            "a choice save must issue exactly one set and one list request"
+        );
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        assert_eq!(manager.active_tab, 1, "the active tab must survive a save");
+        assert_eq!(manager.field_cursor, 1, "the cursor must survive a save");
+        assert!(
+            manager.tab_field_indices().contains(&manager.field_cursor),
+            "the restored cursor must be visible on the active tab"
+        );
+        assert_eq!(manager.fields[1].value, Some(serde_json::json!("two")));
+    }
+
+    #[tokio::test]
+    async fn skill_bundle_save_invalidates_the_skills_list_without_an_eager_fetch() {
+        let (mut manager, calls) = responding_manager();
+        let mut description = field("skill-bundles.demo.description");
+        description.tab = ConfigTab::Settings;
+        let mut include = field("skill-bundles.demo.include");
+        include.tab = ConfigTab::Settings;
+        manager.fields = vec![description, include];
+        manager.tab_names = vec![ConfigTab::Settings, ConfigTab::Skills];
+        manager.active_tab = 0;
+        manager.skills_bundle = "demo".into();
+        manager.skills_list = vec![crate::client::SkillListEntry {
+            name: "from-dir-a".into(),
+        }];
+        manager.skills_active = Some("from-dir-a".into());
+        manager.skills_body = "stale".into();
+        manager.skills_body_loaded = "stale".into();
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "skill-bundles.demo".into(),
+            breadcrumb: vec!["skill-bundles.demo".into()],
+            field_idx: 0,
+        };
+        manager.prepare_edit_at(0);
+        manager.edit_buf = "new".into();
+
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec!["config/set", "config/list"],
+            "a skill-bundle save must refresh once and never eagerly fetch skills"
+        );
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        assert_eq!(manager.active_tab, 0, "the active tab must survive a save");
+        assert!(
+            manager.skills_list.is_empty(),
+            "a save in the section must drop the cached skills list"
+        );
+        assert!(
+            manager.skills_active.is_none(),
+            "a save in the section must drop the cached skills selection"
+        );
+        assert!(
+            manager.skills_body.is_empty(),
+            "a save in the section must drop the cached skill body"
+        );
+        assert_eq!(
+            manager.skills_bundle, "demo",
+            "the bundle identity is derived from the prefix and must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_save_invalidates_the_personality_files_without_an_eager_fetch() {
+        let (mut manager, calls) = responding_manager();
+        let mut model = field("agents.demo.model");
+        model.tab = ConfigTab::Settings;
+        let mut workspace = field("agents.demo.workspace.path");
+        workspace.tab = ConfigTab::Settings;
+        manager.fields = vec![model, workspace];
+        manager.tab_names = vec![ConfigTab::Settings, ConfigTab::Personality];
+        manager.active_tab = 0;
+        manager.personality_agent = "demo".into();
+        manager.personality_files = vec![crate::client::PersonalityFileEntry {
+            filename: "SOUL.md".into(),
+            exists: true,
+            size: 3,
+        }];
+        manager.personality_active_file = Some("SOUL.md".into());
+        manager.personality_content = "stale".into();
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "agents.demo".into(),
+            breadcrumb: vec!["agents.demo".into()],
+            field_idx: 0,
+        };
+        manager.prepare_edit_at(0);
+        manager.edit_buf = "new".into();
+
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec!["config/set", "config/list"],
+            "an agent save must refresh once and never eagerly fetch personality files"
+        );
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        assert_eq!(manager.active_tab, 0, "the active tab must survive a save");
+        assert!(
+            manager.personality_files.is_empty(),
+            "a save in the section must drop the cached personality file list"
+        );
+        assert!(
+            manager.personality_active_file.is_none(),
+            "a save in the section must drop the cached personality selection"
+        );
+        assert!(
+            manager.personality_content.is_empty(),
+            "a save in the section must drop the cached personality content"
+        );
+        assert_eq!(
+            manager.personality_agent, "demo",
+            "the agent identity is derived from the prefix and must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_section_save_leaves_composite_state_alone() {
+        let (mut manager, calls) = responding_manager();
+        let mut first = field("a.first");
+        first.tab = ConfigTab::Connection;
+        let mut second = field("a.second");
+        second.tab = ConfigTab::Advanced;
+        manager.fields = vec![first, second];
+        manager.tab_names = vec![ConfigTab::Connection, ConfigTab::Advanced];
+        manager.active_tab = 1;
+        manager.field_cursor = 1;
+        manager.skills_list = vec![crate::client::SkillListEntry {
+            name: "unrelated".into(),
+        }];
+        manager.personality_files = vec![crate::client::PersonalityFileEntry {
+            filename: "SOUL.md".into(),
+            exists: true,
+            size: 3,
+        }];
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "a".into(),
+            breadcrumb: vec!["a".into()],
+            field_idx: 1,
+        };
+        manager.prepare_edit_at(1);
+        manager.edit_buf = "new".into();
+
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec!["config/set", "config/list"],
+            "the save must go through the ordinary single-refresh path"
+        );
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        assert_eq!(
+            manager.skills_list.len(),
+            1,
+            "a save outside composite sections must not drop the skills list"
+        );
+        assert_eq!(
+            manager.personality_files.len(),
+            1,
+            "a save outside composite sections must not drop the personality files"
         );
     }
 }

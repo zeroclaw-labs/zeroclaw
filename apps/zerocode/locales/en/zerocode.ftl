@@ -443,8 +443,22 @@ zc-chat-pane-acp = ACP
 
 zc-chat-no-agents = No enabled agents yet. Open Quickstart to create one, or use Config to add and enable an agent.
 zc-chat-error-fetch-agents = Failed to fetch agents: { $error }
+zc-chat-history-trimmed-turns = Earlier conversation history was trimmed: { $reason } ({ $dropped } older { $dropped-kind ->
+    [one] turn
+   *[other] turns
+} dropped; { $kept } { $kept-kind ->
+    [one] turn
+   *[other] turns
+} kept).
 zc-chat-history-trimmed = Earlier conversation history was trimmed: { $reason } ({ $dropped } messages dropped; { $kept } turns kept).
 zc-chat-history-trimmed-tokens = Earlier conversation history was trimmed from approximately { $before } to { $after } tokens: { $reason }; { $dropped } messages dropped and { $kept } turns kept.
+zc-chat-history-trimmed-tokens-turns = Earlier conversation history was trimmed from approximately { $before } to { $after } tokens: { $reason }; { $dropped } older { $dropped-kind ->
+    [one] turn
+   *[other] turns
+} dropped and { $kept } { $kept-kind ->
+    [one] turn
+   *[other] turns
+} kept.
 zc-chat-history-trimmed-floor = The conversation history could not be trimmed below the configured token budget: { $reason }; the most recent turn still needs approximately { $after } tokens (configured budget: { $budget }).
 zc-chat-history-trimmed-token-budget-clause = (configured token budget: { $budget })
 zc-chat-history-trimmed-token-source-provider = provider-reported
@@ -517,6 +531,7 @@ zc-chat-help-yank-selection = Yank selection
 zc-chat-help-return-to-input = Return to input
 zc-chat-help-browse-mode = Browse mode
 zc-chat-help-scroll-conversation = Scroll conversation
+zc-chat-help-open-link = Click a link to open it; drag from elsewhere to select text
 zc-chat-help-toggle-thoughts = Toggle thoughts
 zc-chat-help-new-session = New session
 zc-chat-help-acp-memory = History saved & resumable; persistent memory isolated
@@ -541,6 +556,10 @@ zc-chat-copied-clipboard = Copied to clipboard
 zc-chat-copy-message = [Copy]
 zc-chat-copy-message-copied = [Copied]
 zc-chat-context-menu-copy = Copy
+zc-chat-context-menu-copy-selection = Copy selection
+zc-chat-context-menu-open-link = Open link
+zc-chat-context-menu-copy-link = Copy link
+zc-chat-open-link-failed = Could not open link: { $error }
 zc-chat-context-menu-send-now = Send now
 zc-chat-context-menu-edit = Edit
 zc-chat-context-menu-delete = Delete

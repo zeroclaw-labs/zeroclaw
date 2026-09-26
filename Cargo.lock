@@ -1719,6 +1719,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "color_quant"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d7b894f5411737b7867f4827955924d7c254fc9f4d91a6aad6b097804b1018b"
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3930,6 +3936,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gif"
+version = "0.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee8cfcc411d9adbbaba82fb72661cc1bcca13e8bba98b364e62b2dba8f960159"
+dependencies = [
+ "color_quant",
+ "weezl",
+]
+
+[[package]]
 name = "gimli"
 version = "0.32.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4769,6 +4785,8 @@ checksum = "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104"
 dependencies = [
  "bytemuck",
  "byteorder-lite",
+ "color_quant",
+ "gif",
  "image-webp",
  "moxcms",
  "num-traits",
@@ -12694,6 +12712,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "weezl"
+version = "0.1.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
+
+[[package]]
 name = "wezterm-bidi"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14470,6 +14494,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "hyper",
+ "image",
  "libc",
  "nix 0.30.1",
  "parking_lot",
@@ -14716,6 +14741,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "brotli",
+ "cap-fs-ext",
  "cap-std",
  "chrono",
  "directories",
@@ -14734,6 +14760,7 @@ dependencies = [
  "rcgen",
  "regex",
  "reqwest 0.12.28",
+ "rustix 1.1.4",
  "rustls",
  "rustls-pki-types",
  "scopeguard",
@@ -14755,6 +14782,7 @@ dependencies = [
  "uuid",
  "webpki-roots 1.0.9",
  "which",
+ "windows-sys 0.61.2",
  "wiremock",
  "zeroclaw-api",
  "zeroclaw-config",

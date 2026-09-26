@@ -292,6 +292,7 @@ pub enum SessionUpdate {
     HistoryTrimmed {
         session_id: String,
         dropped_messages: u64,
+        dropped_turns: Option<u64>,
         kept_turns: u64,
         reason: String,
         /// Configured context token budget, when the trim was token-budget
@@ -406,6 +407,7 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
         "history_trimmed" => Some(SessionUpdate::HistoryTrimmed {
             session_id: sid,
             dropped_messages: params.get("dropped_messages")?.as_u64()?,
+            dropped_turns: params.get("dropped_turns").and_then(|v| v.as_u64()),
             kept_turns: params.get("kept_turns")?.as_u64()?,
             reason: params.get("reason")?.as_str()?.to_string(),
             token_budget: params.get("token_budget").and_then(|v| v.as_u64()),
@@ -6535,6 +6537,7 @@ mod plan_parse_tests {
             "type": "history_trimmed",
             "session_id": "sess-3",
             "dropped_messages": 12,
+            "dropped_turns": 4,
             "kept_turns": 3,
             "reason": "history message limit exceeded"
         });
@@ -6544,6 +6547,7 @@ mod plan_parse_tests {
             Some(SessionUpdate::HistoryTrimmed {
                 session_id,
                 dropped_messages: 12,
+                dropped_turns: Some(4),
                 kept_turns: 3,
                 reason,
                 token_budget: None,
@@ -6553,6 +6557,25 @@ mod plan_parse_tests {
                 tokens_after_source: None,
                 unsatisfiable_floor: None,
             }) if session_id == "sess-3" && reason == "history message limit exceeded"
+        ));
+    }
+
+    #[test]
+    fn parses_legacy_history_trimmed_update_without_dropped_turns() {
+        let params = serde_json::json!({
+            "type": "history_trimmed",
+            "session_id": "sess-3",
+            "dropped_messages": 12,
+            "kept_turns": 3,
+            "reason": "history message limit exceeded"
+        });
+
+        assert!(matches!(
+            parse_session_update(&params),
+            Some(SessionUpdate::HistoryTrimmed {
+                dropped_turns: None,
+                ..
+            })
         ));
     }
 
@@ -6576,6 +6599,7 @@ mod plan_parse_tests {
             Some(SessionUpdate::HistoryTrimmed {
                 session_id,
                 dropped_messages: 12,
+                dropped_turns: None,
                 kept_turns: 33,
                 reason,
                 token_budget: Some(500000),

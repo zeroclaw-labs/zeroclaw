@@ -1042,7 +1042,7 @@ turn-context-window-exceeded-error = This request exceeds the selected model's c
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 # Reason carried on every history_trimmed event (WS, SSE, ACP).
 history-trim-reason-budget = context token budget exceeded
-history-trim-reason-message-cap = history message limit exceeded
+history-trim-reason-message-cap = history turn limit exceeded
 history-trim-reason-recovery = context window overflow recovery
 # Remediation surfaced when the system prompt + inlined tool definitions alone
 # meet or exceed the context budget, so no amount of conversation trimming can
