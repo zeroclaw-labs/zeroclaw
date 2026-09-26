@@ -622,6 +622,125 @@ impl QdrantMemory {
 
         Ok(true)
     }
+
+    /// Vector search with time bounds applied *before* the result limit.
+    ///
+    /// Qdrant `/points/search` cannot express `since`/`until` as a payload
+    /// `match`, so time bounds are applied client-side. Doing that after asking
+    /// for exactly `limit` points drops eligible in-window matches when a
+    /// higher-ranked out-of-window point occupies a returned slot.
+    ///
+    /// When bounds are present, over-fetch: page through ranked results with a
+    /// growing `offset`, keep only the in-window ones, and stop once `limit` is
+    /// filled or Qdrant returns a short page (candidates exhausted). Without
+    /// bounds this issues a single `limit`-sized search, unchanged from before.
+    /// `session`/`agent` filtering, ranking order, and the inclusive since/until
+    /// contract are all preserved.
+    async fn vector_search_time_bounded(
+        &self,
+        embedding: &[f32],
+        filter: Option<&serde_json::Value>,
+        limit: usize,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let in_window = |timestamp: &str| {
+            since.is_none_or(|s| timestamp >= s) && until.is_none_or(|u| timestamp <= u)
+        };
+
+        // No bounds: one search for exactly `limit`, as before. With bounds:
+        // over-fetch a wider page so an out-of-window prefix cannot starve the
+        // window, then page on if the window is still not filled.
+        let bounded = since.is_some() || until.is_some();
+        let page_limit = if bounded {
+            limit.saturating_mul(4).max(16)
+        } else {
+            limit
+        };
+
+        let mut entries: Vec<MemoryEntry> = Vec::with_capacity(limit);
+        let mut offset: usize = 0;
+
+        loop {
+            let mut search_body = serde_json::json!({
+                "vector": embedding,
+                "limit": page_limit,
+                "with_payload": true
+            });
+            if offset > 0 {
+                search_body["offset"] = serde_json::json!(offset);
+            }
+            if let Some(f) = filter {
+                search_body["filter"] = f.clone();
+            }
+
+            let resp = self
+                .request(
+                    reqwest::Method::POST,
+                    &format!("/collections/{}/points/search", self.collection),
+                )
+                .json(&search_body)
+                .send()
+                .await
+                .context("failed to search Qdrant")?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                anyhow::bail!("Qdrant search failed ({status}): {text}");
+            }
+
+            let result: QdrantSearchResult = resp.json().await?;
+            let page_len = result.result.len();
+
+            for point in result.result {
+                let Some(payload) = point.payload else {
+                    continue;
+                };
+                if !in_window(payload.timestamp.as_str()) {
+                    continue;
+                }
+                let id = match &point.id {
+                    serde_json::Value::String(value) => value.clone(),
+                    serde_json::Value::Number(value) => value.to_string(),
+                    _ => continue,
+                };
+
+                entries.push(MemoryEntry {
+                    id,
+                    key: payload.key,
+                    content: payload.content,
+                    category: Self::parse_category(&payload.category),
+                    timestamp: payload.timestamp,
+                    session_id: payload.session_id,
+                    score: Some(point.score),
+                    namespace: "default".into(),
+                    importance: None,
+                    superseded_by: None,
+                    kind: None,
+                    pinned: false,
+                    tenant_id: None,
+                    agent_alias: payload.agent_id.clone(),
+                    agent_id: payload.agent_id,
+                });
+
+                if entries.len() >= limit {
+                    return Ok(entries);
+                }
+            }
+
+            // A short page means Qdrant has no more candidates to rank, or we
+            // are unbounded and already took the single page we asked for.
+            if !bounded || page_len < page_limit {
+                return Ok(entries);
+            }
+            offset = offset.saturating_add(page_len);
+        }
+    }
 }
 
 /// Qdrant point payload structure
@@ -744,74 +863,8 @@ impl Memory for QdrantMemory {
             })
         });
 
-        let mut search_body = serde_json::json!({
-            "vector": embedding,
-            "limit": limit,
-            "with_payload": true
-        });
-
-        if let Some(f) = filter {
-            search_body["filter"] = f;
-        }
-
-        let resp = self
-            .request(
-                reqwest::Method::POST,
-                &format!("/collections/{}/points/search", self.collection),
-            )
-            .json(&search_body)
-            .send()
+        self.vector_search_time_bounded(&embedding, filter.as_ref(), limit, since, until)
             .await
-            .context("failed to search Qdrant")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Qdrant search failed ({status}): {text}");
-        }
-
-        let result: QdrantSearchResult = resp.json().await?;
-
-        let mut entries: Vec<MemoryEntry> = result
-            .result
-            .into_iter()
-            .filter_map(|point| {
-                let payload = point.payload?;
-                let id = match &point.id {
-                    serde_json::Value::String(s) => s.clone(),
-                    serde_json::Value::Number(n) => n.to_string(),
-                    _ => return None,
-                };
-
-                Some(MemoryEntry {
-                    id,
-                    key: payload.key,
-                    content: payload.content,
-                    category: Self::parse_category(&payload.category),
-                    timestamp: payload.timestamp,
-                    session_id: payload.session_id,
-                    score: Some(point.score),
-                    namespace: "default".into(),
-                    importance: None,
-                    superseded_by: None,
-                    kind: None,
-                    pinned: false,
-                    tenant_id: None,
-                    agent_alias: payload.agent_id.clone(),
-                    agent_id: payload.agent_id,
-                })
-            })
-            .collect();
-
-        // Filter by time range if specified
-        if let Some(s) = since {
-            entries.retain(|e| e.timestamp.as_str() >= s);
-        }
-        if let Some(u) = until {
-            entries.retain(|e| e.timestamp.as_str() <= u);
-        }
-
-        Ok(entries)
     }
 
     async fn get(&self, key: &str) -> Result<Option<MemoryEntry>> {
@@ -1136,69 +1189,10 @@ impl Memory for QdrantMemory {
             "match": { "any": allowed_agent_ids }
         }));
 
-        let search_body = serde_json::json!({
-            "vector": embedding,
-            "limit": limit,
-            "with_payload": true,
-            "filter": { "must": must }
-        });
+        let filter = serde_json::json!({ "must": must });
 
-        let resp = self
-            .request(
-                reqwest::Method::POST,
-                &format!("/collections/{}/points/search", self.collection),
-            )
-            .json(&search_body)
-            .send()
+        self.vector_search_time_bounded(&embedding, Some(&filter), limit, since, until)
             .await
-            .context("failed to search Qdrant for allowed agent set")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Qdrant search failed ({status}): {text}");
-        }
-
-        let result: QdrantSearchResult = resp.json().await?;
-
-        let mut entries: Vec<MemoryEntry> = result
-            .result
-            .into_iter()
-            .filter_map(|point| {
-                let payload = point.payload?;
-                let id = match &point.id {
-                    serde_json::Value::String(s) => s.clone(),
-                    serde_json::Value::Number(n) => n.to_string(),
-                    _ => return None,
-                };
-
-                Some(MemoryEntry {
-                    id,
-                    key: payload.key,
-                    content: payload.content,
-                    category: Self::parse_category(&payload.category),
-                    timestamp: payload.timestamp,
-                    session_id: payload.session_id,
-                    score: Some(point.score),
-                    namespace: "default".into(),
-                    importance: None,
-                    superseded_by: None,
-                    kind: None,
-                    pinned: false,
-                    tenant_id: None,
-                    agent_alias: payload.agent_id.clone(),
-                    agent_id: payload.agent_id,
-                })
-            })
-            .collect();
-
-        if let Some(s) = since {
-            entries.retain(|e| e.timestamp.as_str() >= s);
-        }
-        if let Some(u) = until {
-            entries.retain(|e| e.timestamp.as_str() <= u);
-        }
-        Ok(entries)
     }
 }
 
@@ -1230,6 +1224,39 @@ mod tests {
         async fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
             Ok(vec![Vec::new()])
         }
+    }
+
+    struct OneVectorEmbedding;
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for OneVectorEmbedding {
+        fn name(&self) -> &str {
+            "one"
+        }
+
+        fn dimensions(&self) -> usize {
+            1
+        }
+
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            // A nonempty embedding so recall takes the vector-search path
+            // instead of the list fallback.
+            Ok(texts.iter().map(|_| vec![1.0]).collect())
+        }
+    }
+
+    fn scored_point(id: usize, score: f64, timestamp: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "score": score,
+            "payload": {
+                "key": format!("key-{id}"),
+                "content": format!("content-{id}"),
+                "category": "daily",
+                "timestamp": timestamp,
+                "agent_id": "alpha"
+            }
+        })
     }
 
     fn read_http_request(stream: &mut std::net::TcpStream) -> String {
@@ -1404,6 +1431,137 @@ mod tests {
 
         assert_eq!(recent.len(), 2);
         assert_eq!(fallback.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn time_bounded_vector_recall_overfetches_past_out_of_window_hits() {
+        // The top-ranked point is outside the window; a lower-ranked point is
+        // inside it. With limit=1, sending limit straight to Qdrant returned
+        // only the out-of-window point, which local filtering then dropped,
+        // yielding nothing. Over-fetching must surface the in-window point.
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        // Serve by request path so the test does not depend on how many
+        // initialization requests `ensure_initialized` makes: the collection
+        // check reports the collection exists, migration scrolls return empty,
+        // and every vector search returns the ranked fixture. A shared counter
+        // records how many searches over-fetched.
+        let searches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let over_fetched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let searches_srv = Arc::clone(&searches);
+        let over_fetched_srv = Arc::clone(&over_fetched);
+        let server = thread::spawn(move || {
+            // recall + recall_for_agents each drive one initialization and one
+            // search; keep serving until both searches have been answered.
+            loop {
+                if searches_srv.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+                    break;
+                }
+                let (mut stream, _) = listener.accept().unwrap();
+                // Tolerant reader: GET requests carry no Content-Length, so read
+                // headers, then read exactly Content-Length bytes when present.
+                let request = {
+                    use std::io::Read;
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let header_end = loop {
+                        let n = stream.read(&mut chunk).unwrap();
+                        assert!(n > 0, "fixture closed before headers arrived");
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos;
+                        }
+                    };
+                    let header = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                    let content_length = header
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    while buf.len() < header_end + 4 + content_length {
+                        let n = stream.read(&mut chunk).unwrap();
+                        assert!(n > 0, "fixture closed before body arrived");
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    String::from_utf8_lossy(&buf).to_string()
+                };
+                let request_line = request.lines().next().unwrap_or_default().to_string();
+                let body_str = request.split_once("\r\n\r\n").map(|x| x.1).unwrap_or("");
+
+                let response_body = if request_line.starts_with("GET ") {
+                    // collection existence check -> exists
+                    serde_json::json!({"result": {"status": "green"}}).to_string()
+                } else if request_line.contains("/points/search") {
+                    let body: serde_json::Value = serde_json::from_str(body_str).unwrap();
+                    assert!(
+                        body["limit"].as_u64().unwrap() > 1,
+                        "bounded recall must over-fetch, got limit {}",
+                        body["limit"]
+                    );
+                    searches_srv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    over_fetched_srv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    serde_json::json!({
+                        "result": [
+                            // Highest score, but outside [2026-08-01, 2026-08-31].
+                            scored_point(1, 0.99, "2026-09-15T00:00:00Z"),
+                            // Lower score, inside the window: the eligible answer.
+                            scored_point(2, 0.42, "2026-08-10T00:00:00Z"),
+                        ]
+                    })
+                    .to_string()
+                } else {
+                    // migration scrolls and anything else: empty result set
+                    serde_json::json!({
+                        "result": {"points": [], "next_page_offset": serde_json::Value::Null}
+                    })
+                    .to_string()
+                };
+
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                )
+                .unwrap();
+            }
+        });
+
+        let mem =
+            QdrantMemory::new_lazy("test", &endpoint, "mem", None, Arc::new(OneVectorEmbedding));
+
+        let since = Some("2026-08-01T00:00:00Z");
+        let until = Some("2026-08-31T23:59:59Z");
+
+        let recalled = Memory::recall(&mem, "keyword", 1, None, since, until)
+            .await
+            .unwrap();
+        assert_eq!(recalled.len(), 1, "the in-window point must be returned");
+        assert_eq!(recalled[0].key, "key-2");
+
+        let scoped = Memory::recall_for_agents(&mem, &["alpha"], "keyword", 1, None, since, until)
+            .await
+            .unwrap();
+        assert_eq!(
+            scoped.len(),
+            1,
+            "the in-window point must be returned under the allowlist"
+        );
+        assert_eq!(scoped[0].key, "key-2");
+
+        server.join().unwrap();
+        assert_eq!(
+            over_fetched.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "both recall paths must have issued an over-fetching search"
+        );
     }
 
     #[test]
