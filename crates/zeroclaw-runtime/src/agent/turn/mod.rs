@@ -536,6 +536,8 @@ async fn enforce_reported_budget(
     context_token_budget: usize,
     event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
     observer: &dyn crate::observability::Observer,
+    agent_alias: Option<&str>,
+    turn_id: &str,
     // The multimodal boundary the NEXT request will re-normalize retained
     // history through. A short `[IMAGE:...]` marker in raw history can become a
     // large base64 provider payload, so selection and the recount must describe
@@ -760,8 +762,8 @@ async fn enforce_reported_budget(
                 kept_turns: result.kept_turns,
                 reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
                 channel: None,
-                agent_alias: None,
-                turn_id: None,
+                agent_alias: agent_alias.map(str::to_string),
+                turn_id: Some(turn_id.to_string()),
                 token_budget: Some(context_token_budget as u64),
                 tokens_before: Some(tokens_before as u64),
                 tokens_after: Some(result.tokens_after as u64),
@@ -1630,8 +1632,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     kept_turns: trim_result.kept_turns,
                     reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
                     channel: None,
-                    agent_alias: None,
-                    turn_id: None,
+                    agent_alias: agent_alias.map(str::to_string),
+                    turn_id: Some(turn_id.to_string()),
                     token_budget: Some(event_budget as u64),
                     tokens_before: Some(tokens_before_dispatch),
                     tokens_after: Some(tokens_after_dispatch),
@@ -1668,8 +1670,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     kept_turns: trim_result.kept_turns,
                     reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
                     channel: None,
-                    agent_alias: None,
-                    turn_id: None,
+                    agent_alias: agent_alias.map(str::to_string),
+                    turn_id: Some(turn_id.to_string()),
                     token_budget: Some(model_context_window as u64),
                     tokens_before: Some(tokens_before_dispatch),
                     tokens_after: Some(tokens_before_dispatch),
@@ -1915,6 +1917,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     on_delta.as_ref(),
                     observer,
                     ctx.context_limits,
+                    agent_alias,
+                    turn_id,
                     &mut turn_state.crumb_present,
                 )
                 .await;
@@ -2130,6 +2134,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     ctx.context_limits.context_token_budget,
                     event_tx.as_ref(),
                     observer,
+                    agent_alias,
+                    turn_id,
                     multimodal_config,
                     degrade_strip_images,
                     image_cache.as_deref_mut(),
@@ -3606,6 +3612,65 @@ mod reported_budget_tests {
     use super::*;
     use crate::observability::NoopObserver;
 
+    // Keep existing budget tests focused on trim behavior; the identity test
+    // below calls the production function with an explicit turn identity.
+    #[allow(clippy::too_many_arguments)]
+    async fn enforce_reported_budget(
+        history: &mut Vec<ChatMessage>,
+        reported_input_tokens: usize,
+        reported_population_estimated: usize,
+        tool_schema_tokens: usize,
+        context_token_budget: usize,
+        event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
+        observer: &dyn crate::observability::Observer,
+        multimodal_config: &zeroclaw_config::schema::MultimodalConfig,
+        degrade_strip_images: bool,
+        image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
+        next_use_native_tools: bool,
+        hook_reserve_tokens: usize,
+        crumb_present: &mut bool,
+    ) {
+        super::enforce_reported_budget(
+            history,
+            reported_input_tokens,
+            reported_population_estimated,
+            tool_schema_tokens,
+            context_token_budget,
+            event_tx,
+            observer,
+            None,
+            "test",
+            multimodal_config,
+            degrade_strip_images,
+            image_cache,
+            next_use_native_tools,
+            hook_reserve_tokens,
+            crumb_present,
+        )
+        .await;
+    }
+
+    #[derive(Default)]
+    struct TrimObserver(std::sync::Mutex<Vec<zeroclaw_api::observability_traits::ObserverEvent>>);
+
+    impl crate::observability::Observer for TrimObserver {
+        fn record_event(&self, event: &zeroclaw_api::observability_traits::ObserverEvent) {
+            self.0.lock().expect("trim events lock").push(event.clone());
+        }
+
+        fn record_metric(&self, _metric: &zeroclaw_api::observability_traits::ObserverMetric) {}
+
+        fn name(&self) -> &str {
+            "trim-test"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn flush(&self) {}
+    }
+
     fn big_history() -> Vec<ChatMessage> {
         let big = "x".repeat(2000);
         vec![
@@ -3617,6 +3682,41 @@ mod reported_budget_tests {
             ChatMessage::user("turn3 short".to_string()),
             ChatMessage::assistant("final answer".to_string()),
         ]
+    }
+
+    #[tokio::test]
+    async fn reported_budget_observer_identifies_the_effective_turn() {
+        let mut history = big_history();
+        let estimated = crate::agent::history::estimate_history_tokens(&history);
+        let observer = TrimObserver::default();
+        super::enforce_reported_budget(
+            &mut history,
+            estimated * 4,
+            estimated,
+            0,
+            estimated * 2,
+            None,
+            &observer,
+            Some("effective-agent"),
+            "turn-2",
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            false,
+            None,
+            false,
+            0,
+            &mut false,
+        )
+        .await;
+        let events = observer.0.lock().expect("trim events lock");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
+                agent_alias,
+                turn_id,
+                ..
+            } if agent_alias.as_deref() == Some("effective-agent")
+                && turn_id.as_deref() == Some("turn-2")
+        )));
     }
 
     #[tokio::test]
