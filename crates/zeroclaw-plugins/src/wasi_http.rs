@@ -115,7 +115,8 @@ fn list_with(existing: &[String], host: &str) -> String {
     if !list.contains(&host) {
         list.push(host);
     }
-    format!("'{}'", serde_json::Value::from(list))
+    let json = serde_json::Value::from(list).to_string();
+    format!("'{}'", json.replace('\'', "'\"'\"'"))
 }
 
 /// The operator-facing next step for a missing grant: the exact command that
@@ -1004,6 +1005,26 @@ mod tests {
         assert!(
             remedy.contains("config set"),
             "remedy must be a runnable config-set command: {remedy}"
+        );
+    }
+
+    #[test]
+    fn egress_grant_remedy_shell_escapes_existing_apostrophes() {
+        let scope = crate::instance::test_scope(
+            PluginCapability::Tool,
+            "main",
+            [PluginPermission::HttpClient],
+        );
+        let remedy = egress_grant_remedy(
+            scope.id(),
+            "new.example.com",
+            Some(&["o'brien.example".to_string()]),
+        )
+        .expect("an admitted instance always yields a remedy");
+
+        assert!(
+            remedy.contains("'\"'\"'"),
+            "the JSON argument must escape apostrophes for POSIX shells: {remedy}"
         );
     }
 
