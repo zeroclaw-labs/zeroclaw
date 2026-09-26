@@ -5,7 +5,7 @@ use crate::cron::{
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::types::{FromSqlResult, ValueRef};
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params};
 use std::collections::HashSet;
 use std::sync::{LazyLock, Mutex, OnceLock};
 use uuid::Uuid;
@@ -26,6 +26,34 @@ static LIVE_AGENT_CLAIM_TOKENS: LazyLock<Mutex<HashSet<(std::path::PathBuf, Stri
 #[cfg(test)]
 static FORCED_RELEASE_FAILURES: LazyLock<Mutex<HashSet<std::path::PathBuf>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
+
+// Runs once, on the calling thread, between `update_job_inner`'s read and its
+// write, so a test can attempt a competing write in exactly the window the
+// transaction exists to close.
+#[cfg(test)]
+thread_local! {
+    static AFTER_READ_HOOK_FOR_TESTS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install the hook `run_after_read_hook_for_tests` fires once, on the
+/// calling thread. A test that drives the race through a real tool's
+/// `execute()` (rather than calling `update_job_for_agent` directly) must set
+/// this up front, on the SAME thread that will later poll that `execute()`
+/// future to completion — the guarded read/patch/write chain has no `.await`
+/// of its own, so it runs synchronously, on that one thread, inside a single
+/// poll.
+#[cfg(test)]
+pub(crate) fn install_after_read_hook_for_tests(hook: impl FnOnce() + 'static) {
+    AFTER_READ_HOOK_FOR_TESTS.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_after_read_hook_for_tests(_job_id: &str) {
+    if let Some(hook) = AFTER_READ_HOOK_FOR_TESTS.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+}
 
 fn cron_process_lock_owner() -> &'static str {
     CRON_PROCESS_LOCK_OWNER.get_or_init(|| Uuid::new_v4().to_string())
@@ -338,29 +366,35 @@ pub fn get_job_for_agent(config: &Config, job_id: &str, agent_alias: &str) -> Re
 /// Raw DB row for a job, with no config overlay applied. `shell_output_format`
 /// on the returned job is exactly what's stored in the `cron_jobs` column —
 /// for a declarative job that is a stale/default value, not the canonical
-/// one from `config.cron`. Used by [`update_job`] so unrelated patches don't
-/// re-persist a config-resolved snapshot into a column declarative jobs
-/// don't own; every other caller should use [`get_job`] instead.
+/// one from `config.cron`. The write path reads the same raw row through
+/// [`select_job_raw`], on its own transaction's connection, so an unrelated
+/// patch doesn't re-persist a config-resolved snapshot into a column
+/// declarative jobs don't own; every other caller should use [`get_job`].
 fn get_job_raw(config: &Config, job_id: &str) -> Result<CronJob> {
-    let Some(job) = with_read_connection(config, |conn| {
-        let mut stmt = conn.prepare(
-            "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                     allowed_tools, source, uses_memory, agent_alias, shell_output_format
-             FROM cron_jobs WHERE id = ?1",
-        )?;
-
-        let mut rows = stmt.query(params![job_id])?;
-        if let Some(row) = rows.next()? {
-            map_cron_job_row(row).map_err(Into::into)
-        } else {
-            Err(job_not_found(job_id))
-        }
-    })?
-    else {
+    let Some(job) = with_read_connection(config, |conn| select_job_raw(conn, job_id))? else {
         return Err(job_not_found(job_id));
     };
     Ok(job)
+}
+
+/// The raw-row SELECT behind [`get_job_raw`], taking the connection so a caller
+/// that already holds a write transaction reads through that same connection.
+/// A read on a second connection is a different snapshot from the write that
+/// follows it; see [`update_job_inner`].
+fn select_job_raw(conn: &Connection, job_id: &str) -> Result<CronJob> {
+    let mut stmt = conn.prepare(
+        "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
+                 enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+                 allowed_tools, source, uses_memory, agent_alias, shell_output_format
+         FROM cron_jobs WHERE id = ?1",
+    )?;
+
+    let mut rows = stmt.query(params![job_id])?;
+    if let Some(row) = rows.next()? {
+        map_cron_job_row(row).map_err(Into::into)
+    } else {
+        Err(job_not_found(job_id))
+    }
 }
 
 pub fn resolve_job_id_or_name(
@@ -603,36 +637,99 @@ pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJ
     Ok(jobs)
 }
 
+/// A predicate over the job a write is about to commit, evaluated INSIDE the
+/// write's transaction. `Err` is the refusal message and aborts the write.
+///
+/// This is how a caller's bound reaches the row that is actually stored. A
+/// bound checked on an earlier read of the job (a `get_job_for_agent` in the
+/// tool, say) describes a row another writer may have changed since, and the
+/// write below re-reads and commits whatever it finds; only a check made on
+/// that same read, under the same lock, binds what is committed.
+pub type JobGuard<'a> = &'a dyn Fn(&CronJob) -> std::result::Result<(), String>;
+
+/// The guard for a caller with no bound to enforce: operators, the CLI, the
+/// gateway, and bounded callers whose patch can only remove capability.
+pub fn unguarded(_job: &CronJob) -> std::result::Result<(), String> {
+    Ok(())
+}
+
 pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<CronJob> {
-    update_job_inner(config, job_id, None, patch)
+    update_job_inner(config, job_id, None, patch, &unguarded)
 }
 
 /// Patch a job only if `agent_alias` owns it, with the ownership test carried
 /// into the `UPDATE` itself rather than performed as a separate read. See
 /// `remove_job_for_agent` for why the separate read is not enough.
+///
+/// `guard` sees the job as it will be committed — stored row with `patch`
+/// applied — and refuses inside the same transaction that writes it.
 pub fn update_job_for_agent(
     config: &Config,
     job_id: &str,
     agent_alias: &str,
     patch: CronJobPatch,
+    guard: JobGuard<'_>,
 ) -> Result<CronJob> {
     // Read-side check first so an ordinary miss gets the usual error before any
     // work happens; the WHERE guard below is what makes the write itself safe.
     get_job_for_agent(config, job_id, agent_alias)?;
-    update_job_inner(config, job_id, Some(agent_alias), patch)
+    update_job_inner(config, job_id, Some(agent_alias), patch, guard)
 }
 
-fn update_job_inner(
+/// Read, patch, check and write one job as a single transaction.
+///
+/// `BEGIN IMMEDIATE` takes the write lock before the read, so no other writer
+/// can commit between the row this reads and the row this writes. Without it the
+/// read and the write were two connections and the `UPDATE` rewrote every column
+/// from a snapshot that might already be stale: a bounded caller's write could
+/// then land on top of a row whose `allowed_tools` another turn had widened in
+/// the meantime, and the scheduler replays the stored list.
+pub(super) fn update_job_inner(
     config: &Config,
     job_id: &str,
     owner: Option<&str>,
     patch: CronJobPatch,
+    guard: JobGuard<'_>,
 ) -> Result<CronJob> {
-    // Start from the raw DB row, not the config-resolved `get_job()` view:
-    // for a declarative job, `shell_output_format` isn't DB-owned, so an
-    // unrelated patch (e.g. toggling `enabled`) must not re-persist the
-    // resolved config value into the column and recreate a second owner.
-    let mut job = get_job_raw(config, job_id)?;
+    with_initialized_connection(config, |conn| {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .context("Failed to begin cron job update transaction")?;
+
+        // Start from the raw DB row, not the config-resolved `get_job()` view:
+        // for a declarative job, `shell_output_format` isn't DB-owned, so an
+        // unrelated patch (e.g. toggling `enabled`) must not re-persist the
+        // resolved config value into the column and recreate a second owner.
+        let mut job = select_job_raw(&tx, job_id)?;
+
+        // Ownership is judged on this same read, ahead of the patch and the
+        // guard. The `WHERE` term in the write stays as a second check, but the
+        // guard runs before it, and its refusal names the tools that reach past
+        // the bound: a caller that no longer owns the row must get the ordinary
+        // not-found, not a description of another agent's job.
+        if let Some(owner) = owner
+            && job.agent_alias != owner
+        {
+            anyhow::bail!("Cron job '{job_id}' not found");
+        }
+
+        apply_job_patch(&mut job, job_id, patch)?;
+        guard(&job).map_err(anyhow::Error::msg)?;
+
+        #[cfg(test)]
+        run_after_read_hook_for_tests(job_id);
+
+        write_job_row(&tx, &job, job_id, owner)?;
+        tx.commit()
+            .context("Failed to commit cron job update transaction")?;
+        Ok(())
+    })?;
+
+    get_job(config, job_id)
+}
+
+/// Apply `patch` to `job` in memory, with every boundary check `update_job`
+/// has always made. Pure with respect to the database.
+fn apply_job_patch(job: &mut CronJob, job_id: &str, patch: CronJobPatch) -> Result<()> {
     let mut schedule_changed = false;
 
     if let Some(schedule) = patch.schedule {
@@ -709,7 +806,7 @@ fn update_job_inner(
             );
         }
         if job.job_type != JobType::Shell {
-            let job_type: &str = job.job_type.into();
+            let job_type: &str = job.job_type.clone().into();
             anyhow::bail!(
                 "Cron job '{job_id}': shell_output_format is shell-only and cannot be set on a '{job_type}' job"
             );
@@ -720,83 +817,90 @@ fn update_job_inner(
     if schedule_changed {
         job.next_run = next_run_for_schedule(&job.schedule, Utc::now())?;
     }
+    Ok(())
+}
 
-    with_initialized_connection(config, |conn| {
-        // Declarative jobs don't own `shell_output_format` — the config is the
-        // canonical source, and `resolve_declarative_shell_output_format()` overlays
-        // it on every read. Writing the synthesized (Wrapped) value back into the
-        // column during an unrelated patch would overwrite whatever was stored
-        // there (NULL, garbage, or a future value) with a value the DB doesn't
-        // own. Omit the column from the UPDATE for declarative rows so the
-        // non-owned shadow stays untouched.
-        let changed = if job.source == "declarative" {
-            conn.execute(
-                "UPDATE cron_jobs
-                 SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
-                     session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
-                     allowed_tools = ?12, next_run = ?13, uses_memory = ?14
-                 WHERE id = ?15 AND (?16 IS NULL OR agent_alias = ?16)",
-                params![
-                    job.expression,
-                    job.command,
-                    serde_json::to_string(&job.schedule)?,
-                    <JobType as Into<&str>>::into(job.job_type).to_string(),
-                    job.prompt,
-                    job.name,
-                    job.session_target.as_str(),
-                    job.model,
-                    if job.enabled { 1 } else { 0 },
-                    serde_json::to_string(&job.delivery)?,
-                    if job.delete_after_run { 1 } else { 0 },
-                    encode_allowed_tools(job.allowed_tools.as_ref())?,
-                    job.next_run.to_rfc3339(),
-                    if job.uses_memory { 1 } else { 0 },
-                    job.id,
-                    owner,
-                ],
-            )
-        } else {
-            conn.execute(
-                "UPDATE cron_jobs
-                 SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
-                     session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
-                     allowed_tools = ?12, next_run = ?13, uses_memory = ?14, shell_output_format = ?15
-                 WHERE id = ?16 AND (?17 IS NULL OR agent_alias = ?17)",
-                params![
-                    job.expression,
-                    job.command,
-                    serde_json::to_string(&job.schedule)?,
-                    <JobType as Into<&str>>::into(job.job_type).to_string(),
-                    job.prompt,
-                    job.name,
-                    job.session_target.as_str(),
-                    job.model,
-                    if job.enabled { 1 } else { 0 },
-                    serde_json::to_string(&job.delivery)?,
-                    if job.delete_after_run { 1 } else { 0 },
-                    encode_allowed_tools(job.allowed_tools.as_ref())?,
-                    job.next_run.to_rfc3339(),
-                    if job.uses_memory { 1 } else { 0 },
-                    match job.shell_output_format {
-                        CronShellOutputFormat::Wrapped => "wrapped",
-                        CronShellOutputFormat::Raw => "raw",
-                    },
-                    job.id,
-                    owner,
-                ],
-            )
-        }
-        .context("Failed to update cron job")?;
+/// The `UPDATE` for one job row, guarded by id and (when scoped) owner.
+fn write_job_row(
+    conn: &Connection,
+    job: &CronJob,
+    job_id: &str,
+    owner: Option<&str>,
+) -> Result<()> {
+    // Declarative jobs don't own `shell_output_format` — the config is the
+    // canonical source, and `resolve_declarative_shell_output_format()` overlays
+    // it on every read. Writing the synthesized (Wrapped) value back into the
+    // column during an unrelated patch would overwrite whatever was stored
+    // there (NULL, garbage, or a future value) with a value the DB doesn't
+    // own. Omit the column from the UPDATE for declarative rows so the
+    // non-owned shadow stays untouched.
+    let changed = if job.source == "declarative" {
+        conn.execute(
+            "UPDATE cron_jobs
+             SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
+                 session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
+                 allowed_tools = ?12, next_run = ?13, uses_memory = ?14
+             WHERE id = ?15 AND (?16 IS NULL OR agent_alias = ?16)",
+            params![
+                job.expression,
+                job.command,
+                serde_json::to_string(&job.schedule)?,
+                <JobType as Into<&str>>::into(job.job_type.clone()).to_string(),
+                job.prompt,
+                job.name,
+                job.session_target.as_str(),
+                job.model,
+                if job.enabled { 1 } else { 0 },
+                serde_json::to_string(&job.delivery)?,
+                if job.delete_after_run { 1 } else { 0 },
+                encode_allowed_tools(job.allowed_tools.as_ref())?,
+                job.next_run.to_rfc3339(),
+                if job.uses_memory { 1 } else { 0 },
+                job.id,
+                owner,
+            ],
+        )
+    } else {
+        conn.execute(
+            "UPDATE cron_jobs
+             SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
+                 session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
+                 allowed_tools = ?12, next_run = ?13, uses_memory = ?14, shell_output_format = ?15
+             WHERE id = ?16 AND (?17 IS NULL OR agent_alias = ?17)",
+            params![
+                job.expression,
+                job.command,
+                serde_json::to_string(&job.schedule)?,
+                <JobType as Into<&str>>::into(job.job_type.clone()).to_string(),
+                job.prompt,
+                job.name,
+                job.session_target.as_str(),
+                job.model,
+                if job.enabled { 1 } else { 0 },
+                serde_json::to_string(&job.delivery)?,
+                if job.delete_after_run { 1 } else { 0 },
+                encode_allowed_tools(job.allowed_tools.as_ref())?,
+                job.next_run.to_rfc3339(),
+                if job.uses_memory { 1 } else { 0 },
+                match job.shell_output_format {
+                    CronShellOutputFormat::Wrapped => "wrapped",
+                    CronShellOutputFormat::Raw => "raw",
+                },
+                job.id,
+                owner,
+            ],
+        )
+    }
+    .context("Failed to update cron job")?;
 
-        // Zero rows means the guard matched nothing: the job moved to another
-        // owner between the read above and this write.
-        if changed == 0 {
-            anyhow::bail!("Cron job '{job_id}' not found");
-        }
-        Ok(())
-    })?;
+    // Defensive: the caller read this row and holds the write lock, so it cannot
+    // have moved. Zero rows would mean the owner term above disagrees with the
+    // ownership check made on that read.
+    if changed == 0 {
+        anyhow::bail!("Cron job '{job_id}' not found");
+    }
 
-    get_job(config, job_id)
+    Ok(())
 }
 
 pub fn record_last_run(
@@ -2147,6 +2251,7 @@ mod tests {
                 enabled: Some(false),
                 ..CronJobPatch::default()
             },
+            &unguarded,
         );
         assert!(
             stale.is_err(),
@@ -2160,9 +2265,10 @@ mod tests {
 
     #[test]
     fn scoped_update_guarded_write_refuses_a_stale_owner() {
-        // Calls `update_job_inner` directly with the stale owner, which is what
-        // the guarded UPDATE sees once the preliminary read is out of the way.
-        // Without the `agent_alias` term in the WHERE clause this patch lands.
+        // Calls `update_job_inner` directly with the stale owner, skipping the
+        // preliminary read. The ownership check inside the transaction refuses
+        // it; the `agent_alias` term in the UPDATE's WHERE is a second check that
+        // this test can no longer reach on its own.
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
         let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
@@ -2178,6 +2284,7 @@ mod tests {
                 enabled: Some(false),
                 ..CronJobPatch::default()
             },
+            &unguarded,
         );
         assert!(
             stale.is_err(),
@@ -2206,10 +2313,245 @@ mod tests {
                 enabled: Some(false),
                 ..CronJobPatch::default()
             },
+            &unguarded,
         )
         .unwrap();
         assert!(!updated.enabled);
         assert!(!get_job(&config, &job.id).unwrap().enabled);
+    }
+
+    // ── guard evaluated inside the write's transaction ──────────────────────
+
+    /// An agent job whose stored tool list is `tools`, owned by `owner-agent`.
+    fn agent_job_with_tools(config: &Config, prompt: &str, tools: &[&str]) -> CronJob {
+        add_agent_job(
+            config,
+            "owner-agent",
+            None,
+            Schedule::Every { every_ms: 60_000 },
+            prompt,
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            Some(tools.iter().map(|t| (*t).to_string()).collect()),
+            true,
+        )
+        .unwrap()
+    }
+
+    /// The guard a bounded caller holding exactly `["calculator"]` would pass:
+    /// the job about to be committed must list nothing else.
+    fn calculator_only(job: &CronJob) -> std::result::Result<(), String> {
+        match job.allowed_tools.as_deref() {
+            Some([only]) if only == "calculator" => Ok(()),
+            other => Err(format!("outside the ceiling: {other:?}")),
+        }
+    }
+
+    /// The mechanism, not one instance of it. The write re-reads the row and
+    /// commits every column from what it read; if another writer can commit in
+    /// between, a bound checked on any earlier read describes a row that is no
+    /// longer there. This attempts exactly that from a second connection, in the
+    /// window after the read and before the write.
+    ///
+    /// Predicted red without the transaction: the rival `UPDATE` returns `Ok(1)`
+    /// (see `.ci-local/red-prediction-cron-ceiling-atomicity.md`).
+    #[test]
+    fn no_other_writer_can_commit_between_a_guarded_updates_read_and_its_write() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = agent_job_with_tools(&config, "narrow prompt", &["calculator"]);
+
+        let attempt: std::rc::Rc<std::cell::RefCell<Option<rusqlite::Result<usize>>>> =
+            std::rc::Rc::default();
+        let db_path = cron_db_path(&config);
+        let job_id = job.id.clone();
+        let slot = std::rc::Rc::clone(&attempt);
+        AFTER_READ_HOOK_FOR_TESTS.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let rival = Connection::open(&db_path).unwrap();
+                // No waiting: a rival that could only get in by blocking until
+                // the transaction ends has not got in between read and write.
+                rival.busy_timeout(std::time::Duration::ZERO).unwrap();
+                *slot.borrow_mut() = Some(rival.execute(
+                    "UPDATE cron_jobs SET allowed_tools = ?1 WHERE id = ?2",
+                    params![r#"["calculator","file_write"]"#, job_id],
+                ));
+            }));
+        });
+
+        let updated = update_job_for_agent(
+            &config,
+            &job.id,
+            "owner-agent",
+            CronJobPatch {
+                prompt: Some("re-pointed by the narrow turn".into()),
+                ..CronJobPatch::default()
+            },
+            &calculator_only,
+        )
+        .expect("the narrow update is within its ceiling and must commit");
+
+        let rival = attempt
+            .borrow_mut()
+            .take()
+            .expect("the after-read hook must have run");
+        assert!(
+            rival.is_err(),
+            "a rival writer committed between the guarded update's read and its \
+             write: {rival:?}"
+        );
+        assert_eq!(
+            updated.prompt.as_deref(),
+            Some("re-pointed by the narrow turn")
+        );
+        assert_eq!(
+            get_job(&config, &job.id).unwrap().allowed_tools,
+            Some(vec!["calculator".to_string()]),
+            "the committed row must be the row the guard judged"
+        );
+    }
+
+    /// The refusal half: a row already stored beyond the ceiling is refused,
+    /// and the refused patch leaves no trace.
+    #[test]
+    fn a_guarded_update_refuses_a_row_stored_beyond_its_bound_and_changes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = agent_job_with_tools(&config, "original prompt", &["calculator", "file_write"]);
+
+        let refused = update_job_for_agent(
+            &config,
+            &job.id,
+            "owner-agent",
+            CronJobPatch {
+                prompt: Some("re-pointed".into()),
+                ..CronJobPatch::default()
+            },
+            &calculator_only,
+        );
+        let error = refused.expect_err("a job stored beyond the bound must be refused");
+        assert!(
+            error.to_string().contains("outside the ceiling"),
+            "the refusal must carry the guard's own message, got: {error}"
+        );
+        let after = get_job(&config, &job.id).unwrap();
+        assert_eq!(after.prompt.as_deref(), Some("original prompt"));
+        assert_eq!(
+            after.allowed_tools,
+            Some(vec!["calculator".to_string(), "file_write".to_string()])
+        );
+    }
+
+    /// The positive control for the refusal above: the same call, the same
+    /// guard, a row that IS within the bound. Without it the refusal would be
+    /// satisfied by a guard that rejects everything.
+    #[test]
+    fn a_guarded_update_commits_a_row_within_its_bound() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = agent_job_with_tools(&config, "original prompt", &["calculator"]);
+
+        let updated = update_job_for_agent(
+            &config,
+            &job.id,
+            "owner-agent",
+            CronJobPatch {
+                prompt: Some("re-pointed".into()),
+                ..CronJobPatch::default()
+            },
+            &calculator_only,
+        )
+        .expect("a job within the bound must be updated");
+        assert_eq!(updated.prompt.as_deref(), Some("re-pointed"));
+    }
+
+    /// The guard is judged on the row the patch produces, not on the row as it
+    /// was: a patch that widens the list is refused even though the stored row
+    /// was in bounds.
+    #[test]
+    fn a_guarded_update_judges_the_row_the_patch_produces() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = agent_job_with_tools(&config, "original prompt", &["calculator"]);
+
+        let refused = update_job_for_agent(
+            &config,
+            &job.id,
+            "owner-agent",
+            CronJobPatch {
+                allowed_tools: Some(vec!["calculator".into(), "file_write".into()]),
+                ..CronJobPatch::default()
+            },
+            &calculator_only,
+        );
+        assert!(refused.is_err(), "a widening patch must be refused");
+        assert_eq!(
+            get_job(&config, &job.id).unwrap().allowed_tools,
+            Some(vec!["calculator".to_string()])
+        );
+    }
+
+    /// `owner = None` (operator path) must honour a guard it is handed rather
+    /// than drop it: an optional bound that one arm ignores is lost for free.
+    #[test]
+    fn the_unscoped_arm_of_update_job_inner_also_honours_the_guard() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = agent_job_with_tools(&config, "original prompt", &["calculator", "file_write"]);
+
+        let refused = update_job_inner(
+            &config,
+            &job.id,
+            None,
+            CronJobPatch {
+                prompt: Some("re-pointed".into()),
+                ..CronJobPatch::default()
+            },
+            &calculator_only,
+        );
+        assert!(refused.is_err(), "the guard must apply with no owner too");
+        assert_eq!(
+            get_job(&config, &job.id).unwrap().prompt.as_deref(),
+            Some("original prompt")
+        );
+    }
+
+    /// The guard's refusal describes the row it was shown (it names the tools
+    /// that reach past the bound), so it must never be shown a row the caller no
+    /// longer owns. Ownership is decided on the same read, ahead of the guard.
+    #[test]
+    fn a_stale_owner_is_refused_before_the_guard_sees_the_row() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = agent_job_with_tools(&config, "original prompt", &["calculator", "file_write"]);
+        rename_jobs_by_agent(&config, "owner-agent", "new-owner").unwrap();
+
+        let refused = update_job_inner(
+            &config,
+            &job.id,
+            Some("owner-agent"),
+            CronJobPatch {
+                prompt: Some("re-pointed".into()),
+                ..CronJobPatch::default()
+            },
+            &calculator_only,
+        )
+        .expect_err("a former owner must be refused");
+        let text = refused.to_string();
+        assert!(
+            text.contains("not found"),
+            "a former owner must get the ordinary not-found, got: {text}"
+        );
+        assert!(
+            !text.contains("outside the ceiling"),
+            "the refusal described another agent's job: {text}"
+        );
+        assert_eq!(
+            get_job(&config, &job.id).unwrap().prompt.as_deref(),
+            Some("original prompt")
+        );
     }
 
     #[test]

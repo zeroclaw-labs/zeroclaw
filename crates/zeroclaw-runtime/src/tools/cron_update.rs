@@ -16,6 +16,9 @@ pub struct CronUpdateTool {
     runtime: Arc<dyn RuntimeAdapter>,
     /// Owning agent — risk profile gate for command updates.
     agent_alias: String,
+    /// Bounded-delegation ceiling for the registering loop, or `None` when the
+    /// registration is unbounded. See [`crate::tools::caller_ceiling`].
+    caller_ceiling: Option<crate::tools::caller_ceiling::CallerCeiling>,
 }
 
 impl CronUpdateTool {
@@ -24,12 +27,14 @@ impl CronUpdateTool {
         security: Arc<SecurityPolicy>,
         agent_alias: impl Into<String>,
         runtime: Arc<dyn RuntimeAdapter>,
+        caller_ceiling: Option<crate::tools::caller_ceiling::CallerCeiling>,
     ) -> Self {
         Self {
             config,
             security,
             runtime,
             agent_alias: agent_alias.into(),
+            caller_ceiling,
         }
     }
 
@@ -43,7 +48,7 @@ impl CronUpdateTool {
             crate::platform::create_runtime(&config.runtime)
                 .expect("test config must construct its runtime"),
         );
-        Self::new_with_runtime(config, security, agent_alias, runtime)
+        Self::new_with_runtime(config, security, agent_alias, runtime, None)
     }
 
     fn enforce_mutation_allowed(&self, action: &str) -> Option<ToolResult> {
@@ -75,6 +80,46 @@ impl CronUpdateTool {
 
         None
     }
+}
+
+/// True when the only thing a patch can do is REMOVE capability.
+///
+/// `schedule` exempts `pause` from the ceiling for exactly this reason, and
+/// `cron_update` must not be stricter than its sibling: otherwise a bounded
+/// target could be unable to turn OFF a job it was not allowed to turn on,
+/// which protects nothing and takes away the one safe response to a job it
+/// should not have.
+///
+/// Destructured exhaustively on purpose. A new `CronJobPatch` field must not
+/// join the exempt set by default, so adding one breaks this build instead of
+/// silently widening what a bounded turn may write.
+fn patch_only_disables(patch: &cron::CronJobPatch) -> bool {
+    let cron::CronJobPatch {
+        enabled,
+        schedule,
+        command,
+        prompt,
+        name,
+        delivery,
+        model,
+        session_target,
+        delete_after_run,
+        allowed_tools,
+        uses_memory,
+        shell_output_format,
+    } = patch;
+    *enabled == Some(false)
+        && schedule.is_none()
+        && command.is_none()
+        && prompt.is_none()
+        && name.is_none()
+        && delivery.is_none()
+        && model.is_none()
+        && session_target.is_none()
+        && delete_after_run.is_none()
+        && allowed_tools.is_none()
+        && uses_memory.is_none()
+        && shell_output_format.is_none()
 }
 
 #[async_trait]
@@ -259,7 +304,7 @@ impl Tool for CronUpdateTool {
             }
         };
 
-        let patch = match deserialize_patch_arg(&patch_val) {
+        let mut patch = match deserialize_patch_arg(&patch_val) {
             Ok(patch) => patch,
             Err(error) => {
                 return Ok(ToolResult {
@@ -269,6 +314,60 @@ impl Tool for CronUpdateTool {
                 });
             }
         };
+        // A patch that sets `allowed_tools` rewrites the stored tool set, so it
+        // is the same write `cron_add` performs and takes the same cap. An empty
+        // patch list clears the field to `None` (unrestricted), which is why the
+        // cap refuses an empty result instead of storing it: without that,
+        // `allowed_tools: []` would remove the inherited limit outright.
+        if patch.allowed_tools.is_some() {
+            match crate::tools::caller_ceiling::cap_stored_allowed_tools(
+                "cron_update",
+                self.caller_ceiling.as_ref(),
+                patch.allowed_tools.take(),
+            ) {
+                Ok(capped) => patch.allowed_tools = capped,
+                Err(error) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(error),
+                    });
+                }
+            }
+        }
+        // Capping the patch is not enough: a patch that leaves `allowed_tools`
+        // unset widens nothing by itself, yet every other patched field is
+        // applied unconditionally by `update_job_inner`, so a bounded turn could
+        // re-point an existing unbounded job's `prompt` and re-arm its
+        // `schedule` without ever naming `allowed_tools`; and the automatic
+        // scheduler replays the job's STORED list, which `cron_run` (the manual
+        // launch verb) never sees. The bound therefore belongs on the RESULTING
+        // job.
+        //
+        // It is handed to the store as a guard rather than checked here on a
+        // read of our own. A check made here describes a row another turn of
+        // the same owning agent may have rewritten by the time the write
+        // re-reads it, and the write commits whatever it finds; the guard runs
+        // on that same read, inside the write's transaction.
+        //
+        // A patch that can only DISABLE is exempt, matching `schedule`, which
+        // guards `resume` and leaves `pause` alone: refusing it would leave a
+        // bounded target unable to switch off a job it may not switch on.
+        let ceiling = self.caller_ceiling.clone();
+        let bound = |job: &cron::CronJob| {
+            crate::tools::caller_ceiling::require_job_within_ceiling(
+                "cron_update",
+                ceiling.as_ref(),
+                job,
+            )
+        };
+        let guard: cron::JobGuard<'_> =
+            if self.caller_ceiling.is_some() && !patch_only_disables(&patch) {
+                &bound
+            } else {
+                &cron::unguarded
+            };
+
         let approved = args
             .get("approved")
             .and_then(serde_json::Value::as_bool)
@@ -286,6 +385,7 @@ impl Tool for CronUpdateTool {
             job_id,
             patch,
             approved,
+            guard,
         ) {
             Ok(job) => Ok(ToolResult {
                 success: true,
@@ -451,8 +551,13 @@ mod tests {
         let job = cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
         let runtime: Arc<dyn RuntimeAdapter> =
             Arc::new(crate::platform::NativeRuntime::with_shell("pwsh".into()));
-        let tool =
-            CronUpdateTool::new_with_runtime(cfg.clone(), test_security(&cfg), TEST_AGENT, runtime);
+        let tool = CronUpdateTool::new_with_runtime(
+            cfg.clone(),
+            test_security(&cfg),
+            TEST_AGENT,
+            runtime,
+            None,
+        );
 
         let result = tool
             .execute(json!({
@@ -954,6 +1059,317 @@ mod tests {
         assert_eq!(
             cron::get_job(&cfg, &job.id).unwrap().allowed_tools,
             Some(vec!["file_read".into(), "web_search".into()])
+        );
+    }
+
+    // ── caller ceiling ──────────────────────────────────────────────────────
+
+    fn sealed_ceiling(names: &[&str]) -> crate::tools::caller_ceiling::CallerCeiling {
+        let handle: crate::tools::caller_ceiling::CallerCeiling =
+            Arc::new(std::sync::OnceLock::new());
+        let _ = handle.set(names.iter().map(|n| (*n).to_string()).collect());
+        handle
+    }
+
+    /// `CronUpdateTool` as the bounded assembly builds it: same construction as
+    /// the `#[cfg(test)] new` above, with a sealed ceiling instead of `None`.
+    fn bounded_tool(cfg: &Arc<Config>, ceiling: &[&str]) -> CronUpdateTool {
+        let runtime = Arc::from(
+            crate::platform::create_runtime(&cfg.runtime)
+                .expect("test config must construct its runtime"),
+        );
+        CronUpdateTool::new_with_runtime(
+            Arc::clone(cfg),
+            test_security(cfg),
+            TEST_AGENT,
+            runtime,
+            Some(sealed_ceiling(ceiling)),
+        )
+    }
+
+    fn agent_job_with(
+        cfg: &Config,
+        prompt: &str,
+        allowed: Option<Vec<String>>,
+    ) -> crate::cron::CronJob {
+        cron::add_agent_job(
+            cfg,
+            TEST_AGENT,
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            prompt,
+            crate::cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            allowed,
+            true,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_patch_that_never_names_allowed_tools_cannot_re_arm_an_unbounded_job() {
+        // The escape the `allowed_tools`-only guard left open: every other
+        // patched field is applied unconditionally, so re-pointing an existing
+        // job's prompt runs the owning agent's full registry on attacker text
+        // at the next scheduler tick. Broken state: capping only the patch.
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = agent_job_with(&cfg, "original work", None);
+        let tool = bounded_tool(&cfg, &["cron_update", "cron_add"]);
+
+        let result = tool
+            .execute(json!({
+                "job_id": job.id,
+                "patch": { "prompt": "do the attacker's work instead" }
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "a bounded turn re-pointed a job stored with no ceiling: {result:?}"
+        );
+        let error = result.error.unwrap_or_default();
+        assert!(
+            error.contains("stores no allowed_tools"),
+            "the refusal must name why an unset list is not a pass: {error}"
+        );
+        assert_eq!(
+            cron::get_job(&cfg, &job.id).unwrap().prompt.as_deref(),
+            Some("original work"),
+            "the refusal must not have written anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_patch_to_a_job_already_within_the_ceiling_still_applies() {
+        // The positive half. Without it, a guard that refused every bounded
+        // `cron_update` would satisfy the test above and break the tool.
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = agent_job_with(&cfg, "original work", Some(vec!["cron_add".into()]));
+        let tool = bounded_tool(&cfg, &["cron_update", "cron_add"]);
+
+        let result = tool
+            .execute(json!({
+                "job_id": job.id,
+                "patch": { "prompt": "refined work" }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            cron::get_job(&cfg, &job.id).unwrap().prompt.as_deref(),
+            Some("refined work")
+        );
+    }
+
+    #[tokio::test]
+    async fn narrowing_a_job_into_the_ceiling_is_still_allowed() {
+        // The bound is on the RESULTING job, not on the stored one: a patch
+        // that brings an unbounded job inside the ceiling must pass, or the
+        // guard would make an out-of-ceiling job permanently unpatchable.
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = agent_job_with(&cfg, "original work", None);
+        let tool = bounded_tool(&cfg, &["cron_update", "cron_add"]);
+
+        let result = tool
+            .execute(json!({
+                "job_id": job.id,
+                "patch": { "allowed_tools": ["cron_add"], "prompt": "refined work" }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        let stored = cron::get_job(&cfg, &job.id).unwrap();
+        assert_eq!(stored.allowed_tools, Some(vec!["cron_add".to_string()]));
+        assert_eq!(stored.prompt.as_deref(), Some("refined work"));
+    }
+
+    #[tokio::test]
+    async fn a_shell_job_cannot_be_re_armed_when_the_caller_lacks_shell() {
+        // A shell job has no `allowed_tools` to bound: what runs is the stored
+        // command, under the owning agent's policy. Re-enabling one is the same
+        // deferred execution as creating it.
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        // Disabled FIRST, so the patch below genuinely re-arms. Patching
+        // `enabled: true` onto an already-enabled job would assert the refusal
+        // without the scenario the name promises.
+        cron::pause_job_for_agent(&cfg, &job.id, TEST_AGENT).unwrap();
+        let tool = bounded_tool(&cfg, &["cron_update", "cron_add"]);
+
+        let result = tool
+            .execute(json!({
+                "job_id": job.id,
+                "patch": { "enabled": true }
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "a bounded turn re-armed a shell job its caller could not have run: {result:?}"
+        );
+        let error = result.error.unwrap_or_default();
+        assert!(
+            error.contains("shell"),
+            "the refusal must name the capability it protects: {error}"
+        );
+        assert!(
+            !cron::get_job(&cfg, &job.id).unwrap().enabled,
+            "the refusal must not have re-armed the job"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shell_job_is_patchable_when_the_caller_held_shell() {
+        // The positive half of the refusal above. It patches `name` rather than
+        // `enabled: false`, which is exempt from the ceiling entirely: an exempt
+        // field would make this pass without ever reaching the guard's allow
+        // path, which is the branch it exists to prove.
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        let tool = bounded_tool(&cfg, &["cron_update", "shell"]);
+
+        let result = tool
+            .execute(json!({
+                "job_id": job.id,
+                "patch": { "name": "renamed-by-bounded-caller" }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            cron::get_job(&cfg, &job.id).unwrap().name.as_deref(),
+            Some("renamed-by-bounded-caller")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bounded_caller_may_disable_a_shell_job_it_could_not_have_armed() {
+        // Refusing this would protect nothing and remove the one safe response
+        // to a job the target should not have: `schedule` already exempts
+        // `pause` on the same reasoning, and the two must not disagree.
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        let tool = bounded_tool(&cfg, &["cron_update", "cron_add"]);
+
+        let result = tool
+            .execute(json!({
+                "job_id": job.id,
+                "patch": { "enabled": false }
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "a bounded caller must be able to switch OFF a shell job: {result:?}"
+        );
+        assert!(!cron::get_job(&cfg, &job.id).unwrap().enabled);
+    }
+
+    /// The literal scenario the review described: a narrow delegated turn
+    /// patches a job while another turn of the same owning agent widens its
+    /// stored `allowed_tools` in between. Goes through the real
+    /// `CronUpdateTool::execute` end to end — its own guard construction and
+    /// `patch_only_disables` decision, not a hand-built closure — closing the
+    /// gap the store-level race test (`cron::store::tests::
+    /// no_other_writer_can_commit_between_a_guarded_updates_read_and_its_write`)
+    /// leaves open: that one drives `update_job_for_agent` directly and never
+    /// exercises this file's code at all. The pre-existing tests above run on
+    /// one thread with no rival writer, so they would pass unchanged against
+    /// the pre-fix code too; this is the one that would not.
+    #[tokio::test]
+    async fn a_concurrent_unbounded_widen_cannot_land_between_a_bounded_cron_updates_read_and_its_write()
+     {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = agent_job_with(&cfg, "narrow prompt", Some(vec!["calculator".into()]));
+        let tool = bounded_tool(&cfg, &["cron_update", "calculator"]);
+
+        let attempt: Arc<std::sync::Mutex<Option<rusqlite::Result<usize>>>> = Arc::default();
+        // `cron/store.rs:1942-1944` (`fn cron_db_path`): private to that module,
+        // so the path is reconstructed here rather than exposed further.
+        let db_path = cfg.data_dir.join("cron").join("jobs.db");
+        let job_id = job.id.clone();
+        let slot = Arc::clone(&attempt);
+        crate::cron::install_after_read_hook_for_tests(move || {
+            let rival = rusqlite::Connection::open(&db_path).unwrap();
+            // No waiting: a rival that could only get in by blocking until the
+            // transaction ends has not got in between read and write.
+            rival.busy_timeout(std::time::Duration::ZERO).unwrap();
+            *slot.lock().unwrap() = Some(rival.execute(
+                "UPDATE cron_jobs SET allowed_tools = ?1 WHERE id = ?2",
+                rusqlite::params![r#"["calculator","file_write"]"#, job_id],
+            ));
+        });
+
+        let result = tool
+            .execute(json!({
+                "job_id": job.id,
+                "patch": { "prompt": "re-pointed by the narrow turn" }
+            }))
+            .await
+            .unwrap();
+
+        let rival = attempt
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the after-read hook must have run");
+        assert!(
+            rival.is_err(),
+            "a rival writer widened allowed_tools between this tool's read and its write: \
+             {rival:?}"
+        );
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            cron::get_job(&cfg, &job.id).unwrap().allowed_tools,
+            Some(vec!["calculator".to_string()]),
+            "the committed row must be the row the guard judged, not the rival's"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_disable_exemption_does_not_carry_a_second_field() {
+        // The exemption is for a patch whose ONLY effect is removing
+        // capability. Pairing it with any other field must fall back to the
+        // guard, or `{"enabled": false, "command": "..."}` would be a way in.
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        let tool = bounded_tool(&cfg, &["cron_update", "cron_add"]);
+
+        let result = tool
+            .execute(json!({
+                "job_id": job.id,
+                "patch": { "enabled": false, "command": "echo smuggled" }
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "a disable paired with another field must not ride the exemption: {result:?}"
+        );
+        assert_eq!(
+            cron::get_job(&cfg, &job.id).unwrap().command,
+            "echo ok",
+            "the refusal must not have written the command"
         );
     }
 

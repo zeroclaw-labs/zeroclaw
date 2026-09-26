@@ -1477,6 +1477,17 @@ pub async fn run(
             sop_engine,
             sop_audit,
             None,
+            // `run` is the entry point that carries a per-run allowlist, so it is
+            // also the one that can hand the scheduler tools the ceiling's value.
+            // Pre-sealed: unlike the bounded delegate assembly — which builds its
+            // tools before the sealed set exists — the list is already known
+            // here, so the handle is filled on construction.
+            allowed_tools.as_deref().map(|list| {
+                let handle: crate::tools::caller_ceiling::CallerCeiling =
+                    std::sync::Arc::new(std::sync::OnceLock::new());
+                let _ = handle.set(list.to_vec());
+                handle
+            }),
         )?;
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         // Route the per-agent tool registry through the one gated seam
@@ -2143,6 +2154,13 @@ pub async fn run(
                                 served_route_sink: None,
                                 sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                     config: &config,
+                                    // Forwarding this turn's own per-run
+                                    // allowlist keeps a re-assembled step
+                                    // agent inside the set this loop
+                                    // received. `process_message`'s own
+                                    // `SopStepReassembly` construction below
+                                    // does the same with its `allowed_tools`.
+                                    caller_allowed: allowed_tools.as_deref(),
                                 }),
                             }),
                         ),
@@ -2739,6 +2757,11 @@ pub async fn run(
                                     served_route_sink: None,
                                     sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                         config: &config,
+                                        // Same `run` ceiling as the sibling
+                                        // construction above; both frames of this
+                                        // entry point must forward it or the bound
+                                        // holds on only one of them.
+                                        caller_allowed: allowed_tools.as_deref(),
                                     }),
                                 }),
                             ),
@@ -3037,9 +3060,18 @@ pub async fn process_message(
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
+    allowed_tools: Option<Vec<String>>,
     origin: TurnOrigin,
 ) -> Result<String> {
-    process_message_shared(Arc::new(config), agent_alias, message, session_id, origin).await
+    process_message_shared(
+        Arc::new(config),
+        agent_alias,
+        message,
+        session_id,
+        allowed_tools,
+        origin,
+    )
+    .await
 }
 
 /// Shared-snapshot implementation for callers that already own the canonical
@@ -3051,6 +3083,7 @@ pub(crate) async fn process_message_shared(
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
+    allowed_tools: Option<Vec<String>>,
     origin: TurnOrigin,
 ) -> Result<String> {
     use ::zeroclaw_log::Instrument;
@@ -3190,6 +3223,15 @@ pub(crate) async fn process_message_shared(
             sop_engine,
             sop_audit,
             None,
+            // `process_message` now carries a per-run allowlist when its
+            // caller has one (`send_message_to_peer`'s bounded relay), the
+            // same pre-sealed-handle shape `run()` already builds above.
+            allowed_tools.as_deref().map(|list| {
+                let handle: crate::tools::caller_ceiling::CallerCeiling =
+                    std::sync::Arc::new(std::sync::OnceLock::new());
+                let _ = handle.set(list.to_vec());
+                handle
+            }),
         )?;
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
@@ -3199,7 +3241,9 @@ pub(crate) async fn process_message_shared(
             built: all_tools_result_pm,
             skills: &skills,
             runtime: runtime.clone(),
-            caller_allowed: None,
+            // Most callers have no per-run allowlist (`None`, unchanged); a
+            // bounded `send_message_to_peer` relay is the one caller that does.
+            caller_allowed: allowed_tools.as_deref(),
             connect_mcp: true,
             connect_peripherals: true,
             exclude_memory: false,
@@ -3618,7 +3662,18 @@ pub(crate) async fn process_message_shared(
                     }),
                     Some(agent_alias),
                     Some(&turn_id),
-                    Some(SopStepReassembly { config: &config }),
+                    // `process_message` carries a per-run allowlist when its
+                    // caller has one (the same `allowed_tools` value the
+                    // assembly call above in this function already uses) —
+                    // forwarding it here keeps a cross-agent re-assembled
+                    // step agent inside the set this turn received, instead
+                    // of rebuilding it from the step agent's own full policy
+                    // one hop further out. Same reasoning as `run()`'s own
+                    // `SopStepReassembly` construction.
+                    Some(SopStepReassembly {
+                        config: &config,
+                        caller_allowed: allowed_tools.as_deref(),
+                    }),
                 ),
             )
             .await
@@ -7523,6 +7578,318 @@ mod tests {
         assert_eq!(run.step_results.len(), 2);
         assert_eq!(run.step_results[0].output, "step one done");
         assert_eq!(run.step_results[1].output, "step two done");
+    }
+
+    /// A bounded caller's `sop_execute` guard only sees the action `start_run`
+    /// returns. When that action is an ungated step, the guard lets it through
+    /// to the live driver, which runs the step and then advances the run itself
+    /// (`advance_sop_step` in `drive_live_sop_actions`). If the NEXT step is
+    /// gated, the driver stops there and the run stays parked, resolvable by an
+    /// external approver after this turn, outside the caller's ceiling. The
+    /// tool is built the way production builds it: registered with an
+    /// initiator, then rebound with a sealed ceiling by the bounded assembly.
+    #[tokio::test]
+    async fn run_tool_call_loop_bounded_sop_execute_cannot_leave_a_run_parked_after_a_live_step() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"sop_execute","arguments":{"name":"live-gated-sop"}}
+</tool_call>"#,
+            "step one done",
+            "outer done",
+        ]);
+
+        let sop = crate::sop::Sop {
+            name: "live-gated-sop".to_string(),
+            description: "live sop gated at step two".to_string(),
+            version: "1".to_string(),
+            priority: crate::sop::SopPriority::Normal,
+            execution_mode: crate::sop::SopExecutionMode::Auto,
+            triggers: vec![crate::sop::SopTrigger::Manual],
+            steps: vec![
+                crate::sop::SopStep {
+                    number: 1,
+                    title: "First".to_string(),
+                    body: "Do the first step".to_string(),
+                    requires_confirmation: false,
+                    ..crate::sop::SopStep::default()
+                },
+                crate::sop::SopStep {
+                    number: 2,
+                    title: "Second".to_string(),
+                    body: "Do the second step".to_string(),
+                    requires_confirmation: true,
+                    ..crate::sop::SopStep::default()
+                },
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+            decision: None,
+        };
+        let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
+        engine.replace_sops_for_test(vec![sop]);
+        let engine = Arc::new(Mutex::new(engine));
+        let ceiling: crate::tools::caller_ceiling::CallerCeiling =
+            Arc::new(std::sync::OnceLock::new());
+        let _ = ceiling.set(vec!["sop_execute".to_string()]);
+        let bounded_sop_execute = crate::tools::SopExecuteTool::new(Arc::clone(&engine))
+            .with_initiator("test-agent")
+            .rebound_with_ceiling(ceiling);
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                bounded_sop_execute,
+            )]);
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("start the live sop"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            served_route_sink: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    dispatch_model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 6,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+            channel_name: "agent",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: Some("test-agent"),
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("live SOP execution should complete");
+
+        assert_eq!(result, "outer done");
+        // Positive half: the ungated first step really ran in this turn, so the
+        // assertions below are about the transition the live driver made.
+        let started = sop_started_run_id_from_history(&history)
+            .expect("sop_execute tool result should include a run id");
+        let mut engine = engine.lock().unwrap();
+        let run = engine
+            .get_run(&started)
+            .expect("run should remain queryable")
+            .clone();
+        assert_eq!(run.step_results.len(), 1, "step one must have run: {run:?}");
+        assert_eq!(
+            engine.get_run(&started).map(|r| r.status),
+            Some(crate::sop::SopRunStatus::Cancelled),
+            "the park must end in a cancellation, not any other terminal state"
+        );
+
+        assert!(
+            !engine.active_runs().contains_key(&started),
+            "a bounded caller's run must not stay active after the live driver reaches a \
+             gated step; status={:?}, initiating_agent={:?}",
+            run.status,
+            run.initiating_agent
+        );
+        let outcome = engine
+            .resolve_gate(
+                &started,
+                crate::sop::approval::ApprovalDecision::Approve,
+                crate::sop::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect("resolving the run's gate must not error");
+        assert!(
+            !matches!(outcome, crate::sop::approval::ResolveOutcome::Resumed(_)),
+            "an external approver must not be able to resume a bounded caller's run, \
+             got: {outcome:?}"
+        );
+    }
+
+    /// Same escape through the other tool that queues live actions: a bounded
+    /// `sop_advance` completes step one of a run it did not start, the live
+    /// driver runs step two in this turn, and step three is gated.
+    #[tokio::test]
+    async fn run_tool_call_loop_bounded_sop_advance_cannot_leave_a_run_parked_after_a_live_step() {
+        let step = |number: u32, requires_confirmation: bool| crate::sop::SopStep {
+            number,
+            title: format!("Step {number}"),
+            body: format!("Do step {number}"),
+            requires_confirmation,
+            ..crate::sop::SopStep::default()
+        };
+        let sop = crate::sop::Sop {
+            name: "advance-gated-sop".to_string(),
+            description: "gated at step three".to_string(),
+            version: "1".to_string(),
+            priority: crate::sop::SopPriority::Normal,
+            execution_mode: crate::sop::SopExecutionMode::Auto,
+            triggers: vec![crate::sop::SopTrigger::Manual],
+            steps: vec![step(1, false), step(2, false), step(3, true)],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+            decision: None,
+        };
+        let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
+        engine.replace_sops_for_test(vec![sop]);
+        let run_id = match engine
+            .start_run(
+                "advance-gated-sop",
+                crate::sop::SopEvent {
+                    source: crate::sop::SopTriggerSource::Manual,
+                    topic: None,
+                    payload: None,
+                    timestamp: "2026-09-25T00:00:00Z".to_string(),
+                },
+            )
+            .expect("run starts")
+        {
+            crate::sop::SopRunAction::ExecuteStep { run_id, .. } => run_id,
+            other => panic!("expected step one to be executable, got {other:?}"),
+        };
+        let engine = Arc::new(Mutex::new(engine));
+        let ceiling: crate::tools::caller_ceiling::CallerCeiling =
+            Arc::new(std::sync::OnceLock::new());
+        let _ = ceiling.set(vec!["sop_advance".to_string()]);
+        let bounded_sop_advance =
+            crate::tools::SopAdvanceTool::new(Arc::clone(&engine)).rebound_with_ceiling(ceiling);
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                bounded_sop_advance,
+            )]);
+
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let advance_call = format!(
+            "<tool_call>\n{{\"name\":\"sop_advance\",\"arguments\":{{\"run_id\":\"{run_id}\",\
+             \"status\":\"completed\",\"output\":\"step one done\"}}}}\n</tool_call>"
+        );
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            advance_call.as_str(),
+            "step two done",
+            "outer done",
+        ]);
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("advance the sop"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            served_route_sink: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    dispatch_model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 6,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+            channel_name: "agent",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: Some("test-agent"),
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("live SOP execution should complete");
+
+        assert_eq!(result, "outer done");
+        let engine = engine.lock().unwrap();
+        let run = engine
+            .get_run(&run_id)
+            .expect("run stays queryable")
+            .clone();
+        assert_eq!(
+            run.step_results.len(),
+            2,
+            "step one (advanced) and step two (live) must both have completed: {run:?}"
+        );
+        assert_eq!(
+            run.status,
+            crate::sop::SopRunStatus::Cancelled,
+            "a bounded caller's run must be cancelled when the live driver reaches the \
+             gated step three"
+        );
+        assert!(!engine.active_runs().contains_key(&run_id));
     }
 
     #[tokio::test]
@@ -18187,6 +18554,7 @@ Let me check the result."#;
             "entrypoint-profile-agent",
             "hello",
             Some("session"),
+            None,
             TurnOrigin::SubTurn,
         )
         .await;
@@ -18263,6 +18631,7 @@ Let me check the result."#;
             "process-message-reassembly-agent",
             "hello",
             Some("session"),
+            None,
             TurnOrigin::SubTurn,
         )
         .await;

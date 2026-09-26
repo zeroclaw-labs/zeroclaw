@@ -18,6 +18,9 @@ pub use schedule::{
 pub(crate) use store::finish_agent_claim;
 #[cfg(test)]
 pub(crate) use store::force_release_failure_for_tests;
+#[cfg(test)]
+pub(crate) use store::install_after_read_hook_for_tests;
+pub use store::{JobGuard, unguarded};
 #[allow(unused_imports)]
 pub use store::{
     add_agent_job, all_overdue_jobs, claim_job, claim_job_for_agent,
@@ -284,6 +287,7 @@ pub fn update_shell_job_with_approval(
         job_id,
         patch,
         approved,
+        &unguarded,
     )
 }
 
@@ -297,6 +301,10 @@ pub(crate) fn update_shell_job_with_runtime(
     job_id: &str,
     patch: CronJobPatch,
     approved: bool,
+    // Evaluated on the job as it will be committed, inside the write's own
+    // transaction, on BOTH arms below: a bound that only one arm honoured would
+    // be dropped silently by the other. `unguarded` for callers with none.
+    guard: JobGuard<'_>,
 ) -> Result<CronJob> {
     let patch = remap_agent_command_patch(config, job_id, patch)?;
     if let Some(command) = patch.command.as_deref() {
@@ -305,8 +313,8 @@ pub(crate) fn update_shell_job_with_runtime(
     match owner {
         // Scoped: the ownership test travels with the write rather than being a
         // separate read the operator's rename cascade can slip between.
-        Some(agent_alias) => update_job_for_agent(config, job_id, agent_alias, patch),
-        None => update_job(config, job_id, patch),
+        Some(agent_alias) => update_job_for_agent(config, job_id, agent_alias, patch, guard),
+        None => store::update_job_inner(config, job_id, None, patch, guard),
     }
 }
 
@@ -483,6 +491,8 @@ pub fn resume_job(config: &Config, id: &str) -> Result<CronJob> {
 
 /// Pause a job the calling agent owns. The ownership test travels with the
 /// write; see `store::remove_job_for_agent`.
+///
+/// Pausing only removes capability, so it carries no guard.
 pub fn pause_job_for_agent(config: &Config, id: &str, agent_alias: &str) -> Result<CronJob> {
     update_job_for_agent(
         config,
@@ -492,11 +502,21 @@ pub fn pause_job_for_agent(config: &Config, id: &str, agent_alias: &str) -> Resu
             enabled: Some(false),
             ..CronJobPatch::default()
         },
+        &unguarded,
     )
 }
 
 /// Resume a job the calling agent owns.
-pub fn resume_job_for_agent(config: &Config, id: &str, agent_alias: &str) -> Result<CronJob> {
+///
+/// Re-enabling re-arms deferred execution, so a bounded caller passes its bound
+/// as `guard`, which is checked on the row this call commits and not on an
+/// earlier read of it.
+pub fn resume_job_for_agent(
+    config: &Config,
+    id: &str,
+    agent_alias: &str,
+    guard: JobGuard<'_>,
+) -> Result<CronJob> {
     update_job_for_agent(
         config,
         id,
@@ -505,6 +525,7 @@ pub fn resume_job_for_agent(config: &Config, id: &str, agent_alias: &str) -> Res
             enabled: Some(true),
             ..CronJobPatch::default()
         },
+        guard,
     )
 }
 
@@ -590,6 +611,78 @@ mod security_validation_tests {
                 .to_string()
                 .contains("blocked by security policy")
         );
+    }
+
+    /// `update_shell_job_with_runtime` takes a guard AND an optional owner, and
+    /// the two arms of its `match owner` are separate call sites: one that
+    /// forgot to forward the guard would drop a bound for free. No production
+    /// caller pairs `owner: None` with a real guard today (`update_shell_job_with_approval`
+    /// passes `unguarded`, `cron_update` always passes an owner), so this pins
+    /// the arm before something does.
+    #[test]
+    fn the_unscoped_arm_of_update_shell_job_with_runtime_honours_its_guard() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_agent_job(
+            &config,
+            "owner-agent",
+            None,
+            Schedule::Every { every_ms: 60_000 },
+            "original prompt",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            Some(vec!["calculator".into(), "file_write".into()]),
+            true,
+        )
+        .unwrap();
+        let security = SecurityPolicy::from_risk_profile(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            &config.data_dir,
+        );
+        let runtime = crate::platform::create_runtime(&config.runtime).unwrap();
+        let patch = || CronJobPatch {
+            prompt: Some("re-pointed".into()),
+            ..CronJobPatch::default()
+        };
+
+        let refuse = |_: &CronJob| Err("refused by the guard".to_string());
+        let refused = update_shell_job_with_runtime(
+            &config,
+            runtime.as_ref(),
+            &security,
+            None,
+            &job.id,
+            patch(),
+            false,
+            &refuse,
+        )
+        .expect_err("a refusing guard must stop the owner-less arm too");
+        assert!(
+            refused.to_string().contains("refused by the guard"),
+            "the refusal must be the guard's own, got: {refused}"
+        );
+        assert_eq!(
+            get_job(&config, &job.id).unwrap().prompt.as_deref(),
+            Some("original prompt"),
+            "a refused patch must leave the row untouched"
+        );
+
+        // Positive control: the same call with no bound goes through, so the
+        // refusal above was the guard and not the arm refusing everything.
+        let updated = update_shell_job_with_runtime(
+            &config,
+            runtime.as_ref(),
+            &security,
+            None,
+            &job.id,
+            patch(),
+            false,
+            &unguarded,
+        )
+        .expect("with no bound the owner-less arm must update");
+        assert_eq!(updated.prompt.as_deref(), Some("re-pointed"));
     }
 }
 

@@ -23,6 +23,12 @@ pub(crate) struct QueuedSopAction {
     pub engine: Arc<Mutex<SopEngine>>,
     pub audit: Option<Arc<SopAuditLogger>>,
     pub action: SopRunAction,
+    /// True when the tool that queued this action carries a bounded caller's
+    /// sealed ceiling. The tool's own park check only sees the action it
+    /// returns; the live driver advances the run further on its own, so it
+    /// must apply the same rule to every park it reaches (see
+    /// `cancel_parked_run_for_bounded_caller`).
+    pub bounded_caller: bool,
 }
 
 pub(crate) type LiveActionQueue = Arc<Mutex<VecDeque<QueuedSopAction>>>;
@@ -120,6 +126,7 @@ pub(crate) fn enqueue_live_action(
     engine: Arc<Mutex<SopEngine>>,
     audit: Option<Arc<SopAuditLogger>>,
     action: &SopRunAction,
+    bounded_caller: bool,
 ) {
     if !matches!(
         action,
@@ -132,6 +139,7 @@ pub(crate) fn enqueue_live_action(
         engine,
         audit,
         action: action.clone(),
+        bounded_caller,
     };
     let _ = LIVE_SOP_ACTION_QUEUE.try_with(|queue| {
         if let Some(queue) = queue
@@ -147,6 +155,90 @@ pub(crate) fn drain_live_actions(queue: &LiveActionQueue) -> Vec<QueuedSopAction
         Ok(mut queue) => queue.drain(..).collect(),
         Err(poisoned) => poisoned.into_inner().drain(..).collect(),
     }
+}
+
+/// The run id a just-produced `SopRunAction` left OUT of the live-turn
+/// machinery, if any. The mechanism is `enqueue_live_action`'s own guard
+/// clause above: it enqueues `ExecuteStep`/`DeterministicStep` and nothing
+/// else, so every other non-terminal variant — `WaitApproval` (operator
+/// approval gate), `CheckpointWait` (deterministic-workflow checkpoint), and
+/// `Pending` (unsatisfied dependency, or a park redirected here because the
+/// approval-pending pool was momentarily full) — leaves the run persisted and
+/// active without anything in the current turn driving it again.
+///
+/// `Pending` looks the least like a park — its own reason is about a
+/// dependency or a capacity limit, not approval — but it is not safe to
+/// exclude: `SopEngine::run_maintenance_tick` -> `retry_capacity_blocked_
+/// gated_pends` (engine.rs) runs on a background tick with NO caller or
+/// ceiling of any kind, and for a `Pending` run whose blocked step is gated,
+/// promotes it directly to `WaitingApproval`/`PausedCheckpoint` — the same
+/// park this function already has to catch, just reached one hop later and
+/// entirely outside this call. Excluding `Pending` here because ITS OWN
+/// reason isn't approval-shaped would be excluding by the wrong property:
+/// the invariant is about whether the turn keeps driving the run, not about
+/// why the run stopped.
+///
+/// Every one of these leaves the run resolvable by an external approver, who
+/// then runs the step through `agent::run` with `allowed_tools: None`: full
+/// authority, detached from whichever turn started or advanced the run. A
+/// bounded caller — one whose `sop_execute`/`sop_advance` instance carries a
+/// sealed ceiling — must never be allowed to leave a run in any of these
+/// three states; see the callers in `tools::sop_execute`/`tools::sop_advance`,
+/// and `cancel_parked_run_for_bounded_caller` for the parks the live driver
+/// reaches after those tools have returned.
+pub(crate) fn parked_run_id(action: &SopRunAction) -> Option<&str> {
+    match action {
+        SopRunAction::WaitApproval { run_id, .. }
+        | SopRunAction::CheckpointWait { run_id, .. }
+        | SopRunAction::Pending { run_id, .. } => Some(run_id.as_str()),
+        _ => None,
+    }
+}
+
+/// Cancel the run `action` leaves parked, for a live driver working on behalf
+/// of a bounded caller. Call it with the engine lock that produced `action`
+/// still held, so no approval can resolve the gate in between.
+///
+/// `Ok(None)`: `action` does not park its run. `Ok(Some(Cancelled))`: the run
+/// was cancelled; drive that action instead. `Err`: the cancellation could not
+/// be persisted, so the run is still active and resolvable - reported as an
+/// error, never as a cancellation.
+pub(crate) fn cancel_parked_run_for_bounded_caller(
+    engine: &mut SopEngine,
+    action: &SopRunAction,
+) -> Result<Option<SopRunAction>> {
+    let Some(run_id) = parked_run_id(action) else {
+        return Ok(None);
+    };
+    let run_id = run_id.to_string();
+    if let Err(e) = engine.cancel_run(&run_id) {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "run_id": run_id,
+                    "error": e.to_string(),
+                })),
+            "bounded live SOP driver: parked run could not be cancelled"
+        );
+        anyhow::bail!(
+            "SOP run {run_id} reached a park that a bounded caller's tool ceiling cannot \
+             follow past this turn, and could NOT be cancelled ({e}); it may still be \
+             active - treat it as unresolved, not closed"
+        );
+    }
+    let sop_name = engine
+        .get_run(&run_id)
+        .map(|run| run.sop_name.clone())
+        .unwrap_or_default();
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel)
+            .with_attrs(::serde_json::json!({ "run_id": run_id })),
+        "bounded live SOP driver: cancelled a run that would have parked outside the turn"
+    );
+    Ok(Some(SopRunAction::Cancelled { run_id, sop_name }))
 }
 
 /// Failure recorded for a headless step whose scoped tool policy could not be
@@ -1195,13 +1287,19 @@ pub(crate) fn advance_sop_step(
     engine: &Arc<Mutex<SopEngine>>,
     run_id: &str,
     result: SopStepResult,
+    bounded_caller: bool,
 ) -> Result<(SopRunAction, Option<SopRun>)> {
     let mut engine = engine
         .lock()
         .map_err(|e| anyhow::Error::msg(format!("SOP engine lock poisoned: {e}")))?;
-    let action = engine
+    let mut action = engine
         .advance_step(run_id, result)
         .with_context(|| format!("failed to advance SOP run {run_id}"))?;
+    if bounded_caller
+        && let Some(cancelled) = cancel_parked_run_for_bounded_caller(&mut engine, &action)?
+    {
+        action = cancelled;
+    }
     // `Cancelled` is as terminal as `Completed` / `Failed`: omitting it here means
     // `audit_sop_step` never reaches `log_run_complete`, so a boundary cancellation
     // leaves the in-memory audit record showing `Running` while the durable run and
@@ -1887,6 +1985,7 @@ mod tests {
                 completed_at: Some("2026-06-28T00:00:01Z".to_string()),
                 tool_calls: Vec::new(),
             },
+            false,
         )
         .unwrap();
 
@@ -1944,6 +2043,7 @@ mod tests {
                 completed_at: Some("2026-06-28T00:00:01Z".to_string()),
                 tool_calls: Vec::new(),
             },
+            false,
         )
         .unwrap();
 
@@ -1961,6 +2061,48 @@ mod tests {
             SopRunStatus::Cancelled,
             "the audited run must carry the terminal Cancelled status"
         );
+    }
+
+    /// A bounded caller's park cancellation is terminal too: it must surface
+    /// the finished run exactly like the boundary cancellation above, or the
+    /// audit record stays at `Running` for a run that is already cancelled.
+    #[test]
+    fn a_bounded_park_cancellation_reports_a_finished_run_for_the_audit_projection() {
+        let mut sop = test_sop("bounded-park");
+        let mut second = sop.steps[0].clone();
+        second.number = 2;
+        second.requires_confirmation = true;
+        sop.steps.push(second);
+        let mut engine = SopEngine::new(SopConfig::default());
+        engine.set_sops_for_test(vec![sop]);
+        let action = engine.start_run("bounded-park", manual_event()).unwrap();
+        let run_id = extract_run_id(&action);
+        let engine = Arc::new(Mutex::new(engine));
+
+        let (action, finished_run) = advance_sop_step(
+            &engine,
+            &run_id,
+            SopStepResult {
+                effective_agent: None,
+                step_number: 1,
+                status: SopStepStatus::Completed,
+                output: "ok".to_string(),
+                started_at: "2026-09-25T00:00:00Z".to_string(),
+                completed_at: Some("2026-09-25T00:00:01Z".to_string()),
+                tool_calls: Vec::new(),
+            },
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            matches!(action, SopRunAction::Cancelled { .. }),
+            "advancing a bounded caller's run into an approval gate must cancel it, \
+             got {action:?}"
+        );
+        let finished = finished_run.expect("the cancellation must surface the finished run");
+        assert_eq!(finished.run_id, run_id);
+        assert_eq!(finished.status, SopRunStatus::Cancelled);
     }
 
     #[tokio::test]

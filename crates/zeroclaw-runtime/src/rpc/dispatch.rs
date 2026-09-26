@@ -6441,7 +6441,13 @@ impl RpcDispatcher {
         let job = if self.has_admin_grants() {
             crate::cron::update_job(&config, &req.id, patch)
         } else {
-            crate::cron::update_job_for_agent(&config, &req.id, &owner.agent_alias, patch)
+            crate::cron::update_job_for_agent(
+                &config,
+                &req.id,
+                &owner.agent_alias,
+                patch,
+                &crate::cron::unguarded,
+            )
         }
         .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron patch failed: {e}")))?;
         to_result(job)

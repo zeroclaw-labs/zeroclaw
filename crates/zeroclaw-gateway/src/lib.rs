@@ -1231,56 +1231,88 @@ pub async fn run_gateway_with_plugin_webhooks(
                 sop_engine.clone(),
                 sop_audit.clone(),
                 None,
-            )?;
-            let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
-                config: &config,
-                agent_alias,
-                security: &security,
-                built: all_tools_result,
-                // The gateway registers no skills today; unifying the two
-                // skill loaders through this seam is the Epic F follow-up.
-                skills: &[],
-                runtime: Arc::clone(&runtime),
-                caller_allowed: None,
-                connect_mcp: true,
-                // Gateway tool-listing path: short-lived, no cross-turn reuse
-                // contract, so the per-call connect is correct.
-                mcp_registry: None,
-                // Listing-only registry: loading peripherals physically opens
-                // hardware (exclusive serial holds) that the live turn paths
-                // need. Never connect them for a registry no turn runs against.
-                connect_peripherals: false,
-                emit_assembly_logs: false,
-                exclude_memory: false,
-                acp_delivery: false,
-                list_deferred_mcp_specs: true,
-            })
-            .await;
-            let reaction_handle_gw_opt = Some(assembled.reaction_handle.clone());
-            let channel_names = zeroclaw_channels::orchestrator::register_channels_for_tools(
-                &config,
-                &assembled.ask_user_handle,
-                &assembled.channel_room_handle,
-                &reaction_handle_gw_opt,
-                &assembled.poll_handle,
-                &assembled.escalate_handle,
+                // The gateway builds an agent's own registry — the assembly just
+                // below passes `caller_allowed: None` for the same reason — so
+                // there is no inherited ceiling to cap stored jobs by.
+                None,
             );
-            if !channel_names.is_empty() {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"count": channel_names.len()})),
-                    &format!(
-                        "Registered {} channel(s) for dashboard agent",
-                        channel_names.len()
-                    ),
-                );
+            // Matches every sibling failure path above and below (memory
+            // backend, runtime adapter, risk_profile lookup, SecurityPolicy,
+            // the `(Some(_), None)`/`(None, _)` arms): a bad tool registry
+            // for the default agent falls back to an empty listing rather
+            // than `?`-aborting the whole gateway's startup.
+            match all_tools_result {
+                Ok(all_tools_result) => {
+                    let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
+                        config: &config,
+                        agent_alias,
+                        security: &security,
+                        built: all_tools_result,
+                        // The gateway registers no skills today; unifying the two
+                        // skill loaders through this seam is the Epic F follow-up.
+                        skills: &[],
+                        runtime: Arc::clone(&runtime),
+                        caller_allowed: None,
+                        connect_mcp: true,
+                        // Gateway tool-listing path: short-lived, no cross-turn reuse
+                        // contract, so the per-call connect is correct.
+                        mcp_registry: None,
+                        // Listing-only registry: loading peripherals physically opens
+                        // hardware (exclusive serial holds) that the live turn paths
+                        // need. Never connect them for a registry no turn runs against.
+                        connect_peripherals: false,
+                        emit_assembly_logs: false,
+                        exclude_memory: false,
+                        acp_delivery: false,
+                        list_deferred_mcp_specs: true,
+                    })
+                    .await;
+                    let reaction_handle_gw_opt = Some(assembled.reaction_handle.clone());
+                    let channel_names =
+                        zeroclaw_channels::orchestrator::register_channels_for_tools(
+                            &config,
+                            &assembled.ask_user_handle,
+                            &assembled.channel_room_handle,
+                            &reaction_handle_gw_opt,
+                            &assembled.poll_handle,
+                            &assembled.escalate_handle,
+                        );
+                    if !channel_names.is_empty() {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"count": channel_names.len()})),
+                            &format!(
+                                "Registered {} channel(s) for dashboard agent",
+                                channel_names.len()
+                            ),
+                        );
+                    }
+                    // Listing-only registry: no turn runs against it, so the
+                    // deferred-MCP prompt section and activation handle returned by
+                    // `assemble` have no consumer here (live gateway chat resolves
+                    // its tools inside process_message).
+                    (assembled.registry.into_inner(), assembled.delegate_handle)
+                }
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "agent_alias": agent_alias,
+                                "error": format!("{e}"),
+                            })),
+                        "Gateway: default agent's tool registry failed to build; \
+                         booting with empty tools registry. Fix via /admin/reload \
+                         or /quickstart."
+                    );
+                    (Vec::new(), None)
+                }
             }
-            // Listing-only registry: no turn runs against it, so the
-            // deferred-MCP prompt section and activation handle returned by
-            // `assemble` have no consumer here (live gateway chat resolves
-            // its tools inside process_message).
-            (assembled.registry.into_inner(), assembled.delegate_handle)
         }
         (Some(_), None) => {
             // Agent existed but its config failed to resolve. Warned
@@ -1365,7 +1397,28 @@ pub async fn run_gateway_with_plugin_webhooks(
             sop_engine.clone(),
             sop_audit.clone(),
             None,
-        )?;
+            // Listing-only registry for an agent's own tools: no inherited
+            // ceiling, matching the `caller_allowed: None` of its assembly.
+            None,
+        );
+        // Matches the risk_profile/SecurityPolicy failures above: skip just
+        // this agent's listing rather than `?`-aborting the whole /api/tools
+        // request over one bad agent's registry build.
+        let agent_tools_result = match agent_tools_result {
+            Ok(result) => result,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"agent_alias": alias, "error": format!("{e}")})
+                        ),
+                    "Gateway: agent tool registry failed to build; skipping its /api/tools listing."
+                );
+                continue;
+            }
+        };
         // Same gated seam as the dashboard seed above, so this listing shows
         // the agent's policy-filtered set (filter + MCP). The tools are only
         // enumerated for their specs, never invoked, so the returned channel
@@ -2994,6 +3047,7 @@ pub(crate) async fn run_gateway_chat_with_tools(
                     &agent_alias,
                     message,
                     session_id,
+                    None,
                     zeroclaw_api::ingress::TurnOrigin::Interactive,
                 ),
             ),
