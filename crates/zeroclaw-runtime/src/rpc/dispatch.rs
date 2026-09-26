@@ -6042,14 +6042,46 @@ impl RpcDispatcher {
 
     // ── Memory handlers ──────────────────────────────────────────
 
+    /// The memory handle a request operates on.
+    ///
+    /// Without `agent` this is the daemon's install-wide handle, as before.
+    /// With `agent` the caller must be entitled to that agent, and the handle
+    /// is the agent-scoped view, so rows are read, written and deleted under
+    /// that agent's identity and grants rather than across every agent.
+    async fn memory_for_request(
+        &self,
+        method: Method,
+        agent: Option<&str>,
+    ) -> Result<Arc<dyn zeroclaw_api::memory_traits::Memory>, JsonRpcError> {
+        let Some(alias) = agent.map(str::trim).filter(|a| !a.is_empty()) else {
+            return self
+                .ctx
+                .memory
+                .clone()
+                .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"));
+        };
+        self.selector_agent(method, alias)?;
+        let config = self.ctx.config.read().clone();
+        if !config.agents.contains_key(alias) {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!("Unknown agent {alias:?} (no [agents.{alias}] entry configured)"),
+            ));
+        }
+        let api_key = config
+            .resolved_model_provider_for_agent(alias)
+            .and_then(|(_, _, cfg)| cfg.api_key.clone());
+        zeroclaw_memory::create_memory_for_agent(&config, alias, api_key.as_deref())
+            .await
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Agent memory unavailable: {e:#}")))
+    }
+
     async fn handle_memory_list(&self, params: &Value) -> RpcResult {
-        let mem = self
-            .ctx
-            .memory
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
         let req: MemoryListParams = parse_params(params)?;
         self.authorize_memory_access(req.session_id.as_deref(), Method::MemoryList)
+            .await?;
+        let mem = self
+            .memory_for_request(Method::MemoryList, req.agent.as_deref())
             .await?;
         let category = req
             .category
@@ -6065,13 +6097,11 @@ impl RpcDispatcher {
     }
 
     async fn handle_memory_search(&self, params: &Value) -> RpcResult {
-        let mem = self
-            .ctx
-            .memory
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
         let req: MemorySearchParams = parse_params(params)?;
         self.authorize_memory_access(req.session_id.as_deref(), Method::MemorySearch)
+            .await?;
+        let mem = self
+            .memory_for_request(Method::MemorySearch, req.agent.as_deref())
             .await?;
         let entries = mem
             .recall(
@@ -6115,13 +6145,11 @@ impl RpcDispatcher {
     }
 
     async fn handle_memory_store(&self, params: &Value) -> RpcResult {
-        let mem = self
-            .ctx
-            .memory
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
         let req: MemoryStoreParams = parse_params(params)?;
         self.authorize_memory_access(req.session_id.as_deref(), Method::MemoryStore)
+            .await?;
+        let mem = self
+            .memory_for_request(Method::MemoryStore, req.agent.as_deref())
             .await?;
         let category = req
             .category
@@ -6138,13 +6166,11 @@ impl RpcDispatcher {
     }
 
     async fn handle_memory_delete(&self, params: &Value) -> RpcResult {
-        let mem = self
-            .ctx
-            .memory
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
         let req: MemoryDeleteParams = parse_params(params)?;
         self.authorize_memory_access(None, Method::MemoryDelete)
+            .await?;
+        let mem = self
+            .memory_for_request(Method::MemoryDelete, req.agent.as_deref())
             .await?;
         mem.forget(&req.key)
             .await
@@ -15592,6 +15618,125 @@ mod tests {
             .authorize_memory_access(None, Method::MemoryList)
             .await
             .expect("unscoped connections are unaffected");
+    }
+
+    /// Two configured agents, each with its own SQLite memory under the
+    /// install data dir, and principals entitled to `test-agent` only.
+    fn two_agent_memory_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+        let mut config = two_user_config(tmp);
+        let peer = config
+            .agents
+            .get("test-agent")
+            .cloned()
+            .expect("the fixture configures test-agent");
+        config.agents.insert("other-agent".into(), peer);
+        let member = config
+            .permission_profiles
+            .get_mut("member")
+            .expect("the fixture defines the member profile");
+        member.allowed_agents = vec!["test-agent".into()];
+        member.grants.insert(
+            zeroclaw_api::grants::Resource::Memory,
+            vec![zeroclaw_api::grants::Verb::Read],
+        );
+        config
+    }
+
+    /// A principal entitled to one agent cannot name another agent's memory,
+    /// even while reading inside a session it owns.
+    #[tokio::test]
+    async fn memory_agent_parameter_is_bound_by_the_agent_selector() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_agent_memory_config(&tmp);
+        let (fixture, _sessions) = make_acp_test_dispatcher(config);
+        let ctx = Arc::clone(&fixture.ctx);
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        alice
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "alice-mem",
+            }))
+            .await
+            .expect("alice creates her session");
+
+        let foreign_list = alice
+            .handle_memory_list(&json!({"session_id": "alice-mem", "agent": "other-agent"}))
+            .await
+            .expect_err("a foreign agent's memory is refused");
+        assert_eq!(foreign_list.code, FORBIDDEN, "{}", foreign_list.message);
+        assert!(
+            foreign_list.message.contains("not entitled to agent"),
+            "{}",
+            foreign_list.message
+        );
+        let foreign_search = alice
+            .handle_memory_search(&json!({
+                "query": "anything",
+                "session_id": "alice-mem",
+                "agent": "other-agent",
+            }))
+            .await
+            .expect_err("a foreign agent's memory is refused");
+        assert_eq!(foreign_search.code, FORBIDDEN, "{}", foreign_search.message);
+
+        alice
+            .handle_memory_list(&json!({"session_id": "alice-mem", "agent": "test-agent"}))
+            .await
+            .expect("the entitled agent's memory is readable in an owned session");
+    }
+
+    /// An unscoped operator's `agent` selects that agent's memory: rows are
+    /// stored under it, listed from it, and a delete through one agent does not
+    /// remove the same key held by another.
+    #[tokio::test]
+    async fn memory_agent_parameter_selects_the_agent_memory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_agent_memory_config(&tmp);
+        let (operator, _sessions) = make_acp_test_dispatcher(config);
+
+        for agent in ["test-agent", "other-agent"] {
+            operator
+                .handle_memory_store(&json!({
+                    "key": "shared-key",
+                    "content": format!("{agent} content"),
+                    "agent": agent,
+                }))
+                .await
+                .unwrap_or_else(|e| panic!("store for {agent}: {}", e.message));
+        }
+        let contents = |result: Value| -> Vec<String> {
+            result["entries"]
+                .as_array()
+                .expect("entries is an array")
+                .iter()
+                .map(|e| e["content"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+        let listed = operator
+            .handle_memory_list(&json!({"agent": "test-agent"}))
+            .await
+            .expect("list test-agent");
+        assert_eq!(contents(listed), vec!["test-agent content".to_string()]);
+
+        operator
+            .handle_memory_delete(&json!({"key": "shared-key", "agent": "test-agent"}))
+            .await
+            .expect("delete through test-agent");
+        let remaining = operator
+            .handle_memory_list(&json!({"agent": "other-agent"}))
+            .await
+            .expect("list other-agent");
+        assert_eq!(
+            contents(remaining),
+            vec!["other-agent content".to_string()],
+            "a delete through one agent must not remove another agent's row"
+        );
+
+        let unknown = operator
+            .handle_memory_list(&json!({"agent": "missing-agent"}))
+            .await
+            .expect_err("an unconfigured agent is refused");
+        assert_eq!(unknown.code, INVALID_PARAMS, "{}", unknown.message);
     }
 
     #[test]
