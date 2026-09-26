@@ -560,6 +560,7 @@ zc-chat-context-menu-copy-selection = Copy selection
 zc-chat-context-menu-open-link = Open link
 zc-chat-context-menu-copy-link = Copy link
 zc-chat-open-link-failed = Could not open link: { $error }
+zc-chat-context-menu-add-to-chat = Add to Chat
 zc-chat-context-menu-send-now = Send now
 zc-chat-context-menu-edit = Edit
 zc-chat-context-menu-delete = Delete
