@@ -9612,6 +9612,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_tool_call_loop_browser_and_search_preserve_tool_boundaries() {
+        for (requested_name, registered_name, parameter, value) in [
+            ("browser_open", "browser_open", "url", "https://example.com"),
+            ("browser", "browser", "action", "snapshot"),
+            (
+                "web_search",
+                "web_search_tool",
+                "query",
+                "rust release notes",
+            ),
+        ] {
+            let arguments = serde_json::json!({ parameter: value });
+            for response in [
+                format!("{requested_name}/{parameter}>{value}"),
+                format!(
+                    "<tool_call>{}</tool_call>",
+                    serde_json::json!({"name": requested_name, "arguments": arguments})
+                ),
+            ] {
+                for availability in ["registered", "missing", "excluded"] {
+                    let model_provider =
+                        ScriptedModelProvider::from_text_responses(vec![response.as_str(), "done"]);
+                    let recorded_args = Arc::new(Mutex::new(Vec::new()));
+                    let shell_args = Arc::new(Mutex::new(Vec::new()));
+                    let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+                    if availability != "missing" {
+                        tools.push(Box::new(RecordingArgsTool::new(
+                            registered_name,
+                            Arc::clone(&recorded_args),
+                        )));
+                    }
+                    // An available browser/search tool must work without shell;
+                    // an unavailable one must not borrow shell's authority.
+                    if availability != "registered" {
+                        tools.push(Box::new(RecordingArgsTool::new(
+                            "shell",
+                            Arc::clone(&shell_args),
+                        )));
+                    }
+                    let tools_registry =
+                        crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools);
+                    let excluded_tools = if availability == "excluded" {
+                        vec![registered_name.to_string()]
+                    } else {
+                        Vec::new()
+                    };
+                    let mut history = vec![
+                        ChatMessage::system("test-system"),
+                        ChatMessage::user("run the requested tool"),
+                    ];
+                    let observer = NoopObserver;
+                    let turn_id = uuid::Uuid::new_v4().to_string();
+                    let result = run_tool_call_loop(ToolLoop {
+                        parent_agent_alias: None,
+                        served_route_sink: None,
+                        sop_reassembly: None,
+                        exec: ResolvedAgentExecution {
+                            model_access: ResolvedModelAccess {
+                                model_provider: &model_provider,
+                                provider_name: "mock-provider",
+                                model: "mock-model",
+                                dispatch_model: "mock-model",
+                                temperature: Some(0.0),
+                            },
+                            tools_registry: &tools_registry,
+                            observer: &observer,
+                            silent: true,
+                            approval: None,
+                            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(
+                            ),
+                            config: None,
+                            max_tool_iterations: 4,
+                            hooks: None,
+                            excluded_tools: &excluded_tools,
+                            dedup_exempt_tools: &[],
+                            activated_tools: None,
+                            model_switch_callback: None,
+                            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                            strict_tool_parsing: false,
+                            parallel_tools: false,
+                            max_tool_result_chars: 0,
+                            context_limits: test_context_limits(0),
+                            context_limits_resolver: None,
+                            receipt_generator: None,
+                            knobs: &LoopKnobs::default(),
+                        },
+                        history: &mut history,
+                        history_has_trim_breadcrumb: &mut false,
+                        injected_memory_preamble: &mut None,
+                        channel_name: "cli",
+                        channel_reply_target: None,
+                        cancellation_token: None,
+                        on_delta: None,
+                        shared_budget: None,
+                        channel: None,
+                        collected_receipts: None,
+                        event_tx: None,
+                        steering: None,
+                        new_messages_out: None,
+                        image_cache: None,
+                        memory: None,
+                        ingress: IngressContext::sub_turn(),
+                        agent_alias: None,
+                        turn_id: &turn_id,
+                    })
+                    .await
+                    .expect("browser/search boundary turn should complete");
+
+                    let expected = if availability == "registered" {
+                        assert!(result.ends_with("done"), "{response}: {result}");
+                        vec![arguments.clone()]
+                    } else {
+                        Vec::new()
+                    };
+                    assert_eq!(
+                        *recorded_args.lock().unwrap(),
+                        expected,
+                        "{availability}: {response}"
+                    );
+                    assert!(
+                        shell_args.lock().unwrap().is_empty(),
+                        "browser/search must never execute shell: {availability}: {response}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn run_tool_call_loop_native_mode_preserves_fallback_tool_call_ids() {
         let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider = ScriptedModelProvider::from_text_responses(vec![
