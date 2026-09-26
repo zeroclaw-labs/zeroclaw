@@ -90,6 +90,17 @@ access, the agent may choose these tools during its work. To revoke access,
 remove `"parallel"` from every bundle granted to that agent, or add it to a
 granted bundle's `exclude` list, then restart the session.
 
+### Other compatible servers
+
+[You.com MCP](https://github.com/youdotcom-oss/agent-skills) is another
+compatible HTTP MCP server for web search and page content extraction. Follow
+the standard HTTP MCP setup shown in the Parallel example above, using
+`https://api.you.com/mcp` (authenticated) or
+`https://api.you.com/mcp?profile=free` (keyless) as the URL. See the
+[You.com setup docs](https://you.com/docs) and the
+[ZeroClaw MCP server fields guide](https://zeroclaw.dev/docs/tools/mcp#server-fields)
+for configuration details.
+
 ## Editing servers
 
 Three surfaces edit the same `[[mcp.servers]]` table:
