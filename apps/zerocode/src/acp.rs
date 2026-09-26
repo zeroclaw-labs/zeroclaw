@@ -89,6 +89,7 @@ impl Acp {
         self.inner.add_agent_session(agent_alias).await;
     }
 
+    /// Close one tracked Code session while preserving its durable history.
     pub(crate) async fn close_session(&mut self, session_id: &str) -> bool {
         self.inner.close_session(session_id).await
     }
@@ -135,6 +136,10 @@ impl Acp {
 
     pub(crate) fn take_help_request(&mut self) -> bool {
         self.inner.take_help_request()
+    }
+
+    pub(crate) fn take_add_session_request(&mut self) -> bool {
+        self.inner.take_add_session_request()
     }
 
     pub(crate) fn exit_browse_mode(&mut self) {
