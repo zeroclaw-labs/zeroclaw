@@ -51,14 +51,17 @@ By default an approval prompt is delivered through whichever channel initiated t
 ```toml
 [risk_profiles.frontline.approval_route]
 approver_channel = "matrix.ops"     # a channel registry key, NOT the originator
+approver_recipient = "!ops:example.org" # Matrix room ID; route-specific destination
 on_no_approver   = "deny"           # default; or "inherit-originator"
 timeout_secs     = 120              # default; bounds the approver's response window
 ```
 
 - `approver_channel` is the channel registry key that receives the approval request. Keys are platform-qualified, `<channel>.<alias>` (for example `matrix.ops` or `telegram.default`); a bare platform name (e.g. `matrix`) resolves only when it is the single channel of that platform. An alias on its own is not a registry key and will fail closed. When the route is set, the approval gate asks **only** that channel, not the originating one.
+- `approver_recipient` is the destination on that channel, not the originator's recipient. It is channel-specific: use a Matrix room ID such as `!ops:example.org`, a Telegram chat ID such as `-1001234567890`, a Slack channel ID such as `C0123456789`, or a Discord channel ID such as `123456789012345678`. The configured destination is used for the approver hop; the origin recipient is never reused for it.
 - `on_no_approver` decides what happens when the approver does not answer decisively, is unreachable, is not a registered channel, or times out:
   - `deny` (the default) fails closed and denies the tool call.
   - `inherit-originator` falls back to the originating-channel prompt (today's behavior).
+- A missing or blank `approver_recipient` makes the approver unavailable. It follows `on_no_approver`: the default `deny` fails closed, while `inherit-originator` explicitly permits the originating-channel fallback.
 - `timeout_secs` (default 120) bounds how long the gate waits for the approver before applying `on_no_approver`, so a hung approver channel cannot stall a turn.
 
 When `approval_route` is absent (the default), approvals behave exactly as described above: delivered through whichever channel initiated the conversation. The fail-closed default means a misconfigured or unreachable approver denies rather than silently self-approving.
