@@ -237,6 +237,7 @@ export interface WsMessage {
     | "cron_result"
     | "approval_request"
     | "history_trimmed"
+    | "safeguard_fallback"
     | "aborted";
   content?: string;
   full_response?: string;
@@ -252,19 +253,46 @@ export interface WsMessage {
   timestamp?: string;
   job_id?: string;
   success?: boolean;
+  // History-trim token accounting (server → client). Absent on message-limit
+  // trims and on older daemons; clients fall back to the count-only notice.
+  token_budget?: number;
+  tokens_before?: number;
+  tokens_after?: number;
+  tokens_before_source?: string;
+  tokens_after_source?: string;
+  // The retained request cannot fit the configured budget (protected newest
+  // turn plus schemas) even after trimming. History MAY have been trimmed on
+  // the way to that floor, so this flag — not `dropped_messages === 0` — is
+  // the authoritative "unsatisfiable" signal. Absent for ordinary trims and
+  // older daemons.
+  unsatisfiable_floor?: boolean;
   // Supervised-mode tool approval (server → client). See #6522.
   request_id?: string;
   tool?: string;
   arguments_summary?: string;
   timeout_secs?: number;
   dropped_messages?: number;
+  dropped_turns?: number;
   kept_turns?: number;
   reason?: string;
+  // Safety-safeguard fallback notice (server → client), present only on
+  // "safeguard_fallback" frames. Display-only: the gateway sends just the
+  // model names and which layer switched (`server`/`client`) — never the
+  // classifier category or refusal explanation. See #9262-#9268 (provider
+  // plumbing) plus the gateway/web surfacing built on top of it.
+  requested_model?: string;
+  served_model?: string;
+  fallback_kind?: "server" | "client" | "client_server";
   // Context window info (present on "done" frames). See #7311.
+  // `max_context_tokens` is the preemptive-trim budget the bar fills toward;
+  // `model_context_window` is the model's full capacity (bar denominator when present).
   max_context_tokens?: number;
+  model_context_window?: number | null;
   input_tokens?: number;
   output_tokens?: number;
-  last_input_tokens?: number;
+  // Emitted as JSON null when the accepted call reports no usage (stale
+  // route protection); consumers must branch on null, not undefined.
+  last_input_tokens?: number | null;
 }
 
 export type ApprovalDecision = "approve" | "deny" | "always";

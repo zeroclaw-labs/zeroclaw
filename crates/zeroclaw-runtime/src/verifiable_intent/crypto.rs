@@ -240,6 +240,10 @@ pub fn ec_public_bytes_to_jwk(pub_bytes: &[u8]) -> Result<Jwk, ViError> {
         crv: "P-256".into(),
         x: b64u_encode(&pub_bytes[1..33]),
         y: b64u_encode(&pub_bytes[33..65]),
+        // Raw key bytes carry no identifier. A caller that binds this key into a
+        // mandate sets `kid` there, where it is a naming decision rather than a
+        // property of the curve point.
+        kid: None,
         d: None,
     })
 }
@@ -478,7 +482,12 @@ pub fn parse_sd_jwt(serialized: &str) -> Result<(&str, Vec<&str>, Option<&str>),
         ));
     }
     let issuer_jwt = parts[0];
-    let last = *parts.last().unwrap();
+    let last = parts.last().copied().ok_or_else(|| {
+        ViError::new(
+            ViErrorKind::InvalidDisclosure,
+            "SD-JWT has no trailing segment",
+        )
+    })?;
 
     let kb_jwt = if last.is_empty() {
         None
@@ -903,6 +912,7 @@ mod tests {
             crv: field("crv"),
             x: field("x"),
             y: field("y"),
+            kid: None,
             d: None,
         })
         .expect("reference JWK must convert")

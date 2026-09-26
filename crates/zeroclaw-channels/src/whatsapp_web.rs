@@ -623,50 +623,33 @@ impl WhatsAppWebChannel {
         self.send(message).await
     }
 
-    /// Configure voice transcription (STT) for incoming voice notes.
+    /// Configure voice transcription from a `[transcription]` snapshot.
+    ///
+    /// Compatibility and test path. The daemon routes every channel through
+    /// `with_transcription_manager` with a manager built from live
+    /// config and the owning agent's resolved provider; this path can only see
+    /// the legacy section, so it binds a lone registered provider and
+    /// otherwise leaves the choice unbound (see
+    /// `transcription::manager_from_snapshot`).
     #[cfg(feature = "whatsapp-web")]
-    pub fn with_transcription(
-        mut self,
-        config: zeroclaw_config::schema::TranscriptionConfig,
-    ) -> Self {
-        if !config.enabled {
-            return self;
-        }
-        match super::transcription::TranscriptionManager::new(&config) {
-            Ok(m) => {
-                self.transcription_manager = Some(std::sync::Arc::new(m));
-                self.transcription = Some(config);
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"e": e.to_string()})),
-                    "transcription manager init failed, voice transcription disabled"
-                );
-            }
-        }
-        self
+    pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
+        let manager = super::transcription::manager_from_snapshot(&config);
+        self.with_transcription_manager(config, manager)
     }
 
-    /// Attach a transcription manager the caller already resolved against the
-    /// owning agent's `transcription_provider`.
-    ///
-    /// [`Self::with_transcription`] registers legacy `[transcription]`
-    /// providers only and leaves the agent alias empty, so
-    /// `TranscriptionManager::transcribe` can never select a provider. Channel
-    /// wiring uses this instead, mirroring [`Self::with_tts`], which already
-    /// binds the channel-owning agent.
+    /// Store an already-built transcription manager, or nothing. The config is
+    /// recorded only alongside a manager, so a channel never advertises
+    /// transcription it cannot perform.
     #[cfg(feature = "whatsapp-web")]
-    #[must_use]
-    pub fn with_transcription_manager(
+    pub(crate) fn with_transcription_manager(
         mut self,
         config: zeroclaw_config::schema::TranscriptionConfig,
-        manager: super::transcription::TranscriptionManager,
+        manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
     ) -> Self {
-        self.transcription_manager = Some(std::sync::Arc::new(manager));
-        self.transcription = Some(config);
+        if let Some(manager) = manager {
+            self.transcription_manager = Some(manager);
+            self.transcription = Some(config);
+        }
         self
     }
 
@@ -719,44 +702,33 @@ impl WhatsAppWebChannel {
 
     #[cfg(feature = "whatsapp-web")]
     fn is_number_allowed_for_list(allowed_numbers: &[String], phone: &str) -> bool {
-        // This channel historically accepted a surrounding-whitespace wildcard
-        // (`entry.trim() == "*"`), which is broader than the shared helper's
-        // exact `"*"` check, so keep that pre-check here.
-        if allowed_numbers.iter().any(|entry| entry.trim() == "*") {
-            return true;
-        }
-        crate::allowlist::is_user_allowed_by(allowed_numbers, phone, |entry, phone| {
-            match (
-                Self::normalize_phone_token(entry),
-                Self::normalize_phone_token(phone),
-            ) {
-                (Some(entry_norm), Some(phone_norm)) => entry_norm == phone_norm,
-                _ => false,
-            }
-        })
+        Self::are_numbers_allowed_for_list(allowed_numbers, &[phone])
     }
 
-    /// Normalize a phone-like token to canonical E.164 (`+<digits>`).
-    /// Accepts raw numbers, `+` numbers, and JIDs (uses the user part before `@`).
+    /// One sender reaches this channel under several numbers (its JID, the
+    /// alternate JID and the LID mapping), so they are evaluated as one
+    /// account: a deny naming any of them rejects the sender, whichever number
+    /// would otherwise have carried the grant.
+    #[cfg(feature = "whatsapp-web")]
+    fn are_numbers_allowed_for_list(allowed_numbers: &[String], phones: &[&str]) -> bool {
+        // The surrounding-whitespace wildcard this channel accepts is now what
+        // the shared helper accepts, so there is no broader local notion of the
+        // wildcard left to keep in step with the deny check.
+        crate::allowlist::is_identity_allowed_by(allowed_numbers, phones, Self::phone_matches)
+    }
+
+    /// Both WhatsApp surfaces admit the same accounts, so the raw / `+E.164` /
+    /// JID identity rule lives once in [`crate::whatsapp`] and both call it.
+    /// Keeping a second copy here let the two drift, and the Cloud webhook was
+    /// left comparing exactly while this path canonicalized.
+    #[cfg(feature = "whatsapp-web")]
+    fn phone_matches(entry: &str, phone: &str) -> bool {
+        crate::whatsapp::phone_matches(entry, phone)
+    }
+
     #[cfg(feature = "whatsapp-web")]
     fn normalize_phone_token(value: &str) -> Option<String> {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-
-        let user_part = trimmed
-            .split_once('@')
-            .map(|(user, _)| user)
-            .unwrap_or(trimmed)
-            .trim();
-
-        let digits: String = user_part.chars().filter(|c| c.is_ascii_digit()).collect();
-        if digits.is_empty() {
-            None
-        } else {
-            Some(format!("+{digits}"))
-        }
+        crate::whatsapp::normalize_phone_token(value)
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -834,10 +806,19 @@ impl WhatsAppWebChannel {
             None
         };
         let candidates = Self::sender_phone_candidates(sender, sender_alt, mapped_phone.as_deref());
-        let allowed_phone = candidates
-            .iter()
-            .find(|candidate| Self::is_number_allowed_for_list(allowed_numbers, candidate))
-            .cloned();
+        // Authorize the sender as one account first, so a deny naming any of
+        // its numbers is not sidestepped by another number of the same sender.
+        // Only then pick the number to report downstream.
+        let candidate_refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+        let allowed_phone = if Self::are_numbers_allowed_for_list(allowed_numbers, &candidate_refs)
+        {
+            candidates
+                .iter()
+                .find(|candidate| Self::is_number_allowed_for_list(allowed_numbers, candidate))
+                .cloned()
+        } else {
+            None
+        };
 
         SenderAllowlistResolution {
             mapped_phone,
@@ -911,6 +892,22 @@ impl WhatsAppWebChannel {
             &chat,
             info.source.is_from_me,
         );
+
+        // Business-mode `fromMe` events are delivery mirrors for messages sent
+        // by the linked account, not new user input. Reject them before either
+        // approval handling or `ChannelMessage` construction so their chat JID
+        // cannot grant the direct-message reply-intent bypass downstream.
+        if context.mode == zeroclaw_config::schema::WhatsAppWebMode::Business
+            && info.source.is_from_me
+        {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"chat": chat, "sender": sender})),
+                "ignoring fromMe delivery mirror in business mode"
+            );
+            return;
+        }
 
         // ── Approval-reply interception ──
         //
@@ -1756,6 +1753,48 @@ impl WhatsAppWebChannel {
         String::new()
     }
 
+    /// Hold `content` as this chat's pending voice reply, unless something says
+    /// it must not be spoken. Returns the reason it was not queued.
+    ///
+    /// The refusal happens before the queue is touched, which is the whole
+    /// point: a suppressed notice must not overwrite the conversational reply
+    /// already waiting to be spoken, nor push its timer out by arriving.
+    #[cfg(feature = "whatsapp-web")]
+    fn queue_pending_voice(
+        &self,
+        recipient: &str,
+        content: &str,
+        suppress_voice: bool,
+    ) -> Option<&'static str> {
+        let skip = Self::voice_queue_skip_reason(suppress_voice, content);
+        if skip.is_none()
+            && let Ok(mut pv) = self.pending_voice.lock()
+        {
+            pv.insert(
+                recipient.to_string(),
+                (content.to_string(), std::time::Instant::now()),
+            );
+        }
+        skip
+    }
+
+    /// Why an outbound message must not join the automatic voice queue, or
+    /// `None` when it may.
+    ///
+    /// `suppress_voice` is asked first and on its own terms: the sender of a
+    /// system notice or of an explicitly text-only reply has already decided,
+    /// and that decision does not depend on what the text looks like. It is
+    /// answered before the queue is touched, so a suppressed message cannot
+    /// replace the conversational reply already waiting there, nor push its
+    /// timer out by arriving.
+    #[cfg(feature = "whatsapp-web")]
+    fn voice_queue_skip_reason(suppress_voice: bool, content: &str) -> Option<&'static str> {
+        if suppress_voice {
+            return Some("suppress_voice");
+        }
+        crate::util::voice_reply_skip_reason(content)
+    }
+
     #[cfg(feature = "whatsapp-web")]
     fn group_context_scope(
         passive_group_context: bool,
@@ -1794,6 +1833,7 @@ impl WhatsAppWebChannel {
                 channel: "whatsapp".to_string(),
                 channel_alias: Some(alias.to_string()),
                 sender: sender.to_string(),
+                platform_sender_id: None,
                 // Reply to the originating chat JID (DM or group), passed
                 // through unchanged (library handles LID addressing internally).
                 reply_target,
@@ -1808,6 +1848,7 @@ impl WhatsAppWebChannel {
                 explicitly_addressed: false,
                 conversation_scope,
                 references: Vec::new(),
+                voice_origin: false,
             })
             .await
         {
@@ -1933,6 +1974,11 @@ impl WhatsAppWebChannel {
 
         let media_type = marker.kind.media_type();
         let mime = marker.kind.mime_for_path(path);
+        let image_preview = if matches!(marker.kind, WhatsAppMediaKind::Image) {
+            image_preview(bytes.clone()).await
+        } else {
+            None
+        };
 
         use whatsapp_rust::upload::UploadOptions;
         let upload = client
@@ -1944,8 +1990,8 @@ impl WhatsAppWebChannel {
         let file_enc_sha256 = upload.file_enc_sha256.to_vec();
         let file_sha256 = upload.file_sha256.to_vec();
         let outgoing = match marker.kind {
-            WhatsAppMediaKind::Image => waproto::whatsapp::Message {
-                image_message: waproto::whatsapp::message::ImageMessage {
+            WhatsAppMediaKind::Image => {
+                let mut image = waproto::whatsapp::message::ImageMessage {
                     url: Some(upload.url),
                     direct_path: Some(upload.direct_path),
                     media_key: Some(media_key),
@@ -1954,10 +2000,15 @@ impl WhatsAppWebChannel {
                     file_length: Some(upload.file_length),
                     mimetype: Some(mime),
                     ..Default::default()
+                };
+                if let Some(preview) = image_preview {
+                    preview.apply_to(&mut image);
                 }
-                .into(),
-                ..Default::default()
-            },
+                waproto::whatsapp::Message {
+                    image_message: image.into(),
+                    ..Default::default()
+                }
+            }
             WhatsAppMediaKind::Video => waproto::whatsapp::Message {
                 video_message: waproto::whatsapp::message::VideoMessage {
                     url: Some(upload.url),
@@ -2188,6 +2239,27 @@ fn fromme_outside_self_chat_is_operator_trigger(
         return false;
     }
     super::whatsapp::WhatsAppChannel::text_matches_patterns(applicable, text)
+}
+
+/// WhatsApp JID domains that identify a one-to-one chat.
+///
+/// This is an allow-list rather than "anything that is not `@g.us`". Broadcast
+/// lists, newsletters and call JIDs are not group chats either, yet they are
+/// not direct messages, and treating an unrecognised future domain as a DM
+/// would silently widen every `is_direct_message()` bypass downstream.
+#[cfg(feature = "whatsapp-web")]
+const DIRECT_MESSAGE_JID_DOMAINS: [&str; 2] = ["s.whatsapp.net", "lid"];
+
+/// Whether an originating chat JID denotes a one-to-one conversation.
+///
+/// `reply_target` carries the originating chat JID unchanged, so the domain is
+/// the authoritative signal: `@g.us` is a group, `@s.whatsapp.net` and `@lid`
+/// are individual chats (the latter is WhatsApp's hidden-identity addressing).
+#[cfg(feature = "whatsapp-web")]
+fn is_direct_message_jid(chat_jid: &str) -> bool {
+    chat_jid.rsplit_once('@').is_some_and(|(user, domain)| {
+        !user.is_empty() && DIRECT_MESSAGE_JID_DOMAINS.contains(&domain)
+    })
 }
 
 #[cfg(feature = "whatsapp-web")]
@@ -2603,6 +2675,310 @@ fn whatsapp_delivery_failure_note(failure_count: usize) -> Option<String> {
     ))
 }
 
+/// Markdown spans whose doubled marker collapses to WhatsApp's single one.
+#[cfg(feature = "whatsapp-web")]
+const WHATSAPP_INLINE_SPANS: [(&str, char); 3] = [("**", '*'), ("__", '_'), ("~~", '~')];
+
+/// Convert Markdown to WhatsApp's formatting dialect.
+///
+/// WhatsApp renders `*bold*`, `_italic_`, `~strikethrough~`, `` `code` ``,
+/// ``` ```monospace``` ```, bullet and numbered lists and `>` quotes natively,
+/// and auto-links bare URLs, so only the markers Markdown spells differently
+/// are rewritten. Text already written in WhatsApp style passes through
+/// unchanged.
+#[cfg(feature = "whatsapp-web")]
+fn markdown_to_whatsapp(text: &str) -> String {
+    let mut result_lines: Vec<String> = Vec::new();
+    // Length of the backtick run that opened the current fenced block.
+    let mut open_fence: Option<usize> = None;
+
+    for line in text.split('\n') {
+        let trimmed = line.trim_start();
+        let run = backtick_run(trimmed, 0);
+
+        if let Some(fence) = open_fence {
+            // Only a run at least as long as the opener with nothing but
+            // whitespace after it closes the block (CommonMark fenced code
+            // blocks); a shorter run or one carrying an info string is content.
+            if run >= fence && trimmed[run..].trim().is_empty() {
+                open_fence = None;
+            }
+            result_lines.push(line.to_string());
+            continue;
+        }
+
+        // An opening fence is three or more backticks whose info string holds
+        // no backtick — ```mono``` on one line is a WhatsApp monospace span.
+        if run >= 3 && !trimmed[run..].contains('`') {
+            // WhatsApp shares the backtick fence but has no notion of an info
+            // string, so it would render `rust` as the first code line.
+            let indent = &line[..line.len() - trimmed.len()];
+            result_lines.push(format!("{indent}{}", &trimmed[..run]));
+            open_fence = Some(run);
+            continue;
+        }
+
+        // Headings: `## Title` → `*Title*`. WhatsApp has no heading of its own.
+        let after_hashes = line.trim_start_matches('#');
+        let level = line.len() - after_hashes.len();
+        if (1..=6).contains(&level) && after_hashes.starts_with(' ') {
+            // The whole line is bold, so `# **Title**` sheds its own bold
+            // markers instead of gaining a second wrapper around them.
+            let title = markdown_inline_to_whatsapp_in(after_hashes.trim(), true);
+            result_lines.push(format!("*{title}*"));
+            continue;
+        }
+
+        result_lines.push(markdown_inline_to_whatsapp(line));
+    }
+
+    result_lines.join("\n")
+}
+
+/// Rewrite the inline Markdown markers of a single non-fenced line.
+#[cfg(feature = "whatsapp-web")]
+fn markdown_inline_to_whatsapp(line: &str) -> String {
+    markdown_inline_to_whatsapp_in(line, false)
+}
+
+/// [`markdown_inline_to_whatsapp`] for text that is already inside a bold
+/// span, where a nested `**bold**` contributes only its text.
+#[cfg(feature = "whatsapp-web")]
+fn markdown_inline_to_whatsapp_in(line: &str, inside_bold: bool) -> String {
+    let mut out = String::with_capacity(line.len());
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        // Inline code is copied verbatim so markers inside it stay literal. A
+        // span closes at the next backtick run of exactly the opening length
+        // (CommonMark code spans); an unmatched run is literal text.
+        if bytes[i] == b'`' {
+            let run = backtick_run(line, i);
+            let end = match find_backtick_run(line, i + run, run) {
+                Some(close) => close + run,
+                None => i + run,
+            };
+            out.push_str(&line[i..end]);
+            i = end;
+            continue;
+        }
+
+        // A bare URL is copied through whole so the `_`, `*` and `~` in its
+        // path stay literal; WhatsApp auto-links it as written.
+        if let Some(end) = bare_url_end(line, i) {
+            out.push_str(&line[i..end]);
+            i = end;
+            continue;
+        }
+
+        // `**bold**` → `*bold*`, `__x__` → `_x_`, `~~strike~~` → `~strike~`.
+        // A single marker is already WhatsApp syntax, so a leading `* ` list
+        // bullet and a lone `*bold*` both fall through untouched.
+        if let Some(&(marker, replacement)) = WHATSAPP_INLINE_SPANS
+            .iter()
+            .find(|(marker, _)| line[i..].starts_with(marker))
+            && let Some(end) = line[i + 2..].find(marker)
+        {
+            let inner = &line[i + 2..i + 2 + end];
+            if inside_bold && replacement == '*' {
+                out.push_str(inner);
+            } else {
+                out.push(replacement);
+                out.push_str(inner);
+                out.push(replacement);
+            }
+            i += 4 + end;
+            continue;
+        }
+
+        // `[text](url)` → `text: url`; WhatsApp auto-links the bare URL. The
+        // destination is read with CommonMark's boundaries (angle-bracket
+        // form, balanced or escaped parentheses, optional title), so its
+        // bytes reach the recipient unchanged; anything else stays literal.
+        if bytes[i] == b'['
+            && let Some(bracket_end) = line[i + 1..].find(']')
+        {
+            let after_bracket = i + 1 + bracket_end + 1;
+            if after_bracket < len
+                && bytes[after_bracket] == b'('
+                && let Some((url, end)) = parse_link_destination(line, after_bracket)
+            {
+                let text = &line[i + 1..i + 1 + bracket_end];
+                out.push_str(text);
+                out.push_str(": ");
+                out.push_str(&url);
+                i = end;
+                continue;
+            }
+        }
+
+        let ch = line[i..].chars().next().unwrap_or_default();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    out
+}
+
+/// Length of the backtick run starting at byte `at`.
+#[cfg(feature = "whatsapp-web")]
+fn backtick_run(text: &str, at: usize) -> usize {
+    text.as_bytes()[at..]
+        .iter()
+        .take_while(|&&b| b == b'`')
+        .count()
+}
+
+/// Byte index of the first backtick run of exactly `len` at or after `from`.
+#[cfg(feature = "whatsapp-web")]
+fn find_backtick_run(text: &str, from: usize, len: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut i = from;
+    while i < bytes.len() {
+        if bytes[i] != b'`' {
+            i += 1;
+            continue;
+        }
+        let run = backtick_run(text, i);
+        if run == len {
+            return Some(i);
+        }
+        i += run;
+    }
+    None
+}
+
+/// End of the bare URL starting at byte `at`, if one starts there. The URL
+/// runs to whitespace or `<`, less trailing punctuation and an unbalanced `)`
+/// (GFM autolink extension), so `(see https://x/y).` links `https://x/y`.
+#[cfg(feature = "whatsapp-web")]
+fn bare_url_end(text: &str, at: usize) -> Option<usize> {
+    let rest = &text[at..];
+    if !(rest.starts_with("http://") || rest.starts_with("https://")) {
+        return None;
+    }
+    let mut end = at
+        + rest
+            .find(|c: char| c.is_whitespace() || c == '<')
+            .unwrap_or(rest.len());
+    while let Some(last) = text[at..end].chars().next_back() {
+        let url = &text[at..end];
+        let unbalanced_paren = last == ')' && url.matches(')').count() > url.matches('(').count();
+        if !unbalanced_paren && !"?!.,:*_~'\"".contains(last) {
+            break;
+        }
+        end -= last.len_utf8();
+    }
+    Some(end)
+}
+
+/// Reads the `(destination "title")` tail of an inline link whose `(` sits at
+/// byte `open`. Returns the destination with backslash escapes resolved and
+/// the byte index just past the closing `)`, or `None` when the bytes are not
+/// a CommonMark link destination (the caller then keeps them literal).
+///
+/// CommonMark allows two destination forms: `<...>` (any characters except an
+/// unescaped `<` or `>`, so spaces are allowed) and a bare run without spaces
+/// or control characters in which parentheses must be balanced or escaped.
+/// An optional title (`"..."`, `'...'` or `(...)`) may follow after spaces.
+#[cfg(feature = "whatsapp-web")]
+fn parse_link_destination(text: &str, open: usize) -> Option<(String, usize)> {
+    let bytes = text.as_bytes();
+    let escaped =
+        |at: usize| bytes[at] == b'\\' && bytes.get(at + 1).is_some_and(u8::is_ascii_punctuation);
+    let skip_spaces = |mut at: usize| {
+        while at < bytes.len() && (bytes[at] == b' ' || bytes[at] == b'\t') {
+            at += 1;
+        }
+        at
+    };
+
+    let mut i = skip_spaces(open + 1);
+    let mut url = String::new();
+    if bytes.get(i) == Some(&b'<') {
+        i += 1;
+        loop {
+            match *bytes.get(i)? {
+                b'>' => {
+                    i += 1;
+                    break;
+                }
+                b'<' => return None,
+                _ if escaped(i) => {
+                    url.push(bytes[i + 1] as char);
+                    i += 2;
+                }
+                _ => {
+                    let ch = text[i..].chars().next()?;
+                    url.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
+        }
+    } else {
+        let mut depth = 0usize;
+        loop {
+            match *bytes.get(i)? {
+                b')' if depth == 0 => break,
+                b' ' | b'\t' => break,
+                _ if escaped(i) => {
+                    url.push(bytes[i + 1] as char);
+                    i += 2;
+                }
+                b'(' => {
+                    depth += 1;
+                    url.push('(');
+                    i += 1;
+                }
+                b')' => {
+                    depth -= 1;
+                    url.push(')');
+                    i += 1;
+                }
+                b if b.is_ascii_control() => return None,
+                _ => {
+                    let ch = text[i..].chars().next()?;
+                    url.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
+        }
+    }
+
+    // A title has no WhatsApp form; it is parsed only to find the closing `)`.
+    let after_destination = i;
+    i = skip_spaces(i);
+    if i > after_destination
+        && let Some(close) = match bytes.get(i) {
+            Some(b'"') => Some(b'"'),
+            Some(b'\'') => Some(b'\''),
+            Some(b'(') => Some(b')'),
+            _ => None,
+        }
+    {
+        let opener = bytes[i];
+        i += 1;
+        loop {
+            let b = *bytes.get(i)?;
+            if escaped(i) {
+                i += 2;
+            } else if b == close {
+                i += 1;
+                break;
+            } else if b == opener && opener == b'(' {
+                return None;
+            } else {
+                i += 1;
+            }
+        }
+        i = skip_spaces(i);
+    }
+
+    (bytes.get(i) == Some(&b')')).then(|| (url, i + 1))
+}
+
 #[cfg(feature = "whatsapp-web")]
 impl ::zeroclaw_api::attribution::Attributable for WhatsAppWebChannel {
     fn role(&self) -> ::zeroclaw_api::attribution::Role {
@@ -2620,6 +2996,14 @@ impl ::zeroclaw_api::attribution::Attributable for WhatsAppWebChannel {
 impl Channel for WhatsAppWebChannel {
     fn name(&self) -> &str {
         "whatsapp"
+    }
+
+    /// Without this the trait default (`false`) applies, so every WhatsApp DM
+    /// is treated as a non-direct message. Callers that exist to spare direct
+    /// messages extra handling — notably the reply-intent precheck bypass in
+    /// the channel orchestrator — then never fire for WhatsApp at all.
+    fn is_direct_message(&self, msg: &ChannelMessage) -> bool {
+        is_direct_message_jid(&msg.reply_target)
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
@@ -2687,7 +3071,8 @@ impl Channel for WhatsAppWebChannel {
             let content = &text_content;
             // Only queue substantive natural-language replies for voice.
             // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
-            let skip_reason = crate::util::voice_reply_skip_reason(content);
+            let skip_reason =
+                self.queue_pending_voice(&message.recipient, content, message.suppress_voice);
             if let Some(reason) = skip_reason {
                 // Stable literal per the logging contract: the classification
                 // and per-event measurements ride solely in `attributes` above.
@@ -2704,13 +3089,6 @@ impl Channel for WhatsAppWebChannel {
             }
 
             if skip_reason.is_none() {
-                if let Ok(mut pv) = self.pending_voice.lock() {
-                    pv.insert(
-                        message.recipient.clone(),
-                        (content.clone(), std::time::Instant::now()),
-                    );
-                }
-
                 let pending = self.pending_voice.clone();
                 let voice_chats = self.voice_chats.clone();
                 let client_clone = client.clone();
@@ -2868,7 +3246,7 @@ impl Channel for WhatsAppWebChannel {
 
         // Send text message
         let outgoing = waproto::whatsapp::Message {
-            conversation: Some(text_content),
+            conversation: Some(markdown_to_whatsapp(&text_content)),
             ..Default::default()
         };
 
@@ -3098,6 +3476,7 @@ impl Channel for WhatsAppWebChannel {
                                                 "whatsapp",
                                                 alias.as_ref(),
                                                 &format!("+{digits}"),
+                                                Self::phone_matches,
                                             )
                                             .await
                                     {
@@ -3330,6 +3709,42 @@ impl Channel for WhatsAppWebChannel {
         bot_handle_guard.is_some()
     }
 
+    fn supports_native_polls(&self) -> bool {
+        true
+    }
+
+    /// Post a native WhatsApp poll. Unlike `send`, a recipient outside the
+    /// allowlist is an error rather than a silent no-op: this is a tool call,
+    /// and the caller has to learn that nothing was posted.
+    async fn send_poll(&self, poll: &zeroclaw_api::channel::PollRequest) -> Result<()> {
+        // Validated before the client is touched, so a caller that got the
+        // recipient wrong hears that instead of a connection error.
+        if !Self::is_jid(&poll.recipient) {
+            let normalized = self.normalize_phone(&poll.recipient);
+            anyhow::ensure!(
+                self.is_number_allowed(&normalized),
+                "recipient `{}` is not in this channel's allowlist",
+                poll.recipient
+            );
+        }
+        let deliverable_recipient = Self::resolve_outbound_recipient(&poll.recipient);
+        let to = self.recipient_to_jid(&deliverable_recipient)?;
+
+        let client = self.client.lock().clone();
+        let Some(client) = client else {
+            anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
+        };
+
+        Box::pin(
+            client
+                .polls()
+                .create(to, &poll.question, &poll.options, poll.selectable_count),
+        )
+        .await
+        .map_err(|e| anyhow::Error::msg(format!("WhatsApp poll creation failed: {e}")))?;
+        Ok(())
+    }
+
     async fn start_typing(&self, recipient: &str) -> Result<()> {
         let client = self.client.lock().clone();
         let Some(client) = client else {
@@ -3552,6 +3967,14 @@ impl WhatsAppWebChannel {
         self
     }
 
+    pub(crate) fn with_transcription_manager(
+        self,
+        _config: zeroclaw_config::schema::TranscriptionConfig,
+        _manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
+    ) -> Self {
+        self
+    }
+
     pub fn with_tts(self, _config: zeroclaw_config::schema::TtsConfig) -> Self {
         self
     }
@@ -3605,11 +4028,281 @@ impl Channel for WhatsAppWebChannel {
     }
 }
 
+/// Longest side of the inline JPEG on an outgoing image. Phones draw the
+/// image card from it until the full image is downloaded, and they do not
+/// download automatically from senders outside the contact list, so without
+/// it the card stays empty. The official apps send about this size.
+#[cfg(feature = "whatsapp-web")]
+const IMAGE_PREVIEW_SIDE: u32 = 100;
+
+#[cfg(feature = "whatsapp-web")]
+const IMAGE_PREVIEW_JPEG_QUALITY: u8 = 60;
+
+/// The inline JPEG travels in the message itself.
+#[cfg(feature = "whatsapp-web")]
+const IMAGE_PREVIEW_MAX_BYTES: usize = 16 * 1024;
+
+/// Decoding limits for the image being previewed, which may be a file the
+/// agent downloaded. Anything larger is sent without a preview.
+#[cfg(feature = "whatsapp-web")]
+const IMAGE_PREVIEW_MAX_SOURCE_SIDE: u32 = 12_000;
+
+#[cfg(feature = "whatsapp-web")]
+const IMAGE_PREVIEW_MAX_ALLOC: u64 = 256 * 1024 * 1024;
+
+/// Size and inline preview for an outgoing image card.
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, PartialEq, Eq)]
+struct ImagePreview {
+    width: u32,
+    height: u32,
+    jpeg: Option<Vec<u8>>,
+}
+
+#[cfg(feature = "whatsapp-web")]
+impl ImagePreview {
+    fn apply_to(self, image: &mut waproto::whatsapp::message::ImageMessage) {
+        image.width = Some(self.width);
+        image.height = Some(self.height);
+        if let Some(jpeg) = self.jpeg {
+            image.jpeg_thumbnail = Some(jpeg);
+        }
+    }
+}
+
+/// Best-effort preview for the image in `bytes`: `None`, with a warning,
+/// when it cannot be decoded within the limits.
+#[cfg(feature = "whatsapp-web")]
+async fn image_preview(bytes: Vec<u8>) -> Option<ImagePreview> {
+    let rendered = tokio::task::spawn_blocking(move || {
+        render_image_preview(
+            &bytes,
+            IMAGE_PREVIEW_MAX_SOURCE_SIDE,
+            IMAGE_PREVIEW_MAX_ALLOC,
+        )
+    })
+    .await
+    .unwrap_or_else(|_| Err("preview task did not finish".to_string()));
+    match rendered {
+        Ok(preview) => {
+            if preview.jpeg.is_none() {
+                note_image_preview_skipped("rendered preview exceeds the inline size cap");
+            }
+            Some(preview)
+        }
+        Err(reason) => {
+            note_image_preview_skipped(&reason);
+            None
+        }
+    }
+}
+
+/// Decode `bytes`, apply the EXIF orientation so the preview matches what
+/// the recipient sees, and scale it into an inline JPEG. The reported size is
+/// that of the oriented full image.
+#[cfg(feature = "whatsapp-web")]
+fn render_image_preview(
+    bytes: &[u8],
+    max_source_side: u32,
+    max_alloc: u64,
+) -> std::result::Result<ImagePreview, String> {
+    use image::ImageDecoder as _;
+
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| format!("could not read image: {e}"))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(max_source_side);
+    limits.max_image_height = Some(max_source_side);
+    limits.max_alloc = Some(max_alloc);
+    reader.limits(limits);
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|e| format!("could not decode image: {e}"))?;
+    // `into_decoder` + `from_decoder` skips the reservation `ImageReader::decode`
+    // makes, and the JPEG decoder enforces dimensions but not `max_alloc`, so a
+    // small file within the side limits could still ask for a buffer past the
+    // budget. Check it before anything is allocated.
+    let needed = decoder.total_bytes();
+    if needed > max_alloc {
+        return Err(format!(
+            "decoded image needs {needed} bytes, over the {max_alloc} byte budget"
+        ));
+    }
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut full = image::DynamicImage::from_decoder(decoder)
+        .map_err(|e| format!("could not decode image: {e}"))?;
+    full.apply_orientation(orientation);
+
+    let thumbnail = full
+        .thumbnail(IMAGE_PREVIEW_SIDE, IMAGE_PREVIEW_SIDE)
+        .to_rgb8();
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, IMAGE_PREVIEW_JPEG_QUALITY)
+        .encode_image(&thumbnail)
+        .map_err(|e| format!("could not encode preview: {e}"))?;
+    Ok(ImagePreview {
+        width: full.width(),
+        height: full.height(),
+        jpeg: (jpeg.len() <= IMAGE_PREVIEW_MAX_BYTES).then_some(jpeg),
+    })
+}
+
+#[cfg(feature = "whatsapp-web")]
+fn note_image_preview_skipped(reason: &str) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({ "reason": reason })),
+        "whatsapp-web: image preview skipped"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[cfg(feature = "whatsapp-web")]
     use wacore_binary::jid::Jid;
+
+    // ── Outgoing image previews ──
+
+    #[cfg(feature = "whatsapp-web")]
+    fn encoded_image(width: u32, height: u32, format: image::ImageFormat) -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::RgbImage::from_pixel(width, height, image::Rgb([200, 40, 60]))
+            .write_to(&mut bytes, format)
+            .expect("encode test image");
+        bytes.into_inner()
+    }
+
+    /// A JPEG whose EXIF block says "rotate 90° clockwise to display"
+    /// (orientation 6), as phone cameras write for portrait shots.
+    #[cfg(feature = "whatsapp-web")]
+    fn rotated_jpeg(stored_width: u32, stored_height: u32) -> Vec<u8> {
+        let jpeg = encoded_image(stored_width, stored_height, image::ImageFormat::Jpeg);
+        let mut exif = b"Exif\0\0II*\0".to_vec();
+        exif.extend_from_slice(&8u32.to_le_bytes());
+        exif.extend_from_slice(&1u16.to_le_bytes());
+        exif.extend_from_slice(&[0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00]);
+        exif.extend_from_slice(&6u32.to_le_bytes());
+        exif.extend_from_slice(&0u32.to_le_bytes());
+        let length = u16::try_from(exif.len() + 2).expect("short segment");
+        let mut out = jpeg[..2].to_vec();
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        out.extend_from_slice(&length.to_be_bytes());
+        out.extend_from_slice(&exif);
+        out.extend_from_slice(&jpeg[2..]);
+        out
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn image_preview_reports_the_full_size_and_a_small_inline_jpeg() {
+        let png = encoded_image(1400, 1981, image::ImageFormat::Png);
+        let preview =
+            render_image_preview(&png, IMAGE_PREVIEW_MAX_SOURCE_SIDE, IMAGE_PREVIEW_MAX_ALLOC)
+                .expect("renders");
+        assert_eq!((preview.width, preview.height), (1400, 1981));
+        let jpeg = preview.jpeg.expect("inline preview");
+        assert!(
+            jpeg.starts_with(&[0xFF, 0xD8]),
+            "the inline preview is a JPEG"
+        );
+        let thumbnail = image::load_from_memory(&jpeg).expect("decodes");
+        assert_eq!(
+            thumbnail.height(),
+            100,
+            "phones only draw an inline preview about the size the official apps send"
+        );
+        assert!(
+            thumbnail.width() < thumbnail.height(),
+            "keeps the aspect ratio"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn image_preview_follows_the_exif_orientation() {
+        let preview = render_image_preview(
+            &rotated_jpeg(40, 20),
+            IMAGE_PREVIEW_MAX_SOURCE_SIDE,
+            IMAGE_PREVIEW_MAX_ALLOC,
+        )
+        .expect("renders");
+        assert_eq!(
+            (preview.width, preview.height),
+            (20, 40),
+            "a portrait photo stored sideways is reported as portrait"
+        );
+        let thumbnail =
+            image::load_from_memory(&preview.jpeg.expect("inline preview")).expect("decodes");
+        assert!(thumbnail.width() < thumbnail.height());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn image_preview_fails_on_unreadable_or_oversized_input() {
+        assert!(
+            render_image_preview(
+                b"not an image",
+                IMAGE_PREVIEW_MAX_SOURCE_SIDE,
+                IMAGE_PREVIEW_MAX_ALLOC
+            )
+            .is_err()
+        );
+        let png = encoded_image(40, 40, image::ImageFormat::Png);
+        assert!(
+            render_image_preview(&png, 20, IMAGE_PREVIEW_MAX_ALLOC).is_err(),
+            "images over the decoding limit get no preview"
+        );
+    }
+
+    /// The side limits let a small file through whose decoded buffer is huge:
+    /// a 10000x10000 RGB JPEG is inside 12000 px per side but needs 300 MB.
+    /// The decoder enforces dimensions, not the allocation budget, so the
+    /// budget has to be checked before the buffer is asked for.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn image_preview_refuses_a_decode_that_would_blow_the_allocation_budget() {
+        let png = encoded_image(200, 200, image::ImageFormat::Png);
+        let needed = 200u64 * 200 * 3;
+
+        let error = render_image_preview(&png, IMAGE_PREVIEW_MAX_SOURCE_SIDE, needed - 1)
+            .expect_err("a decode over the budget is refused");
+        assert!(error.contains("budget"), "{error}");
+
+        assert!(
+            render_image_preview(&png, IMAGE_PREVIEW_MAX_SOURCE_SIDE, needed).is_ok(),
+            "the same image renders when the budget covers it"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn image_preview_fills_the_image_card_fields() {
+        let mut image = waproto::whatsapp::message::ImageMessage::default();
+        ImagePreview {
+            width: 1400,
+            height: 1981,
+            jpeg: Some(vec![0xFF, 0xD8, 0xFF]),
+        }
+        .apply_to(&mut image);
+        assert_eq!((image.width, image.height), (Some(1400), Some(1981)));
+        assert_eq!(image.jpeg_thumbnail, Some(vec![0xFF, 0xD8, 0xFF]));
+
+        let mut size_only = waproto::whatsapp::message::ImageMessage::default();
+        ImagePreview {
+            width: 10,
+            height: 20,
+            jpeg: None,
+        }
+        .apply_to(&mut size_only);
+        assert_eq!((size_only.width, size_only.height), (Some(10), Some(20)));
+        assert_eq!(size_only.jpeg_thumbnail, None);
+    }
 
     /// Wrap one message in the single-entry batch that 0.7 delivers for live
     /// traffic, so tests keep expressing "one inbound message" directly.
@@ -3779,6 +4472,41 @@ mod tests {
             &groups,
             &zeroclaw_config::schema::WhatsAppChatPolicy::All
         ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn direct_message_jid_accepts_individual_chats() {
+        // Both individual addressing forms: the plain phone JID and the hidden
+        // identity (LID) form WhatsApp uses for privacy-preserving chats.
+        assert!(super::is_direct_message_jid("15550001111@s.whatsapp.net"));
+        assert!(super::is_direct_message_jid("100000000000001@lid"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn direct_message_jid_rejects_groups() {
+        assert!(!super::is_direct_message_jid("120363000000000001@g.us"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn direct_message_jid_rejects_non_conversational_domains() {
+        // Not groups, but not direct messages either. An allow-list keeps these
+        // out; a "not @g.us" check would wrongly admit all three.
+        assert!(!super::is_direct_message_jid("status@broadcast"));
+        assert!(!super::is_direct_message_jid(
+            "120363000000000000@newsletter"
+        ));
+        assert!(!super::is_direct_message_jid("15550001111@call"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn direct_message_jid_rejects_malformed_input() {
+        assert!(!super::is_direct_message_jid(""));
+        assert!(!super::is_direct_message_jid("15550001111"));
+        assert!(!super::is_direct_message_jid("@s.whatsapp.net"));
     }
 
     #[test]
@@ -4163,6 +4891,102 @@ mod tests {
         assert!(ch.is_number_allowed("+9999999999"));
     }
 
+    /// Resolve peers the way the daemon does, so these cover the
+    /// config-to-adapter boundary rather than a hand-built vector.
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_peers_from_config(toml_src: &str, alias: &str) -> Vec<String> {
+        let config: zeroclaw_config::schema::Config =
+            toml::from_str(toml_src).expect("peer-group config should parse");
+
+        config.channel_external_peers("whatsapp", alias)
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_deny_survives_the_whitespace_wildcard() {
+        // A wildcard written with surrounding whitespace, resolved from config.
+        // Gating deny emission on the exact string `"*"` emitted no deny here
+        // while this matcher still read the entry as a wildcard.
+        let peers = whatsapp_peers_from_config(
+            r#"
+            [peer_groups.whatsapp_ops]
+            channel = "whatsapp.ops"
+            external_peers = [" * "]
+            ignore = ["+15551234567"]
+            "#,
+            "ops",
+        );
+        assert!(!WhatsAppWebChannel::is_number_allowed_for_list(
+            &peers,
+            "+15551234567"
+        ));
+        assert!(WhatsAppWebChannel::is_number_allowed_for_list(
+            &peers,
+            "+15559999999"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_ignore_denies_an_equivalent_phone_spelling() {
+        // This matcher reads `+15551234567` and `15551234567` as one number.
+        // Resolving the deny by comparing raw strings kept the grant and
+        // dropped the `ignore`, and the sender was then admitted.
+        let peers = whatsapp_peers_from_config(
+            r#"
+            [peer_groups.whatsapp_ops]
+            channel = "whatsapp.ops"
+            external_peers = ["+15551234567"]
+            ignore = ["15551234567"]
+            "#,
+            "ops",
+        );
+        assert!(!WhatsAppWebChannel::is_number_allowed_for_list(
+            &peers,
+            "+15551234567"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_ignore_denies_a_jid_spelling_of_the_granted_number() {
+        // A sender arrives as a JID, which normalizes to the same number.
+        let peers = whatsapp_peers_from_config(
+            r#"
+            [peer_groups.whatsapp_ops]
+            channel = "whatsapp.ops"
+            external_peers = ["*"]
+            ignore = ["15551234567@s.whatsapp.net"]
+            "#,
+            "ops",
+        );
+        assert!(!WhatsAppWebChannel::is_number_allowed_for_list(
+            &peers,
+            "+15551234567"
+        ));
+        assert!(WhatsAppWebChannel::is_number_allowed_for_list(
+            &peers,
+            "+15559999999"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_deny_on_one_sender_number_covers_the_others() {
+        // A sender arrives as several numbers (JID, alternate JID, LID
+        // mapping). Denying one of them must reject the sender rather than
+        // letting the next number pick up the wildcard.
+        let peers = vec!["*".to_string(), "!+15551234567".to_string()];
+        assert!(!WhatsAppWebChannel::are_numbers_allowed_for_list(
+            &peers,
+            &["+447700900000", "+15551234567"]
+        ));
+        assert!(WhatsAppWebChannel::are_numbers_allowed_for_list(
+            &peers,
+            &["+447700900000", "+15559999999"]
+        ));
+    }
+
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_number_denied_empty() {
@@ -4257,6 +5081,78 @@ mod tests {
         assert_eq!(
             WhatsAppWebChannel::normalize_phone_token("+1 (555) 123-4567"),
             Some("+15551234567".to_string())
+        );
+    }
+
+    /// Config to writer to runtime, on the one identity WhatsApp spells three
+    /// ways. The writer runs on every reconnect, so a wrong answer here is the
+    /// operator's whole experience of pairing: told it worked, never able to
+    /// talk, and no conflict to act on.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_pairing_write_honors_a_deny_spelled_as_a_jid() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.whatsapp.insert(
+            "admin".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        config.peer_groups.insert(
+            "whatsapp_admin".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("whatsapp.admin".to_string()),
+                external_peers: vec![PeerUsername::new("+15551234567".to_string())],
+                ignore: vec![PeerUsername::new("15551234567@s.whatsapp.net".to_string())],
+                ..Default::default()
+            },
+        );
+
+        let resolved = config.channel_external_peers("whatsapp", "admin");
+        assert!(
+            !WhatsAppWebChannel::are_numbers_allowed_for_list(&resolved, &["+15551234567"]),
+            "the runtime canonicalizes the JID deny and rejects the account"
+        );
+
+        let err = crate::identity_persist::merge_external_peer(
+            &mut config,
+            "whatsapp",
+            "admin",
+            "+15551234567",
+            WhatsAppWebChannel::phone_matches,
+        )
+        .expect_err("the deny names this account, whichever spelling it uses");
+        assert!(
+            err.to_string().contains("ignore"),
+            "the operator is told which field to edit: {err}"
+        );
+
+        config
+            .peer_groups
+            .get_mut("whatsapp_admin")
+            .expect("group exists")
+            .ignore
+            .clear();
+        assert!(
+            crate::identity_persist::merge_external_peer(
+                &mut config,
+                "whatsapp",
+                "admin",
+                "+15551234567",
+                WhatsAppWebChannel::phone_matches,
+            )
+            .expect("merge succeeds once the deny is gone")
+            .is_none(),
+            "the existing grant is now effective, so nothing needs writing"
+        );
+        let resolved = config.channel_external_peers("whatsapp", "admin");
+        assert!(
+            WhatsAppWebChannel::are_numbers_allowed_for_list(&resolved, &["+15551234567"]),
+            "a no-op write leaves the identity admissible: the recovery path ends"
         );
     }
 
@@ -4998,6 +5894,105 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn inbound_path_rejects_business_from_me_before_direct_message_bypass() {
+        use wacore::types::message::{MessageInfo, MessageSource};
+        use whatsapp_rust::TokioRuntime;
+        use whatsapp_rust::bot::Bot;
+        use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
+        use whatsapp_rust_ureq_http_client::UreqHttpClient;
+        use zeroclaw_config::schema::{WhatsAppChatPolicy as Policy, WhatsAppWebMode as Mode};
+
+        const OPERATOR: &str = "15557654321";
+        const CUSTOMER: &str = "15551234567";
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(crate::whatsapp_storage::RusqliteStore::new(tmp.path()).unwrap());
+        let bot = Bot::builder()
+            .with_backend_arc(store)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(UreqHttpClient::new())
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .unwrap();
+        let client = bot.client();
+
+        let event = |sender: &str, from_me: bool, content: &str| {
+            single_message_event(
+                Arc::new(waproto::whatsapp::Message {
+                    conversation: Some(content.to_string()),
+                    ..Default::default()
+                }),
+                Arc::new(MessageInfo {
+                    source: MessageSource {
+                        chat: Jid::pn(CUSTOMER),
+                        sender: Jid::pn(sender),
+                        is_from_me: from_me,
+                        is_group: false,
+                        ..Default::default()
+                    },
+                    id: format!("business-from-me-{from_me}"),
+                    r#type: "text".to_string(),
+                    push_name: "Business DM Probe".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    ..Default::default()
+                }),
+            )
+        };
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let context = WhatsAppInboundContext {
+            tx,
+            alias: Arc::new("business-dm-provenance".to_string()),
+            peer_resolver: Arc::new(Vec::new),
+            allowed_groups_resolver: Arc::new(Vec::new),
+            mode: Mode::Business,
+            dm_policy: Policy::All,
+            group_policy: Policy::All,
+            self_chat_mode: false,
+            mention_only: false,
+            passive_group_context: false,
+            bot_phone: Arc::new(Mutex::new(None)),
+            bot_lid: Arc::new(Mutex::new(None)),
+            dm_mention_patterns: Arc::new(Vec::new()),
+            group_mention_patterns: Arc::new(Vec::new()),
+            transcription_config: None,
+            transcription_manager: None,
+            voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        };
+
+        let outbound_echo = event(OPERATOR, true, "outbound delivery mirror");
+        WhatsAppWebChannel::handle_inbound_message_event(&outbound_echo, &client, &context).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "a business-mode fromMe mirror must not reach channel dispatch"
+        );
+
+        let customer_message = event(CUSTOMER, false, "genuine customer message");
+        WhatsAppWebChannel::handle_inbound_message_event(&customer_message, &client, &context)
+            .await;
+        let dispatched = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("a genuine business DM must reach channel dispatch")
+            .expect("channel dispatch sender must remain open");
+        assert_eq!(dispatched.content, "genuine customer message");
+
+        let channel = WhatsAppWebChannel::new(
+            &zeroclaw_config::schema::WhatsAppConfig::default(),
+            "business-dm-provenance",
+            Arc::new(Vec::new),
+            Arc::new(Vec::new),
+        );
+        assert!(zeroclaw_api::channel::Channel::is_direct_message(
+            &channel,
+            &dispatched
+        ));
+    }
+
     // ── Reconnect retry state machine tests (exercise production helpers) ──
 
     #[test]
@@ -5128,11 +6123,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        let manager = super::super::transcription::TranscriptionManager::from_config_with_provider(
-            &config,
-            "groq.fast".to_string(),
-        )
-        .expect("typed provider must build a manager");
+        let manager =
+            super::super::transcription::build_channel_transcription_manager(&config, "groq.fast")
+                .expect("typed provider must build a manager");
 
         let cfg = zeroclaw_config::schema::WhatsAppConfig {
             enabled: true,
@@ -5145,13 +6138,41 @@ mod tests {
             Arc::new(|| vec!["+1234567890".into()]),
             Arc::new(Vec::new),
         )
-        .with_transcription_manager(config.transcription.clone(), manager);
+        .with_transcription_manager(config.transcription.clone(), Some(Arc::new(manager)));
 
         assert!(ch.transcription.is_some());
-        assert!(
-            ch.transcription_manager.is_some(),
-            "caller-resolved manager must be installed on the channel"
-        );
+        let manager = ch
+            .transcription_manager
+            .as_ref()
+            .expect("caller-resolved manager must be installed on the channel");
+        assert_eq!(manager.bound_provider(), "groq.fast");
+    }
+
+    /// REGRESSION: WhatsApp Web's own `with_transcription` never bound a
+    /// provider, so voice notes always failed with "no transcription_provider
+    /// configured". The shared snapshot path binds the lone provider.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn with_transcription_binds_the_sole_provider() {
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            ..Default::default()
+        };
+        let cfg = zeroclaw_config::schema::WhatsAppConfig {
+            enabled: true,
+            session_path: Some("/tmp/test-whatsapp.db".into()),
+            ..Default::default()
+        };
+        let ch = WhatsAppWebChannel::new(
+            &cfg,
+            "whatsapp_web_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+            Arc::new(Vec::new),
+        )
+        .with_transcription(tc);
+        let manager = ch.transcription_manager.as_ref().expect("manager is built");
+        assert_eq!(manager.bound_provider(), "groq");
     }
 
     #[test]
@@ -7280,6 +8301,128 @@ mod tests {
         );
     }
 
+    // ── Automatic voice queue ──
+
+    #[cfg(feature = "whatsapp-web")]
+    fn voice_channel() -> WhatsAppWebChannel {
+        WhatsAppWebChannel::new(
+            &approval_cfg(300),
+            "alias",
+            Arc::new(Vec::new),
+            Arc::new(Vec::new),
+        )
+    }
+
+    /// Long enough and plain enough to pass the content heuristic, so what the
+    /// tests below observe is the suppression flag and nothing else.
+    #[cfg(feature = "whatsapp-web")]
+    const SPOKEN_REPLY: &str = "Sure, the tasting is on Friday at seven and there are still seats.";
+
+    /// A notice that says it must not be spoken is not spoken, however
+    /// conversational it reads. Producers that set this flag include SOP
+    /// approval notices and `send_via` against a text-only peer group.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn a_suppressed_message_never_reaches_the_voice_queue() {
+        let ch = voice_channel();
+
+        assert_eq!(
+            ch.queue_pending_voice("chat", SPOKEN_REPLY, true),
+            Some("suppress_voice")
+        );
+        assert!(
+            ch.pending_voice.lock().expect("lock").is_empty(),
+            "a suppressed message queues nothing to synthesize"
+        );
+
+        // Positive control: the same text, unsuppressed, is queued.
+        assert_eq!(ch.queue_pending_voice("chat", SPOKEN_REPLY, false), None);
+        assert!(ch.pending_voice.lock().expect("lock").contains_key("chat"));
+    }
+
+    /// The reason suppression is answered before the queue is touched: a
+    /// notice arriving mid-conversation used to overwrite the reply waiting to
+    /// be spoken and restart its ten-second timer, so the chat heard the
+    /// notice instead of the answer, later.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn a_suppressed_notice_leaves_a_queued_reply_untouched() {
+        let ch = voice_channel();
+        ch.queue_pending_voice("chat", SPOKEN_REPLY, false);
+        let queued = ch
+            .pending_voice
+            .lock()
+            .expect("lock")
+            .get("chat")
+            .cloned()
+            .expect("queued");
+
+        ch.queue_pending_voice("chat", "Approval request expired.", true);
+
+        let after = ch
+            .pending_voice
+            .lock()
+            .expect("lock")
+            .get("chat")
+            .cloned()
+            .expect("still queued");
+        assert_eq!(after.0, queued.0, "the reply text is the one queued");
+        assert_eq!(after.1, queued.1, "and its timer was not restarted");
+    }
+
+    /// Suppression is a property of one message, not a sign that the
+    /// conversation went back to text: the chat stays marked, so the next
+    /// conversational reply is still spoken.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn suppression_does_not_end_the_voice_conversation() {
+        let ch = voice_channel();
+        ch.voice_chats
+            .lock()
+            .expect("lock")
+            .insert("chat".to_string());
+
+        ch.queue_pending_voice("chat", "Approval request expired.", true);
+
+        assert!(
+            ch.voice_chats.lock().expect("lock").contains("chat"),
+            "the chat is still a voice chat"
+        );
+        assert_eq!(ch.queue_pending_voice("chat", SPOKEN_REPLY, false), None);
+    }
+
+    /// The content heuristic is unchanged, and still applies when nothing is
+    /// suppressed.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn the_content_heuristic_still_decides_when_nothing_is_suppressed() {
+        for (content, reason) in [
+            (
+                "{\"status\": \"ok\", \"count\": 3, \"note\": \"a long json body\"}",
+                "json_object",
+            ),
+            (
+                "https://example.com/a/rather/long/link/to/somewhere/else",
+                "url_prefix",
+            ),
+            (
+                "Error: the upstream request timed out after thirty seconds",
+                "error_prefix",
+            ),
+            ("ok", "too_short"),
+        ] {
+            assert_eq!(
+                WhatsAppWebChannel::voice_queue_skip_reason(false, content),
+                Some(reason),
+                "{content}"
+            );
+        }
+        assert_eq!(
+            WhatsAppWebChannel::voice_queue_skip_reason(false, SPOKEN_REPLY),
+            None
+        );
+    }
+
     /// `approval_timeout_secs` reaches the channel from config, so every
     /// construction path picks it up rather than three call sites each
     /// remembering to.
@@ -7308,6 +8451,68 @@ mod tests {
         );
         let ch = WhatsAppWebChannel::new(&cfg, "alias", Arc::new(Vec::new), Arc::new(Vec::new));
         assert_eq!(ch.approval_timeout_secs, 300);
+    }
+
+    // ── Native polls ──
+
+    #[cfg(feature = "whatsapp-web")]
+    fn poll_channel(allowed_numbers: &[&str]) -> WhatsAppWebChannel {
+        let cfg = zeroclaw_config::schema::WhatsAppConfig {
+            enabled: true,
+            session_path: Some("/tmp/test-whatsapp-polls.db".into()),
+            ..Default::default()
+        };
+        let peers: Vec<String> = allowed_numbers.iter().map(|n| (*n).to_string()).collect();
+        WhatsAppWebChannel::new(
+            &cfg,
+            "poll_alias",
+            Arc::new(move || peers.clone()),
+            Arc::new(Vec::new),
+        )
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn poll_request(recipient: &str) -> zeroclaw_api::channel::PollRequest {
+        zeroclaw_api::channel::PollRequest::new(
+            recipient,
+            "Which tasting slot?",
+            vec!["Friday".into(), "Saturday".into()],
+        )
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn the_channel_advertises_native_polls() {
+        assert!(poll_channel(&["+15550001111"]).supports_native_polls());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn a_poll_without_a_client_reports_the_same_not_connected_error_as_send() {
+        let channel = poll_channel(&["+15550001111"]);
+        let error = channel
+            .send_poll(&poll_request("+15550001111"))
+            .await
+            .expect_err("no client is connected");
+        assert!(error.to_string().contains("not connected"), "{error}");
+    }
+
+    /// `send` drops a disallowed recipient with a warning and reports success.
+    /// A poll is a tool call, so it has to say that nothing was posted.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn a_poll_to_a_number_outside_the_allowlist_fails_loudly() {
+        let channel = poll_channel(&["+15550001111"]);
+        let error = channel
+            .send_poll(&poll_request("+15559999999"))
+            .await
+            .expect_err("the recipient is not allowed");
+        let message = error.to_string();
+        assert!(message.contains("allowlist"), "{message}");
+        assert!(
+            !message.contains("not connected"),
+            "the allowlist must be checked before the client, so the caller learns the real reason: {message}"
+        );
     }
 
     /// ...and a config built in Rust now agrees with one parsed from a file.
@@ -7561,5 +8766,228 @@ mod tests {
             assert_eq!(got_token, token.to_lowercase());
             assert_eq!(got, want);
         }
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn markdown_inline_markers_collapse_to_whatsapp_syntax() {
+        assert_eq!(markdown_to_whatsapp("**bold**"), "*bold*");
+        assert_eq!(markdown_to_whatsapp("__underscored__"), "_underscored_");
+        assert_eq!(markdown_to_whatsapp("~~gone~~"), "~gone~");
+        assert_eq!(
+            markdown_to_whatsapp("a **b** and ~~c~~ and __d__ end"),
+            "a *b* and ~c~ and _d_ end"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn markdown_headings_become_bold_lines() {
+        assert_eq!(markdown_to_whatsapp("# Title"), "*Title*");
+        assert_eq!(markdown_to_whatsapp("###### Deep"), "*Deep*");
+        // Seven hashes is not a heading, and neither is a bare `#tag`.
+        assert_eq!(markdown_to_whatsapp("####### Nope"), "####### Nope");
+        assert_eq!(markdown_to_whatsapp("#tag"), "#tag");
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn markdown_links_become_text_then_url() {
+        assert_eq!(
+            markdown_to_whatsapp("see [the docs](https://example.com/x) now"),
+            "see the docs: https://example.com/x now"
+        );
+        // A bare URL is left for WhatsApp to auto-link.
+        assert_eq!(
+            markdown_to_whatsapp("https://example.com/x"),
+            "https://example.com/x"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_native_constructs_pass_through() {
+        let native = "- first\n- second\n1. one\n2. two\n> quoted\n`inline code`";
+        assert_eq!(markdown_to_whatsapp(native), native);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn already_whatsapp_styled_text_is_unchanged() {
+        let styled = "*bold* and _italic_ and ~struck~ and `code`";
+        assert_eq!(markdown_to_whatsapp(styled), styled);
+        assert_eq!(
+            markdown_to_whatsapp(&markdown_to_whatsapp("**bold** and __italic__")),
+            "*bold* and _italic_"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn leading_list_marker_is_not_read_as_bold() {
+        assert_eq!(markdown_to_whatsapp("* item one"), "* item one");
+        assert_eq!(
+            markdown_to_whatsapp("* item one\n* item two"),
+            "* item one\n* item two"
+        );
+        assert_eq!(markdown_to_whatsapp("* **hot** item"), "* *hot* item");
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn code_fences_keep_their_contents_and_lose_the_language_tag() {
+        assert_eq!(
+            markdown_to_whatsapp("```rust\nlet x = **y**;\n```"),
+            "```\nlet x = **y**;\n```"
+        );
+        assert_eq!(
+            markdown_to_whatsapp("```\n# not a heading\n[a](b)\n```"),
+            "```\n# not a heading\n[a](b)\n```"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn mixed_hebrew_and_english_gains_no_direction_marks() {
+        let input = "## סיכום Summary\n**חשוב**: ראה [the docs](https://example.com) עכשיו";
+        let rendered = markdown_to_whatsapp(input);
+        assert_eq!(
+            rendered,
+            "*סיכום Summary*\n*חשוב*: ראה the docs: https://example.com עכשיו"
+        );
+        assert!(!rendered.contains('\u{200f}'));
+        assert!(!rendered.contains('\u{200e}'));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn multi_line_message_converts_heading_list_and_bold() {
+        let input = "# Report\n\nThe **build** is green.\n\n- run `cargo test`\n- read [the log](https://ci.example.com/1)\n";
+        assert_eq!(
+            markdown_to_whatsapp(input),
+            "*Report*\n\nThe *build* is green.\n\n- run `cargo test`\n- read the log: https://ci.example.com/1\n"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn link_destination_boundaries_follow_commonmark() {
+        // An angle-bracket destination may contain spaces.
+        assert_eq!(
+            markdown_to_whatsapp("[docs](<https://example.test/a b>)"),
+            "docs: https://example.test/a b"
+        );
+        // An escaped parenthesis belongs to the destination.
+        assert_eq!(
+            markdown_to_whatsapp("[docs](https://example.test/a\\)b)"),
+            "docs: https://example.test/a)b"
+        );
+        assert_eq!(
+            markdown_to_whatsapp("[docs](<https://example.test/a\\>b>)"),
+            "docs: https://example.test/a>b"
+        );
+        // A title in any of its three forms is dropped, not sent as URL.
+        assert_eq!(
+            markdown_to_whatsapp("[docs](https://example.test/x \"Title\")"),
+            "docs: https://example.test/x"
+        );
+        assert_eq!(
+            markdown_to_whatsapp("[docs](https://example.test/x 'Title')"),
+            "docs: https://example.test/x"
+        );
+        assert_eq!(
+            markdown_to_whatsapp("[docs](https://example.test/x (Title))"),
+            "docs: https://example.test/x"
+        );
+        // Not a CommonMark link: an unclosed angle bracket or a bare
+        // destination with a space stays literal.
+        assert_eq!(
+            markdown_to_whatsapp("[docs](<https://example.test/a b)"),
+            "[docs](<https://example.test/a b)"
+        );
+        assert_eq!(
+            markdown_to_whatsapp("[docs](https://example.test/a b)"),
+            "[docs](https://example.test/a b)"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn bare_url_bytes_survive_unchanged() {
+        let url = "https://example.test/a__b__c";
+        assert_eq!(markdown_to_whatsapp(url), url);
+        assert_eq!(
+            markdown_to_whatsapp("see https://example.test/a__b__c now"),
+            "see https://example.test/a__b__c now"
+        );
+        // Trailing punctuation and an unbalanced `)` belong to the sentence,
+        // not the URL, so the markers after a URL still convert.
+        assert_eq!(
+            markdown_to_whatsapp("(see https://example.test/x_(y)_z). **ok**"),
+            "(see https://example.test/x_(y)_z). *ok*"
+        );
+        assert_eq!(
+            markdown_to_whatsapp("**https://example.test/a~~b~~c**"),
+            "*https://example.test/a~~b~~c*"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn link_destination_keeps_balanced_parentheses() {
+        assert_eq!(
+            markdown_to_whatsapp("[docs](https://example.test/a_(b)/c)"),
+            "docs: https://example.test/a_(b)/c"
+        );
+        assert_eq!(
+            markdown_to_whatsapp("[docs](https://example.test/a__b \"title\") tail"),
+            "docs: https://example.test/a__b tail"
+        );
+        // An unbalanced destination is not a link, and the URL still passes whole.
+        assert_eq!(
+            markdown_to_whatsapp("[docs](https://example.test/a_(b"),
+            "[docs](https://example.test/a_(b"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn code_span_closes_only_on_a_matching_backtick_run() {
+        assert_eq!(markdown_to_whatsapp("``a **b**``"), "``a **b**``");
+        assert_eq!(
+            markdown_to_whatsapp("``has ` inside`` and **bold**"),
+            "``has ` inside`` and *bold*"
+        );
+        // An unmatched run is literal text and does not swallow the line.
+        assert_eq!(markdown_to_whatsapp("``open **bold**"), "``open *bold*");
+        assert_eq!(markdown_to_whatsapp("```mono __x__```"), "```mono __x__```");
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn longer_fence_encloses_a_triple_backtick_example() {
+        let input = "````\n```rust\nlet x = **y**;\n```\n[a](b)\n````\n**after**";
+        assert_eq!(
+            markdown_to_whatsapp(input),
+            "````\n```rust\nlet x = **y**;\n```\n[a](b)\n````\n*after*"
+        );
+        // A fence line carrying an info string never closes a block.
+        assert_eq!(
+            markdown_to_whatsapp("```\n```rust\n**x**\n```\n**y**"),
+            "```\n```rust\n**x**\n```\n*y*"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn bold_heading_is_wrapped_once_and_stays_put() {
+        assert_eq!(markdown_to_whatsapp("# **Title**"), "*Title*");
+        assert_eq!(
+            markdown_to_whatsapp(&markdown_to_whatsapp("# **Title**")),
+            "*Title*"
+        );
+        // Bold inside a heading is redundant: the whole line is already bold.
+        assert_eq!(markdown_to_whatsapp("## Plain **part**"), "*Plain part*");
+        assert_eq!(markdown_to_whatsapp("## `**` and __u__"), "*`**` and _u_*");
     }
 }

@@ -53,7 +53,9 @@ For Web mode, `dm_policy` and `group_policy` apply under **both** modes. `self_c
 
 `self_chat_mode` stays personal-only because the self-chat affordance is scoped to the personal branch by design. `mode` selects ZeroClaw's policy posture, not a WhatsApp account type: both modes drive the same linked-device session.
 
-The fromMe guard also stays inside the personal branch, but not because business mode lacks an equivalent. Business mode is still a WhatsApp Web linked-device session, and WhatsApp mirrors the operator's own outbound messages to linked devices as `fromMe` in either mode. The linked account is persisted as an authorized peer, so under business mode that mirror can satisfy the allowlist and reach dispatch, which is the shape #6353 closed for personal mode. That behaviour predates this change and is not introduced here; it is called out rather than asserted away, and repairing it is tracked separately.
+WhatsApp mirrors the linked account's outbound messages as `fromMe` events in either mode. Business mode drops these echoes before approval-reply handling or user-message dispatch, so they cannot start another agent turn. Personal mode retains its intentional self-chat and explicit operator-trigger handling; this business-mode rule does not remove those exceptions.
+
+Admitted WhatsApp Web one-to-one messages, identified by the `@s.whatsapp.net` or `@lid` chat domain, bypass the reply-intent classifier even when precheck is enabled. Channel access policies still apply before dispatch, and bypassing this classifier does not guarantee a reply. Group and other chat domains do not receive this direct-message exemption; other existing bypass conditions, such as an explicit mention, remain unchanged. Business-mode `fromMe` echoes are dropped before they can receive the exemption.
 
 ### Compatibility note for `mode = "business"`
 
@@ -85,6 +87,14 @@ session_path = "/var/lib/zeroclaw/wa.db"
 # Only operate in these two groups; all other groups are dropped.
 allowed_groups = ["120363012345678901@g.us", "120363098765432109"]
 ```
+
+## Polls
+
+The `poll` tool posts a native WhatsApp poll in Web mode instead of the numbered text fallback used on channels without native polls. The tool accepts 2–10 options; the WhatsApp library accepts up to 12, but the tool schema does not expose 11–12. `multi_select` lets a voter select multiple options.
+
+Raw phone-number recipients are checked against the channel's number allowlist, and a disallowed number returns an error instead of silently doing nothing. As with ordinary sends, JID recipients bypass that number check. `duration_minutes` does not expire a native poll.
+
+Votes are not read back yet: the poll card shows the result to people in the chat, and the agent only learns that the poll was posted.
 
 ## Tool approval over chat (`approval_timeout_secs`)
 

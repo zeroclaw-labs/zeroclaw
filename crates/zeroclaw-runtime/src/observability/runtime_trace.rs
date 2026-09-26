@@ -15,6 +15,7 @@ fn to_log_config(config: &zeroclaw_config::schema::ObservabilityConfig) -> zeroc
         log_persistence_rotate_daily: config.log_persistence_rotate_daily,
         log_persistence_retention_max_files: config.log_persistence_retention_max_files,
         log_persistence_retention_max_age_days: config.log_persistence_retention_max_age_days,
+        log_persistence_max_entries_per_segment: config.log_persistence_max_entries_per_segment,
         log_tool_io: config.log_tool_io.as_wire().to_string(),
         log_tool_io_truncate_bytes: config.log_tool_io_truncate_bytes,
         log_tool_io_denylist: config.log_tool_io_denylist.clone(),
@@ -28,6 +29,10 @@ pub fn init_from_config(
     workspace_dir: &Path,
 ) {
     zeroclaw_log::init_from_config(&to_log_config(config), workspace_dir);
+    #[cfg(feature = "observability-otel")]
+    super::otel_logs::configure(config);
+    #[cfg(not(feature = "observability-otel"))]
+    zeroclaw_log::clear_log_exporter();
 }
 
 /// Resolve the configured log path (used by the doctor command).

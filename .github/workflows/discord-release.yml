@@ -11,6 +11,11 @@ on:
         description: "GitHub Release URL"
         required: true
         type: string
+      dry_run:
+        description: "Compose and print the message without publishing it"
+        required: false
+        type: boolean
+        default: false
     secrets:
       DISCORD_WEBHOOK_URL:
         required: false
@@ -21,9 +26,14 @@ on:
         required: true
         type: string
       release_url:
-        description: "GitHub Release URL"
-        required: true
+        description: "GitHub Release URL (defaults to the release page for the tag)"
+        required: false
         type: string
+      dry_run:
+        description: "Compose and print the message without publishing it"
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   discord:
@@ -38,15 +48,41 @@ jobs:
         shell: bash
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
-          RELEASE_URL: ${{ inputs.release_url }}
+          RELEASE_URL: ${{ inputs.release_url || '' }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+
+          if [ -z "$RELEASE_URL" ]; then
+            RELEASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}"
+          fi
+          echo "release_url=${RELEASE_URL}" >> "$GITHUB_OUTPUT"
 
           # Find previous stable tag
           PREV_STABLE=$(git tag --sort=-creatordate \
             | grep -v "^${RELEASE_TAG}$" \
             | grep -vE '\-beta\.' \
             | head -1 || echo "")
+
+          # Preferred: the release author's "## In brief" section from the
+          # published release notes, plus the Highlights bullets (an embed
+          # description has room for them), the counts, and a link to the
+          # website's release post when one exists for this tag.
+          NOTES_FILE="$(mktemp)"
+          if gh release view "$RELEASE_TAG" --json body --jq .body > "$NOTES_FILE" 2>/dev/null \
+            && [ -s "$NOTES_FILE" ] \
+            && BODY="$(scripts/ci/release_post_text.sh \
+                --notes "$NOTES_FILE" --tag "$RELEASE_TAG" --prev "$PREV_STABLE" \
+                --highlights 6 --limit 3500 \
+                --site-feed https://www.zeroclaw.com/blog/rss.xml --fallback-link "$RELEASE_URL")"; then
+            {
+              echo "body<<MSG_EOF"
+              echo "$BODY"
+              echo "MSG_EOF"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "::warning::Release notes for ${RELEASE_TAG} unavailable or without In brief/Highlights; using the commit list"
 
           RANGE="${PREV_STABLE:+${PREV_STABLE}..}${RELEASE_TAG}"
 
@@ -94,12 +130,27 @@ jobs:
             echo "MSG_EOF"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Dry run
+        if: inputs.dry_run == true
+        env:
+          MSG_BODY: ${{ steps.msg.outputs.body }}
+        run: |
+          {
+            echo "## Discord message preview (dry run, nothing published)"
+            echo
+            echo '```'
+            echo "$MSG_BODY"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Dry run: nothing published."
+
       - name: Post to Discord
+        if: inputs.dry_run != true
         shell: bash
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           RELEASE_TAG: ${{ inputs.release_tag }}
-          RELEASE_URL: ${{ inputs.release_url }}
+          RELEASE_URL: ${{ steps.msg.outputs.release_url }}
           MSG_BODY: ${{ steps.msg.outputs.body }}
         run: |
           set -euo pipefail
@@ -109,17 +160,24 @@ jobs:
             exit 0
           fi
 
-          # Build Discord embed payload
+          # Build Discord embed payload. The body's last line is the link the
+          # composer chose (the website post when one exists); the embed title
+          # links there and the release page is named separately when it
+          # differs, so readers reach both.
           PAYLOAD=$(python3 -c "
           import json, os
           tag = os.environ['RELEASE_TAG']
-          url = os.environ['RELEASE_URL']
-          body = os.environ['MSG_BODY']
+          release_url = os.environ['RELEASE_URL']
+          body = os.environ['MSG_BODY'].rstrip()
+          lines = body.split('\n')
+          link = lines[-1].strip() if lines and lines[-1].strip().startswith('http') else release_url
+          if link != release_url and lines and lines[-1].strip() == link:
+              body = '\n'.join(lines[:-1]).rstrip() + f'\n\nRelease notes: {release_url}'
 
           embed = {
-              'title': f'ZeroClaw {tag} Released',
-              'description': body + '\n\nZero overhead. Zero compromise. 100% Rust.',
-              'url': url,
+              'title': f'ZeroClaw {tag}',
+              'description': body,
+              'url': link,
               'color': 0xF97316,
               'footer': {'text': 'ZeroClaw Release Bot'},
           }

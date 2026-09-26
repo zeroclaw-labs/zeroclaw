@@ -1659,7 +1659,13 @@ impl ModelProvider for OpenAiCodexModelProvider {
                 )
                 .json(&request);
 
-            crate::openai::run_responses_sse(request_builder, &tx, count_tokens).await;
+            crate::openai::run_responses_sse(
+                request_builder,
+                &tx,
+                count_tokens,
+                crate::StreamIdleBound::Fixed(crate::STREAM_IDLE_TIMEOUT),
+            )
+            .await;
         });
 
         let guard = AbortOnDrop::new(handle.abort_handle());

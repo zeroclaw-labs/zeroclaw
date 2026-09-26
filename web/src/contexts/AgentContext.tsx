@@ -32,6 +32,11 @@ import {
   type TurnStreamFrame,
   type TurnStreamState,
 } from '@/contexts/turnStream.logic';
+import { buildHistoryTrimmedNotice } from '@/contexts/historyTrimNotices.logic';
+import {
+  EMPTY_CONTEXT_LIMITS,
+  contextLimitsFromDoneFrame,
+} from '@/contexts/contextLimits.logic';
 import {
   loadChatHistory,
   mapServerMessagesToPersisted,
@@ -123,6 +128,7 @@ export interface AgentContextValue {
   respondToApproval: (decision: ApprovalDecision) => void;
   // Context window tracking (from "done" WS frames). See #7311.
   contextMaxTokens: number | null;
+  contextModelWindow: number | null;
   contextInputTokens: number | null;
 }
 
@@ -246,7 +252,7 @@ export function AgentProvider({
   const [modelInfoVersion, setModelInfoVersion] = useState(0);
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   // Context window tracking (from "done" WS frames). See #7311.
-  const [contextMaxTokens, setContextMaxTokens] = useState<number | null>(null);
+  const [contextLimits, setContextLimits] = useState(EMPTY_CONTEXT_LIMITS);
   const [contextInputTokens, setContextInputTokens] = useState<number | null>(null);
 
   const wsRef = useRef<WebSocketClient | null>(null);
@@ -435,14 +441,17 @@ export function AgentProvider({
             },
           ]);
         }
-        // Extract context window info from "done" frame (sent by gateway). See #7311.
+        // Extract context window info from "done" frame (sent by gateway).
         if (msg.type === 'done') {
-          if (typeof msg.max_context_tokens === 'number') {
-            setContextMaxTokens(msg.max_context_tokens);
-          }
+          setContextLimits(contextLimitsFromDoneFrame(msg));
           // Prefer last_input_tokens (accurate per-turn prompt size) over
           // accumulated input_tokens for context-bar rendering.
-          if (typeof msg.last_input_tokens === 'number') {
+          // When last_input_tokens is explicitly null, the accepted route has no
+          // usage data; clear the input state and do NOT fall back to the
+          // accumulated input_tokens (which would be stale from a previous route).
+          if (msg.last_input_tokens === null) {
+            setContextInputTokens(null);
+          } else if (typeof msg.last_input_tokens === 'number') {
             setContextInputTokens(msg.last_input_tokens);
           } else if (typeof msg.input_tokens === 'number') {
             setContextInputTokens(msg.input_tokens);
@@ -555,11 +564,39 @@ export function AgentProvider({
       }
 
       case 'history_trimmed': {
-        const reason = msg.reason || t('agent.history_trimmed_unknown_reason');
-        const content = t('agent.history_trimmed')
-          .replace('{reason}', reason)
-          .replace('{dropped}', String(msg.dropped_messages ?? 0))
-          .replace('{kept}', String(msg.kept_turns ?? 0));
+        const content = buildHistoryTrimmedNotice(msg, t);
+        localMessageMutationVersionRef.current += 1;
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: generateUUID(),
+            role: 'agent' as const,
+            content,
+            timestamp: new Date(),
+            ephemeral: true,
+            notice: true,
+          },
+        ]);
+        break;
+      }
+
+      case 'safeguard_fallback': {
+        // Display-only safety-safeguard downgrade notice. Mirrors
+        // `history_trimmed`: rendered as an ephemeral warning bubble that is
+        // never persisted to localStorage or the backend transcript. Privacy:
+        // the gateway sends only model names and which layer switched — no
+        // classifier category or refusal explanation reaches the browser.
+        const served = msg.served_model ?? '';
+        const requested = msg.requested_model ?? '';
+        if (!served || !requested) break;
+        const key = msg.fallback_kind === 'server'
+          ? 'agent.safeguard_fallback_server'
+          : msg.fallback_kind === 'client_server'
+            ? 'agent.safeguard_fallback_client_server'
+            : 'agent.safeguard_fallback_client';
+        const content = t(key)
+          .replace('{requested}', requested)
+          .replace('{served}', served);
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => [
           ...prev,
@@ -1225,7 +1262,8 @@ export function AgentProvider({
     pendingApproval,
     respondToApproval,
     // Context window tracking (from "done" WS frames). See #7311.
-    contextMaxTokens,
+    contextMaxTokens: contextLimits.maxTokens,
+    contextModelWindow: contextLimits.modelWindow,
     contextInputTokens,
   };
 

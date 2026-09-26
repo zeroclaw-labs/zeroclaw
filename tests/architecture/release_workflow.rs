@@ -463,7 +463,7 @@ fn crates_io_publisher_is_preflighted_gated_and_resumable() {
         "web/dist/index.html",
         "cargo publish --dry-run --locked --allow-dirty",
         "--locked --no-verify --allow-dirty",
-        "Topological order over the publishable set",
+        "python3 \"$REPO_ROOT/scripts/release/publish_order.py\" \"$VERSION\" <<<\"$META\"",
         "wait_for_registry_version",
         "will skip what already landed",
     ] {

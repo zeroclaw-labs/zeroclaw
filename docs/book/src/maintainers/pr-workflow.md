@@ -19,7 +19,34 @@ The control loop that delivers this is layered on purpose:
 - **Risk-based review depth**: high-risk consequences and security boundaries get deep review, while low-risk work stays fast.
 - **Rollback-first merge contract**: every merge path includes a concrete recovery story.
 
-Automation handles path/scope labels, manual issue-dashboard planning reports, and CI gating. Risk, size, type, and contributor-tier labels are maintainer intake decisions unless a maintained workflow explicitly owns them. Final merge accountability stays with human maintainers and PR authors. A PR carrying either `risk:high` or `domain:security` requires deep review and two independent Core Team approvals; automated review does not count as a Core Team approval.
+Automation handles path/scope labels, manual issue-dashboard planning reports, and CI gating. Risk, size, type, and contributor-tier labels are maintainer intake decisions unless a maintained workflow explicitly owns them. Final merge accountability stays with human maintainers and PR authors. A PR carrying either `risk:high` or `domain:security` requires deep review and defaults to two independent Core Team approvals; automated review does not count as a Core Team approval. The only standing exception is the [expedited second-review lane](#expedited-second-review-lane).
+
+## Expedited second-review lane
+
+Two independent Core Team approvals remain the default for PRs carrying `risk:high` or `domain:security`. A human maintainer may evaluate a narrow exception when an active durable public request to a second Core reviewer, distinct from the author and approving reviewer, remains unanswered across five subsequent UTC business dates. This is an optional accountable merge decision, not an automatic approval or permission to proceed without a first independent Core approval.
+
+FND-003 §5.1 supplies the responsibility to review within five business days. Start the clock at the later of the qualifying non-author Core approval and the active public request for the distinct second reviewer. Use UTC calendar dates: that start date is day zero, and each subsequent Monday-through-Friday date counts once. No holiday calendar applies. Eligibility begins at 00:00 UTC on the fifth counted business date, not at the original request's time of day. Record both source timestamps, the five counted dates, and the eligibility date. For example, a Monday start becomes eligible at 00:00 UTC the following Monday.
+
+The request must remain active and unanswered. A review from the requested reviewer, a recorded decline or withdrawal, or removal or cancellation of the request ends that clock. If a second review is still required, reroute it with a new active public request. A request covering materially different scope starts its own clock.
+
+A head change requires a non-author Core approval and clean advisory review on the new current head before the lane can be used. A verified mechanical base integration that selects no behavior may preserve elapsed waiting time only: retain the previously recorded clock start instead of replacing it with the new approval timestamp. This does not waive the current-head approval, advisory evidence, or fresh required CI. Other head changes restart the clock under the later-of rule above. This lane does not carry approvals forward across production repairs.
+
+The report-only `second-core` queue may surface an older approval by a different reviewer for assessment under the ordinary two-Core path. That assessment does not replace the current-head approval required by this lane. A queue row never establishes eligibility for this exception.
+
+Every condition below must hold on the current head before proposing the exception:
+
+- The PR is non-draft, mergeable, and passing every required check.
+- One Core Team member other than the PR author has approved the current head.
+- `zeroclaw-reviewer[bot]` or an explicitly accepted equivalent advisory artifact has completed a clean exact-head review without tool failure, and a human has reconciled every finding. An equivalent artifact must identify its producer and link the durable public record that accepted it for this purpose.
+- Five subsequent UTC business dates have been counted from the qualifying start for the active second-review request.
+- No `do-not-merge`, `needs-author-action`, stale-candidate status, release hold, unresolved human changes-requested review, unresolved review thread, unresolved human or automated finding, or other blocking condition remains.
+- The PR body, labels, linked work, validation, rollback, compatibility disposition, and follow-ups are current and truthful.
+
+An objection or hold is not silence and never expires through this lane. It does not authorize dismissal of reviews, removal of holds, or bypassing CODEOWNERS or branch protection. Author-side assessment and advisory automation never count as independent human approval.
+
+Broad governance, security-floor, release, migration, and irreversible architecture changes still default to two human approvals. They are not automatically eligible because time elapsed. A proposed exception must explain why the exact change is bounded and why one independent human approval plus the named evidence is sufficient; unresolved technical or governance ambiguity stops the merge.
+
+The final packet names the approving Core maintainer, the distinct requested reviewer and active request, both source timestamps and the clock calculation, the advisory producer and reviewed head, any equivalent artifact's acceptance record, fresh required CI, reconciled findings, compatibility and rollback, and the likelihood, impact, and uncertainty of proceeding without the second human review. Publish the approved explanation before merging. The accountable human merger must approve the exact packet; neither silence nor automation supplies a vote.
 
 ## Project board contract
 
@@ -103,7 +130,7 @@ PR lanes are routing expectations, not another required label family. Use them t
 | A: maintenance fast lane | Docs-only corrections, small tests that leave behavior unchanged, metadata/template fixes, narrow examples, CI/tooling fixes that preserve permissions and release behavior | Lightest review; fast merge once CI, template, labels, and privacy checks are clean. Usually `risk:low` and `size:XS` or `size:S`. |
 | B: narrow bug/fix lane | Small bug fixes with clear failing behavior, targeted provider/channel/tool fixes with focused validation, compatibility fixes that preserve behavior outside the reported path | Normal review by one subsystem-aware reviewer unless risk or ownership says otherwise. Merge when the linked issue is actually satisfied, validation is credible, and CI is green. |
 | C: feature slice lane | Additive feature work, new provider/channel/tool support, new config surface, scoped user-visible behavior changes | Normal review plus boundary-specific validation. Milestone fit matters, and the PR should say whether it implements, depends on, or is related to a tracker. |
-| D: architecture, migration, and elevated-review lane | Concrete trust, credential, compatibility, governance, release-authority, migration, lifecycle, persistence, permission, or toolchain-floor boundary; any PR carrying `risk:high` or `domain:security` | Deep review, evidence matched to the changed risk, and rollback and compatibility analysis. A PR carrying `risk:high` or `domain:security` also requires two independent Core Team approvals. |
+| D: architecture, migration, and elevated-review lane | Concrete trust, credential, compatibility, governance, release-authority, migration, lifecycle, persistence, permission, or toolchain-floor boundary; any PR carrying `risk:high` or `domain:security` | Deep review, evidence matched to the changed risk, and rollback and compatibility analysis. A PR carrying `risk:high` or `domain:security` defaults to two independent Core Team approvals; only the [expedited second-review lane](#expedited-second-review-lane) provides a standing exception. |
 | E: supersede, replacement, and overlap lane | Multiple PRs solving the same issue, newer PRs replacing older ones, contributor work carried forward from another PR, old PR made obsolete by current `master` | Coordinate before deep review. Choose one canonical path when possible, use `Supersedes #N` only when accurate, and preserve attribution when work is materially carried forward. |
 
 Do not build a separate manual PR board for these lanes unless native GitHub state and CODEOWNERS stop answering the routing question. Check native GitHub merge state before normal lane review: `DIRTY` means resolve conflicts first; `BEHIND` alone is mergeability housekeeping, not an author-facing blocker.
@@ -137,7 +164,7 @@ Before requesting review, the PR has all of these:
 Before merge:
 
 - `CI Required Gate` is green.
-- Required reviewers approved (including any CODEOWNERS paths); a PR carrying `risk:high` or `domain:security` has two independent Core Team approvals.
+- Required CODEOWNERS and branch-protection reviews are satisfied; a PR carrying `risk:high` or `domain:security` also satisfies the two-Core default or every condition of the [expedited second-review lane](#expedited-second-review-lane).
 - Risk labels match the actual diff and consequence rather than broad component location. See [Labels](./labels.md).
 - Migration / compatibility impact is documented.
 - Rollback path is concrete and fast.
@@ -150,7 +177,7 @@ Every merge:
 - CI gate is green.
 - Docs-quality checks are green when docs changed.
 - Security and privacy fields are complete; evidence is redacted / anonymized.
-- A PR carrying `risk:high` or `domain:security` has two independent Core Team approvals; automated review does not count.
+- A PR carrying `risk:high` or `domain:security` satisfies the two-Core default or every condition of the [expedited second-review lane](#expedited-second-review-lane); automated review never counts as a Core Team approval.
 - Agent-workflow notes are sufficient for reproducibility (if AI-assisted).
 - Rollback plan is explicit.
 - Commit title follows Conventional Commits.
@@ -192,7 +219,7 @@ For stacked work, require explicit `Depends on #...` so review order is determin
 
 Apply that deterministic order operationally: prioritize and review a parent before its children; when a parent is not reviewable, defer deep child review unless a bounded independent slice benefits from early review; after the parent lands, refresh and revalidate the child. A parent becoming reviewable does not make previously collected child evidence current.
 
-For a report-only snapshot of the live GitHub queues, run `python3 scripts/github/pr_review_queue.py --queue all --older-than-days 7 --format table`. The `--queue` values are `near-ready`, `maintainer`, `second-core`, `author-action`, `stacked`, `mine`, and `all`; `--format` accepts `table`, `json`, or `links`. `near-ready` narrows the maintainer lane to PRs whose GitHub search status is successful, so maintainers can start with candidates that may need less work before merge; it does not establish mergeability or approval sufficiency. `all` runs the shared lanes independently, so one PR can appear in more than one lane; add `--author LOGIN` to include the `mine` lane. GitHub search supplies the candidate lists. Only `author-action` reads timeline detail to estimate unanswered-request age, and only `second-core` reads reviews to find one Core approval on the current head. The command never writes queue state or mutates GitHub, and it reports missing or ambiguous detail as unknown. It is a work-selection aid, not merge-readiness evidence.
+For a report-only snapshot of the live GitHub queues, run `python3 scripts/github/pr_review_queue.py --queue all --older-than-days 7 --format table`. The `--queue` values are `near-ready`, `maintainer`, `second-core`, `author-action`, `stacked`, `mine`, and `all`; `--format` accepts `table`, `json`, or `links`. `near-ready` narrows the maintainer lane to PRs whose GitHub search status is successful, so maintainers can start with candidates that may need less work before merge; it does not establish mergeability or approval sufficiency. `all` runs the shared lanes independently, so one PR can appear in more than one lane; add `--author LOGIN` to include the `mine` lane. GitHub search supplies the candidate lists. Only `author-action` reads timeline detail to estimate unanswered-request age, and only `second-core` reads reviews. The `second-core` lane requires one Core approval on the current head. When a different Core reviewer has an active approval on an older revision, the row identifies both approvals as a carry-forward assessment candidate. A maintainer may carry that approval forward only when the later changes are mechanical integration or contract-preserving repair; a changed load-bearing premise, material decision, or risk requires renewed review. The queue does not decide equivalence or certify approval sufficiency. The command never writes queue state or mutates GitHub, and it reports missing or ambiguous detail as unknown. It is a work-selection aid, not merge-readiness evidence.
 
 For replacements, require explicit `Supersedes #...`. See [Superseding PRs](./superseding.md) for attribution and template rules.
 
@@ -211,7 +238,7 @@ Path location alone does not select `risk:high`. Classify the actual diff and co
 
 Filesystem access boundaries and network or authentication behavior inside these crates deserve particular attention even when the diff is small.
 
-**Minimum for `risk:high` or `domain:security` PRs:** threat or risk statement, mitigation notes, rollback steps, and two independent Core Team approvals.
+**Minimum for `risk:high` or `domain:security` PRs:** threat or risk statement, mitigation notes, rollback steps, and either two independent Core Team approvals or every condition of the [expedited second-review lane](#expedited-second-review-lane).
 
 **Recommended for `risk:high` or `domain:security` PRs:** a focused test proving boundary behavior, plus one explicit failure-mode scenario with expected degradation.
 

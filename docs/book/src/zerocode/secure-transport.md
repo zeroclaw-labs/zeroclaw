@@ -399,6 +399,94 @@ In relay-only mode (no `--connect`/`uri`), the inner WSS URL defaults to
 `wss://127.0.0.1:9781` because the inner mTLS terminates at the daemon's loopback
 listener; the relay address is only the TCP dial target.
 
+### 3d. Browser enrollment through the relay frontdoor (opt-in, enrollment only)
+
+The relay can serve a browser enrollment page (the "frontdoor"): open the relay
+URL, enter the node id and a pairing code, compare the short-auth-string against
+the daemon console, and the browser is issued a client certificate.
+
+**It enrolls only.** There is no browser session tier: once enrolled, the page
+hands you the certificate and private key and points you at `zerocode`. The
+daemon's RPC plane requires mTLS, which a browser cannot present through the
+native WebSocket API, so a browser session would need either a TLS
+implementation in page JavaScript (deliberately not shipped, see below) or a
+relay-terminated session mode on the daemon. That is an open design question,
+not a missing feature.
+
+It is **off by default**, because it narrows the blind-forwarder guarantee for
+the browsers that use it, in two distinct ways:
+
+- **The relay is a trusted code origin.** A browser that enrolls here runs
+  enrollment JavaScript served by the relay. A compromised relay could
+  substitute code that leaks what the page handles.
+- **The relay is a principal in the enrollment.** The daemon's enrollment
+  endpoint speaks TLS, and the relay forwards those bytes without decrypting
+  them, so a browser cannot perform the exchange itself. The relay therefore
+  performs it on the browser's behalf: it fetches the daemon CA, then makes the
+  CA-pinned `POST /enroll` carrying the pairing code. **The relay sees the
+  pairing code and the issued certificate, and could use an observed pairing
+  code to enrol a client of its own.**
+
+What the relay does **not** get is the private key: the browser generates the
+keypair with WebCrypto and transmits only a CSR.
+
+The short-auth-string still works as a **detector** - a relay that substitutes a
+different daemon CA produces a SAS that does not match the daemon console, so
+stop if it differs. It cannot protect you from a relay you have chosen to trust:
+browser enrollment through the frontdoor is **relay-terminated, not end-to-end**.
+
+Earlier iterations of this frontdoor shipped a hand-written TLS 1.3 and X.509
+client in relay-served JavaScript so the browser could speak to the daemon
+itself. That is **deleted, not ported**. An unaudited TLS stack in served
+JavaScript is a worse trust story than an honestly disclosed relay-terminated
+one, and it did not remove the trusted-code-origin problem anyway.
+
+The narrowing is bounded: the **RPC plane stays end-to-end mTLS** past the relay
+in every mode, and **`zerocode`/native enrollment never executes relay-served
+code and is never relay-terminated** - use those (sections 1b/1c/3a) when the
+relay must stay fully untrusted.
+
+```toml
+# relay.toml
+[frontdoor]
+enabled = true   # default false; read the trust note above first
+```
+
+When disabled, plain HTTP requests to the relay get a `404` and browsers cannot
+enroll through it; daemon registration, zerocode clients, and the tunneled RPC
+plane are unaffected. The enrollment page itself carries the same trust note,
+and `zerorelay` logs a warning at startup while the frontdoor is on.
+
+#### Prefilled enrollment links
+
+To spare a phone user from typing a long node id, a link can carry the node id
+and the pairing code, and the page fills both fields when it loads:
+
+```text
+https://relay.example.com/#node=<node-id>&code=<pairing-code>
+https://relay.example.com/?node=<node-id>&code=<pairing-code>
+```
+
+Prefer the `#` form. A URL fragment is never sent to any server, so the pairing
+code stays out of reverse-proxy and CDN access logs; the `?` form is accepted
+too. The relay itself drops the query string before routing and never logs or
+reflects it, and serves the page with `cache-control: no-store` and
+`referrer-policy: no-referrer`.
+
+The page only fills the fields. It does not fetch the agent CA or submit
+anything: the user still presses **Fetch the agent CA** and confirms the
+short-auth-string. Values that do not match the node-id or pairing-code shape
+are ignored, and both parameters are removed from the address bar and the
+current history entry as soon as the page reads them, so a copied or bookmarked
+URL does not carry the code.
+
+The browser can still record the link as it was first opened in its own history
+database (Chrome does, for both the `?` and `#` forms); no page can rewrite that.
+What makes that copy harmless is the code itself: it is consumed by the first
+successful enrollment and expires ten minutes after it is minted, so the stored
+link is spent or dead. Treat a link that carries an unused code like the code
+itself, and prefer enrolling promptly after minting.
+
 ---
 
 ## Configuration reference
@@ -466,6 +554,7 @@ listener; the relay address is only the TCP dial target.
 | `[limits].lease_ttl_secs` | `300` | Lease TTL advertised at registration (advisory in v1: WebSocket liveness is the real cleanup rule) |
 | `[limits].accept_burst_per_ip` / `accept_rate_per_ip` | `30` / `10.0` | Per-IP handshake token bucket |
 | `[limits].connect_burst_per_node` / `connect_rate_per_node` | `60` / `20.0` | Per-node connect token bucket |
+| `[frontdoor].enabled` | `false` | Serve the browser enrollment page (see 3d: makes the relay a trusted code origin AND a principal in browser enrollment) |
 | `[limits].max_pending_handshakes` | `256` | Sockets past accept but not yet classified |
 | `[limits].handshake_timeout_secs` | `10` | One deadline over TLS, WS upgrade and signed registration |
 | `[limits].max_registered_nodes` | `1024` | Simultaneously registered daemons (N+1 gets `registry_full`) |
@@ -474,7 +563,8 @@ listener; the relay address is only the TCP dial target.
 
 `--config` `--bind` `--tls-cert` `--tls-key` `--tls-dir` `--tls-san` (repeatable)
 `--registration-mode` `--allow` (repeatable) `--deny` (repeatable) `--relay-token`
-`--max-conns-per-node` `--idle-timeout-secs` `--lease-ttl-secs` `--status-file`.
+`--max-conns-per-node` `--idle-timeout-secs` `--lease-ttl-secs` `--status-file`
+`--frontdoor` (opt-in; see 3d for the trust implications).
 Subcommands: `healthcheck [--addr 127.0.0.1:8443]`, `status --file <path>`.
 
 ### zerocode `[connection.wss]` and CLI

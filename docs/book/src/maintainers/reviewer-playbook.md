@@ -24,9 +24,9 @@ Use [PR lanes](./pr-workflow.md#pr-lanes) for routing expectations; use this pla
 |---|---|---|---|
 | `risk:low` | Documentation, localization, fixtures, generated references, or mechanical metadata with no production, compatibility, build, release, or governance effect | 1 reviewer + CI gate | Coherent validation evidence, no behavior ambiguity |
 | `risk:medium` | Ordinary behavioral runtime, gateway, provider, channel, tool, config, application, and CI work | 1 subsystem-aware reviewer + behavior verification | Focused scenario proof, explicit side effects |
-| `risk:high` or `domain:security` | A concrete trust, credential, compatibility, governance, release-authority, or cross-cutting security boundary | Fast triage + deep review + rollback readiness + two independent Core Team approvals | Security and failure-mode checks, rollback clarity |
+| `risk:high` or `domain:security` | A concrete trust, credential, compatibility, governance, release-authority, or cross-cutting security boundary | Fast triage + deep review + rollback readiness + two independent Core Team approvals by default | Security and failure-mode checks, rollback clarity; only the [expedited second-review lane](./pr-workflow.md#expedited-second-review-lane) provides a standing exception |
 
-`domain:security` remains independent from `risk:*`: use it for an effective security or trust boundary, not simply because the changed component is security-shaped. Either label triggers the same deep-review and two-independent-Core-approval path. Automated review does not count as a Core Team approval.
+`domain:security` remains independent from `risk:*`: use it for an effective security or trust boundary, not simply because the changed component is security-shaped. Either label triggers deep review and defaults to two independent Core Team approvals; only the [expedited second-review lane](./pr-workflow.md#expedited-second-review-lane) provides a standing exception. Automated review does not count as a Core Team approval.
 
 When uncertain, classify upward and ask a maintainer to resolve the boundary before merge.
 
@@ -57,7 +57,10 @@ If any intake check fails, leave one actionable checklist comment and stop. Don'
 - Validation evidence names the checks being relied on and why they cover the changed behavior.
 - Directly user-observable claims identify the user boundary and provide the smallest credible evidence that reaches it; use [User-boundary proof](../contributing/user-boundary-proof.md) when unit, mocked, compile, or generic CI evidence stops short.
 - Presentation-sensitive visual changes include actual-interface evidence from an identifiable revision plus screenshots at representative terminal or viewport dimensions with enough surrounding layout to assess the result. Require numerical dimensions only when needed to reproduce or assess a concrete presentation concern. A semantic-only rendered-interface change may instead use exact-head automated evidence from the final supported-interface output when it cannot affect layout, styling, clipping, wrapping, focus, selection, or interaction behavior. That evidence must exercise the real interface through its final renderer, observe the output users receive, and identify the changed state and observed result; source inspection, pre-render composition, component-only snapshots, and helper-level assertions do not qualify. A concrete presentation concern restores the screenshot requirement. A noninteractive, unstyled, deterministic plain-text CLI, stdout, stderr, or log change may use exact output from the supported interface when it makes no presentation-sensitive claim and no reviewer has identified a concrete presentation concern. Record relevant output-shaping context such as locale and terminal width. Interaction and transition claims also name the user action and observed result.
-- Duplicate local Cargo is not required when fresh required CI covers the same head, target, and feature set. Ask for extra validation only when it maps to a named gap in the required gate, such as macOS/Windows tests, cross-platform Clippy, desktop coverage, release target builds, stale CI, or unavailable CI.
+<!-- >>> generated:review-ci-evidence-playbook by `cargo generate review-docs` - do not edit <<< -->
+- Duplicate local Cargo is not required when fresh required CI covers the same head, target, and feature set. Ask for extra validation only when it maps to a named gap in the required gate, such as macOS/Windows tests, cross-platform Clippy, desktop coverage, release target builds, stale CI beyond the [base-drift-only review case](../contributing/pr-review-protocol.md#ci-freshness-and-base-drift), or unavailable CI.
+<!-- >>> end generated:review-ci-evidence-playbook <<< -->
+- For a named Windows execution gap, use the [advisory Windows label guidance](./ci-and-actions.md#label-gated-advisory-windows-tests-windows-testsyml) to decide whether to request `ci:windows` and how to verify its result.
 - User-facing behavior changes are documented.
 - Author demonstrates understanding of behavior and blast radius (especially for AI-assisted PRs).
 - Rollback path is concrete; "revert" is not concrete.
@@ -222,6 +225,8 @@ When passing review to another maintainer or agent mid-flight, include:
 5. **Suggested next action.**
 
 This keeps context loss low and avoids the next reviewer redoing the same fetches you already did.
+
+Core reviewers aim to review pull requests in their area within five business days, as defined by [FND-003](../foundations/fnd-003-governance.md). If a required second Core review remains unanswered through the qualifying five-business-date window, evaluate the [expedited second-review lane](./pr-workflow.md#expedited-second-review-lane). Elapsed time is not approval and never clears an objection, hold, changes-requested review, unresolved thread, security concern, or other finding. If the PR is not eligible, keep the required human review routed and use the handoff above when another qualified reviewer takes it.
 
 ## Weekly queue hygiene
 

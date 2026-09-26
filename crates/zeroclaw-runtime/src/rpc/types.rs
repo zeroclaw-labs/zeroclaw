@@ -11,7 +11,9 @@ pub use crate::doctor::{DiagResult, Severity as DoctorSeverity};
 pub use crate::rpc::session::SessionOverrides;
 pub use crate::skills::frontmatter::SkillFrontmatter;
 pub use zeroclaw_api::memory_traits::{MemoryCategory, MemoryEntry};
-pub use zeroclaw_api::runtime_status::RuntimeConfigKind;
+pub use zeroclaw_api::runtime_status::{
+    RuntimeConfigKind, RuntimeShellFamily, RuntimeShellProfile,
+};
 pub use zeroclaw_config::cost::types::CostSummary;
 pub use zeroclaw_config::traits::{ConfigFieldEntry, PropKind};
 
@@ -63,6 +65,17 @@ rpc_type! {
             skip_serializing_if = "Option::is_none"
         )]
         pub client_capabilities: Option<serde_json::Value>,
+        /// Explicit credential for authentication (a native pairing token
+        /// or an OIDC access token). Wins over the transport-intrinsic
+        /// peer credential when present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub auth_token: Option<String>,
+        /// Which configured provider verifies `auth_token` (e.g. `native`,
+        /// `oidc.corp`). Defaults to `native`. Selection is explicit and
+        /// final: the selected provider's denial never falls through to
+        /// another provider.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub auth_provider: Option<String>,
     }
 }
 
@@ -95,6 +108,13 @@ rpc_type! {
         /// Supported RPC method names (e.g. "session/prompt", "memory/list").
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub capabilities: Vec<String>,
+        /// Configured auth provider selection keys (e.g. `native`,
+        /// `peercred`, `oidc.corp`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub auth_methods: Vec<String>,
+        /// Canonical principal id this connection is bound to.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub principal_id: Option<String>,
         /// Shared command catalogue entries available on the TUI surface.
         ///
         /// Always serialized so a new daemon's authoritative empty catalogue
@@ -119,6 +139,8 @@ rpc_type! {
         pub config_kind: Option<RuntimeConfigKind>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub local_ipc_endpoint: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub shell_profile: Option<RuntimeShellProfile>,
     }
 }
 
@@ -188,6 +210,10 @@ rpc_type! {
         pub cwd: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub session_id: Option<String>,
+        /// Accepted for wire compatibility and ignored. The session's shell
+        /// environment is resolved from the calling connection's own TUI
+        /// registration, so naming another connection's id here has no
+        /// effect.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub tui_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1146,6 +1172,9 @@ rpc_type! {
         /// Display group for the dashboard sidebar.
         #[serde(default)]
         pub group: String,
+        /// Stable locale-independent group identifier.
+        #[serde(default)]
+        pub group_key: String,
         /// `true` when this section is part of the canonical Quickstart list.
         #[serde(default)]
         pub is_quickstart: bool,
@@ -1237,6 +1266,9 @@ rpc_type! {
         pub data_b64: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub filename: Option<String>,
+        /// Advisory only, retained for wire compatibility. The image/document
+        /// marker decision is made from the filename and payload bytes via the
+        /// canonical provider-loadable contract, never from this field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub mime_type: Option<String>,
         #[serde(default)]
@@ -1313,6 +1345,11 @@ rpc_type! {
         /// pagination regardless of id ordering.
         #[serde(default)]
         pub until_line_offset: Option<u64>,
+        /// Segment-aware cursor. Set from `LogsQueryResult::next_segment_cursor`
+        /// to paginate across rotated archive files. Takes precedence over
+        /// `until_line_offset` when both are supplied.
+        #[serde(default)]
+        pub until_segment_cursor: Option<String>,
         #[serde(default)]
         pub severity_min: Option<u8>,
         #[serde(default)]
@@ -1325,6 +1362,10 @@ rpc_type! {
         pub outcome: Option<String>,
         #[serde(default)]
         pub trace_id: Option<String>,
+        /// Exact SOP run correlation. Uses the canonical persisted-log
+        /// attribution filter, including its compatibility bridge for older rows.
+        #[serde(default)]
+        pub sop_run_id: Option<String>,
         #[serde(default)]
         pub hide_internal: bool,
         #[serde(default)]
@@ -1350,8 +1391,22 @@ rpc_type! {
         /// Byte offset past the last event on this page. Callers should
         /// pass this back as `until_line_offset` on the next request to
         /// resume without re-scanning already-read bytes.
+        ///
+        /// For multi-segment deployments, this is `None` when the oldest event
+        /// on the page is in an archive file — use `next_segment_cursor` instead.
         pub next_cursor_line_offset: Option<u64>,
+        /// Segment-aware cursor for the oldest event on this page. Pass back
+        /// as `until_segment_cursor` to walk older pages across segment
+        /// boundaries. Supersedes `next_cursor_line_offset` for `rotating`-mode
+        /// deployments with multiple retained segments.
+        pub next_segment_cursor: Option<String>,
         pub at_end: bool,
+        /// True when a retained segment could not be read and was left out of
+        /// this page. `at_end` then means "no older events among the segments
+        /// that could be read", which is weaker than "no older events exist",
+        /// so a client that stops paging on `at_end` should say the history is
+        /// partial rather than present it as complete.
+        pub incomplete: bool,
     }
 }
 
@@ -1409,15 +1464,20 @@ pub enum SessionUpdateEvent {
         timeout_secs: u64,
     },
     /// Per-LLM-call token usage. `input_tokens` is the cumulative context size
-    /// for this turn; `max_context_tokens` is the runtime-profile context
-    /// budget (`[runtime_profiles.<name>] max_context_tokens`). Both may be
-    /// absent when the provider doesn't report usage.
+    /// for this turn. `max_context_tokens` is the preemptive-trim budget (the
+    /// resolved `effective_context_budget`), preserving its original meaning as
+    /// the value the meter fills toward. `model_context_window` is the model's
+    /// full context window (provider `context_window`), exposed distinctly so a
+    /// client can render capacity and budget separately. Any may be absent when
+    /// the provider doesn't report usage or the value can't be resolved.
     ContextUsage {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input_tokens: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_context_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_context_window: Option<u64>,
     },
     /// Emitted when the TodoWrite tool produces a plan. The `entries` array
     /// carries the normalized `PlanEntry` values (content, status, priority,
@@ -1446,13 +1506,37 @@ pub enum SessionUpdateEvent {
     /// Emitted whenever older whole turns were dropped from structured history
     /// to fit a token budget or message cap. Surfaces a user-visible "context
     /// was cut here" marker so trimming is never silent. `dropped_messages` is
-    /// the count of conversation messages removed; `kept_turns` is how many
-    /// whole turns remained after the cut.
+    /// the count of conversation messages removed; `dropped_turns` and
+    /// `kept_turns` describe the user-facing whole-turn accounting.
     HistoryTrimmed {
         session_id: String,
         dropped_messages: usize,
+        dropped_turns: usize,
         kept_turns: usize,
         reason: String,
+        /// Configured context token budget in effect at trim time. `None` for
+        /// message-limit trims, which carry no token accounting.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token_budget: Option<u64>,
+        /// Token count before trimming.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_before: Option<u64>,
+        /// Token count after trimming.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_after: Option<u64>,
+        /// Provenance of `tokens_before` ("provider", "estimate", "calibrated").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_before_source: Option<zeroclaw_api::agent::TokenCountSource>,
+        /// Provenance of `tokens_after` ("provider", "estimate", "calibrated").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_after_source: Option<zeroclaw_api::agent::TokenCountSource>,
+        /// The retained provider-facing request cannot be brought under the
+        /// configured budget (protected newest turn plus schemas). History MAY
+        /// have been trimmed on the way to that floor, so this flag — not
+        /// `dropped_messages == 0` — is the authoritative "unsatisfiable"
+        /// signal. Absent for ordinary trims.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unsatisfiable_floor: Option<bool>,
     },
 }
 
@@ -1613,6 +1697,48 @@ mod tests {
             serde_json::from_value::<ChatMode>(json!("acp")).unwrap(),
             ChatMode::Acp
         );
+    }
+
+    #[test]
+    fn status_result_shell_profile_round_trips_and_defaults_absent() {
+        let legacy: StatusResult = serde_json::from_value(json!({
+            "server_version": "0.8.4",
+            "protocol_version": 1,
+            "active_sessions": 0,
+            "session_ids": []
+        }))
+        .unwrap();
+
+        assert_eq!(legacy.shell_profile, None);
+        let legacy_wire = serde_json::to_value(&legacy).unwrap();
+        assert!(legacy_wire.get("shell_profile").is_none());
+
+        let status = StatusResult {
+            server_version: "0.8.4".into(),
+            protocol_version: 1,
+            active_sessions: 0,
+            session_ids: vec![],
+            config_dir: None,
+            config_file: None,
+            config_kind: None,
+            local_ipc_endpoint: None,
+            shell_profile: Some(RuntimeShellProfile {
+                name: "pwsh".into(),
+                family: RuntimeShellFamily::PowerShell,
+            }),
+        };
+
+        let wire = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            wire["shell_profile"],
+            json!({
+                "name": "pwsh",
+                "family": "powershell"
+            })
+        );
+
+        let round_trip: StatusResult = serde_json::from_value(wire).unwrap();
+        assert_eq!(round_trip.shell_profile, status.shell_profile);
     }
 
     #[test]
@@ -1808,6 +1934,48 @@ mod tests {
     }
 
     #[test]
+    fn logs_query_params_accepts_sop_run_filter() {
+        let params: LogsQueryParams = serde_json::from_value(json!({
+            "sop_run_id": "run-123-0001",
+            "limit": 25
+        }))
+        .unwrap();
+        assert_eq!(params.sop_run_id.as_deref(), Some("run-123-0001"));
+        assert_eq!(params.limit, Some(25));
+    }
+
+    #[test]
+    fn config_section_group_key_is_additive_on_the_wire() {
+        let legacy: ConfigSectionEntry = serde_json::from_value(json!({
+            "key": "cron",
+            "label": "Cron",
+            "help": "Scheduled tasks",
+            "has_picker": true,
+            "completed": false,
+            "group": "Agent"
+        }))
+        .unwrap();
+        assert!(legacy.group_key.is_empty());
+
+        let current = ConfigSectionEntry {
+            key: "cron".into(),
+            label: "Cron".into(),
+            help: "Scheduled tasks".into(),
+            has_picker: true,
+            completed: false,
+            ready: false,
+            group: "Agent".into(),
+            group_key: "agent".into(),
+            is_quickstart: true,
+            shape: None,
+            cost_category: String::new(),
+        };
+        let value = serde_json::to_value(current).unwrap();
+        assert_eq!(value["group"], json!("Agent"));
+        assert_eq!(value["group_key"], json!("agent"));
+    }
+
+    #[test]
     fn initialize_params_accepts_snake_case_field_names() {
         let p: InitializeParams = serde_json::from_value(json!({
             "protocol_version": 2,
@@ -1925,7 +2093,9 @@ mod tests {
             log_path: Some("/var/lib/zeroclaw/runtime-trace.jsonl".into()),
             next_cursor: None,
             next_cursor_line_offset: None,
+            next_segment_cursor: None,
             at_end: true,
+            incomplete: false,
         };
 
         let value = serde_json::to_value(result).expect("logs/query result");

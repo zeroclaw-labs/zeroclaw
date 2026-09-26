@@ -842,6 +842,10 @@ where
     fn peer_label(&self) -> String {
         self.peer_label.clone()
     }
+
+    fn kind(&self) -> super::transport::TransportKind {
+        super::transport::TransportKind::Wss
+    }
 }
 
 // ── TLS acceptor ─────────────────────────────────────────────────
@@ -921,6 +925,20 @@ pub async fn run_wss_listener(
     let listener = TcpListener::bind(bind_addr)
         .await
         .with_context(|| format!("binding WSS listener on {bind_addr}"))?;
+    serve_wss_listener(ctx, cancel, client_count, tls_acceptor, listener, limits).await
+}
+
+async fn serve_wss_listener(
+    ctx: Arc<RpcContext>,
+    cancel: CancellationToken,
+    client_count: Arc<AtomicUsize>,
+    tls_acceptor: TlsAcceptor,
+    listener: TcpListener,
+    limits: WssLimits,
+) -> Result<()> {
+    let bind_addr = listener
+        .local_addr()
+        .context("reading WSS listener address")?;
 
     // Bounds on unauthenticated setup work and on established sessions. A
     // permit is held from accept until the peer is through both handshakes;
@@ -1199,8 +1217,13 @@ pub async fn run_wss_listener(
                         peer,
                         conn_cancel.clone(),
                     )
+                    // mTLS peer cert = transport/device admission (quota, audit);
+                    // transport credential = principal authentication at initialize.
+                    // The two layers compose: the cert admits the connection,
+                    // the token authenticates the principal.
                     .with_peer_cert_fingerprint(Some(peer_cert_fp))
-                    .with_connection_activity(activity);
+                    .with_connection_activity(activity)
+                    .with_transport(transport.kind(), transport.credential());
                     // The concrete dispatcher future carries the full request
                     // state machine. Keep that state heap-backed so an active
                     // WSS request does not depend on the executor worker's
@@ -1684,6 +1707,8 @@ mod accept_error_tests {
             tui_sig: None,
             env: Default::default(),
             client_capabilities: None,
+            auth_token: None,
+            auth_provider: None,
         };
         client_sink
             .send(Message::Text(
@@ -1806,6 +1831,8 @@ mod accept_error_tests {
             tui_sig: None,
             env: Default::default(),
             client_capabilities: None,
+            auth_token: None,
+            auth_provider: None,
         };
         client_sink
             .send(Message::Text(
@@ -1949,13 +1976,6 @@ mod accept_error_tests {
                 .signature_verification_algorithms
                 .supported_schemes()
         }
-    }
-
-    async fn free_port() -> u16 {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = l.local_addr().unwrap().port();
-        drop(l);
-        port
     }
 
     fn test_client_connector(
@@ -2131,14 +2151,18 @@ mod accept_error_tests {
         let gen1_listener_exited = Arc::new(AtomicBool::new(false));
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
 
-        let port1 = free_port().await;
-        let addr1: std::net::SocketAddr = format!("127.0.0.1:{port1}").parse().unwrap();
+        // Keep the socket reserved until the serving task takes ownership.
+        let listener1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr1 = listener1.local_addr().unwrap();
 
-        let config1 = zeroclaw_config::schema::Config {
+        let mut config1 = zeroclaw_config::schema::Config {
             data_dir: tmp.path().to_path_buf(),
             config_path: tmp.path().join("config.toml"),
             ..Default::default()
         };
+        // A remote (WSS) connection must authenticate before it can run a
+        // privileged prompt: pair a native token for the test client.
+        config1.gateway.paired_tokens = vec!["zc_tok".to_string()];
         let queue1 = Arc::new(SessionActorQueue::new(4, 30, 60));
         let sessions1 = Arc::new(SessionStore::new(64, queue1));
         let ctx1 = RpcContext::for_persistence_tests(
@@ -2167,35 +2191,41 @@ mod accept_error_tests {
         let ctx1_for_listener = Arc::clone(&ctx1);
         let count1_for_listener = Arc::clone(&count1);
 
-        let gen1_listener_handle = zeroclaw_spawn::spawn!(async move {
-            super::run_wss_listener(
+        let mut gen1_listener_handle = zeroclaw_spawn::spawn!(async move {
+            super::serve_wss_listener(
                 ctx1_for_listener,
                 cancel1_for_listener,
                 count1_for_listener,
                 acceptor1,
-                addr1,
+                listener1,
                 super::WssLimits::default(),
             )
             .await
         });
 
         let connector1 = test_client_connector(&client.cert_pem, &client.key_pem);
-        let url1 = format!("wss://127.0.0.1:{port1}/");
+        let url1 = format!("wss://{addr1}/");
         let ws1 = async {
             let started = std::time::Instant::now();
             loop {
-                match tokio_tungstenite::connect_async_tls_with_config(
-                    &url1,
-                    None,
-                    false,
-                    Some(connector1.clone()),
-                )
-                .await
-                {
+                let connected = tokio::select! {
+                    result = &mut gen1_listener_handle => {
+                        panic!("Gen 1 WSS listener exited during startup: {result:?}");
+                    }
+                    result = tokio_tungstenite::connect_async_tls_with_config(
+                        &url1,
+                        None,
+                        false,
+                        Some(connector1.clone()),
+                    ) => result,
+                };
+                match connected {
                     Ok((ws, _)) => return ws,
                     Err(e) => {
                         if started.elapsed() > Duration::from_secs(5) {
-                            panic!("timed out connecting to Gen 1: {e:?}");
+                            cancel1.cancel();
+                            let listener_result = (&mut gen1_listener_handle).await;
+                            panic!("timed out connecting to Gen 1: {e:?}; listener: {listener_result:?}");
                         }
                         tokio::time::sleep(Duration::from_millis(20)).await;
                     }
@@ -2211,6 +2241,10 @@ mod accept_error_tests {
             tui_sig: None,
             env: Default::default(),
             client_capabilities: None,
+            // Present the paired native token: an unauthenticated remote
+            // connection cannot run the privileged prompt this test drives.
+            auth_token: Some("zc_tok".to_string()),
+            auth_provider: None,
         };
         client_sink1
             .send(Message::Text(
@@ -2283,8 +2317,9 @@ mod accept_error_tests {
                 "the retiring generation must finish draining within the reload budget"
             );
 
-            let port2 = free_port().await;
-            let addr2: std::net::SocketAddr = format!("127.0.0.1:{port2}").parse().unwrap();
+            // Keep the socket reserved until the serving task takes ownership.
+            let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr2 = listener2.local_addr().unwrap();
 
             let acceptor2 = super::build_tls_acceptor(
                 mats.server_cert_path.to_str().unwrap(),
@@ -2295,11 +2330,13 @@ mod accept_error_tests {
             )
             .unwrap();
 
-            let config2 = zeroclaw_config::schema::Config {
+            let mut config2 = zeroclaw_config::schema::Config {
                 data_dir: tmp_path.clone(),
                 config_path: tmp_path.join("config.toml"),
                 ..Default::default()
             };
+            // The replacement generation authenticates the same client.
+            config2.gateway.paired_tokens = vec!["zc_tok".to_string()];
             let queue2 = Arc::new(SessionActorQueue::new(4, 30, 60));
             let sessions2 = Arc::new(SessionStore::new(64, queue2));
             let ctx2 = RpcContext::for_persistence_tests(
@@ -2325,35 +2362,41 @@ mod accept_error_tests {
             let cancel2 = CancellationToken::new();
             let count2 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let cancel2_for_listener = cancel2.clone();
-            let handle2 = zeroclaw_spawn::spawn!(async move {
-                super::run_wss_listener(
+            let mut handle2 = zeroclaw_spawn::spawn!(async move {
+                super::serve_wss_listener(
                     ctx2,
                     cancel2_for_listener,
                     count2,
                     acceptor2,
-                    addr2,
+                    listener2,
                     super::WssLimits::default(),
                 )
                 .await
             });
 
             let connector2 = test_client_connector(&client_cert_pem, &client_key_pem);
-            let url2 = format!("wss://127.0.0.1:{port2}/");
+            let url2 = format!("wss://{addr2}/");
             let ws2 = async {
                 let started = std::time::Instant::now();
                 loop {
-                    match tokio_tungstenite::connect_async_tls_with_config(
-                        &url2,
-                        None,
-                        false,
-                        Some(connector2.clone()),
-                    )
-                    .await
-                    {
+                    let connected = tokio::select! {
+                        result = &mut handle2 => {
+                            panic!("Gen 2 WSS listener exited during startup: {result:?}");
+                        }
+                        result = tokio_tungstenite::connect_async_tls_with_config(
+                            &url2,
+                            None,
+                            false,
+                            Some(connector2.clone()),
+                        ) => result,
+                    };
+                    match connected {
                         Ok((ws, _)) => return ws,
                         Err(e) => {
                             if started.elapsed() > Duration::from_secs(5) {
-                                panic!("timed out connecting to Gen 2: {e:?}");
+                                cancel2.cancel();
+                                let listener_result = (&mut handle2).await;
+                                panic!("timed out connecting to Gen 2: {e:?}; listener: {listener_result:?}");
                             }
                             tokio::time::sleep(Duration::from_millis(20)).await;
                         }
@@ -2369,6 +2412,9 @@ mod accept_error_tests {
                 tui_sig: None,
                 env: Default::default(),
                 client_capabilities: None,
+                // Same paired token for the replacement generation.
+                auth_token: Some("zc_tok".to_string()),
+                auth_provider: None,
             };
             client_sink2
                 .send(Message::Text(

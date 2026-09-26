@@ -17,6 +17,8 @@
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
+mod support;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -31,6 +33,8 @@ use zeroclaw_plugins::egress::{EgressHostService, EgressPolicy, EgressPolicyReso
 use zeroclaw_plugins::instance::PluginInstanceScope;
 use zeroclaw_plugins::services::PluginHostServices;
 use zeroclaw_plugins::{PluginCapability, PluginManifest, PluginPermission};
+
+use support::{admit_fixture, state_service};
 
 // ── fixture provisioning ──────────────────────────────────────────
 
@@ -122,6 +126,7 @@ async fn probe(
         description: None,
         author: None,
         wasm_path: Some("sequential-fixture.wasm".to_string()),
+        wasm_sha256: None,
         capabilities: vec![PluginCapability::Tool],
         permissions: vec![PluginPermission::HttpClient],
         config_schema: None,
@@ -139,13 +144,14 @@ async fn probe(
 
     let services = {
         let manifest = manifest.clone();
-        PluginHostServices::new(PluginConfigResolver::new(move |scope| {
-            resolve_plugin_config(&manifest, scope, None)
-        }))
+        PluginHostServices::new(
+            PluginConfigResolver::new(move |scope| resolve_plugin_config(&manifest, scope, None)),
+            state_service(),
+        )
     };
 
     let mut plugin = zeroclaw_plugins::runtime::create_plugin_with_egress(
-        &fixture(),
+        &admit_fixture(&fixture(), &manifest),
         &scope,
         &services,
         limits(),

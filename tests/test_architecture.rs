@@ -23,3 +23,6 @@ mod container_release;
 
 #[path = "architecture/publish_contract.rs"]
 mod publish_contract;
+
+#[path = "architecture/ci_runner_labels.rs"]
+mod ci_runner_labels;

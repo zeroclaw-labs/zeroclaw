@@ -6,6 +6,8 @@
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
+mod support;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
@@ -25,6 +27,8 @@ use zeroclaw_plugins::instance::PluginInstanceScope;
 use zeroclaw_plugins::services::PluginHostServices;
 use zeroclaw_plugins::wasm_channel::WasmChannel;
 use zeroclaw_plugins::{PluginCapability, PluginManifest, PluginPermission};
+
+use support::{admit_fixture, state_service};
 
 fn fixture() -> PathBuf {
     static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
@@ -86,14 +90,23 @@ fn manifest() -> PluginManifest {
         description: None,
         author: None,
         wasm_path: Some("channel-fixture.wasm".to_string()),
+        wasm_sha256: None,
         capabilities: vec![PluginCapability::Channel],
         // Every fixture channel is ConfigRead-granted so the typed-config and
-        // scoped-secret contract is exercised on every instantiation. The
-        // HttpClient grant is kept but inert: the host withholds `wasi:http`
-        // from channels (see `new_channel_store`), so a channel that grants
-        // HttpClient still receives no outbound-HTTP surface. The deadline
-        // tests therefore drive guest compute (a `spin` message), not network.
-        permissions: vec![PluginPermission::ConfigRead, PluginPermission::HttpClient],
+        // scoped-secret contract is exercised on every instantiation, and
+        // State-granted so the durable-state contract is too. The HttpClient
+        // grant attaches the governed `wasi:http` surface (see
+        // `new_channel_store`), but these channels are constructed with no egress
+        // policy (`from_wasm(.., None)`), so reach is deny-all — no destination
+        // is reachable. The deadline tests drive guest compute (a `spin`
+        // message), not network, so a linked-but-ungoverned surface does not
+        // change what they measure.
+        permissions: vec![
+            PluginPermission::ConfigRead,
+            PluginPermission::HttpClient,
+            PluginPermission::StateRead,
+            PluginPermission::StateWrite,
+        ],
         config_schema: Some(serde_json::json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -141,7 +154,7 @@ fn host_services(config: CanonicalConfig) -> PluginHostServices {
         })?;
         resolve_plugin_config(&manifest, scope, Some(values))
     });
-    PluginHostServices::new(resolver)
+    PluginHostServices::new(resolver, state_service())
 }
 
 async fn build_channel(binding: &str, services: &PluginHostServices) -> WasmChannel {
@@ -155,7 +168,8 @@ async fn build_channel(binding: &str, services: &PluginHostServices) -> WasmChan
     .expect("admit fixture scope");
     let endpoint = PluginChannelEndpoint::new(scope, "plugin").expect("bind fixture endpoint");
 
-    WasmChannel::from_wasm(endpoint, &fixture(), services, limits())
+    let component = admit_fixture(&fixture(), &manifest);
+    WasmChannel::from_wasm(endpoint, &component, services, limits(), None)
         .await
         .expect("instantiate fixture channel")
 }
@@ -190,7 +204,8 @@ async fn channel_with(
     )
     .expect("admit fixture scope");
     let endpoint = PluginChannelEndpoint::new(scope, "plugin").expect("bind fixture endpoint");
-    WasmChannel::from_wasm(endpoint, &fixture(), &services, limits)
+    let component = admit_fixture(&fixture(), &manifest);
+    WasmChannel::from_wasm(endpoint, &component, &services, limits, None)
         .await
         .expect("instantiate fixture channel")
 }
@@ -710,8 +725,10 @@ async fn timed_out_channel_call_releases_lock_and_recreates_instance() {
     let channel = channel_with_timeout("recreate", Duration::from_millis(500)).await;
 
     // A spinning send outlives the 500ms wall-clock deadline; the host must
-    // interrupt it, discard the store, and release the slot lock. Channels have
-    // no outbound-HTTP surface, so the slow operation is guest compute.
+    // interrupt it, discard the store, and release the slot lock. The slow
+    // operation is guest compute (a `spin` message): the governed `wasi:http`
+    // surface is linked but has no egress grant, so it reaches nothing and no
+    // network call is involved.
     let error = channel
         .send(&outbound("spin until the deadline", "room"))
         .await

@@ -3,10 +3,10 @@ pub use zeroclaw_api::model_provider::*;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::ToolSpec;
     use async_trait::async_trait;
     use futures_util::StreamExt;
     use futures_util::stream::{self, BoxStream};
+    use zeroclaw_api::tool::ToolSpec;
 
     /// Representative non-zero temperature for default-path chat tests;
     /// mocks ignore it, so any plausible in-range value is fine — this

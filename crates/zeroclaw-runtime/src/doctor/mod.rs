@@ -1172,8 +1172,10 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
                 ));
             }
 
-            // API key presence
-            if family != "ollama" {
+            // Native Ollama services are credential-optional by declaration.
+            // Keep this narrow: other local-family diagnostics retain their
+            // established API-key warning behavior.
+            if !matches!(family, "ollama" | "hailo_ollama") {
                 if entry.api_key.as_deref().is_some() {
                     items.push(DiagItem::ok(cat, format!("{label}: API key configured")));
                 } else {
@@ -1447,10 +1449,9 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Delegate agents: model_provider validity (resolved from model_provider alias)
-    let mut agent_names: Vec<_> = config.agents.keys().collect();
-    agent_names.sort();
-    for name in agent_names {
-        let agent = config.agents.get(name).unwrap();
+    let mut agents: Vec<_> = config.agents.iter().collect();
+    agents.sort_by_key(|(name, _)| *name);
+    for (name, agent) in agents {
         let provider_ref = agent.model_provider.as_str();
         if provider_ref.is_empty() {
             continue;
@@ -1488,14 +1489,19 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
 /// mapping for the CLI.
 ///
 /// An earlier version of this helper existed for the skills prompt-injection
-/// deprecation and was removed with that warning, so the withheld-capability
-/// notice is currently its only entry.
+/// deprecation and was removed with that warning. The withheld-capability
+/// notice and the disabled-audit notice are its current entries.
 fn localized_validation_warning_message(
     warning: &zeroclaw_config::validation_warnings::ValidationWarning,
 ) -> String {
     match warning.code.as_str() {
         zeroclaw_config::validation_warnings::VERIFIABLE_INTENT_TOOL_WITHHELD => {
             crate::i18n::get_required_cli_string("cli-doctor-verifiable-intent-tool-withheld")
+        }
+        zeroclaw_config::validation_warnings::SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD => {
+            crate::i18n::get_required_cli_string(
+                "cli-doctor-security-audit-disabled-drops-certificate-record",
+            )
         }
         _ => warning.message.clone(),
     }
@@ -1977,6 +1983,53 @@ fn parse_rfc3339(raw: &str) -> Option<DateTime<Utc>> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn local_hailo_alias_does_not_warn_for_missing_api_key() {
+        let mut config = Config::default();
+        config.providers.models.hailo_ollama.insert(
+            "edge".to_string(),
+            zeroclaw_config::schema::HailoOllamaModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("qwen3:1.7b".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.message.contains("hailo_ollama.edge: no api_key set")),
+            "local Hailo aliases must not receive a cloud-credential warning"
+        );
+    }
+
+    #[test]
+    fn non_hailo_local_alias_keeps_existing_missing_api_key_warning() {
+        let mut config = Config::default();
+        config.providers.models.llamacpp.insert(
+            "edge".to_string(),
+            zeroclaw_config::schema::LlamacppModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("local-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        assert!(
+            items
+                .iter()
+                .any(|item| item.message.contains("llamacpp.edge: no api_key set")),
+            "other local families must retain their established API-key warning"
+        );
+    }
 
     #[test]
     fn collapse_model_probes_groups_identical_and_breaks_divergent() {
@@ -3269,6 +3322,30 @@ mod tests {
         // The diagnostic path is what an operator edits, so it stays the
         // config key rather than being folded into the localized sentence.
         assert_eq!(warning.path, "verifiable_intent.enabled");
+    }
+
+    #[test]
+    fn disabled_security_audit_warning_uses_fluent() {
+        let structured_message = "structured API fallback";
+        let warning = zeroclaw_config::validation_warnings::ValidationWarning::new(
+            zeroclaw_config::validation_warnings::SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD,
+            structured_message,
+            "security.audit.enabled",
+        );
+
+        let expected = crate::i18n::get_required_cli_string(
+            "cli-doctor-security-audit-disabled-drops-certificate-record",
+        );
+        assert_eq!(localized_validation_warning_message(&warning), expected);
+        assert_ne!(expected, structured_message);
+        assert_ne!(
+            expected, "{cli-doctor-security-audit-disabled-drops-certificate-record}",
+            "the Fluent key must resolve; a marker means it is absent from every catalog"
+        );
+        assert!(
+            expected.contains("Command execution is not audited"),
+            "the operator line must scope the gap to command execution: {expected}"
+        );
     }
 
     #[test]

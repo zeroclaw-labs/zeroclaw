@@ -154,6 +154,7 @@ pub mod method {
     pub const SOPS_SAVE: &str = "sops/save";
     pub const SOPS_CREATE: &str = "sops/create";
     pub const SOPS_DELETE: &str = "sops/delete";
+    pub const SOPS_RENAME: &str = "sops/rename";
     pub const SOPS_DECIDE: &str = "sops/decide";
     pub const SOPS_WIRE_DRAFT: &str = "sops/wire-draft";
     pub const SOPS_GRAPH_DRAFT: &str = "sops/graph-draft";
@@ -278,17 +279,37 @@ pub enum SessionUpdate {
         timeout_secs: u64,
     },
     /// Emitted once per LLM call with current context size and configured limit.
+    /// `max_context_tokens` is the preemptive-trim budget the bar fills toward;
+    /// `model_context_window` is the model's full capacity, used as the bar
+    /// denominator when present so the trim budget can be drawn as a marker.
     ContextUsage {
         session_id: String,
         input_tokens: Option<u64>,
         max_context_tokens: Option<u64>,
+        model_context_window: Option<u64>,
     },
     /// Older complete turns were removed from structured session history.
     HistoryTrimmed {
         session_id: String,
         dropped_messages: u64,
+        dropped_turns: Option<u64>,
         kept_turns: u64,
         reason: String,
+        /// Configured context token budget, when the trim was token-budget
+        /// driven. `None` for message-limit trims.
+        token_budget: Option<u64>,
+        /// Token count before trimming.
+        tokens_before: Option<u64>,
+        /// Token count after trimming.
+        tokens_after: Option<u64>,
+        /// Provenance of `tokens_before` ("provider", "estimate", "calibrated").
+        tokens_before_source: Option<String>,
+        /// Provenance of `tokens_after` ("provider", "estimate", "calibrated").
+        tokens_after_source: Option<String>,
+        /// The retained request cannot fit the configured budget (protected
+        /// newest turn plus schemas) even after trimming. Absent for ordinary
+        /// trims; authoritative floor signal — not `dropped_messages == 0`.
+        unsatisfiable_floor: Option<bool>,
     },
     /// Terminal event for a turn. Replaces the JSON-RPC response of
     /// `session/prompt`. `outcome` distinguishes a clean finish from a cancel
@@ -381,12 +402,26 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
             session_id: sid,
             input_tokens: params.get("input_tokens").and_then(|v| v.as_u64()),
             max_context_tokens: params.get("max_context_tokens").and_then(|v| v.as_u64()),
+            model_context_window: params.get("model_context_window").and_then(|v| v.as_u64()),
         }),
         "history_trimmed" => Some(SessionUpdate::HistoryTrimmed {
             session_id: sid,
             dropped_messages: params.get("dropped_messages")?.as_u64()?,
+            dropped_turns: params.get("dropped_turns").and_then(|v| v.as_u64()),
             kept_turns: params.get("kept_turns")?.as_u64()?,
             reason: params.get("reason")?.as_str()?.to_string(),
+            token_budget: params.get("token_budget").and_then(|v| v.as_u64()),
+            tokens_before: params.get("tokens_before").and_then(|v| v.as_u64()),
+            tokens_after: params.get("tokens_after").and_then(|v| v.as_u64()),
+            tokens_before_source: params
+                .get("tokens_before_source")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            tokens_after_source: params
+                .get("tokens_after_source")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            unsatisfiable_floor: params.get("unsatisfiable_floor").and_then(|v| v.as_bool()),
         }),
         "turn_complete" => Some(SessionUpdate::TurnComplete {
             session_id: sid,
@@ -1783,11 +1818,18 @@ impl RpcClient {
     /// daemon CA to trust) and `client_cert_path` / `client_key_path` (the client
     /// certificate to present). `skip_verify` disables server verification
     /// (self-signed dev only).
+    ///
+    /// `auth_token` (with an optional `auth_provider` selection, default
+    /// `native`) is presented in the initialize handshake; remote daemons
+    /// require it since the RFC 7141 enforcement boundary. The mTLS cert is
+    /// transport/device admission; the token is principal authentication.
     pub async fn connect_wss_direct(
         url: &str,
         prev_tui_id: Option<&str>,
         prev_tui_sig: Option<&str>,
         tls: &ClientTls,
+        auth_token: Option<&str>,
+        auth_provider: Option<&str>,
     ) -> Result<Self> {
         // The built-in (webpki-roots) connector only for the plain default (no
         // client cert, no custom CA, no skip-verify); any custom TLS material
@@ -1808,7 +1850,15 @@ impl RpcClient {
         .await
         .with_context(|| format!("WSS connect to {url}"))?;
         // No relay pump on the direct path: the socket IS the transport.
-        Self::spawn_ws_session(ws_stream, prev_tui_id, prev_tui_sig, None).await
+        Self::spawn_ws_session(
+            ws_stream,
+            prev_tui_id,
+            prev_tui_sig,
+            auth_token,
+            auth_provider,
+            None,
+        )
+        .await
     }
 
     /// Connect to the daemon through a nominated relay.
@@ -1823,6 +1873,8 @@ impl RpcClient {
         prev_tui_sig: Option<&str>,
         tls: &ClientTls,
         relay: &RelayDial,
+        auth_token: Option<&str>,
+        auth_provider: Option<&str>,
     ) -> Result<Self> {
         // ONE deadline for the whole client-side setup. It is created here, before
         // the first packet, and every step below shares what is left of it: the
@@ -1854,7 +1906,15 @@ impl RpcClient {
         // `?` here would drop the guard and retire the pump, which is exactly
         // what a failed handshake wants.
         let (ws_stream, _response) = handshake?;
-        Self::spawn_ws_session(ws_stream, prev_tui_id, prev_tui_sig, pump.release()).await
+        Self::spawn_ws_session(
+            ws_stream,
+            prev_tui_id,
+            prev_tui_sig,
+            auth_token,
+            auth_provider,
+            pump.release(),
+        )
+        .await
     }
 
     /// Drive a connected WSS stream: spawn the writer/reader tasks and complete
@@ -1868,6 +1928,8 @@ impl RpcClient {
         ws_stream: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<S>>,
         prev_tui_id: Option<&str>,
         prev_tui_sig: Option<&str>,
+        auth_token: Option<&str>,
+        auth_provider: Option<&str>,
         relay_pump: Option<tokio::task::JoinHandle<()>>,
     ) -> Result<Self>
     where
@@ -1977,6 +2039,12 @@ impl RpcClient {
         }
         if let Some(sig) = prev_tui_sig {
             init_params["tui_sig"] = serde_json::Value::String(sig.to_string());
+        }
+        if let Some(token) = auth_token {
+            init_params["auth_token"] = serde_json::Value::String(token.to_string());
+        }
+        if let Some(provider) = auth_provider {
+            init_params["auth_provider"] = serde_json::Value::String(provider.to_string());
         }
         // NOTE: We intentionally do NOT forward the TUI's environment here.
         // In a WSS connection the daemon is on a remote machine, so env values
@@ -2596,6 +2664,18 @@ impl RpcClient {
             .await
     }
 
+    /// Move a SOP to a new name. Separate from `sops_save`, which persists
+    /// under the submitted SOP's own name and so can only overwrite the SOP it
+    /// was loaded from; the daemon collision-checks the target and moves the
+    /// definition rather than copying it.
+    pub async fn sops_rename(&self, from: &str, to: &str) -> Result<Value> {
+        self.call(
+            method::SOPS_RENAME,
+            serde_json::json!({ "from": from, "to": to }),
+        )
+        .await
+    }
+
     pub async fn sops_delete(&self, name: &str) -> Result<Value> {
         self.call(method::SOPS_DELETE, serde_json::json!({ "name": name }))
             .await
@@ -3200,10 +3280,7 @@ pub struct ConfigDeleteResult {}
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct ConfigReloadResult {
-    #[allow(dead_code)]
-    pub reloading: bool,
-}
+pub struct ConfigReloadResult {}
 
 /// One selectable locale (`locales/list`).
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -3227,8 +3304,6 @@ pub struct FetchedCatalog {
 
 #[derive(Debug, serde::Deserialize)]
 pub struct LocalesFetchResult {
-    #[allow(dead_code)]
-    pub locale: String,
     pub catalogs: Vec<FetchedCatalog>,
     pub skipped: Vec<String>,
 }
@@ -3272,6 +3347,10 @@ pub struct ConfigSectionEntry {
     /// back to the flat ungrouped list.
     #[serde(default)]
     pub group: String,
+    /// Stable locale-independent group key. Empty when connected to an older
+    /// daemon; the Config pane then derives it from the legacy English label.
+    #[serde(default)]
+    pub group_key: String,
     #[serde(default)]
     pub shape: Option<SectionShape>,
     #[serde(default)]
@@ -4185,6 +4264,13 @@ pub struct LogsQueryParams {
     /// older than the previous one. Independent of id ordering.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub until_line_offset: Option<u64>,
+    /// Segment-aware cursor passed back from the previous page's
+    /// `next_segment_cursor`. Identifies both the segment file and the
+    /// byte offset within it, so pagination continues across rotated
+    /// archives. Takes precedence over `until_line_offset` when both
+    /// are supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub until_segment_cursor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub severity_min: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4197,6 +4283,8 @@ pub struct LogsQueryParams {
     pub outcome: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sop_run_id: Option<String>,
     #[serde(default)]
     pub hide_internal: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4219,9 +4307,26 @@ pub struct LogsQueryResult {
     /// Byte offset past the OLDEST event on the current page. Pass back
     /// as [`LogsQueryParams::until_line_offset`] on the next request to
     /// walk older pages deterministically regardless of id ordering.
-    /// `None` when the page is empty.
+    /// `None` when the page is empty, and also `None` when the oldest
+    /// event on the page lives in a rotated archive rather than the
+    /// active file — use [`Self::next_segment_cursor`] in that case.
     pub next_cursor_line_offset: Option<u64>,
+    /// Segment-aware cursor for the oldest event on this page. Pass
+    /// back as [`LogsQueryParams::until_segment_cursor`] to walk older
+    /// pages across segment boundaries. Supersedes
+    /// `next_cursor_line_offset` for `rotating`-mode deployments with
+    /// multiple retained segments. Absent (deserialized as `None`) on
+    /// daemons predating multi-segment reads.
+    #[serde(default)]
+    pub next_segment_cursor: Option<String>,
     pub at_end: bool,
+    /// True when a retained segment could not be read and was left out of
+    /// this page. `at_end` is then only "no older events among the segments
+    /// that could be read", so the pane must not present the buffer as the
+    /// complete history. Absent (deserialized as `false`) on daemons that
+    /// predate the field.
+    #[serde(default)]
+    pub incomplete: bool,
 }
 
 /// Mirror of `zeroclaw_runtime::rpc::types::LogsGetResult`. Full log
@@ -4295,10 +4400,6 @@ pub struct SessionOverrides {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SessionConfigureResult {
-    /// Echoed by the daemon; retained to lock the wire shape even though the
-    /// TUI keys off the caller's own session id.
-    #[allow(dead_code)]
-    pub session_id: String,
     #[serde(default)]
     pub overrides: SessionOverrides,
 }
@@ -4366,7 +4467,11 @@ mod dashboard_status_tests {
             "config_dir": "/tmp/zeroclaw-profile",
             "config_file": "/tmp/zeroclaw-profile/config.toml",
             "config_kind": "temporary",
-            "local_ipc_endpoint": "/tmp/zeroclaw-profile/data/daemon.sock"
+            "local_ipc_endpoint": "/tmp/zeroclaw-profile/data/daemon.sock",
+            "shell_profile": {
+                "name": "pwsh",
+                "family": "powershell"
+            }
         });
 
         let status: StatusResult = serde_json::from_value(value).unwrap();
@@ -5474,7 +5579,7 @@ mod notification_tests {
             WebSocketStream::from_raw_socket(MaybeTlsStream::Plain(client_io), Role::Client, None)
                 .await;
         let client = Arc::new(
-            RpcClient::spawn_ws_session(client_ws, None, None, None)
+            RpcClient::spawn_ws_session(client_ws, None, None, None, None, None)
                 .await
                 .unwrap(),
         );
@@ -5775,7 +5880,7 @@ mod notification_tests {
             WebSocketStream::from_raw_socket(MaybeTlsStream::Plain(client_io), Role::Client, None)
                 .await;
         let client = Arc::new(
-            RpcClient::spawn_ws_session(client_ws, None, None, Some(pump))
+            RpcClient::spawn_ws_session(client_ws, None, None, None, None, Some(pump))
                 .await
                 .unwrap(),
         );
@@ -6187,6 +6292,27 @@ mod notification_tests {
     }
 
     #[test]
+    fn parse_context_usage_keeps_budget_and_model_window_distinct() {
+        let params = serde_json::json!({
+            "type": "context_usage",
+            "session_id": "s-context",
+            "input_tokens": 100_000,
+            "max_context_tokens": 180_000,
+            "model_context_window": 200_000
+        });
+
+        assert!(matches!(
+            parse_session_update(&params),
+            Some(SessionUpdate::ContextUsage {
+                session_id,
+                input_tokens: Some(100_000),
+                max_context_tokens: Some(180_000),
+                model_context_window: Some(200_000),
+            }) if session_id == "s-context"
+        ));
+    }
+
+    #[test]
     fn parse_turn_complete_carries_optional_client_generation() {
         let update = parse_session_update(&serde_json::json!({
             "type": "turn_complete",
@@ -6411,6 +6537,7 @@ mod plan_parse_tests {
             "type": "history_trimmed",
             "session_id": "sess-3",
             "dropped_messages": 12,
+            "dropped_turns": 4,
             "kept_turns": 3,
             "reason": "history message limit exceeded"
         });
@@ -6420,9 +6547,71 @@ mod plan_parse_tests {
             Some(SessionUpdate::HistoryTrimmed {
                 session_id,
                 dropped_messages: 12,
+                dropped_turns: Some(4),
                 kept_turns: 3,
                 reason,
+                token_budget: None,
+                tokens_before: None,
+                tokens_after: None,
+                tokens_before_source: None,
+                tokens_after_source: None,
+                unsatisfiable_floor: None,
             }) if session_id == "sess-3" && reason == "history message limit exceeded"
+        ));
+    }
+
+    #[test]
+    fn parses_legacy_history_trimmed_update_without_dropped_turns() {
+        let params = serde_json::json!({
+            "type": "history_trimmed",
+            "session_id": "sess-3",
+            "dropped_messages": 12,
+            "kept_turns": 3,
+            "reason": "history message limit exceeded"
+        });
+
+        assert!(matches!(
+            parse_session_update(&params),
+            Some(SessionUpdate::HistoryTrimmed {
+                dropped_turns: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_history_trimmed_token_accounting() {
+        let params = serde_json::json!({
+            "type": "history_trimmed",
+            "session_id": "sess-4",
+            "dropped_messages": 12,
+            "kept_turns": 33,
+            "reason": "context token budget exceeded",
+            "token_budget": 500000,
+            "tokens_before": 612000,
+            "tokens_after": 117000,
+            "tokens_before_source": "provider",
+            "tokens_after_source": "calibrated"
+        });
+
+        assert!(matches!(
+            parse_session_update(&params),
+            Some(SessionUpdate::HistoryTrimmed {
+                session_id,
+                dropped_messages: 12,
+                dropped_turns: None,
+                kept_turns: 33,
+                reason,
+                token_budget: Some(500000),
+                tokens_before: Some(612000),
+                tokens_after: Some(117000),
+                tokens_before_source: Some(source),
+                tokens_after_source: Some(after_source),
+                unsatisfiable_floor: None,
+            }) if session_id == "sess-4"
+                && reason == "context token budget exceeded"
+                && source == "provider"
+                && after_source == "calibrated"
         ));
     }
 
@@ -6542,6 +6731,8 @@ mod relay_transport_tests {
                     ..Default::default()
                 },
                 &relay,
+                None,
+                None,
             )
             .await
             .expect_err("a silent relay must not hold the connect")

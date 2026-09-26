@@ -190,6 +190,7 @@ fn live_agent_config(tmp: &TempDir, plugins_root: &std::path::Path, instance_key
         ]),
         egress_hosts: Vec::new(),
         egress_allow_private: Vec::new(),
+        tls_profiles: Vec::new(),
     }];
     config
 }

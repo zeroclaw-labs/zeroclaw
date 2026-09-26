@@ -184,8 +184,14 @@ impl HasPropKind for crate::multi_agent::MemoryBackendKind {
 impl HasPropKind for crate::multi_agent::OutputModality {
     const PROP_KIND: PropKind = PropKind::Enum;
 }
+impl HasPropKind for crate::multi_agent::MemoryGrant {
+    const PROP_KIND: PropKind = PropKind::Object;
+}
 impl HasPropKind for Vec<crate::multi_agent::AgentAlias> {
     const PROP_KIND: PropKind = PropKind::StringArray;
+}
+impl HasPropKind for Vec<crate::multi_agent::MemoryGrant> {
+    const PROP_KIND: PropKind = PropKind::ObjectArray;
 }
 impl HasPropKind for Vec<crate::multi_agent::PeerUsername> {
     const PROP_KIND: PropKind = PropKind::StringArray;

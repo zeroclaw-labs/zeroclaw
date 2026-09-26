@@ -156,6 +156,21 @@ impl PostPollDispatchState {
     }
 }
 
+/// Project cached session state only while the daemon connection is
+/// authoritative. A disconnect keeps session state available for reconnection,
+/// but externally visible terminal state must become neutral instead of
+/// advertising a cached working or blocked turn indefinitely.
+fn terminal_status_for_connection<'a>(
+    connection: &ConnectionState,
+    sessions: impl IntoIterator<Item = (Option<&'a crate::turn_status::TurnStatus>, Option<&'a str>)>,
+) -> (Option<&'a crate::turn_status::TurnStatus>, Option<&'a str>) {
+    if matches!(connection, ConnectionState::Disconnected { .. }) {
+        (None, None)
+    } else {
+        crate::osc_status::most_urgent(sessions)
+    }
+}
+
 /// How often the UI redraws when no input arrives (for live panes).
 const TICK: Duration = Duration::from_millis(200);
 const CHROME_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -1276,6 +1291,20 @@ pub async fn run(
             connected: !matches!(conn_state, ConnectionState::Disconnected { .. }),
         };
 
+        // Report whichever session most wants the operator, not whichever is
+        // visible: the terminal status exists to be read from outside this
+        // window, so it has to answer "does anything here need me?". Emitted
+        // before `term.draw` so the OSC write never lands inside a frame.
+        let mut terminal_candidates = chat_pane.terminal_statuses();
+        terminal_candidates.extend(acp_pane.terminal_statuses());
+        let (terminal_status, terminal_agent) = terminal_status_for_connection(
+            &conn_state,
+            terminal_candidates
+                .iter()
+                .map(|(status, agent)| (Some(status), Some(agent.as_str()))),
+        );
+        crate::osc_status::sync(terminal_status, terminal_agent);
+
         term.draw(|frame| {
             // Theme backdrop: paint the whole screen with the active
             // theme's background first so every pane inherits it. The
@@ -1353,10 +1382,10 @@ pub async fn run(
                 2
             };
 
-            let (ctx_input, ctx_max) = match mode {
+            let (ctx_input, ctx_max, ctx_model_window) = match mode {
                 Mode::Chat => chat_pane.ctx_tokens(),
                 Mode::Acp => acp_pane.ctx_tokens(),
-                _ => (None, None),
+                _ => (None, None, None),
             };
             let browse_mode = match mode {
                 Mode::Chat => chat_pane.in_browse_mode(),
@@ -1368,7 +1397,7 @@ pub async fn run(
                 chunks[status_idx],
                 &conn_state,
                 rpc.tui_id(),
-                CtxBar::new(ctx_input, ctx_max),
+                CtxBar::new(ctx_input, ctx_max, ctx_model_window),
                 needs_intervention,
                 browse_mode,
             );
@@ -2838,6 +2867,46 @@ fn draw_reload_status_toast(frame: &mut ratatui::Frame, area: Rect, msg: &str) {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    #[test]
+    fn disconnected_terminal_projection_is_neutral() {
+        let working = crate::turn_status::TurnStatus::Working;
+        let blocked = crate::turn_status::TurnStatus::WaitingForApproval;
+        let disconnected = ConnectionState::Disconnected {
+            reason: "test disconnect".to_string(),
+        };
+
+        let (status, agent) = terminal_status_for_connection(
+            &disconnected,
+            [
+                (Some(&working), Some("chat")),
+                (Some(&blocked), Some("code")),
+            ],
+        );
+
+        assert!(status.is_none());
+        assert!(agent.is_none());
+    }
+
+    #[test]
+    fn connected_terminal_projection_keeps_urgent_session() {
+        let working = crate::turn_status::TurnStatus::Working;
+        let blocked = crate::turn_status::TurnStatus::WaitingForApproval;
+
+        let (status, agent) = terminal_status_for_connection(
+            &ConnectionState::Connected,
+            [
+                (Some(&working), Some("chat")),
+                (Some(&blocked), Some("code")),
+            ],
+        );
+
+        assert!(matches!(
+            status,
+            Some(crate::turn_status::TurnStatus::WaitingForApproval)
+        ));
+        assert_eq!(agent, Some("code"));
+    }
 
     #[tokio::test]
     async fn sidebar_mouse_up_finishes_chat_and_code_transcript_drags() {

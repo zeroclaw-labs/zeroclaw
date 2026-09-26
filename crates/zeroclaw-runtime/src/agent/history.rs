@@ -5,13 +5,17 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::LazyLock;
 use zeroclaw_providers::ChatMessage;
+use zeroclaw_providers::multimodal::IMAGE_MARKER_PREFIX;
+use zeroclaw_providers::multimodal::ImageMarkerDisposition;
+use zeroclaw_providers::multimodal::image_marker_dispositions;
+use zeroclaw_providers::multimodal::image_marker_summary;
 
-/// Default trigger for auto-compaction when non-system message count exceeds this threshold.
-/// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
-/// used when callers omit the parameter.
+/// Default complete-turn retention limit. Prefer passing the config-driven
+/// value via `run_tool_call_loop`; this constant is only used when callers omit
+/// the parameter. The name is retained for config compatibility.
 pub const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
 
-static LOCAL_IMAGE_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
+pub(crate) static LOCAL_IMAGE_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?:[A-Za-z]:[\\/]|\\\\[^\s<>'"`\]\)/\\]+[\\/]|/)[^\s<>'"`\]\)]+?\.(?i:png|jpe?g|webp|gif|bmp)"#,
     )
@@ -311,24 +315,83 @@ pub fn truncate_tool_message(msg_content: &str, max_chars: usize) -> String {
     truncate_tool_result(msg_content, max_chars)
 }
 
-/// Estimate the token cost of a single message using the ~4 chars/token
-/// heuristic plus ~4 framing tokens (role, delimiters). Single-sourced so the
-/// history and system-floor estimates stay in lock-step.
-fn estimate_message_tokens(message: &ChatMessage) -> usize {
-    message.content.len().div_ceil(4) + 4
+/// Fixed per-image charge for `[IMAGE:...]` markers in the history estimate.
+/// Approximates the standard-tier Anthropic maximum (1,568 tokens for an image
+/// at the 1568px downscale). High-resolution tiers and some models bill more
+/// (Anthropic high-res up to 4,784; GPT-4o-mini base 2,833; Qwen-VL ~4k per
+/// A4 page): this is a heuristic for trimming, not a ceiling, and
+/// provider-reported usage corrects it after the first successful response.
+pub const IMAGE_TOKEN_ESTIMATE: usize = 1_600;
+
+/// Estimate the token cost of a single message: the ~4 chars/token heuristic
+/// plus ~4 framing tokens (role, delimiters). Loadable `[IMAGE:...]` markers
+/// are charged at [`IMAGE_TOKEN_ESTIMATE`] per image only when preparation
+/// dispatches them as images ([`ImageMarkerDisposition::Normalized`]); stale
+/// tool-result markers are priced as their non-marker text, and system or
+/// assistant content stays literal text. A message whose markers are all
+/// placeholders keeps the plain-text formula. Single-sourced so the history
+/// and system-floor estimates stay in lock-step.
+fn estimate_message_tokens(message: &ChatMessage, disposition: ImageMarkerDisposition) -> usize {
+    let text_estimate = message.content.len().div_ceil(4) + 4;
+    if disposition == ImageMarkerDisposition::Literal
+        || !message.content.contains(IMAGE_MARKER_PREFIX)
+    {
+        return text_estimate;
+    }
+    let summary = image_marker_summary(&message.content);
+    if summary.image_refs == 0 {
+        return text_estimate; // placeholders stay text, byte-identical to the plain formula
+    }
+    match disposition {
+        ImageMarkerDisposition::Normalized => {
+            summary.text_bytes.div_ceil(4) + summary.image_refs * IMAGE_TOKEN_ESTIMATE + 4
+        }
+        ImageMarkerDisposition::Stripped => summary.text_bytes.div_ceil(4) + 4,
+        // Unreachable after the guard; keeps the arm total.
+        ImageMarkerDisposition::Literal => text_estimate,
+    }
 }
 
-/// Estimate token count for a message history using ~4 chars/token heuristic.
-/// Includes a small overhead per message for role/framing tokens.
+/// Estimate token count for a message history using the ~4 chars/token
+/// heuristic plus ~4 framing tokens per message. Loadable image markers are
+/// charged per image only where preparation dispatches them: user turns and
+/// the tool-result carriers in the current user turn. Stale tool-result
+/// markers are priced as their remaining text, and system or assistant
+/// content is priced as text. Trim probes estimate history suffixes that
+/// always retain the newest turn, so the current turn's tool-result carriers
+/// carry the same disposition in every probe as in the full history.
 pub fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
-    history.iter().map(estimate_message_tokens).sum()
+    let dispositions = image_marker_dispositions(history);
+    history
+        .iter()
+        .zip(dispositions)
+        .map(|(message, disposition)| estimate_message_tokens(message, disposition))
+        .sum()
+}
+
+/// Estimate the token cost of native tool definitions serialized into the
+/// provider request, using the same ~4 chars/token heuristic as messages.
+/// The OpenAI and compatible adapters serialize these schemas into the chat
+/// request, so providers that include them in `input_tokens` report a
+/// population of messages plus tool schemas, not messages alone.
+pub fn estimate_tool_schema_tokens(specs: &[crate::tools::ToolSpec]) -> usize {
+    specs
+        .iter()
+        .map(|spec| {
+            let parameters_len =
+                serde_json::to_string(&*spec.parameters).map_or(0, |serialized| serialized.len());
+            (spec.name.len() + spec.description.len() + parameters_len).div_ceil(4) + 4
+        })
+        .sum()
 }
 
 pub fn estimate_system_floor_tokens(history: &[ChatMessage]) -> usize {
+    // System content is always dispatched verbatim, so the floor always uses
+    // the literal-text formula.
     history
         .iter()
         .filter(|m| m.role == "system")
-        .map(estimate_message_tokens)
+        .map(|m| estimate_message_tokens(m, ImageMarkerDisposition::Literal))
         .sum()
 }
 
@@ -385,63 +448,28 @@ pub fn append_or_merge_system_message(history: &mut Vec<ChatMessage>, content: i
     normalize_system_messages(history);
 }
 
-pub fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
-    let has_system = history.first().is_some_and(|m| m.role == "system");
-    let non_system_count = if has_system {
-        history.len() - 1
-    } else {
-        history.len()
-    };
-
-    if non_system_count <= max_history {
-        return;
-    }
-
-    let system_offset = usize::from(has_system);
-
-    // Find the first user message (the framing anchor). If `max_history` is
-    // too small to fit both the anchor and any recent context, fall back to
-    // the old tail-only behaviour rather than producing a degenerate window.
-    let anchor_idx = history
-        .iter()
-        .enumerate()
-        .skip(system_offset)
-        .find(|(_, m)| m.role == "user")
-        .map(|(i, _)| i);
-
-    let messages_before = history.len();
-
-    let dropped_range = match anchor_idx {
-        Some(anchor) if max_history >= 2 => {
-            // Reserve one slot for the anchor; keep `max_history - 1` most recent.
-            let tail_keep = max_history - 1;
-            let tail_start = history.len().saturating_sub(tail_keep);
-            // Middle range to drop: (anchor + 1) .. tail_start.
-            let drop_start = anchor + 1;
-            if tail_start <= drop_start {
-                // Anchor is already inside the tail window — nothing in the
-                // middle to drop. Fall through to plain head-drop below.
-                None
-            } else {
-                Some(drop_start..tail_start)
-            }
-        }
-        _ => None,
-    };
-
-    if let Some(range) = dropped_range {
-        history.drain(range);
-    } else {
-        // No anchor, or `max_history < 2`: original head-drop behaviour.
-        let to_remove = non_system_count - max_history;
-        history.drain(system_offset..system_offset + to_remove);
-    }
-
-    remove_orphaned_tool_messages(history);
-    normalize_system_messages(history);
-
-    let dropped = messages_before.saturating_sub(history.len());
-    if dropped > 0 {
+pub fn trim_history(
+    history: &mut Vec<ChatMessage>,
+    max_history_turns: usize,
+    history_has_trim_breadcrumb: &mut bool,
+) {
+    let result = crate::agent::history_trim::trim_to_recent_turn_count(
+        std::mem::take(history),
+        max_history_turns,
+        *history_has_trim_breadcrumb,
+    );
+    let crate::agent::history_trim::TurnCountTrimResult {
+        history: trimmed_history,
+        dropped_messages,
+        dropped_turns,
+        kept_turns,
+        trimmed,
+    } = result;
+    let messages_before = trimmed_history.len().saturating_add(dropped_messages);
+    *history = trimmed_history;
+    if trimmed {
+        remove_orphaned_tool_messages(history);
+        normalize_system_messages(history);
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -449,13 +477,12 @@ pub fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
                 .with_attrs(::serde_json::json!({
                     "messages_before": messages_before,
                     "messages_after": history.len(),
-                    "dropped": dropped,
-                    "max_history": max_history,
-                    "kept_anchor": anchor_idx.is_some() && max_history >= 2,
+                    "dropped_messages": dropped_messages,
+                    "dropped_turns": dropped_turns,
+                    "kept_turns": kept_turns,
+                    "max_history_turns": max_history_turns,
                 })),
-            "trim_history fired: middle of conversation dropped. Raise \
-             [runtime_profiles.<name>] max_history_messages or enable \
-             compact_context to avoid silent context loss."
+            "trim_history: dropped oldest whole turns"
         );
     }
 }
@@ -464,13 +491,16 @@ pub fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
 pub struct InteractiveSessionState {
     pub version: u32,
     pub history: Vec<ChatMessage>,
+    #[serde(default)]
+    pub history_has_trim_breadcrumb: bool,
 }
 
 impl InteractiveSessionState {
-    fn from_history(history: &[ChatMessage]) -> Self {
+    pub fn from_history_with_crumb(history: &[ChatMessage], has_crumb: bool) -> Self {
         Self {
-            version: 1,
+            version: 2,
             history: history.to_vec(),
+            history_has_trim_breadcrumb: has_crumb,
         }
     }
 }
@@ -479,8 +509,50 @@ pub fn load_interactive_session_history(
     path: &Path,
     system_prompt: &str,
 ) -> Result<Vec<ChatMessage>> {
+    let (history, _) = load_interactive_session_history_with_crumb(path, system_prompt)?;
+    Ok(history)
+}
+
+/// Canonical breadcrumb text used for trim markers. This is the English
+/// string that has been stable across all locales; it is the locale-
+/// independent anchor for legacy migration. Injected breadcrumbs are always
+/// produced via `get_required_cli_string("history-trim-breadcrumb")`, which
+/// currently resolves to this same English text in every locale. Checking
+/// the canonical value makes restore independent of the current process
+/// locale.
+pub const HISTORY_TRIM_BREADCRUMB_CANONICAL: &str =
+    "[earlier turns omitted to fit the context window]";
+
+pub fn is_history_trim_breadcrumb_text(text: &str) -> bool {
+    if text == HISTORY_TRIM_BREADCRUMB_CANONICAL {
+        return true;
+    }
+    // Best-effort cross-locale coverage: if a future translation changes the
+    // breadcrumb in a non-English locale, a legacy v1 file trimmed in that
+    // locale will still be recognised after a restart with a different locale.
+    // v2 files carry an explicit flag and never reach this path.
+    text == crate::i18n::get_required_cli_string("history-trim-breadcrumb")
+}
+
+/// Load interactive history plus the persisted breadcrumb provenance. Legacy
+/// files without the flag are migrated by inspecting the restored history:
+/// if the first non-system message equals the breadcrumb string, the flag is
+/// recovered as true. v2 records carry an explicit
+/// `history_has_trim_breadcrumb` (true or false) so a genuine user message
+/// that collides with the breadcrumb text keeps its real turn-boundary role.
+/// Legacy v1 migration is locale-independent: it checks the canonical
+/// English breadcrumb plus the current-locale string, covering both the
+/// stable historical value and any future translated variant. A v1 file whose
+/// first user turn genuinely equals the breadcrumb text cannot be
+/// distinguished from a synthetic marker on its one-time migration; after the
+/// next persist the file becomes v2 with the (mis)classified flag, which is
+/// the documented one-time limitation for unmarked legacy state.
+pub fn load_interactive_session_history_with_crumb(
+    path: &Path,
+    system_prompt: &str,
+) -> Result<(Vec<ChatMessage>, bool)> {
     if !path.exists() {
-        return Ok(vec![ChatMessage::system(system_prompt)]);
+        return Ok((vec![ChatMessage::system(system_prompt)], false));
     }
 
     let raw = std::fs::read_to_string(path)?;
@@ -497,15 +569,45 @@ pub fn load_interactive_session_history(
 
     remove_orphaned_tool_messages(&mut state.history);
 
-    Ok(state.history)
+    // Migration: only legacy v1 files lack explicit provenance. v2 records
+    // carry an explicit `history_has_trim_breadcrumb` (true or false) — a
+    // fresh v2 session where the user legitimately sent the breadcrumb text
+    // must not be reclassified as synthetic. Infer only when the persisted
+    // version is < 2 and the flag is false.
+    let mut has_crumb = state.history_has_trim_breadcrumb;
+    if !has_crumb && state.version < 2 {
+        let leading_system = state
+            .history
+            .iter()
+            .take_while(|m| m.role == "system")
+            .count();
+        if let Some(first) = state.history.get(leading_system)
+            && first.role == "user"
+            && is_history_trim_breadcrumb_text(&first.content)
+        {
+            has_crumb = true;
+        }
+    }
+
+    Ok((state.history, has_crumb))
 }
 
 pub fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) -> Result<()> {
+    save_interactive_session_history_with_crumb(path, history, false)
+}
+
+pub fn save_interactive_session_history_with_crumb(
+    path: &Path,
+    history: &[ChatMessage],
+    has_crumb: bool,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    let payload = serde_json::to_string_pretty(&InteractiveSessionState::from_history(history))?;
+    let payload = serde_json::to_string_pretty(&InteractiveSessionState::from_history_with_crumb(
+        history, has_crumb,
+    ))?;
     std::fs::write(path, payload)?;
     Ok(())
 }
@@ -541,6 +643,175 @@ mod tests {
         assert_eq!(estimate_system_floor_tokens(&[]), 0);
         let history = vec![ChatMessage::user("hi"), ChatMessage::assistant("yo")];
         assert_eq!(estimate_system_floor_tokens(&history), 0);
+    }
+
+    #[test]
+    fn image_path_marker_is_charged_per_image_not_per_byte() {
+        // The marker is 18 bytes of text: bytes/4 would price it at ~9
+        // tokens against the ~1.5k the provider bills after downscale.
+        let message = ChatMessage::user("[IMAGE:/tmp/a.png]");
+
+        assert_eq!(
+            estimate_history_tokens(&[message]),
+            IMAGE_TOKEN_ESTIMATE + 4
+        );
+    }
+
+    #[test]
+    fn image_data_uri_marker_is_charged_per_image_not_per_byte() {
+        // ~600 KB of base64 would price at ~150k tokens under the text
+        // heuristic, against ~1.5k billed.
+        let payload = format!("data:image/png;base64,{}", "A".repeat(600_000));
+        let message = ChatMessage::user(format!("[IMAGE:{payload}]"));
+
+        assert_eq!(
+            estimate_history_tokens(&[message]),
+            IMAGE_TOKEN_ESTIMATE + 4
+        );
+    }
+
+    #[test]
+    fn path_and_data_uri_forms_estimate_identically() {
+        // Invariant 2: the same image costs the same however it is
+        // referenced, so the raw-history estimate bounds the prepared
+        // payload from above.
+        let via_path = ChatMessage::user("[IMAGE:/tmp/scene.png]");
+        let payload = format!("data:image/png;base64,{}", "B".repeat(600_000));
+        let via_data_uri = ChatMessage::user(format!("[IMAGE:{payload}]"));
+
+        let path_estimate = estimate_history_tokens(&[via_path]);
+        assert_eq!(path_estimate, estimate_history_tokens(&[via_data_uri]));
+        assert_eq!(path_estimate, IMAGE_TOKEN_ESTIMATE + 4);
+    }
+
+    #[test]
+    fn placeholder_marker_stays_text() {
+        // `parse_image_markers` keeps placeholder markers in the text, so
+        // they retain the plain-text pricing.
+        for placeholder in ["[IMAGE:...]", "[IMAGE:<path>]"] {
+            let message = ChatMessage::user(placeholder);
+
+            assert_eq!(
+                estimate_history_tokens(&[message]),
+                placeholder.len().div_ceil(4) + 4
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_text_and_images_sum() {
+        let content = "see [IMAGE:/a.png] and [IMAGE:/b.png] ok";
+        let message = ChatMessage::user(content);
+
+        let (text, refs) = zeroclaw_providers::multimodal::parse_image_markers(content);
+        assert_eq!(refs.len(), 2);
+        assert_eq!(text, "see  and  ok");
+
+        let expected = text.len().div_ceil(4) + 2 * IMAGE_TOKEN_ESTIMATE + 4;
+        assert_eq!(estimate_history_tokens(&[message]), expected);
+    }
+
+    #[test]
+    fn system_and_assistant_markers_stay_text() {
+        // System and assistant content is dispatched verbatim, so a 16 KB data
+        // URI marker must estimate as its full text, not as one image.
+        let payload = format!("data:image/png;base64,{}", "A".repeat(16_000));
+        let system_marker = ChatMessage::system(format!("[IMAGE:{payload}]"));
+        let system_len = system_marker.content.len();
+        assert_eq!(
+            estimate_history_tokens(&[system_marker]),
+            system_len.div_ceil(4) + 4
+        );
+
+        let assistant_marker = ChatMessage::assistant("[IMAGE:/tmp/a.png]");
+        let assistant_len = assistant_marker.content.len();
+        assert_eq!(
+            estimate_history_tokens(&[assistant_marker]),
+            assistant_len.div_ceil(4) + 4
+        );
+
+        // Twenty short markers in one system message must stay far under the
+        // default 32,000-token floor warning they used to trip.
+        let twenty = (0..20)
+            .map(|index| format!("[IMAGE:/tmp/s-{index}.png]"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let system_history = vec![ChatMessage::system(twenty)];
+        let floor = estimate_system_floor_tokens(&system_history);
+        assert_eq!(floor, system_history[0].content.len().div_ceil(4) + 4);
+        assert!(floor < 32_000);
+    }
+
+    #[test]
+    fn placeholder_with_padding_is_byte_identical_to_master() {
+        // Parsing trims the padding around a placeholder, but a message with
+        // no loadable references keeps the plain-text formula.
+        let padded = "    [IMAGE:...]    ";
+        let message = ChatMessage::user(padded);
+
+        assert_eq!(
+            estimate_history_tokens(&[message]),
+            padded.len().div_ceil(4) + 4
+        );
+    }
+
+    #[test]
+    fn stale_tool_result_markers_are_not_charged_as_images() {
+        let markers: Vec<String> = (0..30)
+            .map(|index| format!("[IMAGE:/tmp/slide-{index}.png]"))
+            .collect();
+        // Bookend prose keeps the non-marker text identical whether the
+        // marker scanner trims the cleaned string or counts raw segment bytes.
+        let tool_content = format!("a\n{}\nb", markers.join("\n"));
+        let tool_text_bytes = "a\n".len() + "\n".len() * (markers.len() - 1) + "\nb".len();
+        let tool = ChatMessage::tool(&tool_content);
+
+        let prefix = || {
+            vec![
+                ChatMessage::system("s"),
+                ChatMessage::user("u"),
+                ChatMessage::assistant("called tools"),
+            ]
+        };
+
+        // A trailing user turn makes the tool run stale: preparation strips
+        // the markers, so the estimate must price the message as text only.
+        let stale_history = [prefix(), vec![tool.clone(), ChatMessage::user("next")]].concat();
+        let stale_control = [prefix(), vec![ChatMessage::user("next")]].concat();
+        let stale_tool_tokens =
+            estimate_history_tokens(&stale_history) - estimate_history_tokens(&stale_control);
+        assert_eq!(
+            stale_tool_tokens,
+            tool_text_bytes.div_ceil(4) + 4,
+            "stale tool markers must be priced as their remaining text"
+        );
+        assert!(stale_tool_tokens < IMAGE_TOKEN_ESTIMATE);
+
+        // Without the trailing user message the tool run is the latest one
+        // and its images are dispatched: thirty per-image charges appear.
+        let latest_history = [prefix(), vec![tool]].concat();
+        let latest_control = prefix();
+        let latest_tool_tokens =
+            estimate_history_tokens(&latest_history) - estimate_history_tokens(&latest_control);
+        assert_eq!(
+            latest_tool_tokens - stale_tool_tokens,
+            30 * IMAGE_TOKEN_ESTIMATE
+        );
+    }
+
+    #[test]
+    fn estimate_tool_schema_tokens_counts_name_description_and_parameters() {
+        let spec = crate::tools::ToolSpec::new(
+            "search",
+            "search the corpus",
+            serde_json::json!({"type": "object", "properties": {"q": {"type": "string"}}}),
+        );
+        let tokens = estimate_tool_schema_tokens(&[spec]);
+        assert!(tokens > 0, "a tool schema must contribute tokens");
+        assert!(
+            estimate_tool_schema_tokens(&[]) == 0,
+            "no tools means no schema tokens"
+        );
     }
 
     #[test]

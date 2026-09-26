@@ -1,4 +1,4 @@
-tool-backup = Crear, listar, verificar y restaurar copias de seguridad del espacio de trabajo
+tool-backup = Crear, listar, verificar y restaurar copias de seguridad del directorio de datos compartidos
 tool-browser = Automatización web/navegador con backends conectables (agent-browser, rust-native, computer_use). Admite acciones DOM más acciones opcionales a nivel de SO (mouse_move, mouse_click, mouse_drag, key_type, key_press, screen_capture) a través de un sidecar de uso de computadora. Use 'snapshot' para mapear elementos interactivos a refs (@e1, @e2). Aplica browser.allowed_domains para acciones de apertura.
 tool-browser-delegate = Delegar tareas basadas en navegador a una CLI con capacidad de navegador para interactuar con aplicaciones web como Teams, Outlook, Jira, Confluence
 tool-browser-open = Abrir una URL HTTPS aprobada en el navegador del sistema. Restricciones de seguridad: solo dominios de la lista de permitidos, sin hosts locales/privados, sin scraping.
@@ -34,7 +34,7 @@ tool-cron-remove = Eliminar un trabajo cron por id
 tool-cron-run = Forzar la ejecución de un trabajo cron inmediatamente y registrar el historial de ejecuciones
 tool-cron-runs = Listar el historial de ejecuciones recientes de un trabajo cron
 tool-cron-update = Parchear un trabajo cron existente (programación, comando, prompt, habilitado, entrega, modelo, etc.)
-tool-data-management = Retención, purga y estadísticas de almacenamiento de datos del espacio de trabajo
+tool-data-management = Vista previa de retención y estadísticas de almacenamiento del directorio de datos compartidos
 tool-delegate = Delegar una subtarea a un agente especializado. Use cuando: una tarea se beneficia de un modelo diferente (p. ej. resumen rápido, razonamiento profundo, generación de código). El subagente ejecuta un único prompt de forma predeterminada; con agentic=true puede iterar con un bucle de llamadas a herramientas filtrado.
 tool-file-edit = Editar un archivo reemplazando una coincidencia exacta de cadena con nuevo contenido
 tool-file-download = Descarga un archivo desde el endpoint remoto configurado y lo escribe en el espacio de trabajo del agente. Proporciona el identificador del documento que se va a obtener y una ruta de destino relativa al espacio de trabajo; la URL del endpoint está fijada por la configuración del host y nunca es controlada por el modelo. Los bytes se transmiten directamente al disco y no se cargan en el contexto del modelo. Devuelve el estado HTTP, el número de bytes escritos y la ruta de destino.
@@ -62,8 +62,11 @@ tool-file-download-error-move = No se pudo mover el archivo descargado a su luga
 tool-file-download-success = Se descargaron { $written } bytes en { $dest_path } ({ $status })
 tool-file-read = Leer el contenido de un archivo con números de línea. Admite lectura parcial mediante offset y limit. Los archivos binarios e imágenes se rechazan (use la herramienta image_info para imágenes). Establezca encoding="base64" para devolver bytes en bruto codificados en base64 (para archivos binarios como .pdf/.xlsx/.docx); offset/limit se ignoran en ese modo.
 tool-file-write = Escribir contenido en un archivo del espacio de trabajo
-tool-git-operations = Realizar operaciones Git estructuradas (status, diff, log, branch, commit, add, checkout, stash). Proporciona salida JSON analizada e integra con la política de seguridad para controles de autonomía.
+tool-git-operations = Realizar operaciones Git estructuradas (status, diff, log, branch, commit, add, checkout, stash, worktree). Proporciona salida JSON analizada e integra con la política de seguridad para controles de autonomía.
 tool-git-operations-error-not-in-repo = No se encuentra en un repositorio Git en '{ $path }'. Elija una ruta dentro de un árbol de trabajo Git, pase 'path' para un subdirectorio del repositorio, o inicialice un repositorio antes de ejecutar git_operations.
+tool-git-operations-error-repository-outside-authorized-roots = No se puede acceder a ningún repositorio Git dentro de las raíces autorizadas para '{ $path }'. Elija una ruta dentro de un repositorio cubierto por la raíz permitida aplicable, o inicialice un repositorio antes de ejecutar git_operations.
+tool-git-operations-error-repository-not-authorized = Los metadatos del repositorio Git en '{ $path }' no están autorizados para esta operación. Elija un repositorio cubierto por la raíz permitida aplicable.
+tool-git-operations-error-path-not-authorized = La ruta Git '{ $path }' no está autorizada para esta operación. Elija una ruta cubierta por la raíz permitida aplicable.
 tool-git-forge-error-requires-field = { $resource }.{ $action } requiere '{ $field }'.
 tool-git-forge-error-requires-number = { $resource }.{ $action } requiere 'number'.
 tool-git-forge-error-issue-close-reason = issue.close 'reason' debe ser 'completed' o 'not_planned'.
@@ -96,7 +99,7 @@ tool-project-intel = Inteligencia de entrega de proyectos: generar informes de e
 tool-proxy-config = Gestionar la configuración del proxy de ZeroClaw (scope: environment | zeroclaw | services), incluida la aplicación del entorno de tiempo de ejecución y de proceso
 tool-pushover = Enviar una notificación de Pushover a tu dispositivo. Requiere PUSHOVER_TOKEN y PUSHOVER_USER_KEY en el archivo .env.
 tool-schedule = Gestionar tareas programadas solo de shell. Acciones: create/add/once/list/get/cancel/remove/pause/resume. ADVERTENCIA: Esta herramienta crea trabajos de shell cuya salida solo se registra, NO se entrega a ningún canal. Para enviar un mensaje programado a Discord/Telegram/Slack/Matrix, use la herramienta cron_add con job_type='agent' y una configuración de entrega como {"{"}"mode":"announce","channel":"discord","to":"<channel_id>"{"}"}.
-tool-screenshot = Capturar una captura de pantalla de la pantalla actual. Devuelve la ruta del archivo y los datos PNG codificados en base64.
+tool-screenshot = Capturar una captura de pantalla de la pantalla actual. Devuelve la ruta del archivo guardado.
 tool-browser-screenshot-error-path-not-allowed = La ruta de captura de pantalla «{ $path }» no está en la lista de rutas permitidas del espacio de trabajo
 tool-browser-screenshot-error-parent-not-exist = El directorio principal «{ $parent }» de la ruta de captura de pantalla «{ $path }» no existe
 tool-browser-screenshot-error-path-outside-workspace = La ruta de captura de pantalla «{ $path }» se resuelve en «{ $canonical }», que está fuera del espacio de trabajo

@@ -1,3 +1,5 @@
+#[cfg(all(feature = "agent-runtime", feature = "channel-acp-server"))]
+mod acp_cli;
 #[cfg(feature = "channel-acp-server")]
 mod acp_session_cwd_stdio;
 #[cfg(feature = "agent-runtime")]
@@ -30,3 +32,6 @@ mod skills_bundle_cli;
 #[cfg(feature = "agent-runtime")]
 mod verifiable_intent_notice_visibility;
 mod whatsapp_webhook_security;
+
+#[cfg(feature = "plugins-wasm")]
+mod plugin_info_cli;

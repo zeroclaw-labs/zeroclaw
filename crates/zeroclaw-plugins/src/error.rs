@@ -46,6 +46,15 @@ pub enum PluginError {
     #[error("invalid plugin signature: {0}")]
     SignatureInvalid(String),
 
+    #[error("plugin '{0}' must declare signed wasm_sha256 in strict mode")]
+    PayloadDigestRequired(String),
+
+    #[error("invalid WASM payload SHA-256: {0}")]
+    PayloadDigestInvalid(String),
+
+    #[error("WASM payload digest mismatch (expected {expected}, got {actual})")]
+    PayloadDigestMismatch { expected: String, actual: String },
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

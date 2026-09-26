@@ -11,6 +11,10 @@ mod component_config;
 mod component_logging;
 #[cfg(feature = "plugins-wasmtime")]
 mod component_secrets;
+#[cfg(feature = "plugins-wasmtime")]
+mod component_state;
+#[cfg(feature = "plugins-wasmtime")]
+mod component_websocket;
 pub mod config;
 pub mod egress;
 pub mod endpoint;
@@ -24,6 +28,9 @@ pub mod runtime;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod services;
 pub mod signature;
+#[cfg(feature = "plugins-wasmtime")]
+pub(crate) mod sockets;
+pub mod validate;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod wasi_http;
 #[cfg(feature = "plugins-wasmtime")]
@@ -52,6 +59,10 @@ pub struct PluginManifest {
     /// for skill-only plugins, which carry no WASM payload.
     #[serde(default)]
     pub wasm_path: Option<String>,
+    /// Lowercase or uppercase hexadecimal SHA-256 of the exact WASM payload.
+    /// Required for executable plugins when signature policy is strict.
+    #[serde(default)]
+    pub wasm_sha256: Option<String>,
     /// Capabilities this plugin provides
     pub capabilities: Vec<PluginCapability>,
     /// Permissions this plugin requests
@@ -134,6 +145,10 @@ pub enum PluginPermission {
     MemoryRead,
     /// Can write agent memory
     MemoryWrite,
+    /// Can read this exact plugin instance's encrypted durable state
+    StateRead,
+    /// Can write this exact plugin instance's encrypted durable state
+    StateWrite,
 }
 
 /// Information about a loaded plugin.

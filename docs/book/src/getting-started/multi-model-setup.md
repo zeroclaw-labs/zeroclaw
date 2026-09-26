@@ -43,6 +43,89 @@ Do not rely on `reliability.api_keys` for credential failover. On a retryable ra
 
 Use separate provider profiles with their own credentials, or an external routing service, when credential-level failover is required.
 
+## Choose a local model with llmfit
+
+[llmfit](https://github.com/AlexsJones/llmfit) can help shortlist models for
+your CPU, RAM, GPU, and available accelerator memory before you configure
+ZeroClaw. It is optional: if you already know which model to use, go straight
+to [provider configuration](../providers/configuration.md) or
+[Quickstart](./quickstart.md).
+
+### 1. Assess fit on the inference host
+
+Install llmfit using its upstream instructions, then run `llmfit recommend`
+on the machine that will serve the model. Use `llmfit recommend --json` if
+you want to inspect or save the assessment locally. Running it on a different
+client machine does not describe the inference host's capacity.
+
+Compare candidates for your intended workload, quantization, and context
+length. Quantization reduces the precision used to store model weights;
+it changes memory use and can affect output quality. Leave memory headroom
+for context, the inference runtime, ZeroClaw, and other applications.
+Treat missing hardware facts as unknown. Fit scores and speed estimates
+are estimates, not measured performance or proof of reliable tool use in
+ZeroClaw.
+
+Keep the assessment local; this workflow requires no account or upload of
+hardware profiles or user content. Review and explicitly confirm model
+downloads, runtime startup, and configuration changes before performing
+them, including when an assistant helps with setup.
+
+### 2. Map the candidate to a ZeroClaw provider
+
+Check the [provider catalog](../providers/catalog.md) for a supported
+integration. A runtime discovered by llmfit is not automatically a supported
+ZeroClaw provider. Confirm that the selected model and quantization are
+available in that runtime, and use the runtime's exact model identifier;
+a catalog name may differ from an Ollama tag or a server's model ID.
+
+For Ollama, follow the [Ollama configuration example](../providers/configuration.md#ollama).
+The [local-small profile below](#local-small-no-text-fallback-profile) shows
+how `providers.models.ollama.local` connects to `agents.local` through
+`model_provider = "ollama.local"`, together with risk and runtime profiles.
+Replace its example model with your selected, installed Ollama tag. Set
+`num_ctx` on the Ollama provider to the context length you intend to test,
+and review the runtime profile's prompt and history limits alongside it.
+The example model and limits are starting points, not a hardware recommendation
+or a verified recipe for your machine.
+
+For llama.cpp or another supported local endpoint, follow
+[custom provider setup](../providers/custom.md) and use that runtime's
+provider slot and endpoint. Configure the server's model and context capacity
+using its own documentation. ZeroClaw's history budget does not allocate
+the server's context window.
+
+### 3. Verify the selected configuration
+
+After confirming setup, run the configured agent with
+`zeroclaw agent -a local` (replace `local` with your agent alias).
+First check that it can answer a simple prompt. Then ask it to use an
+allowed tool, for example to read a small, non-sensitive file in its
+workspace and summarize the contents. Keep the configured approval and
+workspace restrictions in place.
+
+Inspect the run for an actual tool call, its executed result, and an
+assistant continuation that uses that result. A plausible answer or printed
+tool-call markup alone is not a passing tool test. The local-small profile
+below rejects text-form fallback calls; account for that setting when
+investigating a model that chats successfully but cannot use tools.
+
+Before sharing a tested recipe, record:
+
+- Test date, ZeroClaw version or commit and build features, OS, and hardware.
+- Runtime version, exact model identifier and quantization, and artifact
+  digest when available. Mark unavailable details as unknown.
+- Server context settings and the relevant ZeroClaw provider, risk, and
+  runtime profile settings, with secrets removed.
+- The prompt, actual tool call, tool result, and assistant continuation,
+  using non-sensitive test data; include failures and known limitations.
+- Any measured latency or memory use separately from llmfit estimates.
+
+This workflow does not establish a ZeroClaw-verified model list. Evidence
+for one build, model, quantization, and context setting does not verify
+other combinations. If it exposes a reproducible integration gap, report
+that specific gap with the sanitized recipe and observed failure.
+
 ## Local development with hosted alternative
 
 Run a local-Ollama agent and a hosted-provider agent side by side; route each channel to whichever you want it to use.
@@ -95,7 +178,7 @@ This profile composes existing primitives:
 - `compact_context` keeps startup context small.
 - `prompt_injection_mode = "compact"` keeps skill metadata inline and loads full instructions on demand when `read_skill` is available; providers without that loader retain the existing full-injection fallback.
 - `strict_tool_parsing` treats XML/JSON-looking fallback text as assistant text unless the provider returns native tool calls.
-- `max_tool_iterations`, `max_context_tokens`, `max_system_prompt_chars`, and `max_tool_result_chars` bound runaway loops and oversized prompt/tool context.
+- `max_tool_iterations`, `max_system_prompt_chars`, and `max_tool_result_chars` bound runaway loops and oversized prompt/tool context. `max_context_tokens` remains the absolute proactive-trim budget; set `context_compact_ratio` explicitly to opt into a model-relative threshold. Every positive effective threshold is capped by the selected model's configured context capacity; `max_context_tokens = 0` remains the proactive-trimming disable sentinel.
 - `max_actions_per_hour`, `max_cost_per_day_cents`, and the timeout/delegation fields keep local runs on the same budget shape as the built-in preset.
 - `parallel_tools = false` and `keep_tool_context_turns = 1` keep local runs sequential and limit retained tool context.
 

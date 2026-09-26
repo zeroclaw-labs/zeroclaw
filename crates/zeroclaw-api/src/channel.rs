@@ -57,6 +57,38 @@ impl ChannelSopTopic {
     }
 }
 
+// ── Channel-supplied room context ───────────────────────────────
+
+/// Context a chat channel supplies about one specific room.
+///
+/// Rooms in the same channel can serve different purposes — one for package
+/// maintenance, another for incident response — and the operator already
+/// describes that in the chat product's own metadata (Mattermost's channel
+/// purpose, Slack's topic, Matrix's room topic). This carries that description
+/// to prompt assembly so a room can specialise the agent without a separate
+/// config entry per room.
+///
+/// **Channel-supplied, not operator-supplied.** The text originates from
+/// whoever can edit the room's metadata, which on default permission schemes is
+/// usually every member — a wider set than whoever controls the agent's config.
+/// It is therefore rendered as context about the room, explicitly labelled as
+/// such, and never as operating rules. Adapters must return `None` unless the
+/// operator opted the alias in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChannelRoomContext {
+    /// Free-text description of what this room is for.
+    pub purpose: Option<String>,
+}
+
+impl ChannelRoomContext {
+    /// True when there is nothing to inject, so callers can skip the section
+    /// rather than render an empty one.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.purpose.as_ref().is_none_or(|p| p.trim().is_empty())
+    }
+}
+
 // ── Channel approval types ──────────────────────────────────────
 
 /// Where a tool call sits in the batch the model issued for one turn.
@@ -363,6 +395,10 @@ pub enum ChannelConversationScope {
 pub struct ChannelMessage {
     pub id: String,
     pub sender: String,
+    /// Immutable sender identifier assigned by the channel platform, when
+    /// available. Display names and usernames remain in `sender` so existing
+    /// session semantics are unchanged.
+    pub platform_sender_id: Option<String>,
     pub reply_target: String,
     pub content: String,
     pub channel: String,
@@ -404,6 +440,13 @@ pub struct ChannelMessage {
     /// Inbound email References chain (parent thread); used to build the
     /// reply's References header. Empty for non-email channels.
     pub references: Vec<String>,
+    /// Set by the receiving channel when the platform marked the inbound event
+    /// itself as a voice message (Matrix: an `m.audio` event carrying
+    /// `org.matrix.msc3245.voice`). This field creates that fact for the
+    /// runtime — nothing else on the inbound side records it. Never derived
+    /// from message text, a reply parent, or room state. `false` means text
+    /// or unknown.
+    pub voice_origin: bool,
 }
 
 /// Message to send through a channel
@@ -431,6 +474,44 @@ pub struct SendMessage {
     /// a voice note even if the peer's default modality is text.
     /// Ignored when `suppress_voice` is also `true`.
     pub force_voice: bool,
+}
+
+/// A native poll to post in a chat.
+///
+/// Channels that cannot post one report [`Channel::supports_native_polls`] as
+/// `false`, and callers fall back to whatever they did before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PollRequest {
+    /// Chat or peer to post the poll in, in the channel's own addressing.
+    pub recipient: String,
+    pub question: String,
+    /// Answer options, in the order they should be shown.
+    pub options: Vec<String>,
+    /// How many options one voter may pick. `1` is a single-choice poll.
+    pub selectable_count: u32,
+}
+
+impl PollRequest {
+    /// Single-choice poll. Use [`PollRequest::with_selectable_count`] for a
+    /// poll that accepts more than one answer per voter.
+    pub fn new(
+        recipient: impl Into<String>,
+        question: impl Into<String>,
+        options: Vec<String>,
+    ) -> Self {
+        Self {
+            recipient: recipient.into(),
+            question: question.into(),
+            options,
+            selectable_count: 1,
+        }
+    }
+
+    #[must_use]
+    pub fn with_selectable_count(mut self, selectable_count: u32) -> Self {
+        self.selectable_count = selectable_count;
+        self
+    }
 }
 
 /// Cross-channel room visibility used by room-management APIs.
@@ -682,6 +763,63 @@ pub struct ForgeApiResponse {
     pub body: serde_json::Value,
 }
 
+/// Runtime-owned state needed by a channel to present its native model picker.
+///
+/// The picker is presentation only: a selected option must re-enter the
+/// channel runtime through the existing `/model <ref>` command path so model
+/// resolution and session scoping keep a single owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelModelPickerRequest {
+    /// Human-readable display name of the user who sent `/model`, for
+    /// rendering only. Never use this for authorization; that is
+    /// `requesting_user_id`'s role.
+    pub requesting_user: String,
+    /// Immutable platform identity of the requesting user, used to authorize
+    /// picker interactions (only this user may drive the picker) and to bind
+    /// the selection back to the sender. Channels may decline to present a
+    /// picker (return `Ok(false)`) when this is empty.
+    pub requesting_user_id: String,
+    /// Reply scope inherited from the triggering message. The picker must be
+    /// delivered to this target so it lands in the same chat the command was
+    /// issued in.
+    pub reply_target: String,
+    /// Thread/topic scope inherited from the triggering message. When `Some`,
+    /// the picker and any follow-up selection must stay in the same thread or
+    /// topic; when `None`, the channel's default scope applies.
+    pub thread_ts: Option<String>,
+    /// Alias of the channel instance that received the command. A channel
+    /// must decline requests whose alias is not its own (return `Ok(false)`).
+    pub channel_alias: String,
+    /// Alias of the agent that owns this runtime. Implementations that render
+    /// agent-owned picker state must decline (return `Ok(false)`) on mismatch.
+    pub owner_agent_alias: String,
+    /// Provider ref of the currently selected route, shown as the picker's
+    /// starting state.
+    pub current_model_provider: String,
+    /// Model of the currently selected route, shown as the picker's starting
+    /// state.
+    pub current_model: String,
+    /// Restart-scoped route snapshot used by the channel runtime to resolve
+    /// `/model <ref>`. This is an in-memory view of the routes loaded at
+    /// startup, not durable configuration; native pickers must not offer
+    /// routes outside this set.
+    pub model_routes: Vec<ChannelModelPickerRoute>,
+}
+
+/// Provider/model route identity exposed to a channel-native model picker.
+///
+/// API keys stay runtime-owned and are deliberately excluded; route entries
+/// carry only display and resolution identity, never credentials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelModelPickerRoute {
+    /// Short, user-facing alias accepted by `/model <ref>` (e.g. `fast`).
+    pub hint: String,
+    /// Provider ref this route resolves to.
+    pub model_provider: String,
+    /// Model identifier this route resolves to.
+    pub model: String,
+}
+
 /// What a channel can say about its own listener without performing any I/O.
 ///
 /// See [`Channel::listener_health`]. The three states exist because a listener
@@ -702,6 +840,31 @@ pub enum ListenerHealth {
     /// `listen()` is not proof the channel is working.
     Unhealthy,
 }
+
+/// Error a [`Channel::finalize_draft`] implementation returns when it posted
+/// part of a chunked final answer and could not deliver the remainder. The
+/// accepted prefix is already on the wire, so a caller that falls back to
+/// resending the whole answer would duplicate the delivered chunks. Callers must
+/// treat this as degraded-but-committed delivery: do NOT resend the full answer;
+/// the undelivered suffix is lost. `delivered` is the number of physical chunks
+/// accepted before the failure, for logging only.
+#[derive(Debug)]
+pub struct FinalizePartialDelivery {
+    pub delivered: usize,
+}
+
+impl fmt::Display for FinalizePartialDelivery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "final answer partially delivered ({} chunk(s) accepted); \
+             remainder undelivered and must not be resent",
+            self.delivered
+        )
+    }
+}
+
+impl std::error::Error for FinalizePartialDelivery {}
 
 /// Core channel trait — implement for any messaging platform.
 ///
@@ -732,6 +895,30 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Check if channel is healthy
     async fn health_check(&self) -> bool {
         true
+    }
+
+    /// Present a channel-native model picker for a bare `/model` command.
+    ///
+    /// The picker is presentation only: a confirmed selection must re-enter
+    /// the runtime through the existing `/model <ref>` command path so model
+    /// resolution and session scoping keep a single owner. `request` carries
+    /// the reply scope (`reply_target`/`thread_ts`) the picker must preserve
+    /// and a restart-scoped route snapshot it must not exceed; see
+    /// [`ChannelModelPickerRequest`] for the per-field contract.
+    ///
+    /// Returns `Ok(true)` when the channel presented a picker and took over
+    /// the interaction, `Ok(false)` when it did not (e.g. a channel without a
+    /// native picker, an alias or owner mismatch, or an empty
+    /// `requesting_user_id`) — the caller then falls back to the ordinary
+    /// text response. Returning `Err` reports a presentation failure; the
+    /// caller logs it and falls back to the text response as well. The
+    /// default implementation returns `Ok(false)` for every channel, keeping
+    /// the existing text behavior.
+    async fn present_model_picker(
+        &self,
+        _request: &ChannelModelPickerRequest,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
     }
 
     /// Listener health as the channel itself last observed it.
@@ -835,6 +1022,13 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         false
     }
 
+    /// Whether this channel can post a native poll through [`Channel::send_poll`].
+    /// Callers check this before offering one, so a channel without native
+    /// polls keeps whatever fallback the caller already had.
+    fn supports_native_polls(&self) -> bool {
+        false
+    }
+
     /// Whether `send` actually delivers a message OUTBOUND on this channel. Default
     /// `true`. An INBOUND-ONLY transport (e.g. an AMQP trigger source whose `send` is a
     /// deliberate no-op that returns `Ok`) overrides this to `false`, so a surface that
@@ -904,9 +1098,40 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         false
     }
 
-    /// Minimum delay (ms) between sending each paragraph in multi-message mode.
+    /// Whether this channel implements the turn-flush narration contract:
+    /// `flush_draft_turn` delivers each completed agent text turn as a permanent
+    /// outbound message, and the orchestrator therefore routes that narration
+    /// through the outbound hook + leak-detection boundary and orders it ahead of
+    /// the approval prompt via a flush barrier.
+    ///
+    /// Distinct from [`Self::supports_multi_message_streaming`]: a channel can stream
+    /// multiple messages another way (e.g. paragraph edits via `update_draft`)
+    /// without implementing `flush_draft_turn`. Only channels that override
+    /// `flush_draft_turn` may return `true` here, otherwise the orchestrator runs
+    /// outbound policy on phantom flushes that deliver nothing. Default `false`.
+    fn supports_turn_flush_narration(&self) -> bool {
+        false
+    }
+
+    /// Minimum delay (ms) between successive messages in multi-message mode.
+    /// The message boundary is channel-specific (for example, Telegram uses
+    /// completed agent turns).
     fn multi_message_delay_ms(&self) -> u64 {
         800
+    }
+
+    /// Confirmed-delivery byte offset for a MultiMessage draft: how many bytes
+    /// of the cumulative visible text previously handed to `update_draft` have
+    /// already been emitted on the transport as paragraph messages (including
+    /// their trailing `\n\n` delimiters).
+    ///
+    /// The orchestrator reads this before `finalize_draft` so it can reconcile
+    /// a sanitized final response against the paragraphs that are already on
+    /// the wire without stranding or replaying content. Channels that do not
+    /// support multi-message streaming keep the default of `0` (nothing
+    /// confirmed).
+    async fn multi_message_confirmed_offset(&self, _recipient: &str, _message_id: &str) -> usize {
+        0
     }
 
     /// Send an initial draft message. Returns a platform-specific message ID for later edits.
@@ -981,8 +1206,42 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(())
     }
 
+    /// Flush the current agent text turn as an outbound message in multi-message
+    /// streaming mode. Called when an LLM turn completes (e.g. before tool
+    /// execution). Default: no-op.
+    async fn flush_draft_turn(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _text: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Discard a completed agent text turn WITHOUT sending it, marking that
+    /// narration consumed for this draft. Called when the outbound hook cancels a
+    /// narration flush: the cancelled turn must never be re-offered (no
+    /// resurrection), but narration produced by a *later* turn must still be
+    /// deliverable. Advancing the channel's delivered-prefix bookkeeping over the
+    /// cancelled text achieves both. Default: no-op.
+    async fn discard_draft_turn(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _text: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Finalize a draft with the complete response (e.g. apply Markdown formatting).
     /// `suppress_voice` forces text delivery even on voice-only peers.
+    ///
+    /// If finalization must chunk a long answer and a later chunk fails after an
+    /// earlier one was accepted, return [`FinalizePartialDelivery`] rather than a
+    /// generic error: it tells the caller the accepted prefix is already posted
+    /// so it must not resend the whole answer (which would duplicate the
+    /// delivered chunks). A generic `Err` still means nothing was committed and a
+    /// full-message fallback is safe.
     async fn finalize_draft(
         &self,
         _recipient: &str,
@@ -1076,9 +1335,24 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         anyhow::bail!("channel does not support room creation")
     }
 
+    /// Post a native poll when the channel supports it.
+    async fn send_poll(&self, _poll: &PollRequest) -> anyhow::Result<()> {
+        anyhow::bail!("channel does not support native polls")
+    }
+
     /// Invite a user to an existing platform room/conversation.
     async fn invite_user(&self, _room_id: &str, _user_id: &str) -> anyhow::Result<()> {
         anyhow::bail!("channel does not support room invites")
+    }
+
+    /// Context this channel supplies about `room_id`, when the adapter can
+    /// provide it and the operator has opted the alias in.
+    ///
+    /// Returns `None` by default: a channel that does not implement this, or a
+    /// room the operator has not opted in, contributes nothing to the prompt.
+    /// Absence is the safe state, so the default is the safe one.
+    fn room_context(&self, _room_id: &str) -> Option<ChannelRoomContext> {
+        None
     }
 
     /// Request interactive tool-call approval from the channel operator.

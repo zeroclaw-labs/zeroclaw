@@ -62,6 +62,36 @@ impl ProviderEndpoint {
 pub(crate) trait FamilyProviderFactory {
     const ENDPOINT: ProviderEndpoint;
 
+    /// How a context-window discovery probe must authenticate to this
+    /// family's model catalog, or `None` when the family is not eligible for
+    /// generic catalog discovery at all.
+    ///
+    /// Eligibility and authentication are deliberately *one* fact rather than
+    /// two. A family cannot be declared probeable without also declaring how
+    /// its stored credential becomes an outbound header, so the generic
+    /// reader can never be handed a raw credential it does not know how to
+    /// transform. [`crate::fetch_context_window`] resolves this and applies it
+    /// through the compatible module's `apply_auth_to_request` — the same
+    /// function the family's chat requests use. (Plain text rather than an
+    /// intra-doc link: that helper is crate-private, and a public item may not
+    /// link to it.)
+    ///
+    /// The default is `None`: a family is probed only when it has been
+    /// verified to serve `GET {base}/models` returning `data[].id` with a
+    /// per-model `context_length` (or the sibling `context_window` spelling).
+    /// Speaking the OpenAI-compatible *chat* wire is not that proof — a family
+    /// can be chat-compatible and publish its catalog at another path, in
+    /// another shape, or not at all. Opting in without that evidence buys a
+    /// doomed request per alias on every `doctor` run and an implied catalog
+    /// that does not exist.
+    ///
+    /// Declared per family rather than in a hand-maintained list elsewhere,
+    /// because the list was the original bug: a provider added without also
+    /// being written into it silently kept the unconfigured 32,000-token
+    /// fallback ([`zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK`]),
+    /// and nothing failed to compile to say so.
+    const MODEL_CONTEXT_CATALOG_AUTH: Option<AuthStyle> = None;
+
     fn create_provider(
         &self,
         alias: &str,
@@ -98,6 +128,26 @@ pub(crate) trait CompatFamilySpec {
     const FALLBACK_ALLOWS_MISSING_API_KEY: bool = false;
 
     const MODELS_DEV_KEY: Option<&'static str> = None;
+
+    /// Whether this family is verified to serve `GET {DEFAULT_URL}/models`
+    /// returning `data[].id` with a per-model `context_length` (or the
+    /// sibling `context_window` spelling), so context-window discovery can
+    /// read it.
+    ///
+    /// Default `false`. Being an OpenAI-compatible *chat* family is not
+    /// evidence for this: `CompatFamilySpec` proves the chat wire, not the
+    /// catalog endpoint or its shape. NEAR AI is the standing counter-example
+    /// — it is a compat chat family whose catalog lives at `/v1/model/list`
+    /// in a `models[].modelId` shape with no context field at all (see
+    /// [`crate::catalog`]).
+    ///
+    /// Opt in only with evidence, and only for a family whose
+    /// [`FamilyProviderFactory::ENDPOINT`] is [`ProviderEndpoint::Fixed`] — a
+    /// probeable family with no resolvable default endpoint would silently
+    /// answer `None` for every operator who did not set `uri` by hand.
+    /// `every_probeable_family_resolves_a_default_catalog_url` holds that pair
+    /// together.
+    const SERVES_MODEL_CONTEXT_CATALOG: bool = false;
 
     /// OpenRouter vendor prefix used by `list_models` as a last-resort
     /// fallback when this family has no `models.dev` entry and no live
@@ -158,6 +208,18 @@ impl<T: CompatFamilySpec> FamilyProviderFactory for T {
         ProviderEndpoint::Dynamic
     } else {
         ProviderEndpoint::Fixed(T::DEFAULT_URL)
+    };
+
+    /// Derived, never restated: a family that opted into catalog discovery
+    /// probes it with exactly the [`CompatFamilySpec::AUTH`] its own chat
+    /// requests use. There is no second place to declare the auth style, so
+    /// discovery cannot drift away from the request path — which is what
+    /// would put a `ZhipuJwt` family's long-lived `id.secret` on the wire
+    /// behind a plain `Bearer`.
+    const MODEL_CONTEXT_CATALOG_AUTH: Option<AuthStyle> = if T::SERVES_MODEL_CONTEXT_CATALOG {
+        Some(T::AUTH)
+    } else {
+        None
     };
 
     fn create_provider(
@@ -238,6 +300,9 @@ pub fn apply_compat_options(
     if let Some(ref effort) = opts.reasoning_effort {
         b = b.reasoning_effort(Some(effort.clone()));
     }
+    if opts.reasoning_effort_passthrough {
+        b = b.with_reasoning_effort_passthrough();
+    }
     if !opts.extra_headers.is_empty() {
         b = b.extra_headers(opts.extra_headers.clone());
     }
@@ -254,6 +319,12 @@ pub fn apply_compat_options(
     b = b.multimodal(opts.multimodal.clone());
     if opts.replay_assistant_reasoning == Some(false) {
         b = b.without_assistant_reasoning_replay();
+    }
+    if opts.cache_passthrough {
+        b = b.with_cache_passthrough();
+    }
+    if let Some(cache_ttl) = opts.cache_ttl {
+        b = b.with_cache_ttl(cache_ttl);
     }
     // `provider_extra` alias is captured before `build()` because the WARN
     // path below reads it for logging. Only object-shaped JSON is threaded
@@ -481,26 +552,27 @@ use zeroclaw_config::schema::{
     AvianModelProviderConfig, AzureModelProviderConfig, BaichuanModelProviderConfig,
     BasetenModelProviderConfig, BedrockModelProviderConfig, CerebrasModelProviderConfig,
     CloudflareModelProviderConfig, CohereModelProviderConfig, CopilotModelProviderConfig,
-    CustomModelProviderConfig, DeepinfraModelProviderConfig, DeepmystModelProviderConfig,
-    DeepseekModelProviderConfig, DoubaoModelProviderConfig, FeatherlessModelProviderConfig,
-    FireworksModelProviderConfig, FriendliModelProviderConfig, GeminiCliModelProviderConfig,
-    GeminiModelProviderConfig, GithubModelsModelProviderConfig, GlmModelProviderConfig,
-    GrokCliModelProviderConfig, GroqModelProviderConfig, HuggingfaceModelProviderConfig,
-    HunyuanModelProviderConfig, HyperbolicModelProviderConfig, InceptionModelProviderConfig,
-    KiloCliModelProviderConfig, KiloModelProviderConfig, LambdaAiModelProviderConfig,
-    LeptonModelProviderConfig, LitellmModelProviderConfig, LlamacppModelProviderConfig,
-    LmstudioModelProviderConfig, ManifestModelProviderConfig, MinimaxModelProviderConfig,
-    MistralModelProviderConfig, MoonshotEndpoint, MoonshotModelProviderConfig,
-    MorphModelProviderConfig, NearaiModelProviderConfig, NebiusModelProviderConfig,
-    NovitaModelProviderConfig, NscaleModelProviderConfig, NvidiaModelProviderConfig,
-    OllamaModelProviderConfig, OpenAIModelProviderConfig, OpenRouterModelProviderConfig,
-    OpencodeModelProviderConfig, OsaurusModelProviderConfig, OvhModelProviderConfig,
-    PerplexityModelProviderConfig, QianfanModelProviderConfig, QwenModelProviderConfig,
-    RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
-    SiliconflowModelProviderConfig, StepfunModelProviderConfig, SyntheticModelProviderConfig,
-    TelnyxModelProviderConfig, TogetherModelProviderConfig, UpstageModelProviderConfig,
-    VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
-    XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    CrusoeModelProviderConfig, CustomModelProviderConfig, DeepinfraModelProviderConfig,
+    DeepmystModelProviderConfig, DeepseekModelProviderConfig, DoubaoModelProviderConfig,
+    FeatherlessModelProviderConfig, FireworksModelProviderConfig, FriendliModelProviderConfig,
+    GeminiCliModelProviderConfig, GeminiModelProviderConfig, GithubModelsModelProviderConfig,
+    GlmModelProviderConfig, GrokCliModelProviderConfig, GroqModelProviderConfig,
+    HAILO_OLLAMA_DEFAULT_URI, HailoOllamaEndpoint, HailoOllamaModelProviderConfig,
+    HuggingfaceModelProviderConfig, HunyuanModelProviderConfig, HyperbolicModelProviderConfig,
+    InceptionModelProviderConfig, KiloCliModelProviderConfig, KiloModelProviderConfig,
+    LambdaAiModelProviderConfig, LeptonModelProviderConfig, LitellmModelProviderConfig,
+    LlamacppModelProviderConfig, LmstudioModelProviderConfig, ManifestModelProviderConfig,
+    MinimaxModelProviderConfig, MistralModelProviderConfig, MoonshotEndpoint,
+    MoonshotModelProviderConfig, MorphModelProviderConfig, NearaiModelProviderConfig,
+    NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
+    NvidiaModelProviderConfig, OllamaModelProviderConfig, OpenAIModelProviderConfig,
+    OpenRouterModelProviderConfig, OpencodeModelProviderConfig, OsaurusModelProviderConfig,
+    OvhModelProviderConfig, PerplexityModelProviderConfig, QianfanModelProviderConfig,
+    QwenModelProviderConfig, RekaModelProviderConfig, SambanovaModelProviderConfig,
+    SglangModelProviderConfig, SiliconflowModelProviderConfig, StepfunModelProviderConfig,
+    SyntheticModelProviderConfig, TelnyxModelProviderConfig, TogetherModelProviderConfig,
+    UpstageModelProviderConfig, VeniceModelProviderConfig, VercelModelProviderConfig,
+    VllmModelProviderConfig, XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
     ZerorouterModelProviderConfig,
 };
 
@@ -522,6 +594,36 @@ pub fn endpoint_for_family(provider_type: &str) -> Option<ProviderEndpoint> {
 #[deprecated(note = "use endpoint_for_family or default_model_provider_url")]
 pub fn get_default_url(provider_type: &str) -> Option<&'static str> {
     endpoint_for_family(provider_type).and_then(ProviderEndpoint::fixed_url)
+}
+
+/// How a context-window discovery probe authenticates to `provider_type`'s
+/// model catalog, or `None` when that family is not probeable — per the
+/// family's `FamilyProviderFactory::MODEL_CONTEXT_CATALOG_AUTH` declaration.
+/// (Plain text rather than an intra-doc link: the trait is crate-private, and
+/// a public item may not link to it.)
+///
+/// Generated by [`for_each_model_provider_slot!`] — the same macro that
+/// defines the typed slots — so the answer is derived from the family list
+/// instead of tracking it by hand. A family declares this beside its own spec
+/// and is classified the moment its slot exists, which is the property the
+/// previous hand-written list in [`crate::fetch_context_window`] did not have.
+///
+/// [`for_each_model_provider_slot!`]: zeroclaw_config::for_each_model_provider_slot
+#[must_use]
+pub fn family_model_context_catalog_auth(provider_type: &str) -> Option<AuthStyle> {
+    macro_rules! emit_context_catalog_auth {
+        ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
+            match provider_type {
+                $(
+                    $type_str => {
+                        <$cfg_ty as FamilyProviderFactory>::MODEL_CONTEXT_CATALOG_AUTH
+                    }
+                )+
+                _ => None,
+            }
+        };
+    }
+    zeroclaw_config::for_each_model_provider_slot!(emit_context_catalog_auth)
 }
 
 // ── Pure-compat families ───────────────────────────────────────────────
@@ -592,18 +694,28 @@ impl CompatFamilySpec for TogetherModelProviderConfig {
     const DEFAULT_URL: &'static str = "https://api.together.xyz";
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const MODELS_DEV_KEY: Option<&'static str> = Some("togetherai");
+    const SERVES_MODEL_CONTEXT_CATALOG: bool = true;
+}
+impl CompatFamilySpec for CrusoeModelProviderConfig {
+    const DISPLAY: &'static str = "Crusoe Managed Inference";
+    const DEFAULT_URL: &'static str = zeroclaw_config::schema::CrusoeEndpoint::DEFAULT_URI;
+    const AUTH: AuthStyle = AuthStyle::Bearer;
+    const MODELS_DEV_KEY: Option<&'static str> = None;
+    const SERVES_MODEL_CONTEXT_CATALOG: bool = true;
 }
 impl CompatFamilySpec for FireworksModelProviderConfig {
     const DISPLAY: &'static str = "Fireworks AI";
     const DEFAULT_URL: &'static str = "https://api.fireworks.ai/inference/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const MODELS_DEV_KEY: Option<&'static str> = Some("fireworks-ai");
+    const SERVES_MODEL_CONTEXT_CATALOG: bool = true;
 }
 impl CompatFamilySpec for NovitaModelProviderConfig {
     const DISPLAY: &'static str = "Novita AI";
     const DEFAULT_URL: &'static str = "https://api.novita.ai/openai";
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const MODELS_DEV_KEY: Option<&'static str> = Some("novita-ai");
+    const SERVES_MODEL_CONTEXT_CATALOG: bool = true;
 }
 impl CompatFamilySpec for PerplexityModelProviderConfig {
     const DISPLAY: &'static str = "Perplexity";
@@ -669,6 +781,7 @@ impl CompatFamilySpec for HyperbolicModelProviderConfig {
     const DISPLAY: &'static str = "Hyperbolic";
     const DEFAULT_URL: &'static str = "https://api.hyperbolic.xyz/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
+    const SERVES_MODEL_CONTEXT_CATALOG: bool = true;
     // No models.dev entry and no OpenRouter prefix — operator must paste a
     // credential before `list_models` returns anything.
 }
@@ -677,6 +790,7 @@ impl CompatFamilySpec for DeepinfraModelProviderConfig {
     const DEFAULT_URL: &'static str = "https://api.deepinfra.com/v1/openai";
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const MODELS_DEV_KEY: Option<&'static str> = Some("deepinfra");
+    const SERVES_MODEL_CONTEXT_CATALOG: bool = true;
 }
 impl CompatFamilySpec for HuggingfaceModelProviderConfig {
     const DISPLAY: &'static str = "Hugging Face";
@@ -711,12 +825,14 @@ impl CompatFamilySpec for AnyscaleModelProviderConfig {
     const DISPLAY: &'static str = "Anyscale";
     const DEFAULT_URL: &'static str = "https://api.endpoints.anyscale.com/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
+    const SERVES_MODEL_CONTEXT_CATALOG: bool = true;
 }
 impl CompatFamilySpec for NebiusModelProviderConfig {
     const DISPLAY: &'static str = "Nebius Token Factory";
     const DEFAULT_URL: &'static str = "https://api.tokenfactory.nebius.com/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const MODELS_DEV_KEY: Option<&'static str> = Some("nebius");
+    const SERVES_MODEL_CONTEXT_CATALOG: bool = true;
 }
 impl CompatFamilySpec for FriendliModelProviderConfig {
     const DISPLAY: &'static str = "Friendli AI";
@@ -1092,12 +1208,16 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
     ) -> Result<Box<dyn ModelProvider>> {
         let mut b = crate::anthropic::AnthropicModelProvider::builder(alias)
             .credential(key)
+            .server_fallback_models(self.server_fallback_models.clone())
             .base_url(api_url.unwrap_or(fixed_family_endpoint::<Self>()));
         if let Some(mt) = opts.provider_max_tokens {
             b = b.max_tokens(mt);
         }
         if let Some(ts) = opts.provider_timeout_secs {
             b = b.timeout_secs(ts);
+        }
+        if let Some(cache_ttl) = opts.cache_ttl {
+            b = b.cache_ttl(cache_ttl);
         }
         Ok(Box::new(b.build()))
     }
@@ -1224,6 +1344,90 @@ impl FamilyProviderFactory for OllamaModelProviderConfig {
         Ok(apply_compat_options(
             build_ollama_compat_provider(alias, key, api_url, opts),
             opts,
+        ))
+    }
+
+    fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        true
+    }
+}
+
+impl FamilyProviderFactory for HailoOllamaModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(HAILO_OLLAMA_DEFAULT_URI);
+
+    fn create_provider(
+        &self,
+        alias: &str,
+        key: Option<&str>,
+        api_url: Option<&str>,
+        opts: &ModelProviderRuntimeOptions,
+    ) -> Result<Box<dyn ModelProvider>> {
+        use zeroclaw_config::schema::ModelEndpoint;
+
+        if opts.tls_ca_cert_path.is_some() {
+            anyhow::bail!("Hailo-Ollama does not support tls_ca_cert_path");
+        }
+        if opts.think == Some(true) {
+            return Err(anyhow::Error::new(crate::ProviderCapabilityError {
+                model_provider: alias.to_string(),
+                capability: "thinking".to_string(),
+                message: "Hailo-Ollama does not support think=true".to_string(),
+            }));
+        }
+        if opts.vision == Some(true) {
+            return Err(anyhow::Error::new(crate::ProviderCapabilityError {
+                model_provider: alias.to_string(),
+                capability: "vision".to_string(),
+                message: "Hailo-Ollama does not support vision=true".to_string(),
+            }));
+        }
+        if opts.provider_extra.is_some() {
+            anyhow::bail!("Hailo-Ollama does not support provider_extra");
+        }
+        if opts.api_path.is_some() {
+            anyhow::bail!("Hailo-Ollama does not support api_path");
+        }
+        if opts.wire_api.is_some() {
+            anyhow::bail!("Hailo-Ollama does not support wire_api overrides");
+        }
+        if opts.chat_template_kwargs.is_some() {
+            anyhow::bail!("Hailo-Ollama does not support chat_template_kwargs");
+        }
+        if opts.native_tools == Some(true) {
+            return Err(anyhow::Error::new(crate::ProviderCapabilityError {
+                model_provider: alias.to_string(),
+                capability: "native_tools".to_string(),
+                message: "Hailo-Ollama does not support native tool calling".to_string(),
+            }));
+        }
+
+        let max_tokens = opts
+            .provider_max_tokens
+            .map_or(crate::hailo_ollama::HAILO_DEFAULT_NUM_PREDICT, |value| {
+                i32::try_from(value).unwrap_or(i32::MAX)
+            });
+        let tuning = crate::ollama::OllamaTuning {
+            num_ctx: self
+                .base
+                .context_window
+                .map(|value| u32::try_from(value).unwrap_or(u32::MAX))
+                .unwrap_or(crate::hailo_ollama::HAILO_DEFAULT_NUM_CTX),
+            num_predict: max_tokens,
+            temperature_override: None,
+        };
+        let endpoint = HailoOllamaEndpoint::default();
+        let base_url = api_url.unwrap_or_else(|| endpoint.uri());
+        Ok(Box::new(
+            crate::hailo_ollama::HailoOllamaModelProvider::new(
+                alias,
+                Some(base_url),
+                opts.provider_timeout_secs
+                    .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
+                self.queue_timeout_secs
+                    .unwrap_or(crate::hailo_ollama::HAILO_DEFAULT_QUEUE_TIMEOUT_SECS),
+                tuning,
+            )?
+            .with_auth_headers(key, &opts.extra_headers)?,
         ))
     }
 
@@ -1457,6 +1661,15 @@ impl FamilyProviderFactory for QwenModelProviderConfig {
 
 impl FamilyProviderFactory for GroqModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(GROQ_DEFAULT_URL);
+
+    /// Groq builds its compat provider by hand rather than through
+    /// [`CompatFamilySpec`], so it declares the catalog policy directly. It
+    /// was in the hand-written probe list this const replaces, and
+    /// `create_provider` below authenticates with [`AuthStyle::Bearer`] —
+    /// discovery states the same thing, and
+    /// `groq_probes_with_the_same_auth_its_request_path_uses` fails if the two
+    /// ever diverge.
+    const MODEL_CONTEXT_CATALOG_AUTH: Option<AuthStyle> = Some(AuthStyle::Bearer);
 
     fn create_provider(
         &self,
@@ -1814,6 +2027,248 @@ mod tests {
     use zeroclaw_config::schema::{ModelProviderConfig, WireApi};
 
     #[test]
+    fn cache_passthrough_runtime_option_reaches_provider_capability() {
+        let provider = apply_compat_options(
+            OpenAiCompatibleModelProvider::builder("test")
+                .display_name("custom")
+                .base_url("http://127.0.0.1:1")
+                .auth_style(AuthStyle::Bearer),
+            &ModelProviderRuntimeOptions {
+                cache_passthrough: true,
+                ..ModelProviderRuntimeOptions::default()
+            },
+        );
+        assert!(
+            provider.capabilities().prompt_caching,
+            "factory must thread cache_passthrough into the provider capability"
+        );
+
+        let default_provider = apply_compat_options(
+            OpenAiCompatibleModelProvider::builder("test")
+                .display_name("custom")
+                .base_url("http://127.0.0.1:1")
+                .auth_style(AuthStyle::Bearer),
+            &ModelProviderRuntimeOptions::default(),
+        );
+        assert!(!default_provider.capabilities().prompt_caching);
+    }
+
+    /// D2a: `cache_ttl` must survive the factory boundary on both builders.
+    /// The compatible half goes through `apply_compat_options` and the native
+    /// half through `AnthropicModelProviderConfig::create_provider`; each
+    /// drives a structured chat against a capture mock, so deleting the
+    /// `with_cache_ttl` forwarding in `apply_compat_options` or the
+    /// `cache_ttl` forwarding in `create_provider` fails this test (the
+    /// markers lose their `ttl` field). The wire is the observation point
+    /// because both factory functions return `Box<dyn ModelProvider>` and
+    /// the configured lifetime has no trait-object readback.
+    #[tokio::test]
+    async fn cache_ttl_runtime_option_reaches_both_builders() {
+        use crate::traits::{ChatMessage, ChatRequest};
+        use zeroclaw_api::tool::ToolSpec;
+        use zeroclaw_config::schema::{AnthropicModelProviderConfig, CacheTtl};
+
+        fn collect_cache_controls(value: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    if let Some(control) = map.get("cache_control") {
+                        out.push(control.clone());
+                    }
+                    for nested in map.values() {
+                        collect_cache_controls(nested, out);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        collect_cache_controls(item, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        async fn compat_request(opts: &ModelProviderRuntimeOptions) -> serde_json::Value {
+            use axum::{Json, Router, routing::post};
+            use std::sync::{Arc, Mutex};
+            use tokio::net::TcpListener;
+
+            let captured: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+            let captured_for_route = Arc::clone(&captured);
+            let app = Router::new().route(
+                "/chat/completions",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let captured = Arc::clone(&captured_for_route);
+                    async move {
+                        captured.lock().unwrap().push(body);
+                        Json(serde_json::json!({
+                            "choices": [{"message": {"content": "ok"}}]
+                        }))
+                    }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let provider = apply_compat_options(
+                OpenAiCompatibleModelProvider::builder("test")
+                    .display_name("custom")
+                    .base_url(&format!("http://{addr}"))
+                    .auth_style(AuthStyle::Bearer),
+                opts,
+            );
+            let messages = vec![
+                ChatMessage::system("be brief"),
+                ChatMessage::user("first question"),
+                ChatMessage::assistant("first answer"),
+                ChatMessage::user("second question"),
+            ];
+            let result = provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test-model",
+                    None,
+                )
+                .await;
+            server.abort();
+            result.unwrap_or_else(|error| panic!("compat request failed: {error}"));
+            let requests = captured.lock().unwrap();
+            requests[0].clone()
+        }
+
+        async fn native_request(opts: &ModelProviderRuntimeOptions) -> serde_json::Value {
+            use axum::{Json, Router, routing::post};
+            use std::sync::{Arc, Mutex};
+            use tokio::net::TcpListener;
+
+            let captured: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+            let captured_for_route = Arc::clone(&captured);
+            let app = Router::new().route(
+                "/v1/messages",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let captured = Arc::clone(&captured_for_route);
+                    async move {
+                        captured.lock().unwrap().push(body);
+                        Json(serde_json::json!({
+                            "id": "msg_ttl",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "ok"}],
+                            "model": "claude-sonnet-4-5",
+                            "stop_reason": "end_turn",
+                            "usage": {"input_tokens": 10, "output_tokens": 2}
+                        }))
+                    }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let provider = AnthropicModelProviderConfig::default()
+                .create_provider(
+                    "anthropic",
+                    Some("test-key"),
+                    Some(&format!("http://{addr}")),
+                    opts,
+                )
+                .expect("native anthropic provider constructs");
+            let messages = vec![
+                ChatMessage::system("You are a helpful assistant."),
+                ChatMessage::user("gen a 2 sum in golang"),
+                ChatMessage::assistant("```go\nfunc twoSum() {}\n```"),
+                ChatMessage::user("what's meaning of make here?"),
+            ];
+            let tools = vec![ToolSpec::new(
+                "shell",
+                "Run a shell command",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"]
+                }),
+            )];
+            let result = provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: Some(&tools),
+                        thinking: None,
+                    },
+                    "claude-sonnet-4-5",
+                    Some(0.7),
+                )
+                .await;
+            server.abort();
+            result.unwrap_or_else(|error| panic!("native request failed: {error}"));
+            let requests = captured.lock().unwrap();
+            requests[0].clone()
+        }
+
+        let ttl_opts = ModelProviderRuntimeOptions {
+            cache_ttl: Some(CacheTtl::OneHour),
+            cache_passthrough: true,
+            ..ModelProviderRuntimeOptions::default()
+        };
+
+        let compat_one_hour = compat_request(&ttl_opts).await;
+        let mut controls = Vec::new();
+        collect_cache_controls(&compat_one_hour, &mut controls);
+        assert_eq!(
+            controls.len(),
+            2,
+            "system + rolling breakpoints expected: {compat_one_hour}"
+        );
+        for control in &controls {
+            assert_eq!(
+                control["ttl"], "1h",
+                "apply_compat_options must forward cache_ttl: {compat_one_hour}"
+            );
+        }
+
+        let compat_default = compat_request(&ModelProviderRuntimeOptions::default()).await;
+        let mut controls = Vec::new();
+        collect_cache_controls(&compat_default, &mut controls);
+        assert!(
+            controls.is_empty(),
+            "default options must place no cache_control: {compat_default}"
+        );
+
+        let native_one_hour = native_request(&ttl_opts).await;
+        let mut controls = Vec::new();
+        collect_cache_controls(&native_one_hour, &mut controls);
+        assert_eq!(
+            controls.len(),
+            3,
+            "system + tools + rolling markers expected: {native_one_hour}"
+        );
+        for control in &controls {
+            assert_eq!(
+                control["ttl"], "1h",
+                "create_provider must forward cache_ttl: {native_one_hour}"
+            );
+        }
+
+        let native_default = native_request(&ModelProviderRuntimeOptions::default()).await;
+        let mut controls = Vec::new();
+        collect_cache_controls(&native_default, &mut controls);
+        assert_eq!(controls.len(), 3, "marker placement is unconditional");
+        for control in &controls {
+            assert_eq!(
+                serde_json::to_string(control).unwrap(),
+                r#"{"type":"ephemeral"}"#,
+                "default options keep the pre-TTL native wire form: {native_default}"
+            );
+        }
+    }
+
+    #[test]
     fn endpoint_registry_classifies_every_canonical_family() {
         macro_rules! collect_names {
             ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
@@ -1960,6 +2415,12 @@ mod tests {
     fn grok_cli_factory_enables_explicit_vision_override() {
         let working_directory = tempfile::tempdir().expect("temporary working directory");
         let config = GrokCliModelProviderConfig {
+            binary_path: Some(
+                std::env::current_exe()
+                    .expect("current test executable")
+                    .display()
+                    .to_string(),
+            ),
             working_directory: working_directory.path().display().to_string(),
             ..Default::default()
         };
@@ -2910,5 +3371,192 @@ mod tests {
 
         let paths = capture.lock().expect("capture lock poisoned").clone();
         assert_eq!(paths, vec!["/zen/v1/responses".to_string()]);
+    }
+
+    /// The exact set of families eligible for generic context-window
+    /// discovery. This is the whole contract in one place: a family probes
+    /// only by declaring it beside its own spec, and the set is small because
+    /// the bar is evidence that `GET {base}/models` really returns
+    /// `data[].id` with a per-model `context_length`, not that the family
+    /// speaks the OpenAI-compatible chat wire.
+    const PROBEABLE_FAMILIES: [&str; 9] = [
+        "together",
+        "groq",
+        "fireworks",
+        "deepinfra",
+        "hyperbolic",
+        "anyscale",
+        "novita",
+        "nebius",
+        "crusoe",
+    ];
+
+    /// The families the hand-written probe list in `fetch_context_window` used
+    /// to name. Every one must still probe, or moving the declaration into the
+    /// registry silently took context-window discovery away from providers
+    /// that had it.
+    #[test]
+    fn every_previously_listed_family_still_probes_its_context_catalog() {
+        for family in PROBEABLE_FAMILIES {
+            assert!(
+                family_model_context_catalog_auth(family).is_some(),
+                "{family} was in the hand-written probe list and must keep probing"
+            );
+        }
+    }
+
+    /// Chat-wire compatibility is not catalog evidence, so `CompatFamilySpec`
+    /// alone must not make a family probeable. NEAR AI is the concrete reason:
+    /// it is a compat chat family whose catalog is at `/v1/model/list` in a
+    /// `models[].modelId` shape with no context field, so probing
+    /// `{base}/models` would attach the operator's credential to an endpoint
+    /// this repository never claims exists.
+    #[test]
+    fn compat_families_without_evidence_are_not_probed() {
+        for family in [
+            "nearai",
+            "mistral",
+            "deepseek",
+            "cerebras",
+            "perplexity",
+            "vllm",
+            "cohere",
+            "huggingface",
+        ] {
+            assert!(
+                family_model_context_catalog_auth(family).is_none(),
+                "{family} is chat-compatible but its catalog shape is unverified; it must not be probed"
+            );
+        }
+    }
+
+    /// Opting in is deliberate, so a family that wraps a non-compat runtime
+    /// stays out. Widening to "ask everything" would send a doomed request per
+    /// alias on every `doctor` run and imply a catalog that does not exist.
+    #[test]
+    fn bespoke_non_compat_families_are_not_probed() {
+        for family in ["anthropic", "openai", "bedrock"] {
+            assert!(
+                family_model_context_catalog_auth(family).is_none(),
+                "{family} has no OpenAI-compatible /models catalog to ask"
+            );
+        }
+        assert!(
+            family_model_context_catalog_auth("not-a-provider").is_none(),
+            "an unknown provider type must not be probed"
+        );
+    }
+
+    /// The registry is the only place eligibility lives, so this walks every
+    /// slot the family macro defines and pins the answer for all of them —
+    /// not just the ones a test remembered to name. A family added later
+    /// starts at `None` and shows up here the moment someone opts it in.
+    #[test]
+    fn no_family_outside_the_probeable_set_is_eligible() {
+        let mut eligible: Vec<&str> = zeroclaw_config::providers::ModelProviders::slot_names()
+            .iter()
+            .copied()
+            .filter(|family| family_model_context_catalog_auth(family).is_some())
+            .collect();
+        eligible.sort_unstable();
+        let mut expected = PROBEABLE_FAMILIES.to_vec();
+        expected.sort_unstable();
+        assert_eq!(
+            eligible, expected,
+            "the eligible set changed; widening it requires evidence that the family serves \
+             GET {{base}}/models with data[].id and context_length"
+        );
+    }
+
+    /// A probeable family with no resolvable default endpoint would answer
+    /// `None` for every operator who did not set `uri` by hand — discovery
+    /// that looks enabled and silently is not. Eligibility and a default URL
+    /// have to arrive together.
+    #[test]
+    fn every_probeable_family_resolves_a_default_catalog_url() {
+        // Walk the registry, not the list above: a family opted in later must
+        // be caught here even though no test names it.
+        for family in zeroclaw_config::providers::ModelProviders::slot_names() {
+            if family_model_context_catalog_auth(family).is_none() {
+                continue;
+            }
+            assert!(
+                endpoint_for_family(family)
+                    .and_then(ProviderEndpoint::fixed_url)
+                    .is_some(),
+                "{family} is probeable but has no default endpoint to probe, so discovery \
+                 silently answers None for every operator who did not set `uri` by hand"
+            );
+        }
+    }
+
+    /// The credential-safety invariant, stated over the whole registry rather
+    /// than the two families that motivated it: a probe must present the
+    /// stored credential exactly the way that family's request path does. Any
+    /// family whose auth transforms the credential (`ZhipuJwt` mints a
+    /// short-lived JWT from `id.secret`) is caught here if it is ever opted in
+    /// without discovery being taught the same transformation.
+    #[test]
+    fn zhipu_jwt_families_are_not_eligible_for_generic_discovery() {
+        // The premise: these two really do transform the stored credential.
+        assert!(matches!(
+            <ZaiModelProviderConfig as CompatFamilySpec>::AUTH,
+            AuthStyle::ZhipuJwt
+        ));
+        assert!(matches!(
+            <GlmModelProviderConfig as CompatFamilySpec>::AUTH,
+            AuthStyle::ZhipuJwt
+        ));
+        for family in ["zai", "glm"] {
+            assert!(
+                family_model_context_catalog_auth(family).is_none(),
+                "{family} converts its stored id.secret into a per-request JWT; the generic \
+                 catalog reader must not be handed that credential"
+            );
+        }
+        // Stated over the registry rather than the two names above, so a
+        // third JWT family cannot be opted in without this failing.
+        for family in zeroclaw_config::providers::ModelProviders::slot_names() {
+            assert!(
+                !matches!(
+                    family_model_context_catalog_auth(family),
+                    Some(AuthStyle::ZhipuJwt)
+                ),
+                "{family} is eligible for generic discovery with credential-transforming auth"
+            );
+        }
+    }
+
+    /// Groq declares its catalog policy by hand because it builds its provider
+    /// by hand. Pin the two together so discovery cannot drift away from the
+    /// auth the request path actually uses.
+    #[test]
+    fn groq_probes_with_the_same_auth_its_request_path_uses() {
+        assert!(
+            matches!(
+                family_model_context_catalog_auth("groq"),
+                Some(AuthStyle::Bearer)
+            ),
+            "groq's create_provider authenticates with Bearer; discovery must say the same"
+        );
+    }
+
+    /// Every compat family that opted in probes with its own
+    /// `CompatFamilySpec::AUTH`, because the blanket derives one from the
+    /// other rather than letting a family state it twice.
+    #[test]
+    fn compat_probes_derive_auth_from_the_family_spec() {
+        assert!(matches!(
+            <TogetherModelProviderConfig as FamilyProviderFactory>::MODEL_CONTEXT_CATALOG_AUTH,
+            Some(AuthStyle::Bearer)
+        ));
+        assert!(matches!(
+            <TogetherModelProviderConfig as CompatFamilySpec>::AUTH,
+            AuthStyle::Bearer
+        ));
+        assert!(
+            <ZaiModelProviderConfig as FamilyProviderFactory>::MODEL_CONTEXT_CATALOG_AUTH.is_none(),
+            "a family that did not opt in has no catalog policy at all"
+        );
     }
 }

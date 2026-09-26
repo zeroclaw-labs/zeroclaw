@@ -19,17 +19,12 @@ use crate::tools::{AllToolsResult, Tool};
 // ── The matrix as an index of parity rows ───────────────────────────────────
 
 /// How a row is currently backed - bookkeeping only; the enforceable claim is
-/// the test named in `evidence`, never this enum.
+/// the tests and construction boundary named in `evidence`, never this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowStatus {
     /// An in-file L1/L2 test pins this row's behavior; it fails loudly if the
     /// behavior changes. `evidence` names it.
     Tested,
-    /// A confirmed divergence with no single resolution seam to assert against
-    /// in this crate yet (e.g. it spans a cross-crate boot path). Carried as a
-    /// tracked record until the owning epic lands the seam; `evidence` says
-    /// where it is characterized. No cell here claims a per-path verdict.
-    TrackedDivergence,
 }
 
 struct ParityRow {
@@ -41,25 +36,27 @@ struct ParityRow {
     /// row named in a public artifact).
     tracking: &'static str,
     status: RowStatus,
-    /// For `Tested`: the test fn(s) that back this row. For `TrackedDivergence`:
-    /// where the divergence is characterized / tracked. Never empty - the
-    /// meta-test enforces it, so a row cannot ship as an unbacked assertion.
+    /// The test fn(s) and any construction boundary that back this row.
+    /// The meta-test checks bookkeeping only, not the evidence's behavior.
     evidence: &'static str,
 }
 
-/// Rows ship for the tool surface (Epic A). Each names its backing test or its
-/// tracked-divergence record; none encodes a per-path verdict that could rot.
+/// Rows ship for the tool surface (Epic A). Each names its backing evidence;
+/// none encodes a per-path verdict that could rot.
 const MATRIX: &[ParityRow] = &[
     ParityRow {
         surface: "A",
         setting: "built-in filter minted through the one assemble() seam on every path",
         owner_epic: "A",
-        tracking: "gateway + loop_::run + process_message route through assemble(); \
-                   remaining sites cut over one PR at a time",
-        status: RowStatus::TrackedDivergence,
-        evidence: "gateway/loop_::run/process_message route through assemble(); \
-                   from_config/orchestrator/delegate still hand-roll the same filter, \
-                   tracked by the remaining Epic A cut-overs + the seal",
+        tracking: "ScopedToolRegistry seal landed in #9319; parity record follow-up #9649",
+        status: RowStatus::Tested,
+        evidence: "parity_l2_builtin_filter_semantic_parity + \
+                   tools::scoped::tests::assemble_applies_the_builtin_filter_uniformly \
+                   exercise assemble(); private-field ScopedToolRegistry seals production \
+                   construction through assemble() and is carried by ResolvedAgentExecution, \
+                   ResolvedIo, Agent, and ChannelRuntimeContext; from_raw_for_test is gated \
+                   by cfg(any(test, feature = \"test-util\")); \
+                   parity_matrix_rows_are_owned_tracked_and_evidenced checks bookkeeping only",
     },
     ParityRow {
         surface: "A",
@@ -113,11 +110,11 @@ fn parity_matrix_rows_are_owned_tracked_and_evidenced() {
         );
         assert!(
             !row.evidence.is_empty(),
-            "row '{}' has no evidence (name the backing test or the tracked-divergence record)",
+            "row '{}' has no evidence (name the backing test and any construction boundary)",
             row.setting
         );
-        // A `Tested` row must point at something test-shaped; a
-        // `TrackedDivergence` row must not masquerade as tested.
+        // This checks a test-shaped reference, not that the named test exists
+        // or proves the row's claim.
         if row.status == RowStatus::Tested {
             assert!(
                 row.evidence.contains("parity_"),
@@ -148,12 +145,14 @@ async fn parity_l1_engine_honors_excluded_tools() {
     let turn_id = uuid::Uuid::new_v4().to_string();
     let result = run_tool_call_loop(ToolLoop {
         parent_agent_alias: None,
+        served_route_sink: None,
         sop_reassembly: None,
         exec: ResolvedAgentExecution::resolve(
             ResolvedModelAccess {
                 model_provider: &provider,
                 provider_name: "mock",
                 model: "mock-model",
+                dispatch_model: "mock-model",
                 temperature: None,
             },
             ResolvedIo {
@@ -176,11 +175,20 @@ async fn parity_l1_engine_honors_excluded_tools() {
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 30_000,
-                context_token_budget: 100_000,
+                context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                    model_context_window: 100_000,
+                    context_token_budget: 100_000,
+                    model_context_window_source:
+                        zeroclaw_config::schema::ModelContextWindowSource::Configured,
+                },
+                context_limits_resolver: None,
                 knobs: &LoopKnobs::default(),
             },
         ),
         history: &mut history,
+        // Test transcripts start fresh: no prior trim, no crumb.
+        history_has_trim_breadcrumb: &mut false,
+        injected_memory_preamble: &mut None,
         channel_name: "cli",
         channel_reply_target: None,
         cancellation_token: None,
@@ -285,7 +293,7 @@ async fn parity_l2_builtin_filter_semantic_parity() {
 
     assert_eq!(
         seam_names, hand_rolled_names,
-        "the assemble() seam and the still-uncut hand-rolled call must resolve \
+        "the assemble() seam and the direct filter fixture must resolve \
          the built-in filter identically"
     );
     assert!(

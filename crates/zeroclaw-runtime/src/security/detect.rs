@@ -8,8 +8,8 @@ use zeroclaw_config::schema::{RuntimeKind, SandboxBackend, SandboxConfig};
 /// Extra filesystem roots beyond the primary workspace that a sandbox should
 /// also grant access to, mirroring `SecurityPolicy`'s allowed-roots tiers
 /// (`allowed_roots`, `allowed_roots_read_only`, `allowed_roots_write_only`).
-/// Only backends that build per-path rulesets (currently Landlock) consume
-/// this; others ignore it.
+/// Backends that build per-path rulesets (Landlock and macOS Seatbelt)
+/// consume this; others ignore it.
 #[derive(Debug, Clone, Default)]
 pub struct SandboxExtraRoots {
     pub read_write: Vec<PathBuf>,
@@ -352,7 +352,7 @@ pub fn create_sandbox(
 
     match backend {
         SandboxBackend::Auto | SandboxBackend::None => {
-            detect_best_sandbox(runtime_kind, workspace_dir, extra_roots)
+            detect_best_sandbox(runtime_kind, workspace_dir, extra_roots, &sandbox.image)
         }
         requested => {
             let selected =
@@ -367,8 +367,10 @@ pub fn create_sandbox(
                 }
                 return Arc::new(super::traits::NoopSandbox);
             }
-            if let Some(sandbox) = create_selected_sandbox(selected, workspace_dir, extra_roots) {
-                return sandbox;
+            if let Some(built) =
+                create_selected_sandbox(selected, workspace_dir, extra_roots, &sandbox.image)
+            {
+                return built;
             }
             log_requested_backend_unavailable(selected_backend_label(requested));
             Arc::new(super::traits::NoopSandbox)
@@ -380,13 +382,14 @@ fn detect_best_sandbox(
     runtime_kind: RuntimeKind,
     workspace_dir: Option<&Path>,
     extra_roots: &SandboxExtraRoots,
+    image: &str,
 ) -> Arc<dyn Sandbox> {
     let selected = detect_best_backend(runtime_kind, workspace_dir, extra_roots);
     if matches!(selected, SelectedSandboxBackend::DockerRuntime) {
         log_auto_backend_selection(selected, runtime_kind);
         return Arc::new(super::traits::NoopSandbox);
     }
-    if let Some(sandbox) = create_selected_sandbox(selected, workspace_dir, extra_roots) {
+    if let Some(sandbox) = create_selected_sandbox(selected, workspace_dir, extra_roots, image) {
         log_auto_backend_selection(selected, runtime_kind);
         return sandbox;
     }
@@ -395,10 +398,38 @@ fn detect_best_sandbox(
     Arc::new(super::traits::NoopSandbox)
 }
 
+#[cfg(target_os = "macos")]
+struct FailedSeatbeltSandbox {
+    error: std::io::Error,
+}
+
+#[cfg(target_os = "macos")]
+impl Sandbox for FailedSeatbeltSandbox {
+    fn wrap_command(&self, _cmd: &mut std::process::Command) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            self.error.kind(),
+            format!("Seatbelt initialization failed: {}", self.error),
+        ))
+    }
+
+    fn is_available(&self) -> bool {
+        false
+    }
+
+    fn name(&self) -> &str {
+        "sandbox-exec"
+    }
+
+    fn description(&self) -> &str {
+        "Seatbelt initialization failed; commands are blocked"
+    }
+}
+
 fn create_selected_sandbox(
     selected: SelectedSandboxBackend,
     workspace_dir: Option<&Path>,
     extra_roots: &SandboxExtraRoots,
+    image: &str,
 ) -> Option<Arc<dyn Sandbox>> {
     match selected {
         SelectedSandboxBackend::None => None,
@@ -418,10 +449,8 @@ fn create_selected_sandbox(
             }
             #[cfg(not(all(feature = "sandbox-landlock", target_os = "linux")))]
             {
-                // Landlock is the only backend that consumes the extra roots, so
-                // without it the parameter is genuinely unused. Bind it here to
-                // keep the signature uniform across cfgs without tripping
-                // `-D warnings` on the feature-disabled build.
+                // This Landlock branch does not consume extra roots when its
+                // feature/platform implementation is unavailable.
                 let _ = extra_roots;
                 None
             }
@@ -458,12 +487,9 @@ fn create_selected_sandbox(
         }
         SelectedSandboxBackend::Docker => {
             let result = if let Some(ws) = workspace_dir {
-                super::docker::DockerSandbox::with_workspace(
-                    super::docker::DockerSandbox::default_image(),
-                    ws.to_path_buf(),
-                )
+                super::docker::DockerSandbox::with_workspace(image.to_string(), ws.to_path_buf())
             } else {
-                super::docker::DockerSandbox::new()
+                super::docker::DockerSandbox::with_image(image.to_string())
             };
             result
                 .map(|sandbox| Arc::new(sandbox) as Arc<dyn Sandbox>)
@@ -472,9 +498,19 @@ fn create_selected_sandbox(
         SelectedSandboxBackend::SandboxExec => {
             #[cfg(target_os = "macos")]
             {
-                super::seatbelt::SeatbeltSandbox::with_workspace(workspace_dir)
-                    .map(|sandbox| Arc::new(sandbox) as Arc<dyn Sandbox>)
-                    .ok()
+                let result = super::seatbelt::SeatbeltSandbox::with_roots(
+                    workspace_dir,
+                    &extra_roots.read_write,
+                    &extra_roots.read_only,
+                    &extra_roots.write_only,
+                );
+                // Once Seatbelt is selected, initialization failure must block
+                // execution rather than trigger the unsandboxed fallback.
+                let sandbox: Arc<dyn Sandbox> = match result {
+                    Ok(sandbox) => Arc::new(sandbox),
+                    Err(error) => Arc::new(FailedSeatbeltSandbox { error }),
+                };
+                Some(sandbox)
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -633,11 +669,121 @@ pub fn linux_memcg_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroclaw_config::schema::DEFAULT_SANDBOX_IMAGE;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn failed_seatbelt_preserves_error_and_rejects_repeated_commands() {
+        let sandbox = FailedSeatbeltSandbox {
+            error: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "policy unavailable"),
+        };
+        assert!(!sandbox.is_available());
+        assert_eq!(sandbox.name(), "sandbox-exec");
+        for _ in 0..2 {
+            let mut command = std::process::Command::new("/bin/echo");
+            command.arg("must not run");
+            let error = sandbox.wrap_command(&mut command).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(
+                error
+                    .to_string()
+                    .contains("Seatbelt initialization failed: policy unavailable")
+            );
+            assert_eq!(command.get_program(), "/bin/echo");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_factory_keeps_resolution_failures_confined() {
+        if !Path::new(super::super::seatbelt::SANDBOX_EXEC_PATH).is_file() {
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let cycle = fixture.path().join("cycle");
+        std::os::unix::fs::symlink("cycle", &cycle).unwrap();
+        let extra_roots = SandboxExtraRoots {
+            read_only: vec![cycle],
+            ..SandboxExtraRoots::default()
+        };
+        // With Bubblewrap disabled, macOS auto-selection chooses Seatbelt.
+        let backends = [
+            SandboxBackend::SandboxExec,
+            #[cfg(not(feature = "sandbox-bubblewrap"))]
+            SandboxBackend::Auto,
+        ];
+        for backend in backends {
+            let mut config = SandboxConfig {
+                enabled: Some(true),
+                backend,
+                firejail_args: Vec::new(),
+                ..SandboxConfig::default()
+            };
+            let sandbox = create_sandbox(
+                &config,
+                RuntimeKind::Native,
+                Some(fixture.path()),
+                &extra_roots,
+            );
+            assert_eq!(sandbox.name(), "sandbox-exec");
+            assert!(!sandbox.is_available());
+            let mut command = std::process::Command::new("/bin/echo");
+            let error = sandbox.wrap_command(&mut command).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Seatbelt root symlink limit exceeded")
+            );
+
+            config.enabled = Some(false);
+            let disabled = create_sandbox(
+                &config,
+                RuntimeKind::Native,
+                Some(fixture.path()),
+                &extra_roots,
+            );
+            assert_eq!(disabled.name(), "none");
+            assert!(disabled.wrap_command(&mut command).is_ok());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_factory_still_wraps_valid_roots() {
+        if !Path::new(super::super::seatbelt::SANDBOX_EXEC_PATH).is_file() {
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let config = SandboxConfig {
+            enabled: Some(true),
+            backend: SandboxBackend::SandboxExec,
+            firejail_args: Vec::new(),
+            ..SandboxConfig::default()
+        };
+        let sandbox = create_sandbox(
+            &config,
+            RuntimeKind::Native,
+            Some(fixture.path()),
+            &SandboxExtraRoots::default(),
+        );
+        assert_eq!(sandbox.name(), "sandbox-exec");
+        assert!(sandbox.is_available());
+        let mut command = std::process::Command::new("/bin/echo");
+        sandbox.wrap_command(&mut command).unwrap();
+        assert_eq!(
+            command.get_program(),
+            super::super::seatbelt::SANDBOX_EXEC_PATH
+        );
+    }
 
     #[test]
     fn detect_best_sandbox_returns_something() {
-        let sandbox =
-            detect_best_sandbox(RuntimeKind::Cloudflare, None, &SandboxExtraRoots::default());
+        let sandbox = detect_best_sandbox(
+            RuntimeKind::Cloudflare,
+            None,
+            &SandboxExtraRoots::default(),
+            DEFAULT_SANDBOX_IMAGE,
+        );
         // Should always return at least NoopSandbox
         assert!(sandbox.is_available());
     }
@@ -648,6 +794,7 @@ mod tests {
             enabled: Some(false),
             backend: SandboxBackend::None,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         };
         let sandbox = create_sandbox(
             &sandbox_cfg,
@@ -664,6 +811,7 @@ mod tests {
             enabled: Some(false),
             backend: SandboxBackend::None,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         };
         let posture = sandbox_posture(
             &sandbox_cfg,
@@ -682,6 +830,7 @@ mod tests {
             enabled: None, // Auto-detect
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         };
         let sandbox = create_sandbox(
             &sandbox_cfg,
@@ -698,7 +847,12 @@ mod tests {
         // When runtime.kind = "native", Docker must be skipped in auto-detection
         // even when Docker is installed on the host. The sandbox must be
         // NoopSandbox or something OS-native (Landlock, Firejail, Seatbelt).
-        let sandbox = detect_best_sandbox(RuntimeKind::Native, None, &SandboxExtraRoots::default());
+        let sandbox = detect_best_sandbox(
+            RuntimeKind::Native,
+            None,
+            &SandboxExtraRoots::default(),
+            DEFAULT_SANDBOX_IMAGE,
+        );
         assert_ne!(sandbox.name(), "docker");
     }
 
@@ -708,6 +862,7 @@ mod tests {
             enabled: None,
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         };
         let posture = sandbox_posture(
             &sandbox_cfg,
@@ -724,6 +879,7 @@ mod tests {
             enabled: None,
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         };
         let sandbox = create_sandbox(
             &sandbox_cfg,
@@ -749,6 +905,7 @@ mod tests {
             enabled: None,
             backend: SandboxBackend::Docker,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         };
         let sandbox = create_sandbox(
             &sandbox_cfg,
@@ -807,6 +964,7 @@ mod tests {
             enabled: None,
             backend: SandboxBackend::Docker,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         };
 
         let sandbox = create_sandbox(
@@ -825,6 +983,7 @@ mod tests {
             enabled: None,
             backend: SandboxBackend::Docker,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         };
 
         let posture = sandbox_posture(
@@ -854,6 +1013,7 @@ mod tests {
             enabled: Some(false),
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         };
 
         let posture = sandbox_posture(
@@ -874,6 +1034,7 @@ mod tests {
             enabled: None,
             backend: SandboxBackend::None,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         };
 
         let posture = sandbox_posture(
@@ -909,6 +1070,7 @@ mod tests {
             enabled: None,
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
+            ..SandboxConfig::default()
         };
 
         let posture = sandbox_posture(

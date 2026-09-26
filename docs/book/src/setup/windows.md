@@ -88,6 +88,20 @@ cargo install --locked --path .
 zeroclaw quickstart
 ```
 
+### Native runtime shell
+
+When `[runtime].shell` is omitted, Windows selects the first available
+interpreter in this order: `pwsh`, `powershell`, then `cmd.exe`. To preserve
+the legacy `cmd.exe` behavior explicitly, set:
+
+```toml
+[runtime]
+shell = "cmd"
+```
+
+An explicit `pwsh` or `powershell` value is never replaced by an automatic
+fallback if that interpreter is unavailable.
+
 ### Option 4: Scoop
 
 ```cmd

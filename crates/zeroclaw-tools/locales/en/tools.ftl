@@ -9,7 +9,7 @@
 #
 # Literal { and } in values must be escaped as {"{"}  and  {"}"} respectively.
 
-tool-backup = Create, list, verify, and restore workspace backups
+tool-backup = Create, list, verify, and restore shared data directory backups
 
 tool-browser = Web/browser automation with pluggable backends (agent-browser, rust-native, computer_use). Supports DOM actions plus optional OS-level actions (mouse_move, mouse_click, mouse_drag, key_type, key_press, screen_capture) through a computer-use sidecar. Use 'snapshot' to map interactive elements to refs (@e1, @e2). Enforces browser.allowed_domains for open actions.
 
@@ -60,7 +60,7 @@ tool-cron-runs = List recent run history for a cron job
 
 tool-cron-update = Patch an existing cron job (schedule, command, prompt, enabled, delivery, model, etc.)
 
-tool-data-management = Workspace data retention, purge, and storage statistics
+tool-data-management = Shared data directory retention preview and storage statistics
 
 tool-delegate = Delegate a subtask to a specialized agent. Use when: a task benefits from a different model (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single prompt by default; with agentic=true it can iterate with a filtered tool-call loop.
 
@@ -93,9 +93,41 @@ tool-file-download-success = Downloaded { $written } bytes to { $dest_path } ({ 
 tool-file-read = Read file contents with line numbers. Supports partial reading via offset and limit. Binary and image files are rejected (use the image_info tool for images). Set encoding="base64" to return raw bytes base64-encoded (for binary files such as .pdf/.xlsx/.docx); offset/limit are ignored in that mode.
 
 tool-file-write = Write contents to a file in the workspace
+tool-file-write-error-path-blocked = Path blocked by security policy: '{ $path }'
+tool-file-write-error-missing-parent = Invalid path: missing parent directory
+tool-file-write-error-no-existing-parent = Failed to resolve an existing parent directory
+tool-file-write-error-parent-binding = Failed to resolve the file-write parent path: '{ $path }'
+tool-file-write-error-missing-name = Invalid path: missing file name
+tool-file-write-error-runtime-config = Runtime configuration files cannot be changed with file_write: '{ $path }'
+tool-file-write-error-capability-binding = Failed to bind the file-write parent to an authorized directory
+tool-file-write-error-symlink = Refusing to write through a symlink: '{ $path }'
+tool-filesystem-boundary-error-symlink = Refusing to follow a symlink at '{ $path }'
+tool-filesystem-boundary-error-contained = Path must be relative and contained: '{ $path }'
+tool-filesystem-boundary-error-not-directory = Path component is not a directory: '{ $path }'
+tool-filesystem-boundary-error-not-regular = Refusing to open a non-regular file: '{ $path }'
+tool-data-management-error-purge-disabled = Confirmed purge is unavailable; use dry_run to preview eligible files
+tool-data-management-error-read-blocked = Shared data path is not readable under the security policy: '{ $path }'
+tool-backup-error-max-keep = Backup retention max_keep must be at least 1
+tool-backup-error-action-blocked = Backup mutation is blocked by the security policy
+tool-backup-error-source-overlap = Backup source cannot contain the backup output directory: '{ $path }'
+tool-backup-error-rotation-platform = Backup rotation is unavailable on this platform because recursive deletion cannot preserve the verified directory-handle boundary
+tool-backup-error-not-found = Backup not found: '{ $name }'
+tool-backup-error-integrity = Integrity check failed
+tool-backup-error-non-utf8 = Backup contains a non-UTF-8 entry name
+tool-backup-error-contained = Backup path must stay within the shared data directory: '{ $path }'
+tool-backup-error-invalid-name = Invalid backup name: '{ $name }'
+tool-backup-error-symlink = Refusing to traverse a symlink in backup data: '{ $path }'
+tool-backup-error-not-directory = Backup path is not a directory: '{ $path }'
+tool-backup-error-is-directory = Backup file destination is a directory: '{ $path }'
+tool-backup-error-special-file = Refusing to traverse a special file in backup data: '{ $path }'
+tool-backup-error-read-blocked = Shared data path is not readable under the security policy: '{ $path }'
+tool-backup-error-write-blocked = Backup destination is not writable under the security policy: '{ $path }'
 
-tool-git-operations = Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash). Provides parsed JSON output and integrates with security policy for autonomy controls.
+tool-git-operations = Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash, worktree). Provides parsed JSON output and integrates with security policy for autonomy controls.
 tool-git-operations-error-not-in-repo = Not in a Git repository at '{ $path }'. Choose a path inside a Git worktree, pass 'path' for a repository subdirectory, or initialize a repository before running git_operations.
+tool-git-operations-error-repository-outside-authorized-roots = No Git repository is reachable within the authorized roots for '{ $path }'. Choose a path inside a repository covered by the applicable allowed root, or initialize a repository before running git_operations.
+tool-git-operations-error-repository-not-authorized = Git repository metadata at '{ $path }' is not authorized for this operation. Choose a repository covered by the applicable allowed root.
+tool-git-operations-error-path-not-authorized = Git path '{ $path }' is not authorized for this operation. Choose a path covered by the applicable allowed root.
 
 tool-git-forge-error-requires-field = { $resource }.{ $action } requires '{ $field }'.
 tool-git-forge-error-requires-number = { $resource }.{ $action } requires 'number'.
@@ -152,7 +184,11 @@ tool-pushover = Send a Pushover notification to your device. Requires PUSHOVER_T
 
 tool-schedule = Manage scheduled shell-only tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. WARNING: This tool creates shell jobs whose output is only logged, NOT delivered to any channel. To send a scheduled message to Discord/Telegram/Slack/Matrix, use the cron_add tool with job_type='agent' and a delivery config like {"{"}"mode":"announce","channel":"discord","to":"<channel_id>"{"}"}.
 
-tool-screenshot = Capture a screenshot of the current screen. Returns the file path and base64-encoded PNG data.
+tool-sessions-history-header = Session '{ $session_id }': showing { $shown }/{ $total } messages
+tool-sessions-send-error-acp-unsupported = { $tool } does not support { $channel } sessions because durable transcript writes do not deliver messages to the live { $product } session.
+tool-sessions-current-channel = Channel: { $channel }
+
+tool-screenshot = Capture a screenshot of the current screen. Returns the saved file path.
 tool-browser-screenshot-error-path-not-allowed = Screenshot path '{ $path }' is not in the workspace allowlist
 tool-browser-screenshot-error-parent-not-exist = Screenshot path '{ $path }' parent directory '{ $parent }' does not exist
 tool-browser-screenshot-error-path-outside-workspace = Screenshot path '{ $path }' resolves to '{ $canonical }' which is outside the workspace
@@ -194,3 +230,22 @@ tool-web-search-tool-note-truncated-results = (further results omitted)
 tool-workspace = Manage multi-client workspaces. Subcommands: list, switch, create, info, export. Each workspace provides isolated memory, audit, secrets, and tool restrictions.
 
 tool-weather = Get current weather conditions and forecast for any location worldwide. Supports city names (in any language or script), IATA airport codes (e.g. 'LAX'), GPS coordinates (e.g. '51.5,-0.1'), postal/zip codes, and domain-based geolocation. Returns temperature, feels-like, humidity, wind speed/direction, precipitation, visibility, pressure, UV index, and cloud cover. Optional 0-3 day forecast with hourly breakdown. Units default to metric (°C, km/h, mm) but can be set to imperial (°F, mph, inches) per request. No API key required.
+
+tool-a2a-discover = List available remote A2A peer agents and their advertised capabilities. Call with no peer to list all configured peers, or a specific peer to fetch its Agent Card (name, description, skills). Use before a2a_send to find the right peer and agent for a task.
+tool-a2a-discover-desc-peer = Peer name to fetch the Agent Card for. Omit to list all configured peers.
+tool-a2a-discover-desc-filter-tags = Optional tags to filter peers by (e.g. ["production"]).
+tool-a2a-send = Delegate a task to a remote A2A peer agent and wait for the result. Returns a Task with a task_id, state, and artifacts (the peer's reply, fenced as untrusted-external). If the state is non-terminal (working/input-required), poll with a2a_get_task or cancel with a2a_cancel. The message is sent as-is. This is an Act operation that requires approval by default (not in auto_approve) unless the operator explicitly opts in via risk_profiles.<name>.auto_approve.
+tool-a2a-send-desc-peer = Configured peer name to send the task to.
+tool-a2a-send-desc-agent = Target route identity on the peer: the agent alias ({"{"}alias{"}"} in /a2a/{"{"}alias{"}"}) or, when the card shares a URL across tenants, the tenant of the interface to reach.
+tool-a2a-send-desc-message = The task prompt to send to the peer agent.
+tool-a2a-send-desc-return-immediately = Default false (block for a terminal state). Set true to return immediately with a non-terminal (working/input-required) task for polling.
+tool-a2a-send-desc-context-id = Optional context ID for multi-turn continuation (from a prior send's response).
+tool-a2a-send-desc-task-id = Optional task ID for continuing an existing task (e.g. after INPUT_REQUIRED).
+tool-a2a-get-task = Retrieve the current state and artifacts of an in-flight A2A task on a peer. Use to poll a task that a2a_send returned in a non-terminal state (working/input-required).
+tool-a2a-get-task-desc-peer = Configured peer name hosting the task.
+tool-a2a-get-task-desc-task-id = The task id returned by a2a_send.
+tool-a2a-get-task-desc-agent = Optional agent alias or tenant that created the task (from a2a_send). Helps route the poll to the correct interface when discovery is re-run (the cached route is used first).
+tool-a2a-cancel = Cancel an in-flight A2A task on a peer. Returns the updated Task (typically state=canceled, though the spec does not guarantee it).
+tool-a2a-cancel-desc-peer = Configured peer name hosting the task.
+tool-a2a-cancel-desc-task-id = The task id to cancel.
+tool-a2a-cancel-desc-agent = Optional agent alias or tenant that created the task (from a2a_send). Helps route the cancel to the correct interface when discovery is re-run (the cached route is used first).

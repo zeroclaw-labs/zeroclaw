@@ -483,6 +483,7 @@ pub(crate) fn format_location_content(lat: f64, lng: f64, name: Option<&str>) ->
 
 #[cfg(any(
     feature = "channel-discord",
+    feature = "channel-mattermost",
     feature = "channel-signal",
     feature = "channel-slack",
     feature = "channel-whatsapp-cloud",
@@ -538,6 +539,7 @@ pub fn parse_approval_reply(
 /// switch cannot desync the prompt from [`parse_approval_reply`].
 #[cfg(any(
     feature = "channel-discord",
+    feature = "channel-mattermost",
     feature = "channel-signal",
     feature = "channel-slack",
     feature = "channel-whatsapp-cloud",
@@ -577,6 +579,7 @@ pub(crate) fn build_yesno_approval_prompt(
 /// catalogue key and the phrasing cannot drift per channel.
 #[cfg(any(
     feature = "channel-discord",
+    feature = "channel-mattermost",
     feature = "channel-signal",
     feature = "channel-slack",
     feature = "channel-whatsapp-cloud",
@@ -967,6 +970,21 @@ mod tests {
         let (cleaned, attachments) = parse_attachment_markers("Check [UNKNOWN:foo] out");
         assert_eq!(cleaned, "Check [UNKNOWN:foo] out");
         assert!(attachments.is_empty());
+    }
+
+    #[test]
+    fn parse_attachment_markers_delivers_echoed_media_placeholder_as_prose() {
+        // A text-only model sees the degradation placeholder in its history
+        // and may repeat it; the reply must reach the user as readable text,
+        // not as a marker or a stray bracket span.
+        let reply = format!(
+            "I can't view that, it shows as {}.",
+            zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER
+        );
+        let (cleaned, attachments) = parse_attachment_markers(&reply);
+        assert_eq!(cleaned, reply);
+        assert!(attachments.is_empty());
+        assert!(!cleaned.contains('['));
     }
 
     #[test]

@@ -232,6 +232,23 @@ impl SopTrigger {
     pub fn source(&self) -> SopTriggerSource {
         SopTriggerSource::from(self)
     }
+
+    /// True when this trigger can *only* start a run with no ambient agent turn.
+    ///
+    /// Every fan-in source except `Manual` fires from a listener, poller, or
+    /// the maintenance tick, none of which carry an agent identity a step could
+    /// borrow, so a procedure reachable by one must declare its own owning
+    /// agent (see [`Sop::agent`]).
+    ///
+    /// `Manual` is false because it is reachable from both sides: through the
+    /// `sop_execute` tool the calling turn's agent owns the run, while the
+    /// dashboard run endpoint emits the same event from outside any agent turn.
+    /// The trigger alone cannot tell those apart, so ownership for a Manual
+    /// start is enforced by the surface that starts it
+    /// (`sop::headless_ownership_refusal`) rather than by this flag.
+    pub fn is_headless(&self) -> bool {
+        !matches!(self, Self::Manual)
+    }
 }
 
 // ── Step kind ────────────────────────────────────────────────────
@@ -508,6 +525,10 @@ pub struct Sop {
     /// ambient agent loop to borrow.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// Optional decision-model gate and execution-mode choice, from the
+    /// `[decision]` table of `SOP.toml`. See [`super::decision`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<super::decision::SopDecisionSpec>,
 }
 
 fn default_cooldown_secs() -> u64 {
@@ -592,6 +613,8 @@ pub struct SopManifest {
     pub positions: Vec<StepPosition>,
     #[serde(default)]
     pub steps: Vec<SopStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<super::decision::SopDecisionSpec>,
 }
 
 /// One step's persisted canvas coordinate in SOP.toml.
@@ -661,6 +684,7 @@ impl SopManifest {
                 })
                 .collect(),
             steps: sop.steps.clone(),
+            decision: sop.decision.clone(),
         }
     }
 }
@@ -791,6 +815,17 @@ pub struct SopStepResult {
 pub struct SopRun {
     pub run_id: String,
     pub sop_name: String,
+    /// The agent whose turn started this run, for runs that began inside one
+    /// (`sop_execute`). A headless trigger has no initiating turn and leaves it
+    /// `None`.
+    ///
+    /// Persisted because it has to outlive the thing it came from: an unowned
+    /// at an approval resumes on the headless driver — possibly in a later
+    /// daemon generation — with that turn long gone. `#[serde(default)]` so runs
+    /// persisted before this field restore as `None` rather than failing to
+    /// load.
+    #[serde(default)]
+    pub initiating_agent: Option<String>,
     pub trigger_event: SopEvent,
     /// Stable per-run boundary marker for untrusted trigger framing.
     #[serde(default)]
@@ -826,6 +861,11 @@ pub struct SopRun {
     /// reset when a new checkpoint parks, untouched by revise re-parks.
     #[serde(default)]
     pub revision_base: u32,
+    /// Execution mode a decision model chose for this run at dispatch. When
+    /// set it replaces the SOP's authored mode for this run's approval gating;
+    /// step-level confirmations and checkpoints still apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_mode: Option<SopExecutionMode>,
 }
 
 impl ::zeroclaw_api::attribution::Attributable for SopRun {
@@ -836,7 +876,6 @@ impl ::zeroclaw_api::attribution::Attributable for SopRun {
         &self.sop_name
     }
 }
-
 /// Lightweight projection of a run for list surfaces (Runs page). Carries
 /// just enough to render a row and open the per-run overlay, without the
 /// full step-result payload.
@@ -868,6 +907,119 @@ impl SopRunSummary {
             completed_at: run.completed_at.clone(),
             trigger_source: run.trigger_event.source.to_string(),
             active,
+        }
+    }
+}
+
+/// Full detail for one run as exposed over RPC (`sops/run-detail`) — an
+/// explicit projection, not the persisted [`SopRun`].
+///
+/// Policy at this response boundary, applied independently of what any
+/// storage path did earlier:
+/// - free-text fields that can carry model or tool content (step output,
+///   tool arguments/output/error, the trigger topic) pass through the
+///   credential scrubber on the way out;
+/// - fields no consuming view reads are excluded rather than redacted — the
+///   raw trigger payload, the untrusted-framing marker, gate revision
+///   bookkeeping, structured tool output payloads, and savings counters are
+///   not on this struct, so a future serializer change cannot leak them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopRunDetail {
+    pub run_id: String,
+    pub sop_name: String,
+    pub status: SopRunStatus,
+    pub current_step: u32,
+    pub total_steps: u32,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub waiting_since: Option<String>,
+    /// Where the run's trigger came from (manual, a channel, cron, ...).
+    pub trigger_source: String,
+    /// The trigger's routing topic, scrubbed; the raw payload is excluded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_topic: Option<String>,
+    /// True while the run is live rather than a retained terminal record.
+    pub active: bool,
+    /// Why the run failed, scrubbed. This is the run-level cause the engine
+    /// retains, not a step's output: a run can fail before any step result
+    /// exists — an input-schema rejection finishes the run straight from
+    /// validation — and then this is the only explanation the response carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    pub steps: Vec<SopStepDetail>,
+}
+
+/// One executed step inside [`SopRunDetail`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopStepDetail {
+    pub step_number: u32,
+    pub status: SopStepStatus,
+    /// Scrubbed display output (or failure text) recorded for the step.
+    pub output: String,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<SopToolCallDetail>,
+}
+
+/// One tool invocation inside [`SopStepDetail`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopToolCallDetail {
+    pub index: u32,
+    pub tool: String,
+    /// Scrubbed arguments the tool actually received.
+    pub args: serde_json::Value,
+    pub success: bool,
+    /// Scrubbed display output.
+    pub output: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub duration_ms: u64,
+}
+
+impl SopRunDetail {
+    pub fn from_run(run: &SopRun, active: bool) -> Self {
+        use crate::agent::turn::redact::{scrub_credentials, scrub_credentials_value};
+        Self {
+            run_id: run.run_id.clone(),
+            sop_name: run.sop_name.clone(),
+            status: run.status,
+            current_step: run.current_step,
+            total_steps: run.total_steps,
+            started_at: run.started_at.clone(),
+            completed_at: run.completed_at.clone(),
+            waiting_since: run.waiting_since.clone(),
+            trigger_source: run.trigger_event.source.to_string(),
+            trigger_topic: run.trigger_event.topic.as_deref().map(scrub_credentials),
+            active,
+            failure_reason: run.failure_reason.as_deref().map(scrub_credentials),
+            steps: run
+                .step_results
+                .iter()
+                .map(|step| SopStepDetail {
+                    step_number: step.step_number,
+                    status: step.status,
+                    output: scrub_credentials(&step.output),
+                    started_at: step.started_at.clone(),
+                    completed_at: step.completed_at.clone(),
+                    effective_agent: step.effective_agent.clone(),
+                    tool_calls: step
+                        .tool_calls
+                        .iter()
+                        .map(|call| SopToolCallDetail {
+                            index: call.index,
+                            tool: call.tool.clone(),
+                            args: scrub_credentials_value(call.args.clone()),
+                            success: call.success,
+                            output: scrub_credentials(&call.output),
+                            error: call.error.as_deref().map(scrub_credentials),
+                            duration_ms: call.duration_ms,
+                        })
+                        .collect(),
+                })
+                .collect(),
         }
     }
 }
@@ -1423,6 +1575,7 @@ path = "/sop/test"
         let run = SopRun {
             run_id: "run-001".into(),
             sop_name: "test-sop".into(),
+            initiating_agent: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,
@@ -1449,6 +1602,7 @@ path = "/sop/test"
             llm_calls_saved: 0,
             revision: 0,
             revision_base: 0,
+            decided_mode: None,
         };
         let json = serde_json::to_string(&run).unwrap();
         let parsed: SopRun = serde_json::from_str(&json).unwrap();

@@ -1027,6 +1027,27 @@ impl InputBarState {
         }
     }
 
+    /// Delete the grapheme cluster immediately after the cursor (forward
+    /// delete). A selection deletes the whole range instead; at the end of the
+    /// input there is nothing after the cursor, so it is a no-op rather than a
+    /// cursor move.
+    pub fn delete_next_char(&mut self) {
+        if self.selection.is_some() {
+            self.delete_selection();
+            self.cursor =
+                crate::text_navigation::normalize_grapheme_cursor(&self.input, self.cursor);
+            self.update_autocomplete();
+            return;
+        }
+        if self.cursor < self.input.len() {
+            let next_end = crate::text_navigation::next_grapheme_boundary(&self.input, self.cursor);
+            self.input.replace_range(self.cursor..next_end, "");
+            self.cursor =
+                crate::text_navigation::normalize_grapheme_cursor(&self.input, self.cursor);
+            self.update_autocomplete();
+        }
+    }
+
     pub fn delete_previous_word(&mut self) {
         if self.selection.is_some() {
             self.delete_selection();
@@ -1386,6 +1407,10 @@ impl InputBarState {
             }
             Some(IbWidgetAction::DeletePreviousWord) => {
                 self.delete_previous_word();
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::DeleteForward) => {
+                self.delete_next_char();
                 return InputBarAction::Consumed;
             }
             Some(IbWidgetAction::ClearInput) => {
@@ -2378,6 +2403,66 @@ mod tests {
 
         assert!(matches!(action, InputBarAction::Consumed));
         assert_eq!(bar.input(), "hello worl");
+        assert_eq!(bar.cursor(), bar.input().len());
+    }
+
+    #[test]
+    fn plain_delete_removes_the_grapheme_after_the_cursor() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("hello world");
+        bar.move_cursor_left();
+        bar.move_cursor_left();
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        // Cursor sits between the two `l`s after two steps back from the end.
+        assert_eq!(bar.input(), "hello word");
+        assert_eq!(bar.cursor(), "hello wor".len());
+    }
+
+    #[test]
+    fn plain_delete_at_the_end_of_the_input_is_a_no_op() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("hello");
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "hello");
+        assert_eq!(bar.cursor(), bar.input().len());
+    }
+
+    #[test]
+    fn plain_delete_removes_the_selection_when_one_is_active() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("hello world");
+        bar.selection = Some((6, 11));
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "hello ");
+        assert!(bar.selection.is_none());
+        assert_eq!(bar.cursor(), "hello ".len());
+    }
+
+    #[test]
+    fn plain_delete_removes_whole_grapheme_clusters() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("🇺x🇸");
+        bar.cursor = "🇺".len();
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        // The two regional indicators rejoin into one cluster, so the cursor
+        // has to be renormalized onto the new boundary.
+        assert_eq!(bar.input(), "🇺🇸");
         assert_eq!(bar.cursor(), bar.input().len());
     }
 

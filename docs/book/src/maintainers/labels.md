@@ -51,6 +51,10 @@ Today `.github/labeler.yml` owns only path and scope labels such as `docs`, `ci`
 
 Size automation may recalculate on every pushed PR update so labels continue to describe the actual diff under review. #9345 owns the separate risk-classifier rollout. Its risk phase remains report-only until maintainers review the evidence and separately enable mutation. Report-only output must record the proposed risk, matching rule evidence, current risk, `risk:manual` state, and `domain:security` state so maintainers can audit mismatches and security-shaped work that escaped both triggers. Any future risk automation must honor `risk:manual` as a hard freeze: it cannot add, remove, or replace a PR's `risk:*` label until a maintainer removes the override.
 
+## Optional CI execution
+
+`ci:windows` is a maintainer-applied compute switch for advisory Windows tests on a PR, not a review or security approval. It is separate from the automatic `ci` path label. See [when to request Windows execution](./ci-and-actions.md#label-gated-advisory-windows-tests-windows-testsyml) for selection guidance, repeat-run behavior, and how to read the result.
+
 ## Cleanup protocol
 
 Label cleanup is a maintainer action, not a side effect of normal PR review.
@@ -167,7 +171,7 @@ Some scoped component labels are manual routing labels rather than synchronized 
 
 `domain:security` identifies an effective authentication, authorization, credential, secret-handling, confinement, tool-permission, security-policy, cryptographic-identity, or untrusted-input boundary. Apply it when the changed behavior crosses that boundary, including outside canonical security paths. Do not apply it only because a PR discusses security, changes security documentation or tests, updates an advisory dependency, or performs generic hardening without changing a trust boundary. The label remains manual because path matching cannot reliably infer this consequence.
 
-`domain:security` is independent from `risk:*`. A PR carrying either `risk:high` or `domain:security` requires deep review and two independent Core Team approvals before merge. Automated review does not count as a Core Team approval.
+`domain:security` is independent from `risk:*`. A PR carrying either `risk:high` or `domain:security` requires deep review and defaults to two independent Core Team approvals before merge. Only the [expedited second-review lane](./pr-workflow.md#expedited-second-review-lane) provides a standing exception, and automated review never counts as a Core Team approval.
 
 The following duplicate domain and product-surface labels are pending retirement. Do not apply them to new work. They remain live only until a separate exact operation packet migrates any remaining open references and deletes the definitions.
 
@@ -310,8 +314,8 @@ New or manual applications should use the canonical no-space labels below. Exist
 |---|---|
 | `risk:low` | Documentation, localization, fixtures, generated references, or mechanical metadata with no production, compatibility, build, release, or governance effect |
 | `risk:medium` | Ordinary behavioral production change, including most runtime, gateway, provider, channel, tool, config, application, and CI work |
-| `risk:high` | A concrete trust, credential, compatibility, governance, or release-authority boundary that needs deep review and two independent Core Team approvals |
-| `risk:manual` | Maintainer override that freezes future automated risk replacement; it does not lower review or approval requirements |
+| `risk:high` | A concrete trust, credential, compatibility, governance, or release-authority boundary that needs deep review and defaults to two independent Core Team approvals; see the [expedited second-review lane](./pr-workflow.md#expedited-second-review-lane) |
+| `risk:manual` | Maintainer override that freezes future automated risk replacement; it does not by itself lower review or approval requirements |
 
 `risk:*` describes the actual diff and its consequence, not broad component location. A production-inert test-only change inside a high-risk boundary may be `risk:medium` when the complete test-only boundary is demonstrable; #9530 is authoritative for that exception.
 

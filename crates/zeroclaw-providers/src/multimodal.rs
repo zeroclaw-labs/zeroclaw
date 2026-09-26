@@ -11,7 +11,7 @@ use zeroclaw_api::media::{
 use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_config::schema::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
 
-const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
+pub const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
 
 /// Per-path cache for resolved local image data URIs. Keyed by absolute
 /// path; stores `(len, mtime)` for freshness checks (`(0, 0)` sentinel
@@ -348,9 +348,9 @@ fn is_windows_unc_path(candidate: &str) -> bool {
     !server.is_empty() && !share.is_empty()
 }
 
-fn collapse_wrapped_marker(raw: &str) -> String {
+fn collapse_wrapped_marker(raw: &str) -> Cow<'_, str> {
     if !raw.contains('\n') && !raw.contains('\r') {
-        return raw.trim().to_string();
+        return Cow::Borrowed(raw.trim());
     }
     let mut out = String::with_capacity(raw.len());
     let mut skip_ws = false;
@@ -367,7 +367,7 @@ fn collapse_wrapped_marker(raw: &str) -> String {
         }
         out.push(ch);
     }
-    out.trim().to_string()
+    Cow::Owned(out.trim().to_string())
 }
 
 /// True when `content` holds an image marker, terminated or not.
@@ -381,20 +381,21 @@ pub(crate) fn carries_image_marker(content: &str) -> bool {
     content.contains(IMAGE_MARKER_PREFIX)
 }
 
-pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
-    let mut refs = Vec::new();
-    let mut cleaned = String::with_capacity(content.len());
+/// Walk `content` once, reporting every span that survives as text through
+/// `on_text` and every loadable, collapsed image reference through `on_ref`.
+/// Both [`parse_image_markers`] and [`image_marker_summary`] are built on
+/// this scanner so the marker grammar has one definition.
+fn scan_image_markers(content: &str, mut on_text: impl FnMut(&str), mut on_ref: impl FnMut(&str)) {
     let mut cursor = 0usize;
 
     while let Some(rel_start) = content[cursor..].find(IMAGE_MARKER_PREFIX) {
         let start = cursor + rel_start;
-        cleaned.push_str(&content[cursor..start]);
+        on_text(&content[cursor..start]);
 
         let marker_start = start + IMAGE_MARKER_PREFIX.len();
         let Some(rel_end) = content[marker_start..].find(']') else {
-            cleaned.push_str(&content[start..]);
-            cursor = content.len();
-            break;
+            on_text(&content[start..]);
+            return;
         };
 
         let end = marker_start + rel_end;
@@ -404,35 +405,63 @@ pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
             // Preserve the original marker text (placeholders like
             // `[IMAGE:...]` or `[IMAGE:<path>]` should survive as prose
             // rather than triggering a loader error).
-            cleaned.push_str(&content[start..=end]);
+            on_text(&content[start..=end]);
         } else {
-            refs.push(candidate);
+            on_ref(candidate.as_ref());
         }
 
         cursor = end + 1;
     }
 
     if cursor < content.len() {
-        cleaned.push_str(&content[cursor..]);
+        on_text(&content[cursor..]);
     }
+}
 
+pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
+    let mut cleaned = String::with_capacity(content.len());
+    let mut refs = Vec::new();
+    scan_image_markers(
+        content,
+        |text| cleaned.push_str(text),
+        |reference| refs.push(reference.to_string()),
+    );
     (cleaned.trim().to_string(), refs)
 }
 
-pub fn count_image_markers(messages: &[ChatMessage]) -> usize {
-    let latest_tool_indices = latest_tool_result_indices(messages);
-    count_image_markers_with_latest_tool_results(messages, &latest_tool_indices)
+/// Byte count of the non-marker text and the number of loadable references,
+/// computed by the same scanner as `parse_image_markers` without building
+/// the cleaned string or copying references.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImageMarkerSummary {
+    pub text_bytes: usize,
+    pub image_refs: usize,
 }
 
-fn count_image_markers_with_latest_tool_results(
+pub fn image_marker_summary(content: &str) -> ImageMarkerSummary {
+    let mut summary = ImageMarkerSummary::default();
+    scan_image_markers(
+        content,
+        |text| summary.text_bytes += text.len(),
+        |_| summary.image_refs += 1,
+    );
+    summary
+}
+
+pub fn count_image_markers(messages: &[ChatMessage]) -> usize {
+    let current_turn_tool_indices = current_turn_tool_result_indices(messages);
+    count_image_markers_with_current_turn_tool_results(messages, &current_turn_tool_indices)
+}
+
+fn count_image_markers_with_current_turn_tool_results(
     messages: &[ChatMessage],
-    latest_tool_result_indices: &HashSet<usize>,
+    current_turn_tool_result_indices: &HashSet<usize>,
 ) -> usize {
     messages
         .iter()
         .enumerate()
         .filter(|(index, message)| {
-            should_normalize_message_images(*index, message, latest_tool_result_indices)
+            should_normalize_message_images(*index, message, current_turn_tool_result_indices)
         })
         .map(|(_, message)| parse_image_markers(&message.content).1.len())
         .sum()
@@ -484,6 +513,28 @@ const MEDIA_MARKER_KINDS: &[&str] = &[
 /// document and file delivery.
 const AUDIO_MARKER_KINDS: &[&str] = &["VOICE", "AUDIO"];
 
+/// Force-compile this module's lazy regexes on the caller's thread.
+///
+/// A cold `regex` compile descends through dozens of `regex_automata` NFA
+/// compiler frames; `strip_media_markers` and the audio-marker checks run
+/// deep inside turn processing, so the registry builder warms both here —
+/// on its own dedicated thread — before any turn stack exists.
+pub fn warm_lazy_regexes() {
+    // Force the fn-local media-marker regex by running one strip; the
+    // result is unused, only the initialization matters.
+    let _ = strip_media_markers("");
+    std::sync::LazyLock::force(&AUDIO_MARKER_RE);
+}
+
+/// Text a degraded media marker is replaced with before the history reaches
+/// a model that cannot consume the payload. The model may echo it verbatim
+/// into a reply, so it is plain prose rather than bracket syntax: it must
+/// never parse as an outbound delivery marker (`[KIND:target]`, which the
+/// channel parsers key on `[` and `:`), and it contains no JSON-special
+/// characters so a marker replaced inside a native tool-result blob leaves
+/// the surrounding object valid.
+pub const MEDIA_PLACEHOLDER: &str = "(media attachment omitted)";
+
 pub fn strip_media_markers(text: &str) -> String {
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(&format!(
@@ -492,7 +543,7 @@ pub fn strip_media_markers(text: &str) -> String {
         ))
         .expect("static media-marker regex must compile")
     });
-    RE.replace_all(text, "[media attachment]").into_owned()
+    RE.replace_all(text, MEDIA_PLACEHOLDER).into_owned()
 }
 
 /// Matches the audio-kind markers ([`AUDIO_MARKER_KINDS`]), capturing the
@@ -507,23 +558,23 @@ static AUDIO_MARKER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock:
 
 /// Replace audio markers (`[AUDIO:...]`, `[VOICE:...]`) whose payload is a
 /// *loadable* reference (absolute path, `http(s)://` URL, or `data:` URI) with
-/// the same `[media attachment]` placeholder the degrade path uses, returning
-/// the rewritten text and the number of markers replaced.
+/// the same [`MEDIA_PLACEHOLDER`] the degrade path uses, returning the
+/// rewritten text and the number of markers replaced.
 ///
 /// Non-loadable payloads are left as literal text — placeholders (`[AUDIO:...]`),
 /// prose (`[AUDIO:<clip>]`), and the no-transcription note (`[Audio: attached]`)
 /// are harmless and must survive — mirroring how [`parse_image_markers`]
 /// preserves non-loadable `[IMAGE:...]` markers. Runs over the raw string so it
 /// also cleans a marker embedded in a native tool-result JSON blob
-/// (`{"content":"…[AUDIO:/clip.wav]…"}`): `[media attachment]` contains no
-/// JSON-special characters, so the surrounding object stays valid.
+/// (`{"content":"…[AUDIO:/clip.wav]…"}`); see [`MEDIA_PLACEHOLDER`] for why
+/// the surrounding object stays valid.
 fn strip_unplayable_audio_markers(text: &str) -> (String, usize) {
     let mut stripped = 0usize;
     let out = AUDIO_MARKER_RE.replace_all(text, |caps: &regex::Captures<'_>| {
         let payload = collapse_wrapped_marker(&caps[1]);
         if !payload.is_empty() && is_loadable_image_reference(&payload) {
             stripped += 1;
-            "[media attachment]".to_string()
+            MEDIA_PLACEHOLDER.to_string()
         } else {
             // Preserve placeholder/prose markers verbatim.
             caps[0].to_string()
@@ -532,11 +583,96 @@ fn strip_unplayable_audio_markers(text: &str) -> (String, usize) {
     (out.into_owned(), stripped)
 }
 
+/// Apply `rewrite` to the model-visible text of one history message.
+///
+/// An assistant message in native tool-call history is the JSON envelope
+/// built by the runtime (`{"content": …, "tool_calls": […],
+/// "reasoning_content"?: …}`) and parsed back by the provider adapters.
+/// It counts as an envelope only when its `tool_calls` value deserializes
+/// as `Vec<ToolCall>` — the same predicate every provider adapter uses to
+/// decide that an assistant message is a tool-call envelope — so a blob
+/// the adapters would replay as plain text (absent, null, non-array, or
+/// malformed call list) is sanitized as plain text, failing closed to the
+/// whole-string rewrite instead of being protected field-wise.
+///
+/// Only its `content` string is rewritten: `reasoning_content` carries
+/// signed thinking blocks that must replay byte-for-byte, and
+/// `tool_calls[].extra_content` carries provider signatures. The envelope
+/// is re-serialized only when `content` actually changed, so an untouched
+/// envelope stays byte-identical. Every other message is rewritten as a
+/// whole string, which keeps a marker inside a native tool-result blob
+/// cleaned in place (see [`MEDIA_PLACEHOLDER`]).
+///
+/// The protected shape is the intersection every adapter treats as an
+/// envelope. The compatible adapter alone also recognizes a
+/// reasoning-without-calls envelope, but the Anthropic and OpenAI-family
+/// adapters would replay that blob as plain text, so protecting it here
+/// would leak its markers exactly the way a malformed call list does; it
+/// stays under the whole-string rule — a shape the current runtime writer
+/// never produces, since it stores plain text and drops reasoning when
+/// there are no calls.
+fn rewrite_model_visible_text(
+    message: &ChatMessage,
+    rewrite: impl Fn(&str) -> (String, usize),
+) -> (String, usize) {
+    let parsed_envelope = if message.role == "assistant" {
+        serde_json::from_str::<serde_json::Value>(&message.content).ok()
+    } else {
+        None
+    };
+    let Some(mut envelope) = parsed_envelope else {
+        return rewrite(&message.content);
+    };
+    if !envelope.get("tool_calls").is_some_and(|tool_calls| {
+        serde_json::from_value::<Vec<zeroclaw_api::model_provider::ToolCall>>(tool_calls.clone())
+            .is_ok()
+    }) {
+        return rewrite(&message.content);
+    }
+    let Some(content) = envelope.get("content").and_then(serde_json::Value::as_str) else {
+        // A null or absent `content` carries nothing model-visible to
+        // rewrite; the envelope must stay byte-identical.
+        return (message.content.clone(), 0);
+    };
+    let (rewritten, n) = rewrite(content);
+    if n == 0 {
+        // Nothing changed: hand back the original bytes, never a
+        // re-serialization whose key order or escaping could drift.
+        return (message.content.clone(), 0);
+    }
+    envelope["content"] = serde_json::Value::String(rewritten);
+    (envelope.to_string(), n)
+}
+
+/// Strip every media marker from the model-visible text of one message,
+/// for the text-only degrade path: all marker kinds, all roles.
+///
+/// Same contract as [`sanitize_image_markers`] and
+/// [`sanitize_audio_markers`], applied to a single message: an assistant
+/// tool-call envelope is rewritten field-wise (only its `content` string,
+/// through `rewrite_model_visible_text`) so signed `reasoning_content` and
+/// `tool_calls[].extra_content` replay byte-for-byte, and every other
+/// message is rewritten as a whole string. [`strip_media_markers`] stays
+/// the plain-string form for callers that hold text rather than a history
+/// message.
+pub fn strip_media_markers_model_visible(message: &ChatMessage) -> String {
+    rewrite_model_visible_text(message, |text| {
+        let out = strip_media_markers(text);
+        let n = usize::from(out != text);
+        (out, n)
+    })
+    .0
+}
+
 /// Strip loadable audio markers (see `strip_unplayable_audio_markers`)
 /// across every message in `messages`, logging one degradation warning when
 /// any are removed. Returns the input borrowed when no candidate marker is
 /// present (the common, allocation-free path) or an owned rebuilt vector
 /// otherwise.
+///
+/// Assistant messages in native tool-call history are rewritten field-wise —
+/// only their `content` string, through `rewrite_model_visible_text` — so
+/// signed reasoning inside the envelope survives the seam.
 ///
 /// This is the shared seam keeping a raw audio path out of provider payloads,
 /// whichever route the history takes:
@@ -559,7 +695,7 @@ pub fn sanitize_audio_markers(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]
     let rebuilt: Vec<ChatMessage> = messages
         .iter()
         .map(|m| {
-            let (content, n) = strip_unplayable_audio_markers(&m.content);
+            let (content, n) = rewrite_model_visible_text(m, strip_unplayable_audio_markers);
             stripped += n;
             ChatMessage {
                 role: m.role.clone(),
@@ -583,6 +719,100 @@ pub fn sanitize_audio_markers(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]
     Cow::Owned(rebuilt)
 }
 
+/// Matches image markers, capturing the payload for the inline-reference
+/// check. Built from [`IMAGE_MARKER_PREFIX`] so this seam helper and
+/// [`parse_image_markers`] agree on exactly which markers are image markers;
+/// the match is case-sensitive for the same reason.
+static IMAGE_MARKER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(&format!(
+        r"{}([^\]]*)\]",
+        regex::escape(IMAGE_MARKER_PREFIX)
+    ))
+    .expect("static image-marker regex must compile")
+});
+
+/// Replace image markers whose payload is a loadable reference other than an
+/// inline `data:` URI (a filesystem path or an `http(s)://` URL) with the same
+/// [`MEDIA_PLACEHOLDER`] the degrade path uses, returning the rewritten text
+/// and the number of markers replaced.
+///
+/// A `data:` URI is inline content: it has either already passed the
+/// normalizer's size and MIME checks or will hit the provider adapter's
+/// structural check, so it stays. Non-loadable payloads are prose and stay
+/// verbatim, mirroring how [`parse_image_markers`] preserves them. Runs over
+/// the raw string so a marker embedded in a native tool-result JSON blob is
+/// cleaned in place; see [`MEDIA_PLACEHOLDER`] for why the surrounding object
+/// stays valid.
+fn strip_undeliverable_image_markers(text: &str) -> (String, usize) {
+    let mut stripped = 0usize;
+    let out = IMAGE_MARKER_RE.replace_all(text, |caps: &regex::Captures<'_>| {
+        let payload = collapse_wrapped_marker(&caps[1]);
+        if !payload.is_empty()
+            && is_loadable_image_reference(&payload)
+            && !payload.starts_with("data:")
+        {
+            stripped += 1;
+            MEDIA_PLACEHOLDER.to_string()
+        } else {
+            // Preserve inline data URIs and non-loadable markers verbatim.
+            caps[0].to_string()
+        }
+    });
+    (out.into_owned(), stripped)
+}
+
+/// Strip image markers that cannot be delivered inline (see
+/// `strip_undeliverable_image_markers`) across every message, logging one
+/// degradation warning when any are removed. Returns the input borrowed when
+/// no image marker is present (the common, allocation-free path) or an owned
+/// rebuilt vector otherwise.
+///
+/// Assistant messages in native tool-call history are rewritten field-wise —
+/// only their `content` string, through `rewrite_model_visible_text` — so
+/// signed reasoning inside the envelope survives the seam.
+///
+/// This is the fail-closed backstop on one-shot dispatch seams that send
+/// stored history without the full multimodal preparation: a filesystem path
+/// or URL image marker can no longer reach a provider adapter, whichever
+/// route the history took. Inline `data:` URIs and non-loadable prose markers
+/// pass through; callers that want the turn's images delivered run the full
+/// normalizer before they reach this point.
+pub fn sanitize_image_markers(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]> {
+    if !messages
+        .iter()
+        .any(|m| IMAGE_MARKER_RE.is_match(&m.content))
+    {
+        return Cow::Borrowed(messages);
+    }
+
+    let mut stripped = 0usize;
+    let rebuilt: Vec<ChatMessage> = messages
+        .iter()
+        .map(|m| {
+            let (content, n) = rewrite_model_visible_text(m, strip_undeliverable_image_markers);
+            stripped += n;
+            ChatMessage {
+                role: m.role.clone(),
+                content,
+            }
+        })
+        .collect();
+
+    if stripped > 0 {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "markers_stripped": stripped,
+                })),
+            "multimodal: stripped image marker(s) with a path or URL reference on a one-shot dispatch seam; no size or content validation runs there, so the reference was replaced with a placeholder instead of being sent to the model as text"
+        );
+    }
+
+    Cow::Owned(rebuilt)
+}
+
 pub fn extract_ollama_image_payload(image_ref: &str) -> Option<String> {
     if image_ref.starts_with("data:") {
         let comma_idx = image_ref.find(',')?;
@@ -598,47 +828,88 @@ pub fn extract_ollama_image_payload(image_ref: &str) -> Option<String> {
     }
 }
 
+pub(crate) fn is_prompt_tool_result_content(content: &str) -> bool {
+    content.trim_start().starts_with("[Tool results]")
+}
+
 pub(crate) fn is_prompt_tool_result_message(message: &ChatMessage) -> bool {
-    message.role == "user" && message.content.trim_start().starts_with("[Tool results]")
+    message.role == "user" && is_prompt_tool_result_content(&message.content)
 }
 
 fn is_tool_result_carrier(message: &ChatMessage) -> bool {
     message.role == "tool" || is_prompt_tool_result_message(message)
 }
 
-fn latest_tool_result_indices(messages: &[ChatMessage]) -> HashSet<usize> {
+/// Indices of every tool-result carrier in the CURRENT user turn: the
+/// carriers after the most recent user message that is not itself a
+/// prompt-mode tool-result carrier. If no such user message exists, every
+/// tool-result carrier qualifies. Tool images stay live for the user turn
+/// that produced them; they are stripped once the next user message
+/// arrives, so a tool image is never replayed on every later request
+/// forever.
+fn current_turn_tool_result_indices(messages: &[ChatMessage]) -> HashSet<usize> {
+    let current_turn_start = messages
+        .iter()
+        .rposition(|message| message.role == "user" && !is_prompt_tool_result_message(message));
+
     let mut indices = HashSet::new();
-    let Some((last_index, last_message)) = messages.iter().enumerate().next_back() else {
-        return indices;
-    };
-
-    if is_prompt_tool_result_message(last_message) {
-        indices.insert(last_index);
-        return indices;
-    }
-
-    if last_message.role == "tool" {
-        for (index, message) in messages.iter().enumerate().rev() {
-            if message.role != "tool" {
-                break;
-            }
+    for (index, message) in messages.iter().enumerate() {
+        if current_turn_start.is_some_and(|start| index < start) {
+            continue;
+        }
+        if is_tool_result_carrier(message) {
             indices.insert(index);
         }
     }
-
     indices
 }
 
 fn should_normalize_message_images(
     index: usize,
     message: &ChatMessage,
-    latest_tool_result_indices: &HashSet<usize>,
+    current_turn_tool_result_indices: &HashSet<usize>,
 ) -> bool {
     if is_tool_result_carrier(message) {
-        return latest_tool_result_indices.contains(&index);
+        return current_turn_tool_result_indices.contains(&index);
     }
 
     message.role == "user"
+}
+
+/// How multimodal preparation will treat the `[IMAGE:...]` markers in a
+/// message at its position in the history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageMarkerDisposition {
+    /// Loadable markers become provider image blocks: user messages and the
+    /// tool-result carriers in the current user turn.
+    Normalized,
+    /// Markers are stripped before dispatch: tool-result carriers before the
+    /// current user turn.
+    Stripped,
+    /// Content is dispatched verbatim as text: system and assistant messages.
+    Literal,
+}
+
+/// One disposition per message, computed with the same predicates preparation
+/// uses (`is_tool_result_carrier`, `current_turn_tool_result_indices`,
+/// `should_normalize_message_images`). Dispositions do not model the
+/// config-dependent image limits (`max_images`, `max_image_turns`), which can
+/// strip or cap images preparation would otherwise dispatch.
+pub fn image_marker_dispositions(messages: &[ChatMessage]) -> Vec<ImageMarkerDisposition> {
+    let current_turn_indices = current_turn_tool_result_indices(messages);
+    messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            if should_normalize_message_images(index, message, &current_turn_indices) {
+                ImageMarkerDisposition::Normalized
+            } else if is_tool_result_carrier(message) {
+                ImageMarkerDisposition::Stripped
+            } else {
+                ImageMarkerDisposition::Literal
+            }
+        })
+        .collect()
 }
 
 fn stripped_image_marker_text(content: &str) -> String {
@@ -685,9 +956,9 @@ fn strip_tool_result_image_markers(message: &ChatMessage) -> ChatMessage {
 fn replay_message_without_stale_tool_images(
     index: usize,
     message: &ChatMessage,
-    latest_tool_result_indices: &HashSet<usize>,
+    current_turn_tool_result_indices: &HashSet<usize>,
 ) -> ChatMessage {
-    if is_tool_result_carrier(message) && !latest_tool_result_indices.contains(&index) {
+    if is_tool_result_carrier(message) && !current_turn_tool_result_indices.contains(&index) {
         strip_tool_result_image_markers(message)
     } else {
         message.clone()
@@ -768,8 +1039,9 @@ async fn prepare_messages_inner(
     let (max_images, max_image_size_mb) = config.effective_limits();
     let max_bytes = max_image_size_mb.saturating_mul(1024 * 1024);
 
-    let latest_tool_indices = latest_tool_result_indices(messages);
-    let total_images = count_image_markers_with_latest_tool_results(messages, &latest_tool_indices);
+    let current_turn_tool_indices = current_turn_tool_result_indices(messages);
+    let total_images =
+        count_image_markers_with_current_turn_tool_results(messages, &current_turn_tool_indices);
 
     if total_images == 0 {
         return Ok(PreparedMessages {
@@ -777,7 +1049,11 @@ async fn prepare_messages_inner(
                 .iter()
                 .enumerate()
                 .map(|(index, message)| {
-                    replay_message_without_stale_tool_images(index, message, &latest_tool_indices)
+                    replay_message_without_stale_tool_images(
+                        index,
+                        message,
+                        &current_turn_tool_indices,
+                    )
                 })
                 .collect(),
             contains_images: false,
@@ -793,16 +1069,16 @@ async fn prepare_messages_inner(
     // prevents conversations from sticking once the cumulative count crosses
     // the threshold, so no pre-normalization trim is needed here.
     let remote_client = build_runtime_proxy_client_with_timeouts("model_provider.ollama", 30, 10);
-    let latest_tool_indices = latest_tool_result_indices(messages);
+    let current_turn_tool_indices = current_turn_tool_result_indices(messages);
 
     let mut normalized_messages = Vec::with_capacity(messages.len());
     let mut has_successful_images = false;
     for (index, message) in messages.iter().enumerate() {
-        if !should_normalize_message_images(index, message, &latest_tool_indices) {
+        if !should_normalize_message_images(index, message, &current_turn_tool_indices) {
             normalized_messages.push(replay_message_without_stale_tool_images(
                 index,
                 message,
-                &latest_tool_indices,
+                &current_turn_tool_indices,
             ));
             continue;
         }
@@ -860,8 +1136,10 @@ async fn prepare_messages_inner(
         });
     }
 
-    // Apply age-based trimming when configured: strip images from user messages
-    // older than `max_image_turns` turns back from the end of history.
+    // Apply age-based trimming when configured: strip images from user
+    // messages older than `max_image_turns` real user turns back from the end
+    // of history. Prompt-mode tool-result carriers never count as turns and
+    // are never aged out here; the stale-tool rule above owns their lifetime.
     // `max_image_turns == 0` means disabled — no age trimming.
     let age_trimmed = if config.max_image_turns > 0 {
         let before = count_image_markers(&normalized_messages);
@@ -909,12 +1187,18 @@ async fn prepare_messages_inner(
         messages: capped_messages,
     })
 }
+
+/// Strip image markers from user messages older than `max_turns` conversation
+/// turns, where a turn opens at a user message that is not a prompt-mode
+/// tool-result carrier. Carriers never advance the turn count and are never
+/// stripped here; the stale-tool rule and the post-normalization image cap
+/// govern their lifetime, as the `max_image_turns` schema doc documents.
 fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMessage> {
-    // Count user messages from the end to find the cutoff index.
+    // Count real user turns from the end to find the cutoff index.
     let mut user_turn_count = 0usize;
     let mut cutoff = 0usize; // messages at index < cutoff are "too old"
     for (i, m) in messages.iter().enumerate().rev() {
-        if m.role == "user" {
+        if m.role == "user" && !is_prompt_tool_result_message(m) {
             user_turn_count += 1;
             if user_turn_count > max_turns {
                 // Everything up to and including this index is too old.
@@ -932,7 +1216,7 @@ fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMes
         .iter()
         .enumerate()
         .map(|(i, m)| {
-            if i < cutoff && m.role == "user" {
+            if i < cutoff && m.role == "user" && !is_prompt_tool_result_message(m) {
                 let (cleaned, refs) = parse_image_markers(&m.content);
                 if refs.is_empty() {
                     return m.clone();
@@ -960,13 +1244,13 @@ fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMes
 /// are dropped, so a message holding more images than the budget allows keeps
 /// its newest ones instead of losing all of them.
 fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessage> {
-    let latest_tool_indices = latest_tool_result_indices(messages);
+    let current_turn_tool_indices = current_turn_tool_result_indices(messages);
     // Find which messages (by index) contain images, oldest first.
     let image_positions: Vec<(usize, usize)> = messages
         .iter()
         .enumerate()
         .filter(|(index, message)| {
-            should_normalize_message_images(*index, message, &latest_tool_indices)
+            should_normalize_message_images(*index, message, &current_turn_tool_indices)
         })
         .filter_map(|(i, m)| {
             let count = parse_image_markers(&m.content).1.len();
@@ -998,7 +1282,7 @@ fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessa
         .enumerate()
         .map(|(i, m)| {
             let Some(&drop_here) = drop_counts.get(&i) else {
-                return replay_message_without_stale_tool_images(i, m, &latest_tool_indices);
+                return replay_message_without_stale_tool_images(i, m, &current_turn_tool_indices);
             };
 
             trim_message_images(m, drop_here)
@@ -1536,6 +1820,155 @@ fn normalize_content_type(content_type: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn image_marker_dispositions_match_preparation() {
+        let temp = tempfile::tempdir().unwrap();
+        let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        let marker = |name: &str| {
+            let path = temp.path().join(format!("{name}.png"));
+            std::fs::write(&path, png).unwrap();
+            format!("[IMAGE:{}]", path.display())
+        };
+
+        // Native shape: the tool carrier before the current user turn is
+        // Stripped, both tool rounds inside the current turn stay Normalized,
+        // and the assistant's marker is Literal (dispatched verbatim).
+        let native = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(format!("hi {}", marker("native-user-early"))),
+            ChatMessage::assistant(format!("yo {}", marker("native-assistant"))),
+            ChatMessage::tool(format!("early result {}", marker("native-tool-early"))),
+            ChatMessage::user(format!("turn two {}", marker("native-user-current"))),
+            ChatMessage::assistant("calling"),
+            ChatMessage::tool(format!("round one {}", marker("native-tool-round-one"))),
+            ChatMessage::assistant("calling again"),
+            ChatMessage::tool(format!("round two {}", marker("native-tool-round-two"))),
+        ];
+        assert_eq!(
+            image_marker_dispositions(&native),
+            vec![
+                ImageMarkerDisposition::Literal,    // system
+                ImageMarkerDisposition::Normalized, // user message
+                ImageMarkerDisposition::Literal,    // assistant: verbatim text
+                ImageMarkerDisposition::Stripped,   // tool carrier before the current turn
+                ImageMarkerDisposition::Normalized, // user message
+                ImageMarkerDisposition::Literal,    // assistant
+                ImageMarkerDisposition::Normalized, // current turn, first tool round
+                ImageMarkerDisposition::Literal,    // assistant
+                ImageMarkerDisposition::Normalized, // current turn, second tool round
+            ]
+        );
+
+        // Prompt-mode shape: a `[Tool results]` carrier before the current
+        // turn is Stripped, and the same carriers inside the current turn are
+        // Normalized without opening a new turn.
+        let prompt_mode = vec![
+            ChatMessage::user(format!(
+                "[Tool results]\nearly carrier {}",
+                marker("prompt-early")
+            )),
+            ChatMessage::user(format!("turn {}", marker("prompt-user"))),
+            ChatMessage::assistant("called"),
+            ChatMessage::user(format!(
+                "[Tool results]\ncarrier one {}",
+                marker("prompt-carrier-one")
+            )),
+            ChatMessage::user(format!(
+                "[Tool results]\ncarrier two {}",
+                marker("prompt-carrier-two")
+            )),
+        ];
+        assert_eq!(
+            image_marker_dispositions(&prompt_mode),
+            vec![
+                ImageMarkerDisposition::Stripped, // carrier before the current turn
+                ImageMarkerDisposition::Normalized, // the real user message
+                ImageMarkerDisposition::Literal,  // assistant
+                ImageMarkerDisposition::Normalized, // carrier inside the current turn
+                ImageMarkerDisposition::Normalized, // carrier inside the current turn
+            ]
+        );
+
+        // Dispositions do not model the config-dependent cap or age trim, so
+        // the fixture stays under the cap and the age trim stays off; what
+        // preparation does to each message must then match its disposition.
+        let config = MultimodalConfig {
+            max_images: 8,
+            ..Default::default()
+        };
+
+        for (name, history) in [("native", &native), ("prompt_mode", &prompt_mode)] {
+            let dispositions = image_marker_dispositions(history);
+            let prepared = prepare_messages_for_provider(history, &config)
+                .await
+                .unwrap();
+            assert_eq!(prepared.messages.len(), history.len());
+
+            for (index, (original, disposition)) in
+                history.iter().zip(dispositions.iter()).enumerate()
+            {
+                let content = &prepared.messages[index].content;
+                let inline_image = content.contains("data:image/png;base64,");
+                let had_marker = original.content.contains(".png");
+                match disposition {
+                    ImageMarkerDisposition::Normalized => {
+                        assert!(
+                            inline_image,
+                            "{name}[{index}] Normalized must dispatch an image block"
+                        );
+                        assert!(
+                            !content.contains(".png"),
+                            "{name}[{index}] Normalized must not replay the raw path"
+                        );
+                    }
+                    ImageMarkerDisposition::Stripped => {
+                        assert!(
+                            !inline_image,
+                            "{name}[{index}] Stripped must not dispatch an image block"
+                        );
+                        assert!(
+                            !content.contains(".png"),
+                            "{name}[{index}] Stripped must drop the marker"
+                        );
+                    }
+                    ImageMarkerDisposition::Literal => {
+                        assert!(
+                            !inline_image,
+                            "{name}[{index}] Literal must not dispatch an image block"
+                        );
+                        if had_marker {
+                            assert!(
+                                content.contains(".png"),
+                                "{name}[{index}] Literal must replay the marker verbatim"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn image_marker_summary_matches_parse_image_markers() {
+        let placeholder = "[IMAGE:...]";
+        let content = format!(
+            "  see [IMAGE:/tmp/a.png] plus {placeholder} and [IMAGE:/tmp/wrapped-\nlong.png] ok  "
+        );
+        let (cleaned, refs) = parse_image_markers(&content);
+        let summary = image_marker_summary(&content);
+
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0], "/tmp/a.png");
+        assert_eq!(refs[1], "/tmp/wrapped-long.png");
+        assert_eq!(summary.image_refs, refs.len());
+
+        // Every byte the scanner keeps as text, placeholder included, without
+        // the trim parse applies to its cleaned string.
+        let expected_text = format!("  see  plus {placeholder} and  ok  ");
+        assert_eq!(summary.text_bytes, expected_text.len());
+        assert_eq!(summary.text_bytes, cleaned.len() + 4);
+    }
+
     #[test]
     fn image_failure_reporting_tracks_reference_and_kind_until_success() {
         let mut cache = LocalImageCache::new();
@@ -1782,13 +2215,19 @@ mod tests {
     #[test]
     fn strip_media_markers_replaces_image_local_path() {
         let input = "Look at [IMAGE:/zeroclaw-data/workspace/telegram_files/photo_1.jpg]";
-        assert_eq!(strip_media_markers(input), "Look at [media attachment]");
+        assert_eq!(
+            strip_media_markers(input),
+            format!("Look at {MEDIA_PLACEHOLDER}")
+        );
     }
 
     #[test]
     fn strip_media_markers_replaces_image_data_uri() {
         let input = "Inline [IMAGE:data:image/png;base64,abcd]";
-        assert_eq!(strip_media_markers(input), "Inline [media attachment]");
+        assert_eq!(
+            strip_media_markers(input),
+            format!("Inline {MEDIA_PLACEHOLDER}")
+        );
     }
 
     #[test]
@@ -1797,7 +2236,7 @@ mod tests {
         // `crates/zeroclaw-channels/src/util.rs`, which is the source of
         // truth for which marker spellings inbound channels can produce.
         let input = "[IMAGE:/a.jpg] [PHOTO:/b.jpg] [DOCUMENT:/c.pdf] [FILE:/d.zip] [VIDEO:/e.mp4] [VOICE:/f.ogg] [AUDIO:/g.wav]";
-        let expected = "[media attachment] [media attachment] [media attachment] [media attachment] [media attachment] [media attachment] [media attachment]";
+        let expected = [MEDIA_PLACEHOLDER; 7].join(" ");
         assert_eq!(strip_media_markers(input), expected);
     }
 
@@ -1808,7 +2247,7 @@ mod tests {
         // but accept lower/mixed case too so we don't depend on that
         // invariant downstream.
         let input = "[image:/a.jpg] [Photo:/b.jpg] [video:/c.mp4]";
-        let expected = "[media attachment] [media attachment] [media attachment]";
+        let expected = [MEDIA_PLACEHOLDER; 3].join(" ");
         assert_eq!(strip_media_markers(input), expected);
     }
 
@@ -1824,8 +2263,25 @@ mod tests {
         let input = "Use [TODO:foo] and [NOTE:bar] but replace [IMAGE:/x.jpg]";
         assert_eq!(
             strip_media_markers(input),
-            "Use [TODO:foo] and [NOTE:bar] but replace [media attachment]"
+            format!("Use [TODO:foo] and [NOTE:bar] but replace {MEDIA_PLACEHOLDER}")
         );
+    }
+
+    #[test]
+    fn media_placeholder_is_prose_not_a_marker() {
+        // A model may copy the placeholder from its input into a reply, so it
+        // must not be anything the marker grammar recognises: no bracket
+        // span, and nothing the strip paths would rewrite again.
+        assert!(!MEDIA_PLACEHOLDER.contains('['));
+        assert!(!MEDIA_PLACEHOLDER.contains(']'));
+        assert!(!MEDIA_PLACEHOLDER.contains(':'));
+        assert!(!MEDIA_PLACEHOLDER.contains(['"', '\\']));
+        assert_eq!(strip_media_markers(MEDIA_PLACEHOLDER), MEDIA_PLACEHOLDER);
+        assert_eq!(
+            strip_unplayable_audio_markers(MEDIA_PLACEHOLDER),
+            (MEDIA_PLACEHOLDER.to_string(), 0)
+        );
+        assert!(parse_image_markers(MEDIA_PLACEHOLDER).1.is_empty());
     }
 
     // ── loadable audio markers degrade; other media kinds keep their paths ──
@@ -1833,7 +2289,7 @@ mod tests {
     #[test]
     fn strip_unplayable_audio_markers_replaces_loadable_audio_path() {
         let (out, n) = strip_unplayable_audio_markers("hear this [AUDIO:/tmp/clip.wav] now");
-        assert_eq!(out, "hear this [media attachment] now");
+        assert_eq!(out, format!("hear this {MEDIA_PLACEHOLDER} now"));
         assert_eq!(n, 1);
     }
 
@@ -1846,7 +2302,10 @@ mod tests {
         let (out, n) = strip_unplayable_audio_markers(input);
         assert_eq!(
             out,
-            "[PHOTO:/a.jpg] [DOCUMENT:/b.pdf] [FILE:/c.zip] [VIDEO:/d.mp4] [media attachment] [media attachment]"
+            format!(
+                "[PHOTO:/a.jpg] [DOCUMENT:/b.pdf] [FILE:/c.zip] [VIDEO:/d.mp4] \
+                 {MEDIA_PLACEHOLDER} {MEDIA_PLACEHOLDER}"
+            )
         );
         assert_eq!(n, 2);
     }
@@ -1866,7 +2325,7 @@ mod tests {
         // `[IMAGE:...]` is handled by `parse_image_markers`; the audio
         // stripper must never touch it (that would drop a resolvable image).
         let (out, n) = strip_unplayable_audio_markers("[IMAGE:/a.png] and [AUDIO:/b.wav]");
-        assert_eq!(out, "[IMAGE:/a.png] and [media attachment]");
+        assert_eq!(out, format!("[IMAGE:/a.png] and {MEDIA_PLACEHOLDER}"));
         assert_eq!(n, 1);
     }
 
@@ -1892,7 +2351,7 @@ mod tests {
     #[test]
     fn strip_unplayable_audio_markers_is_case_insensitive() {
         let (out, n) = strip_unplayable_audio_markers("[Audio:/tmp/clip.wav]");
-        assert_eq!(out, "[media attachment]");
+        assert_eq!(out, MEDIA_PLACEHOLDER);
         assert_eq!(n, 1);
     }
 
@@ -1901,8 +2360,321 @@ mod tests {
         let (out, n) = strip_unplayable_audio_markers(
             "[VOICE:data:audio/ogg;base64,AAAA] and [AUDIO:https://x/y.mp3]",
         );
-        assert_eq!(out, "[media attachment] and [media attachment]");
+        assert_eq!(out, format!("{MEDIA_PLACEHOLDER} and {MEDIA_PLACEHOLDER}"));
         assert_eq!(n, 2);
+    }
+
+    // ── seam-level image sanitize: paths/URLs drop, inline data URIs stay ──
+
+    #[test]
+    fn strip_undeliverable_image_markers_replaces_path_and_url() {
+        let (out, n) = strip_undeliverable_image_markers(
+            "see [IMAGE:/tmp/shot.png] and [IMAGE:https://x/y.png]",
+        );
+        assert_eq!(
+            out,
+            format!("see {MEDIA_PLACEHOLDER} and {MEDIA_PLACEHOLDER}")
+        );
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn strip_undeliverable_image_markers_keeps_inline_data_uri() {
+        let (out, n) =
+            strip_undeliverable_image_markers("see [IMAGE:data:image/png;base64,iVBORw0KGgo=]");
+        assert_eq!(out, "see [IMAGE:data:image/png;base64,iVBORw0KGgo=]");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn strip_undeliverable_image_markers_preserves_non_loadable_payloads() {
+        // Prose and placeholder markers are harmless literal text and must
+        // survive, mirroring `parse_image_markers`.
+        for input in ["[IMAGE:...]", "[IMAGE:<screenshot>]", "[IMAGE:shot.png]"] {
+            let (out, n) = strip_undeliverable_image_markers(input);
+            assert_eq!(out, input, "should preserve non-loadable marker: {input}");
+            assert_eq!(
+                n, 0,
+                "non-loadable marker must not count as stripped: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_undeliverable_image_markers_is_case_sensitive_like_parse() {
+        // `parse_image_markers` matches the prefix literally, so a lowercase
+        // kind is prose everywhere downstream; the seam helper must agree or
+        // it would rewrite text the in-loop path leaves alone.
+        let (out, n) = strip_undeliverable_image_markers("[image:/tmp/shot.png]");
+        assert_eq!(out, "[image:/tmp/shot.png]");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn sanitize_image_markers_borrows_clean_input() {
+        let messages = [ChatMessage::user("no markers here")];
+        assert!(matches!(
+            sanitize_image_markers(&messages),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn sanitize_image_markers_borrows_when_only_inline_data_uris_present() {
+        let messages = [ChatMessage::user(
+            "see [IMAGE:data:image/png;base64,iVBORw0KGgo=]",
+        )];
+        let sanitized = sanitize_image_markers(&messages);
+        // Rebuilt (the regex matched) but byte-identical content.
+        assert_eq!(sanitized[0].content, messages[0].content);
+    }
+
+    #[test]
+    fn sanitize_image_markers_rewrites_path_markers_in_place() {
+        let marker = format!("[{}:{}]", "IMAGE", "/tmp/shot.png");
+        let messages = [
+            ChatMessage::user("look"),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "content": format!("saved {marker}"),
+                    "tool_call_id": "toolu_1",
+                })
+                .to_string(),
+            ),
+        ];
+        let sanitized = sanitize_image_markers(&messages);
+        assert_eq!(sanitized[0].content, "look");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&sanitized[1].content).expect("tool JSON stays valid");
+        assert_eq!(
+            parsed["content"],
+            format!("saved {MEDIA_PLACEHOLDER}"),
+            "the marker inside the native tool-result envelope must be replaced"
+        );
+        assert_eq!(parsed["tool_call_id"], "toolu_1");
+    }
+
+    // The assistant history entry for native tool calls is a JSON envelope
+    // (`content` / `tool_calls` / `reasoning_content`). `reasoning_content`
+    // carries signed thinking blocks and `tool_calls[].extra_content` carries
+    // provider signatures; both must replay byte-for-byte, so the seam
+    // rewrites only the envelope's `content` field.
+    #[test]
+    fn sanitize_image_markers_preserves_signed_reasoning_in_assistant_envelope() {
+        let marker = format!("[{}:{}]", "IMAGE", "/tmp/shot.png");
+        let reasoning = format!(r#"{{"thinking":"look at {marker} first","signature":"sig_abc"}}"#);
+        let tool_calls = serde_json::json!([{
+            "id": "toolu_1",
+            "name": "shell",
+            "arguments": "{}",
+            "extra_content": {"google": {"thought_signature": "sig_gemini"}},
+        }]);
+        let messages = [
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": format!("saved {marker}"),
+                    "tool_calls": tool_calls.clone(),
+                    "reasoning_content": reasoning.clone(),
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "content": format!("saved {marker}"),
+                    "tool_call_id": "toolu_1",
+                })
+                .to_string(),
+            ),
+        ];
+        let sanitized = sanitize_image_markers(&messages);
+        let parsed: serde_json::Value = serde_json::from_str(&sanitized[0].content)
+            .expect("assistant envelope stays valid JSON");
+        assert_eq!(
+            parsed["content"],
+            format!("saved {MEDIA_PLACEHOLDER}"),
+            "the marker in the envelope's content field is replaced"
+        );
+        assert_eq!(
+            parsed["reasoning_content"].as_str(),
+            Some(reasoning.as_str()),
+            "signed thinking must survive the seam byte-for-byte"
+        );
+        assert_eq!(
+            parsed["tool_calls"], tool_calls,
+            "tool calls (including extra_content signatures) must round-trip unchanged"
+        );
+        let tool_parsed: serde_json::Value =
+            serde_json::from_str(&sanitized[1].content).expect("tool JSON stays valid");
+        assert_eq!(
+            tool_parsed["content"],
+            format!("saved {MEDIA_PLACEHOLDER}"),
+            "the tool message's marker is still replaced in place"
+        );
+    }
+
+    // The envelope's only marker lives inside `reasoning_content`, so the
+    // `content` rewrite counts zero and the envelope must come back
+    // byte-identical. The input is a hand-written non-canonical spelling —
+    // `tool_calls` before `content`, a space after a colon, and `\u002f`
+    // escapes inside the marker's path — which serde_json would never
+    // produce: a re-serialization spells the path with `/` and drops the
+    // spaces, so only the zero-rewrite early return can reproduce these
+    // exact bytes.
+    #[test]
+    fn sanitize_image_markers_leaves_assistant_envelope_byte_identical_when_only_reasoning_matches()
+    {
+        let marker = format!("[{}:{}]", "IMAGE", r"\u002ftmp\u002fshot.png");
+        let envelope = format!(
+            r#"{{"tool_calls": [{{"id": "toolu_1", "name": "shell", "arguments": "{{}}", "extra_content": {{"google": {{"thought_signature": "sig_gemini"}}}}}}], "content": "running the tool", "reasoning_content": "{{\"thinking\":\"look at {marker} first\",\"signature\":\"sig_abc\"}}"}}"#
+        );
+        let messages = [ChatMessage::assistant(envelope)];
+        let sanitized = sanitize_image_markers(&messages);
+        assert_eq!(
+            sanitized[0].content, messages[0].content,
+            "an envelope whose content is untouched must not be re-serialized"
+        );
+    }
+
+    // A malformed call list (an element missing `name`/`arguments`) makes
+    // every adapter replay the whole blob as plain assistant text, so the
+    // seam must sanitize it as plain text too: fail-closed whole-string
+    // rewrite, not field-wise protection that would leave a marker inside
+    // `reasoning_content` untouched.
+    #[test]
+    fn sanitize_image_markers_rewrites_whole_string_when_tool_calls_do_not_deserialize() {
+        let marker = format!("[{}:{}]", "IMAGE", "/tmp/shot.png");
+        let reasoning = format!(r#"{{"thinking":"look at {marker} first","signature":"sig_abc"}}"#);
+        let envelope = serde_json::json!({
+            "content": "running",
+            "tool_calls": [{"id": "x"}],
+            "reasoning_content": reasoning,
+        })
+        .to_string();
+        let messages = [ChatMessage::assistant(envelope)];
+        let sanitized = sanitize_image_markers(&messages);
+        assert!(
+            sanitized[0].content.contains(MEDIA_PLACEHOLDER),
+            "a malformed call list must fall back to the whole-string rewrite: {}",
+            sanitized[0].content
+        );
+        assert!(
+            !sanitized[0].content.contains("/tmp/shot.png"),
+            "the marker inside the reasoning field must not survive as a raw path: {}",
+            sanitized[0].content
+        );
+    }
+
+    // `null` is not an envelope either: without a call list to deserialize,
+    // the adapters replay the blob as plain text, and the seam must match.
+    #[test]
+    fn sanitize_image_markers_rewrites_whole_string_when_tool_calls_is_not_an_array() {
+        let marker = format!("[{}:{}]", "IMAGE", "/tmp/shot.png");
+        let reasoning = format!(r#"{{"thinking":"look at {marker} first","signature":"sig_abc"}}"#);
+        let envelope = serde_json::json!({
+            "content": "running",
+            "tool_calls": null,
+            "reasoning_content": reasoning,
+        })
+        .to_string();
+        let messages = [ChatMessage::assistant(envelope)];
+        let sanitized = sanitize_image_markers(&messages);
+        assert!(
+            sanitized[0].content.contains(MEDIA_PLACEHOLDER),
+            "a null call list must fall back to the whole-string rewrite: {}",
+            sanitized[0].content
+        );
+        assert!(
+            !sanitized[0].content.contains("/tmp/shot.png"),
+            "the marker inside the reasoning field must not survive as a raw path: {}",
+            sanitized[0].content
+        );
+    }
+
+    // Audio twin of the image case: the seam rewrites the envelope's
+    // `content` field and leaves the signed reasoning untouched.
+    #[test]
+    fn sanitize_audio_markers_preserves_signed_reasoning_in_assistant_envelope() {
+        let marker = format!("[{}:{}]", "AUDIO", "/tmp/clip.wav");
+        let reasoning = format!(
+            r#"{{"thinking":"listen to {marker} before answering","signature":"sig_abc"}}"#
+        );
+        let tool_calls = serde_json::json!([{
+            "id": "toolu_1",
+            "name": "shell",
+            "arguments": "{}",
+            "extra_content": {"google": {"thought_signature": "sig_gemini"}},
+        }]);
+        let messages = [
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": format!("heard {marker}"),
+                    "tool_calls": tool_calls.clone(),
+                    "reasoning_content": reasoning.clone(),
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "content": format!("heard {marker}"),
+                    "tool_call_id": "toolu_1",
+                })
+                .to_string(),
+            ),
+        ];
+        let sanitized = sanitize_audio_markers(&messages);
+        let parsed: serde_json::Value = serde_json::from_str(&sanitized[0].content)
+            .expect("assistant envelope stays valid JSON");
+        assert_eq!(
+            parsed["content"],
+            format!("heard {MEDIA_PLACEHOLDER}"),
+            "the audio marker in the envelope's content field is replaced"
+        );
+        assert_eq!(
+            parsed["reasoning_content"].as_str(),
+            Some(reasoning.as_str()),
+            "signed thinking must survive the seam byte-for-byte"
+        );
+        assert_eq!(
+            parsed["tool_calls"], tool_calls,
+            "tool calls (including extra_content signatures) must round-trip unchanged"
+        );
+        let tool_parsed: serde_json::Value =
+            serde_json::from_str(&sanitized[1].content).expect("tool JSON stays valid");
+        assert_eq!(
+            tool_parsed["content"],
+            format!("heard {MEDIA_PLACEHOLDER}"),
+            "the tool message's audio marker is still replaced in place"
+        );
+    }
+
+    // Audio twin of the malformed-call-list case: the envelope's call list
+    // does not deserialize, so the adapters replay the blob as plain text
+    // and the seam rewrites it as plain text, marker inside
+    // `reasoning_content` included.
+    #[test]
+    fn sanitize_audio_markers_rewrites_whole_string_when_tool_calls_do_not_deserialize() {
+        let marker = format!("[{}:{}]", "AUDIO", "/tmp/clip.wav");
+        let reasoning = format!(
+            r#"{{"thinking":"listen to {marker} before answering","signature":"sig_abc"}}"#
+        );
+        let envelope = serde_json::json!({
+            "content": "running",
+            "tool_calls": [{"id": "x"}],
+            "reasoning_content": reasoning,
+        })
+        .to_string();
+        let messages = [ChatMessage::assistant(envelope)];
+        let sanitized = sanitize_audio_markers(&messages);
+        assert!(
+            sanitized[0].content.contains(MEDIA_PLACEHOLDER),
+            "a malformed call list must fall back to the whole-string rewrite: {}",
+            sanitized[0].content
+        );
+        assert!(
+            !sanitized[0].content.contains("/tmp/clip.wav"),
+            "the marker inside the reasoning field must not survive as a raw path: {}",
+            sanitized[0].content
+        );
     }
 
     #[tokio::test]
@@ -1926,7 +2698,7 @@ mod tests {
             "raw audio path must not reach the provider: {}",
             tool_msg.content
         );
-        assert!(tool_msg.content.contains("[media attachment]"));
+        assert!(tool_msg.content.contains(MEDIA_PLACEHOLDER));
         assert!(!prepared.contains_images);
     }
 
@@ -1979,7 +2751,7 @@ mod tests {
             !content.contains("/tmp/clip.wav"),
             "audio path must be stripped: {content}"
         );
-        assert!(content.contains("[media attachment]"));
+        assert!(content.contains(MEDIA_PLACEHOLDER));
         // The image marker is still normalized to a data URI alongside it.
         assert!(prepared.contains_images, "image still inlined: {content}");
     }
@@ -2495,6 +3267,346 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn prepare_messages_keeps_tool_image_after_unrelated_tool_call_in_same_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("same-turn-tool-result.png");
+        let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        std::fs::write(&image_path, png).unwrap();
+
+        let image_tool_content = serde_json::json!({
+            "tool_call_id": "tc_image",
+            "content": format!(
+                "generated screenshot [IMAGE:{}]",
+                image_path.display().to_string()
+            ),
+        })
+        .to_string();
+        let weather_tool_content = serde_json::json!({
+            "tool_call_id": "tc_weather",
+            "content": "Sunny, 25C".to_string(),
+        })
+        .to_string();
+
+        let messages = vec![
+            ChatMessage::user("Take a screenshot, then check the weather.".to_string()),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "tc_image", "name": "screenshot", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(image_tool_content),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "tc_weather", "name": "weather", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(weather_tool_content),
+        ];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("tool images stay live for the user turn that produced them");
+
+        assert!(
+            prepared.contains_images,
+            "an image tool result followed by an unrelated tool result in the same turn must stay normalized"
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&prepared.messages[2].content)
+            .expect("tool result should remain valid JSON");
+        assert_eq!(
+            value.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("tc_image")
+        );
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content should remain a JSON string");
+        assert!(inner.contains("generated screenshot"));
+        // The marker is rewritten in place to wrap the data URI, so the raw
+        // filesystem path must be gone while the payload is inline.
+        assert!(inner.contains("data:image/png;base64,"));
+        assert!(!inner.contains("same-turn-tool-result.png"));
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_strips_tool_image_after_next_user_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("same-turn-tool-result.png");
+        let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        std::fs::write(&image_path, png).unwrap();
+
+        let image_tool_content = serde_json::json!({
+            "tool_call_id": "tc_image",
+            "content": format!(
+                "generated screenshot [IMAGE:{}]",
+                image_path.display().to_string()
+            ),
+        })
+        .to_string();
+        let weather_tool_content = serde_json::json!({
+            "tool_call_id": "tc_weather",
+            "content": "Sunny, 25C".to_string(),
+        })
+        .to_string();
+
+        let messages = vec![
+            ChatMessage::user("Take a screenshot, then check the weather.".to_string()),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "tc_image", "name": "screenshot", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(image_tool_content),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "tc_weather", "name": "weather", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(weather_tool_content),
+            ChatMessage::user("What did you find?".to_string()),
+        ];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("stale tool images should strip without loading them");
+
+        assert!(
+            !prepared.contains_images,
+            "once the next user message arrives the turn's tool images are stale"
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&prepared.messages[2].content)
+            .expect("stale native tool result should remain valid JSON");
+        assert_eq!(
+            value.get("tool_call_id").and_then(|v| v.as_str()),
+            Some("tc_image")
+        );
+        let inner = value
+            .get("content")
+            .and_then(|v| v.as_str())
+            .expect("content should remain a JSON string");
+        assert!(inner.contains("generated screenshot"));
+        assert!(!inner.contains("[IMAGE:"));
+        assert!(!inner.contains("data:image"));
+        assert!(!inner.contains("same-turn-tool-result.png"));
+
+        let weather_value: serde_json::Value = serde_json::from_str(&prepared.messages[4].content)
+            .expect("the text-only tool result should remain valid JSON");
+        assert_eq!(
+            weather_value.get("content").and_then(|v| v.as_str()),
+            Some("Sunny, 25C")
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_keeps_prompt_mode_tool_images_within_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("same-turn-prompt-tool-result.png");
+        let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        std::fs::write(&image_path, png).unwrap();
+
+        let messages = vec![
+            ChatMessage::user("Compare these two.".to_string()),
+            ChatMessage::user(format!(
+                "[Tool results]\n<tool_result name=\"image_gen\">Generated [IMAGE:{}]</tool_result>",
+                image_path.display()
+            )),
+            ChatMessage::user(
+                "[Tool results]\n<tool_result name=\"weather\">Sunny, 25C</tool_result>"
+                    .to_string(),
+            ),
+        ];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("prompt-mode tool images stay live for the user turn that produced them");
+
+        assert!(
+            prepared.contains_images,
+            "an earlier prompt-mode tool-result carrier in the same turn must stay normalized"
+        );
+
+        assert!(prepared.messages[1].content.contains("[Tool results]"));
+        assert!(prepared.messages[1].content.contains("Generated"));
+        assert!(
+            prepared.messages[1]
+                .content
+                .contains("data:image/png;base64,")
+        );
+        assert!(
+            !prepared.messages[1]
+                .content
+                .contains("same-turn-prompt-tool-result.png")
+        );
+        assert!(prepared.messages[2].content.contains("Sunny, 25C"));
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_keeps_prompt_mode_tool_images_within_turn_under_age_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_image_path = temp.path().join("age-limit-user-attachment.png");
+        let tool_image_path = temp.path().join("age-limit-tool-result.png");
+        // Minimal valid PNG (1x1 RGB pixel).
+        let png_data = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2, 0x21, 0xBC,
+            0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(&user_image_path, png_data).unwrap();
+        std::fs::write(&tool_image_path, png_data).unwrap();
+
+        let messages = vec![
+            ChatMessage::user(format!(
+                "Inspect the attached image, then check session information\n[IMAGE:{}]",
+                user_image_path.display()
+            )),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "tc_image", "name": "image_tool", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::user(format!(
+                "[Tool results]\n<tool_result name=\"image_tool\">Generated [IMAGE:{}]</tool_result>",
+                tool_image_path.display()
+            )),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "tc_session", "name": "session_info", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::user(
+                "[Tool results]\n<tool_result name=\"session_info\">session id: abc-123</tool_result>"
+                    .to_string(),
+            ),
+        ];
+
+        let config = MultimodalConfig {
+            max_images: 4,
+            max_image_turns: 1,
+            ..Default::default()
+        };
+
+        let prepared = prepare_messages_for_provider(&messages, &config)
+            .await
+            .expect("one user turn holding two carriers must not age the turn's images out");
+
+        assert!(
+            prepared.contains_images,
+            "the user's own image and the same-turn tool image must both survive the age limit"
+        );
+
+        assert!(
+            prepared.messages[0]
+                .content
+                .contains("Inspect the attached image, then check session information")
+        );
+        assert!(
+            prepared.messages[0]
+                .content
+                .contains("data:image/png;base64,")
+        );
+        assert!(
+            !prepared.messages[0]
+                .content
+                .contains("age-limit-user-attachment.png")
+        );
+        assert!(prepared.messages[2].content.contains("[Tool results]"));
+        assert!(prepared.messages[2].content.contains("Generated"));
+        assert!(
+            prepared.messages[2]
+                .content
+                .contains("data:image/png;base64,")
+        );
+        assert!(
+            !prepared.messages[2]
+                .content
+                .contains("age-limit-tool-result.png")
+        );
+        assert!(prepared.messages[4].content.contains("session id: abc-123"));
+    }
+
+    #[test]
+    fn trim_images_by_age_still_strips_real_user_images_past_the_limit() {
+        let messages = vec![
+            ChatMessage::user("[IMAGE:/old/user-image.png]".to_string()),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "Done.".to_string(),
+            },
+            ChatMessage::user("Next question".to_string()),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "Answered.".to_string(),
+            },
+            ChatMessage::user("Follow-up".to_string()),
+        ];
+
+        let trimmed = trim_images_by_age(&messages, 1);
+
+        assert_eq!(trimmed[0].content, "[image removed from history]");
+        assert_eq!(trimmed[1].content, "Done.");
+        assert_eq!(trimmed[2].content, "Next question");
+        assert_eq!(trimmed[3].content, "Answered.");
+        assert_eq!(trimmed[4].content, "Follow-up");
+    }
+
+    #[test]
+    fn trim_images_by_age_ignores_prompt_mode_carriers_when_counting() {
+        let messages = vec![
+            ChatMessage::user("Inspect this screenshot.".to_string()),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "On it.".to_string(),
+            },
+            ChatMessage::user(
+                "[Tool results]\n<tool_result name=\"image_gen\">Generated [IMAGE:/tmp/tool-image.png]</tool_result>"
+                    .to_string(),
+            ),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "Checked.".to_string(),
+            },
+            ChatMessage::user(
+                "[Tool results]\n<tool_result name=\"weather\">Sunny, 25C</tool_result>"
+                    .to_string(),
+            ),
+        ];
+
+        let trimmed = trim_images_by_age(&messages, 1);
+
+        assert_eq!(trimmed[0].content, messages[0].content);
+        assert_eq!(trimmed[2].content, messages[2].content);
+        assert_eq!(trimmed[4].content, messages[4].content);
+    }
+
     #[test]
     fn count_image_markers_ignores_stale_tool_results() {
         let messages = vec![
@@ -2511,6 +3623,23 @@ mod tests {
         let messages = vec![
             ChatMessage::user("Create an image".to_string()),
             ChatMessage::tool("[IMAGE:/tmp/latest-tool.png]\nGenerated".to_string()),
+        ];
+
+        assert_eq!(count_image_markers(&messages), 1);
+    }
+
+    #[test]
+    fn count_image_markers_counts_tool_images_within_turn() {
+        // The image tool result sits before a later, text-only tool result in
+        // the same user turn; the vision gate must still see its image.
+        let messages = vec![
+            ChatMessage::user("Create an image, then check the weather.".to_string()),
+            ChatMessage::tool("[IMAGE:/tmp/same-turn-tool.png]\nGenerated".to_string()),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "Checking the weather next.".to_string(),
+            },
+            ChatMessage::tool("Sunny, 25C".to_string()),
         ];
 
         assert_eq!(count_image_markers(&messages), 1);

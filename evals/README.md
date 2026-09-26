@@ -2,7 +2,7 @@
 
 Suites of agent evaluation cases for `zeroclaw eval run` (crate: `crates/zeroclaw-eval`).
 
-- `regression/` — must stay at 100% pass. Gated in CI (`crates/zeroclaw-eval/tests/regression_suite.rs`). A failure here blocks merge.
+- `regression/` — must stay at 100% pass. Gated in CI (`crates/zeroclaw-eval/tests/regression_suite.rs`). A failure here blocks merge. The corpus is repository-only; the published `zeroclaw-eval` crate archive excludes the gate and does not carry these fixtures.
 - `capability/` (planned) — hard tasks with a low pass rate; tracked over time, never gated.
 - `live/` (planned) — cases executed against a real provider; cost money, never run in CI by default.
 

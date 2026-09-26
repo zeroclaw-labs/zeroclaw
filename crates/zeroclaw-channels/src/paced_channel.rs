@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex, oneshot};
 use zeroclaw_api::attribution::{Attributable, Role};
 use zeroclaw_api::channel::{
-    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, DraftProgress,
-    ProgressEvent, RoomCreationOptions, SendMessage,
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage,
+    ChannelModelPickerRequest, DraftProgress, ProgressEvent, RoomCreationOptions, SendMessage,
 };
 use zeroclaw_config::schema::{DEFAULT_REPLY_QUEUE_DEPTH, HasReplyPacing, PACING_RECIPIENT_CAP};
 
@@ -347,6 +347,13 @@ impl Channel for PacedChannel {
         self.inner.health_check().await
     }
 
+    /// The picker is an interactive control surface, not paced outbound
+    /// traffic. Without this forward the trait default's `Ok(false)` would
+    /// silently swallow the picker whenever pacing wraps the channel.
+    async fn present_model_picker(&self, request: &ChannelModelPickerRequest) -> Result<bool> {
+        self.inner.present_model_picker(request).await
+    }
+
     /// Forward the inner channel's passive observation.
     ///
     /// Without this the trait default (`None`) answers for the wrapper, and a
@@ -373,8 +380,18 @@ impl Channel for PacedChannel {
         self.inner.supports_multi_message_streaming()
     }
 
+    fn supports_turn_flush_narration(&self) -> bool {
+        self.inner.supports_turn_flush_narration()
+    }
+
     fn multi_message_delay_ms(&self) -> u64 {
         self.inner.multi_message_delay_ms()
+    }
+
+    async fn multi_message_confirmed_offset(&self, recipient: &str, message_id: &str) -> usize {
+        self.inner
+            .multi_message_confirmed_offset(recipient, message_id)
+            .await
     }
 
     async fn send_draft(&self, message: &SendMessage) -> Result<Option<String>> {
@@ -430,6 +447,23 @@ impl Channel for PacedChannel {
     ) -> Result<()> {
         self.inner
             .update_draft_lifecycle(recipient, message_id, event)
+            .await
+    }
+
+    async fn flush_draft_turn(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
+        self.inner
+            .flush_draft_turn(recipient, message_id, text)
+            .await
+    }
+
+    async fn discard_draft_turn(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> Result<()> {
+        self.inner
+            .discard_draft_turn(recipient, message_id, text)
             .await
     }
 
@@ -490,6 +524,24 @@ impl Channel for PacedChannel {
         self.inner.invite_user(room_id, user_id).await
     }
 
+    /// Forwarded rather than paced: a poll is one stanza, and the inner
+    /// channel owns whatever limits apply to it.
+    fn supports_native_polls(&self) -> bool {
+        self.inner.supports_native_polls()
+    }
+
+    async fn send_poll(&self, poll: &zeroclaw_api::channel::PollRequest) -> Result<()> {
+        self.inner.send_poll(poll).await
+    }
+
+    /// Must be forwarded explicitly: the trait default returns `None`, so
+    /// without this every channel wrapped here would report that it supplies no
+    /// room context, no matter what the inner channel knows. Pacing concerns
+    /// outbound sends only and has no opinion about a room's description.
+    fn room_context(&self, room_id: &str) -> Option<zeroclaw_api::channel::ChannelRoomContext> {
+        self.inner.room_context(room_id)
+    }
+
     async fn request_approval(
         &self,
         recipient: &str,
@@ -547,9 +599,9 @@ mod tests {
     /// Minimal `HasReplyPacing` for tests so we can construct pacing
     /// configs without dragging a full `*Config` literal into every
     /// case. Mirrors the production trait shape exactly.
-    struct PacingFixture {
-        interval_secs: u64,
-        depth: u16,
+    pub(super) struct PacingFixture {
+        pub(super) interval_secs: u64,
+        pub(super) depth: u16,
     }
     impl HasReplyPacing for PacingFixture {
         fn reply_min_interval_secs(&self) -> u64 {
@@ -670,6 +722,7 @@ mod tests {
     struct RoomManagementChannel {
         creates: AtomicUsize,
         invites: AtomicUsize,
+        polls: AtomicUsize,
     }
 
     impl Attributable for RoomManagementChannel {
@@ -701,6 +754,14 @@ mod tests {
             assert_eq!(room_id, "!ops:example.org");
             assert_eq!(user_id, "@alice:example.org");
             self.invites.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn supports_native_polls(&self) -> bool {
+            true
+        }
+        async fn send_poll(&self, poll: &zeroclaw_api::channel::PollRequest) -> Result<()> {
+            assert_eq!(poll.question, "Which tasting slot?");
+            self.polls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -1028,6 +1089,7 @@ mod tests {
         let counting = Arc::new(RoomManagementChannel {
             creates: AtomicUsize::new(0),
             invites: AtomicUsize::new(0),
+            polls: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
         let cfg = PacingFixture {
@@ -1050,6 +1112,96 @@ mod tests {
 
         assert_eq!(counting.creates.load(Ordering::SeqCst), 1);
         assert_eq!(counting.invites.load(Ordering::SeqCst), 1);
+    }
+
+    /// A multi-message-streaming channel that reports a fixed nonzero
+    /// confirmed-delivery offset, so the test can prove the paced wrapper
+    /// forwards the query instead of falling back to the trait default of 0.
+    struct ConfirmedOffsetChannel {
+        confirmed_offset: usize,
+    }
+
+    impl Attributable for ConfirmedOffsetChannel {
+        fn role(&self) -> Role {
+            Role::Channel(zeroclaw_api::attribution::ChannelKind::Matrix)
+        }
+        fn alias(&self) -> &str {
+            "confirmed-offset"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for ConfirmedOffsetChannel {
+        fn name(&self) -> &str {
+            "confirmed-offset"
+        }
+        async fn send(&self, _message: &SendMessage) -> Result<()> {
+            Ok(())
+        }
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+            Ok(())
+        }
+        fn supports_multi_message_streaming(&self) -> bool {
+            true
+        }
+        async fn multi_message_confirmed_offset(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+        ) -> usize {
+            self.confirmed_offset
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_message_confirmed_offset_forwards_to_inner_channel() {
+        let inner: Arc<dyn Channel> = Arc::new(ConfirmedOffsetChannel {
+            confirmed_offset: 42,
+        });
+        let cfg = PacingFixture {
+            interval_secs: 3600,
+            depth: 4,
+        };
+        let paced = PacedChannel::wrap(inner, &cfg);
+
+        assert!(paced.supports_multi_message_streaming());
+        assert_eq!(
+            paced
+                .multi_message_confirmed_offset("alice", "draft-1")
+                .await,
+            42,
+            "paced wrapper must report the inner channel's confirmed offset, not the trait default of 0",
+        );
+    }
+
+    /// Without the forwarding overrides the wrapper would report that no
+    /// channel posts native polls, and every poll would silently become text.
+    #[tokio::test]
+    async fn native_polls_reach_the_inner_channel() {
+        let counting = Arc::new(RoomManagementChannel {
+            creates: AtomicUsize::new(0),
+            invites: AtomicUsize::new(0),
+            polls: AtomicUsize::new(0),
+        });
+        let inner: Arc<dyn Channel> = counting.clone();
+        let paced = PacedChannel::wrap(
+            inner,
+            &PacingFixture {
+                interval_secs: 3600,
+                depth: 4,
+            },
+        );
+
+        assert!(paced.supports_native_polls());
+        paced
+            .send_poll(&zeroclaw_api::channel::PollRequest::new(
+                "15550001111",
+                "Which tasting slot?",
+                vec!["Friday".into(), "Saturday".into()],
+            ))
+            .await
+            .expect("the inner channel accepts the poll");
+        assert_eq!(counting.polls.load(Ordering::SeqCst), 1);
     }
 
     /// A channel whose `send` blocks until the test releases a gate, so the
@@ -1138,5 +1290,80 @@ mod tests {
             2,
             "both sends eventually dispatch exactly once each",
         );
+    }
+}
+
+/// The wrapper must not swallow capabilities the inner channel implements.
+///
+/// `PacedChannel` wraps every registered channel, so any `Channel` method it
+/// forgets to forward silently falls back to the trait default for the whole
+/// deployment. That is how `room_context` shipped broken: Mattermost
+/// implemented it, the wrapper did not forward it, and the runtime saw the
+/// default `None` with nothing logged and nothing failing.
+#[cfg(test)]
+mod forwarding_tests {
+    use super::tests::PacingFixture;
+    use super::*;
+    use zeroclaw_api::channel::ChannelRoomContext;
+
+    struct ContextChannel;
+
+    impl Attributable for ContextChannel {
+        fn role(&self) -> Role {
+            Role::Channel(zeroclaw_api::attribution::ChannelKind::Cli)
+        }
+        fn alias(&self) -> &str {
+            "context"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for ContextChannel {
+        fn name(&self) -> &str {
+            "context"
+        }
+        async fn send(&self, _message: &SendMessage) -> Result<()> {
+            Ok(())
+        }
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+            Ok(())
+        }
+        fn room_context(&self, room_id: &str) -> Option<ChannelRoomContext> {
+            (room_id == "room1").then(|| ChannelRoomContext {
+                purpose: Some("Arch packaging".to_string()),
+            })
+        }
+    }
+
+    /// A non-zero interval is required: `wrap` deliberately returns the inner
+    /// `Arc` unchanged when pacing is off, so a zero-interval fixture would
+    /// test the inner channel directly and prove nothing about forwarding.
+    fn paced(inner: ContextChannel) -> Arc<dyn Channel> {
+        let cfg = PacingFixture {
+            interval_secs: 1,
+            depth: 4,
+        };
+        PacedChannel::wrap(Arc::new(inner), &cfg)
+    }
+
+    /// The inner channel's answer must survive the wrapper.
+    #[test]
+    fn room_context_is_forwarded_to_the_inner_channel() {
+        let wrapped = paced(ContextChannel);
+        assert_eq!(
+            wrapped
+                .room_context("room1")
+                .and_then(|context| context.purpose)
+                .as_deref(),
+            Some("Arch packaging"),
+            "the wrapper must not answer for the inner channel"
+        );
+    }
+
+    /// And a genuine `None` must still be a `None`, so the test above cannot
+    /// pass by the wrapper inventing context of its own.
+    #[test]
+    fn unknown_room_still_reports_no_context() {
+        assert!(paced(ContextChannel).room_context("other").is_none());
     }
 }

@@ -165,11 +165,25 @@ fn bridge_target(config: &BridgeGatewayConfig, token: Option<String>) -> BridgeT
 }
 
 fn token_from_env() -> Option<String> {
-    env_value(ACP_BRIDGE_TOKEN_ENV)
+    token_from_env_with(|key| std::env::var(key))
+}
+
+fn token_from_env_with<F>(lookup: F) -> Option<String>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    env_value_with(ACP_BRIDGE_TOKEN_ENV, lookup)
 }
 
 fn env_value(key: &str) -> Option<String> {
-    std::env::var(key)
+    env_value_with(key, |name| std::env::var(name))
+}
+
+fn env_value_with<F>(key: &str, lookup: F) -> Option<String>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    lookup(key)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -461,31 +475,9 @@ mod tests {
         BridgeGatewayConfig, BridgeGatewayTlsConfig, CONFIG_NOT_FOUND_ERROR,
         PAIRING_TOKEN_NOT_FOUND_ERROR, acp_bridge_target, acp_websocket_url, cached_token_path,
         config_dir_from_args, exchange_pairing_code, fetch_pairing_code, http_gateway_url,
-        pair_code_from_args, read_cached_token, token_from_env, write_cached_token, write_frame,
+        pair_code_from_args, read_cached_token, token_from_env_with, write_cached_token,
+        write_frame,
     };
-
-    struct EnvGuard {
-        key: &'static str,
-        original: Option<String>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let original = std::env::var(key).ok();
-            unsafe { std::env::set_var(key, value) };
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            if let Some(value) = &self.original {
-                unsafe { std::env::set_var(self.key, value) };
-            } else {
-                unsafe { std::env::remove_var(self.key) };
-            }
-        }
-    }
 
     #[tokio::test]
     async fn write_frame_appends_newline() {
@@ -568,9 +560,12 @@ mod tests {
 
     #[test]
     fn token_from_env_uses_plaintext_bridge_token() {
-        let _guard = EnvGuard::set("ZEROCLAW_ACP_BRIDGE_TOKEN", "zc_plaintext");
+        let token = token_from_env_with(|key| {
+            assert_eq!(key, "ZEROCLAW_ACP_BRIDGE_TOKEN");
+            Ok("  zc_plaintext  ".to_string())
+        });
 
-        assert_eq!(token_from_env().as_deref(), Some("zc_plaintext"));
+        assert_eq!(token.as_deref(), Some("zc_plaintext"));
     }
 
     #[test]
