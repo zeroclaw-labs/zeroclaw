@@ -32,8 +32,9 @@ const HOUSEKEEPING_LABEL: &str = "blacksmith-4vcpu-ubuntu-2404";
 
 /// Every housekeeping job in the two workflows on the Blacksmith 4-vCPU class.
 /// Workflow-qualified IDs keep same-named jobs in different workflows distinct.
-const HOUSEKEEPING_JOBS: [&str; 16] = [
+const HOUSEKEEPING_JOBS: [&str; 17] = [
     "ci.yml/fmt",
+    "ci.yml/crates-preflight-changes",
     "ci.yml/gate",
     "ci.yml/history-guard",
     "ci.yml/repo-structure",
@@ -76,6 +77,11 @@ const COMPILE_JOBS: [&str; 12] = [
     "parallel-runtime-test",
     "installer-drift",
 ];
+
+/// Compile jobs that call a reusable workflow and hand it the fleet label as
+/// its `runner` input. They have no `runs-on` of their own, so they are kept
+/// apart from COMPILE_JOBS but still count toward the fleet inventory.
+const REUSABLE_COMPILE_JOBS: [&str; 1] = ["crates-preflight"];
 
 /// `use-blacksmith` inputs the rust-cache composite may receive. The matrix
 /// expression belongs to `build`, whose macOS and Windows legs stay on the
@@ -191,13 +197,14 @@ fn only_the_declared_compile_jobs_claim_the_blacksmith_fleet() {
         .collect();
     let declared: BTreeSet<String> = COMPILE_JOBS
         .into_iter()
+        .chain(REUSABLE_COMPILE_JOBS)
         .map(|name| format!("ci.yml/{name}"))
         .collect();
 
     assert_eq!(
         claiming, declared,
-        "every job using {RUNNER_LABEL} must be listed in COMPILE_JOBS, so the \
-         fleet inventory stays reviewable in one place"
+        "every job using {RUNNER_LABEL} must be listed in COMPILE_JOBS or \
+         REUSABLE_COMPILE_JOBS, so the fleet inventory stays reviewable in one place"
     );
 }
 
@@ -283,4 +290,24 @@ fn the_required_gate_still_waits_for_formatting() {
         "CI Required Gate must keep needing fmt: it is the only thing that still \
          makes a formatting error block merge"
     );
+}
+
+#[test]
+fn reusable_compile_jobs_pass_the_fleet_label() {
+    let workflow = ci_workflow();
+    let blocks = job_blocks(&workflow);
+
+    // These jobs compile the workspace and block the required gate. Without
+    // an explicit `runner`, the called workflow falls back to GitHub-hosted
+    // `ubuntu-latest`, which a hosted-runner outage would strand.
+    for name in REUSABLE_COMPILE_JOBS {
+        let block = blocks
+            .get(name)
+            .unwrap_or_else(|| panic!("ci.yml must define the {name} job"));
+        assert!(
+            block.contains("    uses: ./.github/workflows/")
+                && block.contains(&format!("      runner: {RUNNER_LABEL}\n")),
+            "{name} must pass runner: {RUNNER_LABEL} to its reusable workflow"
+        );
+    }
 }

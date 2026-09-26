@@ -158,6 +158,8 @@ Two independent Core Team approvals are the default. Toolchain-floor and release
 
 The **Installer Drift** gate in CI fails the PR if a generated surface is out of sync with the spec, so a missed regeneration cannot land. The **Validate Translations Pin** gate resolves the submodule at the pinned commit and validates catalogue format and msgid parity, so a bad pin cannot land either. See [Docs & Translations](../maintainers/docs-and-translations.md#filling-doc-translations-gettext) for translation pipeline details.
 
+The **crates.io Package Preflight** gate runs whenever a PR changes `[workspace.package] version` to a stable `X.Y.Z`. It packages every crate in the release set and compiles each one from its own tarball, with no registry token, so a bump whose crates cannot publish cannot merge. Expect it to add about half an hour to the bump PR. It also runs again in the merge queue. If it fails, read the Preflight step first. A packaging or compile error is real and must be fixed in the bump PR. A crates.io API error, an npm install failure, or a runner timeout is infrastructure. Re-run only the failed jobs rather than pushing again. If crates.io itself stays unavailable, an admin merge over this check is the maintainer's call. The release run repeats the same preflight before the GitHub Release, so that override cannot publish a broken crate.
+
 **Confirm the merge landed correctly:**
 
 <div class="os-tabs-src">
@@ -415,8 +417,11 @@ re-trigger. Do not try to work around it.
 Three jobs are gated by GitHub environment protection rules. When each becomes
 pending you will see a **"Waiting for review"** banner in the workflow run.
 
-Approve all three when they appear. Approve `crates-io` only after its tokenless
-package preflight is green:
+Approve all three when they appear. The `github-releases` gate appears only
+after the tokenless crates.io preflight, `Preflight crates.io Workspace`, has
+packaged and compiled every crate. It runs beside the binary builds, so a
+release whose crates cannot publish stops before anything becomes public. The
+later `crates-io` job uploads what that preflight verified without repeating it:
 
 | Environment | Job | What it does |
 |---|---|---|
@@ -580,6 +585,13 @@ policy instead.
 **validate failed: version mismatch:** The version bump PR was not merged, or
 you typed the wrong version. Fix the mismatch and re-trigger.
 
+**The crates.io preflight failed:** Nothing was published. The GitHub Release
+waits for this job, and the job holds no registry token. On a dispatched
+release the tag does not exist yet either. Fix the packaging problem on
+`master`, then dispatch Release Stable again for the same version. Run
+`scripts/release/publish-crates.sh` locally first to confirm the fix; without
+`--execute` it only packages and verifies.
+
 **An environment gate timed out:** Re-run only the timed-out job. No need to
 restart the workflow.
 
@@ -597,7 +609,10 @@ deleted. Fix the failing crate at the same release commit, then re-run
 `Pub crates.io` for the same tag with `dry_run: false`; the publisher queries
 every `<crate>@<version>` first and skips versions that already landed. Read the
 Publish step for the last successful crate. If preflight failed, no upload was
-attempted and the problem is still reversible.
+attempted and the problem is still reversible. If the publish job reports that
+`web/dist` does not match the bundle preflight verified, or that the tag does
+not resolve to the release commit, nothing was uploaded; dispatch
+`Pub crates.io` again so a fresh preflight rebuilds and re-verifies it.
 
 **The `scoop` job failed with `remote: Permission ... denied to <account>` (403):**
 A permissions problem, not a manifest problem: the bucket token is dead or

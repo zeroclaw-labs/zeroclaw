@@ -68,7 +68,9 @@ class ReleaseAttestationContractTest(unittest.TestCase):
         self.assertEqual(self.sbom.count("format: spdx-json"), 1)
         self.assertEqual(self.sbom.count("format: cyclonedx-json"), 1)
         self.assertIn("name: release-sboms", self.sbom)
-        self.assertIn("build-desktop-windows, sbom]", self.publish)
+        needs = re.search(r"(?m)^    needs: \[([^\]]*)\]$", self.publish)
+        self.assertIsNotNone(needs, "publish must declare its needs on one line")
+        self.assertIn("sbom", [job.strip() for job in needs.group(1).split(",")])
         self.assertIn("name: release-sboms", self.publish)
         sequence = ("Collect release assets", "id: attest_payloads")
         offsets = [self.publish.index(marker) for marker in sequence]

@@ -164,6 +164,12 @@ jobs:
       - name: Test crates.io publish ordering and preflight
         run: python3 scripts/release/publish_crates_test.py
 
+      - name: Test crates.io release commit resolution
+        run: python3 scripts/release/resolve_crates_release_test.py
+
+      - name: Test crates.io version-bump preflight trigger
+        run: bash scripts/ci/crates_preflight_trigger.test.sh
+
       - name: Test apt install timeout and retry behavior
         run: bash scripts/ci/apt_install.test.sh
 
@@ -1299,10 +1305,50 @@ jobs:
   # Branch protection requires only this single job — internal structure
   # can change without touching branch protection settings.
 
+  # ── crates.io package preflight on version bumps ─────────────────────────
+  # A pull request or merge-queue entry that changes [workspace.package]
+  # version to a stable X.Y.Z is a release's version bump. It must not merge
+  # unless every crate packages and compiles from its own tarball, the same
+  # tokenless check the stable release repeats before the GitHub Release.
+  # Other changes skip it; the static publish contract still runs in `test`.
+  crates-preflight-changes:
+    name: Detect crates.io version bump
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.bump.outputs.run }}
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Detect workspace version change
+        id: bump
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: bash scripts/ci/crates_preflight_trigger.sh "$EVENT_NAME" "$BASE_SHA" >> "$GITHUB_OUTPUT"
+
+  # Blocking by design: a flaky failure here is re-run, not bypassed. The
+  # release run's own preflight still gates the GitHub Release, so an admin
+  # override of this check cannot publish a broken crate.
+  crates-preflight:
+    name: crates.io Package Preflight
+    needs: [crates-preflight-changes]
+    if: needs.crates-preflight-changes.outputs.run == 'true'
+    uses: ./.github/workflows/pub-crates.yml
+    with:
+      release_tag: ${{ needs.crates-preflight-changes.outputs.tag }}
+      release_sha: ${{ github.sha }}
+      stage: preflight
+      dry_run: true
+      runner: blacksmith-8vcpu-ubuntu-2404
+
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, build, windows-task-owner-recovery, check, check-plugin-backends, msrv, check-32bit, bench, test, test-channel-features, memory-postgres-test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
+    needs: [fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, build, windows-task-owner-recovery, check, check-plugin-backends, msrv, check-32bit, bench, test, test-channel-features, memory-postgres-test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests, crates-preflight-changes, crates-preflight]
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Check results
