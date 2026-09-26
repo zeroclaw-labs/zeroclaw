@@ -121,6 +121,14 @@ Applies exactly one canonical `size:*` label from PR file metadata. It runs on P
 
 This workflow runs in `pull_request_target` so it can write labels on fork PRs, but it fetches the classifier script from the trusted workflow/default-branch revision. It does not check out, build, import, source, or execute pull-request code. It does not apply `risk:*`, `type:*`, contributor-tier, status, resolution, stale, pickup, or ProjectV2 fields.
 
+### PR Risk Report (`pr-risk-labeler.yml`)
+
+Runs on PR updates and risk/security label changes through `pull_request_target`, plus manual dispatch for one PR. It fetches the classifier and JSON-compatible policy from the trusted workflow revision, reads PR metadata, changed files, labels, and API source text only when the #9530 test-only proof needs it, and writes a human-readable step summary plus JSON evidence. It never checks out, builds, imports, sources, or executes pull-request code.
+
+Phase 2 is report-only: the workflow has `contents: read` and `pull-requests: read` permissions, does not add, remove, or replace labels, does not create commit statuses, does not enforce approval counts, and does not require a repository ruleset. `risk:manual` is reported as a hard freeze for future mutation, while `domain:security` is reported independently from the proposed `risk:*` result.
+
+The classifier defaults uncertain evidence upward. Docs, fixtures, and known mechanical metadata may be `risk:low`; ordinary behavior changes are `risk:medium`; configured trust, credential, compatibility, governance, release-authority, security, or toolchain-floor paths are `risk:high`. The checked-in policy also carries deterministic changed-line escalation rules for workflow permission expansion, secret access, OIDC, artifact publication, release behavior, elevated `pull_request_target`, toolchain install or container baselines, release-floor changes, and likely WIT contracts. If one of those content-sensitive files changes but the patch is unavailable or malformed, the report stays high instead of guessing medium. The #9530 exception can recommend `risk:medium` only when a complete Rust patch and matching base/head source prove that every high-risk Rust change remains inside existing `#[cfg(test)]` code; missing, truncated, malformed, mixed, conditional-compilation, rename, add, and remove evidence stays high.
+
 ### Project Dashboard Planner (`project-dashboard-plan.yml`)
 
 Runs manually for a single issue number. It reads issue state and labels, then writes a report-only step summary proposing the existing Project Status value that best matches the issue.

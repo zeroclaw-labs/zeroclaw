@@ -4,6 +4,7 @@ Single reference for every label used on PRs and issues. Sources of truth:
 
 - `.github/labeler.yml`: path-label config consumed by `actions/labeler`
 - `.github/label-policy.json`: contributor tier thresholds
+- `.github/risk-labeler.yml`: report-only high-risk path policy consumed by `pr-risk-labeler.yml`
 - This page: definitions, behavior, and what's automated vs manual
 
 When definitions conflict, update the source file first, then sync this page.
@@ -49,7 +50,7 @@ Dependabot also seeds configured labels on its own PRs from `.github/dependabot.
 
 Today `.github/labeler.yml` owns only path and scope labels such as `docs`, `ci`, `channel`, `provider:openai`, and `tool:file`. It does not own `risk:*`, `type:*`, contributor-tier, status, resolution, stale, or pickup labels.
 
-Size automation may recalculate on every pushed PR update so labels continue to describe the actual diff under review. #9345 owns the separate risk-classifier rollout. Its risk phase remains report-only until maintainers review the evidence and separately enable mutation. Report-only output must record the proposed risk, matching rule evidence, current risk, `risk:manual` state, and `domain:security` state so maintainers can audit mismatches and security-shaped work that escaped both triggers. Any future risk automation must honor `risk:manual` as a hard freeze: it cannot add, remove, or replace a PR's `risk:*` label until a maintainer removes the override.
+Size automation may recalculate on every pushed PR update so labels continue to describe the actual diff under review. #9345 owns the separate risk-classifier rollout. `pr-risk-labeler.yml` is the Phase 2 report-only workflow: it proposes a risk label, records matching high-risk globs, deterministic changed-line escalation rules, and #9530 evidence, reports current risk labels, surfaces `risk:manual` and `domain:security`, and performs no label or status mutation. Any future risk automation must honor `risk:manual` as a hard freeze: it cannot add, remove, or replace a PR's `risk:*` label until a maintainer removes the override.
 
 ## Optional CI execution
 

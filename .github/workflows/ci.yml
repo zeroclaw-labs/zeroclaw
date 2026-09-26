@@ -1052,6 +1052,7 @@ jobs:
               ".github/workflows/ci.yml",
               ".github/workflows/windows-tests.yml",
               ".github/workflows/project-dashboard-plan.yml",
+              ".github/workflows/pr-risk-labeler.yml",
               ".github/workflows/pr-size-labeler.yml",
               ".github/workflows/release-stable-manual.yml",
           ):
