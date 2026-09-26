@@ -23,6 +23,14 @@ tempfile = "3.26"
 sha2 = "0.10"
 tokio = { version = "1.50", default-features = false, features = ["sync", "time"] }
 url = "2.5"
+# Shell output decoding, shared by every path that runs a shell command.
+chardetng = "0.1"
+encoding_rs = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+# Console and system code pages, used as context for short legacy-encoded
+# shell output.
+windows = { version = "0.61", features = ["Win32_System_Console", "Win32_Globalization"] }
 
 [dev-dependencies]
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }

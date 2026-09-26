@@ -1,8 +1,11 @@
-use crate::security::SecurityPolicy;
 use anyhow::{Result, bail};
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
+use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::{Config, CronShellOutputFormat};
 
+mod host;
+pub mod i18n;
+mod precondition;
 mod schedule;
 mod store;
 mod types;
@@ -11,23 +14,29 @@ mod types;
 pub mod outbox;
 pub mod scheduler;
 
+pub use host::{
+    CronAgentExecutor, CronAgentRequest, CronAgentRun, CronHealthReporter, NoopCronHealth,
+};
+
 #[allow(unused_imports)]
 pub use schedule::{
     next_run_for_schedule, normalize_expression, schedule_cron_expression, validate_schedule,
 };
-pub(crate) use store::finish_agent_claim;
-#[cfg(test)]
-pub(crate) use store::force_release_failure_for_tests;
 #[allow(unused_imports)]
 pub use store::{
     add_agent_job, all_overdue_jobs, claim_job, claim_job_for_agent,
-    claim_job_for_agent_with_token, clear_stale_locks, due_jobs, get_job, get_job_for_agent,
+    claim_job_for_agent_with_token, claim_job_with_token, clear_stale_locks,
+    declarative_jobs_reconciled, due_jobs, finish_agent_claim, get_job, get_job_for_agent,
     job_not_found, list_jobs, list_jobs_by_agent, list_runs, list_runs_for_agent, record_last_run,
     record_last_run_with_status, record_run, release_job, release_job_for_token, remove_job,
     remove_job_for_agent, remove_jobs_by_agent, rename_jobs_by_agent, reschedule_after_run,
     reschedule_after_run_with_status, resolve_job_id_or_name, skip_missed_run,
     sync_declarative_jobs, update_job, update_job_for_agent,
 };
+/// Fault injection for claim release, for this crate's tests and for callers
+/// that test their own release handling against it.
+#[cfg(any(test, feature = "test-util"))]
+pub use store::{force_claim_for_tests, force_release_failure_for_tests};
 pub use types::{
     CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
     deserialize_maybe_stringified,
@@ -35,7 +44,7 @@ pub use types::{
 
 /// Channel names exposed by the cron tool schemas. Actual runtime delivery is
 /// provided by the registered channel delivery handler, not this static enum.
-pub(crate) const CRON_DELIVERY_SCHEMA_CHANNELS: &[&str] = &[
+pub const CRON_DELIVERY_SCHEMA_CHANNELS: &[&str] = &[
     "telegram",
     "discord",
     "slack",
@@ -62,11 +71,29 @@ pub(crate) const CRON_DELIVERY_SCHEMA_CHANNELS: &[&str] = &[
 ///
 /// Built from `CRON_DELIVERY_SCHEMA_CHANNELS` so the supported types stay
 /// declared once.
-pub(crate) fn cron_delivery_channel_pattern() -> String {
+pub fn cron_delivery_channel_pattern() -> String {
     format!(
         "^({})(\\.[A-Za-z0-9_-]+)?$",
         CRON_DELIVERY_SCHEMA_CHANNELS.join("|")
     )
+}
+
+/// Every enabled agent that lists `job_id` in its `cron_jobs`, sorted.
+///
+/// `Config::agents` is a `HashMap`, so "the first match" is whatever the map
+/// happens to yield. Collecting and sorting makes the set observable and the
+/// order stable, which is what lets callers refuse an ambiguous owner instead
+/// of silently picking one. Shared by declarative-sync validation and
+/// execution-time resolution so the two cannot disagree about who owns a job.
+pub(crate) fn enabled_cron_owners<'a>(config: &'a Config, job_id: &str) -> Vec<&'a str> {
+    let mut owners: Vec<&str> = config
+        .agents
+        .iter()
+        .filter(|(_, agent)| agent.enabled && agent.cron_jobs.iter().any(|c| c == job_id))
+        .map(|(alias, _)| alias.as_str())
+        .collect();
+    owners.sort_unstable();
+    owners
 }
 
 /// Validate a shell command against an agent's security policy
@@ -80,7 +107,7 @@ pub fn validate_shell_command(
     approved: bool,
 ) -> Result<()> {
     let security = SecurityPolicy::for_agent(config, agent_alias)?;
-    let runtime = crate::platform::create_runtime(&config.runtime)?;
+    let runtime = zeroclaw_config::platform::create_runtime(&config.runtime)?;
     validate_shell_command_with_security(runtime.as_ref(), &security, command, approved)
 }
 
@@ -107,7 +134,7 @@ pub fn validate_shell_command_with_security(
         })
 }
 
-pub(crate) fn add_shell_job_with_runtime(
+pub fn add_shell_job_with_runtime(
     config: &Config,
     runtime: &dyn RuntimeAdapter,
     security: &SecurityPolicy,
@@ -219,7 +246,7 @@ pub fn add_shell_job_with_approval_and_format(
     shell_output_format: CronShellOutputFormat,
 ) -> Result<CronJob> {
     let security = SecurityPolicy::for_agent(config, agent_alias)?;
-    let runtime = crate::platform::create_runtime(&config.runtime)?;
+    let runtime = zeroclaw_config::platform::create_runtime(&config.runtime)?;
     add_shell_job_with_runtime_and_format(
         config,
         runtime.as_ref(),
@@ -270,7 +297,7 @@ pub fn update_shell_job_with_approval(
     }
 
     let security = SecurityPolicy::for_agent(config, agent_alias)?;
-    let runtime = crate::platform::create_runtime(&config.runtime)?;
+    let runtime = zeroclaw_config::platform::create_runtime(&config.runtime)?;
     // `owner: None` — this is the OPERATOR entry point, used by the gateway API
     // and the CLI. Its `agent_alias` names whose risk profile validates the
     // command, which is not necessarily the job's owner: patching an agent-type
@@ -287,7 +314,7 @@ pub fn update_shell_job_with_approval(
     )
 }
 
-pub(crate) fn update_shell_job_with_runtime(
+pub fn update_shell_job_with_runtime(
     config: &Config,
     runtime: &dyn RuntimeAdapter,
     security: &SecurityPolicy,
@@ -320,7 +347,7 @@ pub fn add_once_validated(
     approved: bool,
 ) -> Result<CronJob> {
     let security = SecurityPolicy::for_agent(config, agent_alias)?;
-    let runtime = crate::platform::create_runtime(&config.runtime)?;
+    let runtime = zeroclaw_config::platform::create_runtime(&config.runtime)?;
     add_once_validated_with_runtime(
         config,
         runtime.as_ref(),
@@ -333,7 +360,7 @@ pub fn add_once_validated(
     )
 }
 
-pub(crate) fn add_once_validated_with_runtime(
+pub fn add_once_validated_with_runtime(
     config: &Config,
     runtime: &dyn RuntimeAdapter,
     security: &SecurityPolicy,
@@ -367,7 +394,7 @@ pub fn add_once_at_validated(
     approved: bool,
 ) -> Result<CronJob> {
     let security = SecurityPolicy::for_agent(config, agent_alias)?;
-    let runtime = crate::platform::create_runtime(&config.runtime)?;
+    let runtime = zeroclaw_config::platform::create_runtime(&config.runtime)?;
     add_once_at_validated_with_runtime(
         config,
         runtime.as_ref(),
@@ -380,7 +407,7 @@ pub fn add_once_at_validated(
     )
 }
 
-pub(crate) fn add_once_at_validated_with_runtime(
+pub fn add_once_at_validated_with_runtime(
     config: &Config,
     runtime: &dyn RuntimeAdapter,
     security: &SecurityPolicy,
@@ -569,13 +596,13 @@ mod security_validation_tests {
             .risk_profiles
             .entry("default".into())
             .or_default()
-            .level = crate::security::AutonomyLevel::Supervised;
+            .level = zeroclaw_config::policy::AutonomyLevel::Supervised;
 
         let security = SecurityPolicy::from_risk_profile(
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             &config.data_dir,
         );
-        let runtime = crate::platform::create_runtime(&config.runtime).unwrap();
+        let runtime = zeroclaw_config::platform::create_runtime(&config.runtime).unwrap();
         // Simulate scheduler validation path
         let result = validate_shell_command_with_security(
             runtime.as_ref(),
@@ -596,7 +623,7 @@ mod security_validation_tests {
 #[cfg(test)]
 mod validate_delivery_tests {
     use super::*;
-    use crate::cron::types::DeliveryConfig;
+    use crate::types::DeliveryConfig;
 
     #[test]
     fn validate_delivery_accepts_webhook_with_thread_id() {
@@ -626,8 +653,8 @@ mod validate_delivery_tests {
 #[cfg(test)]
 mod remap_agent_command_tests {
     use super::*;
-    use crate::security::AutonomyLevel;
     use tempfile::TempDir;
+    use zeroclaw_config::policy::AutonomyLevel;
 
     const TEST_AGENT: &str = "test-agent";
 

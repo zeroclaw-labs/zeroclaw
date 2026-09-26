@@ -8,6 +8,7 @@ pub mod session_backend;
 pub mod session_queue;
 pub mod session_sqlite;
 pub mod session_store;
+pub mod shell_output;
 pub mod stall_watchdog;
 
 use std::net::SocketAddr;

@@ -77,7 +77,7 @@ pub async fn cascade_owned_state(
     };
 
     // ── cron: list → archive → remove (cron_runs cascade off job_id) ─────────
-    let cron_jobs = match zeroclaw_runtime::cron::list_jobs_by_agent(config, alias) {
+    let cron_jobs = match zeroclaw_cron::list_jobs_by_agent(config, alias) {
         Ok(jobs) => jobs,
         Err(e) => {
             warnings.push(format!("cron list: {e}"));
@@ -87,7 +87,7 @@ pub async fn cascade_owned_state(
     if let Ok(bytes) = serde_json::to_vec_pretty(&cron_jobs) {
         write_json(&cascade_dir.join("cron.json"), bytes).await;
     }
-    let cron_removed = match zeroclaw_runtime::cron::remove_jobs_by_agent(config, alias) {
+    let cron_removed = match zeroclaw_cron::remove_jobs_by_agent(config, alias) {
         Ok(n) => n,
         Err(e) => {
             warnings.push(format!("cron remove: {e}"));
@@ -202,7 +202,7 @@ pub async fn cascade_rename_agent(
         }
     };
 
-    let cron_jobs = match zeroclaw_runtime::cron::rename_jobs_by_agent(config, from, to) {
+    let cron_jobs = match zeroclaw_cron::rename_jobs_by_agent(config, from, to) {
         Ok(n) => n,
         Err(e) => {
             warnings.push(format!("cron rename: {e}"));

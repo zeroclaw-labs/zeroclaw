@@ -122,11 +122,11 @@ impl ShellTool {
 }
 
 fn decode_output(bytes: &[u8]) -> String {
-    super::shell_output::decode_shell_output(bytes)
+    zeroclaw_infra::shell_output::decode_shell_output(bytes)
 }
 
 fn decode_truncated_output(bytes: &[u8]) -> String {
-    super::shell_output::decode_truncated_shell_output(bytes)
+    zeroclaw_infra::shell_output::decode_truncated_shell_output(bytes)
 }
 
 fn is_valid_env_var_name(name: &str) -> bool {

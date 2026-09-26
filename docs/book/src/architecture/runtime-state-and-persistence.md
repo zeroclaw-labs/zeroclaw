@@ -114,7 +114,7 @@ the instance.
 - Session backends: `crates/zeroclaw-infra/src/session_sqlite.rs`, `crates/zeroclaw-infra/src/session_store.rs`
 - ACP session store: `crates/zeroclaw-infra/src/acp_session_store.rs`
 - RPC live sessions: `crates/zeroclaw-runtime/src/rpc/session.rs`
-- Cron persistence: `crates/zeroclaw-runtime/src/cron/store.rs`
+- Cron persistence: `crates/zeroclaw-cron/src/store.rs`
 - SOP persistence: `crates/zeroclaw-runtime/src/sop/store/`
 - Background task and goal supervision: `crates/zeroclaw-runtime/src/control_plane/`
 - Background delegation results: `crates/zeroclaw-runtime/src/tools/delegate.rs`

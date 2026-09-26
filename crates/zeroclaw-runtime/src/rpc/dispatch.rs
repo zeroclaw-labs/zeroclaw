@@ -1421,7 +1421,7 @@ impl RpcDispatcher {
     /// A job owned by another agent reports the same `INVALID_PARAMS`
     /// "Cron job not found" a genuinely missing id reports, so the guard does
     /// not become an existence oracle. That matches
-    /// [`crate::cron::store::get_job_for_agent`]'s documented contract. Rows
+    /// [`zeroclaw_cron::store::get_job_for_agent`]'s documented contract. Rows
     /// written before the owner column exists carry an empty alias, and
     /// `may_use_agent("")` is false for every non-admin principal, so those
     /// legacy rows stay reachable only from operator-level grants.
@@ -1430,18 +1430,18 @@ impl RpcDispatcher {
         method: Method,
         config: &Config,
         id: &str,
-    ) -> Result<crate::cron::CronJob, JsonRpcError> {
+    ) -> Result<zeroclaw_cron::CronJob, JsonRpcError> {
         let Some(auth) = self.auth.as_ref() else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
         };
-        let job = crate::cron::get_job(config, id)
+        let job = zeroclaw_cron::get_job(config, id)
             .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron job not found: {e}")))?;
         if auth.grants.may_use_agent(&job.agent_alias) {
             return Ok(job);
         }
         let denied = rpc_err(
             INVALID_PARAMS,
-            format!("Cron job not found: {}", crate::cron::job_not_found(id)),
+            format!("Cron job not found: {}", zeroclaw_cron::job_not_found(id)),
         );
         self.audit_auth_denial(
             method,
@@ -2334,7 +2334,7 @@ impl RpcDispatcher {
         if config.agent_workspace_dir(from).exists() {
             return true;
         }
-        if crate::cron::list_jobs_by_agent(config, from)
+        if zeroclaw_cron::list_jobs_by_agent(config, from)
             .map(|jobs| !jobs.is_empty())
             .unwrap_or(false)
         {
@@ -6159,7 +6159,7 @@ impl RpcDispatcher {
 
     async fn handle_cron_list(&self) -> RpcResult {
         let config = self.ctx.config.read().clone();
-        let mut jobs = crate::cron::list_jobs(&config)
+        let mut jobs = zeroclaw_cron::list_jobs(&config)
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron list failed: {e}")))?;
         // One query, then drop what this principal is not entitled to see.
         // An operator-level principal keeps the whole list; a scoped one sees
@@ -6185,7 +6185,7 @@ impl RpcDispatcher {
             expr: req.schedule,
             tz: req.tz,
         };
-        let job = crate::cron::add_shell_job_with_approval(
+        let job = zeroclaw_cron::add_shell_job_with_approval(
             &config,
             &req.agent,
             req.name,
@@ -6228,13 +6228,13 @@ impl RpcDispatcher {
         if let Some(command) = patch.command.as_deref()
             && !command.trim().is_empty()
         {
-            crate::cron::validate_shell_command(&config, &owner.agent_alias, command, true)
+            zeroclaw_cron::validate_shell_command(&config, &owner.agent_alias, command, true)
                 .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron patch rejected: {e}")))?;
         }
         let job = if self.has_admin_grants() {
-            crate::cron::update_job(&config, &req.id, patch)
+            zeroclaw_cron::update_job(&config, &req.id, patch)
         } else {
-            crate::cron::update_job_for_agent(&config, &req.id, &owner.agent_alias, patch)
+            zeroclaw_cron::update_job_for_agent(&config, &req.id, &owner.agent_alias, patch)
         }
         .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron patch failed: {e}")))?;
         to_result(job)
@@ -6247,9 +6247,9 @@ impl RpcDispatcher {
         // As with the patch path, a scoped principal's delete carries the
         // owner into the statement so a concurrent rename cannot widen it.
         if self.has_admin_grants() {
-            crate::cron::remove_job(&config, &req.id)
+            zeroclaw_cron::remove_job(&config, &req.id)
         } else {
-            crate::cron::remove_job_for_agent(&config, &req.id, &job.agent_alias)
+            zeroclaw_cron::remove_job_for_agent(&config, &req.id, &job.agent_alias)
         }
         .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron delete failed: {e}")))?;
         to_result(CronDeleteResult {
@@ -6268,9 +6268,9 @@ impl RpcDispatcher {
         // ownership change between the lookup and the read cannot return
         // another agent's runs.
         let runs = if self.has_admin_grants() {
-            crate::cron::list_runs(&config, &req.id, limit)
+            zeroclaw_cron::list_runs(&config, &req.id, limit)
         } else {
-            crate::cron::list_runs_for_agent(&config, &req.id, &job.agent_alias, limit)
+            zeroclaw_cron::list_runs_for_agent(&config, &req.id, &job.agent_alias, limit)
         }
         .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron runs failed: {e}")))?;
         to_result(CronRunsResult { runs })
@@ -6281,10 +6281,10 @@ impl RpcDispatcher {
         let config = self.ctx.config.read().clone();
         let job = self.authorize_cron_job(Method::CronTrigger, &config, &req.id)?;
         let event_tx = self.ctx.event_tx.clone();
-        let result = crate::cron::scheduler::run_manual_job(
+        let result = crate::cron_host::run_manual_job(
             &config,
             &job,
-            crate::cron::scheduler::CronDeliveryContext::RpcManual,
+            zeroclaw_cron::scheduler::CronDeliveryContext::RpcManual,
             &event_tx,
         )
         .await;
@@ -7199,7 +7199,7 @@ impl RpcDispatcher {
             }
         }
 
-        match crate::cron::rename_jobs_by_agent(config, from, to) {
+        match zeroclaw_cron::rename_jobs_by_agent(config, from, to) {
             Ok(n) => cron_jobs = n,
             Err(e) => warnings.push(format!("cron rename: {e}")),
         }
@@ -10863,17 +10863,17 @@ mod tests {
         config: &zeroclaw_config::schema::Config,
         alias: &str,
         name: &str,
-    ) -> crate::cron::CronJob {
-        crate::cron::add_agent_job(
+    ) -> zeroclaw_cron::CronJob {
+        zeroclaw_cron::add_agent_job(
             config,
             alias,
             Some(name.to_string()),
-            crate::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "*/5 * * * *".into(),
                 tz: None,
             },
             "say hello",
-            crate::cron::SessionTarget::Isolated,
+            zeroclaw_cron::SessionTarget::Isolated,
             None,
             None,
             false,
@@ -10921,7 +10921,7 @@ mod tests {
         let config = cron_roster_config_in(&tmp, 4242);
         let alpha = seed_cron_job(&config, "alpha", "alpha-job");
         let now = chrono::Utc::now();
-        crate::cron::record_run(&config, &alpha.id, now, now, "ok", Some("done"), 5)
+        zeroclaw_cron::record_run(&config, &alpha.id, now, now, "ok", Some("done"), 5)
             .expect("the fixture run is recorded");
         let ctx = enforcement_ctx(config);
         let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
@@ -10972,7 +10972,7 @@ mod tests {
             );
         }
         // Nothing ran: the foreign job has no recorded status.
-        let reread = crate::cron::get_job(&config, &beta.id).expect("the beta job still exists");
+        let reread = zeroclaw_cron::get_job(&config, &beta.id).expect("the beta job still exists");
         assert!(reread.last_status.is_none(), "the foreign job must not run");
     }
 
@@ -10993,7 +10993,7 @@ mod tests {
         .await;
         assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
         assert!(
-            crate::cron::list_jobs(&config)
+            zeroclaw_cron::list_jobs(&config)
                 .expect("the store is readable")
                 .is_empty(),
             "a refused cron/add must not create a job"
@@ -11050,7 +11050,7 @@ mod tests {
             "{response}"
         );
 
-        let reread = crate::cron::get_job(&config, &beta.id).expect("the beta job still exists");
+        let reread = zeroclaw_cron::get_job(&config, &beta.id).expect("the beta job still exists");
         assert_eq!(reread.name.as_deref(), Some("beta-job"));
         assert_eq!(reread.prompt.as_deref(), beta.prompt.as_deref());
     }
@@ -11084,7 +11084,7 @@ mod tests {
             "a refused command must not patch the job: {response}"
         );
 
-        let reread = crate::cron::get_job(&config, &job.id).expect("the job still exists");
+        let reread = zeroclaw_cron::get_job(&config, &job.id).expect("the job still exists");
         assert_eq!(
             reread.command, job.command,
             "a rejected patch must leave the stored command unchanged"
@@ -11098,7 +11098,7 @@ mod tests {
         let config = cron_roster_config_in(&tmp, 4242);
         let legacy = seed_cron_job(&config, "legacy", "legacy-job");
         // Rows written before the owner column exists carry an empty alias.
-        crate::cron::rename_jobs_by_agent(&config, "legacy", "")
+        zeroclaw_cron::rename_jobs_by_agent(&config, "legacy", "")
             .expect("the fixture row is re-owned");
         let ctx = enforcement_ctx(config);
 
@@ -19755,11 +19755,11 @@ mod tests {
             .entry("test-profile".into())
             .or_default()
             .allowed_commands = vec!["echo".into()];
-        let job = crate::cron::add_shell_job_with_approval(
+        let job = zeroclaw_cron::add_shell_job_with_approval(
             &config,
             "test-agent",
             Some("rpc-trigger".into()),
-            crate::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "*/5 * * * *".into(),
                 tz: None,
             },
@@ -19785,7 +19785,7 @@ mod tests {
                 .contains("rpc-trigger-ok")
         );
 
-        let updated = crate::cron::get_job(&config, &job.id).expect("job should still exist");
+        let updated = zeroclaw_cron::get_job(&config, &job.id).expect("job should still exist");
         assert_eq!(updated.last_status.as_deref(), Some("ok"));
         assert!(
             updated
@@ -19794,8 +19794,8 @@ mod tests {
                 .is_some_and(|output| output.contains("rpc-trigger-ok"))
         );
 
-        let runs =
-            crate::cron::list_runs(&config, &job.id, 10).expect("RPC trigger should persist runs");
+        let runs = zeroclaw_cron::list_runs(&config, &job.id, 10)
+            .expect("RPC trigger should persist runs");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "ok");
         assert!(
@@ -19809,7 +19809,7 @@ mod tests {
 
     #[tokio::test]
     async fn cron_trigger_rpc_reports_degraded_status_and_broadcasts() {
-        crate::cron::scheduler::register_delivery_fn(Box::new(
+        zeroclaw_cron::scheduler::register_delivery_fn(Box::new(
             |_config, channel, _target, _thread_id, _output| {
                 Box::pin(async move {
                     if channel == "fail-delivery" {
@@ -19827,16 +19827,16 @@ mod tests {
             .entry("test-profile".into())
             .or_default()
             .allowed_commands = vec!["echo".into()];
-        let job = crate::cron::add_shell_job_with_approval(
+        let job = zeroclaw_cron::add_shell_job_with_approval(
             &config,
             "test-agent",
             Some("rpc-trigger-degraded".into()),
-            crate::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "*/5 * * * *".into(),
                 tz: None,
             },
             "echo rpc-trigger-degraded",
-            Some(crate::cron::DeliveryConfig {
+            Some(zeroclaw_cron::DeliveryConfig {
                 mode: "announce".into(),
                 channel: Some("fail-delivery".into()),
                 to: Some("123456".into()),
@@ -19883,8 +19883,8 @@ mod tests {
                 .contains("delivery failed:")
         );
 
-        let runs =
-            crate::cron::list_runs(&config, &job.id, 10).expect("RPC trigger should persist runs");
+        let runs = zeroclaw_cron::list_runs(&config, &job.id, 10)
+            .expect("RPC trigger should persist runs");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "degraded");
     }

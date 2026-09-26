@@ -1,10 +1,10 @@
-use crate::cron;
 use async_trait::async_trait;
 use serde::Serialize;
 use serde_json::json;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
+use zeroclaw_cron as cron;
 
 const MAX_RUN_OUTPUT_CHARS: usize = 500;
 
@@ -216,17 +216,17 @@ mod tests {
 
     /// A job owned by someone else. An agent job needs no risk profile for its
     /// owner, which keeps the fixture to the ownership boundary.
-    fn other_agents_job(cfg: &Config) -> crate::cron::CronJob {
+    fn other_agents_job(cfg: &Config) -> zeroclaw_cron::CronJob {
         cron::add_agent_job(
             cfg,
             "other-agent",
             Some("secret_job".into()),
-            crate::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "0 8 * * *".into(),
                 tz: None,
             },
             "read the other agent's inbox",
-            crate::cron::SessionTarget::Isolated,
+            zeroclaw_cron::SessionTarget::Isolated,
             None,
             None,
             false,

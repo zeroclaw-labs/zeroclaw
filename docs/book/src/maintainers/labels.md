@@ -116,7 +116,7 @@ Applied automatically by `pr-path-labeler.yml`. Globs live in `.github/labeler.y
 | `channel` | `src/channels/**`, `crates/zeroclaw-channels/src/**` |
 | `gateway` | `src/gateway/**`, `crates/zeroclaw-gateway/src/**` |
 | `config` | `src/config/**`, `crates/zeroclaw-config/src/**` |
-| `cron` | `src/cron/**`, `crates/zeroclaw-runtime/src/cron/**` |
+| `cron` | `src/cron/**`, `crates/zeroclaw-cron/**`, `crates/zeroclaw-runtime/src/cron_host.rs` |
 | `daemon` | `src/daemon/**`, `crates/zeroclaw-runtime/src/daemon/**` |
 | `doctor` | `src/doctor/**`, `crates/zeroclaw-runtime/src/doctor/**` |
 | `health` | `src/health/**`, `crates/zeroclaw-runtime/src/health/**` |

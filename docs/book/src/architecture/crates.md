@@ -6,7 +6,7 @@ The workspace is split into layers. Edge crates talk to the outside world; core 
 
 ### `zeroclaw-runtime`
 
-The agent loop, security-policy enforcement, SOP engine, cron scheduler, SubAgent lifecycle, and RPC layer for zerocode. Depends on every other core and edge crate.
+The agent loop, security-policy enforcement, SOP engine, SubAgent lifecycle, and RPC layer for zerocode. Depends on every other core and edge crate.
 
 Notable submodules:
 
@@ -14,10 +14,17 @@ Notable submodules:
 - `security/`: policy types, sandbox detection, OTP, emergency stop
 - `sop/`: Standard Operating Procedure engine (see [SOP → Overview](../sop/index.md))
 - `subagent/`: SubAgent spawning and lifecycle (see [Delegation & SubAgents](../agents/delegation.md))
-- `cron/`, `daemon/`, `heartbeat/`: scheduling and long-running process management
+- `daemon/`, `heartbeat/`: long-running process management
 - `skills/`: skill compilation and execution
 - `service/`: systemd / launchctl / Windows Service integration
 - `rpc/`: the RPC layer for zerocode
+
+### `zeroclaw-cron`
+
+Cron scheduling and job lifecycle: schedule parsing, the SQLite job and run
+store, declarative reconciliation, in-flight claims, precondition gates, and
+run-outcome classification. The runtime supplies agent execution and health
+reporting explicitly when it starts or manually drives the scheduler.
 
 ### `zeroclaw-config`
 

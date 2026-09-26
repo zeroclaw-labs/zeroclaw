@@ -13,7 +13,7 @@
 /// lossy conversion keeps the result representable for malformed input.
 const WINDOWS_SHORT_OUTPUT_LIMIT: usize = 32;
 
-pub(crate) fn decode_shell_output(bytes: &[u8]) -> String {
+pub fn decode_shell_output(bytes: &[u8]) -> String {
     decode_shell_output_with_context(bytes, false, windows_code_page_hint())
 }
 
@@ -21,7 +21,7 @@ pub(crate) fn decode_shell_output(bytes: &[u8]) -> String {
 /// preserved when the caller knows that the capture was truncated; without
 /// that signal, bytes such as a lone CP1252 `0xe9` must remain eligible for
 /// legacy encoding detection.
-pub(crate) fn decode_truncated_shell_output(bytes: &[u8]) -> String {
+pub fn decode_truncated_shell_output(bytes: &[u8]) -> String {
     decode_shell_output_with_context(bytes, true, windows_code_page_hint())
 }
 

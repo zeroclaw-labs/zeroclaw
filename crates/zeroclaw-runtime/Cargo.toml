@@ -3,7 +3,7 @@ name = "zeroclaw-runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Miscellaneous ZeroClaw subsystems: security, observability, gateway, cron, SOP, skills, hardware, TUI, and more."
+description = "Miscellaneous ZeroClaw subsystems: security, observability, gateway, SOP, skills, hardware, TUI, and more."
 repository.workspace = true
 homepage.workspace = true
 publish = true
@@ -13,6 +13,7 @@ zeroclaw-api.workspace = true
 zeroclaw-spawn.workspace = true
 zeroclaw-infra.workspace = true
 zeroclaw-config.workspace = true
+zeroclaw-cron.workspace = true
 zeroclaw-tls.workspace = true
 zeroclaw-relay-proto.workspace = true
 zeroclaw-commands.workspace = true
@@ -32,7 +33,6 @@ cap-fs-ext = "4"
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 chrono-tz = "0.10"
-chardetng = "0.1"
 console = "0.16"
 cron = "0.15"
 # Raw-mode terminal secret input (cli_input::SecretInput). Blocking
@@ -40,7 +40,6 @@ cron = "0.15"
 crossterm = "0.29"
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
 directories = "6.0"
-encoding_rs = "0.8"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 glob = "0.3"
 hex = "0.4"
@@ -114,7 +113,7 @@ schema-export = ["dep:schemars", "zeroclaw-config/schema-export", "zeroclaw-sop-
 
 
 browser-native = []
-plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasmtime"]
+plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasmtime", "zeroclaw-cron/plugins-wasm"]
 # Adds the Cranelift JIT to the plugin host so a `.wasm` component can be
 # compiled on the host instead of requiring a precompiled `.cwasm`. Production
 # builds get this through the root crate's feature of the same name; the runtime
@@ -139,6 +138,8 @@ rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 # Enable the shared cert/CSR test fixtures for the enrollment + relay tests.
 zeroclaw-tls = { workspace = true, features = ["testing"] }
+# The cron_run tool tests inject claim-release failures.
+zeroclaw-cron = { workspace = true, features = ["test-util"] }
 # Real relay for the relay full-path and frontdoor enrollment tests. This is the
 # only edge between the two crates: zerorelay must not dev-depend back on the
 # runtime, or publishing in dependency order becomes impossible.

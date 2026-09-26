@@ -1020,7 +1020,9 @@ pub async fn run(
                 let cfg = scheduler_cfg.clone();
                 let tx = scheduler_event_tx.clone();
                 let cancel = scheduler_cancel.clone();
-                async move { Box::pin(crate::cron::scheduler::run(cfg, Some(tx), cancel)).await }
+                async move {
+                    Box::pin(crate::cron_host::run_scheduler(cfg, Some(tx), cancel)).await
+                }
             },
         ));
     } else {
@@ -1987,7 +1989,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                     } else {
                         continue;
                     };
-                    let delivery_fut = crate::cron::scheduler::deliver_announcement(
+                    let delivery_fut = zeroclaw_cron::scheduler::deliver_announcement(
                         &dm_config, &channel, &target, None, &alert,
                     );
                     match tokio::time::timeout(Duration::from_secs(30), delivery_fut).await {
@@ -2291,7 +2293,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                         output
                     };
                     let suppress_delivery =
-                        !crate::cron::scheduler::announce_delivery_decision(&announcement)
+                        !zeroclaw_cron::scheduler::announce_delivery_decision(&announcement)
                             .should_deliver();
                     if suppress_delivery {
                         ::zeroclaw_log::record!(
@@ -2310,7 +2312,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                     {
                         let delivery_result = tokio::time::timeout(
                             Duration::from_secs(30),
-                            crate::cron::scheduler::deliver_announcement(
+                            zeroclaw_cron::scheduler::deliver_announcement(
                                 &config,
                                 channel,
                                 target,
