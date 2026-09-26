@@ -1,0 +1,58 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Route-layer authentication for the gateway’s configuration and onboarding surfaces."><title>zeroclaw::gateway::principal_gate - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../static.files/rustdoc-1ed95124.css"><script id="default-settings" 
+data-use_system_theme="false"
+data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../../" data-static-root-path="../../../static.files/" data-current-crate="zeroclaw" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module principal_gate</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../../zeroclaw/index.html">zeroclaw</a><span class="version">0.8.5</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module principal_<wbr>gate</a></h2><h3><a href="#structs">Module Items</a></h3><ul class="block"><li><a href="#structs" title="Structs">Structs</a></li><li><a href="#constants" title="Constants">Constants</a></li><li><a href="#functions" title="Functions">Functions</a></li><li><a href="#types" title="Type Aliases">Type Aliases</a></li></ul></section><div id="rustdoc-modnav"><h2><a href="../index.html">In zeroclaw::<wbr>gateway</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../../index.html">zeroclaw</a>::<wbr><a href="../index.html">gateway</a></div><h1>Module <span>principal_<wbr>gate</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Route-layer authentication for the gateway’s configuration and
+onboarding surfaces.</p>
+<p>Structural enforcement: the middleware is attached via <code>route_layer</code>
+on the route group, so a handler added to the group cannot forget the
+check (the per-handler <code>require_auth</code> convention this replaces was
+enforced only by reviewer vigilance).</p>
+<p>The layer also consumes the shared principal model (RFC 7141): a
+paired native bearer resolves to the shared operator exactly as
+before, while a bearer presented with the <code>X-ZeroClaw-Auth-Provider</code>
+header naming an <code>oidc.&lt;alias&gt;</code> provider is verified by that provider
+and resolved to a scoped principal whose Config grants gate the
+request. Provider selection is explicit, mirroring the RPC handshake’s
+<code>auth_provider</code> field: the named provider’s denial is authoritative,
+and there is no fallback between providers.</p>
+<p>Grants are enforced in two places. The route layer applies a coarse
+floor per HTTP method (a read needs <code>Read</code>; anything else needs some
+mutating verb) so a read-only principal never reaches a mutating
+handler. Each mutating handler then authorizes its complete write set
+before its first side effect: every config path it will persist,
+classified by effect (<code>Create</code> for a path it brings into being,
+<code>Delete</code> for one it removes, <code>Update</code> otherwise) and matched against
+the principal’s config path selectors, with the persist boundary
+refusing anything the handler did not authorize
+(<a href="struct.ConfigWriteAuthorization.html" title="struct zeroclaw::gateway::principal_gate::ConfigWriteAuthorization"><code>ConfigWriteAuthorization</code></a>).</p>
+<p>Policy itself moves only at that persist boundary: the handler that
+writes a configuration publishes the policy compiled from it as the
+next accepted revision, and requests are verified and resolved against
+the accepted snapshot as it stands. Nothing on the request path
+compiles policy, so a request that read the configuration before a
+concurrent persist can never reinstall the older policy over the
+newer one.</p>
+</div></details><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.ConfigWriteAuthorization.html" title="struct zeroclaw::gateway::principal_gate::ConfigWriteAuthorization">Config<wbr>Write<wbr>Authorization</a></dt><dd>Proof that a mutation’s complete write set was authorized before its
+first side effect. The persist boundary requires one and re-checks that
+nothing outside the authorized set is about to be written, then
+publishes the policy of what it wrote through the admitting authority.</dd><dt><a class="struct" href="struct.ConfigWriteSet.html" title="struct zeroclaw::gateway::principal_gate::ConfigWriteSet">Config<wbr>Write<wbr>Set</a></dt><dd>One config mutation’s complete write set: every dotted path the
+mutation persists, each with the verb its effect requires.</dd><dt><a class="struct" href="struct.GatewayInboundAuth.html" title="struct zeroclaw::gateway::principal_gate::GatewayInboundAuth">Gateway<wbr>Inbound<wbr>Auth</a></dt><dd>The gateway’s inbound-auth authority: the same provider registry and
+principal resolver the RPC layer uses, built from the same config and
+the daemon’s canonical pairing guard.</dd><dt><a class="struct" href="struct.RequestAuth.html" title="struct zeroclaw::gateway::principal_gate::RequestAuth">Request<wbr>Auth</a></dt><dd>What the route layer hands every admitted request, for the handlers
+that mutate configuration: the principal the request was authenticated
+as (<code>None</code> in the open posture, where the transport is trusted exactly
+as before this layer existed) and the authority whose accepted policy
+admitted it, so the persist boundary can publish the policy of the
+configuration it writes.</dd><dt><a class="struct" href="struct.WriteDenied.html" title="struct zeroclaw::gateway::principal_gate::WriteDenied">Write<wbr>Denied</a></dt><dd>A refused config write: the 403 the handler returns in place of the
+mutation, carrying which path or grant fell short.</dd></dl><h2 id="constants" class="section-header">Constants<a href="#constants" class="anchor">§</a></h2><dl class="item-table"><dt><a class="constant" href="constant.AUTH_PROVIDER_HEADER.html" title="constant zeroclaw::gateway::principal_gate::AUTH_PROVIDER_HEADER">AUTH_<wbr>PROVIDER_<wbr>HEADER</a></dt><dd>Header naming the auth provider to verify the bearer with, mirroring
+the RPC handshake’s <code>auth_provider</code> field (e.g. <code>oidc.corp</code>). Absent
+means the native pairing provider, exactly as before this layer.</dd></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.authorize_config_write.html" title="fn zeroclaw::gateway::principal_gate::authorize_config_write">authorize_<wbr>config_<wbr>write</a></dt><dd>Authorize one mutation’s complete write set for the request’s
+principal, before the mutation’s first side effect. Every path needs
+both the Config verb its effect requires and a matching config path
+selector. The open posture and an admin principal are unrestricted,
+as everywhere else.</dd><dt><a class="fn" href="fn.authorize_whole_config_write.html" title="fn zeroclaw::gateway::principal_gate::authorize_whole_config_write">authorize_<wbr>whole_<wbr>config_<wbr>write</a></dt><dd>A rewrite whose write set cannot be enumerated before it runs (a schema
+migration of the file, a Quickstart apply): a scoped principal needs
+the wildcard selector and every verb the rewrite may exercise. Nothing
+narrower can be honoured, so nothing narrower is accepted.</dd><dt><a class="fn" href="fn.config_route_auth.html" title="fn zeroclaw::gateway::principal_gate::config_route_auth">config_<wbr>route_<wbr>auth</a></dt><dd>Route-layer middleware for the config/onboarding route group.</dd></dl><h2 id="types" class="section-header">Type Aliases<a href="#types" class="anchor">§</a></h2><dl class="item-table"><dt><a class="type" href="type.RequestPrincipal.html" title="type zeroclaw::gateway::principal_gate::RequestPrincipal">Request<wbr>Principal</a></dt><dd>The extractor a mutating handler declares to receive its
+<a href="struct.RequestAuth.html" title="struct zeroclaw::gateway::principal_gate::RequestAuth"><code>RequestAuth</code></a>. Absent only when the handler is invoked outside the
+route group (unit tests call handlers directly); nothing is enforced
+or published then.</dd></dl></section></div></main></body></html>

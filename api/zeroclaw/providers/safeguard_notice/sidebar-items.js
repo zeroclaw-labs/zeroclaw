@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["SafeguardFallbackKind"],"fn":["commit_safeguard_fallback","scope_safeguard_fallback","take_last_safeguard_fallback","visible_provider_fallback"],"struct":["SafeguardFallbackNotice"]};

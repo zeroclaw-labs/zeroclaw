@@ -1,0 +1,1524 @@
+<!DOCTYPE HTML>
+<html lang="en" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Authentication &amp; principals - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Every RPC connection to the daemon binds a principal during the initialize handshake, and every method call is checked against the grants the current…">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+            window.path_to_searchindex_js = "../searchindex-0a8f1f75.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-f8e8c07e.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+<!-- seo:start -->
+        <link rel="canonical" href="https://docs.zeroclaw.com/master/en/security/authentication.html">
+        <meta property="og:type" content="article">
+        <meta property="og:site_name" content="ZeroClaw Docs">
+        <meta property="og:title" content="Authentication &amp; principals - ZeroClaw Docs">
+        <meta property="og:description" content="Every RPC connection to the daemon binds a principal during the initialize handshake, and every method call is checked against the grants the current…">
+        <meta property="og:url" content="https://docs.zeroclaw.com/master/en/security/authentication.html">
+        <meta name="twitter:card" content="summary">
+        <meta name="twitter:title" content="Authentication &amp; principals - ZeroClaw Docs">
+        <meta name="twitter:description" content="Every RPC connection to the daemon binds a principal during the initialize handshake, and every method call is checked against the grants the current…">
+        <!-- seo:end -->
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <h1 id="authentication--principals"><a class="header" href="#authentication--principals">Authentication &amp; principals</a></h1>
+<p>Every RPC connection to the daemon binds a <strong>principal</strong> during the
+<code>initialize</code> handshake, and every method call is checked against the grants
+the current configuration assigns that principal. This page covers the
+provider set, the local-user roster, permission profiles, and, most
+importantly, what changes for existing remote connections.</p>
+<h2 id="the-model-in-one-pass"><a class="header" href="#the-model-in-one-pass">The model in one pass</a></h2>
+<ol>
+<li>
+<p>A <strong>provider</strong> verifies one credential: an explicit <code>auth_token</code> from
+the handshake selects the provider named by <code>auth_provider</code> (defaulting
+to <code>native</code>, the gateway pairing token), and with no token a local Unix
+socket presents its kernel peer uid to the <code>peercred</code> provider. A
+selected provider’s rejection is final: a credential is never retried
+against another provider.</p>
+</li>
+<li>
+<p>The <strong>shared resolver</strong> maps the verified identity to a canonical
+principal id and the permission profiles the configuration assigns it.
+OIDC identities are keyed by validated issuer + subject, local roster
+identities by their durable <code>[users.&lt;name&gt;]</code> principal id.</p>
+</li>
+<li>
+<p>Every RPC method except the two handshake methods is classified to a
+required resource-verb grant and refused without it. <code>initialize</code>
+carries the credential itself, and <code>cert/renew</code> is authenticated by the
+mutual-TLS client certificate that presents it, not by a principal.
+Fine-grained selectors compose on top:</p>
+<ul>
+<li>config writes check <code>config_write_paths</code>;</li>
+<li><code>session/new</code> and <code>session/prompt</code> check the agent selector and hold
+the session’s workspace to a directory that agent’s policy lets it both
+read and write, whether the workspace was named by the request, stored
+with a resumed session, or restored from a durable one. The other
+session methods do not check the agent yet, as described under
+<a href="#what-this-layer-does-not-do-yet">What this layer does not do (yet)</a>;</li>
+<li>running or approving an SOP requires every agent it runs as, with the
+same tool-selector rule as a session, and creating, saving, or deleting
+one requires the agents it runs as. A step that names no agent, on the
+step or on the procedure, counts as the first configured agent alias in
+sort order, which is the agent the headless executor falls back to.
+Every step counts, including the steps of a deterministic procedure;</li>
+<li>attachments, personality files, cost queries that name an agent, and
+cron jobs check the agent selector. An attachment sent by local path
+must also name an absolute path the destination agent’s policy lets it
+read. A fleet cost summary lists only the principal’s agents in its
+per-agent breakdown, but its totals and its per-model usage still cover
+every agent;</li>
+<li><code>fs/list_dir</code> lists only absolute paths that the policy of an enabled
+agent the principal may use lets that agent read. It refuses relative
+paths, <code>..</code> components, and, on Windows, network and device paths.</li>
+</ul>
+<p>These roots come from each agent’s resolved policy: its risk profile, the
+sibling workspaces its <code>workspace.access</code> grants read access to (read and
+write, for a session workspace), and the shared skills directory, which is
+read-only. An agent that is not workspace-only
+(autonomy <code>full</code>, a risk profile with <code>workspace_only = false</code>, the
+<code>yolo</code> preset, or <code>workspace.unrestricted_filesystem = true</code>) may read
+any path outside its forbidden paths, so a principal entitled to such an
+agent may list and open sessions anywhere that agent could.</p>
+<p><code>session/new</code> and <code>session/prompt</code> repeat these checks after waiting for
+the session’s queue, so a request queued before its principal was
+narrowed or its credential expired is refused when its turn comes.</p>
+</li>
+</ol>
+<p>Authorization is <strong>live</strong> for edits made through the daemon’s RPC config
+methods, which is what zerocode’s config editor uses: editing
+<code>[permission_profiles]</code>, <code>[users]</code>, <code>[oidc]</code>, or <code>security.trust_daemon_uid</code>
+that way re-compiles the policy at save time. Established native-token and
+local connections re-resolve at their next operation, with no reconnect or
+restart, and an OIDC connection must initialize again. Edits made
+outside the daemon, directly in <code>config.toml</code>, through the web dashboard, or
+with <code>zeroclaw config set</code>, apply at the next daemon reload or restart.
+Revoking a gateway pairing token through the gateway’s pairing controls
+invalidates connections authenticated with it before their next operation.
+Removing a token from <code>gateway.paired_tokens</code> by editing config, over RPC
+or on disk, has no effect on the running daemon, and connections using the
+token stay authorized. The removal applies at the next daemon reload or
+restart, unless a pairing change made through the gateway before then
+writes the live token set, that token included, back to config. Revoke
+tokens through the pairing controls.</p>
+<h2 id="providers"><a class="header" href="#providers">Providers</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Provider</th><th>Credential</th><th>Configured by</th></tr>
+</thead>
+<tbody>
+<tr><td><code>native</code></td><td>Gateway pairing bearer token</td><td>Gateway pairing (<code>/pair</code>); the daemon and gateway share one live token authority</td></tr>
+<tr><td><code>peercred</code></td><td>Unix peer uid on the local socket</td><td>Always on; <code>[users.&lt;name&gt;].uid</code> maps a uid to a named principal</td></tr>
+<tr><td><code>oidc.&lt;alias&gt;</code></td><td>JWT or opaque bearer from your IdP</td><td><code>[oidc.&lt;alias&gt;]</code></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="local-connections"><a class="header" href="#local-connections">Local connections</a></h3>
+<p>On a Unix socket, a connection that presents no token is identified by its
+kernel peer uid. While <code>security.trust_daemon_uid</code> is <code>true</code> (the default),
+the daemon’s <strong>own uid</strong> connects as the trusted shared operator with full access, with or
+without a <code>[users]</code> roster, so an install with no roster behaves as before
+for the account that runs the daemon.</p>
+<p>The operator who runs the daemon owns its config file, and local-only
+lockout recovery depends on that authority. On a Unix socket, set
+<code>security.trust_daemon_uid</code> to <code>false</code> to require every local peer,
+including the daemon’s own uid, to map through the roster or present a
+token. The setting has no effect on a Windows named pipe, described below.</p>
+<p>Any <strong>other</strong> uid must be mapped by an explicit <code>[users.&lt;name&gt;].uid</code>
+entry. An unmapped uid (root included) that presents no token is denied,
+whether or not a roster exists; there is no fallback to shared-operator
+access. The listener
+creates the socket owner-only, so today only the daemon’s own account and
+root can reach it; a roster entry decides what any other uid may do once
+it can.</p>
+<p>Windows named pipes carry no peer uid. With no roster, the pipe ACL is the
+credential and a local connection is the shared operator. Once a
+<code>[users]</code> roster exists, a local client there must present a token,
+<code>security.trust_daemon_uid</code> has no effect, and the daemon’s own account has
+no trusted local route. A paired gateway token still authenticates as the
+shared operator while the policy compiles, so a client that sends one, over
+WSS or over the pipe, can repair the roster live. zerocode’s local pipe
+connection sends no token, so without such a client a lockout is repaired
+by editing <code>config.toml</code> and restarting.</p>
+<p>A client may forward its shell environment in <code>initialize</code> so the
+daemon’s subprocesses see its <code>PATH</code> and credential sockets (see
+<a href="../zerocode/environment.html">Environment variable pass-through</a>). That
+snapshot is kept only for an operator-level principal (the shared
+operator, or a roster principal with <code>admin = true</code>) on a local connection.
+Every other principal, and every remote connection, gets the daemon’s own
+environment instead.</p>
+<h4 id="recovery"><a class="header" href="#recovery">Recovery</a></h4>
+<p>A remote authentication bypass is never offered: a remote connection always
+has to present a valid credential. While the authorization policy still
+compiles, a client holding a paired gateway token or an operator-level
+principal can repair a lockout from anywhere. Without such a credential,
+and always in the deny-all state, the route back runs on the host that runs
+the daemon. Which local route applies depends on whether the policy still
+compiles.</p>
+<p><strong>Locked out of a policy that compiles.</strong> Authorization is live and the
+local trusted path is intact on a Unix socket; on Windows, see the named
+pipe note above. Connect locally as the daemon’s own uid:
+with <code>security.trust_daemon_uid = true</code> (the default) that account is the
+trusted shared operator whatever the roster says. Repair the offending
+entry over that local connection, for example in zerocode’s config editor
+or with an RPC <code>config/set</code> of <code>users.alice.uid</code>, and the change is
+compiled and published at save time. Editing <code>config.toml</code> or running
+<code>zeroclaw config set</code> also repairs it, but only once the daemon reloads or
+restarts.</p>
+<p><strong>Locked out by a deny-all accepted state.</strong> The policy did not compile,
+so the accepted state refuses every principal before resolution runs, the
+daemon’s own uid and the shared operator included. No RPC repairs it:
+<code>config/set</code> and <code>config/reload</code> are refused along with everything else.
+Edit <code>config.toml</code> directly as its owner, then restart the daemon so the
+repaired sections are compiled and published. The daemon ignores <code>SIGHUP</code>,
+so a restart is the step that reloads it.</p>
+<p>If <code>security.trust_daemon_uid</code> is set to <code>false</code>, the trusted-uid route is
+gone. A policy that compiles can still be repaired live by a client that
+presents a paired gateway token, or by a roster principal with admin
+grants; otherwise both states repair the same way: edit <code>config.toml</code> as
+its owner and restart. Turn the setting off only where that is acceptable.</p>
+<h3 id="the-users-roster"><a class="header" href="#the-users-roster">The users roster</a></h3>
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>permission_profiles</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>The <code>[permission_profiles.&lt;alias&gt;]</code> entries granting this user’s permissions, merged by deterministic union. Required; a user with no profile cannot authenticate.</p>
+<p><strong>Set it on any surface:</strong></p>
+<div class="os-tabs-src">
+<h4 id="gateway-dashboard"><a class="header" href="#gateway-dashboard">Gateway dashboard</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/users"><code>/config/users</code></a> and set the <code>users.&lt;alias&gt;.permission_profiles</code> field.</p>
+<h4 id="zerocode"><a class="header" href="#zerocode">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>users.&lt;alias&gt;.permission_profiles</code> field.</p>
+<h4 id="zeroclaw-config"><a class="header" href="#zeroclaw-config">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set users.&lt;alias&gt;.permission_profiles &lt;value&gt;
+</code></pre>
+<h4 id="environment-variable"><a class="header" href="#environment-variable">Environment variable</a></h4>
+<p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
+<pre><code class="language-sh">export ZEROCLAW_users__&lt;alias&gt;__permission_profiles=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>principal_id</code> <span class="cfg-field-meta"><code>string?</code> · default <code>null</code></span></summary>
+<p>Durable principal identifier for this entry; defaults to the entry name. Audit records key on this id, NOT on the entry name, and ownership of sessions, memory, and approvals will key on it once principal-owned storage lands. To rename the entry without orphaning its data, set <code>principal_id</code> to the original id in the same edit. Changing an entry’s effective principal id creates a new principal.</p>
+<p><strong>Set it on any surface:</strong></p>
+<div class="os-tabs-src">
+<h4 id="gateway-dashboard-1"><a class="header" href="#gateway-dashboard-1">Gateway dashboard</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/users"><code>/config/users</code></a> and set the <code>users.&lt;alias&gt;.principal_id</code> field.</p>
+<h4 id="zerocode-1"><a class="header" href="#zerocode-1">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>users.&lt;alias&gt;.principal_id</code> field.</p>
+<h4 id="zeroclaw-config-1"><a class="header" href="#zeroclaw-config-1">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set users.&lt;alias&gt;.principal_id &lt;value&gt;
+</code></pre>
+<h4 id="environment-variable-1"><a class="header" href="#environment-variable-1">Environment variable</a></h4>
+<p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
+<pre><code class="language-sh">export ZEROCLAW_users__&lt;alias&gt;__principal_id=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>uid</code> <span class="cfg-field-meta"><code>integer?</code> · default <code>null</code></span></summary>
+<p>Unix uid accepted for this user over the local socket (peer credential). Required today: it is the only roster credential the accepted provider set supports.</p>
+<p><strong>Set it on any surface:</strong></p>
+<div class="os-tabs-src">
+<h4 id="gateway-dashboard-2"><a class="header" href="#gateway-dashboard-2">Gateway dashboard</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/users"><code>/config/users</code></a> and set the <code>users.&lt;alias&gt;.uid</code> field.</p>
+<h4 id="zerocode-2"><a class="header" href="#zerocode-2">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>users.&lt;alias&gt;.uid</code> field.</p>
+<h4 id="zeroclaw-config-2"><a class="header" href="#zeroclaw-config-2">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set users.&lt;alias&gt;.uid &lt;value&gt;
+</code></pre>
+<h4 id="environment-variable-2"><a class="header" href="#environment-variable-2">Environment variable</a></h4>
+<p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
+<pre><code class="language-sh">export ZEROCLAW_users__&lt;alias&gt;__uid=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+<p>The entry name doubles as the durable principal id unless <code>principal_id</code>
+pins one explicitly. Audit records key on that id today. Sessions, memory,
+and approvals are not keyed on it yet (see
+<a href="#what-this-layer-does-not-do-yet">What this layer does not do (yet)</a>), but
+they will be, so to rename an entry without orphaning its data later, set
+<code>principal_id</code> to the original id in the same edit.</p>
+<h3 id="oidc"><a class="header" href="#oidc">OIDC</a></h3>
+<p>Each <code>[oidc.&lt;alias&gt;]</code> entry is one trust relationship with one issuer;
+token verification (offline JWKS or RFC 7662 introspection), claim
+mapping, and the lifetime bounds are documented on the section reference:</p>
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>actor_claim</code> <span class="cfg-field-meta"><code>string</code> · default <code>""</code></span></summary>
+<p>Dotted path to a claim the issuer stamps on exactly ONE actor kind’s tokens (present, non-null), e.g. Auth0’s <code>gty</code> on client-credentials tokens or Okta’s <code>uid</code> on user tokens. <code>actor_claim_marks</code> names the kind its presence proves; absence proves the other kind. Required for a client that issues both human and machine tokens (declared in neither client list); also checked against declared clients, where contradicting evidence denies. Empty = no claim-based classification, so every accepted client must be declared.</p>
+<p><strong>Set it on any surface:</strong></p>
+<div class="os-tabs-src">
+<h4 id="gateway-dashboard-3"><a class="header" href="#gateway-dashboard-3">Gateway dashboard</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> and set the <code>oidc.&lt;alias&gt;.actor_claim</code> field.</p>
+<h4 id="zerocode-3"><a class="header" href="#zerocode-3">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>oidc.&lt;alias&gt;.actor_claim</code> field.</p>
+<h4 id="zeroclaw-config-3"><a class="header" href="#zeroclaw-config-3">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.actor_claim &lt;value&gt;
+</code></pre>
+<h4 id="environment-variable-3"><a class="header" href="#environment-variable-3">Environment variable</a></h4>
+<p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__actor_claim=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>actor_claim_marks</code> <span class="cfg-field-meta"><code>OidcActorKind</code> · default <code>"service"</code></span></summary>
+<p>Which actor kind the presence of <code>actor_claim</code> proves.</p>
+<p><strong>Set it on any surface:</strong></p>
+<div class="os-tabs-src">
+<h4 id="gateway-dashboard-4"><a class="header" href="#gateway-dashboard-4">Gateway dashboard</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> and set the <code>oidc.&lt;alias&gt;.actor_claim_marks</code> field.</p>
+<h4 id="zerocode-4"><a class="header" href="#zerocode-4">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>oidc.&lt;alias&gt;.actor_claim_marks</code> field.</p>
+<h4 id="zeroclaw-config-4"><a class="header" href="#zeroclaw-config-4">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.actor_claim_marks &lt;value&gt;
+</code></pre>
+<h4 id="environment-variable-4"><a class="header" href="#environment-variable-4">Environment variable</a></h4>
+<p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__actor_claim_marks=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>allowed_authorized_parties</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>Allowed <code>azp</code> (authorized party) values, meaning the client the token was issued TO. Empty = no restriction; non-empty = the token must carry an <code>azp</code> claim listed here or authentication fails closed.</p>
+<p><strong>Set it on any surface:</strong></p>
+<div class="os-tabs-src">
+<h4 id="gateway-dashboard-5"><a class="header" href="#gateway-dashboard-5">Gateway dashboard</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> and set the <code>oidc.&lt;alias&gt;.allowed_authorized_parties</code> field.</p>
+<h4 id="zerocode-5"><a class="header" href="#zerocode-5">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>oidc.&lt;alias&gt;.allowed_authorized_parties</code> field.</p>
+<h4 id="zeroclaw-config-5"><a class="header" href="#zeroclaw-config-5">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.allowed_authorized_parties &lt;value&gt;
+</code></pre>
+<h4 id="environment-variable-5"><a class="header" href="#environment-variable-5">Environment variable</a></h4>
+<p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__allowed_authorized_parties=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>audience</code> <span class="cfg-field-meta"><code>string</code> · default <code>""</code></span></summary>
+<p>Audience the token must carry in its <code>aud</code> claim for this daemon (typically the client ID or resource identifier registered at the IdP). Required for token verification.</p>
+<p><strong>Set it on any surface:</strong></p>
+<div class="os-tabs-src">
+<h4 id="gateway-dashboard-6"><a class="header" href="#gateway-dashboard-6">Gateway dashboard</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> and set the <code>oidc.&lt;alias&gt;.audience</code> field.</p>
+<h4 id="zerocode-6"><a class="header" href="#zerocode-6">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>oidc.&lt;alias&gt;.audience</code> field.</p>
+<h4 id="zeroclaw-config-6"><a class="header" href="#zeroclaw-config-6">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.audience &lt;value&gt;
+</code></pre>
+<h4 id="environment-variable-6"><a class="header" href="#environment-variable-6">Environment variable</a></h4>
+<p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__audience=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>claim_path</code> <span class="cfg-field-meta"><code>string</code> · default <code>""</code></span></summary>
+<p>Dotted path to the verified claim holding this deployment’s role/group values (e.g. <code>realm_access.roles</code>, <code>groups</code>). Must be set explicitly: the daemon refuses to guess where grants live in a token.</p>
+<p><strong>Set it on any surface:</strong></p>
+<div class="os-tabs-src">
+<h4 id="gateway-dashboard-7"><a class="header" href="#gateway-dashboard-7">Gateway dashboard</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> and set the <code>oidc.&lt;alias&gt;.claim_path</code> field.</p>
+<h4 id="zerocode-7"><a class="header" href="#zerocode-7">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>oidc.&lt;alias&gt;.claim_path</code> field.</p>
+<h4 id="zeroclaw-config-7"><a class="header" href="#zeroclaw-config-7">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.claim_path &lt;value&gt;
+</code></pre>
+<h4 id="environment-variable-7"><a class="header" href="#environment-variable-7">Environment variable</a></h4>
+<p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__claim_path=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>client_id</code> <span class="cfg-field-meta"><code>string</code> · default <code>""</code></span></summary>
+<p>Client ID this daemon authenticates AS for confidential flows (token introspection; enrollment in a later slice). Defaults to <code>audience</code> when empty.</p>
+<p><strong>Set it on any surface:</strong></p>
+<div class="os-tabs-src">
+<h4 id="gateway-dashboard-8"><a class="header" href="#gateway-dashboard-8">Gateway dashboard</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> and set the <code>oidc.&lt;alias&gt;.client_id</code> field.</p>
+<h4 id="zerocode-8"><a class="header" href="#zerocode-8">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>oidc.&lt;alias&gt;.client_id</code> field.</p>
+<h4 id="zeroclaw-config-8"><a class="header" href="#zeroclaw-config-8">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.client_id &lt;value&gt;
+</code></pre>
+<h4 id="environment-variable-8"><a class="header" href="#environment-variable-8">Environment variable</a></h4>
+<p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__client_id=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>client_secret</code> 🔑 <span class="cfg-field-meta"><code>secret</code> · default <code>null</code></span></summary>
+<p>Client secret for confidential-client flows (token introspection). Not required for JWKS validation. Encrypted at rest.</p>
+<p><strong>Set it on any surface:</strong></p>
+<div class="os-tabs-src">
+<h4 id="gateway-dashboard-9"><a class="header" href="#gateway-dashboard-9">Gateway dashboard</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> and set the <code>oidc.&lt;alias&gt;.client_secret</code> field.</p>
+<h4 id="zerocode-9"><a class="header" href="#zerocode-9">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>oidc.&lt;alias&gt;.client_secret</code> field.</p>
+<h4 id="zeroclaw-config-9"><a class="header" href="#zeroclaw-config-9">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.client_secret    # masked input, stored encrypted
+</code></pre>
+<h4 id="environment-variable-9"><a class="header" href="#environment-variable-9">Environment variable</a></h4>
+<p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__client_secret=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>interactive_clients</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>Client identities whose tokens are ALWAYS human principals (authorization-code / device-code clients), matched against the verified <code>client_id</code> claim. Their tokens must carry a nonblank <code>sub</code> and resolve through <code>profile_map</code>. A client may appear in only one of <code>service_clients</code> and <code>interactive_clients</code>.</p>
+<p><strong>Set it on any surface:</strong></p>
+<div class="os-tabs-src">
+<h4 id="gateway-dashboard-10"><a class="header" href="#gateway-dashboard-10">Gateway dashboard</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> and set the <code>oidc.&lt;alias&gt;.interactive_clients</code> field.</p>
+<h4 id="zerocode-10"><a class="header" href="#zerocode-10">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>oidc.&lt;alias&gt;.interactive_clients</code> field.</p>
+<h4 id="zeroclaw-config-10"><a class="header" href="#zeroclaw-config-10">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.interactive_clients &lt;value&gt;
+</code></pre>
+<h4 id="environment-variable-10"><a class="header" href="#environment-variable-10">Environment variable</a></h4>
+<p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__interactive_clients=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>issuer</code> <span class="cfg-field-meta"><code>string</code> · default <code>""</code></span></summary>
+<p>Issuer URL exactly as it appears in validated token <code>iss</code> claims (e.g. <code>https://sso.example.com/realms/main</code>). Discovery is fetched from <code>&lt;issuer&gt;/.well-known/openid-configuration</code> and its <code>issuer</code> field must match this value exactly.</p>
+<p><strong>Set it on any surface:</strong></p>
+<div class="os-tabs-src">
+<h4 id="gateway-dashboard-11"><a class="header" href="#gateway-dashboard-11">Gateway dashboard</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> and set the <code>oidc.&lt;alias&gt;.issuer</code> field.</p>
+<h4 id="zerocode-11"><a class="header" href="#zerocode-11">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>oidc.&lt;alias&gt;.issuer</code> field.</p>
+<h4 id="zeroclaw-config-11"><a class="header" href="#zeroclaw-config-11">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.issuer &lt;value&gt;
+</code></pre>
+<h4 id="environment-variable-11"><a class="header" href="#environment-variable-11">Environment variable</a></h4>
+<p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__issuer=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>max_auth_lifetime_secs</code> <span class="cfg-field-meta"><code>integer</code> · default <code>86400</code></span></summary>
+<p>Maximum authentication lifetime (seconds) for offline-validated (JWKS) tokens. Offline validation cannot see revocation, so the identity expires at the EARLIER of the token <code>exp</code> and <code>iat</code> + this cap. Must be &gt; 0.</p>
+<p><strong>Set it on any surface:</strong></p>
+<div class="os-tabs-src">
+<h4 id="gateway-dashboard-12"><a class="header" href="#gateway-dashboard-12">Gateway dashboard</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> and set the <code>oidc.&lt;alias&gt;.max_auth_lifetime_secs</code> field.</p>
+<h4 id="zerocode-12"><a class="header" href="#zerocode-12">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>oidc.&lt;alias&gt;.max_auth_lifetime_secs</code> field.</p>
+<h4 id="zeroclaw-config-12"><a class="header" href="#zeroclaw-config-12">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.max_auth_lifetime_secs &lt;value&gt;
+</code></pre>
+<h4 id="environment-variable-12"><a class="header" href="#environment-variable-12">Environment variable</a></h4>
+<p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__max_auth_lifetime_secs=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>profile_map</code> <span class="cfg-field-meta"><code>map</code> · default <code>{}</code></span></summary>
+<p>Maps a claim value found at <code>claim_path</code> to a <code>[permission_profiles.&lt;alias&gt;]</code> name. Claim values with no mapping grant nothing; an identity mapping to no profile at all is denied.</p>
+<p><strong>Set it on any surface:</strong></p>
+<div class="os-tabs-src">
+<h4 id="gateway-dashboard-13"><a class="header" href="#gateway-dashboard-13">Gateway dashboard</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> and set the <code>oidc.&lt;alias&gt;.profile_map</code> field.</p>
+<h4 id="zerocode-13"><a class="header" href="#zerocode-13">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>oidc.&lt;alias&gt;.profile_map</code> field.</p>
+<h4 id="zeroclaw-config-13"><a class="header" href="#zeroclaw-config-13">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.profile_map &lt;value&gt;
+</code></pre>
+<h4 id="environment-variable-13"><a class="header" href="#environment-variable-13">Environment variable</a></h4>
+<p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__profile_map=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>require_at_jwt</code> <span class="cfg-field-meta"><code>bool</code> · default <code>true</code></span></summary>
+<p>Require the RFC 9068 typed JWT profile for JWKS validation. Opaque tokens remain valid only through configured introspection.</p>
+<p><strong>Set it on any surface:</strong></p>
+<div class="os-tabs-src">
+<h4 id="gateway-dashboard-14"><a class="header" href="#gateway-dashboard-14">Gateway dashboard</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> and set the <code>oidc.&lt;alias&gt;.require_at_jwt</code> field.</p>
+<h4 id="zerocode-14"><a class="header" href="#zerocode-14">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>oidc.&lt;alias&gt;.require_at_jwt</code> field.</p>
+<h4 id="zeroclaw-config-14"><a class="header" href="#zeroclaw-config-14">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.require_at_jwt &lt;value&gt;
+</code></pre>
+<h4 id="environment-variable-14"><a class="header" href="#environment-variable-14">Environment variable</a></h4>
+<p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__require_at_jwt=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>require_mfa</code> <span class="cfg-field-meta"><code>bool</code> · default <code>false</code></span></summary>
+<p>Require the token to attest MFA through the IdP aggregate <code>mfa</code> marker or an accepted configured ACR before authentication succeeds.</p>
+<p><strong>Set it on any surface:</strong></p>
+<div class="os-tabs-src">
+<h4 id="gateway-dashboard-15"><a class="header" href="#gateway-dashboard-15">Gateway dashboard</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> and set the <code>oidc.&lt;alias&gt;.require_mfa</code> field.</p>
+<h4 id="zerocode-15"><a class="header" href="#zerocode-15">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>oidc.&lt;alias&gt;.require_mfa</code> field.</p>
+<h4 id="zeroclaw-config-15"><a class="header" href="#zeroclaw-config-15">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.require_mfa &lt;value&gt;
+</code></pre>
+<h4 id="environment-variable-15"><a class="header" href="#environment-variable-15">Environment variable</a></h4>
+<p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__require_mfa=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>required_acr</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>Acceptable <code>acr</code> (authentication context class) values. Empty = no requirement; non-empty = the token’s <code>acr</code> claim must be one of these values or authentication fails closed.</p>
+<p><strong>Set it on any surface:</strong></p>
+<div class="os-tabs-src">
+<h4 id="gateway-dashboard-16"><a class="header" href="#gateway-dashboard-16">Gateway dashboard</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> and set the <code>oidc.&lt;alias&gt;.required_acr</code> field.</p>
+<h4 id="zerocode-16"><a class="header" href="#zerocode-16">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>oidc.&lt;alias&gt;.required_acr</code> field.</p>
+<h4 id="zeroclaw-config-16"><a class="header" href="#zeroclaw-config-16">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.required_acr &lt;value&gt;
+</code></pre>
+<h4 id="environment-variable-16"><a class="header" href="#environment-variable-16">Environment variable</a></h4>
+<p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__required_acr=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>revalidation_secs</code> <span class="cfg-field-meta"><code>integer</code> · default <code>60</code></span></summary>
+<p>Revalidation interval (seconds) for introspection mode: the deadline stamped on each identity after which the next privileged operation must re-introspect or fail closed. <code>0</code> = revalidate at every privileged operation.</p>
+<p><strong>Set it on any surface:</strong></p>
+<div class="os-tabs-src">
+<h4 id="gateway-dashboard-17"><a class="header" href="#gateway-dashboard-17">Gateway dashboard</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> and set the <code>oidc.&lt;alias&gt;.revalidation_secs</code> field.</p>
+<h4 id="zerocode-17"><a class="header" href="#zerocode-17">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>oidc.&lt;alias&gt;.revalidation_secs</code> field.</p>
+<h4 id="zeroclaw-config-17"><a class="header" href="#zeroclaw-config-17">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.revalidation_secs &lt;value&gt;
+</code></pre>
+<h4 id="environment-variable-17"><a class="header" href="#environment-variable-17">Environment variable</a></h4>
+<p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__revalidation_secs=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>service_clients</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>Client identities whose tokens are ALWAYS service principals (<code>client_credentials</code> callers), matched against the token’s verified <code>client_id</code> claim. Service principals are keyed by issuer + client identity and never inherit human-user assumptions, whatever provider-specific shape their <code>sub</code> takes (<code>&lt;client&gt;@clients</code>, a service-account user id, or the client id itself). Actor classification is declarative, never inferred from the <code>sub</code>/<code>client_id</code> relationship: a token is a service because its client is listed here, a human because its client is listed in <code>interactive_clients</code>, or classified by <code>actor_claim</code>. A token whose client is declared nowhere and carries no configured actor claim evidence is denied. A client may appear in only one of the two lists.</p>
+<p><strong>Set it on any surface:</strong></p>
+<div class="os-tabs-src">
+<h4 id="gateway-dashboard-18"><a class="header" href="#gateway-dashboard-18">Gateway dashboard</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> and set the <code>oidc.&lt;alias&gt;.service_clients</code> field.</p>
+<h4 id="zerocode-18"><a class="header" href="#zerocode-18">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>oidc.&lt;alias&gt;.service_clients</code> field.</p>
+<h4 id="zeroclaw-config-18"><a class="header" href="#zeroclaw-config-18">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.service_clients &lt;value&gt;
+</code></pre>
+<h4 id="environment-variable-18"><a class="header" href="#environment-variable-18">Environment variable</a></h4>
+<p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__service_clients=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>service_profile_map</code> <span class="cfg-field-meta"><code>map</code> · default <code>{}</code></span></summary>
+<p>Maps a SERVICE client’s verified <code>client_id</code> to a <code>[permission_profiles.&lt;alias&gt;]</code> name. Service principals resolve ONLY through this map, never <code>profile_map</code>, so a machine credential cannot inherit a human profile from similarly-named claims. A service <code>client_id</code> with no entry here is authenticated but entitled to nothing (fail closed).</p>
+<p><strong>Set it on any surface:</strong></p>
+<div class="os-tabs-src">
+<h4 id="gateway-dashboard-19"><a class="header" href="#gateway-dashboard-19">Gateway dashboard</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> and set the <code>oidc.&lt;alias&gt;.service_profile_map</code> field.</p>
+<h4 id="zerocode-19"><a class="header" href="#zerocode-19">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>oidc.&lt;alias&gt;.service_profile_map</code> field.</p>
+<h4 id="zeroclaw-config-19"><a class="header" href="#zeroclaw-config-19">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.service_profile_map &lt;value&gt;
+</code></pre>
+<h4 id="environment-variable-19"><a class="header" href="#environment-variable-19">Environment variable</a></h4>
+<p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__service_profile_map=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>validation</code> <span class="cfg-field-meta"><code>OidcValidation</code> · default <code>"jwks"</code></span></summary>
+<p>How presented tokens are validated.</p>
+<p><strong>Set it on any surface:</strong></p>
+<div class="os-tabs-src">
+<h4 id="gateway-dashboard-20"><a class="header" href="#gateway-dashboard-20">Gateway dashboard</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> and set the <code>oidc.&lt;alias&gt;.validation</code> field.</p>
+<h4 id="zerocode-20"><a class="header" href="#zerocode-20">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>oidc.&lt;alias&gt;.validation</code> field.</p>
+<h4 id="zeroclaw-config-20"><a class="header" href="#zeroclaw-config-20">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.validation &lt;value&gt;
+</code></pre>
+<h4 id="environment-variable-20"><a class="header" href="#environment-variable-20">Environment variable</a></h4>
+<p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__validation=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+<h4 id="enrolling-getting-a-token-to-present"><a class="header" href="#enrolling-getting-a-token-to-present">Enrolling (getting a token to present)</a></h4>
+<p>The daemon only verifies tokens; clients obtain them from the IdP. Two
+browserless flows ship with the CLI:</p>
+<pre><code class="language-sh"># Interactive sign-in via the Device Authorization Grant (RFC 8628):
+# prints a verification code to enter in any browser, waits for
+# approval, then writes the access token to stdout.
+export ZEROCLAW_AUTH_TOKEN="$(zeroclaw oidc login corp)"
+
+# Same, via the system browser: Authorization Code + PKCE (S256 only)
+# with an RFC 8252 one-shot loopback listener. The mechanisms never
+# fall back into each other.
+export ZEROCLAW_AUTH_TOKEN="$(zeroclaw oidc login corp --browser)"
+
+# Headless service principals via client_credentials (requires the
+# entry's client_secret):
+export ZEROCLAW_AUTH_TOKEN="$(zeroclaw oidc token corp)"
+</code></pre>
+<p>Progress messages go to stderr; stdout carries only the token, so both
+commands compose with command substitution (the <code>oidc</code> commands run before
+any startup prelude that could print, the OTP seed disclosure included).
+Nothing is stored: present the token as <code>auth_token</code> in the RPC handshake
+(or via the environment variable) before it expires, then re-enroll.</p>
+<p>The client trusts the issuer the entry names and nothing else: the
+discovery document must assert exactly that issuer before any endpoint it
+advertises is used, every endpoint that receives a credential must satisfy
+the same URL policy as the issuer (<code>https</code>, or <code>http</code> only for an exact
+loopback host), redirects are never followed, response bodies are
+size-capped, and a token response is accepted only when it carries a
+non-empty <code>Bearer</code> access token. A confidential client (an entry with a
+<code>client_secret</code>) authenticates with HTTP Basic on every request; a public
+client sends its <code>client_id</code> in the form.</p>
+<p><code>--browser</code> opens the system browser for you on macOS and Linux, and on
+every platform it also prints the sign-in URL so you can open it by
+hand in a browser on the same machine (the callback lands on a loopback
+port of the host running the CLI). The browser opener runs detached
+from the CLI’s standard streams, so whatever a launcher writes on its
+own stdout cannot contaminate the result: stdout still carries only the
+token.</p>
+<p>Both callback adapters, the CLI’s loopback listener and the gateway
+callback, enforce the RFC 9207 issuer check. A response whose <code>iss</code>
+parameter does not match the issuer that started the flow is refused
+before its <code>code</code> or its <code>error</code> is acted on. A response that carries no
+<code>iss</code> at all is accepted, since the parameter is optional and not every
+issuer sends it. When the code exchange returns an <code>id_token</code> next to
+the access token, that <code>id_token</code> is validated in full (issuer,
+audience, expiry, and the nonce bound to this flow) and then discarded.
+Only the access token is ever presented to the daemon. The enrollment
+client applies the same suspicion to discovery itself: it refuses a
+<code>.well-known/openid-configuration</code> document whose <code>issuer</code> is not an
+exact match for the configured issuer, trailing slash included, before
+it uses any endpoint named in it (the RFC 8414 check), and it caps the
+size of the documents it reads, so a hostile or broken issuer cannot
+redirect the flow to endpoints of its choosing or answer with an
+unbounded body.</p>
+<p>Clients that hold no IdP credentials (the web dashboard, zerocode)
+enroll through the gateway instead, which proxies the same flows with
+the configured entry’s client credentials: <code>GET /api/oidc/providers</code>
+lists aliases, <code>POST /api/oidc/{alias}/device/start</code> and
+<code>/device/poll</code> drive the device grant, and <code>GET /oidc/login/{alias}</code>
+runs the browser flow, whose one-time callback page hands the token to
+the opening window via <code>postMessage</code> (same-origin only) with a manual
+copy fallback. The gateway also sends
+<code>Cross-Origin-Opener-Policy: same-origin</code>, which severs <code>window.opener</code>
+once the popup has navigated through the identity provider, so in
+current browsers the manual copy on that page is the handoff that works
+today and the <code>postMessage</code> contract is in place for the dashboard
+follow-up. These routes are unauthenticated by necessity
+(enrollment precedes authentication), rate limited, and grant nothing:
+they only relay what the IdP grants after the user approves. Design
+rationale and failure-mode table:
+<code>docs/security/oidc-browser-pkce-design-8289.md</code> in the repository.</p>
+<p>The rate limiting works in layers. Requests that start a flow
+(<code>POST /api/oidc/{alias}/device/start</code>, <code>GET /oidc/login/{alias}</code>, and
+<code>GET /oidc/callback</code>) count against an enrollment-specific instance of
+the gateway’s brute-force limiter: the same thresholds and the same
+lockout that govern a bad pairing token, kept on their own ledger, so
+an address locked out of enrollment can still pair or present a webhook
+signature, and a lockout earned on either of those never blocks
+enrollment. A callback counts as an attempt only when it is
+unproductive: no live flow state for the <code>state</code> it carries, an issuer
+that does not match, an error handed back by the identity provider, no
+authorization code, an alias removed while the flow was in flight, or a
+code exchange that fails. A callback that completes a sign-in costs
+nothing, and neither does one the gateway itself turns away because its
+relay capacity is in use, so a crowd of people signing in at once cannot
+lock their shared address out. A browser sign-in that is refused because
+the pending-flow store is full costs the caller nothing either, for the
+same reason. Provider listings, device polls and sign-in starts carry a
+per-client budget of 20 requests per minute, which leaves headroom over
+RFC 8628’s five-second minimum polling interval (12 polls per minute)
+without letting a client spin. A poll counts as an attempt when the
+identity provider answers <code>slow_down</code> or rejects the device code
+outright, so a client relaying garbage device codes walks into the
+existing lockout instead of polling forever; a transport failure on the
+gateway’s own leg to the identity provider says nothing about the
+caller and is not billed to it. A client over its budget, or locked
+out, gets HTTP 429 with a <code>Retry-After</code> naming the delay in seconds,
+and zerocode waits at least that delay, and never less than the RFC’s
+five-second increment, before its next poll (still clipped to the device
+code’s remaining lifetime), and never polls faster than once every five
+seconds in any case. At most 16 outbound relays to the identity
+provider are in flight at once across all clients, which bounds what the
+gateway will do to the IdP on everyone’s behalf. The pending-flow store
+holds 32 browser sign-ins at once, and one remote client may hold eight of
+them, so a caller that starts sign-ins and never finishes them cannot take
+the store away from everyone else for the ten minutes those flows live. Loopback clients are
+exempt from the per-client budgets, as they are from every other gateway
+auth limit, so a reverse proxy sitting on the same host must enable
+<code>trust_forwarded_headers</code> for the per-client limits to apply to the real
+callers behind it. Every enrollment response carries
+<code>Cache-Control: no-store</code> and <code>Pragma: no-cache</code> on top of the gateway’s
+<code>no-referrer</code> policy, because device codes and access tokens travel in
+those bodies.</p>
+<p>zerocode enrolls over the same API from its own config.
+<code>[connection.wss] enroll_url</code> names the gateway’s HTTP origin, and an
+optional path prefix is allowed. It must be <code>https://</code> unless it points
+at a loopback address (<code>127.0.0.1</code>, <code>::1</code>, or <code>localhost</code>), because the
+device code and then the access token travel over it, and redirects are
+not followed, so a plaintext hop cannot be introduced after the fact.
+The enrollment connection uses the same <code>[connection.wss.tls]</code> trust
+material as the WSS leg: the configured CA, <code>skip_verify</code>, and the
+mutual-TLS client certificate. When that material leaves the certificate
+unchecked, zerocode asks before the device code goes out rather than
+after the token has arrived, and it asks about the enrollment origin
+itself, which may not be the daemon the session connects to afterwards.
+Answering <code>always</code> records that origin in <code>skip_verify_routes</code>; a
+non-interactive run has nobody to ask, so enrollment stops there. zerocode clips every polling wait to the
+device code’s remaining lifetime and never polls after it expires, and
+it refuses an advertised lifetime above one hour or a polling interval
+above five minutes rather than sleeping on a hostile answer. An
+advertised interval of <code>0</code> or <code>1</code> is floored at RFC 8628’s five-second
+default, so a gateway answer cannot put zerocode on a once-a-second
+poll the per-client budget would only refuse. The token it receives is
+held in memory for that session only.</p>
+<h2 id="permission-profiles"><a class="header" href="#permission-profiles">Permission profiles</a></h2>
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>admin</code> <span class="cfg-field-meta"><code>bool</code> · default <code>false</code></span></summary>
+<p>Grant everything. When true all other fields are irrelevant.</p>
+<p><strong>Set it on any surface:</strong></p>
+<div class="os-tabs-src">
+<h4 id="gateway-dashboard-21"><a class="header" href="#gateway-dashboard-21">Gateway dashboard</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/permission_profiles"><code>/config/permission_profiles</code></a> and set the <code>permission_profiles.&lt;alias&gt;.admin</code> field.</p>
+<h4 id="zerocode-21"><a class="header" href="#zerocode-21">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>permission_profiles.&lt;alias&gt;.admin</code> field.</p>
+<h4 id="zeroclaw-config-21"><a class="header" href="#zeroclaw-config-21">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set permission_profiles.&lt;alias&gt;.admin &lt;value&gt;
+</code></pre>
+<h4 id="environment-variable-21"><a class="header" href="#environment-variable-21">Environment variable</a></h4>
+<p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
+<pre><code class="language-sh">export ZEROCLAW_permission_profiles__&lt;alias&gt;__admin=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>allowed_agents</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>Agent aliases holders of this profile may bind or address. Empty grants NO agents; grant every agent with the explicit <code>"*"</code> entry.</p>
+<p><strong>Set it on any surface:</strong></p>
+<div class="os-tabs-src">
+<h4 id="gateway-dashboard-22"><a class="header" href="#gateway-dashboard-22">Gateway dashboard</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/permission_profiles"><code>/config/permission_profiles</code></a> and set the <code>permission_profiles.&lt;alias&gt;.allowed_agents</code> field.</p>
+<h4 id="zerocode-22"><a class="header" href="#zerocode-22">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>permission_profiles.&lt;alias&gt;.allowed_agents</code> field.</p>
+<h4 id="zeroclaw-config-22"><a class="header" href="#zeroclaw-config-22">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set permission_profiles.&lt;alias&gt;.allowed_agents &lt;value&gt;
+</code></pre>
+<h4 id="environment-variable-22"><a class="header" href="#environment-variable-22">Environment variable</a></h4>
+<p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
+<pre><code class="language-sh">export ZEROCLAW_permission_profiles__&lt;alias&gt;__allowed_agents=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>allowed_tools</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>Tool names holders may cause an agent to run. Empty grants NO tools; broad access requires the explicit <code>"*"</code> entry. This selector composes with the coarse <code>tools = ["execute"]</code> grant, never replaces it: without that grant the holder’s sessions run tool-less whatever is named here. (Note this differs from risk-profile <code>allowed_tools</code>, where empty means unconstrained: permission profiles are deny-by-default. The agent’s own risk-profile policy still applies on top.)</p>
+<p><strong>Set it on any surface:</strong></p>
+<div class="os-tabs-src">
+<h4 id="gateway-dashboard-23"><a class="header" href="#gateway-dashboard-23">Gateway dashboard</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/permission_profiles"><code>/config/permission_profiles</code></a> and set the <code>permission_profiles.&lt;alias&gt;.allowed_tools</code> field.</p>
+<h4 id="zerocode-23"><a class="header" href="#zerocode-23">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>permission_profiles.&lt;alias&gt;.allowed_tools</code> field.</p>
+<h4 id="zeroclaw-config-23"><a class="header" href="#zeroclaw-config-23">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set permission_profiles.&lt;alias&gt;.allowed_tools &lt;value&gt;
+</code></pre>
+<h4 id="environment-variable-23"><a class="header" href="#environment-variable-23">Environment variable</a></h4>
+<p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
+<pre><code class="language-sh">export ZEROCLAW_permission_profiles__&lt;alias&gt;__allowed_tools=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>config_write_paths</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>Dotted config path prefixes holders may write. A trailing <code>.*</code> grants the subtree (e.g. <code>channels.*</code>); a bare path grants that exact prop; <code>"*"</code> grants every path. Empty grants NO paths.</p>
+<p><strong>Set it on any surface:</strong></p>
+<div class="os-tabs-src">
+<h4 id="gateway-dashboard-24"><a class="header" href="#gateway-dashboard-24">Gateway dashboard</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/permission_profiles"><code>/config/permission_profiles</code></a> and set the <code>permission_profiles.&lt;alias&gt;.config_write_paths</code> field.</p>
+<h4 id="zerocode-24"><a class="header" href="#zerocode-24">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>permission_profiles.&lt;alias&gt;.config_write_paths</code> field.</p>
+<h4 id="zeroclaw-config-24"><a class="header" href="#zeroclaw-config-24">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set permission_profiles.&lt;alias&gt;.config_write_paths &lt;value&gt;
+</code></pre>
+<h4 id="environment-variable-24"><a class="header" href="#environment-variable-24">Environment variable</a></h4>
+<p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
+<pre><code class="language-sh">export ZEROCLAW_permission_profiles__&lt;alias&gt;__config_write_paths=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>grants</code> <span class="cfg-field-meta"><code>map</code> · default <code>{}</code></span></summary>
+<p>Resource-class grants: for each resource kind, the verbs permitted. Resources: <code>system</code>, <code>sessions</code>, <code>memory</code>, <code>cron</code>, <code>config</code>, <code>agents</code>, <code>cost</code>, <code>skills</code>, <code>personality</code>, <code>logs</code>, <code>tui</code>, <code>files</code>, <code>locales</code>, <code>quickstart</code>, <code>channels</code>, <code>providers</code>, <code>models</code>, <code>peer_groups</code>, <code>plugins</code>, <code>tools</code>, <code>sops</code>. Verbs: <code>create</code>, <code>read</code>, <code>update</code>, <code>delete</code>, <code>execute</code>. An unlisted resource is denied.</p>
+<p><strong>Set it on any surface:</strong></p>
+<div class="os-tabs-src">
+<h4 id="gateway-dashboard-25"><a class="header" href="#gateway-dashboard-25">Gateway dashboard</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/permission_profiles"><code>/config/permission_profiles</code></a> and set the <code>permission_profiles.&lt;alias&gt;.grants</code> field.</p>
+<h4 id="zerocode-25"><a class="header" href="#zerocode-25">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>permission_profiles.&lt;alias&gt;.grants</code> field.</p>
+<h4 id="zeroclaw-config-25"><a class="header" href="#zeroclaw-config-25">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set permission_profiles.&lt;alias&gt;.grants &lt;value&gt;
+</code></pre>
+<h4 id="environment-variable-25"><a class="header" href="#environment-variable-25">Environment variable</a></h4>
+<p>Export the override (POSIX shells; drop into <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code>, or a Dockerfile). Replace <code>&lt;alias&gt;</code> with the literal alias:</p>
+<pre><code class="language-sh">export ZEROCLAW_permission_profiles__&lt;alias&gt;__grants=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+<p>Profiles are deny-by-default: an unlisted resource is refused, an empty
+selector list grants no instances, and broad access requires the explicit
+<code>"*"</code> selector or <code>admin = true</code>. Multiple profiles merge by union. For
+cron jobs, attachments, personality files, per-agent cost queries, and SOP
+authoring, <code>allowed_agents = ["*"]</code> covers only the agents the
+configuration defines, not any alias a request names.</p>
+<p>Tool selectors compose by intersection at agent assembly, on top of the
+coarse grant: model-facing tool execution is <code>tools = ["execute"]</code>, and a
+principal without that grant receives a tool-less session whatever its
+<code>allowed_tools</code> names, including <code>"*"</code>. With the grant held, a session
+created by a constrained principal only receives the tools its
+<code>allowed_tools</code> names (an empty list yields a tool-less session), on top
+of whatever the agent’s own risk profile allows. After a queued prompt is
+admitted, authorization is rechecked against the shared resolver, including
+credential expiry and revocation. The current principal selector narrows
+static tools, the deferred search registry, already-activated tools, and
+pinned MCP resource content (each pinned block is admitted under its
+<code>&lt;server&gt;__&lt;uri&gt;</code> name and is withdrawn from later prompts once the selector
+no longer names it); removed tools cannot be reactivated. Reused sessions
+are narrowed before their next turn, and rehydrated sessions are rebuilt
+under current grants. Agent selectors are checked before a turn and before
+rehydration.</p>
+<p>Narrowing never adds tools back to an existing agent. After expanding grants,
+create a new session to receive the expanded surface. No new config snapshot
+or independent principal-policy cache is stored in the agent.</p>
+<p>Deferred MCP instructions are derived from the remaining loadable tools and
+shown only when <code>tool_search</code> is exposed. A principal needs both <code>tool_search</code>
+and the named deferred MCP tool for on-demand activation; the helper is never
+implicitly granted. Permitted <code>mode = "always"</code> MCP tools are preactivated and
+remain callable without the helper.</p>
+<p>If either the principal’s tool selector or agent selector is constrained,
+<code>delegate</code> (bounded and independent), <code>spawn_subagent</code>, and <code>execute_pipeline</code>
+are unavailable, including skill aliases wrapping those tools. These nested
+paths do not yet carry both current principal ceilings; the ordinary parent
+turn remains usable. Admin principals and principals with both selectors set
+to <code>"*"</code> keep their agent’s configured nested capabilities.</p>
+<p>The existing eight-argument Rust <code>Agent::from_live_config_with_tui_env</code>
+constructor remains available. RPC uses the additive
+<code>from_live_config_with_tui_env_and_principal_tools</code> constructor and reapplies
+the shared resolver’s grants at prompt admission.</p>
+<p>That composition does not cover every route to an agent’s tools. Cron jobs
+and SOP authoring check only the agent selector. A constrained principal
+holding cron grants can create a shell job for its agent, or give an
+existing agent job a new prompt and trigger it, and one holding SOP create
+or update grants can save a procedure whose trigger runs it later. Treat
+cron and SOP authoring grants as grants of the agent’s tools.</p>
+<h2 id="breaking-change-remote-wss-requires-authentication"><a class="header" href="#breaking-change-remote-wss-requires-authentication">Breaking change: remote WSS requires authentication</a></h2>
+<p>From this change on, a remote WSS connection must present <code>auth_token</code> in
+<code>initialize</code>. There is no unauthenticated remote fallback.</p>
+<p>A <code>[wss]</code> listener enabled with no possible credential path (no
+<code>[oidc.&lt;alias&gt;]</code>, no paired tokens, and <code>gateway.require_pairing = false</code>)
+is rejected by config validation, so no supported surface can save one.
+A configuration already on disk in that shape still boots: the daemon
+starts and the listener denies every remote handshake. It does not refuse
+to load, because an operator has to be able to boot a daemon in order to
+repair it.</p>
+<p>Invalid <code>[oidc.&lt;alias&gt;]</code>, <code>[users]</code>, or <code>[permission_profiles]</code> sections
+are the separate case. There the authorization policy itself does not
+compile, so the daemon installs a deny-all accepted state and logs that
+it is doing so until the sections are repaired and reloaded. Every
+principal is refused under that state, on remote and local connections
+alike, the daemon’s own uid included, so the repair is the on-disk one
+described under Recovery above.</p>
+<p>Migration for existing remote zerocode users:</p>
+<ol>
+<li>
+<p>Pair with the gateway as usual to obtain a bearer token.</p>
+</li>
+<li>
+<p>Give zerocode the token, either in its config:</p>
+<pre><code class="language-toml">[connection.wss]
+uri = "wss://daemon.example.com:9443"
+auth_token = "zc_..."
+</code></pre>
+<p>or via the <code>ZEROCLAW_AUTH_TOKEN</code> environment variable, which overrides
+the config value and keeps the credential out of the file.</p>
+<p>or by pointing at a file that holds it:</p>
+<pre><code class="language-toml">[connection.wss]
+uri = "wss://daemon.example.com:9443"
+auth_token_file = "/etc/zeroclaw/zerocode-bearer"
+</code></pre>
+<p>Precedence is <code>ZEROCLAW_AUTH_TOKEN</code>, then <code>auth_token_file</code>, then
+<code>auth_token</code>. On platforms with Unix permission bits, a referenced file
+that any other account can read is skipped with a warning rather than
+used, and the next source in that order applies. Elsewhere the file’s ACL
+is the only guard.</p>
+<p>The environment variable is the recommended path. When the token is
+kept in the config file instead, zerocode writes that file owner-only
+(<code>0600</code>, in a <code>0700</code> config directory) and repairs the modes of a file
+that predates this, on platforms with Unix permission bits. On
+platforms without them the directory ACL is the only guard, so treat
+the file as a secret there.</p>
+</li>
+</ol>
+<p>An OIDC access token works the same way with <code>auth_provider = "oidc.&lt;alias&gt;"</code>.</p>
+<h2 id="the-gateway-http-api"><a class="header" href="#the-gateway-http-api">The gateway HTTP API</a></h2>
+<p>The gateway’s configuration and onboarding routes (<code>/api/config*</code>,
+<code>/api/quickstart/*</code>, <code>/api/channels/bind</code>) enforce authentication
+structurally: one route-layer middleware guards the whole group, so no
+individual handler carries (or can forget) a check. The middleware
+speaks the same principal model as the RPC path, through the same
+provider registry and resolver:</p>
+<ul>
+<li>A <strong>paired bearer</strong> (<code>Authorization: Bearer zc_...</code>) resolves to the
+shared operator with full access, exactly as before. Denials keep the
+historical 401 shape.</li>
+<li>An <strong>OIDC bearer</strong> presented with the <code>X-ZeroClaw-Auth-Provider: oidc.&lt;alias&gt;</code> header is verified by that provider and resolved to a
+scoped principal. Selection is explicit, mirroring the RPC
+handshake’s <code>auth_provider</code> field: the named provider’s denial is
+authoritative, and there is never a fallback between providers.</li>
+<li>CORS preflight (<code>OPTIONS</code>) passes through unauthenticated, as it
+always has. Any other method outside GET, HEAD, POST, PUT, PATCH and
+DELETE is refused.</li>
+</ul>
+<p>A scoped principal’s <code>Config</code> grants are enforced in two steps. The
+route layer applies a coarse floor per HTTP method: a read needs
+<code>read</code>, anything else needs at least one of <code>create</code>, <code>update</code> or
+<code>delete</code>, so a read-only principal never reaches a mutating handler.
+Each mutating handler then authorizes its <strong>complete write set</strong> before
+its first side effect: every config path the mutation will persist,
+classified by what it does to the configuration (<code>create</code> for a path it
+brings into being, <code>delete</code> for one it removes, <code>update</code> otherwise) and
+matched against the profile’s <code>config_write_paths</code> selectors. The
+classification follows the operation, not the method: creating a map
+key through <code>POST /api/config/map-key</code>, or implicitly through a <code>PUT</code>
+under a new alias, needs <code>create</code>; a JSON Patch <code>remove</code> and
+<code>DELETE /api/config/map-key</code> need <code>delete</code>; a rename needs <code>delete</code> on
+its source and <code>create</code> on its destination; the references a delete or
+rename cascade rewrites elsewhere are part of the write set too. One
+unauthorized member refuses the whole mutation, batch or cascade, and
+nothing is written. Operations whose write set cannot be enumerated up
+front (a schema migration of the file, a Quickstart apply) require the
+<code>*</code> selector. The persist boundary re-checks the paths about to be
+written against what the handler authorized, so a handler cannot
+persist more than it authorized.</p>
+<p>Policy moves only at that persist boundary: the handler that writes a
+configuration publishes the authorization state compiled from it as
+the next accepted revision, and every request is verified and resolved
+against the accepted snapshot as it stands. Nothing on the request
+path recompiles policy, so a request that read the configuration
+before a concurrent persist can never reinstall the older policy over
+the newer one; a persisted change to a provider’s verification
+settings, a roster or a profile takes effect on the next request. The
+daemon’s own RPC surface holds a separate live configuration and
+reaches the same state through the reload the gateway write flags.
+Other gateway surfaces keep the pairing check per handler and adopt the
+layer in follow-ups.</p>
+<h2 id="credential-lifecycle"><a class="header" href="#credential-lifecycle">Credential lifecycle</a></h2>
+<ul>
+<li><strong>Expiry</strong> ends the connection’s authorization at the deadline; the
+client re-initializes with a fresh token.</li>
+<li><strong>Introspection revalidation</strong>: OIDC introspection identities carry a
+revalidation deadline; past it, the next operation is refused until the
+client re-initializes (which re-verifies against the IdP).</li>
+<li><strong>Pairing revocation</strong> applies before the connection’s next operation.</li>
+<li><strong>Log subscriptions</strong>: an open <code>logs/subscribe</code> stream is rechecked on
+every delivery and ends at the first one after its credential expires,
+its pairing is revoked, or its principal loses <code>Logs:Read</code>.</li>
+<li><strong>Policy changes</strong>: a config save that leaves <code>[oidc]</code>, <code>[users]</code>,
+<code>[permission_profiles]</code>, and <code>security.trust_daemon_uid</code> unchanged keeps
+every binding as it is. A change to any of them publishes a new policy.
+Native-token and local connections re-resolve against it in place, but
+the daemon does not keep an OIDC bearer, so the next operation on an OIDC
+connection is refused until the client re-initializes.</li>
+<li>The <code>tui_id</code>/<code>tui_sig</code> reconnect mechanism is continuity only: it
+preserves the TUI’s registry identity and grants <strong>no</strong> authority. Every
+<code>initialize</code> re-presents a credential.</li>
+</ul>
+<h2 id="session-isolation"><a class="header" href="#session-isolation">Session isolation</a></h2>
+<p>Every session a scoped principal creates is stamped with that principal’s
+id in the live store and on disk (chat backend and ACP store). Scoped
+principals see and touch only their own sessions: listings are filtered,
+reads and mutations get one uniform not-found-or-not-owned denial (no
+existence probing), destructive deletes run as owner-predicated storage
+statements, and in-flight approvals resolve only for the owner of the
+session they were raised for. Sessions created before this change (or by
+unscoped connections) carry no owner: they stay fully visible to unscoped
+connections and invisible to scoped principals.</p>
+<h2 id="migrating-from-securitynevis"><a class="header" href="#migrating-from-securitynevis">Migrating from [security.nevis]</a></h2>
+<p>The Nevis IAM integration was removed; its config table is accepted,
+ignored with a load-time warning, and dropped on the next config save.
+Its scope maps onto the current stack:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Nevis concept</th><th>Replacement</th></tr>
+</thead>
+<tbody>
+<tr><td><code>instance_url</code> / <code>realm</code> token validation</td><td><code>[oidc.&lt;alias&gt;]</code> <code>issuer</code> + <code>validation</code> (<code>jwks</code> or <code>introspection</code>)</td></tr>
+<tr><td><code>role_mapping</code> role → permissions</td><td><code>claim_path</code> + <code>profile_map</code> → <code>[permission_profiles.&lt;alias&gt;]</code> grants</td></tr>
+<tr><td><code>require_mfa</code></td><td><code>[oidc.&lt;alias&gt;] require_mfa</code> / <code>required_acr</code></td></tr>
+<tr><td><code>session_timeout_secs</code></td><td><code>max_auth_lifetime_secs</code> (offline) / <code>revalidation_secs</code> (introspection)</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="what-this-layer-does-not-do-yet"><a class="header" href="#what-this-layer-does-not-do-yet">What this layer does not do (yet)</a></h2>
+<p>Consolidation and governance derive shared-plane rows and do not run for
+private sessions, and administrative access into another principal’s
+private memory has no surfaced pathway yet (deny-by-default).
+<code>sops/runs</code> and <code>sops/run-detail</code> return the run history of every
+procedure to a principal holding <code>Sops:Read</code>, whichever agents it ran as,
+unlike cron history. Gateway HTTP routes keep their existing pairing
+checks, and channel identities do not resolve into this principal model.</p>
+<p>While <code>security.trust_daemon_uid = true</code> (the default) and the policy
+compiles, the daemon’s own uid on a Unix socket keeps full access, so a
+single-operator install with no <code>[users]</code> roster and valid auth sections
+behaves as before.</p>
+<p>Permission profiles limit what a principal can do over RPC. They do not
+isolate the code a principal causes an agent to run. Session turns, cron
+jobs, and SOP steps run as the daemon account. On Unix that code can
+connect to the local socket as the daemon’s uid, which is the shared
+operator while <code>security.trust_daemon_uid = true</code> (the default) and
+otherwise gets whatever roster entry maps that uid. On Windows with no
+roster, the pipe makes it the shared operator. It can also edit <code>config.toml</code>, which
+the daemon applies at its next reload or restart. Setting
+<code>security.trust_daemon_uid = false</code> does not change either. Grant session,
+cron, or SOP execution or authoring only to principals you would trust
+with operator access. Only OS-level confinement that keeps agent processes
+away from the socket and <code>config.toml</code> isolates that code.</p>
+<p>Some config paths carry authority themselves, so treat a broad
+<code>config_write_paths</code> grant as operator access unless it covers only vetted
+leaf settings. For example:</p>
+<ul>
+<li>a principal that can write <code>permission_profiles</code>, <code>users</code>, <code>oidc</code>,
+<code>security</code>, or <code>gateway.paired_tokens</code> can grant itself anything;</li>
+<li>one that can write <code>agents</code>, <code>risk_profiles</code>, <code>cron</code>, <code>channels</code>, or
+provider settings can change which agents run, with which tools, and
+where they may read and write;</li>
+<li>one that can write <code>mcp</code>, <code>mcp_bundles</code>, or
+<code>tunnel.custom.start_command</code> can choose programs the daemon account
+starts.</li>
+</ul>
+<p><code>Config:Update</code> also grants <code>config/reload</code>, which applies whatever
+<code>config.toml</code> holds on disk.</p>
+<p>zerocode’s remote directory picker opens at the daemon’s filesystem root.
+A principal without operator grants may list it only through an enabled
+agent whose policy lets it read <code>/</code>, such as one that is not workspace-only.
+For any other such principal the picker reports a refusal there until it
+opens inside an allowed root instead.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../security/model.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../security/autonomy.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../security/model.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../security/autonomy.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
+        <script src="../searcher-09f2665d.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../_shared/mermaid.min.js"></script>
+        <script src="../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["render_file","render_markdown","render_readme_unix_fast_zone","render_unix_fast_command_zone","render_windows_guide"]};

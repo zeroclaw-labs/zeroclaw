@@ -1,0 +1,33 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="The `oidc.&#60;alias&#62;` auth provider: verifies a presented bearer token against ONE configured issuer — offline (JWKS signature validation) or online (RFC 7662 introspection) — and emits the verified `AuthenticatedIdentity` for the shared principal resolver."><title>zeroclaw_runtime::security::auth_provider::oidc - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../../static.files/rustdoc-1ed95124.css"><script id="default-settings" 
+data-use_system_theme="false"
+data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../../../" data-static-root-path="../../../../static.files/" data-current-crate="zeroclaw_runtime" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module oidc</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../../../zeroclaw_runtime/index.html">zeroclaw_<wbr>runtime</a><span class="version">0.8.5</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module oidc</a></h2><h3><a href="#structs">Module Items</a></h3><ul class="block"><li><a href="#structs" title="Structs">Structs</a></li></ul></section><div id="rustdoc-modnav"><h2><a href="../index.html">In zeroclaw_<wbr>runtime::<wbr>security::<wbr>auth_<wbr>provider</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../../../index.html">zeroclaw_runtime</a>::<wbr><a href="../../index.html">security</a>::<wbr><a href="../index.html">auth_provider</a></div><h1>Module <span>oidc</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>The <code>oidc.&lt;alias&gt;</code> auth provider: verifies a presented bearer token
+against ONE configured issuer — offline (JWKS signature validation) or
+online (RFC 7662 introspection) — and emits the verified
+<a href="../../../../zeroclaw_api/principal/struct.AuthenticatedIdentity.html" title="struct zeroclaw_api::principal::AuthenticatedIdentity"><code>AuthenticatedIdentity</code></a> for the shared principal resolver.</p>
+<p>Contract boundaries (RFC 7141 Rev 8):</p>
+<ul>
+<li>The provider verifies credentials into identities. It never touches
+permission profiles or grants — claim-to-profile mapping belongs to
+the resolver.</li>
+<li>Only access tokens authenticate the bearer path. A token carrying the
+ID-token <code>nonce</code> marker is rejected even when its signature, issuer,
+and audience are valid; the bearer profile also requires an RFC 9068
+typed access token.</li>
+<li>Offline (JWKS) validation cannot see revocation, so the identity’s
+expiry is capped at the earlier of the token <code>exp</code> and
+<code>max_auth_lifetime_secs</code>. Introspection identities carry a
+<code>revalidate_by</code> deadline instead; once it passes, the next privileged
+operation must re-verify or fail closed.</li>
+<li>JWKS refresh is bounded: an unknown <code>kid</code> may trigger at most one
+fetch per cooldown window, so a stream of bad tokens cannot hammer
+the IdP.</li>
+<li>Actor class (human vs. service) is declared, never inferred from the
+<code>sub</code>/<code>client_id</code> relationship: <code>service_clients</code> and
+<code>interactive_clients</code> classify by verified <code>client_id</code>, and
+<code>actor_claim</code> classifies a client that issues both kinds of token.
+A token with no declaration and no configured claim evidence, or with
+evidence contradicting its declaration, is denied.</li>
+<li>Every ambiguity — unreachable issuer, malformed token, missing
+claims, unmatched audience — is a denial, never a fallback.</li>
+</ul>
+</div></details><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.OidcAuthProvider.html" title="struct zeroclaw_runtime::security::auth_provider::oidc::OidcAuthProvider">Oidc<wbr>Auth<wbr>Provider</a></dt></dl></section></div></main></body></html>

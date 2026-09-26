@@ -1,0 +1,49 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Rename an existing SOP: move `&#60;sops_dir&#62;/&#60;from&#62;/` to `&#60;sops_dir&#62;/&#60;to&#62;/` and update the manifest’s `[sop] name` so the directory and the name the runtime loads stay in agreement."><title>rename_sop_typed in zeroclaw_runtime::sop - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><script id="default-settings" 
+data-use_system_theme="false"
+data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="zeroclaw_runtime" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">rename_sop_typed</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../zeroclaw_runtime/index.html">zeroclaw_<wbr>runtime</a><span class="version">0.8.5</span></h2></div><div class="sidebar-elems"><div id="rustdoc-modnav"><h2><a href="index.html">In zeroclaw_<wbr>runtime::<wbr>sop</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">zeroclaw_runtime</a>::<wbr><a href="index.html">sop</a></div><h1>Function <span class="fn">rename_<wbr>sop_<wbr>typed</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"> </span></div><pre class="rust item-decl"><code>pub fn rename_sop_typed(
+    sops_dir: &amp;<a class="struct" href="https://doc.rust-lang.org/1.98.1/std/path/struct.Path.html" title="struct std::path::Path">Path</a>,
+    from: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+    to: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.str.html">str</a>,
+    default_execution_mode: <a class="enum" href="types/enum.SopExecutionMode.html" title="enum zeroclaw_runtime::sop::types::SopExecutionMode">SopExecutionMode</a>,
+) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.98.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.unit.html">()</a>, <a class="enum" href="enum.SopAuthorError.html" title="enum zeroclaw_runtime::sop::SopAuthorError">SopAuthorError</a>&gt;</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Rename an existing SOP: move <code>&lt;sops_dir&gt;/&lt;from&gt;/</code> to <code>&lt;sops_dir&gt;/&lt;to&gt;/</code>
+and update the manifest’s <code>[sop] name</code> so the directory and the name the
+runtime loads stay in agreement.</p>
+<p>Rename is a pure identity change. Only the <code>[sop] name</code> value in
+<code>SOP.toml</code> is rewritten, keeping that line’s own comment and spacing;
+steps, triggers, key order, and every other manifest key are left alone,
+and <code>SOP.md</code> is never touched. That keeps a rename from quietly
+materializing defaults (an execution mode the manifest deliberately left
+unset, say) the way a load/save round trip would. The one cosmetic change
+is quote style: a single-quoted name comes back double-quoted.</p>
+<p>One writer at a time. A concurrent <code>save_sop</code>, <code>create_sop_typed</code>, or
+second rename against the same SOP can interleave with the steps below;
+the authoring surfaces are a single daemon, and nothing here adds
+cross-process locking.</p>
+<p>Ordering is what makes this safe against an interrupted rename. The
+directory move is a single <code>rename(2)</code>, and it goes last:</p>
+<ol>
+<li>collision-check <code>to</code> and strict-validate the renamed SOP, before
+anything on disk moves;</li>
+<li>rewrite <code>[sop] name</code> in place, via a temp file renamed over the
+manifest, so <code>SOP.toml</code> is never half-written;</li>
+<li>move the directory - the commit point.</li>
+</ol>
+<p>The SOP therefore lives in exactly one directory at every instant: there
+is no window with two copies (a fork) or zero copies (a loss). An
+interruption between steps 2 and 3 leaves one directory whose name lags
+its manifest; re-running the same rename finishes the job. If step 3 fails
+outright the manifest is rolled back, leaving the SOP exactly as it was
+found.</p>
+<p>Each step commits through a rename, so a reader and a process killed
+mid-rename both see one whole revision. The directory holding each renamed
+entry is flushed afterwards, so on Unix the two steps are durable across a
+machine crash in the same order they were applied: an interrupted rename
+leaves the SOP either wholly moved or wholly not, never both places or
+neither. macOS honors the flush for ordering without draining the device
+cache, and Windows has no directory-sync primitive, so on those platforms
+that last step is the filesystem’s to keep.</p>
+<p>Errors: <code>NotFound</code> if <code>from</code> is not an SOP directory, <code>AlreadyExists</code> if
+anything already occupies <code>to</code>, and <code>Other</code> for an invalid name (the same
+single-path-component check every other authoring helper applies), a SOP
+that strict validation rejects, or an I/O failure.</p>
+</div></details></section></div></main></body></html>

@@ -1,0 +1,65 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Shared A2A v1.0 wire types for both inbound and outbound."><title>zeroclaw_api::a2a_wire - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><script id="default-settings" 
+data-use_system_theme="false"
+data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="zeroclaw_api" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module a2a_wire</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../zeroclaw_api/index.html">zeroclaw_<wbr>api</a><span class="version">0.8.5</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module a2a_<wbr>wire</a></h2><h3><a href="#structs">Module Items</a></h3><ul class="block"><li><a href="#structs" title="Structs">Structs</a></li><li><a href="#enums" title="Enums">Enums</a></li><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate zeroclaw_<wbr>api</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">zeroclaw_api</a></div><h1>Module <span>a2a_<wbr>wire</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Shared A2A v1.0 wire types for both inbound and outbound.</p>
+<p>Pure-Serde protocol DTOs for the A2A (Agent2Agent) v1.0 protobuf-JSON
+payload, aligned to the official specification and <code>a2a.proto</code>
+(<code>package lf.a2a.v1</code>): camelCase field names, SCREAMING_SNAKE_CASE enum
+values, and oneof discriminators expressed as the branch field name (no
+<code>kind</code> discriminator). Inbound (<code>zeroclaw-gateway/src/a2a.rs</code>) uses these
+to construct responses; outbound (<code>zeroclaw-tools/src/a2a_client.rs</code>) uses
+them to build requests and deserialize peer responses. Router/server-only
+types stay gateway-local.</p>
+<p>This follows the established precedent of <a href="../jsonrpc/index.html" title="mod zeroclaw_api::jsonrpc"><code>crate::jsonrpc</code></a>: a
+dependency-light, pure-Serde wire-model source shared across crates
+without cross-crate coupling. No <code>a2a-rs</code>/protobuf footprint.</p>
+<p><code>JsonSchema</code> derives are gated behind the <code>schema-export</code> feature (mirrors
+<code>zeroclaw-config</code>), so consuming crates can generate OpenAPI/OPTIONS
+schemas from these types directly.</p>
+</div></details><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.AgentCapabilities.html" title="struct zeroclaw_api::a2a_wire::AgentCapabilities">Agent<wbr>Capabilities</a></dt><dd>A2A <code>AgentCapabilities</code> — optional feature flags. Only <code>Some</code> values
+serialize; <code>None</code> fields are omitted.</dd><dt><a class="struct" href="struct.AgentCard.html" title="struct zeroclaw_api::a2a_wire::AgentCard">Agent<wbr>Card</a></dt><dd>A2A <code>AgentCard</code> (spec §14) — the discovery surface for an agent.
+Serializes to the protobuf-JSON wire shape.</dd><dt><a class="struct" href="struct.AgentInterface.html" title="struct zeroclaw_api::a2a_wire::AgentInterface">Agent<wbr>Interface</a></dt><dd>A2A <code>AgentInterface</code> (spec §5.8) — a declared transport interface. The
+first entry of <code>supportedInterfaces</code> is the preferred transport. <code>tenant</code>,
+when set, MUST be echoed into the <code>tenant</code> field of every request sent to
+this interface (spec §5.2).</dd><dt><a class="struct" href="struct.AgentSkill.html" title="struct zeroclaw_api::a2a_wire::AgentSkill">Agent<wbr>Skill</a></dt><dd>A2A <code>AgentSkill</code> (spec §4.4). <code>id</code>/<code>name</code>/<code>description</code> are spec-required.</dd><dt><a class="struct" href="struct.Artifact.html" title="struct zeroclaw_api::a2a_wire::Artifact">Artifact</a></dt><dd>A2A <code>Artifact</code> (proto <code>message Artifact</code>) — a task output. <code>parts</code> is the
+same <code>Part</code> oneof used by messages.</dd><dt><a class="struct" href="struct.JsonRpcError.html" title="struct zeroclaw_api::a2a_wire::JsonRpcError">Json<wbr>RpcError</a></dt><dd>A2A JSON-RPC error object.</dd><dt><a class="struct" href="struct.JsonRpcRequest.html" title="struct zeroclaw_api::a2a_wire::JsonRpcRequest">Json<wbr>RpcRequest</a></dt><dd>A2A JSON-RPC 2.0 request envelope (spec §9).</dd><dt><a class="struct" href="struct.JsonRpcResponse.html" title="struct zeroclaw_api::a2a_wire::JsonRpcResponse">Json<wbr>RpcResponse</a></dt><dd>A2A JSON-RPC 2.0 response envelope. Peers wrap the result payload
+(<code>Task</code>, <code>SendMessageResponse</code>, …) in <code>result</code>; errors come back as
+<code>error</code> with the spec’s negative codes. <code>result</code> is <code>Option&lt;T&gt;</code> so a
+present-but-<code>null</code> result deserializes to <code>None</code> without forcing <code>T: Default</code> (the response union types are untagged enums with no Default).</dd><dt><a class="struct" href="struct.Message.html" title="struct zeroclaw_api::a2a_wire::Message">Message</a></dt><dd>A2A <code>Message</code> (proto <code>message Message</code>) — one unit of client/server
+communication. <code>messageId</code> and <code>role</code> are spec-REQUIRED on send, and
+<code>parts</code> MUST contain at least one <code>Part</code> (spec §5.7 REQUIRED — a list
+field with REQUIRED behavior must have ≥1 element).</dd><dt><a class="struct" href="struct.Part.html" title="struct zeroclaw_api::a2a_wire::Part">Part</a></dt><dd>A2A <code>Part</code> (proto <code>message Part</code>) — a section of communication content.
+The <code>content</code> oneof is expressed without a discriminator: the active
+branch is exactly one of <code>text</code> / <code>raw</code> / <code>url</code> / <code>data</code>; the shared
+optional fields (<code>metadata</code>/<code>filename</code>/<code>mediaType</code>) ride alongside it.
+The oneof invariant is enforced at deserialization (via
+<code>deserialize_part</code>): a payload with zero content branches or more than
+one is rejected, matching the proto <code>oneof</code> semantics (spec §5.7 — a
+<code>Part</code> carries exactly one content branch). A struct (not an enum) lets
+serde handle the field-name-keyed shape directly while a custom
+deserializer validates the oneof invariant.</dd><dt><a class="struct" href="struct.SendMessageConfiguration.html" title="struct zeroclaw_api::a2a_wire::SendMessageConfiguration">Send<wbr>Message<wbr>Configuration</a></dt><dd><code>SendMessageConfiguration</code> (proto) — optional send tuning.</dd><dt><a class="struct" href="struct.SendMessageParams.html" title="struct zeroclaw_api::a2a_wire::SendMessageParams">Send<wbr>Message<wbr>Params</a></dt><dd><code>SendMessage</code> request <code>params</code> (proto <code>SendMessageRequest</code>). <code>tenant</code>
+echoes the selected <code>AgentInterface.tenant</code>; <code>message</code> is REQUIRED.</dd><dt><a class="struct" href="struct.Task.html" title="struct zeroclaw_api::a2a_wire::Task">Task</a></dt><dd>A2A <code>Task</code> (proto <code>message Task</code>) — returned by <code>SendMessage</code> /
+<code>GetTask</code> / <code>CancelTask</code>. Fields beyond the spec-required <code>id</code>/<code>status</code>
+are optional and tolerate absence: a peer that omits <code>contextId</code> or
+<code>artifacts</code> still parses.</dd><dt><a class="struct" href="struct.TaskStatus.html" title="struct zeroclaw_api::a2a_wire::TaskStatus">Task<wbr>Status</a></dt><dd>A2A <code>TaskStatus</code> (proto <code>message TaskStatus</code>).</dd></dl><h2 id="enums" class="section-header">Enums<a href="#enums" class="anchor">§</a></h2><dl class="item-table"><dt><a class="enum" href="enum.Role.html" title="enum zeroclaw_api::a2a_wire::Role">Role</a></dt><dd>A2A <code>Role</code> (proto <code>enum Role</code>) — the sender of a message. ProtoJSON
+serializes enum values as their SCREAMING_SNAKE_CASE proto names (spec
+§5.5).</dd><dt><a class="enum" href="enum.SendMessageResponse.html" title="enum zeroclaw_api::a2a_wire::SendMessageResponse">Send<wbr>Message<wbr>Response</a></dt><dd><code>SendMessageResponse</code> (proto <code>message SendMessageResponse</code>) — the
+<code>oneof payload</code> with branches <code>task</code> / <code>message</code>. Custom de/serialization
+enforces exactly-one branch and the flat proto-shape (<code>{"task": {...}}</code> /
+<code>{"message": {...}}</code>): the default externally-tagged enum serializer would
+nest the branch value one level too deep (<code>{"task":{"task":{...}}}</code>) and
+would not round-trip through the custom deserializer.</dd><dt><a class="enum" href="enum.TaskState.html" title="enum zeroclaw_api::a2a_wire::TaskState">Task<wbr>State</a></dt><dd>A2A <code>TaskState</code> (proto <code>enum TaskState</code>) — task lifecycle state.
+SCREAMING_SNAKE_CASE on the wire (spec §5.5). <code>TASK_STATE_UNSPECIFIED</code>
+is rejected at deserialization: the spec marks <code>state</code> as REQUIRED and
+the default UNSPECIFIED value must not be accepted as a valid wire value.</dd></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.escape_fence_body.html" title="fn zeroclaw_api::a2a_wire::escape_fence_body">escape_<wbr>fence_<wbr>body</a></dt><dd>Unwrap a JSON-RPC response into its result, validating the transport
+envelope. Fails on: missing/invalid <code>jsonrpc</code> version (must be <code>"2.0"</code>),
+response id mismatch (when <code>expected_id</code> is <code>Some</code>), ambiguous envelope
+(both <code>result</code> and <code>error</code> present), missing payload (neither <code>result</code> nor
+<code>error</code>), and a present non-success <code>error</code>.
+Escape the XML closing-tag trigger (<code>&lt;/</code>) in untrusted content before it is
+placed inside an <code>&lt;a2a-* ...&gt;</code> provenance wrapper, so a peer-controlled
+value containing a closing marker such as <code>&lt;/a2a-artifact&gt;</code> cannot
+terminate the wrapper early. The wrapper is advisory provenance (the model
+is already told the interior is <code>untrusted-external</code>), but an inert <code>&lt;\/</code>
+keeps marker-looking content from confusing any downstream cursor/splitter.
+Defined here (the api crate) so both the inbound <code>rpc_result</code> error path
+and the outbound tool renderers share one canonical implementation.</dd><dt><a class="fn" href="fn.rpc_result.html" title="fn zeroclaw_api::a2a_wire::rpc_result">rpc_<wbr>result</a></dt></dl></section></div></main></body></html>

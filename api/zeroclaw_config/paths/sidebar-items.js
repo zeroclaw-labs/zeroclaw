@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MEMORY_SNAPSHOT_FILE"],"fn":["normalize_lexical","resolve_under"],"struct":["RootEscapeError"]};

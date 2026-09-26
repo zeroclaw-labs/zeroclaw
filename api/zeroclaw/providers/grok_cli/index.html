@@ -1,0 +1,59 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Grok Build CLI subprocess model provider."><title>zeroclaw::providers::grok_cli - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../static.files/rustdoc-1ed95124.css"><script id="default-settings" 
+data-use_system_theme="false"
+data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../../" data-static-root-path="../../../static.files/" data-current-crate="zeroclaw" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module grok_cli</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../../zeroclaw/index.html">zeroclaw</a><span class="version">0.8.5</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module grok_<wbr>cli</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#usage" title="Usage">Usage</a></li><li><a href="#host-side-trust-boundary" title="Host-side trust boundary">Host-side trust boundary</a></li><li><a href="#limitations" title="Limitations">Limitations</a></li></ul><h3><a href="#structs">Module Items</a></h3><ul class="block"><li><a href="#structs" title="Structs">Structs</a></li></ul></section><div id="rustdoc-modnav"><h2><a href="../index.html">In zeroclaw::<wbr>providers</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../../index.html">zeroclaw</a>::<wbr><a href="../index.html">providers</a></div><h1>Module <span>grok_<wbr>cli</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Grok Build CLI subprocess model provider.</p>
+<p>Every inference request uses the documented <code>grok agent stdio</code> ACP
+transport. The assembled prompt is sent as JSON-RPC on child stdin; it is
+never placed in argv or a temporary file.
+Authentication uses the Grok CLI login cache by default. API-key auth is an
+explicit per-alias opt-in: export <code>XAI_API_KEY</code> into the ZeroClaw process and
+list that name in <code>env_passthrough</code>. Typed alias <code>api_key</code> is rejected; this
+provider does not store the key in config. At each spawn the child allowlist
+resolves process env by name (including <code>XAI_API_KEY</code> when opted in) so the
+CLI login cache remains the default owner and the key is never snapshotted
+into the long-lived provider handle. A future typed Config bridge may map
+the same name at load time; until then the documented process-env +
+<code>env_passthrough</code> surface is the single operator credential path.</p>
+<h2 id="usage"><a class="doc-anchor" href="#usage">§</a>Usage</h2><div class="example-wrap"><pre class="language-toml"><code>[providers.models.grok_cli.default]
+model = &quot;grok-4.5&quot;
+working_directory = &quot;/path/to/agents/default/workspace&quot;
+# binary_path = &quot;/home/you/.grok/bin/grok&quot;
+
+[agents.default]
+model_provider = &quot;grok_cli.default&quot;
+classifier_provider = &quot;xai.default&quot;</code></pre></div><h2 id="host-side-trust-boundary"><a class="doc-anchor" href="#host-side-trust-boundary">§</a>Host-side trust boundary</h2>
+<p>The child is a tool-capable agent outside ZeroClaw’s native tool approval
+path. The provider therefore:</p>
+<ul>
+<li>requires an explicit absolute working directory;</li>
+<li>clears the inherited environment and forwards only process-runtime entries
+plus explicit per-alias <code>env_passthrough</code> names;</li>
+<li>defaults to <code>--no-plan</code>, <code>--sandbox strict</code>, <code>--permission-mode dontAsk</code>,
+and an empty built-in tool set;</li>
+<li>rejects ACP permission requests unless the alias explicitly enables a
+bypass mode, in which case it selects the request’s allow-once option;</li>
+<li>bounds ACP frames, configurable aggregate stdout, assistant output, and stderr;</li>
+<li>on success, failure, timeout, or cancellation, terminates the child
+process group (Unix) or Job Object (Windows) and reaps the direct child.
+Descendants that create a new session/process group can escape group
+kill on Unix; the public guarantee is process-group / Job Object scope,
+not every possible detached process on the host;</li>
+<li>never includes child stderr or raw ACP frames (or child-controlled
+protocol free-text such as stopReason / protocolVersion / string error
+codes) in public errors or logs.</li>
+</ul>
+<p>Operators can deliberately relax the CLI policy through <code>extra_args</code> (for
+example, <code>--tools=Read,Grep</code>, <code>--permission-mode=acceptEdits</code>, or
+<code>--sandbox=workspace</code>). Such overrides are explicit per-provider-alias
+opt-ins. Bypass flags also authorize the headless ACP client to approve
+interactive permission requests for that alias.</p>
+<h2 id="limitations"><a class="doc-anchor" href="#limitations">§</a>Limitations</h2>
+<ul>
+<li>Only the system prompt (if present) and final user message are forwarded.</li>
+<li>The provider is one-shot; ACP sessions are not resumed.</li>
+<li>Native ZeroClaw tool calls are not emitted; <code>ChatRequest.tools</code> is ignored.</li>
+<li>Token usage is not reported (<code>ChatResponse.usage</code> is <code>None</code>).</li>
+<li>Only temperatures <code>0.7</code> and <code>1.0</code> are accepted because Grok Build has no
+corresponding sampling flag.</li>
+<li><code>timeout_secs</code> is clamped to one hour maximum.</li>
+</ul>
+</div></details><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.GrokCliBuilder.html" title="struct zeroclaw::providers::grok_cli::GrokCliBuilder">Grok<wbr>CliBuilder</a></dt><dd>Typed builder for <a href="struct.GrokCliModelProvider.html" title="struct zeroclaw::providers::grok_cli::GrokCliModelProvider"><code>GrokCliModelProvider</code></a>.</dd><dt><a class="struct" href="struct.GrokCliModelProvider.html" title="struct zeroclaw::providers::grok_cli::GrokCliModelProvider">Grok<wbr>CliModel<wbr>Provider</a></dt><dd>Model provider that invokes Grok Build through ACP.</dd></dl></section></div></main></body></html>

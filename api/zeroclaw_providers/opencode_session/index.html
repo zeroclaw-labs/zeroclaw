@@ -1,0 +1,44 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="`x-opencode-session` — OpenCode relay session-affinity header."><title>zeroclaw_providers::opencode_session - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><script id="default-settings" 
+data-use_system_theme="false"
+data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="zeroclaw_providers" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module opencode_session</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../zeroclaw_providers/index.html">zeroclaw_<wbr>providers</a><span class="version">0.8.5</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module opencode_<wbr>session</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#value-derivation" title="Value derivation">Value derivation</a></li><li><a href="#why-the-scope-is-hashed-rather-than-sent" title="Why the scope is hashed rather than sent">Why the scope is hashed rather than sent</a></li></ul><h3><a href="#constants">Module Items</a></h3><ul class="block"><li><a href="#constants" title="Constants">Constants</a></li><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate zeroclaw_<wbr>providers</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">zeroclaw_providers</a></div><h1>Module <span>opencode_<wbr>session</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p><code>x-opencode-session</code> — OpenCode relay session-affinity header.</p>
+<p>The OpenCode relay (<code>opencode.ai</code>, serving both the Zen and Go endpoints)
+uses <code>x-opencode-session</code> to pin the requests of one conversation to the
+same upstream backend, which is what keeps that backend’s prompt cache warm
+across the turns of a conversation. Upstream documents the header under its
+guidance for keeping an account from being flagged, and at least one Go
+model (<code>deepseek-v4-flash</code>) rejects header-less requests outright with
+HTTP 400 <code>Model is unavailable</code>.</p>
+<p>Every OpenCode inference request, on both wires and on both streaming and
+non-streaming paths, resolves its value through <a href="fn.session_token.html" title="fn zeroclaw_providers::opencode_session::session_token"><code>session_token</code></a> so the
+header cannot drift per code path. Model-catalog and warmup requests
+(<code>GET /models</code>) do not carry it: they are not a conversation turn, so there
+is no backend to pin.</p>
+<h2 id="value-derivation"><a class="doc-anchor" href="#value-derivation">§</a>Value derivation</h2>
+<p>Upstream specifies no format, length, or lifetime for the value; its only
+normative statement is that a tool “includes the <code>x-opencode-session</code>
+header so we can optimize prompt caching”. The one datum on accepted values
+is that a random UUID is sufficient to turn the 400 above into a 200. This
+module therefore emits a 128-bit lowercase hex digest: opaque, fixed-length,
+unambiguously safe as an HTTP header value, and non-reversible.</p>
+<p>The digest is taken over the ambient conversation scope
+(<a href="../../zeroclaw_api/static.TOOL_LOOP_SESSION_KEY.html" title="static zeroclaw_api::TOOL_LOOP_SESSION_KEY"><code>zeroclaw_api::TOOL_LOOP_SESSION_KEY</code></a>) rather than over a cached random
+token, so the value is resolved from the canonical source at use time and
+this module holds no per-session lookup table.</p>
+<h2 id="why-the-scope-is-hashed-rather-than-sent"><a class="doc-anchor" href="#why-the-scope-is-hashed-rather-than-sent">§</a>Why the scope is hashed rather than sent</h2>
+<p>Session keys embed channel and user identifiers — <code>sanitize_session_key</code>
+covers inputs shaped like <code>whatsapp_123@g.us_alice</code> and
+<code>slack_C123_1.2_user one</code>. Forwarding one verbatim would hand a third-party
+relay a cross-service-linkable per-user identifier, which the privacy
+contract in <code>docs/book/src/contributing/privacy.md</code> forbids. Hashing keeps
+the affinity behavior while sending nothing but an opaque token.</p>
+<p>The digest is domain-separated but unsalted, so it is deterministic across
+restarts — which is what preserves cache affinity for a conversation that
+spans a daemon restart. The tradeoff is explicit: this prevents plaintext
+exposure of channel and user identifiers, but it is not a defense against a
+party who knows ZeroClaw’s session-key format brute-forcing a low-entropy
+key space. Defeating that would require a per-install salt, which would cost
+the cross-restart affinity this is for; it is deliberately out of scope here.</p>
+</div></details><h2 id="constants" class="section-header">Constants<a href="#constants" class="anchor">§</a></h2><dl class="item-table"><dt><a class="constant" href="constant.OPENCODE_SESSION_HEADER.html" title="constant zeroclaw_providers::opencode_session::OPENCODE_SESSION_HEADER">OPENCODE_<wbr>SESSION_<wbr>HEADER</a></dt><dd>The affinity header OpenCode reads to pin a conversation to one backend.</dd></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.is_opencode_target.html" title="fn zeroclaw_providers::opencode_session::is_opencode_target">is_<wbr>opencode_<wbr>target</a></dt><dd>True when <code>base_url</code> addresses the OpenCode relay.</dd><dt><a class="fn" href="fn.operator_pinned_session.html" title="fn zeroclaw_providers::opencode_session::operator_pinned_session">operator_<wbr>pinned_<wbr>session</a></dt><dd>True when <code>extra_headers</code> pins an <code>x-opencode-session</code> value that will
+actually reach the wire.</dd><dt><a class="fn" href="fn.redirect_policy.html" title="fn zeroclaw_providers::opencode_session::redirect_policy">redirect_<wbr>policy</a></dt><dd>Redirect policy for clients whose requests may carry the session header.</dd><dt><a class="fn" href="fn.restrict_redirects.html" title="fn zeroclaw_providers::opencode_session::restrict_redirects">restrict_<wbr>redirects</a></dt><dd>Apply <a href="fn.redirect_policy.html" title="fn zeroclaw_providers::opencode_session::redirect_policy"><code>redirect_policy</code></a> to <code>builder</code> when <code>endpoint</code> is an OpenCode target.
+Every other provider keeps reqwest’s default redirect handling.</dd><dt><a class="fn" href="fn.session_token.html" title="fn zeroclaw_providers::opencode_session::session_token">session_<wbr>token</a></dt><dd>Affinity token for the calling conversation, or <code>None</code> when <code>base_url</code> is
+not an OpenCode target.</dd></dl></section></div></main></body></html>

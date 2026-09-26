@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["HAILO_DEFAULT_NUM_CTX","HAILO_DEFAULT_NUM_PREDICT","HAILO_DEFAULT_QUEUE_TIMEOUT_SECS"],"struct":["HailoOllamaModelProvider"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["AttemptUsageOutcome","CallAccountingState","InvalidUsageReason"],"fn":["commit_accepted_provider_route"],"struct":["AcceptedRoute","AccountedAttempt","AccountedCallReport","AccountedChatResponse","ProviderDispatch","ProviderDispatchRef","RejectedAttempt"]};

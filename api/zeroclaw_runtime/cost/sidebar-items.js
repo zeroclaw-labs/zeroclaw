@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_SANE_USD_RATE"],"enum":["BudgetCheck","UsagePeriod"],"fn":["is_sane_usd_rate"],"mod":["tracker","types"],"struct":["AgentCostStats","CostRecord","CostSummary","CostTracker","ModelStats","TokenUsage"]};

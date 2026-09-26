@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["handle_sop_approve","handle_sop_deny","handle_sop_logs","handle_sop_pending"],"struct":["SopLogsQuery","SopResolveBody"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_WEBHOOK_RESPONSE_BODY_BYTES"],"enum":["WebhookOutcome","WebhookReject","WebhookReservation","WebhookReservationStatus"],"struct":["PluginWebhookRegistry","PluginWebhookRegistryLease","RawWebhook","WebhookIdempotency","WebhookReservationToken","WebhookReservationWaiter"],"type":["WebhookCancellation"]};

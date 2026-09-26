@@ -1,0 +1,28 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="The one mutex every config writer in this process serializes on."><title>shared_config_write_lock in zeroclaw_config::write_lock - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><script id="default-settings" 
+data-use_system_theme="false"
+data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="zeroclaw_config" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">shared_config_write_lock</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../zeroclaw_config/index.html">zeroclaw_<wbr>config</a><span class="version">0.8.5</span></h2></div><div class="sidebar-elems"><div id="rustdoc-modnav"><h2><a href="index.html">In zeroclaw_<wbr>config::<wbr>write_<wbr>lock</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">zeroclaw_config</a>::<wbr><a href="index.html">write_lock</a></div><h1>Function <span class="fn">shared_<wbr>config_<wbr>write_<wbr>lock</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"> </span></div><pre class="rust item-decl"><code>pub fn shared_config_write_lock() -&gt; <a class="struct" href="https://doc.rust-lang.org/1.98.1/alloc/sync/struct.Arc.html" title="struct alloc::sync::Arc">Arc</a>&lt;Mutex&lt;<a class="primitive" href="https://doc.rust-lang.org/1.98.1/std/primitive.unit.html">()</a>&gt;&gt;</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>The one mutex every config writer in this process serializes on.</p>
+<p>A config write is a transaction, not a single call: a writer reads the live
+config, mutates a copy, saves the whole snapshot to <code>config.toml</code>, then
+publishes the result back to the shared handle. <code>Config::save</code> syncs the
+serialized snapshot onto the existing document and drops keys the snapshot
+does not carry, so two writers whose transactions interleave do not merge —
+the later save writes the earlier writer’s state back over the newer one,
+and the change is lost on disk even when memory still holds it.</p>
+<p>The gateway and the RPC path each already serialized their own handlers,
+but on separate mutexes, and the channel pairing writer took neither. This
+is the shared one, so a writer is safe against the others without having to
+prove which <code>Arc&lt;RwLock&lt;Config&gt;&gt;</code> it happens to hold: several exist in a
+running daemon (the gateway shares one with the channel supervisor, the RPC
+context builds its own), and a per-handle lock only protects writers that
+reached the config the same way.</p>
+<p>A tokio mutex, not <code>parking_lot</code>, because the guard must survive the
+<code>.await</code> on config-save I/O.</p>
+<p>Lock order is this mutex first, the config <code>RwLock</code> second, always. Acquire
+it before the first read-for-modify and hold it through the publish. Never
+acquire it while holding a config guard, and never re-acquire it in a
+callee: it is not reentrant, so a nested acquisition deadlocks.</p>
+<p>Serializing every writer in the process is stricter than correctness
+requires, since writers on unrelated config handles cannot actually clobber
+each other. It costs nothing worth measuring: config writes are operator
+edits and pairing binds, not a hot path.</p>
+</div></details></section></div></main></body></html>

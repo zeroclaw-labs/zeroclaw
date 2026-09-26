@@ -1,0 +1,38 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Cross-surface OIDC enrollment API."><title>zeroclaw::gateway::api_oidc - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../static.files/rustdoc-1ed95124.css"><script id="default-settings" 
+data-use_system_theme="false"
+data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../../" data-static-root-path="../../../static.files/" data-current-crate="zeroclaw" data-themes="" data-resource-suffix="" data-rustdoc-version="1.98.1 (48a229cea 2026-09-01)" data-channel="1.98.1" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module api_oidc</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../../zeroclaw/index.html">zeroclaw</a><span class="version">0.8.5</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module api_<wbr>oidc</a></h2><h3><a href="#functions">Module Items</a></h3><ul class="block"><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"><h2><a href="../index.html">In zeroclaw::<wbr>gateway</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../../index.html">zeroclaw</a>::<wbr><a href="../index.html">gateway</a></div><h1>Module <span>api_<wbr>oidc</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Cross-surface OIDC enrollment API.</p>
+<p>Design: <code>docs/security/oidc-browser-pkce-design-8289.md</code>. These routes
+are unauthenticated by necessity (enrollment precedes authentication),
+rate limited, and grant nothing: they relay what the IdP grants after
+the user approves. The gateway holds the <code>[oidc.&lt;alias&gt;]</code> client
+credentials so browsers and zerocode need none.</p>
+<ul>
+<li><code>GET  /api/oidc/providers</code> lists configured aliases.</li>
+<li><code>POST /api/oidc/{alias}/device/start</code> proxies the RFC 8628 start.</li>
+<li><code>POST /api/oidc/{alias}/device/poll</code> proxies one token poll. Its
+statuses are a contract a polling client reads: 403 is the
+authorization server’s refusal and ends the flow, while 429 and
+503 (both with <code>Retry-After</code>) and 502 are “not now” and are
+retryable for as long as the device code lives.</li>
+<li><code>GET  /oidc/login/{alias}</code> starts Authorization Code + PKCE (302).</li>
+<li><code>GET  /oidc/callback</code> finishes it: the one-time page hands the token
+to <code>window.opener</code> via <code>postMessage</code> (gateway origin only) with a
+manual copy fallback. No cookies, no session: clients keep
+authenticating per request with the route-layer headers.</li>
+</ul>
+<p>Because nothing here is authenticated, every route is bounded <em>before</em>
+it can cause outbound work, by four independent limits held in
+<code>OidcEnrollmentState</code>: an attempt limiter refuses clients that are
+already locked out, a per-client sliding-window budget caps relay
+requests per minute, a process-wide semaphore caps how many IdP round
+trips can be in flight at once, and the pending-flow store bounds both
+its own size and how much of it one client can hold. Every response from these routes
+is <code>Cache-Control: no-store</code>: each one carries, or is one step from, a
+device code or an access token.</p>
+<p>The attempt limiter is this surface’s own, not the gateway-wide
+<code>auth_limiter</code> that <code>POST /pair</code> and webhook auth share. Those two
+count only failures, so billing enrollment traffic to the same counter
+would let a browser sign-in loop lock a client out of pairing, and a
+wrong pairing code shorten the enrollment budget. Both limiters are
+built from the same thresholds and share the loopback exemption.</p>
+</div></details><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.routes.html" title="fn zeroclaw::gateway::api_oidc::routes">routes</a></dt></dl></section></div></main></body></html>

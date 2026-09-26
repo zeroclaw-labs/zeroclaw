@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["PAIRING_CODE_DEFAULT_LENGTH","PAIRING_CODE_MAX_LENGTH","PAIRING_CODE_MIN_LENGTH","PAIRING_CODE_TTL"],"enum":["GeneratePairingCodeError","PairingCodeCharset","PairingCodePolicyError"],"fn":["constant_time_eq","is_public_bind"],"struct":["PairingCodePolicy","PairingGuard","PairingReservation"]};

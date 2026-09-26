@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["calendar_event_create","calendar_event_delete","calendar_events_list","mail_list","mail_send","onedrive_download","onedrive_list","sharepoint_search","teams_message_list","teams_message_send"]};
