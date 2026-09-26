@@ -2859,7 +2859,7 @@ fn build_owned_step_system_prompt(
         .map(|t| (t.name(), t.description()))
         .collect();
     let bootstrap_max_chars = if owned.agent.resolved.compact_context {
-        Some(6000)
+        Some(crate::agent::system_prompt::COMPACT_BOOTSTRAP_MAX_CHARS)
     } else {
         None
     };

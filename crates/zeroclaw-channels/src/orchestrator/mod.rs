@@ -254,8 +254,9 @@ const WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL: &str = "Current WhatsApp group messa
 // System prompt functions live in `zeroclaw_runtime::agent::system_prompt`.
 #[allow(unused_imports)]
 pub use zeroclaw_runtime::agent::system_prompt::{
-    BOOTSTRAP_MAX_CHARS, build_system_prompt, build_system_prompt_with_mode,
-    build_system_prompt_with_mode_and_autonomy, build_system_prompt_with_mode_and_effective_tools,
+    BOOTSTRAP_MAX_CHARS, COMPACT_BOOTSTRAP_MAX_CHARS, build_system_prompt,
+    build_system_prompt_with_mode, build_system_prompt_with_mode_and_autonomy,
+    build_system_prompt_with_mode_and_effective_tools,
 };
 
 const DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS: u64 = 2;
@@ -16045,7 +16046,7 @@ pub async fn start_channels_with_plugin_webhooks(
         tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
 
         let bootstrap_max_chars = if agent.resolved.compact_context {
-            Some(6000)
+            Some(COMPACT_BOOTSTRAP_MAX_CHARS)
         } else {
             None
         };

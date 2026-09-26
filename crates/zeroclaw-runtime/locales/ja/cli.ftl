@@ -428,6 +428,9 @@ cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" —
 cli-doctor-codex-auth-profile-no-slot = OpenAI Codex 認証情報にサインインしていますが、それを使用するモデルプロバイダースロットがありません。OpenAI プロバイダースロットで `requires_openai_auth = true` を設定し、エージェントの `model_provider` をそこへ向けるか、`zeroclaw quickstart` を実行してください。
 cli-doctor-codex-auth-slot-no-profile = OpenAI スロット {$slots} は `requires_openai_auth = true` を設定していますが、OpenAI Codex 認証情報にサインインしていません。`zeroclaw auth login --provider openai-codex` を実行してください。
 cli-doctor-codex-auth-ok = OpenAI Codex 認証情報にサインインしており、モデルプロバイダースロットから参照されています。
+cli-doctor-bootstrap-file-truncated-compact = [{$alias}] {$file}：このファイルを注入するエージェントループおよびチャンネルのターンでは、ファイルごとの上限により {$total} 文字中 {$retained} 文字が保持されます（{$discarded} 文字を破棄、プロンプト全体の予算より前の段階）。このエージェントでは compact_context が有効です。各ブートストラップファイルは {$limit} 文字に制限されます。`[runtime_profiles.{$profile}]` で `compact_context = false` を設定するか、ファイルを短くしてください。
+cli-doctor-bootstrap-file-truncated-compact-no-profile = [{$alias}] {$file}：このファイルを注入するエージェントループおよびチャンネルのターンでは、ファイルごとの上限により {$total} 文字中 {$retained} 文字が保持されます（{$discarded} 文字を破棄、プロンプト全体の予算より前の段階）。このエージェントでは compact_context が有効です（既定値、ランタイムプロファイルは未割り当て）。各ブートストラップファイルは {$limit} 文字に制限されます。`compact_context = false` を指定した `[runtime_profiles.<name>]` を追加し、エージェントに `runtime_profile = "<name>"` を設定してください。またはファイルを短くしてください。
+cli-doctor-bootstrap-file-truncated = [{$alias}] {$file}：このファイルを注入するエージェントループおよびチャンネルのターンでは、ファイルごとの上限により {$total} 文字中 {$retained} 文字が保持されます（{$discarded} 文字を破棄、プロンプト全体の予算より前の段階）。各ブートストラップファイルは {$limit} 文字に制限されます。ファイルを短くしてください。
 cli-doctor-systemd-linger-enabled = systemd ユーザー linger は有効です
 cli-doctor-systemd-linger-disabled = systemd ユーザー linger は無効です。ログアウト後にユーザーサービスが停止する可能性があります。有効化: loginctl enable-linger {$user}
 cli-doctor-systemd-linger-unknown = loginctl で systemd ユーザー linger を確認できませんでした
