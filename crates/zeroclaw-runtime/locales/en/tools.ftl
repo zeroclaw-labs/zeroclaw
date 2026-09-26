@@ -218,6 +218,8 @@ tool-tool-search = Fetch full schema definitions for deferred MCP tools so they 
 
 tool-web-fetch = Fetch a web page and return its content as clean plain text. HTML pages are automatically converted to readable text. JSON and plain text responses are returned as-is. Only GET requests; follows redirects. Security: allowlist-only domains, no local/private hosts.
 
+tool-web-research = Research a question on the live web and return a written briefing that ends with a Sources list. A bounded sub-agent decomposes the question, searches, reads the pages worth reading, and distills what it found, so raw search results never enter this conversation. Ask a full question rather than search keywords. Optionally pass a starting URL to read first. Approving this call also covers the read-only searches and page fetches the sub-agent makes inside it; they are not approved separately.
+
 tool-web-search-tool = Search the web for information. Returns relevant search results with titles, URLs, and descriptions. Use this to find current information, news, or research topics.
 tool-web-search-tool-error-duckduckgo-blocked = DuckDuckGo is rate-limiting this machine. Do not retry or rephrase the search; wait a few minutes, fetch known URLs directly with web_fetch, or configure SearXNG, Brave, or Tavily as the web_search provider.
 tool-web-search-tool-error-searxng-not-configured = SearXNG instance URL not configured. Set [web_search] searxng_instance_url in config.toml, or override it with the ZEROCLAW_web_search__searxng_instance_url environment variable.
