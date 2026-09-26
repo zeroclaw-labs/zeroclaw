@@ -6,7 +6,8 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::select;
+use tokio::{select, sync::Notify};
+use tokio_util::sync::CancellationToken;
 use waproto::whatsapp::device_props::PlatformType;
 use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelConversationScope,
@@ -443,6 +444,10 @@ pub struct WhatsAppWebChannel {
     /// between a token's registration and the cleanup that follows it.
     #[cfg(test)]
     approval_send_hook: Option<ApprovalSendHook>,
+    /// Supervisor lifecycle notification point. Injected via
+    /// `set_cancel_token` before `listen()` starts so the internal
+    /// shutdown `select!` subscribes to the single SIGINT consumer.
+    cancel_notify: Arc<Notify>,
 }
 
 #[cfg(feature = "whatsapp-web")]
@@ -573,6 +578,7 @@ impl WhatsAppWebChannel {
             persist: None,
             #[cfg(test)]
             approval_send_hook: None,
+            cancel_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -2956,6 +2962,18 @@ impl Channel for WhatsAppWebChannel {
         "whatsapp"
     }
 
+    fn set_cancel_token(&self, token: CancellationToken) {
+        let notify = self.cancel_notify.clone();
+        ::zeroclaw_spawn::spawn!(async move {
+            token.cancelled().await;
+            notify.notify_one();
+        });
+    }
+
+    fn uses_cancel_token(&self) -> bool {
+        true
+    }
+
     /// Without this the trait default (`false`) applies, so every WhatsApp DM
     /// is treated as a non-direct message. Callers that exist to spare direct
     /// messages extra handling — notably the reply-intent precheck bypass in
@@ -3570,14 +3588,18 @@ impl Channel for WhatsAppWebChannel {
             drop(logout_tx);
 
             // Wait for a logout signal or process shutdown.
+            // Shutdown arrives through the supervisor lifecycle token
+            // injected via set_cancel_token — a bridge task notifies
+            // so the single SIGINT consumer in main.rs deterministically
+            // reaches this listener.
             let should_reconnect = select! {
                 res = logout_rx.recv() => {
                     // Both Ok(()) and Err (sender dropped) mean the session ended.
                     let _ = res;
                     true
                 }
-                _ = tokio::signal::ctrl_c() => {
-                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "channel received Ctrl+C");
+                () = self.cancel_notify.notified() => {
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "channel received shutdown signal");
                     false
                 }
             };
