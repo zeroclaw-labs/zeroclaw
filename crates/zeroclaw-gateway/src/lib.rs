@@ -4934,12 +4934,45 @@ async fn handle_admin_paircode_new(
     Ok((StatusCode::OK, Json(body)))
 }
 
-async fn handle_pair_code(State(state): State<AppState>) -> impl IntoResponse {
+/// Headers that mark a request as relayed by a proxy or tunnel. A loopback
+/// peer carrying any of them is a remote client arriving through something
+/// that runs on this host, so it must not be treated as local.
+const PROXY_FORWARDING_HEADERS: [&str; 5] = [
+    "forwarded",
+    "x-forwarded-for",
+    "x-real-ip",
+    "cf-connecting-ip",
+    "true-client-ip",
+];
+
+/// True only for a request made directly from this host: a loopback peer,
+/// no proxy forwarding header, and no configured tunnel (a tunnel client
+/// also connects from loopback, carrying remote traffic).
+fn is_direct_local_request(peer: &SocketAddr, headers: &HeaderMap, tunnel_provider: &str) -> bool {
+    peer.ip().is_loopback()
+        && tunnel_provider == "none"
+        && !PROXY_FORWARDING_HEADERS
+            .iter()
+            .any(|name| headers.contains_key(*name))
+}
+
+async fn handle_pair_code(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     let require = state.pairing.require_pairing();
     let is_paired = state.pairing.is_paired();
+    let local = {
+        let config = state.config.read();
+        is_direct_local_request(&peer, &headers, &config.tunnel.tunnel_provider)
+    };
 
-    // Only expose the code during initial setup (before first pairing)
-    let code = if require && !is_paired {
+    // Only expose the code during initial setup (before first pairing), and
+    // only to a caller on this host. Anyone else who could read it here could
+    // pair as the shared operator before the owner does; remote and container
+    // users read the code from the startup banner in the gateway log instead.
+    let code = if require && !is_paired && local {
         state.pairing.pairing_code()
     } else {
         None
@@ -5850,6 +5883,86 @@ path = "{trigger_path}"
             status,
             StatusCode::FORBIDDEN,
             "minting a pairing code must be rejected for non-loopback peers"
+        );
+    }
+
+    async fn pair_code_json(
+        state: AppState,
+        peer: SocketAddr,
+        headers: HeaderMap,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = handle_pair_code(State(state), ConnectInfo(peer), headers)
+            .await
+            .into_response();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    const LOOPBACK_PEER: ([u8; 4], u16) = ([127, 0, 0, 1], 40_000);
+
+    #[tokio::test]
+    async fn pair_code_is_shown_to_a_direct_local_caller_before_first_pairing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, false);
+        let expected = state.pairing.pairing_code();
+        assert!(expected.is_some(), "a fresh guard issues a startup code");
+
+        let (status, json) =
+            pair_code_json(state, SocketAddr::from(LOOPBACK_PEER), HeaderMap::new()).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["pairing_required"], true);
+        assert_eq!(json["pairing_code"].as_str(), expected.as_deref());
+    }
+
+    #[tokio::test]
+    async fn pair_code_is_withheld_from_a_remote_peer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, false);
+        assert!(state.pairing.pairing_code().is_some());
+
+        let remote = SocketAddr::from(([203, 0, 113, 7], 40_000));
+        let (status, json) = pair_code_json(state, remote, HeaderMap::new()).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["pairing_required"], true);
+        assert!(
+            json["pairing_code"].is_null(),
+            "a remote caller must not read the first-run code: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pair_code_is_withheld_from_a_proxied_loopback_request() {
+        for header in PROXY_FORWARDING_HEADERS {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let state = admin_paircode_state(&tmp, true, false);
+            let mut headers = HeaderMap::new();
+            headers.insert(header, HeaderValue::from_static("203.0.113.7"));
+
+            let (_status, json) =
+                pair_code_json(state, SocketAddr::from(LOOPBACK_PEER), headers).await;
+
+            assert!(
+                json["pairing_code"].is_null(),
+                "a loopback request carrying {header} is relayed remote traffic: {json}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pair_code_is_withheld_when_a_tunnel_is_configured() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, false);
+        state.config.write().tunnel.tunnel_provider = "cloudflare".to_string();
+
+        let (_status, json) =
+            pair_code_json(state, SocketAddr::from(LOOPBACK_PEER), HeaderMap::new()).await;
+
+        assert!(
+            json["pairing_code"].is_null(),
+            "a tunnel client connects from loopback on behalf of remote users: {json}"
         );
     }
 
