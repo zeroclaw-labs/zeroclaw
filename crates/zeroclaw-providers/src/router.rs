@@ -303,6 +303,15 @@ impl CostOptimizedStrategy {
 
 #[async_trait]
 impl ModelProvider for RouterModelProvider {
+    fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        self.model_providers
+            .get(provider_idx)
+            .is_some_and(|(_, provider)| {
+                provider.supports_exact_request_replay(request, &resolved_model)
+            })
+    }
+
     fn has_stable_request_identity(&self, model: &str) -> bool {
         if model.starts_with("hint:") {
             return false;
@@ -615,6 +624,10 @@ mod tests {
 
     #[async_trait]
     impl ModelProvider for MockModelProvider {
+        fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
+            self.vision && model == "replay-model" && request.tools.is_none()
+        }
+
         fn has_stable_request_identity(&self, _model: &str) -> bool {
             true
         }
@@ -1016,6 +1029,56 @@ mod tests {
         assert_eq!(unknown.provider_name, "default.profile");
         assert_eq!(unknown.model, "hint:missing");
         assert_eq!(unknown.kind, RouteResolutionKind::UnknownHintFallback);
+    }
+
+    #[test]
+    fn exact_replay_uses_selected_provider_and_model() {
+        let router = RouterModelProvider::new(
+            "test",
+            vec![
+                (
+                    "default".into(),
+                    Box::new(MockModelProvider::new("no replay")),
+                ),
+                (
+                    "replay".into(),
+                    Box::new(MockModelProvider::new("ok").with_vision(true)),
+                ),
+            ],
+            vec![
+                (
+                    "safe".into(),
+                    Route {
+                        provider_name: "replay".into(),
+                        model: "replay-model".into(),
+                    },
+                ),
+                (
+                    "unsafe".into(),
+                    Route {
+                        provider_name: "replay".into(),
+                        model: "other-model".into(),
+                    },
+                ),
+            ],
+            "replay-model".into(),
+        );
+        let request = ChatRequest {
+            messages: &[],
+            tools: None,
+            thinking: None,
+        };
+        assert!(router.supports_exact_request_replay(request, "hint:safe"));
+        for model in ["hint:unsafe", "hint:unknown", "replay-model"] {
+            assert!(!router.supports_exact_request_replay(request, model));
+        }
+        assert!(!router.supports_exact_request_replay(
+            ChatRequest {
+                tools: Some(&[]),
+                ..request
+            },
+            "hint:safe"
+        ));
     }
 
     #[test]

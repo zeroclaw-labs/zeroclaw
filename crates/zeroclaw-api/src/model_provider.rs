@@ -485,6 +485,10 @@ pub enum StreamError {
     #[error("ModelProvider error: {0}")]
     ModelProvider(String),
 
+    /// A provider returned a non-success HTTP response before streaming began.
+    #[error("ModelProvider HTTP {status}: {message}")]
+    HttpStatus { status: u16, message: String },
+
     #[error(transparent)]
     ModelRefusal(#[from] Box<ModelRefusalError>),
 
@@ -605,6 +609,14 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
     /// identity. Callers use this fact to fail closed for identity-sensitive
     /// behavior such as persistent full-response caching.
     fn has_stable_request_identity(&self, _model: &str) -> bool {
+        false
+    }
+
+    /// Whether this exact request shape can be replayed for `model` on the same
+    /// provider/model route without internal retries, fallback, or key
+    /// mutation. Runtime fails closed when this capability is absent.
+    #[doc(hidden)]
+    fn supports_exact_request_replay(&self, _request: ChatRequest<'_>, _model: &str) -> bool {
         false
     }
 
@@ -911,6 +923,10 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
 impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
     fn has_stable_request_identity(&self, model: &str) -> bool {
         self.as_ref().has_stable_request_identity(model)
+    }
+
+    fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
+        self.as_ref().supports_exact_request_replay(request, model)
     }
 
     fn capabilities(&self) -> ProviderCapabilities {

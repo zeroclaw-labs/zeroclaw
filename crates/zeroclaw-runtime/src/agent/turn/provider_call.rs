@@ -9,7 +9,7 @@ use super::outcome::{
     StreamSemanticEmptyCompletion, ToolLoopCancelled, is_tool_loop_cancelled,
 };
 use super::redact::scrub_credentials;
-use super::stream_consume::consume_provider_streaming_response;
+use super::stream_consume::{StreamProviderFailure, consume_provider_streaming_response};
 use crate::agent::cost::check_tool_loop_budget;
 use crate::cost::types::BudgetCheck;
 use crate::observability::ObserverEvent;
@@ -30,6 +30,19 @@ pub(crate) struct ProviderCallOutcome {
     pub(crate) streamed_live_deltas: bool,
     pub(crate) streamed_protocol_suppressed: bool,
     pub(crate) streamed_visible_text: String,
+    pub(crate) image_recovery_succeeded: bool,
+}
+
+fn is_http_bad_request(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<zeroclaw_providers::reliable::ProviderHttpError>()
+            .is_some_and(|error| error.status() == 400)
+            || matches!(
+                cause.downcast_ref::<zeroclaw_api::model_provider::StreamError>(),
+                Some(zeroclaw_api::model_provider::StreamError::HttpStatus { status: 400, .. })
+            )
+    })
 }
 
 /// Fingerprints of a request's cacheable prompt prefix: the contiguous
@@ -225,6 +238,7 @@ pub(crate) async fn call_provider(
     active_model: &str,
     active_dispatch_model: &str,
     prepared_messages: &[ChatMessage],
+    image_recovery_messages: Option<&[ChatMessage]>,
     request_tools: Option<&[ToolSpec]>,
     should_consume_provider_stream: bool,
     iteration: usize,
@@ -232,13 +246,22 @@ pub(crate) async fn call_provider(
     let mut streamed_live_deltas = false;
     let mut streamed_protocol_suppressed = false;
     let mut streamed_visible_text = String::new();
+    let mut image_recovery_succeeded = false;
+    let original_request = ChatRequest {
+        messages: prepared_messages,
+        tools: request_tools,
+        thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+            .try_with(Clone::clone)
+            .ok()
+            .flatten(),
+    };
 
     let (chat_result, accounting) = if should_consume_provider_stream {
         // The stream is lazily consumed inside this call-scoped owner. Its
         // permitted non-stream recovery therefore shares the same Reliable
         // attempt ledger instead of opening a second scope.
         let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
-        let (result, live_deltas, protocol_suppressed, visible_text) = scope
+        let (result, live_deltas, protocol_suppressed, visible_text, recovered_image_request) = scope
             .scope(Box::pin(zeroclaw_providers::reliable::scope_provider_fallback(Box::pin(async {
                     match consume_provider_streaming_response(
                         active_model_provider,
@@ -267,6 +290,7 @@ pub(crate) async fn call_provider(
                                 streamed.forwarded_live_deltas,
                                 streamed.suppressed_protocol,
                                 streamed.forwarded_visible_text,
+                                false,
                             )
                         }
                         Err(stream_err)
@@ -276,7 +300,10 @@ pub(crate) async fn call_provider(
                                 || is_tool_loop_cancelled(&stream_err)
                                 || stream_err
                                     .downcast_ref::<StreamInterruptedAfterOutput>()
-                                    .is_some() =>
+                                    .is_some()
+                                || stream_err
+                                    .downcast_ref::<StreamProviderFailure>()
+                                    .is_some_and(|error| !error.fallback_safe()) =>
                         {
                             if let Some(usage) = stream_err
                                 .downcast_ref::<StreamPreExecutedToolsWithoutFinalResponse>()
@@ -296,10 +323,15 @@ pub(crate) async fn call_provider(
                                         .downcast_ref::<StreamCancelledWithUsage>()
                                         .and_then(|error| error.usage.clone())
                                 })
+                                .or_else(|| {
+                                    stream_err
+                                        .downcast_ref::<StreamProviderFailure>()
+                                        .and_then(StreamProviderFailure::usage)
+                                })
                             {
                                 scope.record_stream_interruption_usage(usage);
                             }
-                            (Err(stream_err), false, false, String::new())
+                            (Err(stream_err), false, false, String::new(), false)
                         }
                         Err(stream_err) => {
                             let streamed_refusal = stream_err
@@ -312,11 +344,21 @@ pub(crate) async fn call_provider(
                                 })
                                 .or_else(|| {
                                     stream_err.chain().find_map(|cause| {
-                                        cause
-                                            .downcast_ref::<
-                                                zeroclaw_api::model_provider::ModelRefusalError,
-                                            >()
-                                            .cloned()
+                                        if let Some(
+                                            zeroclaw_api::model_provider::StreamError::ModelRefusal(
+                                                refusal,
+                                            ),
+                                        ) = cause.downcast_ref::<
+                                            zeroclaw_api::model_provider::StreamError,
+                                        >() {
+                                            Some((**refusal).clone())
+                                        } else {
+                                            cause
+                                                .downcast_ref::<
+                                                    zeroclaw_api::model_provider::ModelRefusalError,
+                                                >()
+                                                .cloned()
+                                        }
                                     })
                                 });
                             if let Some(usage) = streamed_refusal
@@ -332,6 +374,11 @@ pub(crate) async fn call_provider(
                             } else if let Some(usage) = stream_err
                                 .downcast_ref::<StreamErrorWithUsage>()
                                 .and_then(|error| error.usage.clone())
+                                .or_else(|| {
+                                    stream_err
+                                        .downcast_ref::<StreamProviderFailure>()
+                                        .and_then(StreamProviderFailure::usage)
+                                })
                             {
                                 scope.record_stream_interruption_usage(usage);
                             }
@@ -356,9 +403,23 @@ pub(crate) async fn call_provider(
                                 "llm_stream_fallback: provider stream failed, falling back to non-streaming chat"
                             );
                             scope.clear_provisional_provider_route();
+                            let image_recovery_candidate = is_http_bad_request(&stream_err)
+                                && image_recovery_messages.is_some()
+                                && stream_err
+                                    .downcast_ref::<StreamProviderFailure>()
+                                    .is_none_or(StreamProviderFailure::replay_safe);
+                            let recover_images = image_recovery_candidate
+                                && active_model_provider
+                                    .supports_exact_request_replay(original_request, active_dispatch_model);
+                            let recovery_messages = if recover_images {
+                                zeroclaw_providers::reliable::permit_exact_image_recovery();
+                                image_recovery_messages.unwrap_or(prepared_messages)
+                            } else {
+                                prepared_messages
+                            };
                             let dispatcher = ProviderDispatch::from_ref(active_model_provider);
                             let request = ChatRequest {
-                                messages: prepared_messages,
+                                messages: recovery_messages,
                                 tools: request_tools,
                                 thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
                                     .try_with(Clone::clone)
@@ -388,7 +449,20 @@ pub(crate) async fn call_provider(
                                     }
                                 },
                             );
-                            let result = if let Some(token) = ctx.cancellation_token {
+                            let recovery_result = if recover_images {
+                                zeroclaw_providers::compatible::scope_exact_request_replay(async {
+                                    if let Some(token) = ctx.cancellation_token {
+                                        tokio::select! {
+                                            biased;
+                                            () = token.cancelled() => Err(ToolLoopCancelled.into()),
+                                            result = recovery => result,
+                                        }
+                                    } else {
+                                        recovery.await
+                                    }
+                                })
+                                .await
+                            } else if let Some(token) = ctx.cancellation_token {
                                 tokio::select! {
                                     biased;
                                     () = token.cancelled() => Err(ToolLoopCancelled.into()),
@@ -397,7 +471,23 @@ pub(crate) async fn call_provider(
                             } else {
                                 recovery.await
                             };
-                            (result, false, false, String::new())
+                            let result = if recover_images {
+                                match recovery_result {
+                                    Ok(response) if !response.is_semantically_empty_terminal() => {
+                                        Ok(response)
+                                    }
+                                    _ => Err(stream_err),
+                                }
+                            } else {
+                                recovery_result
+                            };
+                            (
+                                result,
+                                false,
+                                false,
+                                String::new(),
+                                recover_images,
+                            )
                         }
                     }
                 }))))
@@ -409,28 +499,66 @@ pub(crate) async fn call_provider(
         streamed_live_deltas = live_deltas;
         streamed_protocol_suppressed = protocol_suppressed;
         streamed_visible_text = visible_text;
+        image_recovery_succeeded = recovered_image_request && result.is_ok();
         (result, accounting)
     } else {
         // Non-streaming path: wrap with optional per-step timeout from
         // pacing config to catch hung model responses.
         let dispatcher = ProviderDispatch::from_ref(active_model_provider);
         let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
-        let chat_future = scope.scope(Box::pin(with_exact_dispatch_route(
-            active_model_provider_name.to_string(),
-            active_model.to_string(),
-            dispatcher.chat(
-                ChatRequest {
-                    messages: prepared_messages,
-                    tools: request_tools,
-                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                        .try_with(Clone::clone)
-                        .ok()
-                        .flatten(),
-                },
-                active_dispatch_model,
-                ctx.temperature,
-            ),
-        )));
+        // Both attempts belong to one inference step: recovery must not
+        // outlive cancellation or receive a fresh timeout allowance.
+        let chat_future = async {
+            let result = scope
+                .scope(Box::pin(with_exact_dispatch_route(
+                    active_model_provider_name.to_string(),
+                    active_model.to_string(),
+                    dispatcher.chat(original_request, active_dispatch_model, ctx.temperature),
+                )))
+                .await;
+
+            match result {
+                Err(original_error)
+                    if is_http_bad_request(&original_error)
+                        && image_recovery_messages.is_some() =>
+                {
+                    let exact_replay_supported = active_model_provider
+                        .supports_exact_request_replay(original_request, active_dispatch_model);
+                    if exact_replay_supported {
+                        let recovery = zeroclaw_providers::compatible::scope_exact_request_replay(
+                            scope.scope(with_exact_dispatch_route(
+                                active_model_provider_name.to_string(),
+                                active_model.to_string(),
+                                dispatcher.chat(
+                                    ChatRequest {
+                                        messages: image_recovery_messages
+                                            .unwrap_or(prepared_messages),
+                                        tools: request_tools,
+                                        thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                                            .try_with(Clone::clone)
+                                            .ok()
+                                            .flatten(),
+                                    },
+                                    active_dispatch_model,
+                                    ctx.temperature,
+                                ),
+                            )),
+                        )
+                        .await;
+                        match recovery {
+                            Ok(response) if !response.is_semantically_empty_terminal() => {
+                                image_recovery_succeeded = true;
+                                Ok(response)
+                            }
+                            _ => Err(original_error),
+                        }
+                    } else {
+                        Err(original_error)
+                    }
+                }
+                result => result,
+            }
+        };
 
         let result = match ctx.pacing.step_timeout_secs {
             Some(step_secs) if step_secs > 0 => {
@@ -481,6 +609,7 @@ pub(crate) async fn call_provider(
         streamed_live_deltas,
         streamed_protocol_suppressed,
         streamed_visible_text,
+        image_recovery_succeeded,
     })
 }
 
@@ -1013,6 +1142,171 @@ mod streaming_fallback_tests {
         ModelProvider, ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
     };
 
+    fn recovery_test_ctx<'a>(observer: &'a NoopObserver, pacing: &'a PacingConfig) -> TurnCtx<'a> {
+        TurnCtx {
+            observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+            serving_provider_name: None,
+            serving_model: None,
+        }
+    }
+    struct RejectedImageThenPendingProvider {
+        calls: AtomicUsize,
+        recovery_started: tokio::sync::Notify,
+    }
+
+    impl Attributable for RejectedImageThenPendingProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "pending-image-recovery"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for RejectedImageThenPendingProvider {
+        fn supports_exact_request_replay(&self, _request: ChatRequest<'_>, _model: &str) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            unreachable!("structured chat is used")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                return Err(StreamError::HttpStatus {
+                    status: 400,
+                    message: "rejected request".into(),
+                }
+                .into());
+            }
+            self.recovery_started.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn image_recovery_obeys_turn_cancellation() {
+        for step_timeout_secs in [None, Some(10)] {
+            let provider = RejectedImageThenPendingProvider {
+                calls: AtomicUsize::new(0),
+                recovery_started: tokio::sync::Notify::new(),
+            };
+            let observer = NoopObserver;
+            let pacing = PacingConfig {
+                step_timeout_secs,
+                ..Default::default()
+            };
+            let token = tokio_util::sync::CancellationToken::new();
+            let mut ctx = recovery_test_ctx(&observer, &pacing);
+            ctx.cancellation_token = Some(&token);
+            let original = [ChatMessage::user("[IMAGE:data:image/png;base64,aGVsbG8=]")];
+            let recovery = [ChatMessage::user("image omitted")];
+            let call = call_provider(
+                &ctx,
+                &provider,
+                "test-provider",
+                "test-model",
+                "test-model",
+                &original,
+                Some(&recovery),
+                None,
+                false,
+                0,
+            );
+            let cancel = async {
+                provider.recovery_started.notified().await;
+                token.cancel();
+            };
+            let (outcome, ()) = tokio::time::timeout(Duration::from_secs(11), async {
+                tokio::join!(call, cancel)
+            })
+            .await
+            .expect("cancellation must terminate a pending recovery");
+            let outcome = outcome.unwrap();
+            assert!(is_tool_loop_cancelled(&outcome.chat_result.unwrap_err()));
+            assert!(!outcome.image_recovery_succeeded);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn image_recovery_keeps_original_step_deadline() {
+        let provider = RejectedImageThenPendingProvider {
+            calls: AtomicUsize::new(0),
+            recovery_started: tokio::sync::Notify::new(),
+        };
+        let observer = NoopObserver;
+        let pacing = PacingConfig {
+            step_timeout_secs: Some(10),
+            ..Default::default()
+        };
+        let ctx = recovery_test_ctx(&observer, &pacing);
+        let original = [ChatMessage::user("[IMAGE:data:image/png;base64,aGVsbG8=]")];
+        let recovery = [ChatMessage::user("image omitted")];
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(11),
+            call_provider(
+                &ctx,
+                &provider,
+                "test-provider",
+                "test-model",
+                "test-model",
+                &original,
+                Some(&recovery),
+                None,
+                false,
+                0,
+            ),
+        )
+        .await
+        .expect("recovery must not receive a fresh ten-second allowance")
+        .unwrap();
+        assert!(
+            outcome
+                .chat_result
+                .unwrap_err()
+                .to_string()
+                .contains("step_timeout_secs")
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
+        assert!(!outcome.image_recovery_succeeded);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    }
+
     struct EmptyStreamThenTextProvider {
         stream_calls: Arc<AtomicUsize>,
         non_stream_calls: Arc<AtomicUsize>,
@@ -1528,6 +1822,7 @@ mod streaming_fallback_tests {
                         "test-model",
                         &[ChatMessage::user("go")],
                         None,
+                        None,
                         true,
                         0,
                     ),
@@ -1625,6 +1920,7 @@ mod streaming_fallback_tests {
             "test-model",
             &[ChatMessage::user("go")],
             None,
+            None,
             true,
             0,
         )
@@ -1678,6 +1974,7 @@ mod streaming_fallback_tests {
             "test-model",
             "test-model",
             &[ChatMessage::user("go")],
+            None,
             None,
             true,
             0,
@@ -1814,6 +2111,7 @@ mod streaming_fallback_tests {
                 "test-model",
                 &[ChatMessage::user("go")],
                 None,
+                None,
                 true,
                 0,
             )
@@ -1837,6 +2135,124 @@ mod streaming_fallback_tests {
             assert_eq!(outcome.attempts.len(), 2);
             server.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn factory_exact_replay_image_recovery_is_one_image_free_request() {
+        use axum::Json;
+        use axum::response::IntoResponse;
+
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_route = Arc::clone(&request_count);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let request_count = Arc::clone(&request_count_for_route);
+                async move {
+                    let attempt = request_count.fetch_add(1, Ordering::Relaxed);
+                    let has_image = body["messages"].as_array().unwrap().iter().any(|message| {
+                        message["content"].as_array().is_some_and(|parts| {
+                            parts.iter().any(|part| part["type"] == "image_url")
+                        })
+                    });
+                    assert_eq!(
+                        has_image,
+                        attempt == 0,
+                        "only the original request carries images"
+                    );
+                    assert_eq!(body["model"], "test-model");
+                    if attempt == 0 {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": {"message": "image-bearing request rejected"}
+                            })),
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "recovered"}}]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind compatible recovery server");
+        let addr = listener.local_addr().expect("read recovery server address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve compatible recovery responses");
+        });
+        let original = [ChatMessage::user(
+            "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]",
+        )];
+        let recovery = [ChatMessage::user("inspect")];
+        let provider = zeroclaw_providers::create_resilient_model_provider_with_options(
+            "custom",
+            None,
+            Some(&format!("http://{addr}")),
+            &zeroclaw_config::schema::ReliabilityConfig {
+                provider_retries: 0,
+                provider_backoff_ms: 1,
+                ..Default::default()
+            },
+            &zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+        )
+        .expect("construct production factory and reliability wrappers");
+        let provider = zeroclaw_providers::router::RouterModelProvider::new(
+            "test-router",
+            vec![
+                (
+                    "default".into(),
+                    Box::new(StreamFailureNoReplayProvider {
+                        non_stream_calls: Arc::new(AtomicUsize::new(0)),
+                    }),
+                ),
+                ("test-provider".into(), provider),
+            ],
+            vec![(
+                "images".into(),
+                zeroclaw_providers::router::Route {
+                    provider_name: "test-provider".into(),
+                    model: "test-model".into(),
+                },
+            )],
+            "default-model".into(),
+        );
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = recovery_test_ctx(&observer, &pacing);
+
+        let outcome = call_provider(
+            &ctx,
+            &provider,
+            "test-provider",
+            "test-model",
+            "hint:images",
+            &original,
+            Some(&recovery),
+            None,
+            false,
+            0,
+        )
+        .await
+        .expect("provider call returns its outcome");
+
+        assert_eq!(
+            outcome.chat_result.unwrap().text.as_deref(),
+            Some("recovered")
+        );
+        assert!(outcome.image_recovery_succeeded);
+        assert_eq!(outcome.attempts.len(), 2);
+        assert_eq!(
+            request_count.load(Ordering::Relaxed),
+            2,
+            "recovery must add exactly one physical request"
+        );
+        server.abort();
     }
 
     #[tokio::test]
@@ -1899,6 +2315,7 @@ mod streaming_fallback_tests {
                 "requested-model",
                 "requested-model",
                 &[ChatMessage::user("go")],
+                None,
                 None,
                 true,
                 0,
@@ -2003,6 +2420,7 @@ mod streaming_fallback_tests {
             "test-model",
             &[ChatMessage::user("go")],
             None,
+            None,
             true,
             0,
         )
@@ -2072,6 +2490,7 @@ mod streaming_fallback_tests {
             "requested-model",
             "requested-model",
             &[ChatMessage::user("go")],
+            None,
             None,
             false,
             0,
@@ -2144,6 +2563,7 @@ mod streaming_fallback_tests {
             "requested-model",
             &[ChatMessage::user("go")],
             None,
+            None,
             false,
             0,
         )
@@ -2166,5 +2586,242 @@ mod streaming_fallback_tests {
             zeroclaw_providers::dispatch::AttemptUsageOutcome::Complete(usage)
                 if usage.input_tokens == Some(10) && usage.output_tokens == Some(5)
         ));
+    }
+
+    struct ImageRecoveryStreamProvider {
+        non_stream_calls: Arc<AtomicUsize>,
+        recovery_succeeds: bool,
+        thinking_before_error: bool,
+        draft_before_error: bool,
+    }
+
+    #[async_trait]
+    impl ModelProvider for ImageRecoveryStreamProvider {
+        fn supports_exact_request_replay(&self, _request: ChatRequest<'_>, _model: &str) -> bool {
+            true
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            unreachable!("structured chat is used")
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.non_stream_calls.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(
+                zeroclaw_providers::multimodal::count_image_markers(request.messages),
+                usize::from(self.draft_before_error),
+                "draft-only fallback must retain the original image; no-output recovery omits it"
+            );
+            if !self.recovery_succeeds {
+                anyhow::bail!("recovery failed");
+            }
+            Ok(ChatResponse {
+                text: Some("recovered".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: zeroclaw_providers::traits::StreamOptions,
+        ) -> BoxStream<'static, zeroclaw_providers::traits::StreamResult<StreamEvent>> {
+            let error = Err(zeroclaw_api::model_provider::StreamError::HttpStatus {
+                status: 400,
+                message: "request could not be processed".to_string(),
+            });
+            if self.thinking_before_error {
+                Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::ThinkingDelta("working".to_string())),
+                    error,
+                ]))
+            } else if self.draft_before_error {
+                Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::TextDelta(
+                        zeroclaw_api::model_provider::StreamChunk::delta("draft text"),
+                    )),
+                    error,
+                ]))
+            } else {
+                Box::pin(futures_util::stream::iter(vec![error]))
+            }
+        }
+    }
+
+    impl Attributable for ImageRecoveryStreamProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "image-recovery-stream"
+        }
+    }
+
+    #[tokio::test]
+    async fn message_only_http_400_recovers_once_and_accounts_both_attempts() {
+        let provider = ImageRecoveryStreamProvider {
+            non_stream_calls: Arc::new(AtomicUsize::new(0)),
+            recovery_succeeds: true,
+            thinking_before_error: false,
+            draft_before_error: false,
+        };
+        let non_stream_calls = Arc::clone(&provider.non_stream_calls);
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![("primary".to_string(), Box::new(provider))],
+            0,
+            1,
+        );
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = recovery_test_ctx(&observer, &pacing);
+        let original = [ChatMessage::user(
+            "inspect [IMAGE:data:image/png;base64,AAAA]",
+        )];
+        let recovery = [ChatMessage::user("inspect")];
+
+        let outcome = call_provider(
+            &ctx,
+            &provider,
+            "test-provider",
+            "test-model",
+            "test-model",
+            &original,
+            Some(&recovery),
+            None,
+            true,
+            0,
+        )
+        .await
+        .expect("provider call completes");
+
+        assert_eq!(
+            outcome.chat_result.unwrap().text.as_deref(),
+            Some("recovered")
+        );
+        assert!(outcome.image_recovery_succeeded);
+        assert_eq!(outcome.attempts.len(), 2);
+        assert_eq!(non_stream_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_recovery_returns_original_400_and_visible_activity_blocks_replay() {
+        for thinking_before_error in [false, true] {
+            let provider = ImageRecoveryStreamProvider {
+                non_stream_calls: Arc::new(AtomicUsize::new(0)),
+                recovery_succeeds: false,
+                thinking_before_error,
+                draft_before_error: false,
+            };
+            let non_stream_calls = Arc::clone(&provider.non_stream_calls);
+            let provider = ReliableModelProvider::new(
+                "test",
+                vec![("primary".to_string(), Box::new(provider))],
+                0,
+                1,
+            );
+            let observer = NoopObserver;
+            let pacing = PacingConfig::default();
+            let ctx = recovery_test_ctx(&observer, &pacing);
+            let original = [ChatMessage::user("[IMAGE:data:image/png;base64,AAAA]")];
+            let recovery = [ChatMessage::user("[image removed]")];
+
+            let outcome = call_provider(
+                &ctx,
+                &provider,
+                "test-provider",
+                "test-model",
+                "test-model",
+                &original,
+                Some(&recovery),
+                None,
+                true,
+                0,
+            )
+            .await
+            .expect("provider call completes");
+            let error = outcome.chat_result.expect_err("request remains failed");
+            assert!(is_http_bad_request(&error));
+            assert!(!outcome.image_recovery_succeeded);
+            assert_eq!(
+                non_stream_calls.load(Ordering::Relaxed),
+                usize::from(!thinking_before_error)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn image_recovery_draft_only_fallback_preserves_original_request() {
+        for committed_output in [false, true] {
+            let provider = ImageRecoveryStreamProvider {
+                non_stream_calls: Arc::new(AtomicUsize::new(0)),
+                recovery_succeeds: true,
+                thinking_before_error: false,
+                draft_before_error: true,
+            };
+            let observer = NoopObserver;
+            let pacing = PacingConfig::default();
+            let mut ctx = recovery_test_ctx(&observer, &pacing);
+            let (draft_tx, mut draft_rx) = tokio::sync::mpsc::channel(16);
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel(16);
+            ctx.on_delta = Some(&draft_tx);
+            ctx.event_tx = committed_output.then_some(&event_tx);
+            let original = [ChatMessage::user("[IMAGE:data:image/png;base64,AAAA]")];
+            let recovery = [ChatMessage::user("[image removed]")];
+
+            let outcome = call_provider(
+                &ctx,
+                &provider,
+                "test-provider",
+                "test-model",
+                "test-model",
+                &original,
+                Some(&recovery),
+                None,
+                true,
+                0,
+            )
+            .await
+            .expect("provider call completes");
+
+            assert!(draft_rx.try_recv().is_ok(), "draft text must be delivered");
+            assert!(!outcome.image_recovery_succeeded);
+            assert_eq!(
+                provider.non_stream_calls.load(Ordering::Relaxed),
+                usize::from(!committed_output)
+            );
+            if committed_output {
+                assert!(outcome.chat_result.is_err());
+            } else {
+                assert_eq!(
+                    outcome
+                        .chat_result
+                        .expect("ordinary fallback succeeds")
+                        .text
+                        .as_deref(),
+                    Some("recovered")
+                );
+            }
+        }
     }
 }

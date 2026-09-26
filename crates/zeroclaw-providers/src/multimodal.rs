@@ -225,6 +225,20 @@ fn image_failure_reference_key(reference: &str) -> [u8; 32] {
 pub struct PreparedMessages {
     pub messages: Vec<ChatMessage>,
     pub contains_images: bool,
+    /// Normalized image identities in the final provider-visible request.
+    pub submitted_image_ids: Vec<ProviderImageId>,
+    /// Submitted identities explicitly present in the newest user turn.
+    pub newest_user_image_ids: Vec<ProviderImageId>,
+}
+
+/// Stable identity for one normalized provider-visible image reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProviderImageId([u8; 32]);
+
+impl ProviderImageId {
+    fn from_reference(reference: &str) -> Self {
+        Self(Sha256::digest(reference.as_bytes()).into())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1507,6 +1521,8 @@ async fn prepare_messages_inner(
                 })
                 .collect(),
             contains_images: false,
+            submitted_image_ids: Vec::new(),
+            newest_user_image_ids: Vec::new(),
         });
     }
 
@@ -1626,12 +1642,104 @@ async fn prepare_messages_inner(
     // marker per *successful* reference, so the marker count can only shrink
     // from here — re-running either trim would be a guaranteed no-op.
 
+    let submitted_image_ids = provider_image_ids(&normalized_messages);
+    let newest_user_image_ids = normalized_messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user" && !is_prompt_tool_result_message(message))
+        .map(provider_image_ids_in_message)
+        .unwrap_or_default();
+
     Ok(PreparedMessages {
-        contains_images: count_image_markers(&normalized_messages) > 0,
+        contains_images: !submitted_image_ids.is_empty(),
         messages: normalized_messages,
+        submitted_image_ids,
+        newest_user_image_ids,
     })
 }
 
+fn provider_image_ids_in_message(message: &ChatMessage) -> Vec<ProviderImageId> {
+    parse_image_markers(&message.content)
+        .1
+        .iter()
+        .map(|reference| ProviderImageId::from_reference(reference))
+        .collect()
+}
+
+/// Return normalized image identities in provider wire order.
+pub fn provider_image_ids(messages: &[ChatMessage]) -> Vec<ProviderImageId> {
+    let current_turn_tool_indices = current_turn_tool_result_indices(messages);
+    messages
+        .iter()
+        .enumerate()
+        .filter(|(index, message)| {
+            should_normalize_message_images(*index, message, &current_turn_tool_indices)
+        })
+        .flat_map(|(_, message)| provider_image_ids_in_message(message))
+        .collect()
+}
+
+fn omit_provider_image_ids_from_content(content: &str, omitted: &[ProviderImageId]) -> String {
+    let (mut text, references) = parse_image_markers(content);
+    if references.is_empty() {
+        return content.to_string();
+    }
+
+    let retained: Vec<String> = references
+        .iter()
+        .filter(|reference| !omitted.contains(&ProviderImageId::from_reference(reference)))
+        .cloned()
+        .collect();
+    if retained.len() == references.len() {
+        return content.to_string();
+    }
+    if retained.is_empty() && text.trim().is_empty() {
+        text = "[image removed from history]".to_string();
+    }
+    compose_multimodal_message(&text, &retained)
+}
+
+/// Build a provider-only replay view with selected normalized images removed.
+/// The caller retains canonical history unchanged.
+pub fn omit_provider_image_ids(
+    messages: &[ChatMessage],
+    omitted: &[ProviderImageId],
+) -> Vec<ChatMessage> {
+    if omitted.is_empty() {
+        return messages.to_vec();
+    }
+
+    messages
+        .iter()
+        .zip(image_marker_dispositions(messages))
+        .map(|(message, disposition)| {
+            if disposition != ImageMarkerDisposition::Normalized {
+                return message.clone();
+            }
+
+            if message.role == "tool"
+                && let Ok(serde_json::Value::Object(mut object)) =
+                    serde_json::from_str::<serde_json::Value>(&message.content)
+                && let Some(serde_json::Value::String(content)) = object.get("content").cloned()
+            {
+                let filtered = omit_provider_image_ids_from_content(&content, omitted);
+                if filtered == content {
+                    return message.clone();
+                }
+                object.insert("content".to_string(), serde_json::Value::String(filtered));
+                return ChatMessage {
+                    role: message.role.clone(),
+                    content: serde_json::Value::Object(object).to_string(),
+                };
+            }
+
+            ChatMessage {
+                role: message.role.clone(),
+                content: omit_provider_image_ids_from_content(&message.content, omitted),
+            }
+        })
+        .collect()
+}
 /// Strip image markers from user messages older than `max_turns` conversation
 /// turns, where a turn opens at a user message that is not a prompt-mode
 /// tool-result carrier. Carriers never advance the turn count and are never
@@ -9045,6 +9153,15 @@ mod tests {
             .filter(|m| m.content.contains("data:image"))
             .count();
         assert_eq!(surviving, 4, "output should keep exactly max_images");
+        assert_eq!(
+            result.submitted_image_ids,
+            provider_image_ids(&result.messages)
+        );
+        assert_eq!(result.submitted_image_ids.len(), 4);
+        assert_eq!(
+            result.newest_user_image_ids,
+            provider_image_ids_in_message(&result.messages[8])
+        );
 
         // ...and it is the newest four that survive; the oldest five are stripped.
         for (i, m) in result.messages.iter().enumerate() {
@@ -9205,6 +9322,8 @@ mod tests {
             "newest marker failed to load, so no image should be inlined: {:?}",
             result.messages
         );
+        assert!(result.submitted_image_ids.is_empty());
+        assert!(result.newest_user_image_ids.is_empty());
         assert!(
             result.messages[0].content.contains("Older valid image"),
             "older message text must survive the cap"
@@ -9255,6 +9374,58 @@ mod tests {
         );
         assert_eq!(refs.len(), 1);
     }
+    #[test]
+    fn provider_image_filter_removes_only_selected_identity() {
+        let first = "data:image/png;base64,AAAA";
+        let second = "data:image/png;base64,BBBB";
+        let messages = vec![ChatMessage::user(format!(
+            "compare [IMAGE:{first}] with [IMAGE:{second}]"
+        ))];
+        let ids = provider_image_ids(&messages);
+
+        let filtered = omit_provider_image_ids(&messages, &ids[1..]);
+
+        assert_eq!(provider_image_ids(&filtered), vec![ids[0]]);
+        assert!(filtered[0].content.contains(first));
+        assert!(!filtered[0].content.contains(second));
+        assert!(filtered[0].content.contains("compare"));
+    }
+
+    #[test]
+    fn provider_image_filter_preserves_literal_roles_and_tool_arguments() {
+        let marker = "[IMAGE:data:image/png;base64,AAAA]";
+        let assistant = serde_json::json!({
+            "reasoning_content": format!("signed literal {marker}"),
+            "signature": "signed-reasoning",
+            "tool_calls": [{"function": {"arguments": format!("{{\"literal\":\"{marker}\"}}")}}],
+        })
+        .to_string();
+        let old_tool = serde_json::json!({"content": format!("old {marker}")}).to_string();
+        let current_tool =
+            serde_json::json!({"tool_call_id": "call-1", "content": format!("new {marker}")})
+                .to_string();
+        let messages = vec![
+            ChatMessage::system(format!("system literal {marker}")),
+            ChatMessage::user("first turn"),
+            ChatMessage::tool(old_tool),
+            ChatMessage::user(format!("inspect {marker}")),
+            ChatMessage::assistant(assistant),
+            ChatMessage::tool(current_tool),
+        ];
+        let omitted = provider_image_ids(&[ChatMessage::user(marker)]);
+
+        let filtered = omit_provider_image_ids(&messages, &omitted);
+
+        assert_eq!(filtered[0].content, messages[0].content);
+        assert_eq!(filtered[2].content, messages[2].content);
+        assert_eq!(filtered[4].content, messages[4].content);
+        assert!(!filtered[3].content.contains(marker));
+        let tool: serde_json::Value = serde_json::from_str(&filtered[5].content).unwrap();
+        assert_eq!(tool["tool_call_id"], "call-1");
+        assert!(!tool["content"].as_str().unwrap().contains(marker));
+        assert!(provider_image_ids(&filtered).is_empty());
+    }
+
     /// A GIF whose image descriptor claims a frame larger than the logical screen.
     ///
     /// The LZW payload is 1×1 (the same `GIF_VALID_1X1_LZW` data), but the

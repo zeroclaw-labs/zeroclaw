@@ -51,6 +51,7 @@ pub(crate) async fn finish_after_max_iterations(
     dispatch_model: &str,
     temperature: Option<f64>,
     multimodal_config: &MultimodalConfig,
+    quarantined_image_ids: &[super::ProviderImageId],
     pacing: &PacingConfig,
     cancellation_token: Option<&CancellationToken>,
     max_iterations: usize,
@@ -143,6 +144,8 @@ pub(crate) async fn finish_after_max_iterations(
         )
         .await?
         .messages;
+        messages =
+            super::suppress_quarantined_provider_images(&messages, quarantined_image_ids, false);
         // Count the summary prompt, but keep it out of durable history until
         // the request fits: it must not make the newest real turn droppable.
         messages.push(summary_prompt_mirror.clone());
@@ -477,6 +480,7 @@ mod graceful_summary_metering_tests {
             "test-model",
             None,
             &multimodal_config,
+            &[],
             &pacing,
             None,
             2,
@@ -757,6 +761,7 @@ mod graceful_summary_metering_tests {
                 "test-model",
                 None,
                 &MultimodalConfig::default(),
+                &[],
                 &PacingConfig::default(),
                 None,
                 1,
@@ -842,6 +847,7 @@ mod graceful_summary_metering_tests {
             "test-model",
             None,
             &multimodal_config,
+            &[],
             &pacing,
             None,
             2,
@@ -914,6 +920,7 @@ mod graceful_summary_metering_tests {
             "test-model",
             None,
             &multimodal_config,
+            &[],
             &pacing,
             None,
             2,
@@ -996,6 +1003,7 @@ mod graceful_summary_metering_tests {
             "test-model",
             None,
             &multimodal_config,
+            &[],
             &pacing,
             None,
             2,
@@ -1080,6 +1088,7 @@ mod graceful_summary_metering_tests {
             "test-model",
             None,
             &multimodal_config,
+            &[],
             &pacing,
             None,
             2,
@@ -1161,6 +1170,7 @@ mod graceful_summary_metering_tests {
             "test-model",
             None,
             &multimodal_config,
+            &[],
             &pacing,
             None,
             2,

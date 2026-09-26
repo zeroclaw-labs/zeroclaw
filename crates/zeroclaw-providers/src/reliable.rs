@@ -112,6 +112,7 @@ pub(crate) struct ReliableCallAccounting {
     stream_resume_after: Option<ReliableEntryId>,
     stream_recovery_semantic_empty: bool,
     stream_recovery_semantic_empty_permission: bool,
+    stream_recovery_image_replacement_permission: bool,
     stream_recovery_failure: Option<ProviderErrorDiagnostic>,
 }
 
@@ -220,6 +221,18 @@ pub(crate) fn mark_stream_recovery_semantic_empty() {
         let mut accounting = accounting.lock();
         accounting.stream_recovery_semantic_empty = true;
         accounting.stream_recovery_semantic_empty_permission = true;
+    });
+}
+
+/// Permit one non-streaming call to the exact entry whose image-bearing stream
+/// ended in HTTP 400. Runtime grants this only after constructing a provider-
+/// only request view with the novel image identities removed.
+#[doc(hidden)]
+pub fn permit_exact_image_recovery() {
+    let _ = RELIABLE_CALL_ACCOUNTING.try_with(|accounting| {
+        accounting
+            .lock()
+            .stream_recovery_image_replacement_permission = true;
     });
 }
 
@@ -899,6 +912,29 @@ fn compact_error_detail(err: &anyhow::Error) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Sanitized HTTP failure retained across provider wrappers so runtime policy
+/// can act on the status code without parsing provider prose.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct ProviderHttpError {
+    status: u16,
+    message: String,
+}
+
+impl ProviderHttpError {
+    pub(crate) fn new(status: reqwest::StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status: status.as_u16(),
+            message: message.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn status(&self) -> u16 {
+        self.status
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2079,13 +2115,11 @@ impl ReliableModelProvider {
     }
 
     /// Admit an entry with its configured retry budget, except for the exact
-    /// stream-failed entry, which is skipped to avoid replaying it — with two
-    /// exceptions: the semantic-empty entry (when the budget permits it,
-    /// granted as a single attempt), and the single-candidate case (no other
-    /// candidate exists, so a non-stream retry of the same entry is recovery,
-    /// not replay, and it carries the full configured budget). When both
-    /// apply to the same entry, semantic-empty wins and its grant stays a
-    /// single attempt — never two.
+    /// stream-failed entry, which is skipped to avoid replaying it. Image
+    /// replacement and semantic-empty (with budget) each permit one atomic
+    /// non-stream attempt. When no other candidate exists, retrying the same
+    /// entry instead uses its configured budget. An explicit one-attempt grant
+    /// takes precedence when these exceptions overlap.
     fn effective_retry_limit(
         &self,
         model_slot: usize,
@@ -2103,6 +2137,7 @@ impl ReliableModelProvider {
                     max_retries,
                     exact_failed_entry,
                     accounting.stream_recovery_semantic_empty_permission,
+                    accounting.stream_recovery_image_replacement_permission,
                     has_other_candidate,
                 );
                 match decision {
@@ -2110,9 +2145,10 @@ impl ReliableModelProvider {
                         if exact_failed_entry {
                             // Consume one-shot recovery grants so each fires at
                             // most once. Clearing the resume marker merges the
-                            // single-candidate grant into the semantic-empty
-                            // attempt when both apply.
+                            // single-candidate grant into any explicitly
+                            // permitted recovery attempt when they overlap.
                             accounting.stream_recovery_semantic_empty_permission = false;
+                            accounting.stream_recovery_image_replacement_permission = false;
                             if !has_other_candidate {
                                 accounting.stream_resume_after = None;
                             }
@@ -2133,14 +2169,15 @@ impl ReliableModelProvider {
         max_retries: u32,
         exact_failed_entry: bool,
         semantic_empty_permission: bool,
+        image_replacement_permission: bool,
         has_other_candidate: bool,
     ) -> RetryDecision {
         if !exact_failed_entry {
             return RetryDecision::Admit(max_retries);
         }
-        // Semantic-empty wins when both exceptions apply (see
+        // An explicitly permitted recovery wins when exceptions overlap (see
         // `effective_retry_limit` for the merged single-attempt consumption).
-        if max_retries > 0 && semantic_empty_permission {
+        if image_replacement_permission || (max_retries > 0 && semantic_empty_permission) {
             return RetryDecision::Admit(0);
         }
         // Single-candidate stream failure: no alternative entry exists, so a
@@ -2285,6 +2322,25 @@ impl ModelProvider for ReliableModelProvider {
         self.model_providers
             .first()
             .is_some_and(|entry| entry.provider().has_stable_request_identity(model))
+    }
+
+    fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
+        if self.max_retries != 0
+            || !self.api_keys.is_empty()
+            || self.model_providers.len() != 1
+            || self
+                .model_fallbacks
+                .get(model)
+                .is_some_and(|fallbacks| !fallbacks.is_empty())
+        {
+            return false;
+        }
+
+        self.model_providers.first().is_some_and(|entry| {
+            entry
+                .provider()
+                .supports_exact_request_replay(request, entry.served_model(model))
+        })
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
@@ -11392,21 +11448,21 @@ mod tests {
     fn single_candidate_recovery_decision_boundaries() {
         // Non-failed entries always admit the configured budget.
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(0, false, false, true),
+            ReliableModelProvider::stream_recovery_decision(0, false, false, false, true),
             RetryDecision::Admit(0)
         );
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(2, false, false, false),
+            ReliableModelProvider::stream_recovery_decision(2, false, false, false, false),
             RetryDecision::Admit(2)
         );
         // Semantic-empty wins with budget; without budget it stays skipped
         // when another candidate exists.
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(2, true, true, true),
+            ReliableModelProvider::stream_recovery_decision(2, true, true, false, true),
             RetryDecision::Admit(0)
         );
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(0, true, true, true),
+            ReliableModelProvider::stream_recovery_decision(0, true, true, false, true),
             RetryDecision::Skip
         );
         // Single-candidate stream failure: recovery is not replay, so the
@@ -11414,24 +11470,24 @@ mod tests {
         // when that budget is zero). Merges with semantic-empty into the
         // same single attempt when both grants apply at a zero budget.
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(0, true, false, false),
+            ReliableModelProvider::stream_recovery_decision(0, true, false, false, false),
             RetryDecision::Admit(0)
         );
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(0, true, true, false),
+            ReliableModelProvider::stream_recovery_decision(0, true, true, false, false),
             RetryDecision::Admit(0)
         );
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(2, true, false, false),
+            ReliableModelProvider::stream_recovery_decision(2, true, false, false, false),
             RetryDecision::Admit(2)
         );
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(2, true, true, false),
+            ReliableModelProvider::stream_recovery_decision(2, true, true, false, false),
             RetryDecision::Admit(0)
         );
         // Multi-candidate without permission: skip the failed entry.
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(0, true, false, true),
+            ReliableModelProvider::stream_recovery_decision(0, true, false, false, true),
             RetryDecision::Skip
         );
     }
@@ -12044,6 +12100,47 @@ mod tests {
             assert_eq!(provider.effective_retry_limit(9, 10, true), None);
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn image_stream_recovery_permissions_merge_into_one_exact_attempt() {
+        for max_retries in [0, 2] {
+            for has_other_candidate in [false, true] {
+                let provider = ReliableModelProvider::new("test", Vec::new(), max_retries, 1);
+                scope_reliable_call_accounting(async {
+                    activate_stream_recovery_after_first_poll(3, 4);
+                    mark_stream_recovery_semantic_empty();
+                    permit_exact_image_recovery();
+
+                    // Other entries keep their normal budget and cannot consume
+                    // the recovery permissions belonging to the failed entry.
+                    assert_eq!(
+                        provider.effective_retry_limit(3, 3, true),
+                        Some(max_retries)
+                    );
+                    assert_eq!(
+                        provider.effective_retry_limit(2, 4, true),
+                        Some(max_retries)
+                    );
+                    assert_eq!(
+                        provider.effective_retry_limit(3, 4, has_other_candidate),
+                        Some(0)
+                    );
+                    assert_eq!(
+                        provider.effective_retry_limit(3, 4, has_other_candidate),
+                        if has_other_candidate {
+                            None
+                        } else {
+                            Some(max_retries)
+                        }
+                    );
+                    // Re-arming an identity must not resurrect either grant.
+                    activate_stream_recovery_after_first_poll(3, 4);
+                    assert_eq!(provider.effective_retry_limit(3, 4, true), None);
+                })
+                .await;
+            }
+        }
     }
 
     #[tokio::test]
