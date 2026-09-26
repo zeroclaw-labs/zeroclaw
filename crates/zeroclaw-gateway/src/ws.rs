@@ -2160,6 +2160,10 @@ async fn process_chat_message(
                             &memory_config,
                             &user_msg,
                             &assistant_resp,
+                            // A WS chat turn is a person typing in the web
+                            // UI — the same origin the gateway stamps on its
+                            // turn envelopes.
+                            zeroclaw_api::ingress::TurnOrigin::Interactive,
                         )
                         .await
                         {
