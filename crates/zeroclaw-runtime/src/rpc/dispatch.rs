@@ -5790,30 +5790,76 @@ impl RpcDispatcher {
 
     async fn handle_session_messages(&self, params: &Value) -> RpcResult {
         let req: SessionMessagesParams = parse_params(params)?;
+        let cursor_mode = params.get("cursor").is_some();
         let record = self
             .authorize_session_owner(&req.session_id, Method::SessionMessages)
             .await?;
+        if cursor_mode && req.before_index.is_some() {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "cursor pagination cannot be combined with before_index",
+            ));
+        }
         // Read exactly the durable record that was authorized. No second
         // candidate search: a prefixed-id collision or an ACP/chat pair with
         // different owners was already refused as ambiguous by the resolver.
+        let mut cursor_result = None;
         let messages =
             match record.and_then(|r| r.durable) {
                 Some(DurableSession::Acp) => {
                     let store = self.ctx.acp_session_store.as_ref().ok_or_else(|| {
                         rpc_err(INTERNAL_ERROR, "ACP session store is not available")
                     })?;
-                    match store.load_session(&req.session_id) {
-                        Ok(Some(data)) => conversation_message_entries(&data.messages),
-                        Ok(None) => Vec::new(),
-                        Err(e) => {
-                            return Err(rpc_err(
-                                INTERNAL_ERROR,
-                                format!("Failed to load ACP session messages: {e}"),
-                            ));
+                    if cursor_mode {
+                        match store.load_message_page(
+                            &req.session_id,
+                            req.limit.unwrap_or(100),
+                            req.cursor.as_deref(),
+                        ) {
+                            Ok(page) => {
+                                cursor_result = Some((page.next_cursor, page.has_older));
+                                conversation_message_entries(&page.messages)
+                            }
+                            Err(e) => {
+                                let message = e.to_string();
+                                if message.starts_with("unknown ACP session:") {
+                                    return Err(rpc_err(
+                                        INVALID_PARAMS,
+                                        "cursor pagination requires an ACP session",
+                                    ));
+                                }
+                                return Err(rpc_err(
+                                    if message.contains("invalid ACP session cursor")
+                                        || message.contains("cursor page limit")
+                                    {
+                                        INVALID_PARAMS
+                                    } else {
+                                        INTERNAL_ERROR
+                                    },
+                                    format!("Failed to load ACP session messages: {message}"),
+                                ));
+                            }
+                        }
+                    } else {
+                        match store.load_session(&req.session_id) {
+                            Ok(Some(data)) => conversation_message_entries(&data.messages),
+                            Ok(None) => Vec::new(),
+                            Err(e) => {
+                                return Err(rpc_err(
+                                    INTERNAL_ERROR,
+                                    format!("Failed to load ACP session messages: {e}"),
+                                ));
+                            }
                         }
                     }
                 }
                 Some(DurableSession::Chat { key }) => {
+                    if cursor_mode {
+                        return Err(rpc_err(
+                            INVALID_PARAMS,
+                            "cursor pagination requires an ACP session",
+                        ));
+                    }
                     let backend = self.ctx.session_backend.as_ref().ok_or_else(|| {
                         rpc_err(INTERNAL_ERROR, "Session persistence is disabled")
                     })?;
@@ -5832,12 +5878,30 @@ impl RpcDispatcher {
                         .collect()
                 }
                 None => {
+                    if cursor_mode {
+                        return Err(rpc_err(
+                            INVALID_PARAMS,
+                            "cursor pagination requires an ACP session",
+                        ));
+                    }
                     if self.ctx.session_backend.is_none() && self.ctx.acp_session_store.is_none() {
                         return Err(rpc_err(INTERNAL_ERROR, "Session persistence is disabled"));
                     }
                     Vec::new()
                 }
             };
+
+        if let Some((next_cursor, has_older)) = cursor_result {
+            // Cursor mode intentionally does not serialize legacy `total` or
+            // `start`: obtaining either exact value would require an
+            // unbounded full-history projection.
+            return to_result(serde_json::json!({
+                "session_id": req.session_id,
+                "messages": messages,
+                "next_cursor": next_cursor,
+                "has_older": has_older,
+            }));
+        }
 
         let total = messages.len();
         let limit = req.limit.unwrap_or(total);
@@ -5850,6 +5914,8 @@ impl RpcDispatcher {
             messages,
             total,
             start,
+            next_cursor: None,
+            has_older: None,
         })
     }
 
@@ -14752,6 +14818,23 @@ mod tests {
                 "messages",
             ),
             (
+                bob.handle_session_messages_for_test(&json!({
+                    "session_id": "alice-1",
+                    "cursor": null,
+                }))
+                .await,
+                "cursor messages",
+            ),
+            (
+                bob.handle_session_messages_for_test(&json!({
+                    "session_id": "alice-1",
+                    "cursor": null,
+                    "before_index": 1,
+                }))
+                .await,
+                "mixed cursor messages",
+            ),
+            (
                 bob.handle_session_new_for_test(&json!({
                     "agent_alias": "test-agent",
                     "session_id": "alice-1",
@@ -21735,6 +21818,194 @@ mod tests {
                 && entry.tool_call_id.is_none()
                 && entry.tool_output.is_none()
         }));
+    }
+
+    #[tokio::test]
+    async fn cursor_session_messages_returns_bounded_snapshot_pages() {
+        use serde_json::from_value;
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "acp-cursor-page";
+        acp_store
+            .create_session(sid, "test-agent", "/tmp/ws", None)
+            .unwrap();
+        for text in ["one", "two", "three"] {
+            acp_store
+                .append_turn(
+                    sid,
+                    &[ConversationMessage::Chat(ChatMessage::assistant(text))],
+                )
+                .unwrap();
+        }
+
+        let first = dispatcher
+            .handle_session_messages_for_test(&json!({
+                "session_id": sid,
+                "limit": 2,
+                "cursor": null
+            }))
+            .await
+            .unwrap();
+        assert!(first.get("total").is_none());
+        assert!(first.get("start").is_none());
+        let first: SessionMessagesResult = from_value(first).unwrap();
+        assert_eq!(first.messages.len(), 2);
+        assert_eq!(first.total, 0, "cursor mode omits exact totals");
+        assert_eq!(first.messages[0].content, "two");
+        assert_eq!(first.messages[1].content, "three");
+        assert!(first.has_older == Some(true));
+
+        let second = dispatcher
+            .handle_session_messages_for_test(&json!({
+                "session_id": sid,
+                "limit": 2,
+                "cursor": first.next_cursor
+            }))
+            .await
+            .unwrap();
+        let second: SessionMessagesResult = from_value(second).unwrap();
+        assert_eq!(second.messages.len(), 1);
+        assert_eq!(second.messages[0].content, "one");
+        assert_eq!(second.has_older, Some(false));
+    }
+
+    #[tokio::test]
+    async fn cursor_pages_equal_legacy_projection_for_valid_tool_groups() {
+        use serde_json::from_value;
+        use zeroclaw_api::model_provider::{
+            ChatMessage, ConversationMessage, ToolCall, ToolResultMessage,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "acp-cursor-equivalence";
+        acp_store
+            .create_session(sid, "test-agent", "/tmp/ws", None)
+            .unwrap();
+        acp_store
+            .append_turn(
+                sid,
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("question")),
+                    ConversationMessage::AssistantToolCalls {
+                        text: Some("narrating".into()),
+                        tool_calls: vec![
+                            ToolCall {
+                                id: "duplicate".into(),
+                                name: "first".into(),
+                                arguments: "{}".into(),
+                                extra_content: None,
+                            },
+                            ToolCall {
+                                id: "duplicate".into(),
+                                name: "second".into(),
+                                arguments: "{}".into(),
+                                extra_content: None,
+                            },
+                        ],
+                        reasoning_content: Some("private reasoning".into()),
+                    },
+                    ConversationMessage::ToolResults(vec![
+                        ToolResultMessage {
+                            tool_call_id: "duplicate".into(),
+                            content: "first result".into(),
+                            tool_name: "first".into(),
+                        },
+                        ToolResultMessage {
+                            tool_call_id: "orphan".into(),
+                            content: "orphan result".into(),
+                            tool_name: "shell".into(),
+                        },
+                        ToolResultMessage {
+                            tool_call_id: "duplicate".into(),
+                            content: "second result".into(),
+                            tool_name: "second".into(),
+                        },
+                    ]),
+                ],
+            )
+            .unwrap();
+
+        let durable = acp_store.load_session(sid).unwrap().unwrap().messages;
+        let expected = serde_json::to_value(conversation_message_entries(&durable)).unwrap();
+        let mut pages = Vec::new();
+        let mut cursor = serde_json::Value::Null;
+        loop {
+            let result = dispatcher
+                .handle_session_messages_for_test(&json!({
+                    "session_id": sid,
+                    "limit": 2,
+                    "cursor": cursor,
+                }))
+                .await
+                .unwrap();
+            let parsed: SessionMessagesResult = from_value(result).unwrap();
+            let has_older = parsed.has_older;
+            let next_cursor = parsed.next_cursor;
+            pages.push(parsed.messages);
+            if has_older != Some(true) {
+                break;
+            }
+            cursor = json!(next_cursor.expect("older page cursor"));
+        }
+        let actual_entries = pages.into_iter().rev().flatten().collect::<Vec<_>>();
+        assert_eq!(serde_json::to_value(actual_entries).unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn cursor_session_messages_rejects_mixed_or_generic_requests() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        acp_store
+            .create_session("rpc-cursor", "test-agent", "/tmp/ws", None)
+            .unwrap();
+        chat_backend
+            .append(
+                "rpc-generic",
+                &zeroclaw_api::model_provider::ChatMessage::user("old"),
+            )
+            .unwrap();
+
+        let mixed = dispatcher
+            .handle_session_messages_for_test(&json!({
+                "session_id": "rpc-generic",
+                "before_index": 1,
+                "cursor": null
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(mixed.code, INVALID_PARAMS);
+
+        let generic = dispatcher
+            .handle_session_messages_for_test(&json!({
+                "session_id": "rpc-generic",
+                "cursor": null
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(generic.code, INVALID_PARAMS);
+
+        for cursor in ["acp1.zz", "acp1.7b7d"] {
+            let invalid = dispatcher
+                .handle_session_messages_for_test(&json!({
+                    "session_id": "rpc-cursor",
+                    "cursor": cursor
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(invalid.code, INVALID_PARAMS, "cursor {cursor}");
+        }
     }
 
     #[tokio::test]
