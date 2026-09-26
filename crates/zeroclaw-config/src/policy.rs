@@ -2495,6 +2495,306 @@ fn command_basename_for_shell(raw: &str, dialect: ShellDialect) -> &str {
     }
 }
 
+/// Drop single- and double-quoted spans so a pattern search sees only the
+/// text the shell would actually execute.
+fn strip_quoted_spans(command: &str) -> String {
+    let mut out = String::with_capacity(command.len());
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for ch in command.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some(q) => {
+                if ch == '\\' && q == '"' {
+                    escaped = true;
+                } else if ch == q {
+                    quote = None;
+                }
+            }
+            None => match ch {
+                '\'' | '"' => quote = Some(ch),
+                '\\' => escaped = true,
+                _ => out.push(ch),
+            },
+        }
+    }
+    out
+}
+
+/// A self-replicating function that exhausts the process table. Matched on
+/// the unquoted text with whitespace removed, so spacing variants collapse
+/// onto one pattern.
+fn contains_fork_bomb(command: &str) -> bool {
+    let compact: String = strip_quoted_spans(command)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    compact.contains(":(){:|:&};:")
+}
+
+/// Whether a `dd` operand names a raw block device rather than a file.
+/// `/dev/null` and `/dev/zero` are character devices and stay allowed.
+///
+/// Covers the physical-disk families plus the virtual layers that front them:
+/// on an LVM or RAID host `/dev/mapper/vg-root` and `/dev/md0` *are* the
+/// system disk, so omitting them would leave the common server case open.
+/// Still a prefix list, so still best-effort — see
+/// [`is_irreversible_destructive_command`].
+fn dd_writes_raw_block_device(arg: &str) -> bool {
+    let Some(target) = arg.strip_prefix("of=") else {
+        return false;
+    };
+    let target = strip_wrapping_quotes(target);
+    [
+        "/dev/sd",
+        "/dev/hd",
+        "/dev/vd",
+        "/dev/nvme",
+        "/dev/mmcblk",
+        "/dev/disk",
+        "/dev/loop",
+        "/dev/md",
+        "/dev/mapper/",
+        "/dev/dm-",
+    ]
+    .iter()
+    .any(|prefix| target.starts_with(prefix))
+}
+
+/// Whether an `rm` operand names the filesystem root itself.
+///
+/// An absolute path is the root when every one of its components is a no-op:
+/// empty (`//`), `.`, `..`, or a bare glob. `/`, `//`, `/.`, `/..`, and `/*`
+/// all name or expand to the same directory, and a literal `== "/"` comparison
+/// catches only the first. Anything with a real component (`/tmp/scratch`,
+/// `/home/*`) names something *under* the root and is left alone.
+///
+/// Lexical, so still partial: `/tmp/..` is the root too and is not matched.
+/// GNU `rm` refuses all of these itself (`--preserve-root` is the default), so
+/// this is a second line rather than the only one — but a tier whose stated
+/// job is to be the floor should not lean on coreutils' safety net.
+fn rm_targets_filesystem_root(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        let target = strip_wrapping_quotes(arg);
+        target.starts_with('/')
+            && target.split('/').all(|part| {
+                part.is_empty() || part == "." || part == ".." || part.chars().all(|c| c == '*')
+            })
+    })
+}
+
+/// One shell word as the destructive-command matcher sees it.
+struct MatcherShellWord {
+    /// The word as written, quotes and escapes included. Assignment detection
+    /// reads this: a shell only treats `NAME=value` as an assignment when the
+    /// name itself is unquoted.
+    raw: String,
+    /// The word after the shell removes its quoting and escapes.
+    value: String,
+}
+
+/// Split one command segment into shell words, removing quoting the way the
+/// shell does before it runs the command.
+///
+/// Follows the same dialect rules as `split_unquoted_segments`: backslash is a
+/// literal path character for Windows shells, and single quotes are syntax only
+/// where the shell treats them so. Returns `None` when a quote or a trailing
+/// escape never closes.
+///
+/// Deliberately limited to quoting and escapes. It does not expand variables,
+/// command substitution, globs, or aliases; that remains outside what a lexical
+/// matcher can model, as `is_irreversible_destructive_command` documents.
+fn shell_words_for_destructive_match(
+    segment: &str,
+    dialect: ShellDialect,
+) -> Option<Vec<MatcherShellWord>> {
+    let backslash_escapes = !shell_uses_windows_path_syntax(dialect);
+    let single_quotes_are_syntax = shell_uses_single_quote_syntax(dialect);
+    let mut words = Vec::new();
+    let mut raw = String::new();
+    let mut value = String::new();
+    let mut in_word = false;
+    let mut chars = segment.chars();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            c if c.is_whitespace() => {
+                if in_word {
+                    words.push(MatcherShellWord {
+                        raw: std::mem::take(&mut raw),
+                        value: std::mem::take(&mut value),
+                    });
+                    in_word = false;
+                }
+            }
+            '\\' if backslash_escapes => {
+                in_word = true;
+                raw.push(ch);
+                let escaped = chars.next()?;
+                raw.push(escaped);
+                value.push(escaped);
+            }
+            '\'' if single_quotes_are_syntax => {
+                in_word = true;
+                raw.push(ch);
+                loop {
+                    let inner = chars.next()?;
+                    raw.push(inner);
+                    if inner == '\'' {
+                        break;
+                    }
+                    value.push(inner);
+                }
+            }
+            '"' => {
+                in_word = true;
+                raw.push(ch);
+                loop {
+                    let inner = chars.next()?;
+                    raw.push(inner);
+                    match inner {
+                        '"' => break,
+                        '\\' if backslash_escapes => {
+                            // Inside double quotes a backslash only escapes
+                            // these; before anything else it stays literal.
+                            let next = chars.next()?;
+                            raw.push(next);
+                            if !matches!(next, '$' | '`' | '"' | '\\' | '\n') {
+                                value.push('\\');
+                            }
+                            value.push(next);
+                        }
+                        other => value.push(other),
+                    }
+                }
+            }
+            other => {
+                in_word = true;
+                raw.push(other);
+                value.push(other);
+            }
+        }
+    }
+    if in_word {
+        words.push(MatcherShellWord { raw, value });
+    }
+    Some(words)
+}
+
+/// Words for a segment whose quoting never closes, which
+/// `shell_words_for_destructive_match` cannot split.
+///
+/// The shell rejects such a segment without running anything, so the only
+/// question is whether it still spells a covered operation. Removing the quote
+/// and escape characters and splitting on whitespace is the most inclusive
+/// reading of what it names. A covered spelling under that reading is refused;
+/// anything else is left to the shell's own syntax error rather than being
+/// reported as destructive, which is what the refusal message would claim.
+fn unclosed_quoting_fallback_words(segment: &str, dialect: ShellDialect) -> Vec<MatcherShellWord> {
+    let backslash_escapes = !shell_uses_windows_path_syntax(dialect);
+    let single_quotes_are_syntax = shell_uses_single_quote_syntax(dialect);
+    let unquoted: String = segment
+        .chars()
+        .filter(|&c| {
+            !(c == '"'
+                || (c == '\'' && single_quotes_are_syntax)
+                || (c == '\\' && backslash_escapes))
+        })
+        .collect();
+    unquoted
+        .split_whitespace()
+        .map(|word| MatcherShellWord {
+            raw: word.to_string(),
+            value: word.to_string(),
+        })
+        .collect()
+}
+
+/// Whether a command is a **direct spelling** of an operation whose effect is
+/// immediate and irreversible: formatting a filesystem, overwriting a raw
+/// block device, exhausting the process table, or deleting the filesystem
+/// root.
+///
+/// # This is best-effort hardening, not a security boundary
+///
+/// Read this before relying on it, and before widening what it claims.
+///
+/// The matcher is lexical: it inspects the first word of each outer shell
+/// segment. It therefore cannot see an operation passed as an *argument* to
+/// another command, and the native runtime hands the accepted string to
+/// `<shell> -c` unchanged. Under `allowed_commands = ["*"]` with
+/// `block_high_risk_commands = false` — the posture that permits arbitrary
+/// shell syntax — every one of these reaches the shell:
+///
+/// ```text
+/// sh -c 'mkfs.ext4 /dev/sda1'      bash -c "mkfs.ext4 /dev/sda1"
+/// env mkfs.ext4 /dev/sda1          sudo mkfs.ext4 /dev/sda1
+/// echo /dev/sda1 | xargs mkfs.ext4
+/// ```
+///
+/// and so does any equivalent through `nohup`, `timeout`, `find -exec`, or a
+/// language interpreter. Closing that class is not a matter of adding
+/// patterns: a lexical scan of the outer token cannot constrain arbitrary
+/// shell execution. It requires a mechanism that can — the sandbox or runtime
+/// layer — which is a much larger change than this function.
+///
+/// So: this raises the cost of the common accident and the lazy spelling. It
+/// does **not** make the wildcard posture safe against these operations, and
+/// no caller, error message, or document should say that it does. An operator
+/// told "this cannot be disabled" would reasonably conclude the wildcard
+/// posture is bounded, and that belief is more dangerous than not having the
+/// tier at all.
+///
+/// It does run ahead of the wildcard opt-out, so the direct spellings it does
+/// cover fail closed in every posture. That placement is deliberate; putting
+/// it after would make it dead code in exactly the configuration it exists for.
+///
+/// `catastrophic_deny_does_not_bound_the_wildcard_posture` pins the bypasses
+/// above as *permitted*, so the boundary is written down rather than assumed.
+fn is_irreversible_destructive_command(command: &str, dialect: ShellDialect) -> bool {
+    if contains_fork_bomb(command) {
+        return true;
+    }
+
+    for segment in split_unquoted_segments(command, dialect) {
+        // Read the segment the way the shell will, not by whitespace. A quoted
+        // assignment value (`FOO='a b' rm -rf /`) is one word to the shell, and
+        // an escaped or partly quoted name (`r\m`, `"r"m`) is the plain name
+        // after the shell removes its quoting. Splitting on whitespace instead
+        // mistakes a fragment of the assignment for the command and never
+        // looks at the command the shell actually runs.
+        let words = shell_words_for_destructive_match(&segment, dialect)
+            .unwrap_or_else(|| unclosed_quoting_fallback_words(&segment, dialect));
+        let mut words = words
+            .into_iter()
+            .skip_while(|word| is_env_assignment_word(&word.raw));
+        let Some(base_word) = words.next() else {
+            continue;
+        };
+        let base_owned = command_basename_for_shell(&base_word.value, dialect).to_ascii_lowercase();
+        let base = strip_windows_exe_suffix_for_shell(&base_owned, dialect);
+        let args: Vec<String> = words.map(|w| w.value.to_ascii_lowercase()).collect();
+
+        // `mkfs` and every `mkfs.<fstype>` variant format a device.
+        if base == "mkfs" || base.starts_with("mkfs.") {
+            return true;
+        }
+
+        if base == "dd" && args.iter().any(|arg| dd_writes_raw_block_device(arg)) {
+            return true;
+        }
+
+        if base == "rm" && rm_targets_filesystem_root(&args) {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Strip common Windows executable suffixes (.exe, .cmd, .bat) for uniform
 /// matching against allowlists and risk tables. POSIX command dialects keep
 /// suffixes literal even when the host itself is Windows.
@@ -3293,6 +3593,13 @@ impl SecurityPolicy {
             return Err(format!("Command blocked: forbidden path argument: {path}"));
         }
 
+        if is_irreversible_destructive_command(command, dialect) {
+            return Err(
+                "Command not allowed: direct spelling of an irreversible destructive operation"
+                    .into(),
+            );
+        }
+
         if !self.is_command_allowed_for_shell(command, dialect) {
             return Err(format!("Command not allowed by security policy: {command}"));
         }
@@ -3491,6 +3798,14 @@ impl SecurityPolicy {
 
     fn is_posix_like_command_allowed(&self, command: &str, dialect: ShellDialect) -> bool {
         if self.autonomy == AutonomyLevel::ReadOnly {
+            return false;
+        }
+
+        // Ahead of the wildcard opt-out below, so the direct spellings this
+        // covers fail closed in every posture. It does NOT bound the posture:
+        // the same operation via `sh -c`, `env`, `xargs`, … is still permitted
+        // here. See `is_irreversible_destructive_command`.
+        if is_irreversible_destructive_command(command, dialect) {
             return false;
         }
 
@@ -6589,6 +6904,203 @@ mod tests {
         let result = p.validate_command_execution("rm -rf /tmp/test", true);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("high-risk"));
+    }
+
+    /// The most permissive posture an operator can configure: wildcard
+    /// allowlist, high-risk blocking off, full autonomy, pre-approved.
+    fn most_permissive_policy() -> SecurityPolicy {
+        SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        }
+    }
+
+    /// The direct spellings this tier does cover fail closed even when the
+    /// operator has disabled every other gate. This is the guarantee the tier
+    /// actually makes — see
+    /// `catastrophic_deny_does_not_bound_the_wildcard_posture` for the
+    /// guarantee it does NOT make.
+    #[test]
+    fn catastrophic_direct_spellings_are_denied_in_the_most_permissive_posture() {
+        let p = most_permissive_policy();
+
+        for command in [
+            ":(){ :|:& };:",
+            ":(){:|:&};:",
+            "mkfs.ext4 /dev/sda1",
+            "mkfs -t ext4 /dev/sda1",
+            "dd if=/dev/zero of=/dev/sda",
+            "dd if=/dev/zero of=/dev/nvme0n1 bs=1M",
+            // Virtual block layers that front the real disk. On an LVM or
+            // RAID host these ARE the system disk.
+            "dd if=/dev/zero of=/dev/mapper/vg-root",
+            "dd if=/dev/zero of=/dev/dm-0",
+            "dd if=/dev/zero of=/dev/md0",
+            "dd if=/dev/zero of=/dev/loop0",
+            "rm -rf /",
+            "rm -rf /*",
+            "rm --recursive --force /",
+            // Spellings that resolve to the same directory as `/`.
+            "rm -rf //",
+            "rm -rf /.",
+            "rm -rf /..",
+            "rm -rf /**",
+        ] {
+            assert!(
+                !p.is_command_allowed(command),
+                "{command:?} must stay denied even when the operator disables every other gate"
+            );
+            let err = p
+                .validate_command_execution(command, true)
+                .expect_err("catastrophic command must not validate");
+            assert!(
+                err.contains("irreversible"),
+                "{command:?} should report the destructive-operation deny, got: {err}"
+            );
+        }
+    }
+
+    /// Quoting and escapes that the shell removes before it runs the command
+    /// must not hide a covered direct spelling. A quoted assignment value is a
+    /// single shell word, and an escaped or partly quoted name is the plain
+    /// name once the shell strips the quoting.
+    #[test]
+    fn shell_quoting_does_not_hide_a_direct_spelling() {
+        let p = most_permissive_policy();
+
+        for command in [
+            "FOO='bar baz' rm -rf /",
+            "FOO=\"bar baz\" mkfs.ext4 /dev/sda1",
+            "A='x y' B=\"p q\" dd if=/dev/zero of=/dev/sda",
+            "r\\m -rf /",
+            "m\\kfs.ext4 /dev/sda1",
+            "'rm' -rf /",
+            "\"r\"m -rf /",
+            "mk'fs'.ext4 /dev/sda1",
+            "rm -rf '/'",
+            "dd if=/dev/zero of='/dev/sda'",
+            // Quoting that never closes cannot be split exactly. It is still
+            // refused when it visibly spells a covered operation.
+            "rm -rf \"/",
+            "mkfs.ext4 '/dev/sda1",
+        ] {
+            assert!(
+                !p.is_command_allowed(command),
+                "{command:?} must stay denied: the shell runs a covered command"
+            );
+            let err = p
+                .validate_command_execution(command, true)
+                .expect_err("a quoted or escaped direct spelling must not validate");
+            assert!(
+                err.contains("irreversible"),
+                "{command:?} should report the destructive-operation deny, got: {err}"
+            );
+        }
+    }
+
+    /// The quoting-aware reader must not start denying ordinary commands. A
+    /// covered name that the shell sees only as an argument or inside a quoted
+    /// string is not a direct spelling.
+    #[test]
+    fn shell_quoting_awareness_leaves_ordinary_commands_allowed() {
+        let p = most_permissive_policy();
+
+        for command in [
+            "FOO='bar baz' ls /",
+            "FOO=\"a b\" echo hello",
+            "echo 'rm -rf /'",
+            "echo \"mkfs.ext4 /dev/sda1\"",
+            "printf '%s\\n' r\\m",
+            "rm -rf '/tmp/scratch dir'",
+            "\"FOO=x\" ls",
+            // Unclosed quoting the shell will reject on its own. It names no
+            // covered operation, so it must not be reported as destructive.
+            "echo \"unterminated",
+            "echo 'rm -rf /",
+        ] {
+            assert!(
+                p.is_command_allowed(command),
+                "{command:?} is not a direct destructive spelling and must stay allowed"
+            );
+        }
+    }
+
+    /// The boundary, written down.
+    ///
+    /// Asserting that these are **permitted** looks alarming, and that is the
+    /// point: the matcher is lexical and inspects only the first word of each
+    /// outer segment, so an operation passed as an argument to another command
+    /// reaches `<shell> -c` untouched. Pinning it stops a future reader from
+    /// assuming the tier bounds the wildcard posture, and makes any change
+    /// that *does* close the class an explicit, visible edit to this test
+    /// rather than a silent widening of what the tier claims.
+    ///
+    /// Closing this needs enforcement at a layer that can constrain arbitrary
+    /// shell execution (sandbox/runtime), not more patterns here.
+    #[test]
+    fn catastrophic_deny_does_not_bound_the_wildcard_posture() {
+        let p = most_permissive_policy();
+
+        for command in [
+            // Interpreter and wrapper indirection: first word is sh/bash/env/…
+            "sh -c 'mkfs.ext4 /dev/sda1'",
+            "bash -c \"mkfs.ext4 /dev/sda1\"",
+            "env mkfs.ext4 /dev/sda1",
+            "sudo mkfs.ext4 /dev/sda1",
+            "echo /dev/sda1 | xargs mkfs.ext4",
+            // Path indirection the lexical comparison cannot resolve.
+            "rm -rf /tmp/..",
+        ] {
+            assert!(
+                p.is_command_allowed(command),
+                "{command:?} is NOT blocked by this tier — if that changed, the \
+                 tier's documented contract must change with it"
+            );
+        }
+    }
+
+    #[test]
+    fn catastrophic_deny_does_not_capture_ordinary_work() {
+        let p = most_permissive_policy();
+
+        for command in [
+            "dd if=input.iso of=output.img bs=4M",
+            "dd if=/dev/zero of=./disk.img count=1",
+            "rm -rf ./build",
+            "rm -rf /tmp/scratch",
+            "rm -rf /home/agent/workspace/node_modules",
+            "echo ':(){ :|:& };:'",
+            "grep -r mkfs docs/",
+        ] {
+            assert!(
+                p.is_command_allowed(command),
+                "{command:?} is ordinary work and must remain allowed under a wildcard allowlist"
+            );
+        }
+    }
+
+    #[test]
+    fn catastrophic_deny_survives_a_high_risk_command_being_explicitly_listed() {
+        // Explicitly listing `dd` is the documented way to opt into a
+        // high-risk command. It must not also unlock writing to a raw device.
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["dd".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+
+        assert!(p.is_command_allowed("dd if=a.img of=b.img"));
+        assert!(!p.is_command_allowed("dd if=/dev/zero of=/dev/sda"));
+    }
+
+    #[test]
+    fn catastrophic_deny_applies_to_every_segment_of_a_chain() {
+        let p = most_permissive_policy();
+        assert!(!p.is_command_allowed("ls -la && mkfs.ext4 /dev/sdb1"));
+        assert!(!p.is_command_allowed("echo hi; rm -rf /"));
     }
 
     #[test]
