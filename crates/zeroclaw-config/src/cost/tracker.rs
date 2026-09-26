@@ -11,6 +11,156 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+/// Process-local subtree accounting for one hop of a delegation chain.
+///
+/// Single source of truth: the durable ledger remains the source of truth
+/// for every alias's own daily spend, which budget checks read per alias;
+/// the descendant accumulator holds only what THIS delegation chain's
+/// descendants recorded during this process lifetime. It exists because
+/// descendants attribute their ledger records to their own alias, not the
+/// ancestor's, so an ancestor's per-alias daily total alone cannot see
+/// them. Descendant accounting is per process lifetime and per UTC day:
+/// each record lands in the accumulator under the UTC day of its own
+/// timestamp, the same day the ledger's daily aggregates fold that row
+/// into, so the accumulator rolls over with the ledger's daily totals at
+/// UTC midnight instead of carrying one day's descendant spend into the
+/// next day's ceiling check. A daemon restart therefore forgets
+/// descendant spend while every alias's own ledger total persists.
+///
+/// Shared by `Arc` into the budget scopes of the whole chain: the entry's
+/// owning scope checks it in `check_budget`, and every descendant tracker
+/// recording under an inherited chain adds its recorded cost to the
+/// accumulator.
+pub struct SubtreeSpend {
+    alias: String,
+    daily_ceiling_usd: f64,
+    descendant_spend: Mutex<DescendantSpend>,
+}
+
+/// One UTC day's worth of descendant spend in a [`SubtreeSpend`] entry.
+/// The stored total counts toward `day`'s ceiling check only: reads for
+/// any other day see zero, so a stale day's spend never leaks into
+/// another day's check. `day` is `None` until the first record opens the
+/// slot: the entry is created when its tracker is derived, not when its
+/// first descendant spend arrives, so an unopened slot must not behave
+/// as if the derivation day had already accumulated spend (a record
+/// stamped before the derivation would otherwise be dropped as older
+/// than a day that never opened).
+#[derive(Clone, Copy)]
+struct DescendantSpend {
+    day: Option<NaiveDate>,
+    usd: f64,
+}
+
+impl SubtreeSpend {
+    fn new(alias: &str, daily_ceiling_usd: f64) -> Self {
+        Self {
+            alias: alias.to_string(),
+            daily_ceiling_usd,
+            descendant_spend: Mutex::new(DescendantSpend {
+                day: None,
+                usd: 0.0,
+            }),
+        }
+    }
+
+    /// Descendant spend counted toward `day`'s ceiling check: the stored
+    /// total when the stored day is `day`, zero for any other day. Read
+    /// only, so a reader on a stale day just sees zero and never disturbs
+    /// the stored slot.
+    fn descendants_usd_for(&self, day: NaiveDate) -> f64 {
+        let spend = *self.descendant_spend.lock();
+        if spend.day == Some(day) {
+            spend.usd
+        } else {
+            0.0
+        }
+    }
+
+    /// Add `cost_usd` of descendant spend to `day`'s total. The first
+    /// record opens the slot on its own day. After a day is open, a
+    /// record for a NEWER day (the UTC rollover) resets the stored slot
+    /// to `day` at zero first, so each UTC day starts from zero exactly
+    /// like the ledger's daily aggregates; a record for the SAME day
+    /// adds into that day's total; and a record for an OLDER day is
+    /// dropped: the slot was already opened by a newer record (a usage
+    /// stamped just before UTC midnight can be persisted just after
+    /// another record already opened the new day), and resetting the
+    /// slot back to the older day would lose the new day's accumulated
+    /// spend at the next add. The older day's ceiling checks are over,
+    /// and its ledger row still lands on its own day either way, so
+    /// nothing else needs the stale amount.
+    fn add_descendant_spend(&self, day: NaiveDate, cost_usd: f64) {
+        let mut spend = self.descendant_spend.lock();
+        if spend.day.is_none_or(|stored| stored < day) {
+            *spend = DescendantSpend {
+                day: Some(day),
+                usd: 0.0,
+            };
+        }
+        if spend.day == Some(day) {
+            spend.usd += cost_usd;
+        }
+    }
+}
+
+/// Budget scope a derived tracker enforces its substituted daily limit
+/// against. Private to the cost module: the shared ledger stays the source
+/// of truth either way; the scope only chooses which total the substituted
+/// daily limit compares against.
+enum BudgetScope {
+    /// Compare the substituted daily limit against the shared process-wide
+    /// daily total (previous derived-tracker behavior).
+    Shared,
+    /// Compare the shared process-wide daily total against the global daily
+    /// limit tightened by this per-hop ceiling
+    /// (`config.daily_limit_usd.min(daily_ceiling_usd)`, read live each
+    /// check). This is the `track_per_agent = false` degrade: per-alias
+    /// daily totals cannot exist, so the per-hop ceiling can only tighten
+    /// the shared check. No subtree chain rides on this scope: chains only
+    /// apply to per-agent scopes, and the shared cap stays shared.
+    SharedCapped { daily_ceiling_usd: f64 },
+    /// Compare the named agent's OWN daily spend against this ceiling, so a
+    /// per-profile cost ceiling means that agent's usage for the day. The
+    /// shared daily/monthly limits still apply to the shared totals on top.
+    /// `own` is this hop's subtree entry; `inherited` is the delegation
+    /// chain's ancestor entries (nearest first), so a delegated descendant's
+    /// spend also counts against every ancestor's ceiling. Chains only
+    /// exist on per-agent scopes; the shared-cap degrade stays shared.
+    Agent {
+        own: Arc<SubtreeSpend>,
+        inherited: Vec<Arc<SubtreeSpend>>,
+    },
+}
+
+/// Where a tracker reads the two mutable mode flags that decide whether
+/// it enforces and records at all (`enabled`) and whether its recorded
+/// rows carry an agent alias (`track_per_agent`). Split from the limits
+/// on purpose: the limits (`daily_limit_usd`, `monthly_limit_usd`,
+/// `warn_at_percent`) always come from the live config handle, while the
+/// mode is decided once for a derived tracker so a running delegation's
+/// checks and records cannot be desynchronized by a mid-run reload.
+#[derive(Clone, Copy)]
+enum EnforcementMode {
+    /// Read both flags from the live config on every use. The
+    /// process-global tracker is live: an operator reload applies to its
+    /// next check and its next record.
+    Live,
+    /// Both flags frozen for the derived tracker's whole lifetime:
+    /// captured from the live config when deriving from a live base (the
+    /// process-global tracker), and inherited verbatim from an
+    /// already-frozen base, so the mode is fixed at the ROOT delegation
+    /// of a tree and every nested hop of that tree derives with the same
+    /// pair. A delegation that started scoped keeps checking and
+    /// recording under the mode it started with, and one that started
+    /// dropping aliases keeps dropping them, for the delegation's whole
+    /// lifetime.
+    Frozen {
+        enabled: bool,
+        track_per_agent: bool,
+    },
+}
+
 pub struct CostTracker {
     /// Live cost policy. This is hot-swapped on config reload so budget checks
     /// see new global limits without rebuilding the tracker.
@@ -23,6 +173,19 @@ pub struct CostTracker {
     /// Per-daemon-lifetime aggregates keyed by `Option<agent_alias>`,
     /// replacing the unbounded per-turn `Vec<CostRecord>`.
     session_totals: Arc<Mutex<HashMap<Option<String>, AgentTotals>>>,
+    /// Which total the substituted daily limit compares against. The global
+    /// tracker always enforces `Shared`; only derived trackers can carry an
+    /// agent-scoped ceiling.
+    budget_scope: BudgetScope,
+    /// Where the enforcement mode comes from. The mode flags (`enabled`,
+    /// `track_per_agent`) decide whether this tracker enforces and records
+    /// at all and whether recorded rows carry an agent alias; the limits
+    /// (`daily_limit_usd`, `monthly_limit_usd`, `warn_at_percent`) always
+    /// come from the live config handle. The global tracker reads the mode
+    /// live as well; every derived tracker freezes it at derivation so a
+    /// delegation's checks and records keep agreeing for its whole
+    /// lifetime.
+    enforcement_mode: EnforcementMode,
 }
 
 /// Cheap process-local totals for one optional agent attribution bucket.
@@ -54,6 +217,8 @@ impl CostTracker {
             storage: Arc::new(Mutex::new(storage)),
             session_id: uuid::Uuid::new_v4().to_string(),
             session_totals: Arc::new(Mutex::new(HashMap::new())),
+            budget_scope: BudgetScope::Shared,
+            enforcement_mode: EnforcementMode::Live,
         })
     }
 
@@ -65,13 +230,178 @@ impl CostTracker {
         self.config_snapshot()
     }
 
+    /// Whether this tracker enforces and records spend. The
+    /// process-global tracker reads the live config, so a reload applies
+    /// at its next check; a derived tracker reports the mode frozen at
+    /// derivation time, matching what its checks and records actually
+    /// honor for the delegation's whole lifetime.
     pub fn is_enabled(&self) -> bool {
-        self.config.read().enabled
+        self.mode().0
+    }
+
+    /// The effective `(enabled, track_per_agent)` pair for this tracker,
+    /// as the runtime reads it when deciding how a delegated sub-loop is
+    /// scoped: the process-global tracker reports the live pair, and a
+    /// derived tracker the pair frozen at derivation (for a nested hop,
+    /// inherited from its delegating parent). Exposed as a plain pair
+    /// rather than the mode itself so the public surface stays two
+    /// booleans.
+    pub fn enforcement_flags(&self) -> (bool, bool) {
+        self.mode()
     }
 
     /// Hot-swap config so reloaded budget limits apply without a restart.
     pub fn update_config(&self, config: CostConfig) {
         *self.config.write() = config;
+    }
+
+    /// Derive an ephemeral tracker whose budget checks read only the
+    /// shared process-wide daily and monthly totals against the global
+    /// limits (read live each check), with no per-agent ceiling and no
+    /// subtree chain: the frozen-mode equivalent of the global tracker.
+    /// An independent nested delegation with no per-hop ceiling (`0` =
+    /// inherit the global limit) uses this so the target runs under the
+    /// shared global limits instead of its delegating parent's
+    /// agent-scoped tracker, while the enforcement mode stays frozen
+    /// from the base exactly as for every other derived tracker.
+    pub fn derived_shared(&self) -> Self {
+        self.derived_with_scope(BudgetScope::Shared)
+    }
+
+    /// Derive an ephemeral tracker whose shared daily check uses the base
+    /// tracker's global daily limit tightened by `daily_ceiling_usd`
+    /// (`config.daily_limit_usd.min(daily_ceiling_usd)`, read live each
+    /// check). Delegated sub-loops use this when
+    /// `[cost].track_per_agent` is false: per-alias daily totals cannot
+    /// exist, so the per-hop ceiling can only tighten the shared check, and
+    /// their recorded spend lands on the same durable ledger as every other
+    /// path. The captured `track_per_agent = false` is frozen for the
+    /// derived tracker's lifetime, so a mid-run reload enabling per-agent
+    /// attribution does not start attributing this delegation's rows
+    /// halfway through a run. The derived tracker is never registered as
+    /// the process-global one; it lives only as long as the delegation
+    /// that created it.
+    pub fn derived_shared_capped(&self, daily_ceiling_usd: f64) -> Self {
+        self.derived_with_scope(BudgetScope::SharedCapped { daily_ceiling_usd })
+    }
+
+    /// Derive an ephemeral tracker whose `daily_ceiling_usd` is compared
+    /// against `agent_alias`'s OWN daily spend on the shared ledger, so a
+    /// per-profile cost ceiling means that agent's usage for the day. The
+    /// tracker's own shared daily and monthly limits still apply to the
+    /// shared totals on top, so the derived tracker can only ever be
+    /// stricter than the base tracker, never looser. The scope kind and
+    /// the enforcement mode (`enabled`, `track_per_agent`, captured at
+    /// derivation) are fixed for the derived tracker's lifetime; the
+    /// limits themselves are read live from the base tracker's shared
+    /// config handle, so config reloads apply at the next `check_budget`.
+    pub fn derived_for_agent(&self, agent_alias: &str, daily_ceiling_usd: f64) -> Self {
+        self.derived_for_agent_in_chain(agent_alias, daily_ceiling_usd, Vec::new())
+    }
+
+    /// `derived_for_agent` with an inherited delegation chain: `inherited`
+    /// carries the ancestor subtree entries (nearest first) collected with
+    /// [`Self::subtree_chain_for_children`] on the delegating parent's
+    /// tracker. Budget checks through the derived tracker then also count
+    /// this agent's spend against every ancestor's per-hop ceiling, and
+    /// usage recorded through it accumulates into each ancestor entry's
+    /// descendant total. Chains only apply to per-agent scopes.
+    /// The scope kind and the enforcement mode (`enabled`,
+    /// `track_per_agent`, captured at derivation) are fixed for the
+    /// derived tracker's lifetime; the limits themselves are read live
+    /// from the base tracker's shared config handle, so config reloads
+    /// apply at the next `check_budget`.
+    pub fn derived_for_agent_in_chain(
+        &self,
+        agent_alias: &str,
+        daily_ceiling_usd: f64,
+        inherited: Vec<Arc<SubtreeSpend>>,
+    ) -> Self {
+        self.derived_with_scope(BudgetScope::Agent {
+            own: Arc::new(SubtreeSpend::new(agent_alias, daily_ceiling_usd)),
+            inherited,
+        })
+    }
+
+    /// The subtree entries a delegation FROM this tracker's agent passes to
+    /// the child's budget scope: this agent's own entry first, then the
+    /// inherited ancestor chain (nearest first). Empty when this tracker is
+    /// not agent-scoped, so unscoped and shared-cap delegations carry no
+    /// chain. Delegation plumbing calls this on the tracker of the loop a
+    /// delegated sub-agent runs under when building that sub-agent's own
+    /// delegate tool.
+    pub fn subtree_chain_for_children(&self) -> Vec<Arc<SubtreeSpend>> {
+        match &self.budget_scope {
+            BudgetScope::Agent { own, inherited } => {
+                let mut chain = Vec::with_capacity(inherited.len() + 1);
+                chain.push(Arc::clone(own));
+                chain.extend(inherited.iter().cloned());
+                chain
+            }
+            BudgetScope::Shared | BudgetScope::SharedCapped { .. } => Vec::new(),
+        }
+    }
+
+    fn derived_with_scope(&self, budget_scope: BudgetScope) -> Self {
+        // Two sources of truth, split on purpose. The config handle is
+        // shared, not snapshotted: a derived tracker sees every config
+        // reload the base tracker sees (`update_config` writes the one
+        // live `CostConfig`), so an operator lowering `daily_limit_usd`
+        // mid-delegation binds the delegate's next `check_budget`. The
+        // enforcement MODE is frozen instead, and where the frozen pair
+        // comes from depends on the base: deriving from a LIVE base (the
+        // process-global tracker, the root of a delegation tree)
+        // captures `enabled` and `track_per_agent` from the config here,
+        // because whether a delegation enforces at all and how its rows
+        // are attributed are decisions taken at delegation start, same
+        // as the scope kind fixed by `budget_scope`; deriving from a
+        // FROZEN base (any nested hop inside a running delegation)
+        // inherits the base's captured pair verbatim, so the mode is
+        // fixed at the root of the tree and a mid-run reload of either
+        // flag can neither untrack a scoped run, whose spend would then
+        // escape every ceiling if tracking were re-enabled, nor start
+        // reattributing an unattributed one halfway through a run.
+        let enforcement_mode = match self.enforcement_mode {
+            EnforcementMode::Live => {
+                let (enabled, track_per_agent) = {
+                    let config = self.config.read();
+                    (config.enabled, config.track_per_agent)
+                };
+                EnforcementMode::Frozen {
+                    enabled,
+                    track_per_agent,
+                }
+            }
+            frozen @ EnforcementMode::Frozen { .. } => frozen,
+        };
+        Self {
+            config: Arc::clone(&self.config),
+            storage: Arc::clone(&self.storage),
+            session_id: self.session_id.clone(),
+            session_totals: Arc::clone(&self.session_totals),
+            budget_scope,
+            enforcement_mode,
+        }
+    }
+
+    /// The `(enabled, track_per_agent)` pair every enforcement and
+    /// attribution decision on this tracker reads: the early return in
+    /// `check_budget`, the record path's enabled gate, the alias
+    /// stamping, and the ancestor-accumulator gate. A live tracker reads
+    /// the pair from the config; a frozen one returns the pair captured
+    /// at derivation, so a derived tracker keeps honoring the mode its
+    /// delegation started under across later reloads.
+    fn mode(&self) -> (bool, bool) {
+        match &self.enforcement_mode {
+            EnforcementMode::Live => {
+                let config = self.config.read();
+                (config.enabled, config.track_per_agent)
+            }
+            EnforcementMode::Frozen {
+                enabled,
+                track_per_agent,
+            } => (*enabled, *track_per_agent),
+        }
     }
 
     /// Get the session ID.
@@ -93,8 +423,20 @@ impl CostTracker {
 
     /// Check if a request is within budget.
     pub fn check_budget(&self, estimated_cost_usd: f64) -> Result<BudgetCheck> {
+        self.check_budget_at_period(estimated_cost_usd, ReportingPeriod::current())
+    }
+
+    /// [`Self::check_budget`] against an injected reporting period, so
+    /// tests can drive which UTC day the per-day accounting reads without
+    /// waiting for a real midnight rollover.
+    fn check_budget_at_period(
+        &self,
+        estimated_cost_usd: f64,
+        period: ReportingPeriod,
+    ) -> Result<BudgetCheck> {
         let config = self.config_snapshot();
-        if !config.enabled {
+        let (enabled, _) = self.mode();
+        if !enabled {
             return Ok(BudgetCheck::Allowed);
         }
 
@@ -110,16 +452,54 @@ impl CostTracker {
         }
 
         let mut storage = self.lock_storage();
-        let (daily_cost, monthly_cost) = storage.get_aggregated_costs()?;
+        let (daily_cost, monthly_cost) = storage.get_aggregated_costs_at_period(period)?;
+        let day = storage.reporting_period().day;
 
-        // Check daily limit
+        // Check daily limit (shared). A shared-capped scope tightens the
+        // global daily limit by its per-hop ceiling; the global limit is
+        // read live from the shared config handle each call, so an operator
+        // reload applies to running delegates at their next check.
+        let shared_daily_limit = match &self.budget_scope {
+            BudgetScope::SharedCapped { daily_ceiling_usd } => {
+                config.daily_limit_usd.min(*daily_ceiling_usd)
+            }
+            BudgetScope::Shared | BudgetScope::Agent { .. } => config.daily_limit_usd,
+        };
         let projected_daily = daily_cost + estimated_cost_usd;
-        if projected_daily > config.daily_limit_usd {
+        if projected_daily > shared_daily_limit {
             return Ok(BudgetCheck::Exceeded {
                 current_usd: daily_cost,
-                limit_usd: config.daily_limit_usd,
+                limit_usd: shared_daily_limit,
                 period: UsagePeriod::Day,
+                agent_alias: None,
             });
+        }
+
+        // Per-agent daily ceiling: when this tracker was derived for a
+        // specific agent, its ceiling means THAT agent's own spend for the
+        // day, not the shared total, and the ceilings of every delegation
+        // ancestor bind on top: a delegated descendant's spend counts
+        // against each ancestor's ceiling through the chain's shared
+        // subtree entries. The descendant total is read for the check's
+        // accounting day, so it rolls over with the ledger's daily totals
+        // at UTC midnight. Runs after the shared daily check, so the
+        // derived tracker can only be stricter than the base tracker,
+        // never looser. Own entry first, then ancestors nearest first, so
+        // the nearest violated ceiling wins and names its agent.
+        if let BudgetScope::Agent { own, inherited } = &self.budget_scope {
+            for entry in std::iter::once(own).chain(inherited.iter()) {
+                let agent_daily = storage.get_daily_cost_for_agent(&entry.alias);
+                let descendants_usd = entry.descendants_usd_for(day);
+                let projected = agent_daily + descendants_usd + estimated_cost_usd;
+                if projected > entry.daily_ceiling_usd {
+                    return Ok(BudgetCheck::Exceeded {
+                        current_usd: agent_daily + descendants_usd,
+                        limit_usd: entry.daily_ceiling_usd,
+                        period: UsagePeriod::Day,
+                        agent_alias: Some(entry.alias.clone()),
+                    });
+                }
+            }
         }
 
         // Check monthly limit
@@ -129,6 +509,7 @@ impl CostTracker {
                 current_usd: monthly_cost,
                 limit_usd: config.monthly_limit_usd,
                 period: UsagePeriod::Month,
+                agent_alias: None,
             });
         }
 
@@ -257,10 +638,7 @@ impl CostTracker {
         honor_enabled: bool,
         sync_file: fn(&File) -> std::io::Result<()>,
     ) -> Result<()> {
-        let (enabled, track_per_agent) = {
-            let config = self.config.read();
-            (config.enabled, config.track_per_agent)
-        };
+        let (enabled, track_per_agent) = self.mode();
         if honor_enabled && !enabled {
             return Ok(());
         }
@@ -286,6 +664,11 @@ impl CostTracker {
         let record =
             CostRecord::with_attribution(&self.session_id, effective_alias.clone(), task_id, usage)
                 .with_conversation_id(conversation_id);
+        // The UTC day this record belongs to. The ledger's rebuild folds
+        // the row into this day's aggregates and no other day's, so the
+        // descendant accumulator keys on the same day and the two agree
+        // on which day a record's spend counts under.
+        let record_day = record.usage.timestamp.naive_utc().date();
 
         let mut storage = self.lock_storage();
         let append_outcome = storage.add_record_with_sync(record, sync_file)?;
@@ -299,6 +682,23 @@ impl CostTracker {
         }
 
         drop(storage);
+
+        // Delegation-chain accounting: usage recorded through an
+        // agent-scoped tracker with an inherited chain lands on the ledger
+        // under this tracker's own alias, so the ancestors' per-alias daily
+        // totals never see it. Add it to each ancestor entry's
+        // process-local descendant accumulator under the record's own UTC
+        // day, so the ancestor's next `check_budget` counts it against the
+        // ancestor's ceiling for that day and the accumulator rolls over
+        // with the ledger's daily totals. Gated on the same
+        // `track_per_agent` flag as the attribution above: chains only
+        // exist on per-agent scopes.
+        if track_per_agent && let BudgetScope::Agent { inherited, .. } = &self.budget_scope {
+            for entry in inherited {
+                entry.add_descendant_spend(record_day, cost_usd);
+            }
+        }
+
         append_outcome.into_result()
     }
 
@@ -759,6 +1159,11 @@ struct CostStorage {
     daily_cost_usd: f64,
     /// Cached total for the current UTC month.
     monthly_cost_usd: f64,
+    /// Cached per-alias spend for the current UTC day. Records with an
+    /// unassigned alias count toward `daily_cost_usd` only. Maintained by
+    /// the append path and rebuilt in the same pass as `daily_cost_usd`,
+    /// so per-agent budget checks never rescan the ledger.
+    daily_cost_by_agent: HashMap<String, f64>,
     /// Day represented by `daily_cost_usd`.
     cached_day: NaiveDate,
     /// Year represented by `monthly_cost_usd`.
@@ -826,6 +1231,7 @@ impl CostStorage {
             path: path.to_path_buf(),
             daily_cost_usd: 0.0,
             monthly_cost_usd: 0.0,
+            daily_cost_by_agent: HashMap::new(),
             cached_day: now.date_naive(),
             cached_year: now.year(),
             cached_month: now.month(),
@@ -906,12 +1312,17 @@ impl CostStorage {
     fn rebuild_aggregates(&mut self, day: NaiveDate, year: i32, month: u32) -> Result<()> {
         let mut daily_cost = 0.0;
         let mut monthly_cost = 0.0;
+        let mut daily_by_agent: HashMap<String, f64> = HashMap::new();
 
         self.for_each_record(|record| {
             let timestamp = record.usage.timestamp.naive_utc();
 
             if timestamp.date() == day {
                 daily_cost += record.usage.cost_usd;
+                if let Some(agent_alias) = &record.agent_alias {
+                    *daily_by_agent.entry(agent_alias.clone()).or_insert(0.0) +=
+                        record.usage.cost_usd;
+                }
             }
 
             if timestamp.year() == year && timestamp.month() == month {
@@ -921,6 +1332,7 @@ impl CostStorage {
 
         self.daily_cost_usd = daily_cost;
         self.monthly_cost_usd = monthly_cost;
+        self.daily_cost_by_agent = daily_by_agent;
         self.cached_day = day;
         self.cached_year = year;
         self.cached_month = month;
@@ -975,6 +1387,17 @@ impl CostStorage {
         let timestamp = record.usage.timestamp.naive_utc();
         if timestamp.date() == self.cached_day {
             self.daily_cost_usd += record.usage.cost_usd;
+            if let Some(agent_alias) = &record.agent_alias {
+                *self
+                    .daily_cost_by_agent
+                    .entry(agent_alias.clone())
+                    .or_insert(0.0) += record.usage.cost_usd;
+            }
+        } else {
+            // A record for a prior day landed outside its day's cache: the
+            // per-alias day buckets would go stale, so drop the whole cache
+            // and let the next check rebuild it.
+            self.aggregates_current = false;
         }
         if timestamp.year() == self.cached_year && timestamp.month() == self.cached_month {
             self.monthly_cost_usd += record.usage.cost_usd;
@@ -995,8 +1418,24 @@ impl CostStorage {
 
     /// Get aggregated costs for current day and month.
     fn get_aggregated_costs(&mut self) -> Result<(f64, f64)> {
-        self.ensure_period_cache_current()?;
+        self.get_aggregated_costs_at_period(ReportingPeriod::current())
+    }
+
+    /// Get aggregated costs for the given reporting period's day and
+    /// month, rebuilding the caches first when the period moved.
+    fn get_aggregated_costs_at_period(&mut self, period: ReportingPeriod) -> Result<(f64, f64)> {
+        self.ensure_period_cache_current_at(period)?;
         Ok((self.daily_cost_usd, self.monthly_cost_usd))
+    }
+
+    /// Per-alias spend for the cached current day. Reads only the in-memory
+    /// bucket maintained by the append path / rebuild, so per-agent budget
+    /// checks never rescan the ledger.
+    fn get_daily_cost_for_agent(&self, agent_alias: &str) -> f64 {
+        self.daily_cost_by_agent
+            .get(agent_alias)
+            .copied()
+            .unwrap_or(0.0)
     }
 
     fn reporting_period(&self) -> ReportingPeriod {
@@ -1163,6 +1602,17 @@ mod tests {
             None,
             usage,
         )
+    }
+
+    /// A `TokenUsage` priced at exactly `cost_usd` and stamped with the
+    /// given timestamp, for routing a timestamped record through a
+    /// tracker's record path (the record path takes `TokenUsage`, so the
+    /// `record_at` fixture's `CostRecord` cannot ride it directly).
+    fn usage_costing_at(cost_usd: f64, timestamp: DateTime<Utc>) -> TokenUsage {
+        let tokens = (cost_usd * 1_000_000.0).round() as u64;
+        let mut usage = TokenUsage::new("test/model", tokens, 0, 0, 1.0, 1.0, 0.0);
+        usage.timestamp = timestamp;
+        usage
     }
 
     fn write_records(path: &Path, records: &[CostRecord]) {
@@ -2082,6 +2532,946 @@ mod tests {
         assert!(
             matches!(after.check_budget(0.0).unwrap(), BudgetCheck::Allowed),
             "a disabled resident tracker must short-circuit enforcement"
+        );
+    }
+
+    #[test]
+    fn shared_capped_derived_tracker_enforces_cap_over_shared_ledger() {
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                daily_limit_usd: 100.0,
+                monthly_limit_usd: 500.0,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+
+        // The derived tracker shares the base's live config (the global
+        // limits stay the base's) and tightens only the shared daily check
+        // to the $0.50 per-hop cap.
+        let derived = base.derived_shared_capped(0.5);
+        assert_eq!(derived.session_id(), base.session_id());
+        assert!(
+            matches!(derived.check_budget(0.0).unwrap(), BudgetCheck::Allowed),
+            "an empty ledger must pass the capped shared check"
+        );
+
+        // Spend recorded through the base tracker is immediately visible to
+        // the derived tracker's budget check (shared storage, no stale fork).
+        base.record_usage(TokenUsage::new(
+            "test/model",
+            2_000_000,
+            0,
+            0,
+            3.0,
+            3.0,
+            0.0,
+        ))
+        .unwrap();
+        assert!(
+            matches!(
+                derived.check_budget(0.0).unwrap(),
+                BudgetCheck::Exceeded {
+                    limit_usd,
+                    agent_alias: None,
+                    ..
+                } if (limit_usd - 0.5).abs() < 1e-9
+            ),
+            "the derived tracker must see shared-ledger spend against its cap"
+        );
+        assert!(
+            matches!(base.check_budget(0.0).unwrap(), BudgetCheck::Allowed),
+            "the base tracker must still enforce its own (looser) limit"
+        );
+
+        // Spend recorded through the derived tracker lands on the same
+        // durable ledger the base tracker reads.
+        derived
+            .record_usage(TokenUsage::new("test/model", 1000, 500, 0, 1.0, 2.0, 0.0))
+            .unwrap();
+        let day = Utc::now().date_naive();
+        let daily = base.get_daily_cost(day).unwrap();
+        assert!(
+            daily > 0.0,
+            "usage recorded through the derived tracker must reach the shared ledger"
+        );
+        assert!(
+            (derived.get_daily_cost(day).unwrap() - daily).abs() < f64::EPSILON,
+            "both trackers must read the same ledger file"
+        );
+    }
+
+    #[test]
+    fn derived_tracker_sees_base_config_reload() {
+        // Base daily $10, derived for an agent with a $5 ceiling; $1 is
+        // recorded through the derived tracker, then the base's global
+        // daily limit is reloaded to $0.50. The derived tracker shares the
+        // base's live config handle, so its next check must refuse on the
+        // SHARED Day limit (agent_alias None), not the agent ceiling.
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                daily_limit_usd: 10.0,
+                monthly_limit_usd: 500.0,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        let derived = base.derived_for_agent("opus", 5.0);
+        derived
+            .record_usage_with_agent(
+                TokenUsage::new("test/model", 1_000_000, 0, 0, 1.0, 1.0, 0.0),
+                Some("opus"),
+            )
+            .unwrap();
+        assert!(
+            matches!(derived.check_budget(0.1).unwrap(), BudgetCheck::Allowed),
+            "under the original $10 shared limit the $1 spend must pass"
+        );
+
+        let mut reloaded = base.config();
+        reloaded.daily_limit_usd = 0.5;
+        base.update_config(reloaded);
+        match derived.check_budget(0.1).unwrap() {
+            BudgetCheck::Exceeded {
+                current_usd,
+                limit_usd,
+                period,
+                agent_alias,
+            } => {
+                assert!((current_usd - 1.0).abs() < 1e-9);
+                assert!((limit_usd - 0.5).abs() < 1e-9);
+                assert_eq!(period, UsagePeriod::Day);
+                assert_eq!(
+                    agent_alias, None,
+                    "the reload must refuse through the shared limit, not the agent ceiling"
+                );
+            }
+            other => panic!("expected shared-limit Exceeded after reload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shared_capped_derived_tracker_reads_live_global_limit() {
+        // A $2 per-hop cap over a base global daily limit of $10: the
+        // effective shared limit is the cap. Reload the base's global limit
+        // down to $1 and the effective limit becomes the LIVE global $1,
+        // not the cap: the capped scope reads the global limit from the
+        // shared config handle on every check.
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: false,
+                daily_limit_usd: 10.0,
+                monthly_limit_usd: 500.0,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        base.record_usage(TokenUsage::new("test/model", 800_000, 0, 0, 1.0, 1.0, 0.0))
+            .unwrap();
+        let derived = base.derived_shared_capped(2.0);
+        assert!(
+            matches!(derived.check_budget(0.5).unwrap(), BudgetCheck::Allowed),
+            "ledger $0.80 against the effective min(10, 2) = $2 cap must pass"
+        );
+
+        let mut reloaded = base.config();
+        reloaded.daily_limit_usd = 1.0;
+        base.update_config(reloaded);
+        match derived.check_budget(0.5).unwrap() {
+            BudgetCheck::Exceeded {
+                current_usd,
+                limit_usd,
+                agent_alias,
+                ..
+            } => {
+                assert!((current_usd - 0.8).abs() < 1e-9);
+                assert!(
+                    (limit_usd - 1.0).abs() < 1e-9,
+                    "the effective limit must be the live global $1, not the $2 cap"
+                );
+                assert_eq!(agent_alias, None);
+            }
+            other => panic!("expected Exceeded on the reloaded global limit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derived_tracker_keeps_enforcing_after_global_disable() {
+        // A delegation that started scoped stays scoped: the derived
+        // tracker froze `enabled` at derivation, so an operator disabling
+        // cost tracking mid-run stops the GLOBAL tracker's checks but
+        // not the running delegate's, and the delegate's records keep
+        // landing on the ledger instead of vanishing from every ceiling.
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                daily_limit_usd: 100.0,
+                monthly_limit_usd: 500.0,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        let derived = base.derived_for_agent("target", 5.0);
+        derived
+            .record_usage_with_agent(
+                TokenUsage::new("test/model", 6_000_000, 0, 0, 1.0, 1.0, 0.0),
+                Some("target"),
+            )
+            .unwrap();
+
+        let mut disabled = base.config();
+        disabled.enabled = false;
+        base.update_config(disabled);
+
+        match derived.check_budget(0.0).unwrap() {
+            BudgetCheck::Exceeded {
+                current_usd,
+                limit_usd,
+                agent_alias,
+                ..
+            } => {
+                assert!((current_usd - 6.0).abs() < 1e-9);
+                assert!((limit_usd - 5.0).abs() < 1e-9);
+                assert_eq!(
+                    agent_alias.as_deref(),
+                    Some("target"),
+                    "the frozen mode must keep the agent ceiling enforcing"
+                );
+            }
+            other => panic!("expected agent-scoped Exceeded after disable, got {other:?}"),
+        }
+        assert!(
+            matches!(base.check_budget(0.0).unwrap(), BudgetCheck::Allowed),
+            "the global tracker honors the live disabled flag"
+        );
+
+        // Recording through the derived tracker is gated on the frozen
+        // mode too, so the delegation's later spend still lands under
+        // its alias instead of disappearing.
+        derived
+            .record_usage_with_agent(
+                TokenUsage::new("test/model", 1_000_000, 0, 0, 1.0, 1.0, 0.0),
+                Some("target"),
+            )
+            .unwrap();
+        let daily = base.get_summary_for_agent("target").unwrap().daily_cost_usd;
+        assert!(
+            (daily - 7.0).abs() < 1e-9,
+            "post-disable records must keep landing under the alias: {daily}"
+        );
+    }
+
+    #[test]
+    fn derived_from_frozen_base_inherits_frozen_mode() {
+        // The mode a nested delegation runs under is fixed at the ROOT of
+        // its tree: deriving from an already-frozen tracker propagates the
+        // frozen pair instead of re-reading the live config, so an
+        // operator reload between a parent's provider calls cannot flip
+        // the mode the parent's descendants derive with. A derivation
+        // from the still-live base keeps capturing the live pair, so
+        // root behaviour is unchanged.
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                daily_limit_usd: 100.0,
+                monthly_limit_usd: 500.0,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        let derived_a = base.derived_for_agent("parent", 5.0);
+        assert_eq!(derived_a.enforcement_flags(), (true, true));
+
+        let mut reloaded = base.config();
+        reloaded.enabled = false;
+        reloaded.track_per_agent = false;
+        base.update_config(reloaded);
+
+        // The nested hop derives from the frozen parent, not from the
+        // live config the parent's base still shares.
+        let derived_b = derived_a.derived_for_agent("child", 8.0);
+        assert_eq!(
+            derived_b.enforcement_flags(),
+            (true, true),
+            "a frozen base must propagate its own pair to further derivations"
+        );
+        // A derivation straight from the live base still captures the
+        // reloaded pair.
+        let derived_c = base.derived_for_agent("other", 8.0);
+        assert_eq!(
+            derived_c.enforcement_flags(),
+            (false, false),
+            "a live base keeps capturing the live pair"
+        );
+    }
+
+    #[test]
+    fn derived_agent_scope_keeps_attribution_after_track_per_agent_disabled() {
+        // Flipping `track_per_agent` off mid-run must not reattribute a
+        // per-agent-scoped delegation: the child's rows keep their own
+        // alias and keep counting into the ancestor's descendant total,
+        // so the ancestor's ceiling still refuses once the subtree is
+        // over it.
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                daily_limit_usd: 100.0,
+                monthly_limit_usd: 500.0,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        base.record_usage_with_agent(
+            TokenUsage::new("test/model", 6_000_000, 0, 0, 1.0, 1.0, 0.0),
+            Some("parent"),
+        )
+        .unwrap();
+        let parent_scope = base.derived_for_agent("parent", 5.0);
+        let child = base.derived_for_agent_in_chain(
+            "child",
+            8.0,
+            parent_scope.subtree_chain_for_children(),
+        );
+
+        let mut reloaded = base.config();
+        reloaded.track_per_agent = false;
+        base.update_config(reloaded);
+
+        child
+            .record_usage_with_agent(
+                TokenUsage::new("test/model", 1_000_000, 0, 0, 1.0, 1.0, 0.0),
+                Some("child"),
+            )
+            .unwrap();
+        let child_daily = base.get_summary_for_agent("child").unwrap().daily_cost_usd;
+        assert!(
+            (child_daily - 1.0).abs() < 1e-9,
+            "the frozen mode must keep attributing the child's rows: {child_daily}"
+        );
+        let parent_daily = base.get_summary_for_agent("parent").unwrap().daily_cost_usd;
+        assert!(
+            (parent_daily - 6.0).abs() < 1e-9,
+            "the child's row must stay attributed to the child, not the parent: {parent_daily}"
+        );
+
+        // The ancestor entry counted the post-flip record: the parent's
+        // own $6 plus the descendant's $1 exceeds the $5 ceiling, and
+        // both the parent's scoped tracker and the child's (through the
+        // inherited chain) refuse naming the ancestor.
+        match parent_scope.check_budget(0.0).unwrap() {
+            BudgetCheck::Exceeded {
+                current_usd,
+                agent_alias,
+                ..
+            } => {
+                assert!(
+                    (current_usd - 7.0).abs() < 1e-9,
+                    "the ancestor's check must count the descendant's post-flip $1: {current_usd}"
+                );
+                assert_eq!(agent_alias.as_deref(), Some("parent"));
+            }
+            other => panic!("expected ancestor-scoped Exceeded after flip, got {other:?}"),
+        }
+        match child.check_budget(0.0).unwrap() {
+            BudgetCheck::Exceeded {
+                current_usd,
+                agent_alias,
+                ..
+            } => {
+                assert!(
+                    (current_usd - 7.0).abs() < 1e-9,
+                    "the child's check must see the ancestor subtree total: {current_usd}"
+                );
+                assert_eq!(agent_alias.as_deref(), Some("parent"));
+            }
+            other => panic!("expected ancestor-scoped Exceeded through the child, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shared_capped_scope_stays_unattributed_after_track_per_agent_enabled() {
+        // The SharedCapped degrade froze `track_per_agent = false` at
+        // derivation: enabling per-agent attribution mid-run must not
+        // start attributing this delegation's rows halfway through, so
+        // the spend stays in the unattributed bucket of the shared
+        // ledger.
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: false,
+                daily_limit_usd: 100.0,
+                monthly_limit_usd: 500.0,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        let derived = base.derived_shared_capped(2.0);
+
+        let mut reloaded = base.config();
+        reloaded.track_per_agent = true;
+        base.update_config(reloaded);
+
+        derived
+            .record_usage_with_agent(
+                TokenUsage::new("test/model", 1_000_000, 0, 0, 1.0, 1.0, 0.0),
+                Some("x"),
+            )
+            .unwrap();
+        let attributed = base.get_summary_for_agent("x").unwrap().daily_cost_usd;
+        assert!(
+            attributed.abs() < 1e-9,
+            "the frozen SharedCapped mode must keep dropping the alias: {attributed}"
+        );
+        let day = Utc::now().date_naive();
+        let daily = base.get_daily_cost(day).unwrap();
+        assert!(
+            (daily - 1.0).abs() < 1e-9,
+            "the row must still land on the shared ledger, unattributed: {daily}"
+        );
+    }
+
+    /// Fold the day's per-alias spend straight from the ledger file - the
+    /// oracle `daily_cost_by_agent` must match after appends, forced cache
+    /// rebuilds, and day rollovers.
+    fn ledger_daily_by_agent(path: &Path) -> HashMap<String, f64> {
+        let mut out: HashMap<String, f64> = HashMap::new();
+        if !path.exists() {
+            return out;
+        }
+        let file = File::open(path).unwrap();
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let record: CostRecord = serde_json::from_str(trimmed).unwrap();
+            if record.usage.timestamp.naive_utc().date() == Utc::now().date_naive()
+                && let Some(alias) = &record.agent_alias
+            {
+                *out.entry(alias.clone()).or_insert(0.0) += record.usage.cost_usd;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn daily_cost_by_agent_cache_tracks_appends_rebuilds_and_rollover() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+
+        // (a) appends keep the per-alias day buckets in step with the ledger.
+        tracker
+            .record_usage_with_agent(
+                TokenUsage::new("test/model", 1_000_000, 0, 0, 3.0, 3.0, 0.0),
+                Some("opus"),
+            )
+            .unwrap();
+        tracker
+            .record_usage_with_agent(
+                TokenUsage::new("test/model", 500_000, 0, 0, 3.0, 3.0, 0.0),
+                Some("sonnet"),
+            )
+            .unwrap();
+        // Unattributed spend counts toward the shared total only.
+        tracker
+            .record_usage(TokenUsage::new("test/model", 250_000, 0, 0, 3.0, 3.0, 0.0))
+            .unwrap();
+
+        let mut storage = tracker.lock_storage();
+        storage.ensure_period_cache_current().unwrap();
+        assert_eq!(
+            storage.daily_cost_by_agent,
+            ledger_daily_by_agent(&storage.path),
+            "per-alias day buckets must match a from-scratch ledger fold after appends"
+        );
+        drop(storage);
+
+        // (b) a forced cache rebuild produces the same map.
+        tracker
+            .lock_storage()
+            .rebuild_aggregates(
+                Utc::now().date_naive(),
+                Utc::now().year(),
+                Utc::now().month(),
+            )
+            .unwrap();
+        let storage = tracker.lock_storage();
+        assert_eq!(
+            storage.daily_cost_by_agent,
+            ledger_daily_by_agent(&storage.path),
+            "per-alias day buckets must match a from-scratch ledger fold after a rebuild"
+        );
+        assert!(
+            storage.daily_cost_by_agent.contains_key("sonnet"),
+            "both attributed aliases must appear after the rebuild"
+        );
+        drop(storage);
+
+        // (c) a simulated day rollover clears the per-alias buckets with the
+        // rest of the day cache.
+        tracker
+            .lock_storage()
+            .rebuild_aggregates(
+                Utc::now().date_naive() + Duration::days(1),
+                Utc::now().year(),
+                Utc::now().month(),
+            )
+            .unwrap();
+        let storage = tracker.lock_storage();
+        assert!(
+            storage.daily_cost_by_agent.is_empty(),
+            "day rollover must clear the per-alias day buckets"
+        );
+        assert!(
+            storage.daily_cost_usd == 0.0,
+            "day rollover clears the day total"
+        );
+    }
+
+    #[test]
+    fn agent_scoped_derived_tracker_enforces_alias_own_spend() {
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                daily_limit_usd: 100.0,
+                monthly_limit_usd: 500.0,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+
+        // opus spent $6 today; the shared daily total is the same $6.
+        base.record_usage_with_agent(
+            TokenUsage::new("test/model", 6_000_000, 0, 0, 1.0, 1.0, 0.0),
+            Some("opus"),
+        )
+        .unwrap();
+
+        // opus's own $6 already trips a $5 ceiling...
+        let opus_derived = base.derived_for_agent("opus", 5.0);
+        let check = opus_derived.check_budget(0.0).unwrap();
+        match check {
+            BudgetCheck::Exceeded {
+                current_usd,
+                limit_usd,
+                period,
+                agent_alias,
+            } => {
+                assert!((current_usd - 6.0).abs() < 1e-9);
+                assert!((limit_usd - 5.0).abs() < 1e-9);
+                assert_eq!(period, UsagePeriod::Day);
+                assert_eq!(agent_alias.as_deref(), Some("opus"));
+            }
+            other => panic!("expected agent-scoped Exceeded, got {other:?}"),
+        }
+
+        // ...but sonnet's own $0 does not, even though the shared total is $6.
+        let sonnet_derived = base.derived_for_agent("sonnet", 5.0);
+        assert!(
+            matches!(
+                sonnet_derived.check_budget(0.0).unwrap(),
+                BudgetCheck::Allowed
+            ),
+            "the per-agent ceiling must compare the agent's OWN daily spend, \
+             not the shared process-wide total"
+        );
+    }
+
+    #[test]
+    fn derived_for_agent_in_chain_checks_ancestor_ceiling() {
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                daily_limit_usd: 100.0,
+                monthly_limit_usd: 500.0,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+
+        // The ancestor spent $6 of its own today under its own alias.
+        base.record_usage_with_agent(
+            TokenUsage::new("test/model", 6_000_000, 0, 0, 1.0, 1.0, 0.0),
+            Some("parent"),
+        )
+        .unwrap();
+
+        // The parent's own scoped tracker, then the child's tracker derived
+        // with the parent's chain-for-children (own entry plus ancestors,
+        // exactly as delegation plumbing threads it).
+        let parent_scope = base.derived_for_agent("parent", 5.0);
+        let chain = parent_scope.subtree_chain_for_children();
+        let child = base.derived_for_agent_in_chain("child", 8.0, chain);
+
+        // The child's own $0 passes its own $8 ceiling, but the ancestor's
+        // own $6 already exceeds its $5 ceiling, so the child is refused
+        // with the ANCESTOR named and the ancestor's limit.
+        match child.check_budget(0.0).unwrap() {
+            BudgetCheck::Exceeded {
+                current_usd,
+                limit_usd,
+                period,
+                agent_alias,
+            } => {
+                assert!((current_usd - 6.0).abs() < 1e-9);
+                assert!((limit_usd - 5.0).abs() < 1e-9);
+                assert_eq!(period, UsagePeriod::Day);
+                assert_eq!(agent_alias.as_deref(), Some("parent"));
+            }
+            other => panic!("expected ancestor-scoped Exceeded, got {other:?}"),
+        }
+
+        // A descendant's $1 recorded through the child accumulates into the
+        // ancestor entry while staying attributed to the child's own alias.
+        child
+            .record_usage_with_agent(
+                TokenUsage::new("test/model", 1_000_000, 0, 0, 1.0, 1.0, 0.0),
+                Some("child"),
+            )
+            .unwrap();
+        match child.check_budget(0.0).unwrap() {
+            BudgetCheck::Exceeded { current_usd, .. } => {
+                assert!(
+                    (current_usd - 7.0).abs() < 1e-9,
+                    "ancestor current must count its own $6 plus the \
+                     descendant's $1: {current_usd}"
+                );
+            }
+            other => panic!("expected ancestor-scoped Exceeded, got {other:?}"),
+        }
+
+        // Attribution stays per alias: the ancestor's own ledger total is
+        // still $6, and the child's own total is $1.
+        let parent_daily = base.get_summary_for_agent("parent").unwrap().daily_cost_usd;
+        assert!((parent_daily - 6.0).abs() < 1e-9);
+        let child_daily = base.get_summary_for_agent("child").unwrap().daily_cost_usd;
+        assert!((child_daily - 1.0).abs() < 1e-9);
+
+        // With headroom everywhere the chain admits: a fresh ancestor
+        // ledger at $1 against a $5 ceiling plus a $1 descendant is fine.
+        let tmp2 = TempDir::new().unwrap();
+        let base2 = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                daily_limit_usd: 100.0,
+                monthly_limit_usd: 500.0,
+                ..Default::default()
+            },
+            tmp2.path(),
+        )
+        .unwrap();
+        base2
+            .record_usage_with_agent(
+                TokenUsage::new("test/model", 1_000_000, 0, 0, 1.0, 1.0, 0.0),
+                Some("parent"),
+            )
+            .unwrap();
+        let parent_scope2 = base2.derived_for_agent("parent", 5.0);
+        let child2 = base2.derived_for_agent_in_chain(
+            "child",
+            8.0,
+            parent_scope2.subtree_chain_for_children(),
+        );
+        assert!(
+            matches!(child2.check_budget(0.0).unwrap(), BudgetCheck::Allowed),
+            "headroom on every ceiling must admit the chained tracker"
+        );
+    }
+
+    #[test]
+    fn subtree_descendant_spend_resets_on_utc_day_rollover() {
+        // A descendant record counts against the ancestor's ceiling only
+        // on the UTC day the record was stamped with: the accumulator
+        // must roll over with the ledger's daily totals, so a chain alive
+        // across UTC midnight does not carry yesterday's descendant spend
+        // into today's ceiling check.
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                daily_limit_usd: 100.0,
+                monthly_limit_usd: 500.0,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+
+        let day_d = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        let day_d1 = NaiveDate::from_ymd_opt(2026, 9, 21).unwrap();
+        let period = |day: NaiveDate| ReportingPeriod {
+            day,
+            year: day.year(),
+            month: day.month(),
+        };
+        let usage_on = |cost_usd: f64, day: NaiveDate| {
+            usage_costing_at(
+                cost_usd,
+                Utc.from_utc_datetime(&day.and_hms_opt(12, 0, 0).unwrap()),
+            )
+        };
+
+        let parent_scope = base.derived_for_agent("parent", 1.0);
+        let child = base.derived_for_agent_in_chain(
+            "child",
+            10.0,
+            parent_scope.subtree_chain_for_children(),
+        );
+
+        // $0.80 of descendant spend recorded through the child on day D.
+        child
+            .record_usage_with_agent(usage_on(0.80, day_d), Some("child"))
+            .unwrap();
+
+        // Same-day accounting is intact: the ancestor's day-D check counts
+        // the descendant's $0.80 against its $1.00 ceiling.
+        match parent_scope
+            .check_budget_at_period(0.30, period(day_d))
+            .unwrap()
+        {
+            BudgetCheck::Exceeded {
+                current_usd,
+                agent_alias,
+                ..
+            } => {
+                assert!(
+                    (current_usd - 0.80).abs() < 1e-9,
+                    "day D must count the descendant's $0.80: {current_usd}"
+                );
+                assert_eq!(agent_alias.as_deref(), Some("parent"));
+            }
+            other => panic!("expected ancestor-scoped Exceeded on day D, got {other:?}"),
+        }
+
+        // Day D+1 starts from zero: the same check one day later must not
+        // carry day D's descendant spend into the fresh day's ceiling.
+        assert!(
+            matches!(
+                parent_scope
+                    .check_budget_at_period(0.30, period(day_d1))
+                    .unwrap(),
+                BudgetCheck::Allowed
+            ),
+            "day D+1 must not count day D's descendant spend against the ancestor ceiling"
+        );
+
+        // The rollover is a reset-then-add, not a read-side zero: new
+        // descendant spend on day D+1 lands in the fresh slot, so the
+        // ancestor's day-D+1 ceiling sees only day D+1's $0.10.
+        child
+            .record_usage_with_agent(usage_on(0.10, day_d1), Some("child"))
+            .unwrap();
+        match parent_scope
+            .check_budget_at_period(0.95, period(day_d1))
+            .unwrap()
+        {
+            BudgetCheck::Exceeded {
+                current_usd,
+                agent_alias,
+                ..
+            } => {
+                assert!(
+                    (current_usd - 0.10).abs() < 1e-9,
+                    "day D+1 must count only day D+1's descendant $0.10, not the \
+                     carried-over $0.90: {current_usd}"
+                );
+                assert_eq!(agent_alias.as_deref(), Some("parent"));
+            }
+            other => panic!("expected ancestor-scoped Exceeded on day D+1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subtree_descendant_spend_same_day_accumulates() {
+        // Two records on the same UTC day through the same chain add into
+        // one day total: the ancestor's check on that day sees the sum.
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                daily_limit_usd: 100.0,
+                monthly_limit_usd: 500.0,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+
+        let day = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        let period = ReportingPeriod {
+            day,
+            year: day.year(),
+            month: day.month(),
+        };
+
+        let parent_scope = base.derived_for_agent("parent", 2.0);
+        let child = base.derived_for_agent_in_chain(
+            "child",
+            10.0,
+            parent_scope.subtree_chain_for_children(),
+        );
+        child
+            .record_usage_with_agent(
+                usage_costing_at(
+                    0.80,
+                    Utc.from_utc_datetime(&day.and_hms_opt(12, 0, 0).unwrap()),
+                ),
+                Some("child"),
+            )
+            .unwrap();
+        child
+            .record_usage_with_agent(
+                usage_costing_at(
+                    0.70,
+                    Utc.from_utc_datetime(&day.and_hms_opt(13, 0, 0).unwrap()),
+                ),
+                Some("child"),
+            )
+            .unwrap();
+
+        // $0.80 plus $0.70 of same-day descendant spend with the $0.60
+        // estimate exceeds the $2.00 ceiling, and the refusal's current is
+        // the full same-day sum.
+        match parent_scope.check_budget_at_period(0.60, period).unwrap() {
+            BudgetCheck::Exceeded {
+                current_usd,
+                agent_alias,
+                ..
+            } => {
+                assert!(
+                    (current_usd - 1.50).abs() < 1e-9,
+                    "same-day descendant records must add into one day total: {current_usd}"
+                );
+                assert_eq!(agent_alias.as_deref(), Some("parent"));
+            }
+            other => panic!("expected ancestor-scoped Exceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subtree_descendant_spend_ignores_record_from_earlier_day() {
+        // A record stamped on an EARLIER day than the accumulator's
+        // stored slot (a usage recorded just before UTC midnight,
+        // persisted just after another record already opened the new day)
+        // must not reset the slot back to the older day: the new day's
+        // accumulated spend survives, and the older day reads zero
+        // because its record was dropped from the accumulator (its
+        // ledger row still lands on its own day).
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                daily_limit_usd: 100.0,
+                monthly_limit_usd: 500.0,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+
+        let day_d = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        let day_d1 = NaiveDate::from_ymd_opt(2026, 9, 21).unwrap();
+        let period = |day: NaiveDate| ReportingPeriod {
+            day,
+            year: day.year(),
+            month: day.month(),
+        };
+        let usage_on = |cost_usd: f64, day: NaiveDate| {
+            usage_costing_at(
+                cost_usd,
+                Utc.from_utc_datetime(&day.and_hms_opt(12, 0, 0).unwrap()),
+            )
+        };
+
+        let parent_scope = base.derived_for_agent("parent", 1.0);
+        let child = base.derived_for_agent_in_chain(
+            "child",
+            10.0,
+            parent_scope.subtree_chain_for_children(),
+        );
+
+        // Day D+1's slot opens with $0.50 of descendant spend, then a
+        // day-D record arrives late (out-of-order persistence around UTC
+        // midnight) with $0.80.
+        child
+            .record_usage_with_agent(usage_on(0.50, day_d1), Some("child"))
+            .unwrap();
+        child
+            .record_usage_with_agent(usage_on(0.80, day_d), Some("child"))
+            .unwrap();
+
+        // Day D+1's total is unchanged: the ancestor's day-D+1 check
+        // still counts exactly the $0.50 that landed on day D+1, so the
+        // $0.60 estimate is refused with the $0.50 current.
+        match parent_scope
+            .check_budget_at_period(0.60, period(day_d1))
+            .unwrap()
+        {
+            BudgetCheck::Exceeded {
+                current_usd,
+                agent_alias,
+                ..
+            } => {
+                assert!(
+                    (current_usd - 0.50).abs() < 1e-9,
+                    "day D+1 must keep its own $0.50 total: {current_usd}"
+                );
+                assert_eq!(agent_alias.as_deref(), Some("parent"));
+            }
+            other => panic!("expected ancestor-scoped Exceeded on day D+1, got {other:?}"),
+        }
+
+        // Day D reads zero: the late day-D record was dropped from the
+        // accumulator, so the same estimate passes the ancestor's day-D
+        // check instead of seeing the stale $0.80.
+        assert!(
+            matches!(
+                parent_scope
+                    .check_budget_at_period(0.60, period(day_d))
+                    .unwrap(),
+                BudgetCheck::Allowed
+            ),
+            "day D must read zero descendant spend: the older record was dropped"
         );
     }
 }
