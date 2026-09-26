@@ -73,23 +73,7 @@ pub async fn handle_sop_decision_models(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-    let mut models: Vec<_> = {
-        let config = state.config.read();
-        config
-            .decision_models
-            .iter()
-            .filter_map(|(alias, m)| {
-                let (base_url, model) = m.endpoint()?;
-                Some(serde_json::json!({
-                    "alias": alias,
-                    "provider": m.provider,
-                    "model": model,
-                    "base_url": base_url,
-                }))
-            })
-            .collect()
-    };
-    models.sort_by(|a, b| a["alias"].as_str().cmp(&b["alias"].as_str()));
+    let models = zeroclaw_runtime::sop::decision_model_options(&state.config.read());
     Json(serde_json::json!({ "models": models })).into_response()
 }
 

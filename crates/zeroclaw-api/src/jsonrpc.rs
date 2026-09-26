@@ -481,16 +481,43 @@ pub struct SopRunOverlayRequest {
     pub run_id: String,
 }
 
-/// Request payload for `sops/decide`: resolve a paused checkpoint. `name` and
-/// `run_id` select the run; `decision` is the raw `ApprovalDecision` wire value
-/// (`"approve"` or `{"deny": {"reason": "..."}}`), deserialized into the
-/// canonical runtime enum by the handler so no parallel decision enum exists
-/// here to drift from it.
+/// Request payload for `sops/decide`: resolve a paused checkpoint. `run_id`
+/// selects the run; `name`, when given, must be the SOP that run belongs to (a
+/// guard for callers that address runs by SOP). `decision` is the raw
+/// `ApprovalDecision` wire value (`"approve"` or `{"deny": {"reason": "..."}}`),
+/// deserialized into the canonical runtime enum by the handler so no parallel
+/// decision enum exists here to drift from it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SopDecideRequest {
-    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub run_id: String,
     pub decision: serde_json::Value,
+}
+
+/// Request payload for `sops/cancel`: request a safe cancellation of a run.
+/// The in-flight step finishes and the run stops at the next step boundary.
+/// `name`, when given, must be the SOP the run belongs to. `reason` is recorded
+/// with the cancellation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopCancelRequest {
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Request payload for `sops/dispatch-event`: deliver a webhook event for
+/// `path` (e.g. `/sop/deploy`) to every SOP whose webhook trigger matches it.
+/// `payload` is the event body as JSON; it is handed to each started run as
+/// its step-1 input. The caller is responsible for authenticating the
+/// delivery and for idempotency.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopDispatchEventRequest {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
 }
 
 /// Request payload for `sops/run`: fire a Manual trigger for the named SOP.

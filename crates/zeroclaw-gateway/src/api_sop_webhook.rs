@@ -11,8 +11,7 @@ use super::{
     AppState, WebhookJsonResponse, authorize_webhook_request, check_webhook_idempotency,
     require_sop_dispatch_credentials,
 };
-use zeroclaw_runtime::sop::dispatch::{DispatchResult, dispatch_untrusted_fan_in};
-use zeroclaw_runtime::sop::{SopEvent, SopRunAction, SopTriggerSource};
+use zeroclaw_runtime::sop::{SopEvent, SopTriggerSource, WebhookDispatch};
 
 pub(super) enum SopWebhookOutcome {
     NoMatch,
@@ -60,98 +59,21 @@ pub(super) async fn dispatch_webhook_sop(
         return SopWebhookOutcome::Handled(unavailable());
     };
 
-    let results = dispatch_untrusted_fan_in(
+    let config = state.config.read().clone();
+    let (blocked_only, results) = match zeroclaw_runtime::sop::dispatch_webhook_event(
         engine,
         audit,
-        SopTriggerSource::Webhook,
-        Some(path),
+        state.sop_driver_handles.as_ref(),
+        &config,
+        path,
         payload,
-        None,
     )
-    .await;
-    if results.is_empty() {
-        return SopWebhookOutcome::Handled(unavailable());
-    }
-    if results
-        .iter()
-        .all(|result| matches!(result, DispatchResult::NoMatch))
+    .await
     {
-        return SopWebhookOutcome::NoMatch;
-    }
-
-    // An agent step has no loop to run it on this path, so drive it headlessly,
-    // like an approved gate or an editor-started run. Deterministic steps are
-    // already executed by dispatch; parked runs are driven when approved. The
-    // driver is admitted into the daemon generation like every other surface,
-    // so a reload drains it; only a standalone gateway with no generation
-    // detaches it.
-    for result in &results {
-        if let DispatchResult::Started { action, .. } = result
-            && matches!(action.as_ref(), SopRunAction::ExecuteStep { .. })
-        {
-            let config = state.config.read().clone();
-            match state.sop_driver_handles.as_ref() {
-                Some(handles) => {
-                    zeroclaw_runtime::sop::spawn_and_register_sop_driver(
-                        handles,
-                        config,
-                        std::sync::Arc::clone(engine),
-                        Some(std::sync::Arc::clone(audit)),
-                        action.as_ref().clone(),
-                    );
-                }
-                None => drop(zeroclaw_runtime::sop::spawn_headless_run_driver(
-                    config,
-                    std::sync::Arc::clone(engine),
-                    Some(std::sync::Arc::clone(audit)),
-                    action.as_ref().clone(),
-                )),
-            }
-        }
-    }
-
-    let blocked_only = results.iter().all(|result| {
-        matches!(
-            result,
-            DispatchResult::BlockedUnsafe { .. } | DispatchResult::NoMatch
-        )
-    });
-    let results = results
-        .into_iter()
-        .filter_map(|result| match result {
-            DispatchResult::Started {
-                run_id, sop_name, ..
-            } => Some(serde_json::json!({
-                "status": "started",
-                "sop": sop_name,
-                "run_id": run_id,
-            })),
-            DispatchResult::Skipped { sop_name, reason } => Some(serde_json::json!({
-                "status": "skipped",
-                "sop": sop_name,
-                "reason": reason,
-            })),
-            DispatchResult::Deferred { sop_name, reason } => Some(serde_json::json!({
-                "status": "deferred",
-                "sop": sop_name,
-                "reason": reason,
-            })),
-            DispatchResult::Coalesced {
-                sop_name,
-                existing_run_id,
-            } => Some(serde_json::json!({
-                "status": "coalesced",
-                "sop": sop_name,
-                "run_id": existing_run_id,
-            })),
-            DispatchResult::BlockedUnsafe { sop_name, reason } => Some(serde_json::json!({
-                "status": "blocked_unsafe",
-                "sop": sop_name,
-                "reason": reason,
-            })),
-            DispatchResult::NoMatch => None,
-        })
-        .collect::<Vec<_>>();
+        WebhookDispatch::Unavailable => return SopWebhookOutcome::Handled(unavailable()),
+        WebhookDispatch::NoMatch => return SopWebhookOutcome::NoMatch,
+        WebhookDispatch::Dispatched { blocked, results } => (blocked, results),
+    };
     let status = if blocked_only {
         StatusCode::UNPROCESSABLE_ENTITY
     } else {

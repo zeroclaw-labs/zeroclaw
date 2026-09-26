@@ -17,6 +17,7 @@ pub mod schema;
 pub mod scope;
 pub mod step_contract;
 pub mod store;
+pub mod surface;
 pub mod trigger_registry;
 pub mod trigger_source;
 pub mod types;
@@ -55,6 +56,9 @@ pub use step_contract::{StepFailure, StepRouting, SwitchRule};
 pub use store::{
     ClaimToken, PersistedRun, ProposalKind, ProposalRecord, ProposalStatus, SopEventRecord,
     SopRunStore, SqliteRunStore, StoreError, build_run_store,
+};
+pub use surface::{
+    DecisionModelOption, WebhookDispatch, decision_model_options, dispatch_webhook_event,
 };
 pub use trigger_registry::{
     BoundTriggerSource, ChannelAlias, ChannelTriggerKind, ConditionField, ConditionValueType,

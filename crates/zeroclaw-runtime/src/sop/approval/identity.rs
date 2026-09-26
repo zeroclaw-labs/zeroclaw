@@ -57,7 +57,12 @@ pub trait ApprovalIdentityResolver: Send + Sync {
 /// the admin path builds `ApprovalPrincipal::cli(None)` - so a `cli:<user>` group
 /// member is NOT satisfiable yet; it is reserved for a future CLI that forwards a
 /// trusted local identity, so do not gate a policy on `cli:<user>` expecting the
-/// current CLI to meet it. A future auth resolver (the documented junction seam) is
+/// current CLI to meet it. The daemon RPC surface (`sops/decide`, `sops/cancel`)
+/// derives its principal from the connection's bound authentication: a native
+/// pairing bearer yields the same paired-token subject as HTTP/WS (so
+/// `http:<subject>` members match it there too), an authenticated principal
+/// yields `principal:<canonical id>`, and the unauthenticated shared operator is
+/// anonymous. A future auth resolver (the documented junction seam) is
 /// where a per-PERSON canonical identity - linking a user's several device/channel
 /// subjects to one account - belongs; until then membership is per-subject.
 pub struct LocalConfigApprovalIdentityResolver;
