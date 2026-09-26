@@ -94,7 +94,23 @@ The `poll` tool posts a native WhatsApp poll in Web mode instead of the numbered
 
 Raw phone-number recipients are checked against the channel's number allowlist, and a disallowed number returns an error instead of silently doing nothing. As with ordinary sends, JID recipients bypass that number check. `duration_minutes` does not expire a native poll.
 
-Votes are not read back yet: the poll card shows the result to people in the chat, and the agent only learns that the poll was posted.
+Votes come back as `[choice]<option>` messages from the voter, one per
+selected option, the same shape Signal uses for its poll votes.
+
+Each poll says what its own votes should do, through the tool's `vote_reply`:
+
+| `vote_reply` | What a vote does |
+|---|---|
+| `ignore` (default) | Recorded as context, in a group and in a direct chat alike. No turn, no reply. For a poll that only gathers opinions. |
+| `in_chat` | Starts a turn in the chat the poll was posted in, so the agent answers the voter there. |
+| `direct` | Starts a turn addressed to the voter privately, in the same conversation their own direct messages use, leaving the rest of the chat out of what follows. |
+
+So one group can carry a list of wines on offer that answers each buyer to take
+the order, and a preferences poll that stays quiet. Only polls
+this channel posted can be read, and only while they are still in the
+channel's registry (256 polls, seven days); a vote on anything else is
+ignored. A daemon restart forgets the polls it posted, so their later votes
+stop arriving.
 
 ## Tool approval over chat (`approval_timeout_secs`)
 
