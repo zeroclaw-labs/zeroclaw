@@ -16730,6 +16730,12 @@ pub struct DiscordConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: bool,
+    /// When true, the agent's answer is sent as a native Discord reply to
+    /// the message it answers (the first message of a chunked answer, or the
+    /// streaming draft). Default: false, which posts a plain channel message.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub reply_to_messages: bool,
     /// When true, register and serve Discord slash commands (e.g. `/ask`)
     /// over the Gateway WebSocket, in addition to message handling. Default
     /// false. (Prototype: currently registers a single `/ask <prompt>`.)
@@ -34117,6 +34123,7 @@ stream_mode = "single_message"
             listen_to_bots: false,
             interrupt_on_new_message: false,
             mention_only: false,
+            reply_to_messages: false,
             slash_commands: false,
             slash_command_scope: SlashCommandScope::default(),
             proxy_url: None,
@@ -34148,6 +34155,7 @@ stream_mode = "single_message"
             listen_to_bots: false,
             interrupt_on_new_message: false,
             mention_only: false,
+            reply_to_messages: false,
             slash_commands: false,
             slash_command_scope: SlashCommandScope::default(),
             proxy_url: None,
@@ -34597,6 +34605,15 @@ allowed_users = ["U111"]
         let json = r#"{"bot_token":"tok"}"#;
         let parsed: DiscordConfig = serde_json::from_str(json).unwrap();
         assert!(!parsed.interrupt_on_new_message);
+    }
+
+    #[test]
+    async fn discord_config_reply_to_messages_defaults_off_and_parses_on() {
+        let parsed: DiscordConfig = serde_json::from_str(r#"{"bot_token":"tok"}"#).unwrap();
+        assert!(!parsed.reply_to_messages);
+        let parsed: DiscordConfig =
+            serde_json::from_str(r#"{"bot_token":"tok","reply_to_messages":true}"#).unwrap();
+        assert!(parsed.reply_to_messages);
     }
 
     #[test]

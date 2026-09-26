@@ -15,6 +15,9 @@ pub(crate) struct DiscordOutgoing {
     pub(crate) embeds: Vec<DiscordEmbed>,
     pub(crate) components: Vec<DiscordActionRow>,
     pub(crate) flags: DiscordMessageFlags,
+    /// Snowflake of the message this one natively replies to. Omitted from the
+    /// payload when `None`.
+    pub(crate) reply_to: Option<String>,
 }
 
 /// Message flags (e.g. ephemeral, components-v2). Zero by default and omitted
@@ -82,6 +85,14 @@ impl DiscordOutgoing {
             obj.insert(
                 "flags".to_string(),
                 serde_json::Value::Number(self.flags.0.into()),
+            );
+        }
+        // A deleted target must not fail the answer: Discord then posts it as a
+        // plain message instead of rejecting it.
+        if let Some(message_id) = &self.reply_to {
+            obj.insert(
+                "message_reference".to_string(),
+                serde_json::json!({"message_id": message_id, "fail_if_not_exists": false}),
             );
         }
         serde_json::Value::Object(obj)
@@ -188,6 +199,30 @@ pub(crate) const DISCORD_MAX_MESSAGE_LENGTH: usize = 2000;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reply_target_adds_a_lenient_message_reference() {
+        let out = DiscordOutgoing {
+            reply_to: Some("100000000000000001".to_string()),
+            ..DiscordOutgoing::text("answer")
+        };
+        assert_eq!(
+            out.to_rest_json(),
+            serde_json::json!({
+                "content": "answer",
+                "message_reference": {
+                    "message_id": "100000000000000001",
+                    "fail_if_not_exists": false
+                }
+            })
+        );
+        assert!(
+            DiscordOutgoing::text("answer")
+                .to_rest_json()
+                .get("message_reference")
+                .is_none()
+        );
+    }
 
     #[test]
     fn content_only_payload_is_byte_identical_to_legacy() {

@@ -91,6 +91,9 @@ pub struct DiscordChannel {
     /// IDENTIFY mask. Same connection-scoped snapshot semantics as the
     /// mask override above.
     reaction_scope: zeroclaw_config::schema::DiscordReactionScope,
+    /// Send answers as native replies to the message they answer (config
+    /// `reply_to_messages`).
+    reply_to_messages: bool,
     typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
@@ -177,6 +180,7 @@ impl DiscordChannel {
             mention_only,
             intents_mask_override: None,
             reaction_scope: zeroclaw_config::schema::DiscordReactionScope::Off,
+            reply_to_messages: false,
             typing_handles: Mutex::new(HashMap::new()),
             proxy_url: None,
             transcription: None,
@@ -248,6 +252,24 @@ impl DiscordChannel {
     ) -> Self {
         self.reaction_scope = scope;
         self
+    }
+
+    /// Send answers as native Discord replies to the message they answer.
+    pub fn with_reply_to_messages(mut self, enabled: bool) -> Self {
+        self.reply_to_messages = enabled;
+        self
+    }
+
+    /// The inbound message an answer should natively reply to, when enabled.
+    /// Inbound IDs are `discord_<snowflake>`; anything else (interaction
+    /// sentinels, synthetic IDs) yields `None`.
+    fn native_reply_target(&self, in_reply_to: Option<&str>) -> Option<String> {
+        if !self.reply_to_messages {
+            return None;
+        }
+        let id = in_reply_to?.strip_prefix("discord_")?;
+        (!id.is_empty() && id.len() <= 20 && id.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| id.to_string())
     }
 
     /// Gateway intent mask for IDENTIFY: the raw `intents_mask` override
@@ -1504,6 +1526,75 @@ fn contains_bot_mention(content: &str, bot_user_id: &str) -> bool {
     content.contains(&tags[0]) || content.contains(&tags[1])
 }
 
+/// Longest quoted reply target, in characters, prepended to inbound content.
+const REPLY_CONTEXT_MAX_CHARS: usize = 2000;
+
+/// Quote the message a Discord Reply points at, in the same `> @sender:` form
+/// the Telegram channel uses, so the agent can tell what "this" refers to.
+/// Reply-type MESSAGE_CREATE events carry `referenced_message`; it is null
+/// when the target was deleted, and then no context is added.
+fn discord_reply_context(d: &serde_json::Value) -> Option<String> {
+    let reply = d.get("referenced_message").filter(|m| m.is_object())?;
+    let sender = reply
+        .pointer("/author/global_name")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            reply
+                .pointer("/author/username")
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or("unknown");
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(text) = reply
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .filter(|t| !t.is_empty())
+    {
+        parts.push(text);
+    }
+    // Bot answers are often embeds with no content.
+    for embed in reply
+        .get("embeds")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for key in ["title", "description"] {
+            if let Some(text) = embed
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|t| !t.is_empty())
+            {
+                parts.push(text);
+            }
+        }
+    }
+    let has_attachments = reply
+        .get("attachments")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|a| !a.is_empty());
+    let text = if !parts.is_empty() {
+        let joined = parts.join("\n");
+        if joined.chars().count() > REPLY_CONTEXT_MAX_CHARS {
+            let mut clipped: String = joined.chars().take(REPLY_CONTEXT_MAX_CHARS).collect();
+            clipped.push('…');
+            clipped
+        } else {
+            joined
+        }
+    } else if has_attachments {
+        "[Attachment]".to_string()
+    } else {
+        "[Message]".to_string()
+    };
+    let quoted = text
+        .lines()
+        .map(|line| format!("> {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!("> @{sender}:\n{quoted}"))
+}
+
 fn is_conversational_message_type(message_type: u64) -> bool {
     matches!(message_type, 0 | 19)
 }
@@ -1877,6 +1968,8 @@ impl Channel for DiscordChannel {
                     );
                 }
             };
+        // Only the first message of a chunked answer carries the reply.
+        let reply_to = self.native_reply_target(message.in_reply_to.as_deref());
         for (i, chunk) in chunks.iter().enumerate() {
             let message_id = if i == 0 && (!embeds.is_empty() || !component_action_rows.is_empty())
             {
@@ -1884,6 +1977,7 @@ impl Channel for DiscordChannel {
                     content: Some(chunk.clone()),
                     embeds: embeds.clone(),
                     components: component_action_rows.clone(),
+                    reply_to: reply_to.clone(),
                     ..Default::default()
                 };
                 if local_files.is_empty() {
@@ -1909,8 +2003,22 @@ impl Channel for DiscordChannel {
                     &client,
                     &self.bot_token,
                     effective_recipient,
-                    &DiscordOutgoing::text(chunk.clone()),
+                    &DiscordOutgoing {
+                        reply_to: reply_to.clone(),
+                        ..DiscordOutgoing::text(chunk.clone())
+                    },
                     &local_files,
+                )
+                .await?
+            } else if i == 0 && reply_to.is_some() {
+                send_discord_message_payload(
+                    &client,
+                    &self.bot_token,
+                    effective_recipient,
+                    &DiscordOutgoing {
+                        reply_to: reply_to.clone(),
+                        ..DiscordOutgoing::text(chunk.clone())
+                    },
                 )
                 .await?
             } else {
@@ -3354,7 +3462,10 @@ impl Channel for DiscordChannel {
                         } else {
                             channel_id.clone()
                         },
-                        content: final_content,
+                        content: match discord_reply_context(d) {
+                            Some(quote) => format!("{quote}\n\n{final_content}"),
+                            None => final_content,
+                        },
                         channel: "discord".to_string(),
                         channel_alias: Some(self.alias.clone()),
                         timestamp: std::time::SystemTime::now()
@@ -3476,11 +3587,15 @@ impl Channel for DiscordChannel {
                 };
 
                 let client = self.http_client();
-                let msg_id = send_discord_message_json(
+                // The draft becomes the final answer, so it carries the reply.
+                let msg_id = send_discord_message_payload(
                     &client,
                     &self.bot_token,
                     &message.recipient,
-                    &initial_text,
+                    &DiscordOutgoing {
+                        reply_to: self.native_reply_target(message.in_reply_to.as_deref()),
+                        ..DiscordOutgoing::text(initial_text)
+                    },
                 )
                 .await?;
 
@@ -4068,6 +4183,7 @@ impl Channel for DiscordChannel {
             }],
             components: vec![components::action_row(buttons)],
             flags: Default::default(),
+            reply_to: None,
         };
         let message_id = rest::send_discord_outgoing(
             &self.http_client(),
@@ -7600,6 +7716,75 @@ mod tests {
         .with_streaming(StreamMode::MultiMessage, 1000, 600);
         assert!(multi.supports_draft_updates());
         assert_eq!(multi.multi_message_delay_ms, 600);
+    }
+
+    #[tokio::test]
+    async fn native_reply_target_requires_opt_in_and_an_inbound_discord_id() {
+        let channel = || {
+            DiscordChannel::new(
+                "t".into(),
+                vec![],
+                "discord_test_alias",
+                Arc::new(Vec::new),
+                false,
+                false,
+            )
+        };
+        let off = channel();
+        assert_eq!(
+            off.native_reply_target(Some("discord_100000000000000001")),
+            None
+        );
+        let on = channel().with_reply_to_messages(true);
+        assert_eq!(
+            on.native_reply_target(Some("discord_100000000000000001"))
+                .as_deref(),
+            Some("100000000000000001")
+        );
+        assert_eq!(on.native_reply_target(None), None);
+        assert_eq!(on.native_reply_target(Some("100000000000000001")), None);
+        assert_eq!(on.native_reply_target(Some("discord_")), None);
+        assert_eq!(on.native_reply_target(Some("discord_interaction:42")), None);
+        assert_eq!(
+            on.native_reply_target(Some("discord_../../users/@me")),
+            None
+        );
+    }
+
+    #[test]
+    fn reply_context_quotes_the_referenced_message() {
+        let d = json!({
+            "content": "I meant more like this",
+            "referenced_message": {
+                "author": {"username": "helperbot", "global_name": "Helper"},
+                "content": "line one\nline two",
+                "embeds": [{"title": "Summary", "description": "Status: ok"}]
+            }
+        });
+        assert_eq!(
+            discord_reply_context(&d).as_deref(),
+            Some("> @Helper:\n> line one\n> line two\n> Summary\n> Status: ok")
+        );
+        let file = json!({"referenced_message": {"author": {"username": "alice"}, "content": "",
+            "attachments": [{"url": "https://cdn.example/x.png"}]}});
+        assert_eq!(
+            discord_reply_context(&file).as_deref(),
+            Some("> @alice:\n> [Attachment]")
+        );
+        let long = json!({"referenced_message": {"author": {"username": "alice"},
+            "content": "x".repeat(REPLY_CONTEXT_MAX_CHARS + 10)}});
+        let quoted = discord_reply_context(&long).unwrap();
+        assert!(quoted.ends_with('…'));
+        assert_eq!(
+            quoted.chars().count(),
+            "> @alice:\n> ".chars().count() + REPLY_CONTEXT_MAX_CHARS + 1
+        );
+        // Plain messages and replies to deleted messages add nothing.
+        assert_eq!(discord_reply_context(&json!({"content": "hi"})), None);
+        assert_eq!(
+            discord_reply_context(&json!({"referenced_message": null})),
+            None
+        );
     }
 
     #[tokio::test]

@@ -12391,7 +12391,8 @@ fn build_channel_by_id(
                 .with_stall_timeout(dc.stall_timeout_secs)
                 .with_approval_timeout_secs(dc.approval_timeout_secs)
                 .with_intents_mask(dc.intents_mask)
-                .with_reaction_notifications(dc.reaction_notifications),
+                .with_reaction_notifications(dc.reaction_notifications)
+                .with_reply_to_messages(dc.reply_to_messages),
             ))
         }
         #[cfg(not(feature = "channel-discord"))]
@@ -13609,7 +13610,8 @@ fn build_configured_discord_channel(
     .with_slash_commands(dc.slash_commands)
     .with_slash_command_scope(dc.slash_command_scope)
     .with_intents_mask(dc.intents_mask)
-    .with_reaction_notifications(dc.reaction_notifications);
+    .with_reaction_notifications(dc.reaction_notifications)
+    .with_reply_to_messages(dc.reply_to_messages);
 
     configure_discord_transcription(channel, config, &channel_key)
 }

@@ -101,6 +101,13 @@ search; the bot still replies normally either way.
   so it stays quiet in busy channels.
 - `reply_min_interval_secs`: a minimum gap between replies to the same person,
   useful if instant responses feel robotic.
+- `reply_to_messages`: when `true`, each answer is posted as a Discord reply
+  attached to the message it answers. Off by default, so answers are plain
+  channel messages.
+
+When someone uses Discord's **Reply** on an earlier message, the agent sees
+that message quoted above theirs, so "this" or "like that" has something to
+point at. Replies to deleted messages arrive without the quote.
 
 ## Troubleshooting
 
