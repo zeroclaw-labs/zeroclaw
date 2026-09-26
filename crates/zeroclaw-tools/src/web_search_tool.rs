@@ -2469,6 +2469,27 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn transport_search_failure_redacts_query_bearing_url() {
+        let query = "private 多字节 query";
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test client should build without proxy discovery");
+        let error = client
+            .get(format!("http://127.0.0.1:1/search?q={query}"))
+            .send()
+            .await
+            .expect_err("closed local port should produce a deterministic transport error");
+
+        let message = transport_search_failure("duckduckgo", "request", &error).to_string();
+        assert!(message.contains("duckduckgo search failed"));
+        assert!(message.contains("transport=connect"));
+        assert!(!message.contains(query));
+        assert!(!message.contains("%E5%A4%9A"));
+        assert!(!message.contains("http://"));
+    }
+
     #[test]
     fn http_search_failure_classifies_provider_side_failures_as_unavailable() {
         // 5xx outages, 429 rate limiting, and 408 timeout are provider-side or
