@@ -4296,6 +4296,20 @@ mod service_helper_tests {
     }
 
     #[test]
+    fn follow_log_targets_ignores_missing_streams() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let stdout_log = dir.path().join("daemon.stdout.log");
+        let stderr_log = dir.path().join("daemon.stderr.log");
+        fs::write(&stderr_log, "late failure\n").unwrap();
+
+        assert_eq!(
+            follow_log_targets(&stdout_log, &stderr_log),
+            vec![stderr_log],
+            "follow mode should attach only to streams that exist"
+        );
+    }
+
+    #[test]
     fn get_content_command_uses_literal_path_and_doubles_quotes() {
         let command = get_content_command(Path::new("C:\\logs\\o'brien[1].log"), 25, true);
         assert_eq!(
