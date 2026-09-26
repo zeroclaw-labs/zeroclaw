@@ -38,6 +38,8 @@ On macOS, the LaunchAgent (`~/Library/LaunchAgents/com.zeroclaw.daemon.plist`) s
 
 On Windows, `zeroclaw service install` registers a Task Scheduler task triggered `ONLOGON` at the `LIMITED` run level. It starts the daemon at logon; it does not add an automatic restart-on-failure policy.
 
+To keep a Windows service available after a reload refusal, configure an external restart policy or restart the task manually; the built-in `ONLOGON` trigger is not a supervisor.
+
 ## Graceful shutdown
 
 On Unix the daemon traps `SIGINT` and `SIGTERM`; on Windows it traps Ctrl+C (`ctrl_c`). Any of these triggers a clean shutdown: the daemon stops its channel server and the gateway listener and exits.
