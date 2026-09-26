@@ -922,7 +922,9 @@ mod tests {
         let runtime: Arc<dyn RuntimeAdapter> =
             Arc::new(NativeRuntime::with_shell("powershell".into()));
         let tool = ShellTool::new(security, runtime);
-        let command = "[Console]::Write('标准输出'); $bytes = [Text.Encoding]::UTF8.GetBytes('标准错误'); [Console]::OpenStandardError().Write($bytes, 0, $bytes.Length)";
+        // This full-script fixture is intentionally outside the bounded grammar.
+        // Emit UTF-8 bytes explicitly so this test isolates hidden redirected capture/decoding.
+        let command = "$stdout = [Text.Encoding]::UTF8.GetBytes('标准输出'); [Console]::OpenStandardOutput().Write($stdout, 0, $stdout.Length); $stderr = [Text.Encoding]::UTF8.GetBytes('标准错误'); [Console]::OpenStandardError().Write($stderr, 0, $stderr.Length)";
 
         let result = tool
             .execute(json!({"command": command, "approved": true}))
