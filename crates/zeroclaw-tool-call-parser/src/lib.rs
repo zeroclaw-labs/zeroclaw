@@ -2059,6 +2059,54 @@ fn range_hits_rejected_span(rejected: &[std::ops::Range<usize>], start: usize, e
         .any(|span| !span.is_empty() && start < span.end && span.start < end)
 }
 
+// DeepSeek DSML marker: wraps tool-call tags with U+FF5C (FULLWIDTH VERTICAL LINE)
+// or ASCII pipe + "DSML" + same run. Matches entire block from <｜DSML｜ calls> to </｜DSML｜ calls>.
+static DSML_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)<[\u{FF5C}|]{1,3}DSML[\u{FF5C}|]{1,3}\s+calls\s*>(.*?)</[\u{FF5C}|]{1,3}DSML[\u{FF5C}|]{1,3}\s+calls\s*>")
+        .expect("DSML_BLOCK_RE regex must compile")
+});
+
+// Normalizes DSML-wrapped tags: <｜DSML｜ invoke> → <invoke>, </｜DSML｜ invoke> → </invoke>
+// Uses backreference \2 to ensure same pipe run on both sides of DSML.
+static DSML_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"<([/]?)[\u{FF5C}|]{1,3}DSML[\u{FF5C}|]{1,3}\s*")
+        .expect("DSML_TAG_RE regex must compile")
+});
+
+/// Extract DeepSeek DSML-wrapped tool-call blocks, normalize inner tags, parse them.
+/// DSML blocks are removed from text whether they parse or not (malformed protocol must not leak).
+fn extract_dsml_blocks(input: &str) -> (String, Vec<ParsedToolCall>) {
+    if !input.contains("DSML") {
+        return (input.to_string(), Vec::new());
+    }
+
+    let mut cleaned = String::new();
+    let mut calls = Vec::new();
+    let mut last_end = 0;
+
+    for caps in DSML_BLOCK_RE.captures_iter(input) {
+        let full_match = caps.get(0).unwrap();
+        let inner_content = caps.get(1).unwrap();
+
+        // Add text before this DSML block
+        cleaned.push_str(&input[last_end..full_match.start()]);
+
+        // Normalize DSML markers in inner tags: <｜DSML｜ invoke> → <invoke>
+        let normalized = DSML_TAG_RE.replace_all(inner_content.as_str(), "<$1");
+
+        // Parse normalized content (recursive call safe: no DSML markers remain)
+        let (_, parsed_calls) = parse_tool_calls(&normalized);
+        calls.extend(parsed_calls);
+
+        last_end = full_match.end();
+    }
+
+    // Add remaining text after last DSML block
+    cleaned.push_str(&input[last_end..]);
+
+    (cleaned, calls)
+}
+
 pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     // Strip `<think>...</think>` blocks before parsing.  Qwen and other
     // reasoning models embed chain-of-thought inline in the response text;
@@ -2069,6 +2117,24 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
 
     let mut text_parts = Vec::new();
     let mut calls = Vec::new();
+
+    // DeepSeek wraps tool-call XML tags with a DSML marker (U+FF5C or ASCII pipe
+    // + "DSML" + same run) on BOTH opening and closing tags. Extract DSML blocks,
+    // normalize the inner tags, and parse them. DSML blocks are removed from the
+    // text whether they parse or not (malformed tool protocol must not leak).
+    // This MUST run before `remaining` is bound, so both `response` and
+    // `remaining` point at the DSML-cleaned text and the marker cannot leak
+    // into the returned text via the tag-walk accumulator.
+    let (dsml_cleaned, dsml_calls) = extract_dsml_blocks(response);
+    let dsml_cleaned_owned;
+    let response = if !dsml_calls.is_empty() || dsml_cleaned != response {
+        dsml_cleaned_owned = dsml_cleaned;
+        dsml_cleaned_owned.as_str()
+    } else {
+        response
+    };
+    calls.extend(dsml_calls);
+
     let mut remaining = response;
     // Byte ranges of `<tools>` spans this loop refused. Consulted by the global
     // fallbacks that re-scan `response` instead of walking `remaining`.
@@ -5505,5 +5571,62 @@ Let me check the result."#;
         assert_eq!(strip_trailing_terminal_markers("<eom>\n"), "");
         assert_eq!(strip_trailing_terminal_markers("<|eom|>  "), "");
         assert_eq!(strip_trailing_terminal_markers("<eom>\n<|eom|>"), "");
+    }
+
+    #[test]
+    fn dsml_fullwidth_pipe_parses_tool_call() {
+        // Real DeepSeek sample from .agent/dsml-sample.txt (U+FF5C FULLWIDTH VERTICAL LINE)
+        let input = "<\u{FF5C}DSML\u{FF5C} calls>\n<\u{FF5C}DSML\u{FF5C} invoke name=\"shell\">\n<\u{FF5C}DSML\u{FF5C} parameter name=\"command\" string=\"true\">ls -la ~/ 2>/dev/null</\u{FF5C}DSML\u{FF5C} parameter>\n</\u{FF5C}DSML\u{FF5C} invoke>\n</\u{FF5C}DSML\u{FF5C} calls>";
+        let (text, calls) = parse_tool_calls(input);
+
+        assert_eq!(calls.len(), 1, "Should parse one tool call");
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").and_then(|v| v.as_str()),
+            Some("ls -la ~/ 2>/dev/null")
+        );
+
+        // Text must NOT contain DSML or U+FF5C
+        assert!(!text.contains("DSML"), "Text must not contain DSML marker");
+        assert!(!text.contains('\u{FF5C}'), "Text must not contain U+FF5C");
+    }
+
+    #[test]
+    fn dsml_ascii_pipe_parses_tool_call() {
+        // ASCII pipe variant: |DSML|
+        let input = "<|DSML| calls>\n<|DSML| invoke name=\"shell\">\n<|DSML| parameter name=\"command\" string=\"true\">ls -la ~/ 2>/dev/null</|DSML| parameter>\n</|DSML| invoke>\n</|DSML| calls>";
+        let (text, calls) = parse_tool_calls(input);
+
+        assert_eq!(calls.len(), 1, "Should parse one tool call");
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").and_then(|v| v.as_str()),
+            Some("ls -la ~/ 2>/dev/null")
+        );
+
+        assert!(!text.contains("DSML"), "Text must not contain DSML marker");
+    }
+
+    #[test]
+    fn dsml_malformed_does_not_leak() {
+        // DSML block with invalid content should not leak to text
+        let input = "Before text\n<\u{FF5C}DSML\u{FF5C} calls>\nmalformed garbage\n</\u{FF5C}DSML\u{FF5C} calls>\nAfter text";
+        let (text, calls) = parse_tool_calls(input);
+
+        assert!(calls.is_empty(), "Malformed DSML should not parse");
+        assert!(!text.contains("DSML"), "DSML marker must not leak");
+        assert!(!text.contains('\u{FF5C}'), "U+FF5C must not leak");
+        assert!(
+            !text.contains("malformed garbage"),
+            "Malformed content must not leak"
+        );
+        assert!(
+            text.contains("Before text"),
+            "Text before DSML block preserved"
+        );
+        assert!(
+            text.contains("After text"),
+            "Text after DSML block preserved"
+        );
     }
 }
