@@ -11478,11 +11478,11 @@ mod tests {
             RetryDecision::Admit(0)
         );
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(2, true, false, false),
+            ReliableModelProvider::stream_recovery_decision(2, true, false, false, false),
             RetryDecision::Admit(2)
         );
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(2, true, true, false),
+            ReliableModelProvider::stream_recovery_decision(2, true, true, false, false),
             RetryDecision::Admit(0)
         );
         // Multi-candidate without permission: skip the failed entry.
