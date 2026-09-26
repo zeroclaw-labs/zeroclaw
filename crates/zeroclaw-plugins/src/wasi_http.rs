@@ -103,19 +103,25 @@ fn dns_failure() -> ErrorCode {
     )
 }
 
-/// Emit the structured denial event that attributes the attempt to the exact
-/// instance. The destination host and the boundary's reason are recorded
-/// host-side — the operator needs both to seed a grant — while only the guest's
-/// error is masked.
+/// Wrap `value` as one POSIX single-quoted shell word. An apostrophe inside
+/// closes the quoted run, contributes a backslash-escaped apostrophe outside
+/// it, and reopens the run, so the word stays one argument with the original
+/// bytes. This is the quoting `shell_escape` in `zeroclaw-runtime`'s
+/// `coding_cli_executor` applies to generated commands.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// `existing` with `host` appended when it is not already there, rendered as
-/// the single-quoted JSON list `config set` takes. `config set` replaces the
-/// whole list, so a remedy has to carry every entry the operator already has.
+/// one single-quoted shell argument carrying the JSON list `config set` takes.
+/// `config set` replaces the whole list, so a remedy has to carry every entry
+/// the operator already has.
 fn list_with(existing: &[String], host: &str) -> String {
     let mut list: Vec<&str> = existing.iter().map(String::as_str).collect();
     if !list.contains(&host) {
         list.push(host);
     }
-    format!("'{}'", serde_json::Value::from(list))
+    shell_quote(&serde_json::Value::from(list).to_string())
 }
 
 /// The operator-facing next step for a missing grant: the exact command that
@@ -194,6 +200,10 @@ fn egress_remedy(
     }
 }
 
+/// Emit the structured denial event that attributes the attempt to the exact
+/// instance. The destination host and the boundary's reason are recorded
+/// host-side — the operator needs both to seed a grant — while only the guest's
+/// error is masked.
 fn record_denial(id: &PluginInstanceId, host: &str, reason: &str, remedy: Option<String>) {
     ::zeroclaw_log::record!(
         WARN,
@@ -1042,6 +1052,97 @@ mod tests {
         );
     }
 
+    /// A grant with no quoting-sensitive characters keeps the exact command the
+    /// remedy has always printed. Only entries that need escaping change.
+    #[test]
+    fn a_remedy_for_plain_grants_keeps_the_command_unchanged() {
+        let scope = crate::instance::test_scope(
+            PluginCapability::Tool,
+            "main",
+            [PluginPermission::HttpClient],
+        );
+        let id = scope.id();
+        let key = id
+            .config_entry_key()
+            .expect("an admitted instance has a config-entry key");
+        let existing = vec!["docs.example.com".to_string()];
+        let remedy = egress_grant_remedy(id, "new.example.com", Some(&existing))
+            .expect("a missing grant has a fix");
+        let expected = format!(
+            "grant reach with: zeroclaw config set plugins.entries.{key}.egress_hosts '[\"docs.example.com\",\"new.example.com\"]'"
+        );
+        assert_eq!(remedy, expected, "{remedy}");
+    }
+
+    /// The serialized list was wrapped in single quotes without escaping the
+    /// apostrophes inside it, so a grant like `o'brien.example` closed the
+    /// quoted run early and left the operator with an unterminated quote. This
+    /// is the command the remedy printed for that grant.
+    #[test]
+    fn a_remedy_for_a_grant_with_an_apostrophe_is_one_shell_argument() {
+        let scope = crate::instance::test_scope(
+            PluginCapability::Tool,
+            "main",
+            [PluginPermission::HttpClient],
+        );
+        let id = scope.id();
+        let key = id
+            .config_entry_key()
+            .expect("an admitted instance has a config-entry key");
+        let existing = vec!["o'brien.example".to_string()];
+        let remedy = egress_grant_remedy(id, "new.example.com", Some(&existing))
+            .expect("a missing grant has a fix");
+        let expected = format!(
+            "grant reach with: zeroclaw config set plugins.entries.{key}.egress_hosts '[\"o'\\''brien.example\",\"new.example.com\"]'"
+        );
+        assert_eq!(remedy, expected, "{remedy}");
+    }
+
+    /// The same command read back the way a POSIX shell reads it has to carry
+    /// the list `config set` replaces, apostrophe and all.
+    #[test]
+    fn a_remedy_for_a_grant_with_an_apostrophe_round_trips() {
+        let scope = crate::instance::test_scope(
+            PluginCapability::Tool,
+            "main",
+            [PluginPermission::HttpClient],
+        );
+        let id = scope.id();
+        let existing = vec![
+            "docs.example.com".to_string(),
+            "o'brien.example".to_string(),
+        ];
+        let remedy = egress_grant_remedy(id, "new.example.com", Some(&existing))
+            .expect("a missing grant has a fix");
+        let written = remedy_list(&remedy);
+        assert_eq!(
+            written,
+            vec![
+                "docs.example.com".to_string(),
+                "o'brien.example".to_string(),
+                "new.example.com".to_string()
+            ],
+            "{remedy}"
+        );
+        EgressPolicy::new(&written, &[], &[], 16).expect("the remedied list stays a valid policy");
+    }
+
+    /// The escape sequence is data, not syntax: a grant that already contains
+    /// `'\''`, adjacent apostrophes or a trailing one must survive unchanged
+    /// rather than being escaped a second time.
+    #[test]
+    fn a_grant_containing_the_escape_sequence_round_trips() {
+        for value in [
+            "a'\\''b.example",
+            "o''brien.example",
+            "trailing'",
+            "'leading",
+        ] {
+            let quoted = shell_quote(value);
+            assert_eq!(shell_argument(&quoted), value, "{quoted}");
+        }
+    }
+
     /// The remedy names the field each refusal actually needs, and is absent
     /// where no config change would help: a granted host that resolved into
     /// private address space must be pointed at `egress_allow_private`, not
@@ -1158,11 +1259,41 @@ mod tests {
         assert!(remedy.contains("egress_allow_private"), "{remedy}");
     }
 
-    /// The list a remedy command would write, parsed back out of it.
+    /// The list a remedy command would hand to `config set`, read off the
+    /// command the way a POSIX shell would read it.
     fn remedy_list(remedy: &str) -> Vec<String> {
-        let start = remedy.rfind(" '").expect("remedy ends in a quoted list") + 2;
-        let end = remedy.rfind('\'').expect("the list is single-quoted");
-        serde_json::from_str(&remedy[start..end]).expect("the list is JSON")
+        let argument = remedy
+            .split_once("config set ")
+            .and_then(|(_, tail)| tail.split_once(' '))
+            .map(|(_, argument)| argument)
+            .unwrap_or_else(|| panic!("no config-set argument in the remedy: {remedy}"));
+        serde_json::from_str(&shell_argument(argument)).expect("the list is JSON")
+    }
+
+    /// Resolve one single-quoted shell argument. [`shell_quote`] emits a quoted
+    /// run, and for an apostrophe it splices out to a backslash-escaped quote
+    /// and back in; anything else after a closing quote is an unterminated
+    /// quote, which is exactly the defect here, so this fails loudly there
+    /// instead of quietly decoding a truncated list.
+    fn shell_argument(raw: &str) -> String {
+        let mut out = String::new();
+        let mut rest = raw
+            .strip_prefix('\'')
+            .unwrap_or_else(|| panic!("the argument must open with a quote: {raw}"));
+        loop {
+            let end = rest
+                .find('\'')
+                .unwrap_or_else(|| panic!("unterminated quote in the argument: {raw}"));
+            out.push_str(&rest[..end]);
+            rest = &rest[end + 1..];
+            if rest.is_empty() {
+                return out;
+            }
+            rest = rest
+                .strip_prefix("\\''")
+                .unwrap_or_else(|| panic!("text after the closing quote in the argument: {raw}"));
+            out.push('\'');
+        }
     }
 
     /// `config set` replaces a whole list, so a remedy that printed only the
