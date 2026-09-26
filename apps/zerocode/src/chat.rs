@@ -216,6 +216,9 @@ pub(crate) struct ResumeEntry {
     queue: ReconnectQueueState,
     interrupted: bool,
     recovery_required: bool,
+    /// Bounded cleanup notice captured while the old pane was disconnected.
+    /// It is restored only after the replacement pane successfully adopts.
+    cleanup_notice: Option<String>,
 }
 
 /// Client-owned queue and composer state that cannot be reconstructed from the
@@ -298,6 +301,9 @@ pub(crate) struct Chat {
     /// stay here so a later explicit retry or transport reconnect can recover
     /// them without losing their client-owned queues.
     resume_backgrounds: Vec<ResumeEntry>,
+    /// A cleanup failure belongs to the transport handoff, not to the old
+    /// pane. Keep its sanitized message until a rebuilt pane can surface it.
+    reconnect_cleanup_notice: Option<String>,
     /// List rect of the agent picker, recorded each draw so mouse clicks in the
     /// PickAgent phase can map a row to a selection. Default until first draw.
     pick_agent_list_area: Rect,
@@ -564,6 +570,7 @@ impl Chat {
             last_focused_sid: None,
             resume_focused: None,
             resume_backgrounds: Vec::new(),
+            reconnect_cleanup_notice: None,
             pick_agent_list_area: Rect::default(),
             pick_agent_double_click: crate::mouse::DoubleClickTracker::new(),
             session_list_double_click: crate::mouse::DoubleClickTracker::new(),
@@ -611,7 +618,7 @@ impl Chat {
     /// Every session this pane tracks, in sidebar order, for the app layer to
     /// carry across a reconnect rebuild. Durable transcript is intentionally
     /// not copied: the rebuilt pane reloads it from `session/messages`.
-    pub(crate) fn resume_entries(&self) -> Vec<ResumeEntry> {
+    pub(crate) fn resume_entries(&mut self) -> Vec<ResumeEntry> {
         let summaries = self.session_summaries();
         let mut entries = Vec::with_capacity(
             summaries.len()
@@ -635,6 +642,12 @@ impl Chat {
                     || state.pending_elicitation.is_some(),
                 recovery_required: state.last_error == Some(SessionError::ResyncFailed)
                     || self.session_resync_in_flight.contains(&state.session_id),
+                // Only the focused pane can display this notice. Cloning keeps
+                // it available when a transactional rebuild fails mid-flight.
+                cleanup_notice: summary
+                    .focused
+                    .then(|| self.reconnect_cleanup_notice.clone())
+                    .flatten(),
             });
         }
 
@@ -1205,6 +1218,34 @@ impl Chat {
         }
     }
 
+    /// On transport loss, remove active-turn clipboard temporaries without
+    /// touching the composer or queued messages, so the cached pane stays
+    /// live across a reconnect. Surfaces any bounded cleanup failures on the
+    /// still-active pane.
+    pub(crate) fn cleanup_active_turn_on_disconnect(&mut self) {
+        if let ChatPhase::Active(state) = &mut self.phase {
+            let report = state.cleanup_active_turn_attachments();
+            if let Some(notice) = report.notice() {
+                // The current pane may be replaced after a successful
+                // reconnect, so retain the sanitized message for handoff.
+                self.reconnect_cleanup_notice = Some(notice.clone());
+                state.set_info_notice(notice);
+            }
+        }
+    }
+
+    /// Reclaim dispatched clipboard temporaries when the TUI exits normally.
+    /// This deliberately leaves composer and queued attachments untouched:
+    /// those inputs are not active turns and may be user-selected files.
+    pub(crate) fn cleanup_active_turn_on_shutdown(&mut self) {
+        if let ChatPhase::Active(state) = &mut self.phase {
+            let _ = state.cleanup_active_turn_attachments();
+        }
+        for state in &mut self.background {
+            let _ = state.cleanup_active_turn_attachments();
+        }
+    }
+
     /// Fetch agent list. If exactly one enabled agent, auto-start a session (or
     /// show the CWD picker first on WSS ACP connections) — except on the Code
     /// (ACP) pane with no resumable history, where the single-item agent
@@ -1373,6 +1414,7 @@ impl Chat {
             queue: ReconnectQueueState::default(),
             interrupted: false,
             recovery_required: false,
+            cleanup_notice: None,
         });
         self.pick_or_start_session(&agent_alias).await;
     }
@@ -1783,6 +1825,7 @@ impl Chat {
                         entry.queue,
                         entry.interrupted,
                         entry.recovery_required,
+                        entry.cleanup_notice,
                     );
                 }
                 if !self.session_order.contains(&state.session_id) {
@@ -1985,6 +2028,7 @@ impl Chat {
             entry.queue.clone(),
             entry.interrupted,
             entry.recovery_required,
+            entry.cleanup_notice.clone(),
         );
         Ok(state)
     }
@@ -10417,6 +10461,7 @@ impl ChatState {
         queue: ReconnectQueueState,
         interrupted: bool,
         recovery_required: bool,
+        cleanup_notice: Option<String>,
     ) {
         self.message_queue = queue.messages;
         self.next_queue_id = queue.next_id;
@@ -10436,6 +10481,11 @@ impl ChatState {
                     "zc-chat-reconnect-interrupted",
                 ))));
             self.mark_dirty_append();
+        }
+        // The old disconnected pane cannot survive a successful adoption.
+        // Restore its sanitized cleanup warning after the new state is live.
+        if let Some(notice) = cleanup_notice {
+            self.set_info_notice(notice);
         }
     }
 
@@ -11667,6 +11717,7 @@ mod tests {
             queue: ReconnectQueueState::default(),
             interrupted: false,
             recovery_required: false,
+            cleanup_notice: None,
         }
     }
 
@@ -14527,7 +14578,7 @@ mod tests {
             }
         }
 
-        let chat = tokio::time::timeout(Duration::from_secs(2), init)
+        let mut chat = tokio::time::timeout(Duration::from_secs(2), init)
             .await
             .expect("a healthy background should keep the pane usable")
             .unwrap();
@@ -14724,7 +14775,12 @@ mod tests {
             }],
             false,
         );
-        rebuilt.restore_reconnect_state(entry.queue, entry.interrupted, entry.recovery_required);
+        rebuilt.restore_reconnect_state(
+            entry.queue,
+            entry.interrupted,
+            entry.recovery_required,
+            entry.cleanup_notice,
+        );
         assert_eq!(rebuilt.queue_len(), 1);
         assert!(rebuilt.queue_paused());
         assert_eq!(rebuilt.input_bar.input(), "draft survives reconnect");
@@ -21575,6 +21631,77 @@ mod tests {
         assert!(
             !clipboard_path.exists(),
             "reconnect handoff must reclaim the abandoned turn's clipboard temp"
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_exit_cleans_active_clipboard_attachment_without_touching_user_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let clipboard_path = dir.path().join("normal-exit-clipboard.png");
+        let user_path = dir.path().join("normal-exit-user.png");
+        std::fs::write(&clipboard_path, b"clipboard").expect("write clipboard temp");
+        std::fs::write(&user_path, b"user").expect("write user file");
+
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let client = Arc::new(RpcClient::with_rpc(Arc::new(RpcOutbound::new(tx))));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut active = state();
+        active.active_turn_attachments = vec![
+            clipboard_att(&clipboard_path, "normal-exit-clipboard.png"),
+            PendingAttachment {
+                path: user_path.clone(),
+                mime_type: "image/png".to_string(),
+                filename: "normal-exit-user.png".to_string(),
+                size_bytes: 4,
+                source: crate::attachment::AttachmentSource::File,
+            },
+        ];
+        chat.phase = ChatPhase::Active(Box::new(active));
+        // This is invoked by the app's normal exit path after the event loop.
+        chat.cleanup_active_turn_on_shutdown();
+
+        assert!(
+            !clipboard_path.exists(),
+            "normal exit must reclaim the active clipboard temp"
+        );
+        assert!(
+            user_path.exists(),
+            "normal exit must preserve user-selected files"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_adoption_restores_active_turn_cleanup_failure_notice() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let blocked_path = dir.path().join("cleanup-failure");
+        std::fs::create_dir(&blocked_path).expect("create forced-failure path");
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let client = Arc::new(RpcClient::with_rpc(Arc::new(RpcOutbound::new(tx))));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut active = state();
+        active.active_turn_attachments = vec![clipboard_att(&blocked_path, "cleanup-failure")];
+        chat.phase = ChatPhase::Active(Box::new(active));
+        chat.session_order = vec!["sess-1".to_string()];
+
+        chat.cleanup_active_turn_on_disconnect();
+        let entry = chat
+            .resume_entries()
+            .into_iter()
+            .next()
+            .expect("focused session must be retained");
+        let mut rebuilt = state();
+        rebuilt.restore_reconnect_state(
+            entry.queue,
+            entry.interrupted,
+            entry.recovery_required,
+            entry.cleanup_notice,
+        );
+
+        assert!(
+            rebuilt
+                .info_message
+                .as_ref()
+                .is_some_and(|message| { message.text.contains("1 temporary file") })
         );
     }
 

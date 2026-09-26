@@ -1461,6 +1461,10 @@ pub async fn run(
                 }
             }
             let since = *disconnected_at.get_or_insert_with(Instant::now);
+            // Transport loss terminates ownership of active-turn clipboard
+            // temporaries without touching the composer or queued messages, so
+            // the cached pane stays live for reconnect.
+            chat_pane.cleanup_active_turn_on_disconnect();
             if should_respawn_ephemeral(
                 owned_daemon_pid,
                 ephemeral_respawn_done,
@@ -2010,6 +2014,11 @@ pub async fn run(
         }
     }
 
+    // The event loop is ending by an explicit normal-exit path. Reclaim only
+    // dispatched clipboard temporaries; drafts and queued messages stay owned
+    // by their input state and must never be treated as active turn files.
+    chat_pane.cleanup_active_turn_on_shutdown();
+    acp_pane.cleanup_active_turn_on_shutdown();
     Ok(())
 }
 

@@ -26,12 +26,18 @@ impl Acp {
         self.inner.set_resume_sessions(entries);
     }
 
-    pub(crate) fn resume_entries(&self) -> Vec<chat::ResumeEntry> {
+    /// Snapshot Code sessions and any reconnect cleanup warning for adoption.
+    pub(crate) fn resume_entries(&mut self) -> Vec<chat::ResumeEntry> {
         self.inner.resume_entries()
     }
 
     pub(crate) fn commit_reconnect_handoff(&mut self) {
         self.inner.commit_reconnect_handoff();
+    }
+
+    /// Reclaim only dispatched clipboard temporaries during a normal TUI exit.
+    pub(crate) fn cleanup_active_turn_on_shutdown(&mut self) {
+        self.inner.cleanup_active_turn_on_shutdown();
     }
 
     pub(crate) fn terminal_statuses(&self) -> Vec<(crate::turn_status::TurnStatus, String)> {
