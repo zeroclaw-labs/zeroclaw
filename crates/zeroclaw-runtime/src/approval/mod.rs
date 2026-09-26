@@ -94,6 +94,9 @@ pub struct ApprovalManager {
     /// When `true`, shell calls in non-interactive mode still enter the outer
     /// approval flow because a real client approval channel exists.
     non_interactive_shell_requires_approval: bool,
+    /// Whether a tool-level approval may satisfy the hidden command-specific
+    /// approval input consumed by command tools.
+    propagate_runtime_command_approval: bool,
     /// Session-scoped allowlist built from "Always" responses.
     session_allowlist: Mutex<HashSet<String>>,
     /// Audit trail of approval decisions.
@@ -118,6 +121,7 @@ impl ApprovalManager {
             autonomy_level: risk_profile.level,
             non_interactive: false,
             non_interactive_shell_requires_approval: false,
+            propagate_runtime_command_approval: true,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
         }
@@ -130,8 +134,20 @@ impl ApprovalManager {
             autonomy_level: risk_profile.level,
             non_interactive: true,
             non_interactive_shell_requires_approval: false,
+            propagate_runtime_command_approval: true,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Create a non-interactive manager for a bounded delegated child.
+    ///
+    /// The target profile decides whether the child may invoke a tool, but it
+    /// cannot grant command-specific approval to caller-owned command tools.
+    pub(crate) fn for_bounded_non_interactive(risk_profile: &RiskProfileConfig) -> Self {
+        Self {
+            propagate_runtime_command_approval: false,
+            ..Self::for_non_interactive(risk_profile)
         }
     }
 
@@ -142,6 +158,7 @@ impl ApprovalManager {
             autonomy_level: risk_profile.level,
             non_interactive: true,
             non_interactive_shell_requires_approval: true,
+            propagate_runtime_command_approval: true,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
         }
@@ -164,6 +181,7 @@ impl ApprovalManager {
             autonomy_level: risk_profile.level,
             non_interactive: self.non_interactive,
             non_interactive_shell_requires_approval: self.non_interactive_shell_requires_approval,
+            propagate_runtime_command_approval: self.propagate_runtime_command_approval,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
         }
@@ -173,6 +191,10 @@ impl ApprovalManager {
     /// (i.e. for channel-driven runs where no operator can approve).
     pub fn is_non_interactive(&self) -> bool {
         self.non_interactive
+    }
+
+    pub(crate) fn propagates_runtime_command_approval(&self) -> bool {
+        self.propagate_runtime_command_approval
     }
 
     /// The autonomy level this manager enforces. Prompt rendering reads the

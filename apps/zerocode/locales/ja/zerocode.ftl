@@ -436,6 +436,7 @@ zc-model-switch-provider-ok = model_provider を { $provider } に切り替え�
 zc-model-switch-failed = モデルの切り替えに失敗しました: { $error }
 zc-model-catalog-no-provider = 設定からこのエージェントの model_provider を解決できませんでした。
 zc-model-catalog-empty = アクティブな model_provider に利用可能なモデルがありません。
+zc-model-catalog-failed = アクティブな model_provider のモデルを読み込めませんでした: { $error }
 zc-model-catalog-loading = モデルを読み込み中…
 zc-model-provider-catalog-failed = model_providers を読み込めませんでした: { $error }
 zc-chat-label-you = あなた:
@@ -461,6 +462,7 @@ zc-chat-help-yank-selection = 選択範囲をヤンク
 zc-chat-help-return-to-input = 入力に戻る
 zc-chat-help-browse-mode = 閲覧モード
 zc-chat-help-scroll-conversation = 会話をスクロール
+zc-chat-help-open-link = リンクをクリックして開く。別の場所からドラッグするとテキストを選択
 zc-chat-help-toggle-thoughts = 思考を切り替え
 zc-chat-help-new-session = 新しいセッション
 zc-chat-session-list-resume-title = 保存済みセッション (Enter=再開, Esc=新規)
@@ -479,6 +481,10 @@ zc-chat-copied-clipboard = クリップボードにコピーしました
 zc-chat-copy-message = [コピー]
 zc-chat-copy-message-copied = [コピーしました]
 zc-chat-context-menu-copy = コピー
+zc-chat-context-menu-copy-selection = 選択範囲をコピー
+zc-chat-context-menu-open-link = リンクを開く
+zc-chat-context-menu-copy-link = リンクをコピー
+zc-chat-open-link-failed = リンクを開けませんでした: { $error }
 zc-chat-context-menu-send-now = 今すぐ送信
 zc-chat-context-menu-edit = 編集
 zc-chat-context-menu-delete = 削除
@@ -573,6 +579,11 @@ zc-config-footer-action-help = ヘルプ
 zc-config-footer-action-new-line = 改行
 zc-config-field-edit-hint = { $keys } → 押して編集
 zc-doctor-log-path = log: { $path }
+
+zc-oidc-enroll-visit = サインインするには { $uri } を開き、コード { $code } を入力してください
+zc-oidc-enroll-waiting = ID プロバイダーの承認を待っています(コードは { $seconds } 秒で失効します)...
+zc-oidc-enroll-missing-url = auth_provider { $provider } が設定されていますが auth_token がありません。対話的にサインインするには [connection.wss] enroll_url にゲートウェイの HTTP オリジンを設定するか、ZEROCLAW_AUTH_TOKEN をエクスポートしてください(参照: zeroclaw oidc login)。
+zc-oidc-enroll-done = サインインしました。トークンはこのセッションのみ保持されます。次回の登録を省略するには ZEROCLAW_AUTH_TOKEN をエクスポートしてください。
 
 ## 設定レジストリのメタデータ。キーは安定した識別子から生成され、RPC が返す英語表示は互換性のためのフォールバックとして残ります。
 zc-config-group-foundation = 基盤

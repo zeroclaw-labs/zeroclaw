@@ -436,6 +436,7 @@ zc-model-switch-provider-ok = model_provider cambiado a { $provider } (modelo: {
 zc-model-switch-failed = Error al cambiar de modelo: { $error }
 zc-model-catalog-no-provider = No se pudo resolver el model_provider de este agente desde la configuración.
 zc-model-catalog-empty = No hay modelos disponibles para el model_provider activo.
+zc-model-catalog-failed = No se pudieron cargar los modelos del model_provider activo: { $error }
 zc-model-catalog-loading = Cargando modelos…
 zc-model-provider-catalog-failed = No se pudieron cargar los model_providers: { $error }
 zc-chat-label-you = Tú:
@@ -461,6 +462,7 @@ zc-chat-help-yank-selection = Copiar selección
 zc-chat-help-return-to-input = Volver a la entrada
 zc-chat-help-browse-mode = Modo de navegación
 zc-chat-help-scroll-conversation = Desplazar conversación
+zc-chat-help-open-link = Haz clic en un enlace para abrirlo; arrastra desde otro lugar para seleccionar texto
 zc-chat-help-toggle-thoughts = Alternar pensamientos
 zc-chat-help-new-session = Nueva sesión
 zc-chat-session-list-resume-title = Sesiones guardadas (Intro=reanudar, Esc=nueva)
@@ -479,6 +481,10 @@ zc-chat-copied-clipboard = Copiado al portapapeles
 zc-chat-copy-message = [Copiar]
 zc-chat-copy-message-copied = [Copiado]
 zc-chat-context-menu-copy = Copiar
+zc-chat-context-menu-copy-selection = Copiar selección
+zc-chat-context-menu-open-link = Abrir enlace
+zc-chat-context-menu-copy-link = Copiar enlace
+zc-chat-open-link-failed = No se pudo abrir el enlace: { $error }
 zc-chat-context-menu-send-now = Enviar ahora
 zc-chat-context-menu-edit = Editar
 zc-chat-context-menu-delete = Eliminar
@@ -573,6 +579,11 @@ zc-config-footer-action-help = ayuda
 zc-config-footer-action-new-line = nueva línea
 zc-config-field-edit-hint = { $keys } → presiona para editar
 zc-doctor-log-path = log: { $path }
+
+zc-oidc-enroll-visit = Para iniciar sesión, abre { $uri } e introduce el código { $code }
+zc-oidc-enroll-waiting = Esperando la aprobación del proveedor de identidad (el código caduca en { $seconds } segundos)...
+zc-oidc-enroll-missing-url = auth_provider { $provider } está configurado sin auth_token. Configura [connection.wss] enroll_url con el origen HTTP de la pasarela para iniciar sesión interactivamente, o exporta ZEROCLAW_AUTH_TOKEN (ver: zeroclaw oidc login).
+zc-oidc-enroll-done = Sesión iniciada. El token se conserva solo durante esta sesión; exporta ZEROCLAW_AUTH_TOKEN para omitir la inscripción la próxima vez.
 
 ## Config registry metadata. Stable identifiers are used for lookup while the
 ## RPC-provided English display strings remain compatibility fallbacks.

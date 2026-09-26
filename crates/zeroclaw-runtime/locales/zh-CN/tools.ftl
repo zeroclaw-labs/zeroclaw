@@ -1,4 +1,4 @@
-tool-backup = 创建、列出、验证和恢复工作区备份
+tool-backup = 创建、列出、验证和恢复共享数据目录备份
 tool-browser = 使用可插拔后端（agent-browser、rust-native、computer_use）进行网页/浏览器自动化。支持 DOM 操作以及通过 computer-use 边车进行的可选系统级操作（mouse_move、mouse_click、mouse_drag、key_type、key_press、screen_capture）。使用 'snapshot' 将交互元素映射到引用（@e1、@e2）。对 open 操作强制执行 browser.allowed_domains。
 tool-browser-delegate = 将基于浏览器的任务委托给具备浏览器能力的 CLI，用于与 Teams、Outlook、Jira、Confluence 等 Web 应用进行交互
 tool-browser-open = 在系统浏览器中打开经批准的 HTTPS URL。安全约束：仅限允许列表中的域名，不允许本地/私有主机，不允许抓取。
@@ -34,7 +34,7 @@ tool-cron-remove = 按 id 移除一个 cron 任务
 tool-cron-run = 立即强制运行一个 cron 任务并记录运行历史
 tool-cron-runs = 列出某个 cron 任务的近期运行历史
 tool-cron-update = 修补现有的 cron 任务（schedule、command、prompt、enabled、delivery、model 等）
-tool-data-management = 工作区数据保留、清除和存储统计
+tool-data-management = 共享数据目录保留预览和存储统计
 tool-delegate = 将子任务委托给专门的 agent。适用场景：某项任务受益于不同的模型（例如快速摘要、深度推理、代码生成）。默认情况下子 agent 运行单个提示词；当 agentic=true 时，它可以通过经过筛选的工具调用循环进行迭代。
 tool-file-edit = 通过将精确匹配的字符串替换为新内容来编辑文件
 tool-file-download = 从配置的远程端点下载文件并将其写入代理的工作区。提供要获取的文档标识符和工作区相对目标路径；端点 URL 由主机配置固定，永远不受模型控制。字节直接流式写入磁盘，不会加载到模型上下文中。返回 HTTP 状态、写入的字节数和目标路径。
@@ -99,7 +99,7 @@ tool-project-intel = 项目交付智能：生成状态报告、检测风险、�
 tool-proxy-config = 管理 ZeroClaw 代理设置（范围：environment | zeroclaw | services），包括运行时和进程环境变量应用
 tool-pushover = 向你的设备发送 Pushover 通知。需要 .env 文件中的 PUSHOVER_TOKEN 和 PUSHOVER_USER_KEY。
 tool-schedule = 管理仅限 shell 的定时任务。操作：create/add/once/list/get/cancel/remove/pause/resume。警告：此工具创建的 shell 任务输出仅被记录，不会投递到任何频道。要向 Discord/Telegram/Slack/Matrix 发送定时消息，请使用 cron_add 工具，并设置 job_type='agent' 和如 {"{"}"mode":"announce","channel":"discord","to":"<channel_id>"{"}"} 的 delivery 配置。
-tool-screenshot = 捕获当前屏幕的截图。返回文件路径和 base64 编码的 PNG 数据。
+tool-screenshot = 捕获当前屏幕的截图。返回已保存文件的路径。
 tool-browser-screenshot-error-path-not-allowed = 截图路径 '{ $path }' 不在工作区允许列表中
 tool-browser-screenshot-error-parent-not-exist = 截图路径 '{ $path }' 的父目录 '{ $parent }' 不存在
 tool-browser-screenshot-error-path-outside-workspace = 截图路径 '{ $path }' 解析为 '{ $canonical }'，位于工作区之外

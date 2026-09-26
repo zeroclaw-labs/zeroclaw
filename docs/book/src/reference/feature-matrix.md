@@ -13,7 +13,7 @@ The generated **ZeroClaw** sections below each reflect a specific source: the cu
 | Experimental | 🧪 | Present but may change; validate before depending on it |
 | Planned | 📋 | Tracked but not yet implemented |
 | None | ❌ | Not available on that runtime |
-| Unknown | ❓ | Parity not yet recorded for that runtime |
+| Unknown | ❓ | Support not established: not yet assessed or the available evidence is inconclusive |
 
 ## Runtime and deployment modes
 

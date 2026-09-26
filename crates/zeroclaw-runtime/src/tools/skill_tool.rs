@@ -358,6 +358,10 @@ fn narrow_schema(
 
 #[async_trait]
 impl Tool for SkillBuiltinTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        self.target_tool.requires_unrestricted_principal()
+    }
+
     fn name(&self) -> &str {
         &self.tool_name
     }
@@ -617,6 +621,80 @@ mod tests {
         let result = tool.execute(serde_json::json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("hello-skill"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn skill_shell_preserves_inherited_powershell_cache_path() {
+        const CHILD: &str = "ZEROCLAW_SKILL_CACHE_TEST_CHILD";
+        const KEY: &str = "PSModuleAnalysisCachePath";
+        const VALUE: &str = r"C:\synthetic cache\ModuleAnalysisCache";
+
+        if let Ok(case) = std::env::var(CHILD) {
+            let expected = match case.as_str() {
+                "present" => Some(VALUE),
+                "absent" => None,
+                _ => panic!("unknown cache forwarding test case"),
+            };
+            assert_eq!(std::env::var(KEY).ok().as_deref(), expected);
+            let workspace = tempfile::tempdir().unwrap();
+            let security = Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Supervised,
+                workspace_dir: workspace.path().to_path_buf(),
+                allowed_commands: vec!["set".into()],
+                ..SecurityPolicy::default()
+            });
+            let skill = SkillTool {
+                name: "cache_probe".into(),
+                description: "Read the inherited cache variable".into(),
+                kind: "shell".into(),
+                command: format!("set {KEY}"),
+                args: HashMap::new(),
+                target: None,
+                locked_args: HashMap::new(),
+                timeout_secs: None,
+            };
+            let tool = SkillShellTool::new_with_runtime(
+                "test",
+                &skill,
+                security,
+                Arc::new(NativeRuntime::with_shell("cmd".into())),
+            );
+            let result = tool.execute(serde_json::json!({})).await.unwrap();
+            if let Some(value) = expected {
+                assert!(result.success, "{:?}", result.error);
+                assert_eq!(result.output.trim(), format!("{KEY}={value}"));
+            } else {
+                assert!(!result.success);
+                assert!(result.output.trim().is_empty());
+                assert!(result.error.as_deref().unwrap_or_default().contains(KEY));
+            }
+            return;
+        }
+
+        // Each case gets its own inherited environment, without racing other tests.
+        for case in ["present", "absent"] {
+            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+            child.args([
+                "--exact",
+                "tools::skill_tool::tests::skill_shell_preserves_inherited_powershell_cache_path",
+            ]).env(CHILD, case).kill_on_drop(true);
+            if case == "present" {
+                child.env(KEY, VALUE);
+            } else {
+                child.env_remove(KEY);
+            }
+            let output = tokio::time::timeout(Duration::from_secs(120), child.output())
+                .await
+                .expect("isolated cache test timed out")
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(), "{case}: {stdout}");
+            assert!(
+                stdout.contains("1 passed;"),
+                "exact child test was not executed: {stdout}"
+            );
+        }
     }
 
     #[cfg(windows)]

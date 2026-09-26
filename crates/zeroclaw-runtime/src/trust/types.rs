@@ -58,8 +58,7 @@ impl TrustTracker {
 
     /// Get current trust score for domain (initializes if missing)
     pub fn get_score(&mut self, domain: &str) -> f64 {
-        self.ensure_domain(domain);
-        self.scores[domain].score
+        self.ensure_domain(domain).score
     }
 
     /// Record a correction event — reduces trust
@@ -69,11 +68,11 @@ impl TrustTracker {
         correction_type: CorrectionType,
         description: &str,
     ) {
-        self.ensure_domain(domain);
         let now = Utc::now();
+        let correction_penalty = self.config.correction_penalty;
 
-        let score = self.scores.get_mut(domain).unwrap();
-        score.score = (score.score - self.config.correction_penalty).max(0.0);
+        let score = self.ensure_domain(domain);
+        score.score = (score.score - correction_penalty).max(0.0);
         score.last_updated = now;
         score.event_count += 1;
 
@@ -87,11 +86,11 @@ impl TrustTracker {
 
     /// Record a success — small boost to trust
     pub fn record_success(&mut self, domain: &str) {
-        self.ensure_domain(domain);
         let now = Utc::now();
+        let success_boost = self.config.success_boost;
 
-        let score = self.scores.get_mut(domain).unwrap();
-        score.score = (score.score + self.config.success_boost).min(1.0);
+        let score = self.ensure_domain(domain);
+        score.score = (score.score + success_boost).min(1.0);
         score.last_updated = now;
         score.event_count += 1;
     }
@@ -174,18 +173,16 @@ impl TrustTracker {
         &self.config
     }
 
-    fn ensure_domain(&mut self, domain: &str) {
-        if !self.scores.contains_key(domain) {
-            self.scores.insert(
-                domain.to_string(),
-                TrustScore {
-                    domain: domain.to_string(),
-                    score: self.config.initial_score,
-                    last_updated: Utc::now(),
-                    event_count: 0,
-                },
-            );
-        }
+    fn ensure_domain(&mut self, domain: &str) -> &mut TrustScore {
+        let initial_score = self.config.initial_score;
+        self.scores
+            .entry(domain.to_string())
+            .or_insert_with(|| TrustScore {
+                domain: domain.to_string(),
+                score: initial_score,
+                last_updated: Utc::now(),
+                event_count: 0,
+            })
     }
 }
 

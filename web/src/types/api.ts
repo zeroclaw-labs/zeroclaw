@@ -272,6 +272,7 @@ export interface WsMessage {
   arguments_summary?: string;
   timeout_secs?: number;
   dropped_messages?: number;
+  dropped_turns?: number;
   kept_turns?: number;
   reason?: string;
   // Safety-safeguard fallback notice (server → client), present only on

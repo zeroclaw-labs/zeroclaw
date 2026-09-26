@@ -165,6 +165,15 @@ cli-auth-login-about = Login with OAuth (OpenAI Codex, Gemini, or xAI)
 cli-auth-refresh-about = Refresh OAuth access token using refresh token
 cli-auth-logout-about = Remove auth profile
 cli-auth-use-about = Set active profile for a provider
+cli-oidc-unknown-alias = No [oidc.{ $alias }] entry in the config. Configured entries: { $known }
+cli-oidc-device-visit = To sign in, visit { $uri } and enter code { $code }
+cli-oidc-device-waiting = Waiting for identity-provider approval (the code expires in { $seconds } seconds)...
+cli-oidc-device-expired = The device code expired before approval; run the command again.
+cli-oidc-enrolled = Enrolled with [oidc.{ $alias }]. The access token is on stdout; present it as auth_token in the RPC handshake or export it as ZEROCLAW_AUTH_TOKEN.
+cli-oidc-token-expiry = The token expires in { $seconds } seconds.
+cli-oidc-browser-open = Opening your browser to sign in. If nothing opens, visit:
+    { $uri }
+cli-oidc-browser-waiting = Waiting for the browser sign-in to complete...
 cli-auth-list-about = List auth profiles
 cli-auth-status-about = Show auth status with active profile and token expiry info
 
@@ -932,6 +941,8 @@ cli-config-secret-set = {$path} is set (encrypted secret — value not displayed
 cli-config-secret-unset = {$path} is not set (encrypted secret)
 cli-config-updated = {$path} updated.
 cli-config-review-hint = Run `zeroclaw config list` to review, then set required fields.
+cli-config-catalog-unavailable-manual = {"  "}⚠ Catalog for {$provider} is unavailable ({$error}); enter the model ID manually.
+model-switch-catalog-failed = Could not load catalog for configured provider profile {$provider}: {$error}
 cli-config-backed-up = Backed up to {$path}
 cli-plugin-name-version = Plugin: {$name} v{$version}
 cli-plugin-description = Description: {$desc}
@@ -1035,7 +1046,7 @@ turn-context-window-exceeded-error = This request exceeds the selected model's c
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 # Reason carried on every history_trimmed event (WS, SSE, ACP).
 history-trim-reason-budget = context token budget exceeded
-history-trim-reason-message-cap = history message limit exceeded
+history-trim-reason-message-cap = history turn limit exceeded
 history-trim-reason-recovery = context window overflow recovery
 # Remediation surfaced when the system prompt + inlined tool definitions alone
 # meet or exceed the context budget, so no amount of conversation trimming can
@@ -1165,6 +1176,43 @@ cli-alias-live-acp-sessions = {$count} live ACP session(s) for `{$alias}` — en
 cli-alias-owned-state-unavailable = note: config references were updated, but the agent's owned state (memory rows, workspace dir, cron/acp/session rows) was NOT cascaded by this CLI yet — use the gateway API for the full owned-state cascade.
 cli-bundle-not-configured = skill bundle '{$alias}' is not configured
 cli-bundle-rename-failed = rename failed: {$error}
+
+# ── Agent bundle export — zeroclaw agents export ──
+cli-agent-export-workspace-root-escape = the agent workspace {$path} is not reachable through real directories under the install's agents tree: {$at} is a symlink or leaves that tree, so the copy cannot prove what it would carry
+cli-agent-export-skill-root-escape = skill bundle `{$alias}` at {$path} is not reachable through real directories under the install's shared tree: {$at} is a symlink or leaves that tree, so the copy cannot prove what it would carry
+cli-agent-export-path-unresolvable = {$path} reaches through `..` inside a directory that does not exist yet, so what it names cannot be checked before the export writes; write the path without `..`
+cli-agent-export-source-not-a-directory = {$path} exists but is not a directory; the export refuses to publish a bundle that silently lacks the source it names
+cli-agent-export-workspace-path-unresolvable = the configured workspace path {$path} does not end in a plain directory name, so the export cannot bind what it copies to what it checked; set `workspace.path` to the resolved directory and export again
+cli-agent-export-source-root-replaced = {$path} was replaced while the export was opening it; the copy carries the tree it inspected or nothing at all, so run the export again
+cli-agent-export-workspace-root-symlink = the agent workspace {$path} is a symlink; the bundle would carry whatever it points at as the agent's own tree, so set `workspace.path` to the real directory and export again
+cli-agent-export-skill-root-symlink = skill bundle `{$alias}` resolves to the symlink {$path}; a bundle directory must be a real directory inside the install's shared tree
+cli-agent-export-dest-not-a-dir = destination {$path} exists and is not a directory
+cli-agent-export-dest-symlink = destination {$path} is a symlink; publishing would replace whatever it points at rather than the path you named, so name the directory itself
+cli-agent-export-dest-appeared = destination {$path} did not exist when the export started and does now; replacing it was never admitted, so nothing was written
+cli-agent-export-dest-changed = destination {$path} is not the directory this export checked before copying; nothing was replaced, so look at what is there and export again
+cli-agent-export-dest-is-source = destination {$path} is now one of the trees this export read; publishing would replace the source it just copied, so nothing was written
+cli-agent-export-dest-not-empty = destination {$path} is not empty — pass --force to replace its contents
+cli-agent-export-dest-no-parent = destination {$path} has no parent directory to stage the bundle beside
+cli-agent-export-dest-contains-workspace = destination {$path} contains the agent workspace {$workspace} — exporting there would replace the workspace itself
+cli-agent-export-dest-inside-workspace = destination {$path} is inside the agent workspace {$workspace} — choose a path outside it
+cli-agent-export-dest-contains-skills = destination {$path} contains skill bundle `{$alias}` at {$source} — exporting there would replace the skills the bundle carries
+cli-agent-export-dest-inside-skills = destination {$path} is inside skill bundle `{$alias}` at {$source} — choose a path outside it
+cli-agent-export-restore-failed = failed to publish the bundle to {$path} ({$error}), and the previous bundle could not be moved back — it is at {$retired}
+cli-agent-export-written = exported agent `{$alias}` to {$path} ({$files} workspace file(s), {$kib} KiB)
+cli-agent-export-skills-carried = {"  "}{$files} skill file(s) carried from {$bundles} skill bundle(s)
+cli-agent-export-replaced-skipped = {"  "}{$count} entry/entries were replaced while the export ran and were skipped — the bundle carries the objects it inspected
+cli-agent-export-hard-links-skipped = {"  "}{$count} hard-linked file(s) skipped — a second name for a file that may live anywhere on this host is not this workspace's content to carry
+cli-agent-export-others-skipped = {"  "}{$count} special file(s) skipped — sockets, FIFOs, and devices are host state, not content a bundle can carry
+cli-agent-export-symlinks-skipped = {"  "}{$count} symlink(s) skipped — links are not followed into a bundle
+cli-agent-export-risk-header = ⚠️  {$count} capability grant(s) an importing operator must accept:
+cli-agent-export-risk-entry = {"  "}[{$kind}] {$path} — {$detail}
+cli-agent-export-secrets-header = 🔑 {$count} credential(s) were scrubbed and must be supplied on import:
+cli-agent-export-secrets-entry = {"  "}{$path}
+cli-agent-export-dropped-header = ℹ️  {$count} item(s) could not travel and were left behind:
+cli-agent-export-dropped-entry = {"  "}{$path} ({$reason}) — {$detail}
+cli-agent-export-scrub-scope = ⚠️  Scrubbing blanks the fields the schema marks secret. It is not credential detection: other config values travel as written, so a token in an MCP server's url, or a credential in its command or args, is carried and repeated in the manifest's risk flags.
+cli-agent-export-content-not-scrubbed = ⚠️  {$count} carried file(s) are copied as-is. Scrubbing covers config.toml only: workspace and skill content is never scanned for secrets, so a .env file, a token in a note, or a credential in a git remote will be contained in the export.
+cli-agent-export-review-hint = Review config.toml, zeroclaw-agent.toml, and the files the bundle carries before sharing it.
 
 # ── Skill-bundle CLI — zeroclaw skills bundle {add,remove,rename} (#7468 / #7175) ──
 cli-bundle-exists = skill bundle '{$alias}' already exists (no change)
@@ -1343,6 +1391,19 @@ channel-approval-opt-reject = Reject
 channel-approval-opt-reject-with-edit = Reject with edit
 tool-git-operations-error-docker-runtime-write-unsupported = Git write commands are unavailable with the Docker runtime because they cannot be confined to its container.
 
+# ── RPC inbound authentication ──
+rpc-auth-required-token = Authentication required: present auth_token in initialize, or connect from a mapped local uid
+rpc-auth-credential-rejected = Credential rejected
+rpc-auth-credential-expired = Credential expired: re-initialize with a fresh token
+rpc-auth-assurance-required = Authentication assurance not met (MFA/ACR required)
+rpc-auth-unknown-provider = Unknown auth_provider selection
+rpc-auth-not-entitled = Authenticated, but no permission profile grants this identity anything
+rpc-auth-alias-not-entitled = Principal is not entitled to the requested agent
+rpc-auth-misconfigured = Authentication is misconfigured on this daemon (fail closed)
+rpc-auth-local-roster-required = A local user roster is configured: connect from a mapped uid or present auth_token in initialize
+rpc-auth-remote-token-required = Remote connections must present auth_token in initialize
+rpc-auth-first-call-initialize = First call must be 'initialize'
+rpc-auth-revalidation-due = Credential revalidation due: re-initialize to revalidate
 rpc-auth-pairing-revoked = Pairing token revoked: re-pair and re-initialize
 
 cron-agent-job-failed = The scheduled task could not be completed. Please try again or ask an administrator to check the logs.

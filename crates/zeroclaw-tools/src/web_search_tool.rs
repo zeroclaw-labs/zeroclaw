@@ -4120,14 +4120,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_serply_connection_refused_error_is_query_free() {
-        // Bind then drop an ephemeral port so the connect is refused
-        // deterministically without touching the network.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        // Reserve the port without listening so parallel tests cannot reuse it
+        // before the request and turn connection refusal into a different error.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = socket.local_addr().unwrap();
 
         let (_tmp, tool) = serply_tool_with_key("serply-test-key");
         let client = reqwest::Client::builder()
+            .no_proxy()
             .timeout(Duration::from_secs(5))
             .build()
             .expect("client builder should succeed without a proxy");

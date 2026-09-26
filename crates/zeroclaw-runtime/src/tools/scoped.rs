@@ -60,6 +60,74 @@ impl ScopedToolRegistry {
         self.0.retain(f);
     }
 
+    /// Re-point the forwarded client environment of the shell tool in an
+    /// ALREADY-sealed registry to `env` (already filtered for the current
+    /// connection's entitlement; empty overlays nothing). A reused session's
+    /// canonical agent keeps the shell tool it was built with, whose
+    /// environment was filtered for the ORIGINAL connection; on reuse under a
+    /// re-derived entitlement (a principal that lost `admin`, a WSS reconnect
+    /// describing another host) that stale environment must be re-derived, or
+    /// the resumed session would keep overlaying the first connection's
+    /// forwarded shell environment onto its subprocesses.
+    ///
+    /// This mutates the existing tool in place through its wrapper chain
+    /// (`Tool::rebind_forwarded_env` is forwarded by the rate-limit/path-guard
+    /// wrappers), so the sandbox, rate limiter and timeout the seal installed
+    /// are preserved — only the forwarded environment changes. It never adds or
+    /// removes a tool name.
+    pub(crate) fn rebind_shell_env(&self, env: Option<std::collections::HashMap<String, String>>) {
+        for tool in self.0.iter() {
+            if tool.name() == "shell" {
+                tool.rebind_forwarded_env(env.clone());
+            }
+        }
+    }
+
+    /// Rebind the memory-backed tools of an ALREADY-sealed registry to a new
+    /// backend handle. Session memory follows its owner: when a session is
+    /// pinned to a principal's private plane the memory tools — which each
+    /// captured a clone of the shared handle at assembly — must be re-pointed
+    /// at the routed handle, or an owned session would keep issuing shared-plane
+    /// recall/store/export/delete while the agent reports its memory as private.
+    ///
+    /// This replaces the SAME named memory tools in place with fresh instances
+    /// over `memory`; it never introduces a new tool name, so the surface the
+    /// seal admitted is unchanged. Any memory tool already withdrawn by policy
+    /// narrowing stays withdrawn (only tools currently present are rebound).
+    pub(crate) fn rebind_memory_tools(
+        &mut self,
+        memory: Arc<dyn zeroclaw_memory::Memory>,
+        security: Arc<SecurityPolicy>,
+    ) {
+        use zeroclaw_tools::{
+            memory_export::MemoryExportTool, memory_forget::MemoryForgetTool,
+            memory_purge::MemoryPurgeTool, memory_recall::MemoryRecallTool,
+            memory_store::MemoryStoreTool,
+        };
+        for tool in self.0.iter_mut() {
+            let replacement: Option<Box<dyn Tool>> = match tool.name() {
+                "memory_store" => Some(Box::new(MemoryStoreTool::new(
+                    Arc::clone(&memory),
+                    Arc::clone(&security),
+                ))),
+                "memory_recall" => Some(Box::new(MemoryRecallTool::new(Arc::clone(&memory)))),
+                "memory_forget" => Some(Box::new(MemoryForgetTool::new(
+                    Arc::clone(&memory),
+                    Arc::clone(&security),
+                ))),
+                "memory_export" => Some(Box::new(MemoryExportTool::new(Arc::clone(&memory)))),
+                "memory_purge" => Some(Box::new(MemoryPurgeTool::new(
+                    Arc::clone(&memory),
+                    Arc::clone(&security),
+                ))),
+                _ => None,
+            };
+            if let Some(replacement) = replacement {
+                *tool = replacement;
+            }
+        }
+    }
+
     /// Test-only constructor that mints a registry directly from raw tools,
     /// bypassing [`Self::assemble`]. Gated to `test` (this crate's own unit
     /// tests) OR the `test-util` feature (so OTHER crates' test builds -
@@ -148,9 +216,16 @@ pub struct ScopedAssembled {
     /// resources are granted. Private for the same reason as [`Self::deferred_section`]
     /// above - access via the same two accessor patterns.
     pinned_section: String,
+    /// The same pinned resources as attributed blocks (`<server>__<uri>` key plus the
+    /// rendered text), for holders that must be able to withdraw a block when the
+    /// caller's tool selector later narrows past its key. Always renders to exactly
+    /// [`Self::pinned_section`].
+    pinned_blocks: Vec<tools::mcp_context::PinnedResourceBlock>,
     /// Live handle to the activated deferred-MCP set (present only when a deferred
     /// `tool_search` tool was registered).
     pub activated_handle: Option<Arc<std::sync::Mutex<ActivatedToolSet>>>,
+    /// The same search instance exposed in the registry, for session narrowing.
+    pub tool_search_handle: Option<Arc<tools::ToolSearchTool>>,
     pub mcp_tool_names: HashSet<String>,
 }
 
@@ -182,6 +257,12 @@ impl ScopedAssembled {
     /// The pinned-MCP-resources section on its own. See [`Self::deferred_section`].
     pub fn pinned_section(&self) -> &str {
         &self.pinned_section
+    }
+
+    /// The pinned resources as attributed blocks, for a holder that re-renders the
+    /// section itself and prunes blocks on live tool narrowing (`Agent`).
+    pub fn pinned_blocks(&self) -> &[tools::mcp_context::PinnedResourceBlock] {
+        &self.pinned_blocks
     }
 }
 
@@ -302,7 +383,9 @@ impl ScopedToolRegistry {
         // (`run`, `process_message`) append this onto their `deferred_section` copy;
         // `from_config` injects it into the Agent's distinct pinned-section slot.
         let mut pinned_section = String::new();
+        let mut pinned_blocks = Vec::new();
         let mut activated_handle: Option<Arc<std::sync::Mutex<ActivatedToolSet>>> = None;
+        let mut tool_search_handle = None;
         let mut mcp_elevation_arcs: Vec<Arc<dyn Tool>> = Vec::new();
         // MCP-origin ground truth for the tool_filter_groups gates; see
         // the `ScopedAssembled::mcp_tool_names` field doc for the contract.
@@ -388,12 +471,14 @@ impl ScopedToolRegistry {
                         mcp_tool_names.insert(capability_name);
                     }
                 }
-                pinned_section = tools::mcp_context::build_pinned_resources_section(
+                pinned_blocks = tools::mcp_context::build_pinned_resource_blocks(
                     &registry,
                     &agent_mcp_servers,
                     mcp_policy.as_ref(),
                 )
                 .await;
+                pinned_section =
+                    tools::mcp_context::render_pinned_resources_section(&pinned_blocks);
                 if config.mcp.deferred_loading {
                     let deferred_set = tools::DeferredMcpToolSet::from_registry(
                         Arc::clone(&registry),
@@ -505,7 +590,11 @@ impl ScopedToolRegistry {
                         );
                         let mut tool_search =
                             tools::ToolSearchTool::new(filtered_deferred, activated);
-                        if let Some(policy) = mcp_policy {
+                        if let Some(mut policy) = mcp_policy {
+                            // The caller ceiling already materialized the stub
+                            // registry above. Do not retain a second, stale
+                            // principal selector in the long-lived search tool.
+                            policy.caller_allowed = None;
                             tool_search = tool_search.with_access_policy(policy);
                         }
                         // Newly-activated deferred tools are also exposed to the
@@ -521,7 +610,9 @@ impl ScopedToolRegistry {
                                 }
                             }));
                         }
-                        tools_registry.push(Box::new(tool_search));
+                        let tool_search = Arc::new(tool_search);
+                        tool_search_handle = Some(Arc::clone(&tool_search));
+                        tools_registry.push(Box::new(tools::ArcToolRef(tool_search)));
                     }
                 } else {
                     let names = registry.tool_names();
@@ -616,6 +707,11 @@ impl ScopedToolRegistry {
             }
         }
 
+        if caller_allowed.is_some_and(|allowed| !allowed.iter().any(|name| name == "tool_search")) {
+            tools_registry.retain(|tool| tool.name() != "tool_search");
+            deferred_section.clear();
+        }
+
         ScopedAssembled {
             registry: ScopedToolRegistry(tools_registry),
             delegate_handle,
@@ -626,7 +722,9 @@ impl ScopedToolRegistry {
             channel_room_handle,
             deferred_section,
             pinned_section,
+            pinned_blocks,
             activated_handle,
+            tool_search_handle,
             mcp_tool_names,
         }
     }
@@ -1547,7 +1645,9 @@ mod tests {
             channel_room_handle: None,
             deferred_section: deferred.to_string(),
             pinned_section: pinned.to_string(),
+            pinned_blocks: Vec::new(),
             activated_handle: None,
+            tool_search_handle: None,
             mcp_tool_names: HashSet::new(),
         }
     }

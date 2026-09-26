@@ -87,6 +87,10 @@ fn child_run_overrides(policy: Arc<SecurityPolicy>) -> AgentRunOverrides {
 
 #[async_trait]
 impl Tool for SpawnSubagentTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         Self::NAME
     }

@@ -1351,7 +1351,7 @@ pub async fn run(
         // ── Effective per-agent runtime tunables ──────────────────────
         // Profile values (when set) override the agent's inline fields.
         // See `Config::resolved_agent_config` for precedence rules.
-        let eff_max_history_messages = agent.resolved.max_history_messages;
+        let eff_max_history_turns = agent.resolved.max_history_messages;
         let eff_compact_context = agent.resolved.compact_context;
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
         let eff_prompt_injection_mode = agent.resolved.prompt_injection_mode;
@@ -1722,7 +1722,7 @@ pub async fn run(
         tool_descs.push(("cron_runs", "Show recent run history for a cron job."));
         tool_descs.push((
         "screenshot",
-        "Capture a screenshot of the current screen. Returns file path and base64-encoded PNG. Use when: visual verification, UI inspection, debugging displays.",
+        "Capture a screenshot of the current screen. Returns the saved file path. Use when: visual verification, UI inspection, debugging displays.",
     ));
         tool_descs.push((
         "image_info",
@@ -2076,7 +2076,7 @@ pub async fn run(
                         TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                             cost_tracking_context.clone(),
                             run_tool_call_loop(ToolLoop {
-                                exec: ResolvedAgentExecution::resolve(
+                                                                exec: ResolvedAgentExecution::resolve(
                                     ResolvedModelAccess {
                                         model_provider: model_provider.as_ref(),
                                         provider_name: &provider_name,
@@ -2984,8 +2984,12 @@ pub async fn run(
                     }
                 }
 
-                // Hard cap as a safety net.
-                trim_history(&mut history, eff_max_history_messages);
+                // Whole-turn retention limit as a safety net.
+                trim_history(
+                    &mut history,
+                    eff_max_history_turns,
+                    &mut history_has_trim_breadcrumb,
+                );
 
                 // Restore base system prompt after the per-turn tool framing
                 // and optional thinking prefix have been applied.
@@ -5941,7 +5945,7 @@ mod tests {
         };
 
         let mut history = vec![ChatMessage::user(
-            "please inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+            "please inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
         )];
         let tools_registry =
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
@@ -6110,8 +6114,15 @@ mod tests {
         let uploads = temp.path().join("uploads");
         std::fs::create_dir(&uploads).unwrap();
         let image_path = uploads.join("cached.png");
-        let original_bytes = [
-            0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 1, 2, 3, 4,
+        // A real decodable 1x1 PNG, not a bare signature: preparation fully
+        // decodes image content now, so bytes that only carry the magic
+        // number are refused and no data URI would ever reach the provider.
+        let original_bytes: [u8; 67] = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
         ];
         let replacement_bytes = vec![
             0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 5, 6, 7, 8,
@@ -6130,9 +6141,10 @@ mod tests {
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
                 CountingTool::new("probe", Arc::clone(&invocations)),
             )]);
+        let marker_path = image_path.to_string_lossy().replace('\\', "/");
         let mut history = vec![ChatMessage::user(format!(
             "inspect [IMAGE:{}]",
-            image_path.display()
+            marker_path
         ))];
         let observer = NoopObserver;
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -6207,7 +6219,7 @@ mod tests {
         // message is plain text.
         let mut history = vec![
             ChatMessage::user(
-                "please inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+                "please inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
             ),
             ChatMessage::user("what is WAL?".to_string()),
         ];
@@ -6306,7 +6318,7 @@ mod tests {
         };
 
         let mut history = vec![ChatMessage::user(
-            "Analyze this [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+            "Analyze this [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
         )];
         let tools_registry =
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
@@ -6386,7 +6398,7 @@ mod tests {
         let mut history = vec![
             ChatMessage::user("inspect the screenshot".to_string()),
             ChatMessage::tool(
-                "File: /tmp/x.png\n[IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+                "File: /tmp/x.png\n[IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
             ),
         ];
         let tools_registry =
@@ -6465,7 +6477,7 @@ mod tests {
         };
 
         let mut history = vec![ChatMessage::user(
-            "inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+            "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
         )];
         let tools_registry =
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
@@ -6739,6 +6751,7 @@ mod tests {
             _until: Option<&str>,
         ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
             Ok(vec![zeroclaw_memory::MemoryEntry {
+                principal_id: None,
                 id: "1".into(),
                 key: "remembered".into(),
                 content: "the server is prod-3".into(),
@@ -6944,7 +6957,7 @@ mod tests {
         };
 
         let mut history = vec![ChatMessage::user(
-            "look [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+            "look [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
         )];
         let tools_registry =
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
@@ -9983,6 +9996,9 @@ mod tests {
             ChatMessage::user("run tool calls"),
         ];
         let observer = NoopObserver;
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(8);
 
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
@@ -10024,11 +10040,11 @@ mod tests {
             channel_name: "matrix",
             channel_reply_target: None,
             cancellation_token: None,
-            on_delta: None,
+            on_delta: Some(delta_tx),
             shared_budget: None,
             channel: None,
             collected_receipts: None,
-            event_tx: None,
+            event_tx: Some(event_tx),
             steering: None,
             new_messages_out: None,
             image_cache: None,
@@ -10057,6 +10073,24 @@ mod tests {
             .filter(|msg| msg.role == "user" && msg.content.contains("[Tool call parse error]"))
             .count();
         assert_eq!(feedback_count, MAX_MALFORMED_TOOL_PROTOCOL_RETRIES);
+
+        let fallback =
+            crate::i18n::get_required_cli_string("channel-runtime-malformed-tool-output");
+        let mut event_chunks = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            if let zeroclaw_api::agent::TurnEvent::Chunk { delta } = event {
+                event_chunks.push(delta);
+            }
+        }
+        assert_eq!(event_chunks, vec![fallback.to_string()]);
+
+        let mut draft_text = Vec::new();
+        while let Some(delta) = delta_rx.recv().await {
+            if let DraftEvent::Text(text) = delta {
+                draft_text.push(text);
+            }
+        }
+        assert_eq!(draft_text, vec![fallback]);
     }
 
     #[tokio::test]
@@ -13901,7 +13935,7 @@ This is an example, not an invocation."#;
         let original_len = history.len();
         assert!(original_len > DEFAULT_MAX_HISTORY_MESSAGES + 1);
 
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES, &mut false);
 
         // System prompt preserved
         assert_eq!(history[0].role, "system");
@@ -13923,7 +13957,7 @@ This is an example, not an invocation."#;
             ChatMessage::user("hello"),
             ChatMessage::assistant("hi"),
         ];
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES, &mut false);
         assert_eq!(history.len(), 3);
     }
 
@@ -14240,7 +14274,7 @@ This is an example, not an invocation."#;
         for i in 0..DEFAULT_MAX_HISTORY_MESSAGES + 20 {
             history.push(ChatMessage::user(format!("msg {i}")));
         }
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES, &mut false);
         assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES);
     }
 
@@ -14252,7 +14286,7 @@ This is an example, not an invocation."#;
             history.push(ChatMessage::user(format!("user {i}")));
             history.push(ChatMessage::assistant(format!("assistant {i}")));
         }
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES, &mut false);
         assert_eq!(history[0].role, "system");
         assert_eq!(history[history.len() - 1].role, "assistant");
     }
@@ -14261,7 +14295,7 @@ This is an example, not an invocation."#;
     fn trim_history_with_only_system_prompt() {
         // Recovery: Only system prompt should not be trimmed
         let mut history = vec![ChatMessage::system("system prompt")];
-        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES);
+        trim_history(&mut history, DEFAULT_MAX_HISTORY_MESSAGES, &mut false);
         assert_eq!(history.len(), 1);
     }
 
@@ -14469,14 +14503,14 @@ Let me check the result."#;
     #[test]
     fn trim_history_empty_history() {
         let mut history: Vec<ChatMessage> = vec![];
-        trim_history(&mut history, 10);
+        trim_history(&mut history, 10, &mut false);
         assert!(history.is_empty());
     }
 
     #[test]
     fn trim_history_system_only() {
         let mut history = vec![ChatMessage::system("system prompt")];
-        trim_history(&mut history, 10);
+        trim_history(&mut history, 10, &mut false);
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].role, "system");
     }
@@ -14488,49 +14522,65 @@ Let me check the result."#;
             ChatMessage::user("msg 1"),
             ChatMessage::assistant("reply 1"),
         ];
-        trim_history(&mut history, 2); // 2 non-system messages = exactly at limit
+        trim_history(&mut history, 1, &mut false);
         assert_eq!(history.len(), 3, "should not trim when exactly at limit");
     }
 
     #[test]
-    fn trim_history_keeps_first_user_anchor_and_recent_tail() {
-        // The framing anchor (first user message) must survive trim so the
-        // model doesn't start a turn thinking "Continue" is the first thing
-        // it ever saw. Middle messages are the ones that get dropped.
+    fn trim_history_keeps_latest_complete_turns() {
         let mut history = vec![
             ChatMessage::system("system"),
-            ChatMessage::user("anchor: what's the task"),
-            ChatMessage::assistant("middle reply 1"),
+            ChatMessage::user("old user"),
+            ChatMessage::assistant("old reply"),
             ChatMessage::user("middle user 1"),
             ChatMessage::assistant("middle reply 2"),
             ChatMessage::user("recent user"),
             ChatMessage::assistant("recent reply"),
         ];
-        // max_history = 3 → keep anchor + 2 most recent (=3 non-system).
-        trim_history(&mut history, 3);
+        trim_history(&mut history, 2, &mut false);
         assert_eq!(history[0].role, "system");
-        assert_eq!(
-            history[1].content, "anchor: what's the task",
-            "first user message (framing anchor) must survive"
-        );
+        assert_eq!(history[1].content, "middle user 1");
         let last = history.last().expect("history not empty");
         assert_eq!(last.content, "recent reply", "tail must be preserved");
     }
 
     #[test]
-    fn trim_history_falls_back_to_tail_when_max_history_is_one() {
-        // With max_history=1 there's no room for both anchor and tail; fall
-        // back to plain head-drop so we don't produce a degenerate window.
+    fn trim_history_keeps_newest_incomplete_turn_when_limit_is_one() {
         let mut history = vec![
             ChatMessage::system("system"),
             ChatMessage::user("anchor"),
             ChatMessage::assistant("middle"),
             ChatMessage::user("recent"),
         ];
-        trim_history(&mut history, 1);
+        trim_history(&mut history, 1, &mut false);
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].role, "system");
         assert_eq!(history[1].content, "recent");
+    }
+
+    #[test]
+    fn trim_history_does_not_count_tool_rows_as_turns() {
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("run tools"),
+        ];
+        for index in 0..60 {
+            history.push(ChatMessage::assistant(format!("tool call {index}")));
+            history.push(ChatMessage::user(format!("[Tool results]\nresult {index}")));
+        }
+        history.push(ChatMessage::assistant("done"));
+        let original: Vec<_> = history
+            .iter()
+            .map(|message| (message.role.clone(), message.content.clone()))
+            .collect();
+
+        trim_history(&mut history, 1, &mut false);
+
+        let retained: Vec<_> = history
+            .iter()
+            .map(|message| (message.role.clone(), message.content.clone()))
+            .collect();
+        assert_eq!(retained, original, "tool rows must remain part of one turn");
     }
 
     #[test]
@@ -19065,9 +19115,10 @@ Let me check the result."#;
 
             async fn before_llm_call(
                 &self,
-                _messages: &mut Vec<ChatMessage>,
+                messages: &mut Vec<ChatMessage>,
                 model: &mut String,
             ) -> HookResult<()> {
+                messages.push(ChatMessage::assistant("hook suffix"));
                 if self.calls.fetch_add(1, Ordering::SeqCst) >= 1 {
                     *model = self.next_model.to_string();
                 }
@@ -19386,6 +19437,27 @@ Let me check the result."#;
         if !floor {
             let next = &captured[1];
             assert_eq!(next.model, next_model);
+            assert!(
+                next.messages
+                    .iter()
+                    .any(|m| m.content == "run the tool once"),
+                "normalized results must not displace the newest real user"
+            );
+            assert!(
+                next.messages
+                    .iter()
+                    .any(|m| m.content.contains(&"r".repeat(1600))),
+                "the newest tool result must remain paired with its request"
+            );
+            if !summary {
+                assert_eq!(
+                    next.messages
+                        .iter()
+                        .filter(|m| m.content == "hook suffix")
+                        .count(),
+                    1
+                );
+            }
             assert_eq!(next.schema_tokens > 0, next_model == "native-model");
             assert_eq!(
                 next.messages
@@ -19478,13 +19550,14 @@ Let me check the result."#;
                 zeroclaw_api::agent::TokenCountSource::Estimated
             };
             assert_eq!(*source, Some(expected_source));
-            if summary && !floor {
-                let actual =
-                    estimate_history_tokens(&captured[1].messages) as u64 * usage_multiplier;
+            if !floor {
+                let actual = (estimate_history_tokens(&captured[1].messages)
+                    + captured[1].schema_tokens) as u64
+                    * if calibrated { usage_multiplier } else { 1 };
                 assert_eq!(
                     *tokens_after,
                     Some(actual),
-                    "trim event must count the summary prompt too"
+                    "trim event must count the exact dispatched messages and schemas"
                 );
             }
         }
@@ -19921,8 +19994,11 @@ Let me check the result."#;
     async fn prepared_image_capacity_is_enforced_with_soft_trimming_disabled() {
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("shot.png");
-        let mut image_bytes = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
-        image_bytes.extend(std::iter::repeat_n(0u8, 3_000));
+        // Use a fully decodable image: the multimodal boundary intentionally
+        // rejects files that merely carry a valid signature, and the
+        // capacity estimate charges a fixed per-image cost regardless of size.
+        const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+        let image_bytes = STANDARD.decode(PNG_B64).expect("valid PNG fixture");
         std::fs::write(&image_path, image_bytes).unwrap();
         let history = vec![
             ChatMessage::system("text prompt"),
@@ -20014,12 +20090,10 @@ Let me check the result."#;
 
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("shot.png");
-        // PNG signature plus filler bytes so the base64-expanded payload is
-        // large enough to dwarf the raw `[IMAGE:...]` marker text — the
-        // exact mismatch the gate's heuristic must not misattribute after
-        // the carrying turn is dropped.
-        let mut image_bytes = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
-        image_bytes.extend(std::iter::repeat_n(0u8, 3_000));
+        // Use a fully decodable image: the multimodal boundary intentionally
+        // rejects files that merely carry a valid signature.
+        const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+        let image_bytes = STANDARD.decode(PNG_B64).expect("valid PNG fixture");
         std::fs::write(&image_path, &image_bytes).unwrap();
         let marker = format!("[IMAGE:{}]", image_path.display());
 
