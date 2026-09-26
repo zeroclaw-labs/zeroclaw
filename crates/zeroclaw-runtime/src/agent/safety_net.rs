@@ -2,6 +2,7 @@
 //! known NOT to cover (spec: the eight seams in the consolidation plan).
 
 use super::*;
+use crate::observability;
 use async_trait::async_trait;
 use std::collections::VecDeque;
 use std::ops::{Deref, DerefMut};
