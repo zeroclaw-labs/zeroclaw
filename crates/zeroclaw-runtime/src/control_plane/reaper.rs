@@ -250,6 +250,7 @@ mod tests {
             depth: 0,
             parent_id: None,
             originator_route: None,
+            originator_chain: Vec::new(),
             delivered: false,
             idem_key: None,
             principal_id: None,

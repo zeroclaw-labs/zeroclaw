@@ -13,7 +13,7 @@ use super::task_registry::{
 
 mod goal;
 
-const CONTROL_PLANE_SCHEMA_VERSION: i64 = 8;
+const CONTROL_PLANE_SCHEMA_VERSION: i64 = 9;
 
 pub struct SqliteTaskStore {
     conn: Mutex<Connection>,
@@ -83,6 +83,7 @@ impl SqliteTaskStore {
                  depth           INTEGER NOT NULL DEFAULT 0,
                  parent_id       TEXT,
                  originator_route TEXT,
+                 originator_chain TEXT,
                  delivered       INTEGER NOT NULL DEFAULT 0,
                  idem_key        TEXT,
                  principal_id    TEXT,
@@ -150,6 +151,16 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
              PRAGMA user_version = 8;",
         )
         .context("apply control-plane schema v8")?;
+    }
+    if version < 9 {
+        add_column_if_missing(
+            conn,
+            "tasks",
+            "originator_chain",
+            "ALTER TABLE tasks ADD COLUMN originator_chain TEXT",
+        )?;
+        conn.execute_batch("PRAGMA user_version = 9;")
+            .context("apply control-plane schema v9")?;
     }
     if version > CONTROL_PLANE_SCHEMA_VERSION {
         ::zeroclaw_log::record!(
@@ -225,6 +236,29 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
     let status = status_from_db(&status_s).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into())
     })?;
+    // A chain that does not parse is dropped, not surfaced as a read error: the
+    // row keeps whatever `originator_route` says, so a creator-stamped row loses
+    // ancestor access and nothing else. A row with no creator route either is
+    // indistinguishable from a pre-chain legacy row after this decode; a
+    // non-TEXT value in the column is still a conversion error above.
+    let originator_chain: Vec<String> = match row.get::<_, Option<String>>("originator_chain")? {
+        Some(raw) if !raw.is_empty() => match serde_json::from_str(&raw) {
+            Ok(chain) => chain,
+            Err(_) => {
+                let task_id: String = row.get("id")?;
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "task_id": task_id,
+                        })),
+                    "control-plane: task originator_chain is unreadable and was ignored; the creator route alone governs access"
+                );
+                Vec::new()
+            }
+        },
+        _ => Vec::new(),
+    };
     Ok(TaskRecord {
         id: row.get("id")?,
         kind,
@@ -236,6 +270,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
         depth: row.get::<_, i64>("depth")? as u32,
         parent_id: row.get("parent_id")?,
         originator_route: row.get("originator_route")?,
+        originator_chain,
         delivered: row.get::<_, i64>("delivered")? != 0,
         idem_key: row.get("idem_key")?,
         principal_id: row.get("principal_id")?,
@@ -525,12 +560,19 @@ fn insert_task_record(conn: &Connection, rec: TaskRecord) -> Result<()> {
     // ON CONFLICT DO NOTHING, NOT INSERT OR REPLACE: re-registering an existing id
     // must be a true no-op, never clobber an already-recorded output/error/terminal
     // status back to NULL/running (review finding— the documented idempotency).
+    // The chain is stored as a JSON string array; an empty chain stays NULL so
+    // pre-chain rows and non-delegate rows are indistinguishable at rest.
+    let originator_chain_db = if rec.originator_chain.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&rec.originator_chain).ok()
+    };
     conn.execute(
         "INSERT INTO tasks
             (id, kind, agent, status, owner_pid, owner_boot_id, heartbeat_at, depth,
-             parent_id, originator_route, delivered, idem_key, principal_id,
+             parent_id, originator_route, originator_chain, delivered, idem_key, principal_id,
              started_at, finished_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
          ON CONFLICT(id) DO NOTHING",
         params![
             rec.id,
@@ -543,6 +585,7 @@ fn insert_task_record(conn: &Connection, rec: TaskRecord) -> Result<()> {
             rec.depth as i64,
             rec.parent_id,
             rec.originator_route,
+            originator_chain_db,
             rec.delivered as i64,
             rec.idem_key,
             rec.principal_id,
@@ -959,6 +1002,7 @@ mod tests {
             depth: 0,
             parent_id: None,
             originator_route: None,
+            originator_chain: Vec::new(),
             delivered: false,
             idem_key: None,
             principal_id: None,
@@ -1010,6 +1054,98 @@ mod tests {
 
         assert_eq!(version, CONTROL_PLANE_SCHEMA_VERSION);
         assert_eq!(outbox_exists, 1);
+    }
+
+    #[tokio::test]
+    async fn originator_chain_round_trips_and_migrates() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        // A chained row round-trips root-first, ending at the creating caller.
+        let mut chained = rec("chain", "main", 1, "boot-1");
+        chained.originator_route = Some("middle".into());
+        chained.originator_chain = vec!["root".into(), "middle".into()];
+        s.create(chained).await.unwrap();
+        let got = s.get("chain").await.unwrap().unwrap();
+        assert_eq!(got.originator_route.as_deref(), Some("middle"));
+        assert_eq!(
+            got.originator_chain,
+            vec!["root".to_string(), "middle".to_string()]
+        );
+
+        // An empty chain stores NULL and reads back empty.
+        s.create(rec("no-chain", "main", 1, "boot-1"))
+            .await
+            .unwrap();
+        let got = s.get("no-chain").await.unwrap().unwrap();
+        assert!(got.originator_chain.is_empty());
+        {
+            let conn = s.conn.lock();
+            let stored: Option<String> = conn
+                .query_row(
+                    "SELECT originator_chain FROM tasks WHERE id = ?1",
+                    params!["no-chain"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                stored.is_none(),
+                "an empty chain is stored as NULL, got {stored:?}"
+            );
+        }
+
+        // A v8 store (tasks table without the column) migrates to v9 on reopen.
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteTaskStore::new(dir.path()).unwrap();
+        {
+            let conn = store.conn.lock();
+            conn.execute_batch(
+                "ALTER TABLE tasks DROP COLUMN originator_chain;
+                 PRAGMA user_version = 8;",
+            )
+            .unwrap();
+        }
+        drop(store);
+
+        let reopened = SqliteTaskStore::new(dir.path()).unwrap();
+        {
+            let conn = reopened.conn.lock();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, CONTROL_PLANE_SCHEMA_VERSION);
+            let has_chain_column: i64 = conn
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM pragma_table_info('tasks')
+                         WHERE name = 'originator_chain'
+                    )",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                has_chain_column, 1,
+                "the v9 migration must add originator_chain to an existing tasks table"
+            );
+        }
+
+        // A malformed chain value fails closed to an empty chain, not an error.
+        reopened
+            .create(rec("migrated", "main", 1, "boot-1"))
+            .await
+            .unwrap();
+        {
+            let conn = reopened.conn.lock();
+            conn.execute(
+                "UPDATE tasks SET originator_chain = 'not json' WHERE id = ?1",
+                params!["migrated"],
+            )
+            .unwrap();
+        }
+        let got = reopened.get("migrated").await.unwrap().unwrap();
+        assert!(
+            got.originator_chain.is_empty(),
+            "an unreadable chain fails closed to the creator route: {got:?}"
+        );
     }
 
     #[tokio::test]

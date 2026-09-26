@@ -226,6 +226,7 @@ impl Tool for SpawnSubagentTool {
                     depth: u32::from(self.is_subagent_caller),
                     parent_id: None,
                     originator_route: None,
+                    originator_chain: Vec::new(),
                     delivered: false,
                     idem_key: None,
                     principal_id: None,
