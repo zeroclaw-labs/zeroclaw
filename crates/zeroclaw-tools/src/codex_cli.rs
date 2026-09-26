@@ -461,6 +461,12 @@ mod tests {
     }
 
     #[test]
+    fn codex_cli_command_args_keep_empty_prompt_after_terminator() {
+        let config = test_config();
+        assert_eq!(codex_exec_args(&config, ""), vec!["exec", "--", ""]);
+    }
+
+    #[test]
     fn codex_cli_default_config_values() {
         let config = CodexCliConfig::default();
         assert!(!config.enabled);
