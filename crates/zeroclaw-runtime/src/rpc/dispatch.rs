@@ -1902,6 +1902,65 @@ impl RpcDispatcher {
         Some(auth.principal.id.as_str().to_owned())
     }
 
+    /// The private-memory scope for `owner` on `agent_alias`: the owner
+    /// composed with the agent dimension. Namespace and tenant are not on the
+    /// RPC wire today, so they resolve to the backend's defaults.
+    fn memory_scope_for(
+        &self,
+        owner: String,
+        agent_alias: &str,
+    ) -> zeroclaw_api::memory_traits::PrincipalScope {
+        zeroclaw_api::memory_traits::PrincipalScope::new(owner)
+            .with_agent(Some(agent_alias.to_string()))
+    }
+
+    /// Which memory plane an RPC memory call acts on.
+    ///
+    /// The plane follows the caller's durable IDENTITY, not the admin bypass:
+    /// a named administrator's memory is their private plane like anyone
+    /// else's, so promoting or demoting a user never hides their notes or
+    /// silently redirects their writes. Only the unauthenticated shared
+    /// operator is on the shared plane by default. A caller may name
+    /// `plane: "shared"` explicitly; that is honoured only for callers with
+    /// the admin bypass (audited), and refused for scoped principals.
+    fn memory_plane(
+        &self,
+        requested: Option<&str>,
+        method: Method,
+    ) -> Result<Option<zeroclaw_api::memory_traits::PrincipalScope>, JsonRpcError> {
+        let owner = self.owner_principal_id();
+        match requested {
+            None | Some("private") => {
+                Ok(owner.map(zeroclaw_api::memory_traits::PrincipalScope::new))
+            }
+            Some("shared") => {
+                if self.scoped_principal_id().is_some() {
+                    return Err(rpc_err(
+                        FORBIDDEN,
+                        "The shared memory plane is not available to scoped principals",
+                    ));
+                }
+                if let Some(actor) = owner {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::System)
+                            .with_attrs(::serde_json::json!({
+                                "method": method.wire_name(),
+                                "principal_id": actor,
+                            })),
+                        "Administrator selected the shared memory plane explicitly"
+                    );
+                }
+                Ok(None)
+            }
+            Some(other) => Err(rpc_err(
+                INVALID_PARAMS,
+                format!("Unknown memory plane {other:?}; expected \"private\" or \"shared\""),
+            )),
+        }
+    }
+
     /// Resolve a session id to the ONE stored resource it names.
     ///
     /// The live incarnation, every chat-backend key the id can be stored
@@ -2098,40 +2157,20 @@ impl RpcDispatcher {
         Ok(current)
     }
 
-    /// Fail-closed memory scoping for scoped principals until
-    /// principal-owned memory lands: session-scoped queries against an
-    /// OWNED session pass; cross-session queries and bare-key operations
-    /// are refused.
-    async fn authorize_memory_access(
-        &self,
-        session_id: Option<&str>,
-        method: Method,
-    ) -> Result<(), JsonRpcError> {
-        if self.scoped_principal_id().is_none() {
-            return Ok(());
-        }
-        // Writes stay closed for scoped principals in this slice: the memory
-        // backend keys rows by (agent, key) with no owner predicate, so an
-        // upsert scoped only by its destination session could still replace
-        // or re-home another principal's row under the same key. Owner-
-        // predicated storage lands with private principal memory; until then
-        // reads are scoped to an owned session and writes are refused.
-        if matches!(method, Method::MemoryStore | Method::MemoryDelete) {
-            return Err(rpc_err(
+    /// Map a private-plane memory error: a backend that has not
+    /// implemented principal scoping FAILS CLOSED as a denial; anything
+    /// else is an internal error.
+    fn map_private_memory_err(e: &anyhow::Error) -> JsonRpcError {
+        let msg = format!("{e:#}");
+        if msg.contains("does not support principal-scoped memory") {
+            rpc_err(
                 FORBIDDEN,
-                "Scoped principals cannot write memory yet: the current backend cannot \
-                 isolate writes by owner, so store and delete remain unscoped-only until \
-                 principal-owned memory lands",
-            ));
-        }
-        match session_id {
-            Some(sid) => self.authorize_session_owner(sid, method).await.map(|_| ()),
-            None => Err(rpc_err(
-                FORBIDDEN,
-                "Scoped principals must scope memory operations to an owned session_id; \
-                 cross-session queries and bare-key memory operations remain \
-                 unscoped-only until principal-owned memory lands",
-            )),
+                "The configured memory backend does not support principal-scoped \
+                 memory; private memory is unavailable for scoped principals on \
+                 this deployment",
+            )
+        } else {
+            rpc_err(INTERNAL_ERROR, format!("Memory operation failed: {msg}"))
         }
     }
 
@@ -3142,6 +3181,26 @@ impl RpcDispatcher {
     }
 
     #[cfg(test)]
+    pub async fn handle_memory_store_for_test(&self, params: &Value) -> RpcResult {
+        self.handle_memory_store(params).await
+    }
+
+    #[cfg(test)]
+    pub async fn handle_memory_get_for_test(&self, params: &Value) -> RpcResult {
+        self.handle_memory_get(params).await
+    }
+
+    #[cfg(test)]
+    pub async fn handle_memory_search_for_test(&self, params: &Value) -> RpcResult {
+        self.handle_memory_search(params).await
+    }
+
+    #[cfg(test)]
+    pub async fn handle_memory_delete_for_test(&self, params: &Value) -> RpcResult {
+        self.handle_memory_delete(params).await
+    }
+
+    #[cfg(test)]
     pub async fn handle_session_messages_for_test(&self, params: &Value) -> RpcResult {
         self.handle_session_messages(params).await
     }
@@ -3197,6 +3256,34 @@ impl RpcDispatcher {
         chat_mode: &crate::rpc::types::ChatMode,
         existing: crate::rpc::session::ResumedRpcSession,
     ) -> RpcResult {
+        // The canonical live agent keeps the shell tool it was built with,
+        // whose forwarded environment was filtered for the connection that
+        // FIRST constructed it. This resume may be a different connection —
+        // the same principal after losing `admin`, a WSS reconnect describing
+        // another host — so re-derive the forwarded shell environment against
+        // THIS connection's own registration before the resumed session runs a
+        // command. The registration env was already filtered for this
+        // connection's entitlement at `initialize` (an environment is retained
+        // only for a local operator, dropped and audited otherwise), so
+        // re-installing it neither widens a scoped principal's environment nor
+        // strands a permitted local operator's. A connection with no retained
+        // environment installs `None`, dropping any environment the prior
+        // incarnation carried.
+        //
+        // Like the approval-channel rebind below, this must NOT make the
+        // reconnect wait on an active turn that owns the Agent mutex: install
+        // the re-derived environment as soon as the predecessor releases the
+        // canonical Agent. The rebind is idempotent and the next turn cannot
+        // start a command before its own `session/prompt` acquires the lock, so
+        // applying it after the in-flight turn drains is correct — an in-flight
+        // command keeps the environment it began with.
+        let resumed_env = self
+            .tui_registration()
+            .and_then(|(id, epoch)| self.ctx.tui_registry.env_for_registration(id, epoch));
+        let env_agent = Arc::clone(&existing.agent);
+        zeroclaw_spawn::spawn!(async move {
+            env_agent.lock().await.rebind_shell_env(resumed_env);
+        });
         self.rebind_rpc_approval_channel(Arc::clone(&existing.agent), session_id.clone());
         if matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
             && let Some(plan) = self.ctx.sessions.get_plan(&session_id).await
@@ -3219,15 +3306,30 @@ impl RpcDispatcher {
         let req: SessionNewParams = parse_params(params)?;
         self.selector_session_agent(Method::SessionNew, &req.agent_alias)?;
         let resuming = req.session_id.is_some();
+        // When resuming an existing session, its DURABLE owner is preserved
+        // through restoration: an administrator restoring another principal's
+        // reaped session must not re-label it as their own or redirect its
+        // memory plane. `None` here means either a genuinely new session (the
+        // caller is stamped below) or a legacy unowned record (which stays
+        // unowned). Only a new session adopts the caller as owner.
+        //
+        // A client-supplied session_id that names NOTHING yet is still a new
+        // session, so `restoring_existing` tracks whether a durable/live
+        // record actually existed, distinct from `resuming` (which is merely
+        // "an id was supplied").
+        let mut preserved_owner: Option<String> = None;
+        let mut restoring_existing = false;
         if let Some(existing) = req.session_id.as_deref() {
             // Resuming targets an EXISTING session: enforce its ownership
             // before any store is touched (scoped principals get the
             // uniform not-found-or-not-owned denial; a brand-new id passes
             // because it exists nowhere yet). The live rebind below repeats
             // the check under the store lock against the exact incarnation.
-            if self.resolve_session_record(existing).await?.is_some() {
+            if let Some(record) = self.resolve_session_record(existing).await? {
                 self.authorize_session_owner(existing, Method::SessionNew)
                     .await?;
+                preserved_owner = record.owner;
+                restoring_existing = true;
             }
         }
         let session_id = req
@@ -3615,6 +3717,33 @@ impl RpcDispatcher {
         if let Some(grants) = grants.as_ref() {
             self.apply_principal_grants_to_agent(grants, &mut agent);
         }
+
+        // The effective owner of the session about to be built: for a
+        // genuine new session (including a client-supplied id that names
+        // nothing yet) it is the caller's durable identity; for a restored
+        // (reaped) session it is the DURABLE owner recorded when the session
+        // was created, so an administrator restoring another principal's
+        // session neither re-labels it nor moves its memory plane (a legacy
+        // unowned record stays unowned).
+        let effective_owner = if restoring_existing {
+            preserved_owner.clone()
+        } else {
+            self.owner_principal_id()
+        };
+
+        // The session's memory follows its OWNER: an owned session works on
+        // the owner's private plane for its whole life, whoever prompts it
+        // later. The shared operator keeps the shared handle.
+        if let Some(owner) = effective_owner.clone() {
+            agent
+                .route_memory_to_principal(self.memory_scope_for(owner, &req.agent_alias))
+                .map_err(|e| {
+                    rpc_err(
+                        INTERNAL_ERROR,
+                        format!("Failed to scope session memory: {e}"),
+                    )
+                })?;
+        }
         agent.set_interaction_context(
             resolved_interaction_surface.map(crate::agent::prompt::InteractionSurface::resolve),
         );
@@ -3635,7 +3764,7 @@ impl RpcDispatcher {
         let candidate =
             super::session::RpcSession::new(agent, &req.agent_alias, &cwd, chat_mode.clone())
                 .with_owner(self.tui_id.clone())
-                .with_owner_principal(self.owner_principal_id());
+                .with_owner_principal(effective_owner.clone());
         let candidate_agent = Arc::clone(&candidate.agent);
         // Fresh sessions must claim capacity before creating durable rows.
         // Only a replacement can keep its existing slot throughout preparation.
@@ -3692,11 +3821,12 @@ impl RpcDispatcher {
                         let cwd_owned = cwd.clone();
                         // The durable row is stamped at creation so the session
                         // survives a restart under the same isolation. The
-                        // stamp is the creator's DURABLE identity, not the
-                        // authorization scope: a named administrator's own
-                        // session carries her identity, and only the admin
-                        // bypass is scope-free.
-                        let owner = self.owner_principal_id();
+                        // stamp is the effective owner: for a new session that
+                        // is the creator's DURABLE identity; for a restore the
+                        // preserved durable owner, so an administrator does not
+                        // re-label another principal's session on the Missing
+                        // create path.
+                        let owner = effective_owner.clone();
                         tokio::task::spawn_blocking(move || -> anyhow::Result<AcpSessionNewLoad> {
                             match store_cloned.load_session_for_restore(&sid)? {
                             zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(
@@ -3939,7 +4069,7 @@ impl RpcDispatcher {
         // restart as nobody's. An unscoped creator's stamp is attribution
         // only, so its failure is logged and creation proceeds.
         if let (Some(owner), Some(backend)) =
-            (self.owner_principal_id(), self.ctx.session_backend.as_ref())
+            (effective_owner.clone(), self.ctx.session_backend.as_ref())
             && !matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
             && let Err(error) = backend.set_session_principal(&format!("rpc_{session_id}"), &owner)
         {
@@ -4414,6 +4544,26 @@ impl RpcDispatcher {
         if let Some(grants) = grants {
             self.apply_principal_grants_to_agent(grants, &mut agent);
         }
+
+        // Memory follows the DURABLE owner of the reaped session, not the
+        // principal restoring it.
+        if let Some(owner) = data.principal_id.clone()
+            && let Err(error) =
+                agent.route_memory_to_principal(self.memory_scope_for(owner, &data.agent_alias))
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "session_id": sid,
+                        "error": error.to_string(),
+                    })),
+                "session/prompt: refusing to rehydrate a session whose memory cannot be scoped to its owner"
+            );
+            return Ok(None);
+        }
         let interaction_context = match data.interaction_surface.as_deref() {
             Some(value) => match crate::agent::prompt::InteractionSurface::from_persisted(value) {
                 Some(surface) => Some(surface.resolve()),
@@ -4682,13 +4832,16 @@ impl RpcDispatcher {
             .apply_model_provider(
                 session_id,
                 session_generation,
-                provider,
-                provider_name,
-                model,
-                resolver,
-                dispatcher,
-                config_generation,
-                Some(temperature),
+                crate::rpc::session::ModelProviderUpdate {
+                    model_provider: provider,
+                    model_provider_name: provider_name,
+                    model_name: model,
+                    model_route_resolver: resolver,
+                    tool_dispatcher: dispatcher,
+                    config_generation: Arc::clone(&config_generation),
+                    temperature: Some(temperature),
+                    multimodal_config: config_generation.multimodal.clone(),
+                },
             )
             .await
     }
@@ -5666,15 +5819,18 @@ impl RpcDispatcher {
                 .apply_model_provider(
                     &req.session_id,
                     session_generation,
-                    model_provider,
-                    model_provider_name,
-                    model_name,
-                    model_route_resolver,
-                    tool_dispatcher,
-                    config_generation,
-                    // Temperature is already committed through
-                    // `set_overrides_gated` on this path.
-                    None,
+                    crate::rpc::session::ModelProviderUpdate {
+                        model_provider,
+                        model_provider_name,
+                        model_name,
+                        model_route_resolver,
+                        tool_dispatcher,
+                        config_generation: Arc::clone(&config_generation),
+                        // Temperature is already committed through
+                        // `set_overrides_gated` on this path.
+                        temperature: None,
+                        multimodal_config: config_generation.multimodal.clone(),
+                    },
                 )
                 .await
                 .then_some(())
@@ -6127,6 +6283,18 @@ impl RpcDispatcher {
 
     // ── Memory handlers ──────────────────────────────────────────
 
+    /// Parse a wire category name into the canonical variant, so `core`
+    /// names [`MemoryCategory::Core`] rather than a custom category that
+    /// happens to spell the same.
+    fn parse_memory_category(name: &str) -> MemoryCategory {
+        match name {
+            "core" => MemoryCategory::Core,
+            "daily" => MemoryCategory::Daily,
+            "conversation" => MemoryCategory::Conversation,
+            other => MemoryCategory::Custom(other.to_string()),
+        }
+    }
+
     async fn handle_memory_list(&self, params: &Value) -> RpcResult {
         let mem = self
             .ctx
@@ -6134,16 +6302,24 @@ impl RpcDispatcher {
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
         let req: MemoryListParams = parse_params(params)?;
-        self.authorize_memory_access(req.session_id.as_deref(), Method::MemoryList)
-            .await?;
-        let category = req
-            .category
-            .as_deref()
-            .map(|s| MemoryCategory::Custom(s.to_string()));
-        let entries = mem
-            .list(category.as_ref(), req.session_id.as_deref())
-            .await
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory list failed: {e}")))?;
+        let category = req.category.as_deref().map(Self::parse_memory_category);
+        // The plane follows the caller's identity (private for every
+        // authenticated principal, shared for the operator), composed with
+        // the agent dimension; see `memory_plane`.
+        let entries = match self.memory_plane(req.plane.as_deref(), Method::MemoryList)? {
+            Some(scope) => mem
+                .list_for_principal(
+                    &scope.with_agent(req.agent.clone()),
+                    category.as_ref(),
+                    req.session_id.as_deref(),
+                )
+                .await
+                .map_err(|e| Self::map_private_memory_err(&e))?,
+            None => mem
+                .list(category.as_ref(), req.session_id.as_deref())
+                .await
+                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory list failed: {e}")))?,
+        };
         let count = entries.len();
         let entries = truncate_memory_previews(entries);
         to_result(MemoryListResult { entries, count })
@@ -6156,18 +6332,29 @@ impl RpcDispatcher {
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
         let req: MemorySearchParams = parse_params(params)?;
-        self.authorize_memory_access(req.session_id.as_deref(), Method::MemorySearch)
-            .await?;
-        let entries = mem
-            .recall(
-                &req.query,
-                req.limit,
-                req.session_id.as_deref(),
-                req.since.as_deref(),
-                req.until.as_deref(),
-            )
-            .await
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory search failed: {e}")))?;
+        let entries = match self.memory_plane(req.plane.as_deref(), Method::MemorySearch)? {
+            Some(scope) => mem
+                .recall_for_principal(
+                    &scope.with_agent(req.agent.clone()),
+                    &req.query,
+                    req.limit,
+                    req.session_id.as_deref(),
+                    req.since.as_deref(),
+                    req.until.as_deref(),
+                )
+                .await
+                .map_err(|e| Self::map_private_memory_err(&e))?,
+            None => mem
+                .recall(
+                    &req.query,
+                    req.limit,
+                    req.session_id.as_deref(),
+                    req.since.as_deref(),
+                    req.until.as_deref(),
+                )
+                .await
+                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory search failed: {e}")))?,
+        };
         let count = entries.len();
         let entries = truncate_memory_previews(entries);
         to_result(MemorySearchResult { entries, count })
@@ -6184,12 +6371,16 @@ impl RpcDispatcher {
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
         let req: MemoryGetParams = parse_params(params)?;
-        self.authorize_memory_access(None, Method::MemoryGet)
-            .await?;
-        let entry = mem
-            .get(&req.key)
-            .await
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory get failed: {e}")))?;
+        let entry = match self.memory_plane(req.plane.as_deref(), Method::MemoryGet)? {
+            Some(scope) => mem
+                .get_for_principal(&scope.with_agent(req.agent.clone()), &req.key)
+                .await
+                .map_err(|e| Self::map_private_memory_err(&e))?,
+            None => mem
+                .get(&req.key)
+                .await
+                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory get failed: {e}")))?,
+        };
         match entry {
             Some(e) => to_result(MemoryGetResult { entry: Some(e) }),
             None => Err(rpc_err(
@@ -6206,16 +6397,27 @@ impl RpcDispatcher {
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
         let req: MemoryStoreParams = parse_params(params)?;
-        self.authorize_memory_access(req.session_id.as_deref(), Method::MemoryStore)
-            .await?;
         let category = req
             .category
             .as_deref()
-            .map(|s| MemoryCategory::Custom(s.to_string()))
+            .map(Self::parse_memory_category)
             .unwrap_or(MemoryCategory::Custom("user".into()));
-        mem.store(&req.key, &req.content, category, req.session_id.as_deref())
-            .await
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory store failed: {e}")))?;
+        match self.memory_plane(req.plane.as_deref(), Method::MemoryStore)? {
+            Some(scope) => mem
+                .store_for_principal(
+                    &scope.with_agent(req.agent.clone()),
+                    &req.key,
+                    &req.content,
+                    category,
+                    req.session_id.as_deref(),
+                )
+                .await
+                .map_err(|e| Self::map_private_memory_err(&e))?,
+            None => mem
+                .store(&req.key, &req.content, category, req.session_id.as_deref())
+                .await
+                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory store failed: {e}")))?,
+        }
         to_result(MemoryStoreResult {
             key: req.key,
             stored: true,
@@ -6229,11 +6431,16 @@ impl RpcDispatcher {
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
         let req: MemoryDeleteParams = parse_params(params)?;
-        self.authorize_memory_access(None, Method::MemoryDelete)
-            .await?;
-        mem.forget(&req.key)
-            .await
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory delete failed: {e}")))?;
+        match self.memory_plane(req.plane.as_deref(), Method::MemoryDelete)? {
+            Some(scope) => mem
+                .forget_for_principal(&scope.with_agent(req.agent.clone()), &req.key)
+                .await
+                .map_err(|e| Self::map_private_memory_err(&e))?,
+            None => mem
+                .forget(&req.key)
+                .await
+                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory delete failed: {e}")))?,
+        };
         to_result(MemoryDeleteResult {
             key: req.key,
             deleted: true,
@@ -6760,17 +6967,18 @@ impl RpcDispatcher {
                 .apply_model_provider(
                     &session_id,
                     session_generation,
-                    model_provider,
-                    model_provider_name,
-                    model_name,
-                    model_route_resolver,
-                    tool_dispatcher,
-                    Arc::clone(&config_generation),
-                    // Temperature travels in the same state transition as the
-                    // provider box rather than a follow-up `set_temperature`,
-                    // so a session cannot briefly show the new provider with
-                    // the old profile temperature.
-                    Some(temperature),
+                    crate::rpc::session::ModelProviderUpdate {
+                        model_provider,
+                        model_provider_name,
+                        model_name,
+                        model_route_resolver,
+                        tool_dispatcher,
+                        config_generation: Arc::clone(&config_generation),
+                        // Temperature travels in the same state transition as
+                        // the provider box rather than a follow-up setter.
+                        temperature: Some(temperature),
+                        multimodal_config: config_generation.multimodal.clone(),
+                    },
                 )
                 .await;
             if applied {
@@ -7868,7 +8076,9 @@ impl RpcDispatcher {
         // that models.dev may not carry yet) rather than silently falling back.
         let config = self.ctx.config.read().clone();
         let (models, pricing, live) =
-            crate::quickstart::model_catalog_with_config(Some(&config), &req.model_provider).await;
+            crate::quickstart::model_catalog_with_config_result(Some(&config), &req.model_provider)
+                .await
+                .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
         to_result(CatalogModelsResult {
             model_provider: req.model_provider,
             models,
@@ -9375,6 +9585,7 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<St
         },
         TurnEvent::HistoryTrimmed {
             dropped_messages,
+            dropped_turns,
             kept_turns,
             reason,
             token_budget,
@@ -9386,6 +9597,7 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<St
         } => SessionUpdateEvent::HistoryTrimmed {
             session_id: session_id.to_string(),
             dropped_messages: *dropped_messages,
+            dropped_turns: *dropped_turns,
             kept_turns: *kept_turns,
             reason: reason.clone(),
             token_budget: *token_budget,
@@ -13672,6 +13884,27 @@ mod tests {
         result.output.into_string()
     }
 
+    /// Poll the shell environment until `pred` holds or a bounded number of
+    /// yields elapse. The resume path applies its environment rebind in a
+    /// spawned task (so the reconnect never waits on an in-flight turn), so a
+    /// test observing the rebound value must let that task run first.
+    #[cfg(unix)]
+    async fn wait_for_shell_env(
+        ctx: &Arc<RpcContext>,
+        session_id: &str,
+        pred: impl Fn(&str) -> bool,
+    ) -> String {
+        let mut last = String::new();
+        for _ in 0..200 {
+            last = session_shell_env(ctx, session_id).await;
+            if pred(&last) {
+                return last;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        last
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn session_new_ignores_a_foreign_request_tui_id_for_environment() {
@@ -13806,6 +14039,168 @@ mod tests {
         assert!(
             !env.contains("NEW_SOCK"),
             "a superseded registration must not read its successor's environment:\n{env}"
+        );
+    }
+
+    /// Reviewer regression (discussion_r4109687906): reusing a canonical live
+    /// session must re-derive the forwarded shell environment against the
+    /// RESUMING connection, not keep the environment cloned into the shell tool
+    /// at first construction. A local operator creates an environment-bearing
+    /// session; the SAME connection then resumes it after its retained
+    /// environment is gone (reconnect re-registers the id with no environment,
+    /// e.g. the entitlement that kept it was lost). The resumed session's own
+    /// shell tool must stop overlaying the stale sentinel. Environment-free
+    /// reuse stays clean, and an unchanged retained environment survives reuse.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resuming_a_session_re_derives_the_forwarded_shell_environment() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(shell_env_config(&tmp));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut client = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:reuse".into());
+        client.set_authenticated_for_test();
+
+        // ── First connection: env-bearing registration builds the session ──
+        register_tui_env(
+            &ctx,
+            &mut client,
+            "tui_reuse0001",
+            "REUSE_SOCK",
+            "/tmp/reuse.sock",
+        );
+        let response = rpc(
+            &mut client,
+            &mut rx,
+            1,
+            "session/new",
+            json!({"agent_alias": "test-agent", "session_id": "s-reuse"}),
+        )
+        .await;
+        assert_eq!(
+            response["result"]["session_id"],
+            json!("s-reuse"),
+            "{response}"
+        );
+        let first = session_shell_env(&ctx, "s-reuse").await;
+        assert!(
+            first.contains("REUSE_SOCK=/tmp/reuse.sock"),
+            "the building connection's environment reaches the fresh session:\n{first}"
+        );
+        let canonical = ctx.sessions.get_agent("s-reuse").await.unwrap();
+
+        // ── Same session RESUMED after the retained environment is gone ──
+        // The reconnect re-registers the same id under a new epoch carrying no
+        // environment (the value `retained_tui_env` produces once the operator
+        // entitlement that kept it is lost). Resuming must re-derive the shell
+        // tool's environment, not keep the sentinel cloned in at construction.
+        let epoch = ctx
+            .tui_registry
+            .register(crate::rpc::tui_identity::TuiEntry {
+                tui_id: "tui_reuse0001".to_string(),
+                connected_at: chrono::Utc::now(),
+                peer_label: "tui_reuse0001".to_string(),
+                transport: "unix".to_string(),
+                env: std::collections::HashMap::new(),
+            });
+        client.set_tui_registration_for_test(Some(("tui_reuse0001".to_string(), epoch)));
+        let response = rpc(
+            &mut client,
+            &mut rx,
+            2,
+            "session/new",
+            json!({"agent_alias": "test-agent", "session_id": "s-reuse"}),
+        )
+        .await;
+        assert_eq!(
+            response["result"]["session_id"],
+            json!("s-reuse"),
+            "{response}"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &canonical,
+                &ctx.sessions.get_agent("s-reuse").await.unwrap()
+            ),
+            "the resume rebinds the SAME canonical incarnation, not a fresh build"
+        );
+        let after = wait_for_shell_env(&ctx, "s-reuse", |env| !env.contains("REUSE_SOCK")).await;
+        assert!(
+            !after.contains("REUSE_SOCK"),
+            "resuming under a connection with no retained environment must drop the \
+             environment the first incarnation carried:\n{after}"
+        );
+
+        // ── Permitted continuity: re-registering the SAME environment keeps it ──
+        register_tui_env(
+            &ctx,
+            &mut client,
+            "tui_reuse0001",
+            "REUSE_SOCK",
+            "/tmp/reuse.sock",
+        );
+        let response = rpc(
+            &mut client,
+            &mut rx,
+            3,
+            "session/new",
+            json!({"agent_alias": "test-agent", "session_id": "s-reuse"}),
+        )
+        .await;
+        assert_eq!(
+            response["result"]["session_id"],
+            json!("s-reuse"),
+            "{response}"
+        );
+        let restored = wait_for_shell_env(&ctx, "s-reuse", |env| {
+            env.contains("REUSE_SOCK=/tmp/reuse.sock")
+        })
+        .await;
+        assert!(
+            restored.contains("REUSE_SOCK=/tmp/reuse.sock"),
+            "an unchanged retained environment survives reuse:\n{restored}"
+        );
+    }
+
+    /// A session built with NO forwarded environment stays environment-free
+    /// across reuse — the rebind never invents one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resuming_an_environment_free_session_stays_environment_free() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(shell_env_config(&tmp));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut client = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:reuse-empty".into());
+        client.set_authenticated_for_test();
+        // Register with no sentinel: the connection forwards nothing.
+        let epoch = ctx
+            .tui_registry
+            .register(crate::rpc::tui_identity::TuiEntry {
+                tui_id: "tui_empty0001".to_string(),
+                connected_at: chrono::Utc::now(),
+                peer_label: "tui_empty0001".to_string(),
+                transport: "unix".to_string(),
+                env: std::collections::HashMap::new(),
+            });
+        client.set_tui_registration_for_test(Some(("tui_empty0001".to_string(), epoch)));
+        for id in [1, 2] {
+            let response = rpc(
+                &mut client,
+                &mut rx,
+                id,
+                "session/new",
+                json!({"agent_alias": "test-agent", "session_id": "s-empty"}),
+            )
+            .await;
+            assert_eq!(
+                response["result"]["session_id"],
+                json!("s-empty"),
+                "{response}"
+            );
+        }
+        let env = session_shell_env(&ctx, "s-empty").await;
+        assert!(
+            !env.contains("REUSE_SOCK") && !env.contains("SENTINEL"),
+            "environment-free reuse must not acquire a forwarded environment:\n{env}"
         );
     }
 
@@ -14576,6 +14971,111 @@ mod tests {
             !agent.tool_names().contains(&"calculator"),
             "the queued prompt must execute under the narrowed (empty) ceiling, \
              pruning the session's own tools"
+        );
+    }
+
+    /// Reviewer regression (discussion_r4109687900 follow-up): the ORIGINAL
+    /// coarse-revocation counterexample removed only the `Tools:Execute`
+    /// grant while RETAINING a wildcard tool selector — not the empty-selector
+    /// shape the sibling queued/persisted tests exercise. A wildcard selector
+    /// would resolve to the unrestricted `None` ceiling if the coarse grant
+    /// were not checked first, so this pins that removing `Tools:Execute`
+    /// alone still prunes a queued turn's tools on the session's own agent.
+    #[tokio::test]
+    async fn principal_queued_prompt_prunes_when_only_tools_execute_is_revoked() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Seed unrestricted: wildcard tools AND the coarse Tools:Execute
+        // grant, so the session and first prompt are permitted.
+        let config = principal_test_config(&tmp, &["*"], &["*"]);
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+        let dispatcher = bind_test_principal(dispatcher).await;
+        let params = json!({"agent_alias":"test-agent", "session_id":"coarse-revoke"});
+        dispatcher
+            .handle_session_new_for_test(&params)
+            .await
+            .unwrap();
+        let original = sessions.get_agent("coarse-revoke").await.unwrap();
+        {
+            let mut agent = original.lock().await;
+            assert!(
+                agent.tool_names().contains(&"calculator"),
+                "an unrestricted principal keeps the agent's own tools"
+            );
+            agent.set_model_provider(Box::new(FailingProvider));
+        }
+        // Reattach to the same live session (same binding), then park a prompt.
+        dispatcher
+            .handle_session_new_for_test(&params)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &original,
+            &sessions.get_agent("coarse-revoke").await.unwrap()
+        ));
+        let queue_guard = sessions
+            .session_queue
+            .acquire("coarse-revoke")
+            .await
+            .unwrap();
+        let prompt_params = json!({"session_id":"coarse-revoke", "prompt":"exercise admission"});
+        let pending = dispatcher.handle_session_prompt(&prompt_params);
+        tokio::pin!(pending);
+        tokio::select! {
+            result = &mut pending => panic!("prompt bypassed queue: {result:?}"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+        }
+        // Remove ONLY the coarse Tools:Execute grant while KEEPING the wildcard
+        // tool selector. This is the reviewer's exact counterexample: the
+        // selector still says "*", but the coarse grant that gates any tool
+        // execution is gone, so the effective ceiling must be empty.
+        {
+            let mut cfg = dispatcher.ctx.config.write();
+            let profile = cfg.permission_profiles.get_mut("principal-test").unwrap();
+            assert_eq!(
+                profile.allowed_tools,
+                vec!["*".to_string()],
+                "the selector stays wildcard; only the coarse grant is revoked"
+            );
+            let sessions_verbs = profile
+                .grants
+                .get(&Resource::Sessions)
+                .cloned()
+                .unwrap_or_default();
+            // Keep Sessions grants (so the queued prompt is still admitted),
+            // drop Tools entirely (removes Tools:Execute).
+            profile.grants =
+                std::collections::HashMap::from([(Resource::Sessions, sessions_verbs)]);
+            dispatcher.ctx.auth.refresh_from_config(&cfg).unwrap();
+        }
+        // NB: `principal_tool_narrowing()` reads the connection's STAMPED
+        // grants, which are re-resolved lazily at the next operation gate, so
+        // it still reports the pre-revocation ceiling here. The load-bearing
+        // proof is below: on release the queued prompt re-resolves at
+        // admission and prunes the session's tools under the empty ceiling.
+        drop(queue_guard);
+        // On release the parked prompt is admitted past auth (owner isolation),
+        // re-narrows the session's own agent to the empty ceiling, then fails
+        // only at the dead provider with a non-auth code.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+            .await
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "the failing provider makes the admitted turn error: {result:?}"
+        );
+        if let Err(e) = &result {
+            assert!(
+                e.code != FORBIDDEN && e.code != AUTH_REQUIRED,
+                "the turn is admitted past auth and fails only at the provider: {e:?}"
+            );
+        }
+        let _ = Verb::Execute; // keep the import meaningful across edits
+        let agent = original.lock().await;
+        assert!(
+            !agent.tool_names().contains(&"calculator"),
+            "revoking Tools:Execute (wildcard selector retained) must still prune \
+             the queued turn's tools on the session's own agent"
         );
     }
 
@@ -15666,6 +16166,159 @@ mod tests {
         assert_eq!(acp_store.session_principal("op1").unwrap(), Some(None));
     }
 
+    /// The reviewer's exact case (discussion_r4109687910): an administrator
+    /// restoring another principal's reaped session THROUGH `session/new`
+    /// (not the rehydration helper) must preserve the durable owner, for both
+    /// ACP and Chat modes, and a legacy NULL-owner row must stay unowned.
+    #[tokio::test]
+    async fn session_new_restoration_by_admin_preserves_the_durable_owner() {
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+        use zeroclaw_infra::session_backend::SessionBackend as _;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = two_user_config(&tmp);
+        config.permission_profiles.insert(
+            "admin".into(),
+            PermissionProfileConfig {
+                admin: true,
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "carol".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4444),
+                permission_profiles: vec!["admin".into()],
+            },
+        );
+        let data_dir = config.data_dir.clone();
+        let (fixture, sessions, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let ctx = Arc::clone(&fixture.ctx);
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let bob = scoped_dispatcher(&ctx, 4343).await;
+        let carol = scoped_dispatcher(&ctx, 4444).await;
+
+        // ── ACP: alice's session, reaped, then restored by carol via new ──
+        alice
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "acp1",
+                "chat_mode": "acp",
+            }))
+            .await
+            .expect("alice creates her ACP session");
+        assert_eq!(
+            acp_store.session_principal("acp1").unwrap(),
+            Some(Some("user:alice".to_string())),
+            "alice's ACP create stamps alice up front"
+        );
+        assert!(sessions.remove("acp1").await, "reap the live incarnation");
+        assert_eq!(
+            acp_store.session_principal("acp1").unwrap(),
+            Some(Some("user:alice".to_string())),
+            "reaping the live incarnation leaves the durable ACP owner intact"
+        );
+        carol
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "acp1",
+                "chat_mode": "acp",
+            }))
+            .await
+            .expect("the administrator restores alice's ACP session via session/new");
+        assert_eq!(
+            acp_store.session_principal("acp1").unwrap(),
+            Some(Some("user:alice".to_string())),
+            "session/new restoration keeps the durable ACP owner, not the restorer"
+        );
+        assert_eq!(
+            sessions.session_owner_principal("acp1").await,
+            Some(Some("user:alice".to_string())),
+            "the live incarnation is re-stamped with the preserved owner"
+        );
+        let err = bob
+            .handle_session_messages_for_test(&json!({"session_id": "acp1"}))
+            .await
+            .expect_err("bob still cannot read alice's restored session");
+        assert_eq!(err.code, FORBIDDEN);
+        alice
+            .handle_session_messages_for_test(&json!({"session_id": "acp1"}))
+            .await
+            .expect("alice still owns her restored ACP session");
+
+        // ── Chat: alice's chat session, reaped, then restored by carol ──
+        alice
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "chat1",
+                "chat_mode": "chat",
+            }))
+            .await
+            .expect("alice creates her chat session");
+        assert_eq!(
+            chat_backend
+                .get_session_metadata("rpc_chat1")
+                .and_then(|m| m.principal_id),
+            Some("user:alice".to_string()),
+            "the chat row is stamped with alice"
+        );
+        assert!(sessions.remove("chat1").await, "reap the live incarnation");
+        carol
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "chat1",
+                "chat_mode": "chat",
+            }))
+            .await
+            .expect("the administrator restores alice's chat session via session/new");
+        assert_eq!(
+            chat_backend
+                .get_session_metadata("rpc_chat1")
+                .and_then(|m| m.principal_id),
+            Some("user:alice".to_string()),
+            "session/new restoration keeps the durable chat owner, not the restorer"
+        );
+        assert_eq!(
+            sessions.session_owner_principal("chat1").await,
+            Some(Some("user:alice".to_string())),
+            "the live chat incarnation is re-stamped with the preserved owner"
+        );
+        let err = bob
+            .handle_session_messages_for_test(&json!({"session_id": "chat1"}))
+            .await
+            .expect_err("bob cannot read alice's restored chat session");
+        assert_eq!(err.code, FORBIDDEN);
+
+        // ── Legacy NULL-owner row stays unowned across admin restoration ──
+        fixture
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "legacy1",
+                "chat_mode": "acp",
+            }))
+            .await
+            .expect("the shared operator creates a legacy session");
+        assert_eq!(acp_store.session_principal("legacy1").unwrap(), Some(None));
+        assert!(
+            sessions.remove("legacy1").await,
+            "reap the live incarnation"
+        );
+        carol
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "legacy1",
+                "chat_mode": "acp",
+            }))
+            .await
+            .expect("the administrator restores the legacy session via session/new");
+        assert_eq!(
+            acp_store.session_principal("legacy1").unwrap(),
+            Some(None),
+            "a legacy NULL-owner row is not adopted by the restoring administrator"
+        );
+    }
+
     /// Delete destroys the durable record it authorized and reports what
     /// actually happened; wrong owners and NULL-owner rows are refused with
     /// the row intact.
@@ -15820,58 +16473,6 @@ mod tests {
         assert!(sessions.get_agent("operator-ok").await.is_some());
     }
 
-    /// Scoped memory writes stay closed until storage carries an owner
-    /// predicate: the same key from two principals can never overwrite or
-    /// re-home a row, because neither write is admitted. Reads scoped to an
-    /// owned session keep working; unscoped connections keep today's path.
-    #[tokio::test]
-    async fn scoped_memory_writes_are_refused_while_storage_cannot_isolate_them() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = two_user_config(&tmp);
-        let data_dir = config.data_dir.clone();
-        let (fixture, _sessions, _chat_backend, _acp_store) =
-            make_persistence_test_dispatcher(config, &data_dir);
-        let ctx = Arc::clone(&fixture.ctx);
-        let alice = scoped_dispatcher(&ctx, 4242).await;
-        let bob = scoped_dispatcher(&ctx, 4343).await;
-        alice
-            .handle_session_new_for_test(&json!({
-                "agent_alias": "test-agent",
-                "session_id": "m1",
-                "chat_mode": "acp",
-            }))
-            .await
-            .unwrap();
-
-        for (who, label) in [(&alice, "the owner"), (&bob, "another principal")] {
-            for method in [Method::MemoryStore, Method::MemoryDelete] {
-                let err = who
-                    .authorize_memory_access(Some("m1"), method)
-                    .await
-                    .expect_err(label);
-                assert_eq!(err.code, FORBIDDEN, "{label} {}", method.wire_name());
-                assert!(
-                    err.message.contains("cannot write memory"),
-                    "{label}: {}",
-                    err.message
-                );
-            }
-        }
-        alice
-            .authorize_memory_access(Some("m1"), Method::MemoryList)
-            .await
-            .expect("reads scoped to an owned session pass");
-        let err = bob
-            .authorize_memory_access(Some("m1"), Method::MemoryList)
-            .await
-            .expect_err("reads scoped to someone else's session do not");
-        assert_eq!(err.code, FORBIDDEN);
-        fixture
-            .authorize_memory_access(None, Method::MemoryStore)
-            .await
-            .expect("unscoped connections keep today's behavior");
-    }
-
     /// The ownership boundary through the real request path: the coarse gate
     /// admits the method, the handler's ownership check refuses the foreign
     /// session with the uniform denial.
@@ -15983,39 +16584,322 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scoped_memory_access_is_fail_closed() {
+    async fn scoped_memory_routes_to_the_private_plane() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
         let tmp = tempfile::TempDir::new().unwrap();
         let config = two_user_config(&tmp);
-        let (fixture, _sessions) = make_acp_test_dispatcher(config);
-        let ctx = Arc::clone(&fixture.ctx);
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(config, sessions);
+        let mut ctx = Arc::try_unwrap(ctx)
+            .ok()
+            .expect("minimal test context should be uniquely owned");
+        let mem_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "sqlite".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        ctx.memory = Some(Arc::from(
+            zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None)
+                .expect("sqlite memory for tests"),
+        ));
+        let ctx = Arc::new(ctx);
+
         let alice = scoped_dispatcher(&ctx, 4242).await;
+        let bob = scoped_dispatcher(&ctx, 4343).await;
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut unscoped = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:test".into());
+        unscoped.set_authenticated_for_test();
 
+        // Alice stores privately; the unscoped (legacy) plane cannot see it.
         alice
-            .handle_session_new_for_test(&json!({
-                "agent_alias": "test-agent",
-                "session_id": "alice-mem",
-            }))
+            .handle_memory_store_for_test(&json!({"key": "note", "content": "alice-secret"}))
             .await
-            .expect("alice creates her session");
+            .expect("private store");
+        let err = unscoped
+            .handle_memory_get_for_test(&json!({"key": "note"}))
+            .await
+            .expect_err("the legacy plane must not see private rows");
+        assert!(err.message.contains("not found"), "{}", err.message);
 
-        // Owned-session scope passes the backstop.
-        alice
-            .authorize_memory_access(Some("alice-mem"), Method::MemoryList)
+        // A shared row under the same key coexists; each plane reads its own.
+        unscoped
+            .handle_memory_store_for_test(&json!({"key": "note", "content": "shared"}))
             .await
-            .expect("owned session scope passes");
-        // Cross-session (unscoped) queries and bare-key operations deny.
-        for sid in [None, Some("legacy-or-other")] {
-            let err = alice
-                .authorize_memory_access(sid, Method::MemoryList)
-                .await
-                .expect_err("scoped memory access outside owned sessions denies");
-            assert_eq!(err.code, zeroclaw_api::jsonrpc::error_codes::FORBIDDEN);
+            .expect("legacy store");
+        let got = alice
+            .handle_memory_get_for_test(&json!({"key": "note"}))
+            .await
+            .expect("alice reads her private row");
+        assert!(got.to_string().contains("alice-secret"));
+        assert!(!got.to_string().contains("\"shared\""));
+
+        // Bob's private plane is empty: same-key rows of others invisible.
+        let err = bob
+            .handle_memory_get_for_test(&json!({"key": "note"}))
+            .await
+            .expect_err("bob has no such private row");
+        assert!(err.message.contains("not found"), "{}", err.message);
+
+        // Search respects the plane split in both directions.
+        let hits = alice
+            .handle_memory_search_for_test(&json!({"query": "secret", "limit": 10}))
+            .await
+            .expect("private search");
+        assert!(hits.to_string().contains("alice-secret"));
+        let hits = unscoped
+            .handle_memory_search_for_test(&json!({"query": "secret", "limit": 10}))
+            .await
+            .expect("legacy search");
+        assert!(!hits.to_string().contains("alice-secret"));
+
+        // Private delete removes only Alice's row; the shared row survives.
+        alice
+            .handle_memory_delete_for_test(&json!({"key": "note"}))
+            .await
+            .expect("private delete");
+        let got = unscoped
+            .handle_memory_get_for_test(&json!({"key": "note"}))
+            .await
+            .expect("shared row survives");
+        assert!(got.to_string().contains("shared"));
+    }
+
+    /// A memory-enabled persistence context: two roster users plus a named
+    /// administrator, an SQLite memory backend, and the session stores.
+    fn memory_isolation_ctx(
+        tmp: &tempfile::TempDir,
+    ) -> (
+        Arc<RpcContext>,
+        Arc<crate::rpc::session::SessionStore>,
+        Arc<dyn zeroclaw_memory::Memory>,
+    ) {
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let mut config = two_user_config(tmp);
+        config
+            .permission_profiles
+            .get_mut("member")
+            .unwrap()
+            .grants
+            .insert(
+                zeroclaw_api::grants::Resource::Memory,
+                vec![
+                    zeroclaw_api::grants::Verb::Create,
+                    zeroclaw_api::grants::Verb::Read,
+                    zeroclaw_api::grants::Verb::Delete,
+                ],
+            );
+        config.permission_profiles.insert(
+            "admin".into(),
+            PermissionProfileConfig {
+                admin: true,
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "carol".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4444),
+                permission_profiles: vec!["admin".into()],
+            },
+        );
+        let data_dir = config.data_dir.clone();
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let chat_backend =
+            Arc::new(zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&data_dir).unwrap());
+        let acp_store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(&data_dir).unwrap());
+        let ctx = RpcContext::for_persistence_tests(
+            config,
+            Arc::clone(&sessions),
+            Some(chat_backend as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            Some(acp_store),
+        );
+        let mut ctx = Arc::try_unwrap(ctx)
+            .ok()
+            .expect("persistence test context should be uniquely owned");
+        let mem_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "sqlite".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let memory: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).expect("sqlite memory"),
+        );
+        ctx.memory = Some(Arc::clone(&memory));
+        (Arc::new(ctx), sessions, memory)
+    }
+
+    /// The memory plane follows the caller's identity, not the admin bypass:
+    /// a named administrator keeps her private notes across promotion and
+    /// demotion, reaches the shared plane only by naming it (audited), and a
+    /// scoped principal cannot name it at all.
+    #[tokio::test]
+    async fn memory_plane_follows_identity_not_the_admin_bypass() {
+        use zeroclaw_config::schema::PermissionProfileConfig;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, _sessions, _memory) = memory_isolation_ctx(&tmp);
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let carol = scoped_dispatcher(&ctx, 4444).await;
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut operator = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:test".into());
+        operator.set_authenticated_for_test();
+
+        // The operator's note is on the shared plane; carol's is private
+        // even though she holds admin; alice's is private.
+        operator
+            .handle_memory_store_for_test(&json!({"key": "note", "content": "shared"}))
+            .await
+            .unwrap();
+        carol
+            .handle_memory_store_for_test(&json!({"key": "note", "content": "carol-private"}))
+            .await
+            .unwrap();
+        alice
+            .handle_memory_store_for_test(&json!({"key": "note", "content": "alice-private"}))
+            .await
+            .unwrap();
+        let got = carol
+            .handle_memory_get_for_test(&json!({"key": "note"}))
+            .await
+            .unwrap();
+        assert!(got.to_string().contains("carol-private"), "{got}");
+        // The administrator reaches the shared plane only explicitly.
+        let got = carol
+            .handle_memory_get_for_test(&json!({"key": "note", "plane": "shared"}))
+            .await
+            .unwrap();
+        assert!(got.to_string().contains("\"shared\""), "{got}");
+        // A scoped principal cannot name the shared plane.
+        let err = alice
+            .handle_memory_get_for_test(&json!({"key": "note", "plane": "shared"}))
+            .await
+            .expect_err("scoped principals have no shared plane");
+        assert_eq!(err.code, FORBIDDEN);
+        let err = alice
+            .handle_memory_get_for_test(&json!({"key": "note", "plane": "elsewhere"}))
+            .await
+            .expect_err("unknown planes are refused");
+        assert_eq!(err.code, INVALID_PARAMS);
+
+        // Demote carol: her note is still hers, still private.
+        {
+            let mut config = ctx.config.read().clone();
+            config.permission_profiles.insert(
+                "admin".into(),
+                PermissionProfileConfig {
+                    admin: false,
+                    allowed_agents: vec!["*".into()],
+                    grants: std::collections::HashMap::from([(
+                        zeroclaw_api::grants::Resource::Memory,
+                        vec![
+                            zeroclaw_api::grants::Verb::Create,
+                            zeroclaw_api::grants::Verb::Read,
+                        ],
+                    )]),
+                    ..PermissionProfileConfig::default()
+                },
+            );
+            ctx.auth
+                .refresh_from_config(&config)
+                .expect("demotion is a valid refresh");
         }
-        // Unscoped connections keep today's behavior.
-        fixture
-            .authorize_memory_access(None, Method::MemoryList)
+        let got = carol
+            .handle_memory_get_for_test(&json!({"key": "note"}))
             .await
-            .expect("unscoped connections are unaffected");
+            .expect("a demoted administrator keeps her private note");
+        assert!(got.to_string().contains("carol-private"), "{got}");
+        carol
+            .handle_memory_store_for_test(&json!({"key": "note", "content": "carol-updated"}))
+            .await
+            .expect("her writes still land privately");
+        let got = operator
+            .handle_memory_get_for_test(&json!({"key": "note"}))
+            .await
+            .unwrap();
+        assert!(
+            got.to_string().contains("\"shared\""),
+            "the shared row is untouched: {got}"
+        );
+        // The agent dimension composes: the same key under another agent is
+        // another row.
+        alice
+            .handle_memory_store_for_test(
+                &json!({"key": "note", "content": "alice-on-test-agent", "agent": "test-agent"}),
+            )
+            .await
+            .unwrap();
+        let got = alice
+            .handle_memory_get_for_test(&json!({"key": "note"}))
+            .await
+            .unwrap();
+        assert!(got.to_string().contains("alice-private"), "{got}");
+        let got = alice
+            .handle_memory_get_for_test(&json!({"key": "note", "agent": "test-agent"}))
+            .await
+            .unwrap();
+        assert!(got.to_string().contains("alice-on-test-agent"), "{got}");
+    }
+
+    /// An owned session's memory handle is pinned to the owner's private
+    /// plane at construction and stays there whoever prompts it later; the
+    /// shared operator's session keeps the shared handle.
+    #[tokio::test]
+    async fn owned_sessions_memory_is_pinned_to_the_owners_private_plane() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, sessions, _memory) = memory_isolation_ctx(&tmp);
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let carol = scoped_dispatcher(&ctx, 4444).await;
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut operator = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:test".into());
+        operator.set_authenticated_for_test();
+        let new_acp =
+            |id: &str| json!({"agent_alias": "test-agent", "session_id": id, "chat_mode": "acp"});
+
+        alice
+            .handle_session_new_for_test(&new_acp("a-mem"))
+            .await
+            .unwrap();
+        let agent = sessions.get_agent("a-mem").await.expect("live");
+        assert_eq!(
+            agent.lock().await.memory_principal(),
+            Some("user:alice"),
+            "alice's session memory is pinned to her plane"
+        );
+        operator
+            .handle_session_new_for_test(&new_acp("op-mem"))
+            .await
+            .unwrap();
+        let agent = sessions.get_agent("op-mem").await.expect("live");
+        assert_eq!(
+            agent.lock().await.memory_principal(),
+            None,
+            "the shared operator's session keeps the shared handle"
+        );
+        carol
+            .handle_session_new_for_test(&new_acp("c-mem"))
+            .await
+            .unwrap();
+        let agent = sessions.get_agent("c-mem").await.expect("live");
+        assert_eq!(
+            agent.lock().await.memory_principal(),
+            Some("user:carol"),
+            "a named administrator's session is pinned to her own plane"
+        );
+
+        // Rehydration by an administrator keeps the durable owner's plane.
+        assert!(sessions.remove("a-mem").await);
+        carol
+            .rehydrate_reaped_session("a-mem", carol.stamped_grants())
+            .await
+            .expect("the administrator restores alice's session");
+        let agent = sessions.get_agent("a-mem").await.expect("restored");
+        assert_eq!(
+            agent.lock().await.memory_principal(),
+            Some("user:alice"),
+            "restoration pins memory to the durable owner, not the restorer"
+        );
     }
 
     #[test]
@@ -16028,6 +16912,7 @@ mod tests {
             ("session/new", Resource::Sessions, Verb::Create),
             ("memory/delete", Resource::Memory, Verb::Delete),
             ("sops/run", Resource::Sops, Verb::Execute),
+            ("sops/run-detail", Resource::Sops, Verb::Read),
             ("skills/write", Resource::Skills, Verb::Update),
             ("cron/trigger", Resource::Cron, Verb::Execute),
         ] {
@@ -19178,6 +20063,7 @@ mod tests {
     fn history_trimmed_notification() {
         let event = TurnEvent::HistoryTrimmed {
             dropped_messages: 12,
+            dropped_turns: 4,
             kept_turns: 1,
             reason: "context token budget exceeded".into(),
             token_budget: Some(500_000),
@@ -19193,6 +20079,7 @@ mod tests {
         assert_eq!(v["params"]["type"], "history_trimmed");
         assert_eq!(v["params"]["session_id"], "s1");
         assert_eq!(v["params"]["dropped_messages"], 12);
+        assert_eq!(v["params"]["dropped_turns"], 4);
         assert_eq!(v["params"]["kept_turns"], 1);
         assert_eq!(v["params"]["reason"], "context token budget exceeded");
         assert_eq!(v["params"]["token_budget"], 500_000);
@@ -19209,6 +20096,7 @@ mod tests {
         // keep resolving the provenance label.
         let event = TurnEvent::HistoryTrimmed {
             dropped_messages: 4,
+            dropped_turns: 1,
             kept_turns: 2,
             reason: "context token budget exceeded".into(),
             token_budget: Some(10_000),
@@ -21455,6 +22343,7 @@ mod tests {
         let (dispatcher, mut rx, _sessions) = make_dispatcher_with_capture(config);
         let event = TurnEvent::HistoryTrimmed {
             dropped_messages: 4,
+            dropped_turns: 2,
             kept_turns: 1,
             reason: "message cap".into(),
             token_budget: None,
@@ -21975,16 +22864,26 @@ mod tests {
             ConversationMessage::Chat(ChatMessage::assistant("new answer")),
         ];
 
+        // The limit counts complete turns: keeping one turn retains the
+        // newest exchange and drops the older tool-bearing turn whole.
         let active = crate::agent::history_trim::trim_conversation_to_recent_turns(
             durable.clone(),
-            2,
-            crate::agent::history_trim::history_trim_target(2, 1.0),
+            1,
             false,
         );
         assert!(active.trimmed);
         assert!(!active.history.iter().any(|message| matches!(
             message,
             ConversationMessage::Chat(chat) if chat.content == "old question"
+        )));
+        assert!(!active.history.iter().any(|message| matches!(
+            message,
+            ConversationMessage::ToolResults(results)
+                if results.iter().any(|result| result.tool_call_id == "old-call")
+        )));
+        assert!(active.history.iter().any(|message| matches!(
+            message,
+            ConversationMessage::Chat(chat) if chat.content == "new question"
         )));
 
         let transcript = conversation_message_entries(&durable);
@@ -24330,7 +25229,7 @@ mod tests {
             .runtime_profiles
             .get_mut("reloadable")
             .expect("runtime profile exists")
-            .max_history_messages = Some(2);
+            .max_history_messages = Some(1);
 
         let agent = dispatcher
             .ctx
@@ -24360,194 +25259,6 @@ mod tests {
                 if chat.content == "new assistant"
         )));
     }
-
-    #[tokio::test]
-    async fn existing_session_uses_reloaded_history_trim_low_water() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut config = make_model_refresh_test_config(&tmp);
-        config
-            .agents
-            .get_mut("test-agent")
-            .expect("test agent exists")
-            .runtime_profile = "reloadable".into();
-        config.runtime_profiles.insert(
-            "reloadable".into(),
-            zeroclaw_config::schema::RuntimeProfileConfig {
-                max_history_messages: Some(4),
-                ..Default::default()
-            },
-        );
-
-        let dispatcher = make_config_set_test_dispatcher(config);
-        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
-        dispatcher
-            .ctx
-            .config
-            .write()
-            .runtime_profiles
-            .get_mut("reloadable")
-            .expect("runtime profile exists")
-            .history_trim_low_water = Some(1.0);
-
-        let agent = dispatcher
-            .ctx
-            .sessions
-            .get_agent(&session_id)
-            .await
-            .expect("session agent exists");
-        let mut agent = agent.lock().await;
-        let event = agent.seed_history_with_event(&[
-            ChatMessage::user("old user"),
-            ChatMessage::assistant("old answer"),
-            ChatMessage::user("middle user"),
-            ChatMessage::assistant("middle answer"),
-            ChatMessage::user("new user"),
-            ChatMessage::assistant("new answer"),
-        ]);
-
-        let Some(TurnEvent::HistoryTrimmed {
-            dropped_messages,
-            kept_turns,
-            ..
-        }) = event
-        else {
-            panic!("an existing session must observe the reloaded low-water fraction");
-        };
-        assert_eq!(dropped_messages, 2, "legacy 1.0 refills to the cap of 4");
-        assert_eq!(kept_turns, 2, "legacy 1.0 retains the newest two turns");
-        let breadcrumb = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
-        let history = agent.history();
-        assert_eq!(
-            history.len(),
-            6,
-            "synthesized system prompt plus breadcrumb plus the retained body"
-        );
-        assert!(!history.iter().any(|message| matches!(
-            message,
-            zeroclaw_providers::ConversationMessage::Chat(chat)
-                if chat.content == "old user" || chat.content == "old answer"
-        )));
-        for retained in ["middle user", "middle answer", "new user", "new answer"] {
-            assert!(
-                history.iter().any(|message| matches!(
-                    message,
-                    zeroclaw_providers::ConversationMessage::Chat(chat)
-                        if chat.content == retained
-                )),
-                "fraction 1.0 loaded after construction must retain {retained}"
-            );
-        }
-        assert_eq!(
-            history
-                .iter()
-                .filter(|message| matches!(
-                    message,
-                    zeroclaw_providers::ConversationMessage::Chat(chat)
-                        if chat.role == "user" && chat.content == breadcrumb
-                ))
-                .count(),
-            1,
-            "exactly one synthetic breadcrumb accompanies the retained turns"
-        );
-    }
-
-    #[tokio::test]
-    async fn config_set_persists_history_trim_low_water_and_trims_existing_session() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut config = make_model_refresh_test_config(&tmp);
-        config
-            .agents
-            .get_mut("test-agent")
-            .expect("test agent exists")
-            .runtime_profile = "reloadable".into();
-        config.runtime_profiles.insert(
-            "reloadable".into(),
-            zeroclaw_config::schema::RuntimeProfileConfig {
-                max_history_messages: Some(4),
-                history_trim_low_water: None,
-                ..Default::default()
-            },
-        );
-
-        let dispatcher = make_config_set_test_dispatcher(config);
-        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
-
-        let set = dispatcher
-            .handle_config_set(&json!({
-                "prop": "runtime_profiles.reloadable.history_trim_low_water",
-                "value": 1.0
-            }))
-            .await;
-        assert!(
-            set.is_ok(),
-            "config/set must accept the low-water fraction: {set:?}"
-        );
-
-        let config_path = tmp.path().join("config.toml");
-        let disk = std::fs::read_to_string(&config_path).unwrap();
-        let reloaded: zeroclaw_config::schema::Config = toml::from_str(&disk)
-            .unwrap_or_else(|e| panic!("config must reload after the fraction write: {e}\n{disk}"));
-        assert_eq!(
-            reloaded
-                .runtime_profiles
-                .get("reloadable")
-                .and_then(|profile| profile.history_trim_low_water),
-            Some(1.0),
-            "the RPC write must persist the exact fraction to disk"
-        );
-
-        let agent = dispatcher
-            .ctx
-            .sessions
-            .get_agent(&session_id)
-            .await
-            .expect("session agent exists");
-        let mut agent = agent.lock().await;
-        let event = agent.seed_history_with_event(&[
-            ChatMessage::user("old user"),
-            ChatMessage::assistant("old answer"),
-            ChatMessage::user("middle user"),
-            ChatMessage::assistant("middle answer"),
-            ChatMessage::user("new user"),
-            ChatMessage::assistant("new answer"),
-        ]);
-
-        let Some(TurnEvent::HistoryTrimmed {
-            dropped_messages,
-            kept_turns,
-            ..
-        }) = event
-        else {
-            panic!("an existing session must observe the persisted low-water fraction");
-        };
-        assert_eq!(
-            dropped_messages, 2,
-            "fraction 1.0 written via config/set refills to the cap of 4"
-        );
-        assert_eq!(kept_turns, 2, "fraction 1.0 retains the newest two turns");
-        let history = agent.history();
-        assert_eq!(
-            history.len(),
-            6,
-            "synthesized system prompt plus breadcrumb plus the retained body"
-        );
-        assert!(!history.iter().any(|message| matches!(
-            message,
-            zeroclaw_providers::ConversationMessage::Chat(chat)
-                if chat.content == "old user" || chat.content == "old answer"
-        )));
-        for retained in ["middle user", "middle answer", "new user", "new answer"] {
-            assert!(
-                history.iter().any(|message| matches!(
-                    message,
-                    zeroclaw_providers::ConversationMessage::Chat(chat)
-                        if chat.content == retained
-                )),
-                "fraction 1.0 persisted via config/set must retain {retained}"
-            );
-        }
-    }
-
     #[tokio::test]
     async fn config_set_provider_model_refreshes_matching_live_session() {
         let tmp = tempfile::TempDir::new().unwrap();

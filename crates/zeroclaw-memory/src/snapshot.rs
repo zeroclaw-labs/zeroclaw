@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 use crate::sqlite::SqliteMemory;
 
 /// Filename for the snapshot (lives at workspace root for Git visibility).
-pub const SNAPSHOT_FILENAME: &str = "MEMORY_SNAPSHOT.md";
+///
+/// Defined in `zeroclaw-config` because the agent-bundle exporter has to
+/// recognize the same name to keep memory out of a bundle.
+pub const SNAPSHOT_FILENAME: &str = zeroclaw_config::paths::MEMORY_SNAPSHOT_FILE;
 
 /// Header written at the top of every snapshot file.
 const SNAPSHOT_HEADER: &str = "# 🧠 ZeroClaw Memory Snapshot\n\n\
@@ -33,12 +36,28 @@ pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
     let conn = Connection::open(&db_path)?;
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
 
-    let mut stmt = conn.prepare(
+    // Private principal rows never enter the snapshot. The column arrived
+    // with private principal memory; a database written before it has no
+    // private rows to exclude and no column to name, so the predicate is
+    // applied only where the column exists.
+    let has_principal_column = conn
+        .prepare("PRAGMA table_info(memories)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|column| column == "principal_id");
+    let sql = if has_principal_column {
+        "SELECT key, content, created_at, updated_at
+         FROM memories
+         WHERE category = 'core' AND principal_id IS NULL
+         ORDER BY updated_at DESC"
+    } else {
         "SELECT key, content, created_at, updated_at
          FROM memories
          WHERE category = 'core'
-         ORDER BY updated_at DESC",
-    )?;
+         ORDER BY updated_at DESC"
+    };
+    let mut stmt = conn.prepare(sql)?;
 
     let rows: Vec<(String, String, String, String)> = stmt
         .query_map([], |row| {

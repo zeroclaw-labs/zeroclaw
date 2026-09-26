@@ -2,6 +2,7 @@
 //! LLM for a tools-free final summary (with step timeout + cancel select)
 //! and return it appended to the accumulated display text, or bail.
 
+use super::StreamDelta;
 use super::execution::SettledAttemptSummary;
 use super::knobs::{LoopKnobs, MaxIterationBehavior};
 use super::outcome::ToolLoopCancelled;
@@ -57,6 +58,7 @@ pub(crate) async fn finish_after_max_iterations(
     turn_id: &str,
     knobs: &LoopKnobs,
     event_tx: Option<&Sender<TurnEvent>>,
+    on_delta: Option<&Sender<StreamDelta>>,
     mut new_messages_out: Option<&mut Vec<ChatMessage>>,
     context_limits: ResolvedContextLimits,
     crumb_present: &mut bool,
@@ -179,6 +181,7 @@ pub(crate) async fn finish_after_max_iterations(
                 let _ = tx
                     .send(TurnEvent::HistoryTrimmed {
                         dropped_messages,
+                        dropped_turns,
                         kept_turns: trim.kept_turns,
                         reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
                         token_budget: Some(event_budget as u64),
@@ -381,6 +384,9 @@ pub(crate) async fn finish_after_max_iterations(
     // narration earlier iterations already streamed, and resending it here
     // would duplicate it in the client.
     super::events::emit_posthoc_turn_chunk(event_tx, &segment).await;
+    if let Some(tx) = on_delta {
+        let _ = tx.send(StreamDelta::Text(segment.clone())).await;
+    }
     accumulated_display_text.push_str(&segment);
     Ok(accumulated_display_text)
 }
@@ -389,7 +395,7 @@ pub(crate) async fn finish_after_max_iterations(
 mod graceful_summary_metering_tests {
     use super::finish_after_max_iterations;
     use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
-    use crate::agent::turn::LoopKnobs;
+    use crate::agent::turn::{LoopKnobs, StreamDelta};
     use async_trait::async_trait;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -457,6 +463,7 @@ mod graceful_summary_metering_tests {
         provider: &dyn ModelProvider,
         accumulated_display_text: String,
         event_tx: Option<&Sender<TurnEvent>>,
+        on_delta: Option<&Sender<StreamDelta>>,
     ) -> anyhow::Result<String> {
         let mut history = vec![ChatMessage::user("do the work")];
         let pacing = PacingConfig::default();
@@ -477,6 +484,7 @@ mod graceful_summary_metering_tests {
             "trace-req-test",
             &knobs,
             event_tx,
+            on_delta,
             None,
             ResolvedContextLimits::legacy_fallback(0),
             &mut false,
@@ -487,7 +495,7 @@ mod graceful_summary_metering_tests {
     }
 
     async fn run_summary(provider: &dyn ModelProvider) -> anyhow::Result<String> {
-        run_summary_with_events(provider, String::new(), None).await
+        run_summary_with_events(provider, String::new(), None, None).await
     }
 
     // The graceful summary now routes through the metered provider seam: under a
@@ -537,7 +545,7 @@ mod graceful_summary_metering_tests {
         let out = TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
                 Some(ctx),
-                run_summary_with_events(&provider, String::new(), Some(&event_tx)),
+                run_summary_with_events(&provider, String::new(), Some(&event_tx), None),
             )
             .await
             .expect("graceful summary should succeed");
@@ -757,6 +765,7 @@ mod graceful_summary_metering_tests {
                 &LoopKnobs::default(),
                 Some(&tx),
                 None,
+                None,
                 ResolvedContextLimits {
                     model_context_window: budget,
                     ..ResolvedContextLimits::legacy_fallback(if disable_soft_budget {
@@ -841,6 +850,7 @@ mod graceful_summary_metering_tests {
             &knobs,
             None,
             None,
+            None,
             ResolvedContextLimits::legacy_fallback(0),
             &mut false,
             super::super::DispatchTokenCounter::default(),
@@ -912,6 +922,7 @@ mod graceful_summary_metering_tests {
             &knobs,
             None,
             None,
+            None,
             ResolvedContextLimits::legacy_fallback(0),
             &mut false,
             super::super::DispatchTokenCounter::default(),
@@ -943,11 +954,17 @@ mod graceful_summary_metering_tests {
     // the summary path: the summary may see the turn's images.
     #[tokio::test]
     async fn graceful_summary_normalizes_local_and_inline_tool_image_markers() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
         let temp = tempfile::tempdir().expect("temp dir");
         let png_path = temp.path().join("shot.png");
-        std::fs::write(&png_path, [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
-            .expect("write png signature");
-        let inline_uri = "data:image/png;base64,iVBORw0KGgo=";
+        std::fs::write(
+            &png_path,
+            STANDARD.decode(PNG_B64).expect("valid PNG fixture"),
+        )
+        .expect("write PNG fixture");
+        let inline_uri = format!("data:image/png;base64,{PNG_B64}");
         let inline_marker = format!("[{}:{}]", "IMAGE", inline_uri);
         let local_marker = format!("[{}:{}]", "IMAGE", png_path.display());
 
@@ -985,6 +1002,7 @@ mod graceful_summary_metering_tests {
             String::new(),
             "trace-req-img-inline",
             &knobs,
+            None,
             None,
             None,
             ResolvedContextLimits::legacy_fallback(0),
@@ -1070,6 +1088,7 @@ mod graceful_summary_metering_tests {
             &knobs,
             None,
             None,
+            None,
             ResolvedContextLimits::legacy_fallback(0),
             &mut false,
             super::super::DispatchTokenCounter::default(),
@@ -1150,6 +1169,7 @@ mod graceful_summary_metering_tests {
             &knobs,
             None,
             None,
+            None,
             ResolvedContextLimits::legacy_fallback(0),
             &mut false,
             super::super::DispatchTokenCounter::default(),
@@ -1184,19 +1204,32 @@ mod graceful_summary_metering_tests {
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
 
-        let out = run_summary_with_events(&provider, "earlier narration".to_string(), Some(&tx))
-            .await
-            .expect("graceful summary should succeed");
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<StreamDelta>(8);
+        let out = run_summary_with_events(
+            &provider,
+            "earlier narration".to_string(),
+            Some(&tx),
+            Some(&delta_tx),
+        )
+        .await
+        .expect("graceful summary should succeed");
 
         assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
 
-        let mut chunk_delta = None;
+        let mut chunk_deltas = Vec::new();
         while let Ok(event) = rx.try_recv() {
             if let TurnEvent::Chunk { delta } = event {
-                chunk_delta = Some(delta);
+                chunk_deltas.push(delta);
             }
         }
-        let delta = chunk_delta.expect("max-iteration exit must emit a TurnEvent::Chunk");
+        assert_eq!(
+            chunk_deltas.len(),
+            1,
+            "max-iteration exit must emit exactly one TurnEvent::Chunk"
+        );
+        let delta = chunk_deltas
+            .pop()
+            .expect("max-iteration exit must emit a TurnEvent::Chunk");
         assert!(
             delta.contains("wrap-up summary"),
             "chunk must carry the summary text: {delta}"
@@ -1208,6 +1241,14 @@ mod graceful_summary_metering_tests {
         assert!(
             !delta.contains("earlier narration"),
             "chunk must not re-send narration already streamed in earlier iterations: {delta}"
+        );
+        assert!(matches!(
+            delta_rx.recv().await,
+            Some(StreamDelta::Text(draft_delta)) if draft_delta == delta
+        ));
+        assert!(
+            delta_rx.try_recv().is_err(),
+            "summary must emit one draft delta"
         );
     }
 
@@ -1259,7 +1300,7 @@ mod graceful_summary_metering_tests {
             text: raw.to_string(),
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
-        run_summary_with_events(&provider, "earlier narration".to_string(), Some(&tx))
+        run_summary_with_events(&provider, "earlier narration".to_string(), Some(&tx), None)
             .await
             .expect("graceful summary should succeed");
         let mut chunk_delta = None;

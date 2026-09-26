@@ -575,6 +575,8 @@ async fn enforce_reported_budget(
     let taken_had_crumb = *crumb_present;
     let taken = std::mem::take(history);
     let taken_len = taken.len();
+    let taken_turns = crate::agent::history_trim::count_turns(&taken)
+        .saturating_sub(usize::from(taken_had_crumb));
     let ratio = reported_input_tokens as f64 / pre_trim_estimated.max(1) as f64;
     // Project the provider-facing population of the FULL pre-trim history, so
     // `tokens_before` always describes the population actually trimmed — even
@@ -736,6 +738,7 @@ async fn enforce_reported_budget(
             let _ = tx
                 .send(TurnEvent::HistoryTrimmed {
                     dropped_messages: result.dropped_messages,
+                    dropped_turns: taken_turns.saturating_sub(result.kept_turns),
                     kept_turns: result.kept_turns,
                     reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
                     token_budget: Some(context_token_budget as u64),
@@ -1280,13 +1283,14 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             activated_tools,
         )?;
 
-        let prepared_messages = prepare_messages_for_iteration(
-            turn_state.history,
-            multimodal_config,
-            degrade_strip_images,
-            image_cache.as_deref_mut(),
-        )
-        .await?;
+        let (prepared_messages, prepared_source_rows) =
+            vision_route::prepare_messages_with_source_rows(
+                turn_state.history,
+                multimodal_config,
+                degrade_strip_images,
+                image_cache.as_deref_mut(),
+            )
+            .await?;
         let mut provider_request_messages = prepared_messages.messages;
         let pre_hook_messages = provider_request_messages.clone();
         let mut hook_selected_model = None;
@@ -1476,6 +1480,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // mutations to retained messages rather than discarding them.
         let post_hook_snapshot = provider_request_messages.clone();
         let post_hook_had_crumb = crumb_before;
+        let original_body_start = turn_state
+            .history
+            .iter()
+            .take_while(|m| m.is_system())
+            .count()
+            + usize::from(crumb_before);
         // The gate attempts a whole-turn trim of the durable history but does
         // not itself decide Trimmed vs. Floor for the client-visible event:
         // a dropped turn can carry a disproportionate share of the measured
@@ -1520,37 +1530,17 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             let mut tokens_after_dispatch = tokens_before_dispatch;
             let max_iterations = crate::agent::history_trim::count_turns(turn_state.history) + 1;
             for _ in 0..max_iterations {
-                // Preserve the hook's mutations to retained messages by
-                // trimming the already-mutated post-hook snapshot directly,
-                // rather than repreparing the trimmed durable history and
-                // losing rewrites of existing messages.
-                let mut trimmed_post_hook = post_hook_snapshot.clone();
-                // Separate any hook-appended suffix (messages beyond the
-                // original prepared length) so turn-dropping targets the
-                // durable prefix without dropping the hook's transient growth.
-                let suffix_len = hook_suffix.len();
-                let mut suffix = Vec::new();
-                if suffix_len > 0 && trimmed_post_hook.len() >= suffix_len {
-                    suffix = trimmed_post_hook.split_off(trimmed_post_hook.len() - suffix_len);
-                }
-                // Drop oldest whole turns from the post-hook prefix until its
-                // turn count matches the (possibly further-trimmed) durable
-                // history's count.
-                let durable_target_turns =
-                    crate::agent::history_trim::count_turns(turn_state.history)
-                        .saturating_sub(usize::from(turn_state.crumb_present));
-                while crate::agent::history_trim::count_turns(&trimmed_post_hook)
-                    .saturating_sub(usize::from(post_hook_had_crumb))
-                    > durable_target_turns
-                {
-                    let dropped = crate::agent::history_trim::drop_oldest_whole_turn(
-                        &mut trimmed_post_hook,
-                        post_hook_had_crumb,
-                    );
-                    if dropped == 0 {
-                        break;
-                    }
-                }
+                // Wire roles cannot identify turns: prompt-mode results are
+                // plain user messages. Remove precisely the durable source
+                // span, preserving prepared media and the hook suffix.
+                let removed_rows =
+                    original_body_start..original_body_start + total_dropped_messages;
+                let mut trimmed_post_hook: Vec<_> = post_hook_snapshot
+                    .iter()
+                    .zip(&prepared_source_rows)
+                    .filter(|(_, source_row)| !removed_rows.contains(source_row))
+                    .map(|(message, _)| message.clone())
+                    .collect();
                 // If the durable trim inserted a fresh breadcrumb, mirror it
                 // in the post-hook request so the dispatched population
                 // matches the persisted history.
@@ -1562,7 +1552,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 }
                 // Re-append the hook's transient suffix and re-apply prompt
                 // framing so the system anchor stays consistent.
-                trimmed_post_hook.extend(suffix);
+                trimmed_post_hook.extend(hook_suffix.iter().cloned());
                 refresh_prompt_anchor(&mut trimmed_post_hook, use_native_tools);
                 refresh_scoped_tool_protocol_prompt(
                     turn_state.history,
@@ -1622,6 +1612,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 let _ = tx
                     .send(TurnEvent::HistoryTrimmed {
                         dropped_messages: trim_result.dropped_messages,
+                        dropped_turns,
                         kept_turns: trim_result.kept_turns,
                         reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
                         token_budget: Some(event_budget as u64),
@@ -1659,6 +1650,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 let _ = tx
                     .send(TurnEvent::HistoryTrimmed {
                         dropped_messages: 0,
+                        dropped_turns: 0,
                         kept_turns: trim_result.kept_turns,
                         reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
                         token_budget: Some(model_context_window as u64),
@@ -2500,6 +2492,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         turn_id,
         knobs,
         event_tx.as_ref(),
+        on_delta.as_ref(),
         turn_state.canonical.as_deref_mut(),
         summary_limits,
         &mut turn_state.crumb_present,
@@ -3859,6 +3852,8 @@ mod reported_budget_tests {
 
     #[tokio::test]
     async fn enforce_retrims_against_the_prepared_population_for_retained_images() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
         // `estimate_history_tokens` now charges the same fixed per-image cost
         // whether a `[IMAGE:...]` marker holds a path or the base64 payload
         // preparation resolves it to, so the raw and prepared populations for
@@ -3870,14 +3865,14 @@ mod reported_budget_tests {
         // request (prepared retained messages), not drift from it.
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("shot.png");
-        // PNG signature plus padding: MIME detection only needs the
-        // extension, but the padding keeps the base64 expansion larger than
-        // the marker's own path text regardless of how long the platform's
-        // temp-dir path is (a bare 8-byte signature can lose that race on
-        // Windows CI runners, whose temp paths run longer than Linux's).
-        let mut fake_png = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
-        fake_png.extend(vec![0u8; 4096]);
-        std::fs::write(&image_path, &fake_png).unwrap();
+        // Use a fully decodable image: the multimodal boundary intentionally
+        // rejects files that merely carry a valid signature.
+        const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+        std::fs::write(
+            &image_path,
+            STANDARD.decode(PNG_B64).expect("valid PNG fixture"),
+        )
+        .unwrap();
         let marker = format!("[IMAGE:{}]", image_path.display());
         let big = "x".repeat(2000);
         let mut history = vec![
@@ -5853,6 +5848,8 @@ mod sop_step_reassembly_tests {
         parent_tools: &crate::tools::scoped::ScopedToolRegistry,
         observer: &dyn crate::observability::Observer,
         history: &mut Vec<ChatMessage>,
+        history_has_trim_breadcrumb: Option<&mut bool>,
+        event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
         new_messages_out: Option<&mut Vec<ChatMessage>>,
         agent_alias: Option<&str>,
         sop_reassembly: Option<SopStepReassembly<'_>>,
@@ -5870,10 +5867,13 @@ mod sop_step_reassembly_tests {
             audit: None,
             action,
         };
+        let mut local_history_has_trim_breadcrumb = false;
+        let history_has_trim_breadcrumb =
+            history_has_trim_breadcrumb.unwrap_or(&mut local_history_has_trim_breadcrumb);
         drive_live_sop_actions(
             vec![queued],
             history,
-            &mut false,
+            history_has_trim_breadcrumb,
             parent_provider,
             "mock",
             "mock-model",
@@ -5910,7 +5910,7 @@ mod sop_step_reassembly_tests {
             None,
             None,
             None,
-            None,
+            event_tx,
             new_messages_out,
             None,
             agent_alias,
@@ -5981,6 +5981,8 @@ mod sop_step_reassembly_tests {
             &parent_tools,
             &crate::observability::NoopObserver {},
             &mut history,
+            None,
+            None,
             Some(&mut new_out),
             Some("outer"),
             Some(handle),
@@ -6093,6 +6095,8 @@ mod sop_step_reassembly_tests {
             &crate::observability::NoopObserver {},
             &mut history,
             None,
+            None,
+            None,
             Some("outer"),
             Some(handle),
             None,
@@ -6169,6 +6173,8 @@ mod sop_step_reassembly_tests {
             &observer,
             &mut history,
             None,
+            None,
+            None,
             Some("outer"),
             Some(handle),
             None,
@@ -6215,6 +6221,8 @@ mod sop_step_reassembly_tests {
             &observer,
             &mut history,
             None,
+            None,
+            None,
             Some("outer"),
             Some(handle),
             None,
@@ -6247,6 +6255,67 @@ mod sop_step_reassembly_tests {
     }
 
     #[tokio::test]
+    async fn same_agent_step_excludes_existing_breadcrumb_from_trim_turn_count() {
+        let (engine, _run_id, action) = start_single_cross_agent_step("outer");
+        let config = zeroclaw_config::schema::Config::default();
+        let handle = SopStepReassembly { config: &config };
+
+        let parent_provider = TextProvider;
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let mut history = vec![
+            ChatMessage::system("parent system prompt"),
+            crate::agent::history_trim::breadcrumb(),
+            ChatMessage::user("old ".repeat(120_000)),
+            ChatMessage::assistant("old reply"),
+            ChatMessage::user("recent request"),
+            ChatMessage::assistant("recent reply"),
+        ];
+        let mut history_has_trim_breadcrumb = true;
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let mut exec_cache = std::collections::HashMap::new();
+
+        drive_step(
+            Arc::clone(&engine),
+            action,
+            &parent_provider,
+            &parent_tools,
+            &crate::observability::NoopObserver {},
+            &mut history,
+            Some(&mut history_has_trim_breadcrumb),
+            Some(event_tx),
+            None,
+            Some("outer"),
+            Some(handle),
+            None,
+            &mut exec_cache,
+        )
+        .await;
+
+        let dropped_turns = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .find_map(|event| match event {
+                TurnEvent::HistoryTrimmed { dropped_turns, .. } => Some(dropped_turns),
+                _ => None,
+            })
+            .expect("the oversized old turn must emit a trim event");
+        assert_eq!(
+            dropped_turns, 1,
+            "the synthetic breadcrumb must not be reported as a dropped user turn"
+        );
+        assert!(history_has_trim_breadcrumb);
+        let breadcrumb = crate::agent::history_trim::breadcrumb();
+        assert_eq!(
+            history
+                .iter()
+                .filter(|message| {
+                    message.role == breadcrumb.role && message.content == breadcrumb.content
+                })
+                .count(),
+            1,
+            "repeated same-agent trimming must retain exactly one breadcrumb"
+        );
+    }
+
+    #[tokio::test]
     async fn same_agent_step_output_reaches_parent_capture_once() {
         let (engine, _run_id, action) = start_single_cross_agent_step("outer");
         let config = zeroclaw_config::schema::Config::default();
@@ -6266,6 +6335,8 @@ mod sop_step_reassembly_tests {
             &parent_tools,
             &observer,
             &mut history,
+            None,
+            None,
             Some(&mut capture),
             Some("outer"),
             Some(handle),
@@ -6323,6 +6394,8 @@ mod sop_step_reassembly_tests {
             &crate::observability::NoopObserver {},
             &mut history,
             None,
+            None,
+            None,
             Some("outer"),
             Some(handle),
             None,
@@ -6370,6 +6443,8 @@ mod sop_step_reassembly_tests {
             &parent_tools,
             &crate::observability::NoopObserver {},
             &mut history,
+            None,
+            None,
             None,
             Some("outer"),
             None,
@@ -6550,6 +6625,8 @@ mod sop_step_reassembly_tests {
             &crate::observability::NoopObserver {},
             &mut history,
             None,
+            None,
+            None,
             Some("outer"),
             Some(handle),
             Some(Arc::clone(&parent_switch_state)),
@@ -6672,6 +6749,8 @@ mod sop_step_reassembly_tests {
             &parent_tools,
             &crate::observability::NoopObserver {},
             &mut history,
+            None,
+            None,
             None,
             None,
             None,

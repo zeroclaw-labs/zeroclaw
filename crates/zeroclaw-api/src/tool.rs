@@ -423,6 +423,34 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
         Vec::new()
     }
 
+    /// Re-point the forwarded client environment this tool overlays on the
+    /// subprocesses it spawns. The daemon filters a connecting client's
+    /// environment ONCE per authorization (retained only for a local
+    /// operator, dropped otherwise). A long-lived tool captures that filtered
+    /// environment at construction, so when the SAME live tool is reused by a
+    /// later connection — a session resumed under a re-derived entitlement, a
+    /// principal that has since lost `admin`, a WSS reconnect describing a
+    /// different host — its captured environment must be re-derived against
+    /// the current connection's entitlement rather than left as the value the
+    /// first `initialize` computed.
+    ///
+    /// `env` is the ALREADY-FILTERED environment for the current invocation
+    /// (`Some(map)` to overlay it, `Some(empty)`/`None` to overlay nothing).
+    /// Filtering is the caller's responsibility; this method only installs the
+    /// decided value. The default is a no-op: only tools that forward a client
+    /// environment to subprocesses (the shell tool) carry one. Delegating
+    /// wrappers around a `dyn Tool` MUST forward this to the inner tool, or a
+    /// rebind would stop at the wrapper and leave the wrapped tool holding the
+    /// stale environment.
+    ///
+    /// Takes `&self`: a sealed registry stores tools behind `Arc<dyn Tool>`
+    /// (see the crate's `ArcDelegatingTool`), which cannot be mutated through a
+    /// `&mut` wrapper. A tool that carries a rebindable environment therefore
+    /// holds it behind interior mutability and swaps it here.
+    fn rebind_forwarded_env(&self, env: Option<std::collections::HashMap<String, String>>) {
+        let _ = env;
+    }
+
     /// Execute the tool with given arguments
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult>;
 

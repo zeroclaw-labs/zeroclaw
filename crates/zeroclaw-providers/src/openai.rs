@@ -1,3 +1,4 @@
+use crate::compatible::{MAX_MODELS_RESPONSE_BYTES, read_body_capped};
 use crate::openai_codex::{
     ResponsesStreamApiError, ResponsesStreamState, ResponsesToolSpec, append_utf8_stream_chunk,
     build_responses_input, convert_tools, first_nonempty, parse_responses_usage, process_sse_chunk,
@@ -1211,6 +1212,20 @@ impl OpenAiResponsesModelProvider {
         builder.build().unwrap_or_else(|_| Client::new())
     }
 
+    /// Sibling `/models` endpoint next to the configured `/responses` URL,
+    /// following the same OpenAI-compatible convention used elsewhere in
+    /// this crate (base URL with the wire-specific suffix stripped, plus
+    /// `/models`).
+    fn models_url(&self) -> String {
+        let base = self
+            .responses_url
+            .trim_end_matches('/')
+            .strip_suffix("/responses")
+            .unwrap_or(&self.responses_url)
+            .trim_end_matches('/');
+        format!("{base}/models")
+    }
+
     fn streaming_client(&self) -> Client {
         let default_headers = self.build_default_headers();
         let mut builder = Client::builder()
@@ -1260,6 +1275,33 @@ impl ModelProvider for OpenAiResponsesModelProvider {
 
     fn supports_streaming_tool_events(&self) -> bool {
         true
+    }
+
+    /// Configured Responses-wire aliases (custom/self-hosted endpoints using
+    /// `wire_api = "responses"`) have no default public fallback the way the
+    /// OpenAI family does, so an unimplemented listing method here silently
+    /// drops the configured endpoint in favor of a generic catalog. Probe
+    /// the sibling `/models` endpoint next to the configured `/responses`
+    /// URL, the same OpenAI-compatible convention `OpenAiCompatibleModelProvider`
+    /// uses, so a credentialed or header-authenticated alias returns its own
+    /// live models instead of an unrelated public list.
+    async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        let url = self.models_url();
+        let mut request = self.http_client().get(&url);
+        if let Some(credential) = self.credential.as_deref() {
+            request = request.header("Authorization", format!("Bearer {credential}"));
+        }
+        let response = request.send().await.map_err(|error| {
+            anyhow::Error::msg(format!(
+                "OpenAI Responses model list request failed: {url}: {error}"
+            ))
+        })?;
+        if !response.status().is_success() {
+            let status = response.status();
+            anyhow::bail!("OpenAI Responses model list failed at {url}: HTTP {status}");
+        }
+        let bytes = read_body_capped(response, MAX_MODELS_RESPONSE_BYTES).await?;
+        crate::compatible::parse_model_ids_from_bytes(&bytes)
     }
 
     async fn chat_with_system(
@@ -1472,6 +1514,202 @@ impl ::zeroclaw_api::attribution::Attributable for OpenAiResponsesModelProvider 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn responses_model_listing_parses_normal_body() {
+        use axum::{Json, Router, routing::get};
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/models",
+            get(|| async {
+                Json(serde_json::json!({
+                    "data": [{"id": "z-model"}, {"id": "a-model"}]
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Responses model-list test server");
+        let addr = listener
+            .local_addr()
+            .expect("Responses model-list test address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Responses model-list test");
+        });
+
+        let provider = OpenAiResponsesModelProvider::builder("test")
+            .api_url(&format!("http://{addr}"))
+            .credential(Some("test-key"))
+            .build();
+        assert_eq!(
+            provider
+                .list_models()
+                .await
+                .expect("normal Responses catalog must parse"),
+            vec!["a-model", "z-model"]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn responses_model_listing_omits_empty_authorization_header() {
+        use axum::{Json, Router, extract::Request, http::StatusCode, routing::get};
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/models",
+            get(|request: Request| async move {
+                if request.headers().get("authorization").is_some() {
+                    Err(StatusCode::BAD_REQUEST)
+                } else {
+                    Ok(Json(serde_json::json!({
+                        "data": [{"id": "unauthenticated-model"}]
+                    })))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Responses model-list test server");
+        let addr = listener
+            .local_addr()
+            .expect("Responses model-list test address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Responses model-list test");
+        });
+
+        let provider = OpenAiResponsesModelProvider::builder("test")
+            .api_url(&format!("http://{addr}"))
+            .build();
+        assert_eq!(
+            provider
+                .list_models()
+                .await
+                .expect("unauthenticated Responses catalog must parse"),
+            vec!["unauthenticated-model"]
+        );
+        server.abort();
+    }
+
+    /// A header-only configured Responses profile (a `Cookie`/`X-Auth`
+    /// bridge rather than a credential resolved into `Authorization`) must
+    /// reach `/models` carrying its configured `extra_headers`, and a real
+    /// authorization failure on that path must stay actionable rather than
+    /// being replaced by unrelated public catalog data.
+    #[tokio::test]
+    async fn responses_model_listing_carries_header_only_profile_and_surfaces_auth_failure() {
+        use axum::{Json, Router, extract::Request, http::StatusCode, routing::get};
+        use tokio::net::TcpListener;
+
+        // Success case: the configured X-Auth header must arrive, and no
+        // Authorization header should be synthesized for a header-only profile.
+        let app = Router::new().route(
+            "/models",
+            get(|request: Request| async move {
+                let headers = request.headers();
+                if headers.get("authorization").is_some() {
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+                match headers.get("x-auth").and_then(|value| value.to_str().ok()) {
+                    Some("bridge-token") => Ok(Json(serde_json::json!({
+                        "data": [{"id": "header-only-model"}]
+                    }))),
+                    // Without the configured header the endpoint rejects the
+                    // request, which is what the failure case below asserts.
+                    _ => Err(StatusCode::FORBIDDEN),
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind header-only Responses test server");
+        let addr = listener
+            .local_addr()
+            .expect("header-only Responses test address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve header-only Responses test");
+        });
+
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Auth".to_string(), "bridge-token".to_string());
+        let provider = OpenAiResponsesModelProvider::builder("header-only")
+            .api_url(&format!("http://{addr}"))
+            .extra_headers(headers)
+            .build();
+        assert_eq!(
+            provider
+                .list_models()
+                .await
+                .expect("a header-only Responses profile must reach /models with its headers"),
+            vec!["header-only-model"],
+            "the configured extra_headers must be carried into the catalog request"
+        );
+
+        // Failure case: same endpoint, no configured bridge header. The 403
+        // must surface as an actionable error, not an empty/public fallback.
+        let unauthenticated = OpenAiResponsesModelProvider::builder("header-only-missing")
+            .api_url(&format!("http://{addr}"))
+            .build();
+        let error = unauthenticated
+            .list_models()
+            .await
+            .expect_err("a genuine Responses authorization failure must stay actionable");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("403"),
+            "expected the endpoint's real authorization failure, got: {rendered}"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn responses_model_listing_bounds_success_body() {
+        use axum::{Router, body::Body, response::Response, routing::get};
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/models",
+            get(|| async {
+                Response::builder()
+                    .status(200)
+                    .body(Body::from(vec![
+                        b'x';
+                        (MAX_MODELS_RESPONSE_BYTES as usize) + 1
+                    ]))
+                    .expect("oversized test response")
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Responses model-list test server");
+        let addr = listener
+            .local_addr()
+            .expect("Responses model-list test address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Responses model-list test");
+        });
+
+        let provider = OpenAiResponsesModelProvider::builder("test")
+            .api_url(&format!("http://{addr}"))
+            .credential(Some("test-key"))
+            .build();
+        let error = provider
+            .list_models()
+            .await
+            .expect_err("oversized Responses catalog must be rejected");
+        assert!(error.to_string().contains("exceeds"));
+        server.abort();
+    }
 
     #[tokio::test]
     async fn responses_completed_ignores_trailing_events_without_eof() {
@@ -1822,6 +2060,102 @@ mod tests {
             p.extra_headers.is_empty(),
             "fresh provider must default extra_headers to an empty HashMap"
         );
+    }
+
+    #[test]
+    fn models_url_strips_responses_suffix_from_custom_base() {
+        let p = OpenAiResponsesModelProvider::builder("custom")
+            .api_url("https://custom.example.com/v1")
+            .credential(Some("key"))
+            .build();
+        assert_eq!(p.responses_url, "https://custom.example.com/v1/responses");
+        assert_eq!(p.models_url(), "https://custom.example.com/v1/models");
+    }
+
+    #[tokio::test]
+    async fn list_models_probes_configured_endpoint_for_responses_wire_alias() {
+        // A credentialed custom Responses-wire alias (`wire_api = "responses"`)
+        // must list from its own configured `/models` endpoint rather than
+        // silently falling back to a generic public catalog when the trait
+        // default is used.
+        use axum::Router;
+        use axum::routing::get;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let captured_auth: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let captured_for_route = captured_auth.clone();
+        let app = Router::new().route(
+            "/v1/models",
+            get(move |headers: axum::http::HeaderMap| {
+                let captured = captured_for_route.clone();
+                async move {
+                    *captured.lock().unwrap() = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    axum::Json(serde_json::json!({
+                        "data": [{"id": "custom-endpoint-only-model"}]
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let provider = OpenAiResponsesModelProvider::builder("custom")
+            .api_url(&format!("http://{addr}/v1"))
+            .credential(Some("secret-key"))
+            .build();
+
+        let models = provider
+            .list_models()
+            .await
+            .expect("configured Responses-wire alias must list from its own endpoint");
+        assert_eq!(models, vec!["custom-endpoint-only-model".to_string()]);
+        assert_eq!(
+            captured_auth.lock().unwrap().as_deref(),
+            Some("Bearer secret-key"),
+            "the configured credential must reach the catalog probe"
+        );
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn list_models_surfaces_a_genuine_responses_endpoint_failure() {
+        use axum::Router;
+        use axum::routing::get;
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/v1/models",
+            get(|| async { axum::http::StatusCode::UNAUTHORIZED }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let provider = OpenAiResponsesModelProvider::builder("custom")
+            .api_url(&format!("http://{addr}/v1"))
+            .credential(Some("bad-key"))
+            .build();
+
+        let error = provider
+            .list_models()
+            .await
+            .expect_err("a genuine native listing failure must remain actionable");
+        assert!(
+            error.to_string().contains("HTTP 401"),
+            "expected the real endpoint failure, got: {error}"
+        );
+
+        server_handle.abort();
     }
 
     #[test]

@@ -436,6 +436,7 @@ zc-model-switch-provider-ok = model_provider 已切换为 { $provider }（模型
 zc-model-switch-failed = 模型切换失败：{ $error }
 zc-model-catalog-no-provider = 无法从配置中解析此代理的 model_provider。
 zc-model-catalog-empty = 当前激活的 model_provider 没有可用模型。
+zc-model-catalog-failed = 无法加载当前 model_provider 的模型：{ $error }
 zc-model-catalog-loading = 正在加载模型…
 zc-model-provider-catalog-failed = 无法加载 model_providers：{ $error }
 zc-chat-label-you = 你：
@@ -461,6 +462,7 @@ zc-chat-help-yank-selection = 复制选择
 zc-chat-help-return-to-input = 返回输入
 zc-chat-help-browse-mode = 浏览模式
 zc-chat-help-scroll-conversation = 滚动对话
+zc-chat-help-open-link = 点击链接打开；从其他位置拖动以选择文本
 zc-chat-help-toggle-thoughts = 切换思考
 zc-chat-help-new-session = 新建会话
 zc-chat-session-list-resume-title = 已保存会话（Enter=恢复，Esc=新建）
@@ -479,6 +481,10 @@ zc-chat-copied-clipboard = 已复制到剪贴板
 zc-chat-copy-message = [复制]
 zc-chat-copy-message-copied = [已复制]
 zc-chat-context-menu-copy = 复制
+zc-chat-context-menu-copy-selection = 复制所选内容
+zc-chat-context-menu-open-link = 打开链接
+zc-chat-context-menu-copy-link = 复制链接
+zc-chat-open-link-failed = 无法打开链接：{ $error }
 zc-chat-context-menu-send-now = 立即发送
 zc-chat-context-menu-edit = 编辑
 zc-chat-context-menu-delete = 删除
@@ -573,6 +579,11 @@ zc-config-footer-action-help = 帮助
 zc-config-footer-action-new-line = 换行
 zc-config-field-edit-hint = { $keys } → 按下以编辑
 zc-doctor-log-path = 日志：{ $path }
+
+zc-oidc-enroll-visit = 要登录,请打开 { $uri } 并输入代码 { $code }
+zc-oidc-enroll-waiting = 正在等待身份提供方批准(代码将在 { $seconds } 秒后过期)...
+zc-oidc-enroll-missing-url = 已设置 auth_provider { $provider } 但没有 auth_token。请将 [connection.wss] enroll_url 设置为网关的 HTTP 源以交互式登录,或导出 ZEROCLAW_AUTH_TOKEN(参见:zeroclaw oidc login)。
+zc-oidc-enroll-done = 已登录。令牌仅在本次会话中保留;导出 ZEROCLAW_AUTH_TOKEN 可跳过下次注册。
 
 ## Config registry metadata. Stable identifiers are used for lookup while the
 ## RPC-provided English display strings remain compatibility fallbacks.

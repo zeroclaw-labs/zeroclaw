@@ -796,9 +796,9 @@ pub async fn run(
             };
 
         let hooks: Option<std::sync::Arc<crate::hooks::HookRunner>> = if config.hooks.enabled {
-            Some(std::sync::Arc::new(crate::hooks::HookRunner::from_config(
-                &config.hooks,
-            )))
+            Some(std::sync::Arc::new(
+                crate::hooks::HookRunner::from_root_config(&config),
+            ))
         } else {
             None
         };
@@ -1196,7 +1196,10 @@ async fn await_socket_startup(
         Ok(SocketStartupState::Fatal { kind, message }) => {
             Err(std::io::Error::new(kind, message).into())
         }
-        Ok(SocketStartupState::Pending) => unreachable!("wait_for excludes pending state"),
+        Ok(SocketStartupState::Pending) => Err(std::io::Error::other(
+            "socket startup remained pending after readiness wait",
+        )
+        .into()),
         Err(_) => Ok(()),
     }
 }

@@ -764,6 +764,7 @@ mod tests {
         session_id: Option<&str>,
     ) -> MemoryEntry {
         MemoryEntry {
+            principal_id: None,
             id: key.into(),
             key: key.into(),
             content: content.into(),

@@ -3483,6 +3483,7 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
         TurnEvent::ApprovalRequest { .. } => return None,
         TurnEvent::HistoryTrimmed {
             dropped_messages,
+            dropped_turns,
             kept_turns,
             reason,
             token_budget,
@@ -3495,6 +3496,7 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
             let mut params = serde_json::json!({
                 "sessionId": session_id,
                 "droppedMessages": dropped_messages,
+                "droppedTurns": dropped_turns,
                 "keptTurns": kept_turns,
                 "reason": reason,
             });
@@ -3732,6 +3734,18 @@ type RpcResult = std::result::Result<Value, RpcError>;
 mod tests {
     use super::*;
     use async_trait::async_trait;
+
+    fn valid_1x1_png() -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([255, 0, 0, 255]),
+        ))
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .expect("test PNG encodes");
+        bytes.into_inner()
+    }
 
     struct RecordingNativeProvider {
         requests: Arc<parking_lot::Mutex<Vec<Vec<ChatMessage>>>>,
@@ -6099,6 +6113,7 @@ mod tests {
             "restored-session",
             &TurnEvent::HistoryTrimmed {
                 dropped_messages: 12,
+                dropped_turns: 4,
                 kept_turns: 3,
                 reason: "message limit".to_string(),
                 token_budget: Some(500_000),
@@ -6118,6 +6133,7 @@ mod tests {
             serde_json::json!({
                 "sessionId": "restored-session",
                 "droppedMessages": 12,
+                "droppedTurns": 4,
                 "keptTurns": 3,
                 "reason": "message limit",
                 "tokenBudget": 500_000,
@@ -7009,7 +7025,7 @@ mod tests {
             .runtime_profiles
             .get_mut("default")
             .unwrap()
-            .max_history_messages = Some(2);
+            .max_history_messages = Some(1);
         let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
         let server = Arc::new(AcpServer::new_with_writer_and_store(
             config,
@@ -7058,8 +7074,9 @@ mod tests {
         // `dropped_messages` from the crumb-aware restore trim counts only
         // real messages, but the persisted leading breadcrumb is still a row
         // of the seed vector. The replay offset must skip that crumb row too:
-        // with [crumb, old turn, new turn] and one old turn dropped, replay
-        // must begin at the new turn, not at the old turn's assistant reply.
+        // with [crumb, old turn, new turn], a one-turn cap drops the old
+        // turn whole, and replay must begin at the new turn, not at the old
+        // turn's assistant reply.
         let cwd = tempfile::tempdir().unwrap();
         let store =
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
@@ -7103,7 +7120,7 @@ mod tests {
             .runtime_profiles
             .get_mut("default")
             .unwrap()
-            .max_history_messages = Some(2);
+            .max_history_messages = Some(1);
         let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
         let server = Arc::new(AcpServer::new_with_writer_and_store(
             config,
@@ -7606,12 +7623,14 @@ mod tests {
         store
             .replace_messages_and_breadcrumb(session_id, &before, true)
             .unwrap();
+        // A one-turn cap: the new prompt's turn displaces the old turn whole,
+        // leaving the breadcrumb and the new exchange.
         let mut config = make_test_config(cwd.path());
         config
             .runtime_profiles
             .get_mut("default")
             .unwrap()
-            .max_history_messages = Some(2);
+            .max_history_messages = Some(1);
         let server = Arc::new(AcpServer::new_with_store(
             config,
             AcpServerConfig::default(),
@@ -8350,11 +8369,7 @@ mod tests {
         // attachment and renders the marker localized at projection time.
         let cwd = tempfile::tempdir().unwrap();
         let image_path = cwd.path().join("cross-locale.png");
-        std::fs::write(
-            &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
-        )
-        .unwrap();
+        std::fs::write(&image_path, valid_1x1_png()).unwrap();
         let marker = format!("look at this [IMAGE:{}]", image_path.display());
 
         let store =
@@ -8558,11 +8573,7 @@ mod tests {
 
         let cwd = tempfile::tempdir().unwrap();
         let image_path = cwd.path().join("rejected-live.png");
-        std::fs::write(
-            &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
-        )
-        .unwrap();
+        std::fs::write(&image_path, valid_1x1_png()).unwrap();
         let marker = format!("look at this [IMAGE:{}]", image_path.display());
 
         let store =
@@ -8663,7 +8674,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_image_with_prompt_tool_results_degrades_media_on_both_paths() {
+    async fn failed_image_with_tool_result_carrier_degrades_media_on_both_paths() {
         use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
 
         // A prompt-mode tool round appends its results as a user-role
@@ -8681,8 +8692,8 @@ mod tests {
         // ── Phase A: restore path ────────────────────────────────────
         let cwd = tempfile::tempdir().unwrap();
         let image_path = cwd.path().join("carrier-rejected.png");
-        let file_bytes = [0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
-        std::fs::write(&image_path, file_bytes).unwrap();
+        let file_bytes = valid_1x1_png();
+        std::fs::write(&image_path, &file_bytes).unwrap();
         let marker = format!("look at this [IMAGE:{}]", image_path.display());
 
         let store =
@@ -8854,7 +8865,7 @@ mod tests {
 
         let live_cwd = tempfile::tempdir().unwrap();
         let live_image = live_cwd.path().join("carrier-live.png");
-        std::fs::write(&live_image, file_bytes).unwrap();
+        std::fs::write(&live_image, &file_bytes).unwrap();
         let live_marker = format!("look at this [IMAGE:{}]", live_image.display());
         let tool_call_response = format!(
             "<tool_call>\n{{\"name\": \"file_read\", \"arguments\": {{\"path\": {}}}}}\n</tool_call>",
@@ -9026,13 +9037,13 @@ mod tests {
 
         // The cap retains only the newer turn: after repair the seed body is
         // [older user, older failure sentinel, newer user, newer assistant],
-        // and trimming drops the first two rows.
+        // two complete turns, and a one-turn cap drops the older one whole.
         let mut config = make_test_config(cwd.path());
         config
             .runtime_profiles
             .get_mut("default")
             .unwrap()
-            .max_history_messages = Some(2);
+            .max_history_messages = Some(1);
         let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
         let server = Arc::new(AcpServer::new_with_writer_and_store(
             config,
