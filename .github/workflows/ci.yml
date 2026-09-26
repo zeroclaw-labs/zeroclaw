@@ -502,6 +502,14 @@ jobs:
             control_plane::boot::tests::recovery_retains_live_foreign_process_then_reclaims_after_exit -- --exact 2>&1 | tee "$RUNNER_TEMP/windows-owner-recovery.log"
           grep -Fq 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/windows-owner-recovery.log"
 
+      - name: Test Windows WhatsApp passkey handoffs
+        if: runner.os == 'Windows'
+        shell: bash
+        run: >-
+          cargo test --profile ci --locked -p zeroclaw-channels
+          --no-default-features --features whatsapp-web
+          --target x86_64-pc-windows-msvc --lib whatsapp_passkey::tests::
+
   check:
     name: Check (${{ matrix.name }})
     runs-on: blacksmith-8vcpu-ubuntu-2404
