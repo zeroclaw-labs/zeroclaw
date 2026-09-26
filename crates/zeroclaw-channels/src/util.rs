@@ -1055,6 +1055,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn voice_reply_keeps_markdown_prose_eligible() {
+        assert_eq!(
+            voice_reply_skip_reason(
+                "**Summary:** the deployment completed successfully and is ready for review."
+            ),
+            None
+        );
+    }
+
     /// The bracket clause still has to reject genuine machine output. An
     /// attachment marker reaching TTS would read a filesystem path aloud.
     #[test]
