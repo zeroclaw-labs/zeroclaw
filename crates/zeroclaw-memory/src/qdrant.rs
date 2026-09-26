@@ -29,6 +29,26 @@ pub struct QdrantMemory {
 }
 
 impl QdrantMemory {
+    fn add_time_range_filter(
+        must: &mut Vec<serde_json::Value>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) {
+        let mut range = serde_json::Map::new();
+        if let Some(value) = since {
+            range.insert("gte".into(), serde_json::Value::String(value.into()));
+        }
+        if let Some(value) = until {
+            range.insert("lte".into(), serde_json::Value::String(value.into()));
+        }
+        if !range.is_empty() {
+            must.push(serde_json::json!({
+                "key": "timestamp",
+                "range": range,
+            }));
+        }
+    }
+
     pub async fn new(
         alias: &str,
         url: &str,
@@ -735,14 +755,14 @@ impl Memory for QdrantMemory {
         }
 
         // Build filter for session_id if provided
-        let filter = session_id.map(|sid| {
-            serde_json::json!({
-                "must": [{
-                    "key": "session_id",
-                    "match": { "value": sid }
-                }]
-            })
-        });
+        let mut must = Vec::new();
+        if let Some(sid) = session_id {
+            must.push(serde_json::json!({
+                "key": "session_id",
+                "match": { "value": sid }
+            }));
+        }
+        Self::add_time_range_filter(&mut must, since, until);
 
         let mut search_body = serde_json::json!({
             "vector": embedding,
@@ -750,8 +770,8 @@ impl Memory for QdrantMemory {
             "with_payload": true
         });
 
-        if let Some(f) = filter {
-            search_body["filter"] = f;
+        if !must.is_empty() {
+            search_body["filter"] = serde_json::json!({ "must": must });
         }
 
         let resp = self
@@ -1135,6 +1155,7 @@ impl Memory for QdrantMemory {
             "key": "agent_id",
             "match": { "any": allowed_agent_ids }
         }));
+        Self::add_time_range_filter(&mut must, since, until);
 
         let search_body = serde_json::json!({
             "vector": embedding,
