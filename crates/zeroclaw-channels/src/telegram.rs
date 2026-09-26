@@ -8457,7 +8457,8 @@ Ensure only one `zeroclaw` process is using this bot token."
         let tap_instruction = i18n::get_required_cli_string("channel-approval-tap-instruction");
         let btn_approve = i18n::get_required_cli_string("channel-approval-btn-approve");
         let btn_deny = i18n::get_required_cli_string("channel-approval-btn-deny");
-        let btn_always = i18n::get_required_cli_string("channel-approval-btn-always");
+        let strict_session_prompt_approval =
+            zeroclaw_api::is_strict_session_prompt_approval(request);
 
         let tool = Self::escape_html(&request.tool_name);
         let args = Self::escape_html(&request.arguments_summary);
@@ -8474,12 +8475,16 @@ Ensure only one `zeroclaw` process is using this bot token."
              {tap_instruction}",
         );
 
+        let mut buttons = vec![
+            serde_json::json!({ "text": format!("✅ {btn_approve}"),  "callback_data": format!("approval:{}:approve", approval_id) }),
+            serde_json::json!({ "text": format!("❌ {btn_deny}"),     "callback_data": format!("approval:{}:deny", approval_id) }),
+        ];
+        if !strict_session_prompt_approval {
+            let btn_always = i18n::get_required_cli_string("channel-approval-btn-always");
+            buttons.push(serde_json::json!({ "text": format!("✅✅ {btn_always}"), "callback_data": format!("approval:{}:always", approval_id) }));
+        }
         let reply_markup = serde_json::json!({
-            "inline_keyboard": [[
-                { "text": format!("✅ {btn_approve}"),  "callback_data": format!("approval:{}:approve", approval_id) },
-                { "text": format!("❌ {btn_deny}"),     "callback_data": format!("approval:{}:deny", approval_id) },
-                { "text": format!("✅✅ {btn_always}"), "callback_data": format!("approval:{}:always", approval_id) },
-            ]]
+            "inline_keyboard": [buttons]
         });
 
         let mut body = serde_json::json!({
@@ -8501,6 +8506,7 @@ Ensure only one `zeroclaw` process is using this bot token."
                 sender: tx,
                 destination: chat_id.to_string(),
                 tool_name: request.tool_name.clone(),
+                strict_session_prompt_approval,
             },
         );
 
@@ -10777,6 +10783,7 @@ mod tests {
             arguments_summary: "expr=1+1".to_string(),
             raw_arguments: None,
             position: None,
+            strict_session_prompt_approval: false,
         };
 
         let result = ch.request_approval("123", &request).await.unwrap();
@@ -10842,6 +10849,7 @@ mod tests {
             arguments_summary: "expr=1+1".to_string(),
             raw_arguments: None,
             position: None,
+            strict_session_prompt_approval: false,
         };
 
         let started = std::time::Instant::now();
@@ -18469,6 +18477,7 @@ mod tests {
                     sender,
                     destination: "-2001".to_string(),
                     tool_name: format!("tool-{i}"),
+                    strict_session_prompt_approval: false,
                 },
             );
             approval_receivers.push((i, receiver));
@@ -22854,6 +22863,7 @@ mod tests {
                 sender: tx,
                 destination: "-2001".to_string(),
                 tool_name: "shell".to_string(),
+                strict_session_prompt_approval: false,
             },
         );
 
@@ -22909,6 +22919,7 @@ mod tests {
                 sender: approve_tx,
                 destination: "-2001".to_string(),
                 tool_name: "shell".to_string(),
+                strict_session_prompt_approval: false,
             },
         );
         assert_eq!(
@@ -23022,6 +23033,7 @@ mod tests {
                 sender: approval_tx,
                 destination: "-2001".to_string(),
                 tool_name: "shell".to_string(),
+                strict_session_prompt_approval: false,
             },
         );
         let (message_tx, mut message_rx) = tokio::sync::mpsc::channel(1);
@@ -23135,6 +23147,7 @@ mod tests {
                 sender: tx,
                 destination: "12345".to_string(),
                 tool_name: "shell".to_string(),
+                strict_session_prompt_approval: false,
             },
         );
 
@@ -23399,6 +23412,7 @@ mod tests {
                 sender: resp_tx,
                 destination: "12345".to_string(),
                 tool_name: "shell".to_string(),
+                strict_session_prompt_approval: false,
             },
         );
 
@@ -23557,6 +23571,7 @@ mod tests {
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
             position: None,
+            strict_session_prompt_approval: false,
         };
         let attributed = ch
             .request_approval_attributed("12345", &request)
@@ -23650,6 +23665,7 @@ mod tests {
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
             position: None,
+            strict_session_prompt_approval: false,
         };
         let waiter = {
             let ch = Arc::clone(&ch);
@@ -23718,6 +23734,7 @@ mod tests {
                 sender: tx,
                 destination: "12345".to_string(),
                 tool_name: "shell".to_string(),
+                strict_session_prompt_approval: false,
             },
         );
         // the callback claims the entry first and its response is already in
@@ -23749,6 +23766,7 @@ mod tests {
                 sender: tx,
                 destination: "12345".to_string(),
                 tool_name: "shell".to_string(),
+                strict_session_prompt_approval: false,
             },
         );
 
@@ -23791,6 +23809,7 @@ mod tests {
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
             position: None,
+            strict_session_prompt_approval: false,
         };
 
         // No one resolves the pending oneshot — the short timeout above lets
@@ -23878,6 +23897,7 @@ mod tests {
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
             position: Some(zeroclaw_api::channel::ApprovalPosition { index: 2, total: 3 }),
+            strict_session_prompt_approval: false,
         };
 
         // Nothing resolves the pending oneshot; the short timeout returns a
@@ -23963,6 +23983,7 @@ mod tests {
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
             position: Some(zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 }),
+            strict_session_prompt_approval: false,
         };
 
         let _ = ch.request_approval("12345", &request).await;

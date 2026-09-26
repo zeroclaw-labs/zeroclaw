@@ -108,13 +108,17 @@ than omitting it: the host will call your export and trust the answer.
 
 `request-approval` is the deepest integration point. The runtime presents a
 compact `approval-request` (tool name, arguments summary, optional raw JSON
-arguments) and your channel renders it however the platform allows (buttons,
-reactions, a reply convention). The `approval-response` variant you return
-drives the security machinery:
+arguments, and the host-owned `strict-session-prompt-approval` policy marker)
+and your channel renders it however the platform allows (buttons, reactions, a
+reply convention). When the marker is `true`, render only one-time approve and
+deny actions; do not offer `always-approve`, because the host rejects that
+response for a strict session-prompt mutation. The `approval-response` variant
+you return drives the security machinery:
 
 - `approve`: execute this one call
 - `deny`: refuse it
 - `always-approve`: execute and add the tool to the session-scoped allowlist
+  (only when `strict-session-prompt-approval` is `false`)
 - `deny-with-edit(string)`: refuse, but supply edited replacement arguments
 
 Return `none` when the prompt cannot be presented; the caller falls back to

@@ -15,7 +15,7 @@ use tokio::fs;
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 use uuid::Uuid;
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_api::channel::{Channel, ChannelApprovalResponse, ChannelMessage, SendMessage};
 use zeroclaw_config::pairing::constant_time_eq;
 use zeroclaw_config::schema::StreamMode;
 
@@ -252,6 +252,7 @@ fn build_approval_card(
     tool_name: &str,
     arguments_summary: &str,
     position: Option<(u32, u32)>,
+    strict_session_prompt_approval: bool,
 ) -> serde_json::Value {
     // Two pending cards from one turn are otherwise identical until tapped.
     // The shared line is newline-terminated; Lark's markdown needs the blank
@@ -275,6 +276,14 @@ fn build_approval_card(
         })
     };
 
+    let mut columns = vec![
+        serde_json::json!({ "tag": "column", "elements": [make_button("✅ Approve", "primary_filled", "approve")] }),
+        serde_json::json!({ "tag": "column", "elements": [make_button("❌ Deny", "danger_filled", "deny")] }),
+    ];
+    if !strict_session_prompt_approval {
+        columns.push(serde_json::json!({ "tag": "column", "elements": [make_button("✅✅ Always", "default", "always")] }));
+    }
+
     serde_json::json!({
         "schema": "2.0",
         "config": { "wide_screen_mode": true },
@@ -294,17 +303,7 @@ fn build_approval_card(
                 {
                     "tag": "column_set",
                     "flex_mode": "stretch",
-                    "columns": [
-                        { "tag": "column", "elements": [
-                            make_button("✅ Approve", "primary_filled", "approve")
-                        ]},
-                        { "tag": "column", "elements": [
-                            make_button("❌ Deny", "danger_filled", "deny")
-                        ]},
-                        { "tag": "column", "elements": [
-                            make_button("✅✅ Always", "default", "always")
-                        ]}
-                    ]
+                    "columns": columns
                 }
             ]
         }
@@ -719,6 +718,7 @@ struct PendingApproval {
     message_id: String,
     tool_name: String,
     arguments_summary: String,
+    strict_session_prompt_approval: bool,
 }
 
 #[derive(Clone)]
@@ -3179,11 +3179,14 @@ impl Channel for LarkChannel {
         request: &zeroclaw_api::channel::ChannelApprovalRequest,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         let approval_id = Uuid::new_v4().to_string();
+        let strict_session_prompt_approval =
+            zeroclaw_api::is_strict_session_prompt_approval(request);
         let card = build_approval_card(
             &approval_id,
             &request.tool_name,
             &request.arguments_summary,
             request.position_counter(),
+            strict_session_prompt_approval,
         );
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.pending_approvals.lock().await.insert(
@@ -3194,6 +3197,7 @@ impl Channel for LarkChannel {
                 message_id: String::new(),
                 tool_name: request.tool_name.clone(),
                 arguments_summary: request.arguments_summary.clone(),
+                strict_session_prompt_approval,
             },
         );
 
@@ -3824,7 +3828,7 @@ impl LarkChannel {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
         let pending = self
-            .take_pending_approval(approval_id, responder, destination)
+            .take_pending_approval(approval_id, responder, destination, &decision)
             .await;
         let Some(pending) = pending else {
             ::zeroclaw_log::record!(
@@ -3873,6 +3877,7 @@ impl LarkChannel {
         approval_id: &str,
         responder: &str,
         destination: &str,
+        response: &ChannelApprovalResponse,
     ) -> Option<PendingApproval> {
         if responder.is_empty() || destination.is_empty() || !self.is_user_allowed(responder) {
             return None;
@@ -3883,6 +3888,12 @@ impl LarkChannel {
             .get(approval_id)
             .is_some_and(|pending| pending.destination == destination);
         if !destination_matches {
+            return None;
+        }
+        if pending_approvals.get(approval_id).is_some_and(|pending| {
+            pending.strict_session_prompt_approval
+                && matches!(response, ChannelApprovalResponse::AlwaysApprove)
+        }) {
             return None;
         }
         pending_approvals.remove(approval_id)
@@ -6119,7 +6130,7 @@ mod tests {
 
     #[test]
     fn build_approval_card_contains_all_three_buttons() {
-        let card = build_approval_card("test-id", "shell", "rm -rf /tmp/foo", None);
+        let card = build_approval_card("test-id", "shell", "rm -rf /tmp/foo", None, false);
 
         // Card 2.0 schema lock — guard against future regressions where the
         // send-side schema drifts back to 1.0 (which Feishu's PATCH endpoint
@@ -6152,7 +6163,7 @@ mod tests {
 
     #[test]
     fn build_approval_card_round_trips_approval_id_in_all_buttons() {
-        let card = build_approval_card("approval-abc-123", "tool", "args", None);
+        let card = build_approval_card("approval-abc-123", "tool", "args", None, false);
         let columns = card["body"]["elements"][1]["columns"]
             .as_array()
             .expect("columns array");
@@ -6166,7 +6177,7 @@ mod tests {
 
     #[test]
     fn build_approval_card_shows_the_batch_position() {
-        let card = build_approval_card("test-id", "shell", "rm -rf /tmp/foo", Some((2, 3)));
+        let card = build_approval_card("test-id", "shell", "rm -rf /tmp/foo", Some((2, 3)), false);
         let content = card["body"]["elements"][0]["content"]
             .as_str()
             .expect("markdown content");
@@ -6180,8 +6191,8 @@ mod tests {
 
     #[test]
     fn build_approval_card_omits_the_position_for_a_single_call() {
-        let single = build_approval_card("test-id", "shell", "args", Some((1, 1)));
-        let none = build_approval_card("test-id", "shell", "args", None);
+        let single = build_approval_card("test-id", "shell", "args", Some((1, 1)), false);
+        let none = build_approval_card("test-id", "shell", "args", None, false);
         assert_eq!(
             single, none,
             "a one-call batch renders exactly as an unpositioned card"
@@ -6192,7 +6203,7 @@ mod tests {
     fn build_approval_card_and_resolved_card_share_schema_version() {
         use zeroclaw_api::channel::ChannelApprovalResponse;
 
-        let send_card = build_approval_card("id", "shell", "args", None);
+        let send_card = build_approval_card("id", "shell", "args", None, false);
         let patch_card =
             build_resolved_approval_card("shell", "args", ChannelApprovalResponse::Approve);
 
@@ -6423,6 +6434,7 @@ mod tests {
                     message_id: String::new(),
                     tool_name: String::new(),
                     arguments_summary: String::new(),
+                    strict_session_prompt_approval: false,
                 },
             );
 
@@ -6455,6 +6467,7 @@ mod tests {
                 message_id: String::new(),
                 tool_name: String::new(),
                 arguments_summary: String::new(),
+                strict_session_prompt_approval: false,
             },
         );
 
@@ -6494,6 +6507,7 @@ mod tests {
                     message_id: String::new(),
                     tool_name: String::new(),
                     arguments_summary: String::new(),
+                    strict_session_prompt_approval: false,
                 },
             );
             approvals.insert(
@@ -6504,6 +6518,7 @@ mod tests {
                     message_id: String::new(),
                     tool_name: String::new(),
                     arguments_summary: String::new(),
+                    strict_session_prompt_approval: false,
                 },
             );
             approvals.insert(
@@ -6514,6 +6529,7 @@ mod tests {
                     message_id: String::new(),
                     tool_name: String::new(),
                     arguments_summary: String::new(),
+                    strict_session_prompt_approval: false,
                 },
             );
         }
@@ -6662,6 +6678,7 @@ mod tests {
                         message_id: String::new(),
                         tool_name: String::new(),
                         arguments_summary: String::new(),
+                        strict_session_prompt_approval: false,
                     },
                 );
             }
@@ -6814,6 +6831,7 @@ mod tests {
                 message_id: String::new(),
                 tool_name: String::new(),
                 arguments_summary: String::new(),
+                strict_session_prompt_approval: false,
             },
         );
 
@@ -6874,6 +6892,7 @@ mod tests {
                 message_id: String::new(),
                 tool_name: String::new(),
                 arguments_summary: String::new(),
+                strict_session_prompt_approval: false,
             },
         );
 
@@ -6981,6 +7000,7 @@ mod tests {
                         arguments_summary: "demo args".to_string(),
                         raw_arguments: None,
                         position: None,
+                        strict_session_prompt_approval: false,
                     },
                 )
                 .await

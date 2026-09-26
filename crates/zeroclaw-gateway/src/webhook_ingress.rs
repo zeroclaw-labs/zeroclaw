@@ -327,7 +327,9 @@ pub(crate) struct VerifiedWebhookIngress {
 impl VerifiedWebhookIngress {
     /// Parse the exact verified bytes into normalized messages. Consuming the
     /// proof and keeping the resulting fields private prevents dispatch from
-    /// accepting a separately supplied message vector.
+    /// accepting a separately supplied message vector. Transport-specific
+    /// routing may discard messages from the parsed batch, but it cannot add a
+    /// message that was not derived from these verified bytes.
     pub(crate) fn parse_messages<E>(
         self,
         parse: impl FnOnce(&[u8]) -> Result<Vec<ChannelMessage>, E>,
@@ -367,12 +369,28 @@ impl VerifiedWebhookMessages {
         self.messages.is_empty()
     }
 
-    /// Remove messages handled entirely by the transport adapter, such as
-    /// WhatsApp approval replies. This can narrow the parsed set but cannot
-    /// introduce content that did not come from the verified body.
+    /// Retain only messages from the parsed, authenticated batch after an
+    /// asynchronous transport-specific routing decision. The callback only
+    /// borrows each parsed message, so it can discard an existing message but
+    /// cannot inject a separately constructed message into the authenticated
+    /// dispatch path.
     #[cfg(feature = "channel-whatsapp-cloud")]
-    pub(crate) fn retain(&mut self, keep: impl FnMut(&ChannelMessage) -> bool) {
-        self.messages.retain(keep);
+    pub(crate) async fn retain_messages<F>(&mut self, mut should_retain: F)
+    where
+        F: for<'message> FnMut(
+            &'message ChannelMessage,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = bool> + Send + 'message>,
+        >,
+    {
+        let messages = std::mem::take(&mut self.messages);
+        let mut retained = Vec::with_capacity(messages.len());
+        for message in messages {
+            if should_retain(&message).await {
+                retained.push(message);
+            }
+        }
+        self.messages = retained;
     }
 }
 

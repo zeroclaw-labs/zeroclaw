@@ -730,6 +730,14 @@ impl ModelPickerDispatchOwnership {
     }
 }
 
+#[cfg(not(feature = "channel-telegram"))]
+// This deliberate no-op Drop keeps the feature-neutral ownership guard
+// non-movable, matching the Telegram-backed guard's scope semantics and
+// satisfying the feature-specific clippy/ownership contract.
+impl Drop for ModelPickerDispatchOwnership {
+    fn drop(&mut self) {}
+}
+
 /// A turn waiting for its conversation lane.
 struct PendingTurn {
     ctx: Arc<ChannelRuntimeContext>,
@@ -2154,6 +2162,18 @@ fn build_channel_system_prompt_for_message_with_signal(
         // no-op. Preserves byte-stability for non-default startup prompts.
         prompt
     }
+}
+
+fn append_session_prompts_to_channel_system_prompt(
+    system_prompt: &mut String,
+    attachments: &str,
+    max_system_prompt_chars: usize,
+) -> anyhow::Result<()> {
+    ::zeroclaw_runtime::agent::prompt::append_required_session_prompt_attachments(
+        system_prompt,
+        attachments,
+        max_system_prompt_chars,
+    )
 }
 
 fn current_date_section() -> String {
@@ -4176,6 +4196,21 @@ fn extract_current_turn_tool_messages(history: &[ChatMessage]) -> Vec<ChatMessag
         .collect()
 }
 
+/// Persistent-prompt mutation arguments are private provider context. Retained
+/// channel history must not turn them into a later transcript/API export.
+fn redact_sensitive_session_prompt_tool_messages(
+    messages: Vec<ChatMessage>,
+    session_prompts_enabled: bool,
+) -> Vec<ChatMessage> {
+    if !session_prompts_enabled {
+        // With the feature disabled, preserve ordinary transcript content
+        // instead of applying a prompt-specific heuristic to prose or
+        // malformed tool diagnostics that merely mention its names.
+        return messages;
+    }
+    zeroclaw_runtime::agent::prompt::redact_session_prompt_tool_exchanges_for_export(&messages)
+}
+
 fn rollback_orphan_user_turn(
     ctx: &ChannelRuntimeContext,
     sender_key: &str,
@@ -5072,26 +5107,50 @@ async fn handle_runtime_command_for_delivery(
             // Serialize per-sender persistence to prevent interleaving
             let persist_lock = acquire_persist_lock(ctx, &sender_key);
             let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
-            clear_sender_history(ctx, &sender_key);
-            ctx.thinking_overrides
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&sender_key);
-            if let Some(ref store) = ctx.session_store
-                && let Err(e) = store.delete_session(&sender_key)
-            {
+            let delete_error = ctx
+                .session_store
+                .as_ref()
+                .map(|store| store.delete_session(&sender_key))
+                .transpose()
+                .err();
+            let missing_required_store =
+                ctx.prompt_config.channels.session_prompts_enabled && ctx.session_store.is_none();
+            if let Some(ref error) = delete_error {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(
-                            ::serde_json::json!({"error": format!("{}", e), "sender_key": sender_key})
+                            ::serde_json::json!({"error": error.to_string(), "sender_key": sender_key})
                         ),
                     "Failed to delete persisted session for"
                 );
             }
-            mark_sender_for_new_session(ctx, &sender_key);
-            channel_runtime_cli_string("channel-runtime-new-session")
+            if missing_required_store {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"sender_key": sender_key})),
+                    "Session prompts are enabled but the persisted session backend is unavailable"
+                );
+            }
+            // When a durable session backend is attached, a reset must not
+            // report success until it has proved that the session (including
+            // any prompt attachments) was deleted. With no backend configured
+            // and prompt injection disabled, retain the legacy ephemeral
+            // reset behavior; that runtime has no durable owner it can clear.
+            if delete_error.is_some() || missing_required_store {
+                channel_runtime_cli_string("channel-runtime-new-session-failed")
+            } else {
+                clear_sender_history(ctx, &sender_key);
+                ctx.thinking_overrides
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&sender_key);
+                mark_sender_for_new_session(ctx, &sender_key);
+                channel_runtime_cli_string("channel-runtime-new-session")
+            }
         }
         ChannelRuntimeCommand::SetThinking(level) => match level {
             Some(level) => {
@@ -9062,7 +9121,6 @@ async fn process_channel_message_body(
         let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
         clear_sender_history(ctx.as_ref(), &history_key);
     }
-
     let had_prior_history = if force_fresh_session {
         false
     } else {
@@ -9195,6 +9253,43 @@ async fn process_channel_message_body(
         target_channel.as_ref(),
         per_turn_native_tool_specs_present,
     );
+    let session_prompt_attachments = if ctx.prompt_config.channels.session_prompts_enabled {
+        let prompt_result = match ctx.session_store.as_ref() {
+            Some(backend) => backend.list_session_prompts(&history_key),
+            None => Err(std::io::Error::other(
+                "persistent session prompts are enabled but the session backend is unavailable",
+            )),
+        };
+        match prompt_result {
+            Ok(prompts) => zeroclaw_infra::session_prompts::render_session_prompts(&prompts),
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                    "Persistent session prompts could not be loaded; refusing to dispatch without them"
+                );
+                if let Some(channel) = target_channel.as_ref() {
+                    let message =
+                        channel_runtime_cli_string("channel-runtime-session-prompt-load-failed");
+                    let _ = channel.send(&SendMessage::reply_to(&msg, message)).await;
+                }
+                rollback_orphan_user_turn(ctx.as_ref(), &history_key, &timestamped_content);
+                reconcile_early_ack(
+                    ctx.as_ref(),
+                    &msg,
+                    target_channel.as_ref(),
+                    early_ack_task,
+                    Some("\u{26A0}\u{FE0F}"),
+                )
+                .await;
+                return;
+            }
+        }
+    } else {
+        String::new()
+    };
     if send_message_to_peer_tool_available(ctx.as_ref(), &msg)
         && let Some(current_channel_ref) = peer_prompt_channel_ref(ctx.as_ref(), &msg)
     {
@@ -9214,6 +9309,51 @@ async fn process_channel_message_body(
     // user turn instead, matching the CLI shape.
     if let Some(ref prefix) = thinking.params.system_prompt_prefix {
         system_prompt = format!("{prefix}\n\n{system_prompt}");
+    }
+    // Attachments are loaded before this turn begins, but appended only after
+    // every host-authored channel addition so they remain a complete trailing
+    // section inside the final provider-bound budget.
+    let max = ctx.agent_cfg.resolved.max_system_prompt_chars;
+    if ctx.prompt_config.channels.session_prompts_enabled && session_prompt_attachments.is_empty() {
+        // Channel-specific host context is assembled after the agent's initial
+        // finalizer. With no mutable tail to reserve, this owner performs the
+        // canonical final character-budget pass over its completed host prompt.
+        system_prompt =
+            zeroclaw_runtime::agent::system_prompt::finalize_system_prompt(system_prompt, max);
+    }
+    let session_prompt_budget = zeroclaw_infra::session_backend::SessionPromptBudget::new(
+        system_prompt.chars().count(),
+        max,
+    );
+    if append_session_prompts_to_channel_system_prompt(
+        &mut system_prompt,
+        &session_prompt_attachments,
+        max,
+    )
+    .is_err()
+    {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"max_system_prompt_chars": max})),
+            "Persistent session prompts exceed the system prompt budget; refusing to dispatch without them"
+        );
+        if let Some(channel) = target_channel.as_ref() {
+            let message =
+                channel_runtime_cli_string("channel-runtime-session-prompt-budget-exceeded");
+            let _ = channel.send(&SendMessage::reply_to(&msg, message)).await;
+        }
+        rollback_orphan_user_turn(ctx.as_ref(), &history_key, &timestamped_content);
+        reconcile_early_ack(
+            ctx.as_ref(),
+            &msg,
+            target_channel.as_ref(),
+            early_ack_task,
+            Some("\u{26A0}\u{FE0F}"),
+        )
+        .await;
+        return;
     }
     // Captured before the tool-call loop can drop whole turns, so the
     // post-loop resync below can detect that a trim happened.
@@ -9897,6 +10037,18 @@ async fn process_channel_message_body(
             let tool_loop = zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(cost_tracking_context.clone(), tool_loop);
             let tool_loop = scope_session_key(Some(history_key.clone()), tool_loop);
+            let tool_loop = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED.scope(
+                ctx.prompt_config.channels.session_prompts_enabled && ctx.session_store.is_some(),
+                tool_loop,
+            );
+            let tool_loop = zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_BACKEND.scope(
+                ctx.session_store
+                    .clone()
+                    .map(zeroclaw_infra::session_backend::ScopedSessionBackend),
+                tool_loop,
+            );
+            let tool_loop = zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_PROMPT_BUDGET
+                .scope(Some(session_prompt_budget), tool_loop);
             let tool_loop = scope_thread_id(thread_scope_id, tool_loop);
             let timed_tool_loop =
                 tokio::time::timeout(Duration::from_secs(timeout_budget_secs), tool_loop);
@@ -10271,7 +10423,10 @@ async fn process_channel_message_body(
                 // Find tool messages for the current turn: everything after
                 // the last user message up to (but not including) the final
                 // assistant response that matches our delivered text.
-                let tool_messages: Vec<ChatMessage> = extract_current_turn_tool_messages(&history);
+                let tool_messages = redact_sensitive_session_prompt_tool_messages(
+                    extract_current_turn_tool_messages(&history),
+                    ctx.prompt_config.channels.session_prompts_enabled,
+                );
                 for tool_msg in tool_messages {
                     append_sender_turn(ctx.as_ref(), &history_key, tool_msg);
                 }
@@ -26263,6 +26418,7 @@ BTC is currently around $65,000 based on latest tool output."#
     struct DelayedHistoryCaptureModelProvider {
         delay: Duration,
         calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
+        started: Option<Arc<tokio::sync::Notify>>,
     }
 
     #[async_trait::async_trait]
@@ -26292,6 +26448,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 calls.push(snapshot);
                 calls.len()
             };
+            if let Some(started) = &self.started {
+                started.notify_one();
+            }
             tokio::time::sleep(self.delay).await;
             Ok(format!("response-{call_index}"))
         }
@@ -28951,6 +29110,275 @@ BTC is currently around $65,000 based on latest tool output."#
         let reply = sent_messages.last().unwrap();
         assert!(reply.contains("Current session: test-channel_chat-42_alice"));
         assert!(reply.contains("Messages: 1"));
+    }
+
+    #[tokio::test]
+    async fn enabled_session_prompts_without_backend_fail_before_provider_dispatch() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider = Arc::new(ModelCaptureModelProvider::default());
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.session_prompts_enabled = true;
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider.clone(),
+            config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let msg = channel_message("test-channel", None);
+        let history_key = conversation_history_key(&msg);
+
+        process_channel_message(runtime_ctx.clone(), msg, CancellationToken::new()).await;
+
+        assert_eq!(
+            provider.call_count.load(Ordering::SeqCst),
+            0,
+            "a missing required prompt backend must fail before provider dispatch"
+        );
+        assert!(
+            runtime_ctx
+                .conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .peek(history_key.as_str())
+                .is_none(),
+            "the failed turn must not leave an orphaned user message in history"
+        );
+        let expected = channel_runtime_cli_string("channel-runtime-session-prompt-load-failed");
+        assert!(
+            channel_impl
+                .sent_messages
+                .lock()
+                .await
+                .iter()
+                .any(|message| message == &format!("r1:{expected}")),
+            "the channel must receive the visible prompt-backend failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_session_does_not_claim_success_when_persistence_cleanup_fails() {
+        struct FailingDeleteBackend {
+            prompts: Vec<zeroclaw_infra::session_prompts::SessionPrompt>,
+        }
+
+        impl SessionBackend for FailingDeleteBackend {
+            fn list_session_prompts(
+                &self,
+                _session_key: &str,
+            ) -> std::io::Result<Vec<zeroclaw_infra::session_prompts::SessionPrompt>> {
+                Ok(self.prompts.clone())
+            }
+
+            fn load(&self, _session_key: &str) -> Vec<ChatMessage> {
+                vec![]
+            }
+
+            fn append(&self, _session_key: &str, _message: &ChatMessage) -> std::io::Result<()> {
+                Ok(())
+            }
+
+            fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+                Ok(false)
+            }
+
+            fn list_sessions(&self) -> Vec<String> {
+                vec!["test-channel_r1_u1".to_string()]
+            }
+
+            fn delete_session(&self, _session_key: &str) -> std::io::Result<bool> {
+                Err(std::io::Error::other("synthetic delete failure"))
+            }
+        }
+
+        for session_prompts_enabled in [true, false] {
+            let channel_impl = Arc::new(RecordingChannel::default());
+            let channel: Arc<dyn Channel> = channel_impl.clone();
+            let mut config = zeroclaw_config::schema::Config::default();
+            config.channels.session_prompts_enabled = session_prompts_enabled;
+            let base = test_runtime_ctx_with_config_agent_and_provider_ref(
+                channel,
+                Arc::new(DummyModelProvider),
+                config,
+                zeroclaw_config::schema::AliasedAgentConfig::default(),
+                "test-provider",
+                None,
+            );
+            let backend: Arc<dyn SessionBackend> = Arc::new(FailingDeleteBackend {
+                prompts: vec![zeroclaw_infra::session_prompts::SessionPrompt {
+                    id: "task".to_string(),
+                    content: "private task context".to_string(),
+                    updated_at: "2026-09-15T00:00:00Z".to_string(),
+                }],
+            });
+            let ctx = Arc::new(ChannelRuntimeContext {
+                session_store: Some(backend.clone()),
+                ..(*base).clone()
+            });
+            let mut msg = channel_message("test-channel", None);
+            msg.content = "/new".to_string();
+            let history_key = runtime_conversation_history_key(&ctx, &msg);
+            ctx.conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(
+                    history_key.clone(),
+                    vec![ChatMessage::user("existing history")],
+                );
+
+            assert!(
+                handle_runtime_command_if_needed(
+                    &ctx,
+                    &msg,
+                    Some(&(channel_impl.clone() as Arc<dyn Channel>))
+                )
+                .await
+            );
+
+            let expected = channel_runtime_cli_string("channel-runtime-new-session-failed");
+            assert_eq!(
+                channel_impl.sent_messages.lock().await.as_slice(),
+                [format!("r1:{expected}")],
+                "session_prompts_enabled={session_prompts_enabled}"
+            );
+            assert!(
+                ctx.conversation_histories
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .peek(&history_key)
+                    .is_some(),
+                "a failed durable reset must leave the in-memory session intact; \
+                 session_prompts_enabled={session_prompts_enabled}"
+            );
+            assert!(
+                !ctx.pending_new_sessions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(&history_key),
+                "a failed durable reset must not mark the sender fresh; \
+                 session_prompts_enabled={session_prompts_enabled}"
+            );
+            assert_eq!(
+                backend.list_session_prompts(&history_key).unwrap().len(),
+                1,
+                "the test backend still exposes the attachment after its failed deletion; \
+                 session_prompts_enabled={session_prompts_enabled}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn new_session_does_not_claim_success_when_enabled_prompt_backend_is_unavailable() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.session_prompts_enabled = true;
+        let base = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let ctx = Arc::new(ChannelRuntimeContext {
+            session_store: None,
+            ..(*base).clone()
+        });
+        let mut msg = channel_message("test-channel", None);
+        msg.content = "/new".to_string();
+        let history_key = runtime_conversation_history_key(&ctx, &msg);
+        ctx.conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(
+                history_key.clone(),
+                vec![ChatMessage::user("existing history")],
+            );
+
+        assert!(
+            handle_runtime_command_if_needed(
+                &ctx,
+                &msg,
+                Some(&(channel_impl.clone() as Arc<dyn Channel>))
+            )
+            .await
+        );
+
+        let expected = channel_runtime_cli_string("channel-runtime-new-session-failed");
+        assert_eq!(
+            channel_impl.sent_messages.lock().await.as_slice(),
+            [format!("r1:{expected}")]
+        );
+        assert!(
+            ctx.conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .peek(&history_key)
+                .is_some(),
+            "a reset with an unavailable required backend must preserve live history"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_session_preserves_ephemeral_reset_without_a_durable_backend() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let config = zeroclaw_config::schema::Config::default();
+        let base = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let ctx = Arc::new(ChannelRuntimeContext {
+            session_store: None,
+            ..(*base).clone()
+        });
+        let mut msg = channel_message("test-channel", None);
+        msg.content = "/new".to_string();
+        let history_key = runtime_conversation_history_key(&ctx, &msg);
+        ctx.conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(
+                history_key.clone(),
+                vec![ChatMessage::user("existing history")],
+            );
+
+        assert!(
+            handle_runtime_command_if_needed(
+                &ctx,
+                &msg,
+                Some(&(channel_impl.clone() as Arc<dyn Channel>))
+            )
+            .await
+        );
+
+        let expected = channel_runtime_cli_string("channel-runtime-new-session");
+        assert_eq!(
+            channel_impl.sent_messages.lock().await.as_slice(),
+            [format!("r1:{expected}")]
+        );
+        assert!(
+            ctx.conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .peek(&history_key)
+                .is_none(),
+            "the legacy ephemeral reset must still clear in-memory history"
+        );
+        assert!(
+            ctx.pending_new_sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&history_key),
+            "the successor turn must still be marked fresh"
+        );
     }
 
     #[tokio::test]
@@ -32650,17 +33078,25 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn message_dispatch_interrupts_in_flight_telegram_request_and_preserves_context() {
+    async fn message_dispatch_new_session_starts_successors_with_fresh_history() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
+        let first_turn_started = Arc::new(tokio::sync::Notify::new());
         let provider_impl = Arc::new(DelayedHistoryCaptureModelProvider {
             delay: Duration::from_millis(250),
             calls: std::sync::Mutex::new(Vec::new()),
+            started: Some(Arc::clone(&first_turn_started)),
         });
+        let mut prompt_config = zeroclaw_config::schema::Config::default();
+        // Runtime commands deliberately retain the established channel
+        // debounce policy (only `/stop` is an ingress fast path). Disable
+        // debouncing here so this test exercises lane ordering and `/new`
+        // reset semantics, rather than combining the command with text.
+        prompt_config.channels.debounce_ms = 0;
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -32701,10 +33137,10 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            prompt_config: Arc::new(prompt_config),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: true,
+                telegram: false,
                 slack: false,
                 discord: false,
                 mattermost: false,
@@ -32764,12 +33200,14 @@ BTC is currently around $65,000 based on latest tool output."#
             })
             .await
             .unwrap();
-            tokio::time::sleep(Duration::from_millis(40)).await;
+            // Do not race a wall clock: wait until the first turn has really
+            // started, then queue an ordinary predecessor before `/new`.
+            first_turn_started.notified().await;
             tx.send(zeroclaw_api::channel::ChannelMessage {
                 id: "msg-2".to_string(),
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
-                content: "summarize this".to_string(),
+                content: "parallel predecessor".to_string(),
                 channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 2,
@@ -32777,7 +33215,55 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: "msg-3".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/new".to_string(),
+                channel: "telegram".into(),
+                channel_alias: None,
+                timestamp: 3,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
 
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: "msg-4".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "first fresh successor".to_string(),
+                channel: "telegram".into(),
+                channel_alias: None,
+                timestamp: 4,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: "msg-5".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "second fresh successor".to_string(),
+                channel: "telegram".into(),
+                channel_alias: None,
+                timestamp: 5,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
                 ..Default::default()
             })
             .await
@@ -32788,31 +33274,54 @@ BTC is currently around $65,000 based on latest tool output."#
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 1);
-        assert!(sent_messages[0].starts_with("chat-1:"));
-        assert!(sent_messages[0].contains("response-2"));
+        assert_eq!(sent_messages.len(), 5);
+        assert!(
+            sent_messages
+                .iter()
+                .all(|message| message.starts_with("chat-1:"))
+        );
+        assert!(sent_messages.iter().any(|message| message.contains(
+            &zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-new-session")
+        )));
         drop(sent_messages);
 
         let calls = provider_impl
             .calls
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        assert_eq!(calls.len(), 2);
-        let second_call = &calls[1];
+        assert_eq!(calls.len(), 4);
         assert!(
-            second_call
+            calls[0]
                 .iter()
-                .any(|(role, content)| { role == "user" && content.contains("forwarded content") })
+                .any(|(role, content)| role == "user" && content.contains("forwarded content"))
         );
         assert!(
-            second_call
-                .iter()
-                .any(|(role, content)| { role == "user" && content.contains("summarize this") })
+            calls[1].iter().any(|(role, content)| {
+                role == "user" && content.contains("parallel predecessor")
+            })
         );
-        assert!(
-            !second_call.iter().any(|(role, _)| role == "assistant"),
-            "cancelled turn should not persist an assistant response"
-        );
+
+        let successor_calls: Vec<_> = calls
+            .iter()
+            .filter(|call| {
+                call.iter().any(|(role, content)| {
+                    role == "user"
+                        && (content.contains("first fresh successor")
+                            || content.contains("second fresh successor"))
+                })
+            })
+            .collect();
+        assert_eq!(successor_calls.len(), 2);
+        for successor_call in successor_calls {
+            assert!(
+                !successor_call.iter().any(|(role, content)| {
+                    role == "user"
+                        && (content.contains("forwarded content")
+                            || content.contains("parallel predecessor"))
+                }),
+                "no successor may overtake /new and observe predecessor history"
+            );
+        }
     }
 
     #[tokio::test]
@@ -32826,6 +33335,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let provider_impl = Arc::new(DelayedHistoryCaptureModelProvider {
             delay: Duration::from_millis(250),
             calls: std::sync::Mutex::new(Vec::new()),
+            started: None,
         });
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
@@ -32985,6 +33495,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let provider_impl = Arc::new(DelayedHistoryCaptureModelProvider {
             delay: Duration::from_millis(250),
             calls: std::sync::Mutex::new(Vec::new()),
+            started: None,
         });
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
@@ -33149,6 +33660,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let provider_impl = Arc::new(DelayedHistoryCaptureModelProvider {
             delay: Duration::from_millis(250),
             calls: std::sync::Mutex::new(Vec::new()),
+            started: None,
         });
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
@@ -33341,6 +33853,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let provider_impl = Arc::new(DelayedHistoryCaptureModelProvider {
             delay: Duration::from_millis(250),
             calls: std::sync::Mutex::new(Vec::new()),
+            started: None,
         });
 
         let mut channel_config = zeroclaw_config::schema::ChannelsConfig::default();
@@ -34213,6 +34726,7 @@ BTC is currently around $65,000 based on latest tool output."#
                             arguments_summary: "command".to_string(),
                             raw_arguments: None,
                             position: None,
+                            strict_session_prompt_approval: false,
                         },
                     )
                     .await
@@ -52301,6 +52815,83 @@ Done."#;
     }
 
     #[test]
+    fn retained_tool_history_redacts_session_prompt_mutations() {
+        let messages = vec![
+            ChatMessage::assistant(
+                r#"{"tool_calls":[{"name":"session_prompt_set","arguments":"private marker"}]}"#,
+            ),
+            ChatMessage::tool("prompt saved"),
+            ChatMessage::assistant(r#"{"tool_call":"shell"}"#),
+            ChatMessage::tool("shell result"),
+        ];
+
+        let retained = redact_sensitive_session_prompt_tool_messages(messages, true);
+        assert_eq!(retained.len(), 4);
+        assert!(
+            retained
+                .iter()
+                .all(|message| !message.content.contains("private marker"))
+        );
+        assert!(
+            retained
+                .iter()
+                .any(|message| message.content.contains("shell"))
+        );
+    }
+
+    #[test]
+    fn retained_tool_history_redacts_every_result_from_a_mixed_sensitive_batch() {
+        let messages = vec![
+            ChatMessage::assistant(
+                r#"{"tool_calls":[{"name":"shell","arguments":{}},{"name":"session_prompt_list","arguments":{}}]}"#,
+            ),
+            ChatMessage::tool("shell result"),
+            ChatMessage::tool("private marker from list"),
+        ];
+        let retained = redact_sensitive_session_prompt_tool_messages(messages, true);
+        assert_eq!(retained.len(), 3);
+        assert!(
+            retained
+                .iter()
+                .all(|message| !message.content.contains("private marker"))
+        );
+    }
+
+    #[test]
+    fn retained_tool_history_preserves_ordinary_tool_arguments_that_name_session_prompts() {
+        let messages = vec![
+            ChatMessage::assistant(
+                r#"{"tool_calls":[{"name":"shell","arguments":{"cmd":"echo session_prompt_set"}}]}"#,
+            ),
+            ChatMessage::tool("session prompt tool name echoed"),
+        ];
+
+        let retained = redact_sensitive_session_prompt_tool_messages(messages.clone(), true);
+        assert_eq!(retained.len(), messages.len());
+        for (actual, expected) in retained.iter().zip(&messages) {
+            assert_eq!(actual.role, expected.role);
+            assert_eq!(actual.content, expected.content);
+        }
+    }
+
+    #[test]
+    fn retained_tool_history_preserves_malformed_prompt_mentions_when_disabled() {
+        let messages = vec![
+            ChatMessage::assistant(
+                r#"diagnostic: <tool_call name=\"shell\">session_prompt_set was mentioned</tool_call>"#,
+            ),
+            ChatMessage::tool("ordinary diagnostic details"),
+        ];
+
+        let retained = redact_sensitive_session_prompt_tool_messages(messages.clone(), false);
+        assert_eq!(retained.len(), messages.len());
+        for (actual, expected) in retained.iter().zip(&messages) {
+            assert_eq!(actual.role, expected.role);
+            assert_eq!(actual.content, expected.content);
+        }
+    }
+
+    #[test]
     fn normalize_cached_channel_turns_passes_through_tool_messages() {
         let turns = vec![
             ChatMessage::user("block the iPad"),
@@ -52345,6 +52936,59 @@ Done."#;
         assert!(
             !prompt.contains("delivery="),
             "system prompt must not include the cron_add delivery hint; got {prompt}"
+        );
+    }
+
+    #[test]
+    fn channel_session_prompt_attachments_reserve_the_exact_final_cap() {
+        let attachments = "## Session Prompts\n- id: \"task\"; content: \"persisted\"\n";
+        let host_context = "host context ".repeat(64);
+        let peer_map = "Current-channel peer map for agent \"main\"";
+        let thinking_prefix = "Think step by step.";
+        let mut prompt = format!("{thinking_prefix}\n\n{host_context}\n\n{peer_map}");
+        let max = prompt.chars().count() + 2 + attachments.chars().count();
+
+        append_session_prompts_to_channel_system_prompt(&mut prompt, attachments, max)
+            .expect("a fitting attachment must reserve the completed host prompt budget");
+
+        assert!(
+            prompt.chars().count() <= max,
+            "channel prompt exceeded finite budget"
+        );
+        assert!(prompt.contains("content: \"persisted\""));
+        assert!(prompt.ends_with(attachments));
+    }
+
+    #[test]
+    fn channel_session_prompt_empty_collection_finalizes_completed_host_prompt() {
+        let mut prompt = "host context ".repeat(64);
+        let max = prompt.chars().count() / 2;
+
+        prompt = zeroclaw_runtime::agent::system_prompt::finalize_system_prompt(prompt, max);
+
+        append_session_prompts_to_channel_system_prompt(&mut prompt, "", max)
+            .expect("an empty attachment collection must not alter finalized host context");
+
+        assert!(
+            prompt.chars().count() <= max,
+            "channel prompt exceeded finite budget"
+        );
+        assert!(!prompt.contains("## Session Prompts"));
+    }
+
+    #[test]
+    fn channel_session_prompt_attachment_that_cannot_fit_fails_closed() {
+        let attachments = "## Session Prompts\n- id: \"task\"; content: \"persisted\"\n";
+        let mut prompt = "host context".to_string();
+        let max = attachments.len() + 2;
+
+        let error = append_session_prompts_to_channel_system_prompt(&mut prompt, attachments, max)
+            .expect_err("an attachment with no remaining host budget must block dispatch");
+
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to dispatch without them")
         );
     }
 

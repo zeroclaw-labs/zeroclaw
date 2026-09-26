@@ -120,6 +120,11 @@ pub struct ChannelApprovalRequest {
     /// count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<ApprovalPosition>,
+    /// Whether this request is the dedicated strict confirmation for a
+    /// session-prompt mutation. This is explicit so downstream adapters do
+    /// not infer policy from the presence or absence of `raw_arguments`.
+    #[serde(default)]
+    pub strict_session_prompt_approval: bool,
 }
 
 impl ChannelApprovalRequest {

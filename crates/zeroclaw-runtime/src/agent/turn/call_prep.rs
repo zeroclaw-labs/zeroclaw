@@ -22,6 +22,10 @@ pub(crate) struct PreparedToolCalls {
     pub(crate) ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>>,
     pub(crate) executable_indices: Vec<usize>,
     pub(crate) executable_calls: Vec<ParsedToolCall>,
+    /// Contexts created by a successful before-hook phase, in the same order
+    /// as `executable_calls`. Terminal hook routing must preserve this fact:
+    /// a hook may rewrite a non-sensitive tool into a session-prompt tool.
+    pub(crate) hook_contexts: Vec<Option<ToolCallHookContext>>,
     /// Per-call immutable snapshot for draft start/completion events.
     pub(crate) stream_calls: Vec<Option<StreamToolCall>>,
 }
@@ -44,6 +48,10 @@ fn tool_call_signature(tool_name: &str, tool_args: &serde_json::Value) -> (Strin
     (tool_name.trim().to_ascii_lowercase(), args_json)
 }
 
+fn is_sensitive_session_prompt_tool(tool_name: &str) -> bool {
+    crate::agent::tool_execution::is_sensitive_session_prompt_tool(tool_name)
+}
+
 async fn record_duplicate_tool_call(
     ctx: &TurnCtx<'_>,
     tool_name: &str,
@@ -52,22 +60,24 @@ async fn record_duplicate_tool_call(
 ) -> ToolExecutionOutcome {
     let duplicate =
         format!("Skipped duplicate tool call '{tool_name}' with identical arguments in this turn.");
-    ::zeroclaw_log::record!(
-        INFO,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
-            .with_category(::zeroclaw_log::EventCategory::Tool)
-            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-            .with_attrs(::serde_json::json!({
-                "model": ctx.model,
-                "iteration": iteration + 1,
-                "tool": tool_name,
-                "arguments": scrub_credentials(&tool_args.to_string()),
-                "result": duplicate,
-                "deduplicated": true,
-                "trace_id": ctx.turn_id,
-            })),
-        "tool_call_result"
-    );
+    if !is_sensitive_session_prompt_tool(tool_name) {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
+                .with_category(::zeroclaw_log::EventCategory::Tool)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "model": ctx.model,
+                    "iteration": iteration + 1,
+                    "tool": tool_name,
+                    "arguments": scrub_credentials(&tool_args.to_string()),
+                    "result": duplicate,
+                    "deduplicated": true,
+                    "trace_id": ctx.turn_id,
+                })),
+            "tool_call_result"
+        );
+    }
     if let Some(tx) = ctx.on_delta {
         let _ = tx
             .send(StreamDelta::Status(format!(
@@ -106,20 +116,32 @@ async fn abandon_prepared_context(ctx: &TurnCtx<'_>, context: &ToolCallHookConte
 /// operation.
 pub(crate) async fn abandon_unexecuted_prepared_contexts(
     ctx: &TurnCtx<'_>,
-    iteration: usize,
     executable_indices: &[usize],
     executable_calls: &[ParsedToolCall],
+    hook_contexts: &[Option<ToolCallHookContext>],
     completed: &[usize],
 ) {
     let Some(hooks) = ctx.hooks else {
         return;
     };
-    for (call_idx, call) in executable_indices.iter().zip(executable_calls.iter()) {
+    for ((call_idx, call), hook_context) in executable_indices
+        .iter()
+        .zip(executable_calls.iter())
+        .zip(hook_contexts.iter())
+    {
+        // Only calls whose before hook ran have a lifecycle context to abandon.
+        // Do not reconstruct that state from the final tool name: a hook can
+        // rewrite an ordinary call into a session-prompt tool after entering
+        // the lifecycle. Other hook policies for prompt attachments remain
+        // deliberately out of scope until a separate architecture decision.
         if completed.contains(call_idx) {
             continue;
         }
-        let context = crate::hooks::tool_call_hook_context(ctx.turn_id, iteration, *call_idx);
-        hooks.fire_tool_call_abandoned(&context, &call.name).await;
+        if let Some(hook_context) = hook_context {
+            hooks
+                .fire_tool_call_abandoned(hook_context, &call.name)
+                .await;
+        }
     }
 }
 
@@ -139,6 +161,7 @@ pub(crate) async fn prepare_tool_calls(
         (0..tool_calls.len()).map(|_| None).collect();
     let mut executable_indices: Vec<usize> = Vec::new();
     let mut executable_calls: Vec<ParsedToolCall> = Vec::new();
+    let mut executable_hook_contexts: Vec<Option<ToolCallHookContext>> = Vec::new();
     let mut executable_stream_calls = Vec::new();
     let mut prompt_approval_tool_signatures_this_round: HashSet<(String, String)> = HashSet::new();
     // Contexts whose before phase ran and that are still awaiting a terminal
@@ -152,11 +175,21 @@ pub(crate) async fn prepare_tool_calls(
         // ── Hook: before_tool_call (modifying) ──────────
         let mut tool_name = call.name.clone();
         let mut tool_args = call.arguments.clone();
-        let hook_context = crate::hooks::tool_call_hook_context(ctx.turn_id, iteration, idx);
-        if let Some(hooks) = ctx.hooks {
+        let incoming_sensitive_session_prompt = is_sensitive_session_prompt_tool(&tool_name);
+        // A prompt attachment becomes provider-visible system context on a
+        // later turn. Its body is intentionally limited to the provider,
+        // explicit list results, and the exact approval surface; hooks are
+        // independent extension points and therefore must not receive it.
+        // V1 deliberately excludes alternative hook policies for these tools.
+        // A redacted, metadata-only hook projection could be designed later,
+        // but it would establish a distinct hook-policy contract beyond this
+        // proposal and requires a separate architectural decision.
+        let hook_context = (!incoming_sensitive_session_prompt)
+            .then(|| crate::hooks::tool_call_hook_context(ctx.turn_id, iteration, idx));
+        if let (Some(hook_context), Some(hooks)) = (hook_context.as_ref(), ctx.hooks) {
             match hooks
                 .run_before_tool_call_with_context(
-                    &hook_context,
+                    hook_context,
                     tool_name.clone(),
                     tool_args.clone(),
                 )
@@ -165,7 +198,7 @@ pub(crate) async fn prepare_tool_calls(
                 crate::hooks::HookResult::Cancel(reason) => {
                     // The before phase ran, so this context's only terminal
                     // lifecycle operation is abandonment.
-                    abandon_prepared_context(ctx, &hook_context, &tool_name).await;
+                    abandon_prepared_context(ctx, hook_context, &tool_name).await;
                     ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel).with_category(::zeroclaw_log::EventCategory::Tool).with_attrs(::serde_json::json!({"tool": call.name, "reason": reason.to_string()})), "tool call cancelled by hook");
                     let cancelled = format!("Cancelled by hook: {reason}");
                     ::zeroclaw_log::record!(
@@ -227,6 +260,7 @@ pub(crate) async fn prepare_tool_calls(
         );
 
         crate::agent::set_runtime_approved_arg(&tool_name, &mut tool_args, false);
+        let sensitive_session_prompt = is_sensitive_session_prompt_tool(&tool_name);
 
         let requires_prompt = ctx
             .approval
@@ -239,7 +273,9 @@ pub(crate) async fn prepare_tool_calls(
             if !prompt_approval_tool_signatures_this_round.insert(prompt_signature.clone()) {
                 let duplicate =
                     record_duplicate_tool_call(ctx, &tool_name, &tool_args, iteration).await;
-                abandon_prepared_context(ctx, &hook_context, &tool_name).await;
+                if let Some(hook_context) = hook_context.as_ref() {
+                    abandon_prepared_context(ctx, hook_context, &tool_name).await;
+                }
                 ordered_results[idx] =
                     Some((tool_name.clone(), call.tool_call_id.clone(), duplicate));
                 continue;
@@ -276,7 +312,9 @@ pub(crate) async fn prepare_tool_calls(
                 for (retained_context, retained_tool) in &retained_hook_contexts {
                     abandon_prepared_context(ctx, retained_context, retained_tool).await;
                 }
-                abandon_prepared_context(ctx, &hook_context, &tool_name).await;
+                if let Some(hook_context) = hook_context.as_ref() {
+                    abandon_prepared_context(ctx, hook_context, &tool_name).await;
+                }
                 anyhow::bail!("{repeated}");
             }
         }
@@ -295,11 +333,13 @@ pub(crate) async fn prepare_tool_calls(
                 ApprovalGateOutcome::Deny(outcome) | ApprovalGateOutcome::Replace(outcome) => {
                     // The before phase ran but this call will never execute:
                     // its only terminal lifecycle operation is abandonment.
-                    abandon_prepared_context(ctx, &hook_context, &tool_name).await;
+                    if let Some(hook_context) = hook_context.as_ref() {
+                        abandon_prepared_context(ctx, hook_context, &tool_name).await;
+                    }
                     // Streaming consumers see the denied/replaced call and its
                     // synthesized result (e.g. a DenyWithEdit replacement) as a
                     // ToolCall/ToolResult pair, as the direct path always did.
-                    if let Some(tx) = ctx.event_tx {
+                    if !sensitive_session_prompt && let Some(tx) = ctx.event_tx {
                         emit_tool_call_pair(tx, call, &outcome).await;
                     }
                     ordered_results[idx] =
@@ -312,7 +352,9 @@ pub(crate) async fn prepare_tool_calls(
                     for (retained_context, retained_tool) in &retained_hook_contexts {
                         abandon_prepared_context(ctx, retained_context, retained_tool).await;
                     }
-                    abandon_prepared_context(ctx, &hook_context, &tool_name).await;
+                    if let Some(hook_context) = hook_context.as_ref() {
+                        abandon_prepared_context(ctx, hook_context, &tool_name).await;
+                    }
                     return Err(ToolLoopCancelled.into());
                 }
             };
@@ -324,35 +366,41 @@ pub(crate) async fn prepare_tool_calls(
         if dedup_enabled && !dedup_exempt && !seen_tool_signatures.insert(signature) {
             let duplicate =
                 record_duplicate_tool_call(ctx, &tool_name, &tool_args, iteration).await;
-            abandon_prepared_context(ctx, &hook_context, &tool_name).await;
+            if let Some(hook_context) = hook_context.as_ref() {
+                abandon_prepared_context(ctx, hook_context, &tool_name).await;
+            }
             ordered_results[idx] = Some((tool_name.clone(), call.tool_call_id.clone(), duplicate));
             continue;
         }
 
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start)
-                .with_category(::zeroclaw_log::EventCategory::Tool)
-                .with_attrs(::serde_json::json!({
-                    "model": ctx.model,
-                    "iteration": iteration + 1,
-                    "tool": tool_name.clone(),
-                    "arguments": scrub_credentials(&tool_args.to_string()),
-                    "trace_id": ctx.turn_id,
-                })),
-            "tool_call_start"
-        );
+        if !sensitive_session_prompt {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                    .with_attrs(::serde_json::json!({
+                        "model": ctx.model,
+                        "iteration": iteration + 1,
+                        "tool": tool_name.clone(),
+                        "arguments": scrub_credentials(&tool_args.to_string()),
+                        "trace_id": ctx.turn_id,
+                    })),
+                "tool_call_start"
+            );
+        }
 
         // ── Progress: tool start ────────────────────────────
         send_progress(ctx.on_delta, ProgressEvent::RunningTool).await;
-        let stream_call = ctx.on_delta.map(|_| StreamToolCall {
-            arguments: Arc::new(tool_args.clone()),
-            tool_provenance: crate::agent::tool_execution::resolved_tool_provenance(
-                tools_registry,
-                activated_tools,
-                &tool_name,
-            ),
-        });
+        let stream_call = (!sensitive_session_prompt)
+            .then_some(())
+            .and(ctx.on_delta.map(|_| StreamToolCall {
+                arguments: Arc::new(tool_args.clone()),
+                tool_provenance: crate::agent::tool_execution::resolved_tool_provenance(
+                    tools_registry,
+                    activated_tools,
+                    &tool_name,
+                ),
+            }));
         if let (Some(tx), Some(stream_call)) = (ctx.on_delta, stream_call.as_ref()) {
             ::zeroclaw_log::record!(
                 DEBUG,
@@ -372,10 +420,13 @@ pub(crate) async fn prepare_tool_calls(
 
         executable_indices.push(idx);
         executable_stream_calls.push(stream_call);
+        executable_hook_contexts.push(hook_context.clone());
         // From here the context's terminal operation is execution's
         // responsibility: the after hook on completion, or abandonment if the
         // execution phase aborts before post-execution handling.
-        retained_hook_contexts.push((hook_context, tool_name.clone()));
+        if let Some(hook_context) = hook_context {
+            retained_hook_contexts.push((hook_context, tool_name.clone()));
+        }
         let call_id = super::events::resolve_tool_call_id(&ParsedToolCall {
             name: tool_name.clone(),
             arguments: tool_args.clone(),
@@ -396,13 +447,14 @@ pub(crate) async fn prepare_tool_calls(
         ordered_results,
         executable_indices,
         executable_calls,
+        hook_contexts: executable_hook_contexts,
         stream_calls: executable_stream_calls,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PreparedToolCalls, prepare_tool_calls};
+    use super::{PreparedToolCalls, abandon_unexecuted_prepared_contexts, prepare_tool_calls};
     use crate::agent::tool_execution::ToolExecutionOutcome;
     use crate::agent::turn::context::TurnCtx;
     use crate::agent::turn::post_exec::record_executed_outcomes;
@@ -474,6 +526,7 @@ mod tests {
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
             temperature: None,
             approval: None,
+            session_prompt_approval_required: true,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -525,6 +578,7 @@ mod tests {
             &ctx,
             &prepared.executable_indices,
             &prepared.executable_calls,
+            &prepared.hook_contexts,
             &prepared.stream_calls,
             vec![ToolExecutionOutcome {
                 output: "ok".to_string(),
@@ -617,6 +671,10 @@ mod tests {
         cancel_before_for: Vec<String>,
     }
 
+    struct RewriteToSessionPromptRecorder {
+        observations: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
     #[async_trait]
     impl crate::hooks::HookHandler for LifecycleRecorder {
         fn name(&self) -> &str {
@@ -663,6 +721,39 @@ mod tests {
                 tool,
                 context.invocation_id()
             ));
+        }
+    }
+
+    #[async_trait]
+    impl crate::hooks::HookHandler for RewriteToSessionPromptRecorder {
+        fn name(&self) -> &str {
+            "rewrite-to-session-prompt"
+        }
+
+        async fn before_tool_call_with_context(
+            &self,
+            _context: &zeroclaw_api::hook::ToolCallHookContext,
+            _name: String,
+            _args: serde_json::Value,
+        ) -> crate::hooks::HookResult<(String, serde_json::Value)> {
+            crate::hooks::HookResult::Continue((
+                "session_prompt_set".to_string(),
+                serde_json::json!({"id": "task", "content": "private attachment"}),
+            ))
+        }
+
+        async fn on_after_tool_call_with_context_and_args(
+            &self,
+            _context: &zeroclaw_api::hook::ToolCallHookContext,
+            tool: &str,
+            args: &serde_json::Value,
+            result: &crate::tools::ToolResult,
+            _duration: Duration,
+        ) {
+            self.observations
+                .lock()
+                .unwrap()
+                .push(format!("tool={tool};args={args};result={}", result.output));
         }
     }
 
@@ -736,6 +827,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_abandonment_skips_session_prompt_without_a_hook_context() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut runner = crate::hooks::HookRunner::new();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        runner.register(Box::new(LifecycleRecorder {
+            events: Arc::clone(&events),
+            cancel_before_for: Vec::new(),
+        }));
+        let ctx = lifecycle_ctx(&observer, &pacing, &tx, None, Some(&runner));
+        let calls = [parsed_call(
+            "session_prompt_set",
+            serde_json::json!({"id": "task", "content": "synthetic attachment"}),
+            "call-1",
+        )];
+
+        abandon_unexecuted_prepared_contexts(&ctx, &[0], &calls, &[None], &[]).await;
+
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "a session-prompt call bypasses the before hook, so batch abandonment must not synthesize an orphaned callback"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_session_prompt_call_never_enters_the_hook_lifecycle() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut runner = crate::hooks::HookRunner::new();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        runner.register(Box::new(LifecycleRecorder {
+            events: Arc::clone(&events),
+            cancel_before_for: Vec::new(),
+        }));
+        let mut ctx = lifecycle_ctx(&observer, &pacing, &tx, None, Some(&runner));
+        ctx.session_prompt_approval_required = false;
+        let calls = [parsed_call(
+            "session_prompt_set",
+            serde_json::json!({"id": "task", "content": "synthetic attachment"}),
+            "call-1",
+        )];
+        let mut seen = HashSet::new();
+        let mut prompt_seen = HashSet::new();
+
+        let prepared = prepare_tool_calls(
+            &ctx,
+            &[],
+            None,
+            &calls,
+            &mut seen,
+            &mut prompt_seen,
+            0,
+            false,
+        )
+        .await
+        .expect("session-prompt preparation completes");
+
+        assert!(prepared.hook_contexts[0].is_none());
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "direct session-prompt tools must not expose their lifecycle or payload to hooks"
+        );
+    }
+
+    #[tokio::test]
+    async fn rewritten_session_prompt_gets_a_terminal_hook_without_its_payload() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (tx, _rx) = mpsc::channel(8);
+        let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut runner = crate::hooks::HookRunner::new();
+        runner.register(Box::new(RewriteToSessionPromptRecorder {
+            observations: Arc::clone(&observations),
+        }));
+        let mut ctx = lifecycle_ctx(&observer, &pacing, &tx, None, Some(&runner));
+        // This test isolates terminal-hook pairing. Dedicated prompt approval
+        // is exercised by approval-gate tests and would deny before execution
+        // without an interactive manager.
+        ctx.session_prompt_approval_required = false;
+        let calls = [parsed_call(
+            "ordinary_tool",
+            serde_json::json!({}),
+            "call-1",
+        )];
+        let mut seen = HashSet::new();
+        let mut prompt_seen = HashSet::new();
+        let mut prepared = prepare_tool_calls(
+            &ctx,
+            &[],
+            None,
+            &calls,
+            &mut seen,
+            &mut prompt_seen,
+            0,
+            false,
+        )
+        .await
+        .expect("the rewritten call remains executable");
+
+        assert!(prepared.hook_contexts[0].is_some());
+        assert_eq!(prepared.executable_calls[0].name, "session_prompt_set");
+        record_executed_outcomes(
+            &ctx,
+            &prepared.executable_indices,
+            &prepared.executable_calls,
+            &prepared.hook_contexts,
+            &prepared.stream_calls,
+            vec![ToolExecutionOutcome {
+                output: "private result".to_string(),
+                output_data: None,
+                success: true,
+                error_reason: None,
+                duration: Duration::ZERO,
+                receipt: None,
+            }],
+            &mut prepared.ordered_results,
+            0,
+        )
+        .await;
+
+        let observations = observations.lock().unwrap();
+        assert_eq!(
+            observations.len(),
+            1,
+            "the entered hook must terminate once"
+        );
+        assert!(observations[0].contains("tool=session_prompt_set"));
+        assert!(observations[0].contains("session_prompt_payload"));
+        assert!(!observations[0].contains("private attachment"));
+        assert!(!observations[0].contains("private result"));
+    }
+
+    #[tokio::test]
     async fn duplicate_suppression_abandons_only_the_suppressed_call() {
         let observer = NoopObserver;
         let pacing = PacingConfig::default();
@@ -779,6 +1005,7 @@ mod tests {
             &ctx,
             &prepared.executable_indices,
             &prepared.executable_calls,
+            &prepared.hook_contexts,
             &prepared.stream_calls,
             vec![ToolExecutionOutcome {
                 output: "ok".to_string(),
@@ -1150,8 +1377,18 @@ mod tests {
             parsed_call("kept", serde_json::json!({"k": 1}), "call-1"),
             parsed_call("lost", serde_json::json!({"l": 1}), "call-3"),
         ];
-        super::abandon_unexecuted_prepared_contexts(&ctx, 0, &[0, 2], &executable_calls, &[2])
-            .await;
+        let hook_contexts = vec![
+            Some(crate::hooks::tool_call_hook_context("test-turn", 0, 0)),
+            Some(crate::hooks::tool_call_hook_context("test-turn", 0, 2)),
+        ];
+        super::abandon_unexecuted_prepared_contexts(
+            &ctx,
+            &[0, 2],
+            &executable_calls,
+            &hook_contexts,
+            &[2],
+        )
+        .await;
 
         assert_eq!(
             *events.lock().unwrap(),
@@ -1177,7 +1414,18 @@ mod tests {
             parsed_call("first", serde_json::json!({"n": 1}), "call-1"),
             parsed_call("second", serde_json::json!({"n": 2}), "call-2"),
         ];
-        super::abandon_unexecuted_prepared_contexts(&ctx, 3, &[0, 1], &executable_calls, &[]).await;
+        let hook_contexts = vec![
+            Some(crate::hooks::tool_call_hook_context("test-turn", 3, 0)),
+            Some(crate::hooks::tool_call_hook_context("test-turn", 3, 1)),
+        ];
+        super::abandon_unexecuted_prepared_contexts(
+            &ctx,
+            &[0, 1],
+            &executable_calls,
+            &hook_contexts,
+            &[],
+        )
+        .await;
 
         assert_eq!(
             *events.lock().unwrap(),

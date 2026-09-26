@@ -105,6 +105,13 @@ channel component must export the documented stubs even when it does not claim
 webhook ingress. This addition changes the generated component ABI, so a host
 upgrade requires rebuilding non-webhook channel components too.
 
+The `approval-request` record also carries the host-owned
+`strict-session-prompt-approval` policy marker. Channel components must rebuild
+against the target host's WIT and, when the marker is `true`, offer only
+one-time approve/deny responses; the host rejects `always-approve` for that
+request. Components must not infer the policy from whether raw arguments are
+present.
+
 **Targeting a minor bump (e.g. 0.1 → 0.2):** recompile. No source changes
 needed for items added via `@since`.
 

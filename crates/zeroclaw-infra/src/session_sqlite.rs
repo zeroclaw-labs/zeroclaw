@@ -1,7 +1,12 @@
 //! SQLite-backed session persistence with FTS5 search.
 
 use crate::session_backend::{
-    SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState,
+    SessionBackend, SessionContext, SessionMetadata, SessionPromptBudget, SessionQuery,
+    SessionState,
+};
+use crate::session_prompts::{
+    MAX_SESSION_PROMPTS, MAX_SESSION_PROMPTS_BYTES, SessionPrompt, SessionPromptSetOutcome,
+    render_session_prompts, validate_prompt, validate_prompt_id,
 };
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
@@ -67,6 +72,7 @@ impl SqliteSessionBackend {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
+             PRAGMA foreign_keys = ON;
              PRAGMA temp_store = MEMORY;
              PRAGMA mmap_size = 4194304;",
         )?;
@@ -88,6 +94,15 @@ impl SqliteSessionBackend {
                 last_activity TEXT NOT NULL,
                 message_count INTEGER NOT NULL DEFAULT 0,
                 name         TEXT
+             );
+
+             CREATE TABLE IF NOT EXISTS session_prompts (
+                session_key TEXT NOT NULL REFERENCES session_metadata(session_key) ON DELETE CASCADE,
+                prompt_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (session_key, prompt_id)
              );
 
              CREATE TABLE IF NOT EXISTS jsonl_import_receipts (
@@ -840,6 +855,162 @@ impl SqliteSessionBackend {
 }
 
 impl SessionBackend for SqliteSessionBackend {
+    fn list_session_prompts(&self, session_key: &str) -> std::io::Result<Vec<SessionPrompt>> {
+        let conn = self.conn.lock();
+        let mut statement = conn
+            .prepare("SELECT prompt_id, content, updated_at FROM session_prompts WHERE session_key = ?1 ORDER BY prompt_id ASC")
+            .map_err(std::io::Error::other)?;
+        statement
+            .query_map(params![session_key], |row| {
+                Ok(SessionPrompt {
+                    id: row.get(0)?,
+                    content: row.get(1)?,
+                    updated_at: row.get(2)?,
+                })
+            })
+            .map_err(std::io::Error::other)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(std::io::Error::other)
+    }
+
+    fn set_session_prompt(
+        &self,
+        session_key: &str,
+        id: &str,
+        content: &str,
+    ) -> std::io::Result<SessionPromptSetOutcome> {
+        self.set_session_prompt_with_budget(session_key, id, content, None)
+    }
+
+    fn set_session_prompt_with_budget(
+        &self,
+        session_key: &str,
+        id: &str,
+        content: &str,
+        budget: Option<SessionPromptBudget>,
+    ) -> std::io::Result<SessionPromptSetOutcome> {
+        let (id, content) = validate_prompt(id, content)?;
+        let mut conn = self.conn.lock();
+        let transaction = conn.transaction().map_err(std::io::Error::other)?;
+        // A first tool call can happen before the channel/RPC loop persists its
+        // first conversation message. Materialize metadata here so attachment
+        // creation is still atomic with a valid durable session owner.
+        let now = Utc::now().to_rfc3339();
+        transaction
+            .execute(
+                "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count) \
+                 VALUES (?1, ?2, ?2, 0) ON CONFLICT(session_key) DO NOTHING",
+                params![session_key, now],
+            )
+            .map_err(std::io::Error::other)?;
+        let already_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_prompts WHERE session_key = ?1 AND prompt_id = ?2)", params![session_key, id], |row| row.get(0),
+        ).map_err(std::io::Error::other)?;
+        if !already_exists {
+            let count: usize = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM session_prompts WHERE session_key = ?1",
+                    params![session_key],
+                    |row| row.get(0),
+                )
+                .map_err(std::io::Error::other)?;
+            if count >= MAX_SESSION_PROMPTS {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "session prompt limit reached",
+                ));
+            }
+        }
+        let total_bytes: usize = transaction.query_row(
+            "SELECT COALESCE(SUM(length(CAST(content AS BLOB))), 0) FROM session_prompts WHERE session_key = ?1 AND prompt_id <> ?2", params![session_key, id], |row| row.get(0),
+        ).map_err(std::io::Error::other)?;
+        if total_bytes.saturating_add(content.len()) > MAX_SESSION_PROMPTS_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "session prompt aggregate limit reached",
+            ));
+        }
+        if let Some(budget) = budget {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT prompt_id, content, updated_at FROM session_prompts \
+                     WHERE session_key = ?1 ORDER BY prompt_id ASC",
+                )
+                .map_err(std::io::Error::other)?;
+            let mut proposed = statement
+                .query_map(params![session_key], |row| {
+                    Ok(SessionPrompt {
+                        id: row.get(0)?,
+                        content: row.get(1)?,
+                        updated_at: row.get(2)?,
+                    })
+                })
+                .map_err(std::io::Error::other)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(std::io::Error::other)?;
+            match proposed.iter_mut().find(|prompt| prompt.id == id) {
+                Some(prompt) => prompt.content.clone_from(&content),
+                None => proposed.push(SessionPrompt {
+                    id: id.clone(),
+                    content: content.clone(),
+                    updated_at: now.clone(),
+                }),
+            }
+            proposed.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+            if !budget.permits(&render_session_prompts(&proposed)) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "session prompt collection exceeds the current prompt budget",
+                ));
+            }
+        }
+        transaction.execute(
+            "INSERT INTO session_prompts (session_key, prompt_id, content, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4) ON CONFLICT(session_key, prompt_id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
+            params![session_key, id, content, now],
+        ).map_err(std::io::Error::other)?;
+        transaction.commit().map_err(std::io::Error::other)?;
+        Ok(if already_exists {
+            SessionPromptSetOutcome::Updated
+        } else {
+            SessionPromptSetOutcome::Created
+        })
+    }
+
+    fn delete_session_prompt(&self, session_key: &str, id: &str) -> std::io::Result<bool> {
+        let id = validate_prompt_id(id)?;
+        let conn = self.conn.lock();
+        Ok(conn
+            .execute(
+                "DELETE FROM session_prompts WHERE session_key = ?1 AND prompt_id = ?2",
+                params![session_key, id],
+            )
+            .map_err(std::io::Error::other)?
+            > 0)
+    }
+
+    fn reset_session(&self, session_key: &str) -> std::io::Result<usize> {
+        let mut conn = self.conn.lock();
+        let transaction = conn.transaction().map_err(std::io::Error::other)?;
+        let count = transaction
+            .execute(
+                "DELETE FROM sessions WHERE session_key = ?1",
+                params![session_key],
+            )
+            .map_err(std::io::Error::other)?;
+        transaction
+            .execute(
+                "DELETE FROM session_prompts WHERE session_key = ?1",
+                params![session_key],
+            )
+            .map_err(std::io::Error::other)?;
+        transaction.execute(
+            "UPDATE session_metadata SET message_count = 0, last_activity = ?1, trim_breadcrumb = NULL WHERE session_key = ?2",
+            params![Utc::now().to_rfc3339(), session_key],
+        ).map_err(std::io::Error::other)?;
+        transaction.commit().map_err(std::io::Error::other)?;
+        Ok(count)
+    }
+
     fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         let conn = self.conn.lock();
         let mut stmt = match conn
@@ -1102,7 +1273,7 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn cleanup_stale(&self, ttl_hours: u32) -> std::io::Result<usize> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
         let cutoff = (Utc::now() - Duration::hours(i64::from(ttl_hours))).to_rfc3339();
 
         // Find stale sessions
@@ -1117,14 +1288,19 @@ impl SessionBackend for SqliteSessionBackend {
         };
 
         let count = stale_keys.len();
+        let transaction = conn.transaction().map_err(std::io::Error::other)?;
         for key in &stale_keys {
-            let _ = conn.execute("DELETE FROM sessions WHERE session_key = ?1", params![key]);
-            let _ = conn.execute(
-                "DELETE FROM session_metadata WHERE session_key = ?1",
-                params![key],
-            );
+            transaction
+                .execute("DELETE FROM sessions WHERE session_key = ?1", params![key])
+                .map_err(std::io::Error::other)?;
+            transaction
+                .execute(
+                    "DELETE FROM session_metadata WHERE session_key = ?1",
+                    params![key],
+                )
+                .map_err(std::io::Error::other)?;
         }
-
+        transaction.commit().map_err(std::io::Error::other)?;
         Ok(count)
     }
 
@@ -1152,37 +1328,103 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(count)
     }
 
-    fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
-        let conn = self.conn.lock();
+    fn delete_session_key_set(&self, session_keys: &[&str]) -> std::io::Result<bool> {
+        let mut conn = self.conn.lock();
+        let transaction = conn.transaction().map_err(std::io::Error::other)?;
+        let mut deleted = false;
+        for session_key in session_keys {
+            let exists: bool = transaction
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM session_metadata WHERE session_key = ?1",
+                    params![session_key],
+                    |row| row.get(0),
+                )
+                .map_err(std::io::Error::other)?;
+            if !exists {
+                continue;
+            }
 
-        // Check if session exists
-        let exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM session_metadata WHERE session_key = ?1",
-                params![session_key],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
+            // Delete messages (FTS5 trigger handles sessions_fts cleanup).
+            transaction
+                .execute(
+                    "DELETE FROM sessions WHERE session_key = ?1",
+                    params![session_key],
+                )
+                .map_err(std::io::Error::other)?;
 
-        if !exists {
-            return Ok(false);
+            // Delete metadata and its cascade-owned prompt attachments.
+            transaction
+                .execute(
+                    "DELETE FROM session_metadata WHERE session_key = ?1",
+                    params![session_key],
+                )
+                .map_err(std::io::Error::other)?;
+            deleted = true;
         }
 
-        // Delete messages (FTS5 trigger handles sessions_fts cleanup)
-        conn.execute(
-            "DELETE FROM sessions WHERE session_key = ?1",
-            params![session_key],
-        )
-        .map_err(std::io::Error::other)?;
+        transaction.commit().map_err(std::io::Error::other)?;
+        Ok(deleted)
+    }
 
-        // Delete metadata
-        conn.execute(
-            "DELETE FROM session_metadata WHERE session_key = ?1",
-            params![session_key],
-        )
-        .map_err(std::io::Error::other)?;
+    fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
+        self.delete_session_key_set(&[session_key])
+    }
 
-        Ok(true)
+    fn delete_session_key_set_owned(
+        &self,
+        session_keys: &[&str],
+        owner_principal_id: &str,
+    ) -> std::io::Result<bool> {
+        let mut conn = self.conn.lock();
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let mut owned_keys = Vec::new();
+        for session_key in session_keys {
+            if owned_keys.contains(session_key) {
+                continue;
+            }
+            let owner: Option<Option<String>> = transaction
+                .query_row(
+                    "SELECT principal_id FROM session_metadata WHERE session_key = ?1",
+                    params![session_key],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(std::io::Error::other)?;
+            match owner {
+                Some(Some(owner)) if owner == owner_principal_id => {
+                    owned_keys.push(*session_key);
+                }
+                Some(_) => return Ok(false),
+                None => {}
+            }
+        }
+
+        for session_key in &owned_keys {
+            // Keep the predicate on the deleting statement as well as the
+            // transaction-wide preflight. No alias can be deleted if another
+            // existing alias belongs to a different principal.
+            let deleted = transaction
+                .execute(
+                    "DELETE FROM session_metadata WHERE session_key = ?1 AND principal_id = ?2",
+                    params![session_key, owner_principal_id],
+                )
+                .map_err(std::io::Error::other)?;
+            if deleted != 1 {
+                return Err(std::io::Error::other(
+                    "owned session key changed during deletion",
+                ));
+            }
+            transaction
+                .execute(
+                    "DELETE FROM sessions WHERE session_key = ?1",
+                    params![session_key],
+                )
+                .map_err(std::io::Error::other)?;
+        }
+        transaction.commit().map_err(std::io::Error::other)?;
+        Ok(!owned_keys.is_empty())
     }
 
     fn delete_session_owned(
@@ -1644,8 +1886,9 @@ impl SessionBackend for SqliteSessionBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session_prompts::MAX_SESSION_PROMPT_BYTES;
     use crate::session_store::SessionStore;
-    use std::sync::{Arc, mpsc};
+    use std::sync::{Arc, Barrier, mpsc};
     use std::time::Duration as StdDuration;
     use tempfile::TempDir;
 
@@ -1665,6 +1908,372 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[1].role, "assistant");
+    }
+
+    #[test]
+    fn session_prompts_persist_across_restart_and_are_isolated() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+            backend
+                .append("first", &ChatMessage::user("hello"))
+                .unwrap();
+            backend
+                .append("second", &ChatMessage::user("hello"))
+                .unwrap();
+            assert_eq!(
+                backend
+                    .set_session_prompt("first", "task.primary", "keep the current task")
+                    .unwrap(),
+                SessionPromptSetOutcome::Created
+            );
+            assert_eq!(
+                backend
+                    .set_session_prompt("second", "task.primary", "separate task")
+                    .unwrap(),
+                SessionPromptSetOutcome::Created
+            );
+        }
+
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(
+            backend.list_session_prompts("first").unwrap()[0].content,
+            "keep the current task"
+        );
+        assert_eq!(
+            backend.list_session_prompts("second").unwrap()[0].content,
+            "separate task"
+        );
+    }
+
+    #[test]
+    fn session_prompt_can_create_its_session_owner_before_first_message() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        assert_eq!(
+            backend
+                .set_session_prompt("new-session", "task", "start here")
+                .unwrap(),
+            SessionPromptSetOutcome::Created
+        );
+        assert!(backend.session_exists("new-session"));
+        assert_eq!(
+            backend.list_session_prompts("new-session").unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn session_prompts_enforce_count_and_byte_bounds_transactionally() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend
+            .append("session", &ChatMessage::user("hello"))
+            .unwrap();
+
+        for id in ["one", "two", "three", "four"] {
+            backend.set_session_prompt("session", id, "x").unwrap();
+        }
+        assert!(backend.set_session_prompt("session", "five", "x").is_err());
+        assert_eq!(
+            backend.list_session_prompts("session").unwrap().len(),
+            MAX_SESSION_PROMPTS
+        );
+
+        assert_eq!(
+            backend
+                .set_session_prompt("session", "one", &"x".repeat(MAX_SESSION_PROMPT_BYTES))
+                .unwrap(),
+            SessionPromptSetOutcome::Updated
+        );
+        assert_eq!(
+            backend
+                .set_session_prompt("session", "two", &"é".repeat(MAX_SESSION_PROMPT_BYTES / 2))
+                .unwrap(),
+            SessionPromptSetOutcome::Updated
+        );
+        assert!(
+            backend
+                .set_session_prompt(
+                    "session",
+                    "two",
+                    &"é".repeat(MAX_SESSION_PROMPT_BYTES / 2 + 1)
+                )
+                .is_err()
+        );
+        assert_eq!(
+            backend.list_session_prompts("session").unwrap()[3].content,
+            "é".repeat(MAX_SESSION_PROMPT_BYTES / 2)
+        );
+    }
+
+    #[test]
+    fn session_prompt_budget_admission_is_atomic_per_session() {
+        let tmp = TempDir::new().unwrap();
+        let backend = Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        let content = "keep the current task";
+        let one_prompt = render_session_prompts(&[SessionPrompt {
+            id: "first".to_string(),
+            content: content.to_string(),
+            updated_at: String::new(),
+        }]);
+        let budget = SessionPromptBudget::new(0, one_prompt.chars().count() + 2);
+        let start = Arc::new(Barrier::new(3));
+
+        std::thread::scope(|scope| {
+            let first_backend = Arc::clone(&backend);
+            let first_start = Arc::clone(&start);
+            let first = scope.spawn(move || {
+                first_start.wait();
+                first_backend.set_session_prompt_with_budget(
+                    "session",
+                    "first",
+                    content,
+                    Some(budget),
+                )
+            });
+            let second_backend = Arc::clone(&backend);
+            let second_start = Arc::clone(&start);
+            let second = scope.spawn(move || {
+                second_start.wait();
+                second_backend.set_session_prompt_with_budget(
+                    "session",
+                    "second",
+                    content,
+                    Some(budget),
+                )
+            });
+
+            start.wait();
+            let successes = [first.join().unwrap(), second.join().unwrap()]
+                .into_iter()
+                .filter(std::result::Result::is_ok)
+                .count();
+            assert_eq!(successes, 1);
+        });
+        assert_eq!(backend.list_session_prompts("session").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reset_and_delete_session_remove_prompt_attachments() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend
+            .append("reset", &ChatMessage::user("hello"))
+            .unwrap();
+        backend
+            .set_session_prompt("reset", "task", "current task")
+            .unwrap();
+        assert_eq!(backend.reset_session("reset").unwrap(), 1);
+        assert!(backend.list_session_prompts("reset").unwrap().is_empty());
+        assert!(backend.session_exists("reset"));
+
+        backend
+            .set_session_prompt("reset", "task", "new task")
+            .unwrap();
+        assert!(backend.delete_session("reset").unwrap());
+        assert!(backend.list_session_prompts("reset").unwrap().is_empty());
+    }
+
+    #[test]
+    fn reset_session_clears_trim_breadcrumb_even_when_already_empty() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend
+            .append("session", &ChatMessage::user("hello"))
+            .unwrap();
+        backend
+            .set_session_trim_breadcrumb("session", true)
+            .unwrap();
+        assert_eq!(backend.reset_session("session").unwrap(), 1);
+        assert_eq!(
+            backend.get_session_trim_breadcrumb("session").unwrap(),
+            None
+        );
+
+        backend
+            .set_session_trim_breadcrumb("session", true)
+            .unwrap();
+        assert_eq!(backend.reset_session("session").unwrap(), 0);
+        assert_eq!(
+            backend.get_session_trim_breadcrumb("session").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn reset_session_rolls_back_transcript_prompts_and_breadcrumb_on_metadata_failure() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend
+            .append("session", &ChatMessage::user("hello"))
+            .unwrap();
+        backend
+            .set_session_prompt("session", "task", "current task")
+            .unwrap();
+        backend
+            .set_session_trim_breadcrumb("session", true)
+            .unwrap();
+        {
+            let conn = backend.conn.lock();
+            conn.execute_batch(
+                "CREATE TRIGGER reject_session_reset BEFORE UPDATE ON session_metadata \
+                 BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+            )
+            .unwrap();
+        }
+
+        assert!(backend.reset_session("session").is_err());
+        assert_eq!(backend.load("session").len(), 1);
+        assert_eq!(backend.list_session_prompts("session").unwrap().len(), 1);
+        assert_eq!(
+            backend.get_session_trim_breadcrumb("session").unwrap(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn delete_session_rolls_back_when_metadata_deletion_fails() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend
+            .append("session", &ChatMessage::user("hello"))
+            .unwrap();
+        backend
+            .set_session_prompt("session", "task", "current task")
+            .unwrap();
+        {
+            let conn = backend.conn.lock();
+            conn.execute_batch(
+                "CREATE TRIGGER reject_session_delete BEFORE DELETE ON session_metadata \
+                 BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+            )
+            .unwrap();
+        }
+
+        assert!(backend.delete_session("session").is_err());
+        assert!(backend.session_exists("session"));
+        assert_eq!(backend.load("session").len(), 1);
+        assert_eq!(backend.list_session_prompts("session").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delete_session_key_set_rolls_back_when_a_later_alias_fails() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let keys = ["raw-session", "rpc_raw-session", "gw_raw-session"];
+        for key in keys {
+            backend.append(key, &ChatMessage::user("hello")).unwrap();
+            backend
+                .set_session_prompt(key, "task", "current task")
+                .unwrap();
+        }
+        {
+            let conn = backend.conn.lock();
+            conn.execute_batch(
+                "CREATE TRIGGER reject_gateway_alias_delete BEFORE DELETE ON session_metadata \
+                 WHEN OLD.session_key = 'gw_raw-session' \
+                 BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+            )
+            .unwrap();
+        }
+
+        assert!(backend.delete_session_key_set(&keys).is_err());
+        for key in keys {
+            assert!(backend.session_exists(key), "{key} must be rolled back");
+            assert_eq!(backend.load(key).len(), 1, "{key} messages must survive");
+            assert_eq!(
+                backend.list_session_prompts(key).unwrap().len(),
+                1,
+                "{key} prompt attachments must survive"
+            );
+        }
+    }
+
+    #[test]
+    fn owned_key_set_deletes_every_alias_and_its_prompts() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let keys = ["raw-owned", "rpc_raw-owned", "gw_raw-owned"];
+        for key in keys {
+            backend.append(key, &ChatMessage::user("hello")).unwrap();
+            backend.set_session_principal(key, "user:alice").unwrap();
+            backend.set_session_prompt(key, "task", "context").unwrap();
+        }
+
+        assert!(
+            backend
+                .delete_session_key_set_owned(&keys, "user:alice")
+                .unwrap()
+        );
+        for key in keys {
+            assert!(!backend.session_exists(key));
+            assert!(backend.load(key).is_empty());
+            assert!(backend.list_session_prompts(key).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn owned_key_set_refuses_a_foreign_or_ownerless_alias_without_partial_delete() {
+        for other_owner in [Some("user:bob"), None] {
+            let tmp = TempDir::new().unwrap();
+            let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+            let keys = ["raw-owned", "rpc_raw-owned", "gw_raw-owned"];
+            for key in keys {
+                backend.append(key, &ChatMessage::user("hello")).unwrap();
+                backend.set_session_prompt(key, "task", "context").unwrap();
+                if key != keys[2] {
+                    backend.set_session_principal(key, "user:alice").unwrap();
+                } else if let Some(owner) = other_owner {
+                    backend.set_session_principal(key, owner).unwrap();
+                }
+            }
+
+            assert!(
+                !backend
+                    .delete_session_key_set_owned(&keys, "user:alice")
+                    .unwrap()
+            );
+            for key in keys {
+                assert!(backend.session_exists(key), "{key} must remain");
+                assert_eq!(backend.load(key).len(), 1);
+                assert_eq!(backend.list_session_prompts(key).unwrap().len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn owned_key_set_rolls_back_when_a_later_alias_fails() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let keys = ["raw-owned", "rpc_raw-owned", "gw_raw-owned"];
+        for key in keys {
+            backend.append(key, &ChatMessage::user("hello")).unwrap();
+            backend.set_session_principal(key, "user:alice").unwrap();
+            backend.set_session_prompt(key, "task", "context").unwrap();
+        }
+        {
+            let conn = backend.conn.lock();
+            conn.execute_batch(
+                "CREATE TRIGGER reject_gateway_alias_delete BEFORE DELETE ON session_metadata \
+                 WHEN OLD.session_key = 'gw_raw-owned' \
+                 BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+            )
+            .unwrap();
+        }
+
+        assert!(
+            backend
+                .delete_session_key_set_owned(&keys, "user:alice")
+                .is_err()
+        );
+        for key in keys {
+            assert!(backend.session_exists(key), "{key} must be rolled back");
+            assert_eq!(backend.load(key).len(), 1);
+            assert_eq!(backend.list_session_prompts(key).unwrap().len(), 1);
+        }
     }
 
     #[test]
@@ -1802,6 +2411,9 @@ mod tests {
         backend
             .append("new_session", &ChatMessage::user("fresh"))
             .unwrap();
+        backend
+            .set_session_prompt("old_session", "task", "expired context")
+            .unwrap();
 
         let cleaned = backend.cleanup_stale(48).unwrap(); // 48h TTL
         assert_eq!(cleaned, 1);
@@ -1809,6 +2421,12 @@ mod tests {
         let sessions = backend.list_sessions();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0], "new_session");
+        let attachment_count: i64 = backend
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM session_prompts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(attachment_count, 0);
     }
 
     #[test]

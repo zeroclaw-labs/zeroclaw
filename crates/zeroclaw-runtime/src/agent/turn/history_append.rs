@@ -46,3 +46,40 @@ pub(crate) fn append_tool_round_to_history(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::append_tool_round_to_history;
+    use crate::agent::prompt::redact_session_prompt_tool_exchanges_for_export;
+    use zeroclaw_providers::ChatMessage;
+
+    #[test]
+    fn json_tool_calls_text_fallback_result_is_redacted_only_in_export_copies() {
+        let marker = "session-prompt-private-marker";
+        let assistant =
+            format!(r#"{{"tool_calls":[{{"name":"session_prompt_list","arguments":{{}}}}]}}"#);
+        let result = format!("<tool_result name=\"session_prompt_list\">{marker}</tool_result>");
+        let mut history: Vec<ChatMessage> = Vec::new();
+
+        append_tool_round_to_history(
+            &mut history,
+            assistant,
+            &[],
+            &[(None, result.clone())],
+            &result,
+            false,
+        );
+
+        assert!(
+            history[1].content.contains(marker),
+            "the provider's working history keeps the explicit list result"
+        );
+        let exported = redact_session_prompt_tool_exchanges_for_export(&history);
+        assert!(
+            exported
+                .iter()
+                .all(|message| !message.content.contains(marker)),
+            "generic exports must not retain the opaque attachment body"
+        );
+    }
+}

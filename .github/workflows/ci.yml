@@ -840,6 +840,8 @@ jobs:
             command: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-lark --lib lark_url_verification"
           - name: Matrix
             command: "cargo nextest run --locked -p zeroclaw-channels --features channel-matrix --lib matrix::"
+          - name: WhatsApp gateway
+            command: "cargo nextest run --locked -p zeroclaw-gateway --features channel-whatsapp-cloud --lib whatsapp_"
           - name: QQ
             command: "cargo nextest run --locked -p zeroclaw-channels --features channel-qq --lib qq::tests::health_check one_off_send_resolves_dotted_qq_alias deliver_announcement_routes_qq_to_qq_arm deliver_announcement_rejects_disabled_qq_alias compiled_channel_keys_have_intentional_announcement_delivery_registration compiled_channel_keys_have_intentional_one_shot_builder_support"
     steps:

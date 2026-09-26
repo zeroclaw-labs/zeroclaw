@@ -10,6 +10,14 @@ use super::custom_id::CustomId;
 
 pub(crate) const APPROVAL_KIND: &str = "apv";
 
+/// A parked Discord approval carries the daemon-owned policy marker alongside
+/// its resolver. Text replies and component clicks must enforce the same
+/// one-shot contract before removing the entry.
+pub(crate) struct PendingApproval {
+    pub(crate) sender: oneshot::Sender<ChannelApprovalResponse>,
+    pub(crate) strict_session_prompt_approval: bool,
+}
+
 /// `custom_id` kind for STATELESS SOP-gate buttons (`ChannelGatePrompt`
 /// deliveries). Unlike [`APPROVAL_KIND`] there is no server-side registration:
 /// the arg carries `<choice_id>:<reference>` directly, so the buttons survive
@@ -127,12 +135,18 @@ pub(crate) fn approval_button_binding(
 }
 
 pub(crate) fn resolve_parked_approval(
-    map: &mut HashMap<String, oneshot::Sender<ChannelApprovalResponse>>,
+    map: &mut HashMap<String, PendingApproval>,
     token: &str,
     decision: ApprovalDecision,
+    strict_session_prompt_approval: bool,
 ) -> bool {
+    if matches!(decision.response(), ChannelApprovalResponse::AlwaysApprove)
+        && strict_session_prompt_approval
+    {
+        return false;
+    }
     map.remove(token)
-        .map(|sender| sender.send(decision.response()).is_ok())
+        .map(|entry| entry.sender.send(decision.response()).is_ok())
         .unwrap_or(false)
 }
 
@@ -142,9 +156,17 @@ pub(crate) fn resolve_parked_approval(
 /// makes a click resolvable (an unregistered id resolves to nothing).
 pub(crate) fn build_approval_row(
     token: &str,
+    strict_session_prompt_approval: bool,
 ) -> (DiscordActionRow, Vec<(CustomId, ApprovalDecision)>) {
     let bindings: Vec<(CustomId, ApprovalDecision)> = APPROVAL_BUTTONS
         .iter()
+        .filter(|decision| {
+            !strict_session_prompt_approval
+                || matches!(
+                    decision,
+                    ApprovalDecision::AllowOnce | ApprovalDecision::Deny
+                )
+        })
         .map(|d| approval_button_binding(token, *d))
         .collect();
     let buttons = bindings
@@ -182,8 +204,19 @@ mod tests {
     }
 
     #[test]
+    fn strict_session_prompt_row_has_only_one_time_choices() {
+        let (row, bindings) = build_approval_row("abc123", true);
+        assert_eq!(row.components.len(), 2);
+        assert_eq!(bindings.len(), 2);
+        assert!(bindings.iter().all(|(_, decision)| matches!(
+            decision,
+            ApprovalDecision::AllowOnce | ApprovalDecision::Deny
+        )));
+    }
+
+    #[test]
     fn row_has_four_buttons_with_unique_ids_carrying_the_token() {
-        let (row, bindings) = build_approval_row("abc123");
+        let (row, bindings) = build_approval_row("abc123", false);
         assert_eq!(row.components.len(), 4, "four approval buttons");
         assert_eq!(bindings.len(), 4);
 
@@ -201,7 +234,7 @@ mod tests {
 
     #[test]
     fn bindings_cover_every_decision_exactly_once() {
-        let (_, bindings) = build_approval_row("tok");
+        let (_, bindings) = build_approval_row("tok", false);
         let decisions: Vec<ApprovalDecision> = bindings.iter().map(|(_, d)| *d).collect();
         assert!(decisions.contains(&ApprovalDecision::AllowOnce));
         assert!(decisions.contains(&ApprovalDecision::AllowSession));
@@ -232,10 +265,16 @@ mod tests {
         ] {
             let mut map = HashMap::new();
             let (tx, rx) = oneshot::channel();
-            map.insert("tok".to_string(), tx);
+            map.insert(
+                "tok".to_string(),
+                PendingApproval {
+                    sender: tx,
+                    strict_session_prompt_approval: false,
+                },
+            );
 
             assert!(
-                resolve_parked_approval(&mut map, "tok", decision),
+                resolve_parked_approval(&mut map, "tok", decision, false),
                 "live oneshot resolves"
             );
             assert_eq!(rx.await.unwrap(), expected, "decision: {decision:?}");
@@ -247,17 +286,24 @@ mod tests {
     async fn replay_resolves_nothing_after_first_click() {
         let mut map = HashMap::new();
         let (tx, _rx) = oneshot::channel();
-        map.insert("tok".to_string(), tx);
+        map.insert(
+            "tok".to_string(),
+            PendingApproval {
+                sender: tx,
+                strict_session_prompt_approval: false,
+            },
+        );
 
         assert!(resolve_parked_approval(
             &mut map,
             "tok",
-            ApprovalDecision::Deny
+            ApprovalDecision::Deny,
+            false
         ));
         // A second click on the same (now-drained) token resolves nothing — the
         // approval layer is single-use even if a stale button is clicked.
         assert!(
-            !resolve_parked_approval(&mut map, "tok", ApprovalDecision::AllowOnce),
+            !resolve_parked_approval(&mut map, "tok", ApprovalDecision::AllowOnce, false),
             "replay refused"
         );
     }
@@ -266,13 +312,20 @@ mod tests {
     async fn forged_or_unknown_token_resolves_nothing() {
         let mut map = HashMap::new();
         let (tx, _rx) = oneshot::channel();
-        map.insert("real".to_string(), tx);
+        map.insert(
+            "real".to_string(),
+            PendingApproval {
+                sender: tx,
+                strict_session_prompt_approval: false,
+            },
+        );
         // A token we never parked (forged, or for another approval) resolves
         // nothing and leaves the real entry untouched.
         assert!(!resolve_parked_approval(
             &mut map,
             "forged",
-            ApprovalDecision::AllowOnce
+            ApprovalDecision::AllowOnce,
+            false,
         ));
         assert!(map.contains_key("real"), "the real entry is not drained");
     }
@@ -284,10 +337,16 @@ mod tests {
         // → reported as not resolved, matching the deny-by-default outcome.
         let mut map = HashMap::new();
         let (tx, rx) = oneshot::channel();
-        map.insert("tok".to_string(), tx);
+        map.insert(
+            "tok".to_string(),
+            PendingApproval {
+                sender: tx,
+                strict_session_prompt_approval: false,
+            },
+        );
         drop(rx); // receiver gone, as after a timeout
         assert!(
-            !resolve_parked_approval(&mut map, "tok", ApprovalDecision::AllowOnce),
+            !resolve_parked_approval(&mut map, "tok", ApprovalDecision::AllowOnce, false),
             "send to a dropped receiver is not a successful resolve"
         );
     }

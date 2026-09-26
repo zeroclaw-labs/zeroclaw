@@ -88,6 +88,10 @@ interface channel {
         /// Batch position, when the runtime knows it; `none` on paths that
         /// approve a single call with no batch to count.
         position: option<approval-position>,
+        /// Whether this is the dedicated strict confirmation for a
+        /// session-prompt mutation. Hosts must not infer policy from the
+        /// presence or absence of raw arguments.
+        strict-session-prompt-approval: bool,
     }
 
     /// The operator's response to a channel-presented approval prompt.

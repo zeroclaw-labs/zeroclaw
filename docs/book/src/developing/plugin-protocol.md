@@ -506,6 +506,12 @@ component, including one that does not serve webhooks, must be rebuilt against
 the WIT shipped by the target host and export the documented capability-gated
 stubs. The frozen-version compatibility window does not apply yet.
 
+The `approval-request` record includes the host-owned
+`strict-session-prompt-approval` marker. Rebuild channel components after this
+field changes; when it is `true`, render only one-time approve/deny actions and
+do not offer `always-approve`. The host rejects that persistent action for a
+strict request, and guests must not infer strictness from raw-argument shape.
+
 ### `logging`
 
 `wit/v0/logging.wit` is imported by all three worlds. Plugins call `log-record`

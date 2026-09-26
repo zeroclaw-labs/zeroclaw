@@ -32,6 +32,11 @@ struct ReactionTarget {
     timestamp_ms: u64,
 }
 
+struct PendingApproval {
+    sender: oneshot::Sender<ChannelApprovalResponse>,
+    strict_session_prompt_approval: bool,
+}
+
 #[derive(Clone)]
 pub struct SignalChannel {
     http_url: String,
@@ -50,7 +55,7 @@ pub struct SignalChannel {
     ignore_stories: bool,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
-    pending_approvals: Arc<Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+    pending_approvals: Arc<Mutex<HashMap<String, PendingApproval>>>,
     /// Seconds to wait for an operator reply to a `request_approval` prompt
     /// before treating the silence as a deny. Default 300.
     approval_timeout_secs: u64,
@@ -783,8 +788,17 @@ impl Channel for SignalChannel {
                                                 crate::util::parse_approval_reply(&msg.content)
                                             {
                                                 let mut map = self.pending_approvals.lock().await;
-                                                if let Some(sender) = map.remove(&token) {
-                                                    let _ = sender.send(response);
+                                                if map.get(&token).is_some_and(|pending| {
+                                                    pending.strict_session_prompt_approval
+                                                        && matches!(
+                                                            response,
+                                                            ChannelApprovalResponse::AlwaysApprove
+                                                        )
+                                                }) {
+                                                    continue;
+                                                }
+                                                if let Some(pending) = map.remove(&token) {
+                                                    let _ = pending.sender.send(response);
                                                     consumed_as_approval = true;
                                                     continue;
                                                 }
@@ -834,8 +848,17 @@ impl Channel for SignalChannel {
                                     crate::util::parse_approval_reply(&msg.content)
                                 {
                                     let mut map = self.pending_approvals.lock().await;
-                                    if let Some(sender) = map.remove(&token) {
-                                        let _ = sender.send(response);
+                                    if map.get(&token).is_some_and(|pending| {
+                                        pending.strict_session_prompt_approval
+                                            && matches!(
+                                                response,
+                                                ChannelApprovalResponse::AlwaysApprove
+                                            )
+                                    }) {
+                                        continue;
+                                    }
+                                    if let Some(pending) = map.remove(&token) {
+                                        let _ = pending.sender.send(response);
                                         continue;
                                     }
                                 }
@@ -942,18 +965,24 @@ impl Channel for SignalChannel {
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         let token = crate::util::new_approval_token();
-        let text = crate::util::build_yesno_approval_prompt(
+        let text = crate::util::build_yesno_approval_prompt_with_policy(
             &token,
             &request.tool_name,
             &request.arguments_summary,
             request.position_counter(),
+            zeroclaw_api::is_strict_session_prompt_approval(request),
         );
 
         let (tx, rx) = oneshot::channel();
-        self.pending_approvals
-            .lock()
-            .await
-            .insert(token.clone(), tx);
+        self.pending_approvals.lock().await.insert(
+            token.clone(),
+            PendingApproval {
+                sender: tx,
+                strict_session_prompt_approval: zeroclaw_api::is_strict_session_prompt_approval(
+                    request,
+                ),
+            },
+        );
 
         if let Err(err) = self.send(&SendMessage::new(text, recipient)).await {
             self.pending_approvals.lock().await.remove(&token);
@@ -1960,13 +1989,19 @@ mod tests {
             ignore_stories,
         );
         let (tx, rx) = tokio::sync::oneshot::channel();
-        ch.pending_approvals
-            .lock()
-            .await
-            .insert("abc123".to_string(), tx);
+        ch.pending_approvals.lock().await.insert(
+            "abc123".to_string(),
+            PendingApproval {
+                sender: tx,
+                strict_session_prompt_approval: false,
+            },
+        );
         // simulate listen() routing
         let sender = ch.pending_approvals.lock().await.remove("abc123").unwrap();
-        sender.send(ChannelApprovalResponse::Approve).unwrap();
+        sender
+            .sender
+            .send(ChannelApprovalResponse::Approve)
+            .unwrap();
         assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
     }
     fn make_reaction_channel() -> SignalChannel {

@@ -5475,11 +5475,14 @@ impl Channel for MatrixChannel {
             .await?
             .to_string();
         let token = approval::generate_token_default();
-        let prompt = crate::util::build_approve_deny_approval_prompt(
+        let strict_session_prompt_approval =
+            zeroclaw_api::is_strict_session_prompt_approval(request);
+        let prompt = crate::util::build_approve_deny_approval_prompt_with_policy(
             &token,
             &request.tool_name,
             &request.arguments_summary,
             request.position_counter(),
+            strict_session_prompt_approval,
         );
 
         let (tx, rx) = oneshot::channel();
@@ -5489,6 +5492,7 @@ impl Channel for MatrixChannel {
                 sender: tx,
                 destination,
                 tool_name: request.tool_name.clone(),
+                strict_session_prompt_approval,
             },
         );
 
@@ -7721,6 +7725,7 @@ mod tests {
                         sender: approved_tx,
                         destination: test_room().to_string(),
                         tool_name: "tool".to_string(),
+                        strict_session_prompt_approval: false,
                     },
                 );
                 approvals.insert(
@@ -7729,6 +7734,7 @@ mod tests {
                         sender: wrong_tx,
                         destination: "!other:localhost".into(),
                         tool_name: "tool".to_string(),
+                        strict_session_prompt_approval: false,
                     },
                 );
                 approvals.insert(
@@ -7737,6 +7743,7 @@ mod tests {
                         sender: unauthorized_tx,
                         destination: test_room().to_string(),
                         tool_name: "tool".to_string(),
+                        strict_session_prompt_approval: false,
                     },
                 );
             }
@@ -7899,6 +7906,7 @@ mod tests {
                     sender: tx,
                     destination: "!origin:example.invalid".to_string(),
                     tool_name: "tool".to_string(),
+                    strict_session_prompt_approval: false,
                 },
             );
 
@@ -7963,6 +7971,7 @@ mod tests {
                     sender: approve_tx,
                     destination: "!origin:example.invalid".to_string(),
                     tool_name: "tool".to_string(),
+                    strict_session_prompt_approval: false,
                 },
             );
             assert_eq!(

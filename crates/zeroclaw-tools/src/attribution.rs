@@ -64,8 +64,8 @@ use crate::report_template_tool::ReportTemplateTool;
 use crate::screenshot::ScreenshotTool;
 use crate::send_via::SendViaTool;
 use crate::sessions::{
-    SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
-    SessionsListTool, SessionsSendTool,
+    SessionDeleteTool, SessionPromptDeleteTool, SessionPromptListTool, SessionPromptSetTool,
+    SessionResetTool, SessionsCurrentTool, SessionsHistoryTool, SessionsListTool, SessionsSendTool,
 };
 use crate::text_browser::TextBrowserTool;
 use crate::tool_search::ToolSearchTool;
@@ -131,6 +131,9 @@ tool_attribution!(ReportTemplateTool, ToolKind::Plugin);
 tool_attribution!(ScreenshotTool, ToolKind::Plugin);
 tool_attribution!(SendViaTool, ToolKind::Plugin);
 tool_attribution!(SessionDeleteTool, ToolKind::Plugin);
+tool_attribution!(SessionPromptDeleteTool, ToolKind::Plugin);
+tool_attribution!(SessionPromptListTool, ToolKind::Plugin);
+tool_attribution!(SessionPromptSetTool, ToolKind::Plugin);
 tool_attribution!(SessionResetTool, ToolKind::Plugin);
 tool_attribution!(SessionsCurrentTool, ToolKind::Plugin);
 tool_attribution!(SessionsHistoryTool, ToolKind::Plugin);
