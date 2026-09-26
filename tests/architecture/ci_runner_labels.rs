@@ -32,7 +32,7 @@ const HOUSEKEEPING_LABEL: &str = "blacksmith-4vcpu-ubuntu-2404";
 
 /// Every housekeeping job in the two workflows on the Blacksmith 4-vCPU class.
 /// Workflow-qualified IDs keep same-named jobs in different workflows distinct.
-const HOUSEKEEPING_JOBS: [&str; 16] = [
+const HOUSEKEEPING_JOBS: [&str; 17] = [
     "ci.yml/fmt",
     "ci.yml/gate",
     "ci.yml/history-guard",
@@ -43,6 +43,7 @@ const HOUSEKEEPING_JOBS: [&str; 16] = [
     "ci.yml/path-changes",
     "ci.yml/relay-container-smoke-changes",
     "ci.yml/windows-clippy-tools-changes",
+    "ci.yml/windows-service-smoke-changes",
     "ci.yml/nix-eval",
     "ci.yml/nix-hash-drift",
     "ci.yml/relay-container-smoke",

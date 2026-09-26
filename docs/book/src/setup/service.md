@@ -176,11 +176,12 @@ Don't mix `zeroclaw service` CLI commands with `brew services`, pick one. Both e
 
 - Trigger: at logon (`/SC ONLOGON`)
 - Run level: `LIMITED` (runs as the current user, not elevated)
-- Action: runs the install wrapper `zeroclaw-daemon.cmd`, which launches `zeroclaw daemon`
+- Action: runs `zeroclaw.exe --config-dir <config-dir> service run-windows-daemon` directly; the internal runner owns the daemon child and its output capture
+- Window: Windows currently attaches an empty console window to this interactive scheduled task. Leave it open while the service runs; closing it may stop the runner and daemon. Background launch without that window is tracked in [#10991](https://github.com/zeroclaw-labs/zeroclaw/issues/10991).
 
 Verify in Task Scheduler GUI (`taskschd.msc`) under Task Scheduler Library → ZeroClaw Daemon.
 
-Logs go to `<config-dir>\logs\` as `daemon.stdout.log` and `daemon.stderr.log` (for a default install, `%USERPROFILE%\.zeroclaw\logs\`). `zeroclaw service logs` prints whichever of the two files hold output, and `--follow` shows the others first and then streams `daemon.stdout.log`, or `daemon.stderr.log` when only that file holds output, because `Get-Content -Wait` tracks a single path. To read one directly:
+Logs go to `<config-dir>\logs\` as `daemon.stdout.log` and `daemon.stderr.log` (for a default install, `%USERPROFILE%\.zeroclaw\logs\`). Each file retains recent output within an 8 MiB bound. Reinstall the task after upgrading from the older `.cmd` wrapper. First run `schtasks /Change /TN "ZeroClaw Daemon" /Disable`, reboot Windows, then run `zeroclaw service install`. Installation refuses to replace a legacy task in any state except Disabled because Task Scheduler's Ready state does not prove that the wrapper's child processes exited; `zeroclaw service stop` alone is therefore insufficient for this migration. Reinstalling the direct runner stops the exact scheduled task and waits for it to exit, so expect a brief service interruption. The old wrapper file may remain but is no longer used. The runner requires the config root and capture files to belong to the task account and rejects reparse-point paths while restricting their ACLs. Task Scheduler action paths containing literal `%` signs are not supported. `zeroclaw service logs` prints whichever of the two files hold output, and `--follow` shows the others first and then streams `daemon.stdout.log`, or `daemon.stderr.log` when only that file holds output, because `Get-Content -Wait` tracks a single path. To read one directly:
 
 <div class="os-tabs-src">
 
