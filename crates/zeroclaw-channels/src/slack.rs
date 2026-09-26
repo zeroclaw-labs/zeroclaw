@@ -201,6 +201,9 @@ pub struct SlackChannel {
     thread_context_max_messages_resolver: Arc<dyn Fn() -> usize + Send + Sync>,
     /// Use the newer `markdown` block type (richer formatting, 12k char limit).
     use_markdown_blocks: bool,
+    /// Accept `subtype = "bot_message"` posts from other Slack apps.
+    /// Off by default; see `SlackConfig::allow_bot_messages`.
+    allow_bot_messages: bool,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
     #[cfg(test)]
@@ -230,6 +233,9 @@ pub struct SlackChannel {
     /// `Channel::self_handle` override reads it without an HTTP call so
     /// the guard runs on every inbound after the first.
     cached_bot_user_id: Mutex<Option<String>>,
+    /// This app's own `bot_id` from `auth.test`, used to drop the echoes of
+    /// our own posts once `allow_bot_messages` lets bot posts through.
+    cached_bot_id: Mutex<Option<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -436,6 +442,17 @@ const SLACK_SUPPORTED_IMAGE_MIME_TYPES: &[&str] = &[
     "image/bmp",
 ];
 
+/// Resolved author of an inbound Slack message.
+///
+/// `is_bot` is the authorization-relevant half: bot-authored text may start a
+/// turn when the operator opts in, but it must never consume a pending
+/// human approval token. See `parse_approval_reply` call sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InboundSender<'a> {
+    id: &'a str,
+    is_bot: bool,
+}
+
 impl SlackChannel {
     pub fn new(
         bot_token: String,
@@ -470,6 +487,7 @@ impl SlackChannel {
                 zeroclaw_config::schema::DEFAULT_SLACK_THREAD_CONTEXT_MAX_MESSAGES
             }),
             use_markdown_blocks: false,
+            allow_bot_messages: false,
             proxy_url: None,
             #[cfg(test)]
             api_base_url: None,
@@ -483,6 +501,7 @@ impl SlackChannel {
             pending_approvals: Arc::new(AsyncMutex::new(HashMap::new())),
             approval_timeout_secs: 300,
             cached_bot_user_id: Mutex::new(None),
+            cached_bot_id: Mutex::new(None),
         }
     }
 
@@ -557,6 +576,14 @@ impl SlackChannel {
     /// Only use this if your Slack workspace supports it.
     pub fn with_markdown_blocks(mut self, enabled: bool) -> Self {
         self.use_markdown_blocks = enabled;
+        self
+    }
+
+    /// Accept `subtype = "bot_message"` posts from other Slack apps (for
+    /// example Workflow Builder). Authorization still applies to the posting
+    /// app's bot ID.
+    pub fn with_allow_bot_messages(mut self, enabled: bool) -> Self {
+        self.allow_bot_messages = enabled;
         self
     }
 
@@ -1367,9 +1394,29 @@ impl SlackChannel {
             .await
             .ok()?;
 
+        // `auth.test` returns the app's `bot_id` alongside the bot user id.
+        // Cache it so `inbound_sender_identity` can recognise our own posts
+        // when they echo back as `subtype = "bot_message"`. A blank value is
+        // not an identity: caching it would read as "known" everywhere and
+        // match none of our own posts, so leave the cache unset instead.
+        if let Some(bot_id) = resp
+            .get("bot_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            && let Ok(mut guard) = self.cached_bot_id.lock()
+        {
+            *guard = Some(bot_id.to_string());
+        }
+
         resp.get("user_id")
             .and_then(|u| u.as_str())
             .map(String::from)
+    }
+
+    /// This app's cached `bot_id`, populated by `get_bot_user_id`.
+    fn own_bot_id(&self) -> Option<String> {
+        self.cached_bot_id.lock().ok().and_then(|g| g.clone())
     }
 
     /// Resolve the thread identifier for inbound Slack messages.
@@ -1631,6 +1678,102 @@ impl SlackChannel {
 
     fn is_supported_message_subtype(subtype: Option<&str>) -> bool {
         matches!(subtype, None | Some("file_share" | "thread_broadcast"))
+    }
+
+    /// Subtype gate for a channel that may also accept other apps' posts.
+    ///
+    /// Slack delivers Workflow Builder steps and app posts as
+    /// `subtype = "bot_message"` with no `user` field, so they fail both the
+    /// base subtype gate and the human-sender checks that follow it. Operators
+    /// opt in per channel with `allow_bot_messages`.
+    fn is_supported_message_subtype_with_bots(subtype: Option<&str>, allow_bots: bool) -> bool {
+        Self::is_supported_message_subtype(subtype)
+            || (allow_bots && subtype == Some("bot_message"))
+    }
+
+    /// Identity to authorize an inbound message under.
+    ///
+    /// Human posts carry `user`. A `bot_message` is always attributed to the
+    /// posting app's `bot_id` — that becomes the identity the peer allowlist
+    /// is matched against, even when the event also carries a `user` field —
+    /// enabling `allow_bot_messages` widens *which senders are considered*, it
+    /// does not skip authorization.
+    ///
+    /// Returns `None` when the message is one of our own posts (either the bot
+    /// user or this app's `bot_id`), which is what stops the agent replying to
+    /// itself once its own `chat.postMessage` echoes back as a bot post.
+    ///
+    /// A userless `bot_message` can only be told apart from our own echo by
+    /// comparing `bot_id` against this app's `bot_id`. Until that identity is
+    /// known (`auth.test` failed or omitted it), such posts are rejected: the
+    /// admission fails closed rather than risk re-entering on our own output.
+    /// That applies to every bot-authored event, including one that carries
+    /// `user` as well: `bot_user_id` is empty when `auth.test` returned no
+    /// user id, and an empty value matches nothing. For the same reason a
+    /// `bot_message` without a usable `bot_id` is rejected outright — there is
+    /// no `user` fallback, because the allowlist contract documents the `B...`
+    /// ID as the matching subject and a `user` entry must not stand in for an
+    /// unlisted or missing bot ID.
+    fn inbound_sender_identity<'a>(
+        message: &'a serde_json::Value,
+        bot_user_id: &str,
+        own_bot_id: Option<&str>,
+        allow_bots: bool,
+    ) -> Option<InboundSender<'a>> {
+        // Provenance comes from the subtype, not from which field supplied the
+        // identity: Slack may deliver a `bot_message` that *also* carries a
+        // `user`, and such a message must still be treated as bot-authored.
+        let is_bot = message.get("subtype").and_then(|v| v.as_str()) == Some("bot_message");
+
+        let user = message
+            .get("user")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or_default();
+        if is_bot {
+            // The opt-in admits `bot_message` posts, nothing else. Other
+            // events can carry a `bot_id` too (a bot-authored `file_share`,
+            // say) and already pass the subtype gate on their own merits;
+            // letting `bot_id` stand in for a sender there would silently
+            // widen the opt-in and make those events model-visible.
+            if !allow_bots {
+                return None;
+            }
+
+            // Our own identity is checked before any sender is resolved. The
+            // echo of our own post can arrive carrying `bot_id` alone or
+            // `user` and `bot_id` together, and only `bot_id` tells it apart
+            // from a foreign app reliably: `bot_user_id` is empty when
+            // `auth.test` returned no usable user id, and an empty value
+            // matches nothing. Without a known own `bot_id` there is nothing
+            // to compare against, so nothing bot-authored is admitted.
+            let own = own_bot_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            // A `bot_message` is authorized by the posting app's `bot_id`,
+            // never by a `user` it may also carry. Without a validated,
+            // non-empty `bot_id` the post cannot be attributed to an
+            // allowlisted app, so it is rejected here rather than falling
+            // back to `user`.
+            let bot_id = message
+                .get("bot_id")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            if bot_id == own {
+                return None;
+            }
+            if !user.is_empty() && user == bot_user_id {
+                return None;
+            }
+
+            return Some(InboundSender { id: bot_id, is_bot });
+        }
+
+        if user.is_empty() || user == bot_user_id {
+            return None;
+        }
+        Some(InboundSender { id: user, is_bot })
     }
 
     fn compose_incoming_content(text: String, attachment_blocks: Vec<String>) -> Option<String> {
@@ -4359,7 +4502,7 @@ impl SlackChannel {
                     continue;
                 }
                 let subtype = event.get("subtype").and_then(|v| v.as_str());
-                if !Self::is_supported_message_subtype(subtype) {
+                if !Self::is_supported_message_subtype_with_bots(subtype, self.allow_bot_messages) {
                     continue;
                 }
 
@@ -4377,13 +4520,19 @@ impl SlackChannel {
                     continue;
                 }
 
-                let user = event
-                    .get("user")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                if user.is_empty() || user == bot_user_id {
+                let own_bot_id = self.own_bot_id();
+                let Some(InboundSender {
+                    id: user,
+                    is_bot: sender_is_bot,
+                }) = Self::inbound_sender_identity(
+                    event,
+                    bot_user_id,
+                    own_bot_id.as_deref(),
+                    self.allow_bot_messages,
+                )
+                else {
                     continue;
-                }
+                };
                 let allowed_peers = (self.peer_resolver)();
                 if !crate::allowlist::is_user_allowed(
                     &allowed_peers,
@@ -4431,7 +4580,13 @@ impl SlackChannel {
                     continue;
                 };
 
-                if let Some((token, response)) = crate::util::parse_approval_reply(&normalized_text)
+                // Approvals are operator decisions. A bot may start a turn when
+                // the operator opts in, but must never consume a pending human
+                // approval token: permission to post must not become permission
+                // to authorize tool calls.
+                if !sender_is_bot
+                    && let Some((token, response)) =
+                        crate::util::parse_approval_reply(&normalized_text)
                     && crate::util::resolve_pending_approval(
                         &self.pending_approvals,
                         &token,
@@ -5656,6 +5811,18 @@ impl Channel for SlackChannel {
         // resolves without an additional `auth.test` round-trip.
         self.cache_bot_user_id().await;
         let bot_user_id = self.get_bot_user_id().await.unwrap_or_default();
+        if self.allow_bot_messages && self.own_bot_id().is_none() {
+            // `inbound_sender_identity` fails closed for userless bot posts
+            // until our own `bot_id` is known, so the opt-in is inert for
+            // those posts on this run. Say so instead of silently dropping.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "allow_bot_messages is enabled but auth.test did not return this app's bot_id; \
+                 app posts without a user field are ignored until the identity is known"
+            );
+        }
         let scoped_channels = self.scoped_channel_ids();
         if self.configured_app_token().is_some() {
             ::zeroclaw_log::record!(
@@ -5789,23 +5956,32 @@ impl Channel for SlackChannel {
                     // Messages come newest-first, reverse to process oldest first
                     for msg in messages.iter().rev() {
                         let subtype = msg.get("subtype").and_then(|value| value.as_str());
-                        if !Self::is_supported_message_subtype(subtype) {
+                        if !Self::is_supported_message_subtype_with_bots(
+                            subtype,
+                            self.allow_bot_messages,
+                        ) {
                             continue;
                         }
                         let ts = msg.get("ts").and_then(|t| t.as_str()).unwrap_or("");
-                        let user = msg
-                            .get("user")
-                            .and_then(|u| u.as_str())
-                            .unwrap_or("unknown");
+                        // Resolves `bot_id` for app posts and drops our own
+                        // messages, including their `bot_message` echoes.
+                        let own_bot_id = self.own_bot_id();
+                        let Some(InboundSender {
+                            id: user,
+                            is_bot: sender_is_bot,
+                        }) = Self::inbound_sender_identity(
+                            msg,
+                            &bot_user_id,
+                            own_bot_id.as_deref(),
+                            self.allow_bot_messages,
+                        )
+                        else {
+                            continue;
+                        };
                         let last_ts = last_ts_by_channel
                             .get(&channel_id)
                             .map(String::as_str)
                             .unwrap_or("");
-
-                        // Skip bot's own messages
-                        if user == bot_user_id {
-                            continue;
-                        }
 
                         // Sender validation
                         let allowed_peers = (self.peer_resolver)();
@@ -5853,8 +6029,11 @@ impl Channel for SlackChannel {
 
                         let sender = self.resolve_sender_identity(user).await;
 
-                        if let Some((token, response)) =
-                            crate::util::parse_approval_reply(&normalized_text)
+                        // Approvals are operator decisions; bot-authored text
+                        // must never consume a pending human approval token.
+                        if !sender_is_bot
+                            && let Some((token, response)) =
+                                crate::util::parse_approval_reply(&normalized_text)
                             && crate::util::resolve_pending_approval(
                                 &self.pending_approvals,
                                 &token,
@@ -5930,17 +6109,26 @@ impl Channel for SlackChannel {
                     Self::advance_active_thread_cursor(&mut active_threads, &thread_ts, reply_ts);
 
                     let subtype = reply.get("subtype").and_then(|v| v.as_str());
-                    if !Self::is_supported_message_subtype(subtype) {
+                    if !Self::is_supported_message_subtype_with_bots(
+                        subtype,
+                        self.allow_bot_messages,
+                    ) {
                         continue;
                     }
 
-                    let user = reply
-                        .get("user")
-                        .and_then(|u| u.as_str())
-                        .unwrap_or_default();
-                    if user.is_empty() || user == bot_user_id {
+                    let own_bot_id = self.own_bot_id();
+                    let Some(InboundSender {
+                        id: user,
+                        is_bot: sender_is_bot,
+                    }) = Self::inbound_sender_identity(
+                        reply,
+                        &bot_user_id,
+                        own_bot_id.as_deref(),
+                        self.allow_bot_messages,
+                    )
+                    else {
                         continue;
-                    }
+                    };
                     if !self.is_user_allowed(user) {
                         continue;
                     }
@@ -5960,8 +6148,11 @@ impl Channel for SlackChannel {
 
                     let sender = self.resolve_sender_identity(user).await;
 
-                    if let Some((token, response)) =
-                        crate::util::parse_approval_reply(&normalized_text)
+                    // Approvals are operator decisions; bot-authored text must
+                    // never consume a pending human approval token.
+                    if !sender_is_bot
+                        && let Some((token, response)) =
+                            crate::util::parse_approval_reply(&normalized_text)
                         && crate::util::resolve_pending_approval(
                             &self.pending_approvals,
                             &token,
@@ -6686,6 +6877,431 @@ mod tests {
         );
 
         assert_eq!(permalinks.len(), 1);
+    }
+
+    #[test]
+    fn bot_message_with_user_field_is_still_bot_authored() {
+        // Slack can deliver a `bot_message` that also carries `user`. Taking
+        // provenance from whichever field supplied the id would mark this
+        // human and hand it the approval path.
+        let hybrid = serde_json::json!({
+            "subtype": "bot_message",
+            "user": "U_APP",
+            "bot_id": "B_APP",
+            "text": "deploy finished"
+        });
+
+        let resolved =
+            SlackChannel::inbound_sender_identity(&hybrid, "U_SELF", Some("B_SELF"), true)
+                .expect("an allowed bot post resolves");
+        assert_eq!(resolved.id, "B_APP");
+        assert!(
+            resolved.is_bot,
+            "subtype=bot_message is bot-authored even when `user` is present"
+        );
+
+        assert_eq!(
+            SlackChannel::inbound_sender_identity(&hybrid, "U_SELF", Some("B_SELF"), false),
+            None,
+            "with bots disabled the same message is not admitted at all"
+        );
+    }
+
+    #[test]
+    fn human_sender_is_never_marked_bot_authored() {
+        let human = serde_json::json!({"user": "U_HUMAN", "text": "abc123 approve"});
+        let resolved =
+            SlackChannel::inbound_sender_identity(&human, "U_SELF", Some("B_SELF"), true)
+                .expect("human resolves");
+        assert!(
+            !resolved.is_bot,
+            "ordinary human text keeps the approval path"
+        );
+    }
+
+    #[tokio::test]
+    async fn bot_reply_cannot_consume_a_pending_approval() {
+        // The authorization boundary: an admitted bot may start a turn, but
+        // answering a visible approval token must not authorize the tool call.
+        // Mirrors the guard at each `parse_approval_reply` call site.
+        let channel = SlackChannel::new(
+            unique_test_bot_token(),
+            None,
+            vec![],
+            "slack_test_alias",
+            Arc::new(Vec::new),
+        )
+        .with_allow_bot_messages(true);
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        channel.pending_approvals.lock().await.insert(
+            "abc123".to_string(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination: "C_TEST".to_string(),
+                tool_name: "shell".to_string(),
+            },
+        );
+
+        // The exact escalation shape from review: token + decision + a trailing
+        // mention, which also satisfies mention-only mode.
+        let text = "abc123 approve <@U_SELF>";
+        let parsed = crate::util::parse_approval_reply(text);
+        assert!(parsed.is_some(), "fixture must be a valid approval reply");
+
+        let bot = serde_json::json!({"subtype": "bot_message", "bot_id": "B_APP", "text": text});
+        let sender =
+            SlackChannel::inbound_sender_identity(&bot, "U_SELF", Some("B_SELF"), true).unwrap();
+        assert!(sender.is_bot);
+
+        // Guard: bot-authored text never reaches the pending-approval map.
+        // Same shape as each receive path: the `!is_bot` gate short-circuits
+        // before `resolve_pending_approval` is ever reached.
+        if !sender.is_bot
+            && let Some((token, response)) = crate::util::parse_approval_reply(text)
+        {
+            let _ = crate::util::resolve_pending_approval(
+                &channel.pending_approvals,
+                &token,
+                response,
+                true,
+                "C_TEST",
+            )
+            .await;
+        }
+
+        assert!(
+            channel
+                .pending_approvals
+                .lock()
+                .await
+                .contains_key("abc123"),
+            "a bot reply must leave the pending approval untouched"
+        );
+        drop(rx);
+    }
+
+    #[tokio::test]
+    async fn human_reply_still_resolves_a_pending_approval() {
+        let channel = SlackChannel::new(
+            unique_test_bot_token(),
+            None,
+            vec![],
+            "slack_test_alias",
+            Arc::new(Vec::new),
+        )
+        .with_allow_bot_messages(true);
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        channel.pending_approvals.lock().await.insert(
+            "abc123".to_string(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination: "C_TEST".to_string(),
+                tool_name: "shell".to_string(),
+            },
+        );
+
+        let text = "abc123 approve";
+        let human = serde_json::json!({"user": "U_HUMAN", "text": text});
+        let sender =
+            SlackChannel::inbound_sender_identity(&human, "U_SELF", Some("B_SELF"), true).unwrap();
+        assert!(!sender.is_bot);
+
+        // Same shape as each receive path: the `!is_bot` gate short-circuits
+        // before `resolve_pending_approval` is ever reached.
+        if !sender.is_bot
+            && let Some((token, response)) = crate::util::parse_approval_reply(text)
+        {
+            let _ = crate::util::resolve_pending_approval(
+                &channel.pending_approvals,
+                &token,
+                response,
+                true,
+                "C_TEST",
+            )
+            .await;
+        }
+
+        assert!(
+            !channel
+                .pending_approvals
+                .lock()
+                .await
+                .contains_key("abc123"),
+            "a human reply must still resolve the approval"
+        );
+        assert!(rx.await.is_ok(), "the decision reaches the waiting request");
+    }
+
+    #[test]
+    fn bot_message_subtype_requires_opt_in() {
+        // Workflow Builder steps and app posts arrive as `bot_message`; they
+        // stay out unless the operator enables them for the channel.
+        assert!(!SlackChannel::is_supported_message_subtype_with_bots(
+            Some("bot_message"),
+            false
+        ));
+        assert!(SlackChannel::is_supported_message_subtype_with_bots(
+            Some("bot_message"),
+            true
+        ));
+    }
+
+    #[test]
+    fn allowing_bots_does_not_widen_other_subtypes() {
+        // Only `bot_message` is added; unrelated subtypes stay rejected.
+        for subtype in ["channel_join", "message_changed", "message_deleted"] {
+            assert!(
+                !SlackChannel::is_supported_message_subtype_with_bots(Some(subtype), true),
+                "{subtype} must stay filtered even with bots allowed"
+            );
+        }
+        assert!(SlackChannel::is_supported_message_subtype_with_bots(
+            None, true
+        ));
+        assert!(SlackChannel::is_supported_message_subtype_with_bots(
+            Some("file_share"),
+            true
+        ));
+    }
+
+    #[test]
+    fn inbound_identity_prefers_user_and_skips_our_bot_user() {
+        let human = serde_json::json!({"user": "U_HUMAN", "text": "hi"});
+        assert_eq!(
+            SlackChannel::inbound_sender_identity(&human, "U_SELF", Some("B_SELF"), true)
+                .map(|s| (s.id, s.is_bot)),
+            Some(("U_HUMAN", false))
+        );
+
+        let own = serde_json::json!({"user": "U_SELF", "text": "mine"});
+        assert_eq!(
+            SlackChannel::inbound_sender_identity(&own, "U_SELF", Some("B_SELF"), true),
+            None
+        );
+    }
+
+    #[test]
+    fn inbound_identity_uses_bot_id_only_when_bots_are_allowed() {
+        let workflow = serde_json::json!({"subtype": "bot_message", "bot_id": "B_WORKFLOW", "text": "deploy done"});
+
+        // Disabled: a userless bot post has no identity, so it never reaches
+        // the allowlist and cannot trigger a turn.
+        assert_eq!(
+            SlackChannel::inbound_sender_identity(&workflow, "U_SELF", Some("B_SELF"), false),
+            None
+        );
+
+        // Enabled: the posting app's bot ID becomes the authorization subject.
+        assert_eq!(
+            SlackChannel::inbound_sender_identity(&workflow, "U_SELF", Some("B_SELF"), true)
+                .map(|s| (s.id, s.is_bot)),
+            Some(("B_WORKFLOW", true))
+        );
+    }
+
+    #[test]
+    fn inbound_identity_admits_userless_bot_ids_only_for_bot_message() {
+        // The opt-in is scoped to `bot_message`. Other userless events can
+        // carry a `bot_id` as well, and some already pass the subtype gate on
+        // their own merits, but `bot_id` must not become a sender for them:
+        // that would widen the opt-in past its documented boundary.
+        for subtype in [
+            serde_json::Value::Null,
+            serde_json::json!("file_share"),
+            serde_json::json!("thread_broadcast"),
+            serde_json::json!("channel_join"),
+        ] {
+            let mut event = serde_json::json!({"bot_id": "B_WORKFLOW", "text": "x"});
+            if !subtype.is_null() {
+                event["subtype"] = subtype.clone();
+            }
+            assert_eq!(
+                SlackChannel::inbound_sender_identity(&event, "U_SELF", Some("B_SELF"), true),
+                None,
+                "userless event with subtype {subtype:?} must not resolve a bot sender"
+            );
+        }
+
+        // The documented case still resolves.
+        let post =
+            serde_json::json!({"subtype": "bot_message", "bot_id": "B_WORKFLOW", "text": "x"});
+        assert_eq!(
+            SlackChannel::inbound_sender_identity(&post, "U_SELF", Some("B_SELF"), true)
+                .map(|s| (s.id, s.is_bot)),
+            Some(("B_WORKFLOW", true))
+        );
+    }
+
+    #[test]
+    fn inbound_identity_drops_our_own_bot_echo() {
+        // Our own `chat.postMessage` echoes back as a bot post. Without this
+        // the agent would answer itself in a loop once bots are allowed.
+        let echo = serde_json::json!({"subtype": "bot_message", "bot_id": "B_SELF", "text": "my own reply"});
+        assert_eq!(
+            SlackChannel::inbound_sender_identity(&echo, "U_SELF", Some("B_SELF"), true),
+            None
+        );
+    }
+
+    #[test]
+    fn inbound_identity_ignores_blank_and_missing_bot_ids() {
+        let blank = serde_json::json!({"bot_id": "   ", "text": "x"});
+        assert_eq!(
+            SlackChannel::inbound_sender_identity(&blank, "U_SELF", Some("B_SELF"), true),
+            None
+        );
+
+        let neither = serde_json::json!({"text": "x"});
+        assert_eq!(
+            SlackChannel::inbound_sender_identity(&neither, "U_SELF", Some("B_SELF"), true),
+            None
+        );
+    }
+
+    #[test]
+    fn inbound_identity_rejects_userless_bot_posts_until_own_bot_id_is_known() {
+        // When `auth.test` failed or omitted `bot_id`, a userless post cannot
+        // be distinguished from our own echo, so admission fails closed for
+        // every such post, foreign or not. Once the identity is known the
+        // foreign bot resolves and our own echo is still dropped.
+        let workflow =
+            serde_json::json!({"subtype": "bot_message", "bot_id": "B_WORKFLOW", "text": "x"});
+        let own_echo =
+            serde_json::json!({"subtype": "bot_message", "bot_id": "B_SELF", "text": "x"});
+        assert_eq!(
+            SlackChannel::inbound_sender_identity(&workflow, "U_SELF", None, true),
+            None,
+            "unknown own identity must not admit a userless bot post"
+        );
+        assert_eq!(
+            SlackChannel::inbound_sender_identity(&own_echo, "U_SELF", None, true),
+            None
+        );
+        assert_eq!(
+            SlackChannel::inbound_sender_identity(&workflow, "U_SELF", Some("B_SELF"), true)
+                .map(|s| (s.id, s.is_bot)),
+            Some(("B_WORKFLOW", true))
+        );
+        assert_eq!(
+            SlackChannel::inbound_sender_identity(&own_echo, "U_SELF", Some("B_SELF"), true),
+            None
+        );
+    }
+
+    #[test]
+    fn inbound_identity_drops_our_own_hybrid_bot_echo_regardless_of_user() {
+        // Our own echo can arrive as a `bot_message` carrying both `user` and
+        // `bot_id`. The `user` comparison alone does not catch it when
+        // `auth.test` returned no user id, because `bot_user_id` is then empty
+        // and matches nothing, so `bot_id` has to be checked first.
+        let own_hybrid = serde_json::json!({
+            "subtype": "bot_message",
+            "user": "U_SELF",
+            "bot_id": "B_SELF",
+            "text": "4"
+        });
+
+        for bot_user_id in ["", "U_SELF"] {
+            assert_eq!(
+                SlackChannel::inbound_sender_identity(
+                    &own_hybrid,
+                    bot_user_id,
+                    Some("B_SELF"),
+                    true
+                ),
+                None,
+                "our own hybrid echo must never resolve (bot_user_id {bot_user_id:?})"
+            );
+        }
+
+        // Unknown own identity fails closed for a hybrid event too, rather
+        // than falling back to the `user` field.
+        assert_eq!(
+            SlackChannel::inbound_sender_identity(&own_hybrid, "", None, true),
+            None,
+            "an unknown own bot id must not fall back to `user`"
+        );
+
+        // A foreign hybrid post is still admitted, but attributed to the
+        // posting app's `bot_id` — the `user` field never stands in for it.
+        let foreign_hybrid = serde_json::json!({
+            "subtype": "bot_message",
+            "user": "U_APP",
+            "bot_id": "B_APP",
+            "text": "deploy finished"
+        });
+        assert_eq!(
+            SlackChannel::inbound_sender_identity(&foreign_hybrid, "", Some("B_SELF"), true)
+                .map(|s| (s.id, s.is_bot)),
+            Some(("B_APP", true))
+        );
+    }
+
+    #[test]
+    fn inbound_identity_rejects_hybrid_bot_message_without_bot_id() {
+        // A `bot_message` that carries a `user` but no usable `bot_id` cannot
+        // be attributed to an allowlisted app, so it is rejected outright even
+        // though the `user` alone would have resolved before.
+        for bot_id in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("   "),
+        ] {
+            let mut event = serde_json::json!({
+                "subtype": "bot_message",
+                "user": "U_APP",
+                "text": "deploy finished"
+            });
+            if !bot_id.is_null() {
+                event["bot_id"] = bot_id.clone();
+            }
+            assert_eq!(
+                SlackChannel::inbound_sender_identity(&event, "U_SELF", Some("B_SELF"), true),
+                None,
+                "a hybrid bot_message without a usable bot_id must not resolve (bot_id {bot_id:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn inbound_identity_treats_blank_own_bot_id_as_unknown() {
+        // A blank own id is not an identity: compared literally it differs
+        // from our real `bot_id` and would admit our own echo, so it has to
+        // count as unknown and fail closed like an absent one.
+        let own_echo =
+            serde_json::json!({"subtype": "bot_message", "bot_id": "B_SELF", "text": "4"});
+        let workflow =
+            serde_json::json!({"subtype": "bot_message", "bot_id": "B_WORKFLOW", "text": "x"});
+        for blank in ["", "   ", "\t"] {
+            assert_eq!(
+                SlackChannel::inbound_sender_identity(&own_echo, "U_SELF", Some(blank), true),
+                None,
+                "blank own bot id {blank:?} must not admit our own echo"
+            );
+            assert_eq!(
+                SlackChannel::inbound_sender_identity(&workflow, "U_SELF", Some(blank), true),
+                None,
+                "blank own bot id {blank:?} must fail closed for foreign bots too"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_bot_messages_defaults_off_and_builder_sets_it() {
+        let channel = SlackChannel::new(
+            unique_test_bot_token(),
+            None,
+            vec![],
+            "slack_test_alias",
+            Arc::new(Vec::new),
+        );
+        assert!(
+            !channel.allow_bot_messages,
+            "accepting other apps' posts must be opt-in"
+        );
+        assert!(channel.with_allow_bot_messages(true).allow_bot_messages);
     }
 
     #[test]
@@ -9045,6 +9661,345 @@ mod tests {
                 .iter()
                 .any(|request| request.url.path() == "/conversations.history"),
             "test must drive the production polling ingress"
+        );
+    }
+
+    /// Drive the production polling ingress against a mocked Slack API and
+    /// collect whatever reaches agent dispatch within a short window after the
+    /// first `conversations.history` poll has been served.
+    async fn poll_bot_posts_through_ingress(
+        auth_test_body: serde_json::Value,
+        history_messages: serde_json::Value,
+    ) -> Vec<ChannelMessage> {
+        // Wildcard peers: the allowlist must not be what saves us here.
+        poll_bot_posts_through_ingress_with_peers(
+            auth_test_body,
+            history_messages,
+            vec!["*".into()],
+        )
+        .await
+    }
+
+    /// Same as [`poll_bot_posts_through_ingress`], but with an explicit peer
+    /// allowlist, so tests can prove the allowlist sees the posting app's
+    /// `bot_id` and not a `user` a hybrid `bot_message` may also carry.
+    async fn poll_bot_posts_through_ingress_with_peers(
+        auth_test_body: serde_json::Value,
+        history_messages: serde_json::Value,
+        peers: Vec<String>,
+    ) -> Vec<ChannelMessage> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/auth.test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(auth_test_body))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/conversations.history"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "messages": history_messages
+            })))
+            .mount(&server)
+            .await;
+
+        let channel = SlackChannel::new(
+            unique_test_bot_token(),
+            None,
+            vec!["C_ORIGIN".into()],
+            "slack_test_alias",
+            Arc::new(move || peers.clone()),
+        )
+        .with_api_base_url(server.uri())
+        .with_allow_bot_messages(true);
+
+        let (tx, mut inbound_rx) = tokio::sync::mpsc::channel(8);
+        let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
+
+        // The polling receiver sleeps before its first fetch, so the window has
+        // to outlast one cycle. Wait on the delivery channel rather than
+        // sampling the mock server: a spin here competes for CPU with the rest
+        // of the suite and perturbs timing-sensitive tests elsewhere.
+        let mut delivered = Vec::new();
+        if let Ok(Some(first)) =
+            tokio::time::timeout(Duration::from_secs(9), inbound_rx.recv()).await
+        {
+            delivered.push(first);
+            while let Ok(Some(next)) =
+                tokio::time::timeout(Duration::from_millis(200), inbound_rx.recv()).await
+            {
+                delivered.push(next);
+            }
+        }
+
+        listener.abort();
+        let _ = listener.await;
+
+        // Checked once, after the listener stops: an empty `delivered` only
+        // means "nothing was admitted" if the ingress actually ran.
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| request.url.path() == "/conversations.history"),
+            "test must drive the production polling ingress"
+        );
+        delivered
+    }
+
+    #[tokio::test]
+    async fn polling_ingress_drops_own_userless_bot_echo_when_auth_test_lacks_bot_id() {
+        // `auth.test` answers without `bot_id`, so the channel does not know
+        // its own app identity. With the opt-in on and wildcard peers, our own
+        // userless `bot_message` echo must still never start a turn.
+        let delivered = poll_bot_posts_through_ingress(
+            serde_json::json!({ "ok": true, "user_id": "U_BOT" }),
+            serde_json::json!([
+                {
+                    "ts": "9999999999.000002",
+                    "subtype": "bot_message",
+                    "bot_id": "B_SELF",
+                    "text": "4"
+                },
+                {
+                    "ts": "9999999999.000001",
+                    "subtype": "bot_message",
+                    "bot_id": "B_WORKFLOW",
+                    "text": "<@U_BOT> what is 2+2?"
+                }
+            ]),
+        )
+        .await;
+
+        assert!(
+            delivered.is_empty(),
+            "no userless bot post may be admitted while own bot_id is unknown, got {:?}",
+            delivered.iter().map(|m| &m.sender).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn polling_ingress_drops_our_own_hybrid_echo_when_auth_test_has_no_user_id() {
+        // `auth.test` answers with our `bot_id` but no usable `user_id`, so
+        // `bot_user_id` is empty and the own-user comparison matches nothing.
+        // Our own echo arrives as a `bot_message` carrying both fields; under
+        // wildcard peers it must still not start a turn. The foreign post in
+        // the same batch is the positive control.
+        let delivered = poll_bot_posts_through_ingress(
+            serde_json::json!({ "ok": true, "bot_id": "B_SELF" }),
+            serde_json::json!([
+                {
+                    "ts": "9999999999.000002",
+                    "subtype": "bot_message",
+                    "user": "U_SELF",
+                    "bot_id": "B_SELF",
+                    "text": "4"
+                },
+                {
+                    "ts": "9999999999.000001",
+                    "subtype": "bot_message",
+                    "user": "U_APP",
+                    "bot_id": "B_WORKFLOW",
+                    "text": "<@U_BOT> what is 2+2?"
+                }
+            ]),
+        )
+        .await;
+
+        let senders: Vec<&str> = delivered.iter().map(|m| m.sender.as_str()).collect();
+        assert!(
+            !senders.contains(&"U_SELF"),
+            "our own hybrid echo must never reach dispatch, got {senders:?}"
+        );
+        assert_eq!(
+            senders,
+            vec!["B_WORKFLOW"],
+            "only the foreign bot post should be admitted, attributed to its bot_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn polling_ingress_rejects_hybrid_bot_message_whose_bot_id_is_not_allowlisted() {
+        // The peer allowlist carries the posting app's `user` entry but not
+        // its `bot_id`. A `bot_message` is authorized by the posting app's
+        // `bot_id`, so the allowlisted `user` must not admit it.
+        let delivered = poll_bot_posts_through_ingress_with_peers(
+            serde_json::json!({ "ok": true, "user_id": "U_BOT", "bot_id": "B_SELF" }),
+            serde_json::json!([
+                {
+                    "ts": "9999999999.000001",
+                    "subtype": "bot_message",
+                    "user": "U_APP",
+                    "bot_id": "B_UNTRUSTED",
+                    "text": "<@U_BOT> deploy now"
+                }
+            ]),
+            vec!["U_APP".into()],
+        )
+        .await;
+
+        assert!(
+            delivered.is_empty(),
+            "a hybrid bot_message whose bot_id is not allowlisted must not reach dispatch, got {:?}",
+            delivered.iter().map(|m| &m.sender).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn polling_ingress_rejects_hybrid_bot_message_without_bot_id() {
+        // A `bot_message` that carries a `user` but no `bot_id` cannot be
+        // attributed to an allowlisted app, so it is rejected even when the
+        // `user` is on the peer allowlist.
+        let delivered = poll_bot_posts_through_ingress_with_peers(
+            serde_json::json!({ "ok": true, "user_id": "U_BOT", "bot_id": "B_SELF" }),
+            serde_json::json!([
+                {
+                    "ts": "9999999999.000001",
+                    "subtype": "bot_message",
+                    "user": "U_APP",
+                    "text": "<@U_BOT> deploy now"
+                }
+            ]),
+            vec!["U_APP".into()],
+        )
+        .await;
+
+        assert!(
+            delivered.is_empty(),
+            "a hybrid bot_message without a bot_id must not reach dispatch, got {:?}",
+            delivered.iter().map(|m| &m.sender).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn polling_ingress_admits_hybrid_bot_message_under_its_bot_id() {
+        // Positive control for the attribution rule: with the posting app's
+        // `bot_id` allowlisted, a hybrid `bot_message` starts a turn and is
+        // attributed to the `bot_id`, not the `user` it also carries.
+        let delivered = poll_bot_posts_through_ingress_with_peers(
+            serde_json::json!({ "ok": true, "user_id": "U_BOT", "bot_id": "B_SELF" }),
+            serde_json::json!([
+                {
+                    "ts": "9999999999.000001",
+                    "subtype": "bot_message",
+                    "user": "U_APP",
+                    "bot_id": "B_APP",
+                    "text": "<@U_BOT> deploy finished"
+                }
+            ]),
+            vec!["B_APP".into()],
+        )
+        .await;
+
+        let senders: Vec<&str> = delivered.iter().map(|m| m.sender.as_str()).collect();
+        assert_eq!(
+            senders,
+            vec!["B_APP"],
+            "the hybrid bot post should be admitted under its bot_id, got {senders:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn polling_ingress_keeps_the_opt_in_scoped_to_bot_message() {
+        // Opted in, identity known, wildcard peers: a userless `file_share`
+        // carrying a foreign `bot_id` passes the base subtype gate but is not
+        // what the operator opted into, so it must not start a turn. The
+        // `bot_message` in the same batch still does.
+        let delivered = poll_bot_posts_through_ingress(
+            serde_json::json!({ "ok": true, "user_id": "U_BOT", "bot_id": "B_SELF" }),
+            serde_json::json!([
+                {
+                    "ts": "9999999999.000002",
+                    "subtype": "file_share",
+                    "bot_id": "B_WORKFLOW",
+                    "text": "<@U_BOT> here is a file"
+                },
+                {
+                    "ts": "9999999999.000001",
+                    "subtype": "bot_message",
+                    "bot_id": "B_WORKFLOW",
+                    "text": "<@U_BOT> what is 2+2?"
+                }
+            ]),
+        )
+        .await;
+
+        let texts: Vec<&str> = delivered.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            texts.len(),
+            1,
+            "only the bot_message should be admitted, got {texts:?}"
+        );
+        assert!(
+            texts[0].contains("what is 2+2?"),
+            "the admitted message should be the bot_message, got {texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn polling_ingress_drops_own_userless_bot_echo_when_auth_test_bot_id_is_blank() {
+        // Separate from the missing-field control: `auth.test` answers, but
+        // with a whitespace-only `bot_id`. That is not a usable identity, so
+        // admission must fail closed exactly as it does for an absent one.
+        let delivered = poll_bot_posts_through_ingress(
+            serde_json::json!({ "ok": true, "user_id": "U_BOT", "bot_id": "   " }),
+            serde_json::json!([
+                {
+                    "ts": "9999999999.000002",
+                    "subtype": "bot_message",
+                    "bot_id": "B_SELF",
+                    "text": "4"
+                },
+                {
+                    "ts": "9999999999.000001",
+                    "subtype": "bot_message",
+                    "bot_id": "B_WORKFLOW",
+                    "text": "<@U_BOT> what is 2+2?"
+                }
+            ]),
+        )
+        .await;
+
+        assert!(
+            delivered.is_empty(),
+            "a blank auth.test bot_id must not admit userless bot posts, got {:?}",
+            delivered.iter().map(|m| &m.sender).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn polling_ingress_admits_foreign_bot_and_drops_own_echo_when_bot_id_is_known() {
+        // Positive control for the fail-closed rule: once `auth.test` supplies
+        // `bot_id`, the foreign app's post starts a turn and our own echo does not.
+        let delivered = poll_bot_posts_through_ingress(
+            serde_json::json!({ "ok": true, "user_id": "U_BOT", "bot_id": "B_SELF" }),
+            serde_json::json!([
+                {
+                    "ts": "9999999999.000002",
+                    "subtype": "bot_message",
+                    "bot_id": "B_SELF",
+                    "text": "4"
+                },
+                {
+                    "ts": "9999999999.000001",
+                    "subtype": "bot_message",
+                    "bot_id": "B_WORKFLOW",
+                    "text": "<@U_BOT> what is 2+2?"
+                }
+            ]),
+        )
+        .await;
+
+        let senders: Vec<&str> = delivered.iter().map(|m| m.sender.as_str()).collect();
+        assert_eq!(
+            senders,
+            vec!["B_WORKFLOW"],
+            "exactly the foreign bot post should reach dispatch"
         );
     }
 
