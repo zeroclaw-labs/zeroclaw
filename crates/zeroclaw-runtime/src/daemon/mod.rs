@@ -514,9 +514,15 @@ pub async fn run(
 
     crate::health::mark_component_ok("daemon");
 
-    // Shared broadcast channel so all daemon components (gateway, cron,
-    // heartbeat) can publish real-time events to dashboard clients.
-    let (event_tx, _rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
+    // The daemon owns the event bus: every component (gateway, cron,
+    // heartbeat, RPC) publishes on and reads from this one. Its observer is
+    // installed as the process-wide broadcast hook here, exactly once per run,
+    // so `logs/subscribe` and `events/history` carry agent, tool, and LLM
+    // frames whether or not the gateway runs. The guard lives until `run`
+    // returns.
+    let event_bus = crate::observability::EventBus::new();
+    let _event_hook_guard = event_bus.install_hook();
+    let event_tx = event_bus.sender().clone();
 
     zeroclaw_log::set_broadcast_hook(event_tx.clone());
 
@@ -569,7 +575,7 @@ pub async fn run(
         let gateway_cfg = config.clone();
         let gateway_pairing = pairing_guard.clone();
         let gateway_host = host.clone();
-        let gateway_event_tx = event_tx.clone();
+        let gateway_event_bus = event_bus.clone();
         let gateway_reload_controls = GatewayReloadControls {
             shutdown_tx: gateway_shutdown_tx.clone(),
             reload_tx: reload_tx.clone(),
@@ -585,7 +591,7 @@ pub async fn run(
             move || {
                 let cfg = gateway_cfg.clone();
                 let host = gateway_host.clone();
-                let tx = gateway_event_tx.clone();
+                let bus = gateway_event_bus.clone();
                 let reload_controls = gateway_reload_controls.clone();
                 let tui_reg = gateway_tui_registry.clone();
                 let start = gateway_start.clone();
@@ -598,7 +604,7 @@ pub async fn run(
                         host,
                         port,
                         cfg,
-                        Some(tx),
+                        Some(bus),
                         Some(reload_controls),
                         Some(tui_reg),
                         Some(pairing),
@@ -829,6 +835,7 @@ pub async fn run(
                 &config.data_dir,
             ),
             event_tx: Some(event_tx.clone()),
+            event_history: Some(std::sync::Arc::clone(event_bus.history())),
             reload_tx: Some(reload_tx.clone()),
             gateway_shutdown_tx: Some(gateway_shutdown_tx.clone()),
             approval_pending: std::sync::Arc::new(
@@ -2767,15 +2774,18 @@ mod tests {
         config.agents.insert(agent_alias.to_string(), agent);
     }
 
-    /// Hold the process-global log broadcast still for a daemon lifecycle test.
+    /// Hold both process-global broadcast hooks still for a daemon lifecycle
+    /// test.
     ///
-    /// `run` calls `set_broadcast_hook`, replacing the sender every
-    /// log-assertion test subscribed to, and those tests only serialize
-    /// against each other. A lifecycle test that calls `run` without this lock
-    /// closes their receiver mid-read, which surfaces as a missing log event.
+    /// `run` calls `zeroclaw_log::set_broadcast_hook`, replacing the sender
+    /// every log-assertion test subscribed to, and it installs the event bus
+    /// as the observer broadcast hook, which would take observer events meant
+    /// for a hook-capturing test. Those tests serialize on these two locks; a
+    /// lifecycle test that calls `run` without them makes theirs miss events.
     #[must_use]
-    fn hold_log_broadcast() -> impl Drop {
-        zeroclaw_log::__private_test_hook_lock()
+    async fn hold_log_broadcast() -> (impl Drop, impl Drop) {
+        let observer_hook = crate::observability::HOOK_TEST_LOCK.lock().await;
+        (zeroclaw_log::__private_test_hook_lock(), observer_hook)
     }
 
     async fn recv_log_event(
@@ -3885,7 +3895,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn registry_gateway_starter_can_trigger_daemon_reload() {
-        let _broadcast_guard = hold_log_broadcast();
+        let _broadcast_guard = hold_log_broadcast().await;
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
         let expected_data_dir = config.data_dir.clone();
@@ -3968,7 +3978,7 @@ mod tests {
     async fn initial_socket_addr_in_use_fails_daemon_startup() {
         use std::io;
 
-        let _broadcast_guard = hold_log_broadcast();
+        let _broadcast_guard = hold_log_broadcast().await;
         for startup_feedback_enabled in [false, true] {
             let tmp = TempDir::new().unwrap();
             let config = test_config(&tmp);
@@ -4052,7 +4062,7 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let _broadcast_guard = hold_log_broadcast();
+        let _broadcast_guard = hold_log_broadcast().await;
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -4102,7 +4112,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::time::{Duration, timeout};
 
-        let _broadcast_guard = hold_log_broadcast();
+        let _broadcast_guard = hold_log_broadcast().await;
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
         config.reliability.channel_initial_backoff_secs = 1;
@@ -4159,7 +4169,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         use tokio::time::{Duration, Instant, timeout};
 
-        let _broadcast_guard = hold_log_broadcast();
+        let _broadcast_guard = hold_log_broadcast().await;
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
 
@@ -4243,7 +4253,7 @@ mod tests {
     async fn scheduler_cooperative_shutdown_observed_through_daemon_reload() {
         use tokio::time::{Duration, timeout};
 
-        let _broadcast_guard = hold_log_broadcast();
+        let _broadcast_guard = hold_log_broadcast().await;
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
         config.scheduler.enabled = true;

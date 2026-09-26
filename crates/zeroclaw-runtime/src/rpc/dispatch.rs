@@ -166,6 +166,7 @@ pub enum Method {
     LogsSubscribe,
     LogsQuery,
     LogsGet,
+    EventsHistory,
 
     // TUI
     TuiList,
@@ -284,6 +285,7 @@ impl Method {
         // Logs
         (Method::LogsSubscribe, "logs/subscribe"),
         (Method::LogsQuery, "logs/query"),
+        (Method::EventsHistory, "events/history"),
         (Method::LogsGet, "logs/get"),
         // TUI
         (Method::TuiList, "tui/list"),
@@ -412,7 +414,9 @@ impl Method {
             }
             M::PersonalityPut => (Resource::Personality, Verb::Update),
 
-            M::LogsSubscribe | M::LogsQuery | M::LogsGet => (Resource::Logs, Verb::Read),
+            M::LogsSubscribe | M::LogsQuery | M::LogsGet | M::EventsHistory => {
+                (Resource::Logs, Verb::Read)
+            }
 
             M::TuiList => (Resource::Tui, Verb::Read),
 
@@ -2608,6 +2612,7 @@ impl RpcDispatcher {
             // Logs
             Method::LogsSubscribe => self.handle_logs_subscribe().await,
             Method::LogsQuery => self.handle_logs_query(&req.params).await,
+            Method::EventsHistory => self.handle_events_history(),
             Method::LogsGet => self.handle_logs_get(&req.params).await,
 
             // TUI
@@ -7863,6 +7868,21 @@ impl RpcDispatcher {
             }
         });
         to_result(LogsSubscribeResult { subscribed: true })
+    }
+
+    /// Recent observer frames (agent, tool, LLM, history-trim, error), oldest
+    /// first: the RPC twin of the gateway's `/api/events/history`, read from
+    /// the daemon's bus so it works without the gateway. Pairing credentials
+    /// are never replayed.
+    fn handle_events_history(&self) -> RpcResult {
+        let history = self
+            .ctx
+            .event_history
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Event history is not available"))?;
+        to_result(EventsHistoryResult {
+            events: crate::observability::broadcast::history_events(history),
+        })
     }
 
     #[allow(deprecated)] // we still forward the legacy cursor for backwards compat
@@ -16337,6 +16357,157 @@ mod tests {
         assert!(
             !seen.contains(zeroclaw_log::EPHEMERAL_BROADCAST_MARKER),
             "the internal fail-closed marker must be stripped from forwarded frames: {seen:?}"
+        );
+    }
+
+    /// G2a: the daemon owns the observer hook, so with no gateway running a
+    /// `logs/subscribe` client still receives the agent, tool, and LLM frames
+    /// recorded through any factory-built observer, each exactly once, and
+    /// `events/history` replays them.
+    #[tokio::test]
+    async fn logs_subscribe_carries_observer_frames_without_a_gateway() {
+        use crate::observability::{EventBus, ObserverEvent};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let _hook = crate::observability::HOOK_TEST_LOCK.lock().await;
+        crate::observability::clear_broadcast_hook();
+
+        // What `daemon::run` does, and nothing the gateway does.
+        let bus = EventBus::with_capacities(64, 16);
+        let _daemon_hook = bus.install_hook();
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_event_bus(
+            zeroclaw_config::schema::Config::default(),
+            sessions,
+            &bus,
+        );
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let d = RpcDispatcher::new(ctx, writer_tx, "local:uid=0".into());
+        assert!(d.handle_logs_subscribe().await.is_ok());
+
+        let observer =
+            crate::observability::create_observer(&zeroclaw_config::schema::ObservabilityConfig {
+                backend: zeroclaw_config::schema::ObservabilityBackend::None,
+                ..Default::default()
+            });
+        let turn = Some("g2a-turn".to_string());
+        observer.record_event(&ObserverEvent::AgentStart {
+            model_provider: "p".into(),
+            model: "m".into(),
+            channel: None,
+            agent_alias: None,
+            turn_id: turn.clone(),
+        });
+        observer.record_event(&ObserverEvent::LlmRequest {
+            model_provider: "p".into(),
+            model: "m".into(),
+            messages_count: 1,
+            channel: None,
+            agent_alias: None,
+            parent_agent_alias: None,
+            turn_id: turn.clone(),
+        });
+        observer.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
+            tool: "shell".into(),
+            tool_call_id: None,
+            duration: std::time::Duration::from_millis(1),
+            success: true,
+            arguments: None,
+            result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: turn.clone(),
+        });
+
+        let mut kinds = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while kinds.len() < 3 {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let Ok(Some(frame)) = tokio::time::timeout(remaining, writer_rx.recv()).await else {
+                break;
+            };
+            let frame: Value = serde_json::from_str(&frame).expect("notification is JSON");
+            if frame["method"] == json!(notification::LOGS_EVENT)
+                && frame["params"]["turn_id"] == json!("g2a-turn")
+            {
+                kinds.push(
+                    frame["params"]["type"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+        }
+        assert_eq!(kinds, ["agent_start", "llm_request", "tool_call"]);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), writer_rx.recv())
+                .await
+                .is_err(),
+            "each observer event must be delivered once"
+        );
+
+        let history = d.handle_events_history().expect("history is available");
+        let types: Vec<_> = history["events"]
+            .as_array()
+            .expect("events array")
+            .iter()
+            .map(|event| event["type"].clone())
+            .collect();
+        assert_eq!(
+            types,
+            [
+                json!("agent_start"),
+                json!("llm_request"),
+                json!("tool_call")
+            ]
+        );
+
+        crate::observability::clear_broadcast_hook();
+    }
+
+    /// `events/history` is classified `Logs:Read`: a principal without that
+    /// grant is refused, and one holding it reads the daemon's history.
+    #[tokio::test]
+    async fn events_history_requires_logs_read() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        assert_eq!(
+            Method::EventsHistory.authz(),
+            MethodAuthz::Requires(Resource::Logs, Verb::Read)
+        );
+        let bus = crate::observability::EventBus::with_capacities(16, 16);
+        bus.history()
+            .push(json!({"type": "tool_call", "source": "observability", "tool": "SENTINEL"}));
+
+        let denied_config = roster_config(4242);
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_event_bus(denied_config, sessions, &bus);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let response = rpc(&mut alice, &mut rx, 1, "events/history", json!({})).await;
+        assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+        assert!(
+            !response.to_string().contains("SENTINEL"),
+            "a denied caller must not see history: {response}"
+        );
+
+        let mut granted_config = roster_config(4242);
+        granted_config
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the fixture profile exists")
+            .grants
+            .insert(Resource::Logs, vec![Verb::Read]);
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_event_bus(granted_config, sessions, &bus);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let response = rpc(&mut alice, &mut rx, 1, "events/history", json!({})).await;
+        assert_eq!(
+            response["result"]["events"][0]["tool"],
+            json!("SENTINEL"),
+            "{response}"
         );
     }
 
@@ -24915,6 +25086,7 @@ mod tests {
             memory: None,
             cost_tracker: None,
             event_tx: None,
+            event_history: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
@@ -24964,6 +25136,7 @@ mod tests {
             memory: None,
             cost_tracker: None,
             event_tx: None,
+            event_history: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
@@ -25072,6 +25245,7 @@ mod tests {
             memory: None,
             cost_tracker: None,
             event_tx: None,
+            event_history: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),

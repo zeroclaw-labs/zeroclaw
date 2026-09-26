@@ -1333,6 +1333,13 @@ rpc_type! {
 }
 
 rpc_type! {
+    /// `events/history`: recent observer frames, oldest first.
+    pub struct EventsHistoryResult {
+        pub events: Vec<serde_json::Value>,
+    }
+}
+
+rpc_type! {
     pub struct LogsQueryParams {
         #[serde(default)]
         pub since_ts: Option<String>,

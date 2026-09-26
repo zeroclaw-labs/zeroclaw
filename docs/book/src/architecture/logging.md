@@ -238,6 +238,16 @@ The on-disk JSON shape (`LogEvent` in `event.rs`):
 
 Do not use Observer, OTLP, or SSE delivery to prove that every canonical event was retained. Conversely, do not assume a row absent from JSONL was never emitted: it may have reached OTLP or live broadcast, and the Observer bridge when bound, before the persistence queue dropped or failed it.
 
+## Observer events share the same bus
+
+Typed observer events (`agent_start`, `agent_end`, `llm_request`, `tool_call`, `tool_call_start`, `history_trimmed`, `error`) reach the same broadcast channel through a separate path: `zeroclaw_runtime::observability::broadcast`. Every observer built by `create_observer` tees into one process-wide broadcast hook, and an `EventBus` (the live sender plus a 500-frame history buffer) supplies that hook.
+
+- **Under the daemon**, `daemon::run` creates the bus and installs its hook once, whether or not the gateway runs. RPC `logs/subscribe` therefore carries these frames with the gateway off. A supervised gateway reuses the daemon's bus and installs nothing, so each frame is delivered once and buffered once.
+- **A standalone gateway** (`zeroclaw gateway start`) builds and installs its own bus.
+- **History:** `GET /api/events/history` and RPC `events/history` (grant `Logs:Read`) replay the buffered observer frames, oldest first. Like live delivery, they never carry pairing credentials: frames with the ephemeral marker are withheld from history, and `logs/subscribe` withholds them from live delivery.
+
+Log-layer frames sent directly on the channel are live-only; the history buffer holds observer frames only.
+
 ## Reader cursors span the active file and retained archives
 
 `GET /api/logs` and `logs/query` call `reader::query_log_page`, which owns segment
