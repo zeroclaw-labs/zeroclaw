@@ -44868,6 +44868,11 @@ allowed_users = []
             LarkConfig::default().approval_timeout_secs,
             default_channel_approval_timeout_secs()
         );
+        assert_eq!(
+            DiscordConfig::default().stall_timeout_secs,
+            0,
+            "stall watchdog remains an explicit opt-in until its default is changed"
+        );
     }
 
     /// Sibling to `whatsapp_rust_default_matches_serde_default`, pinning the
