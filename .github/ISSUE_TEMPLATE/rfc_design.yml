@@ -77,9 +77,12 @@ body:
     id: alternatives
     attributes:
       label: Alternatives considered
-      description: What other paths did you consider, including doing nothing?
+      description: >
+        What other paths did you consider, including doing nothing? If the only real
+        alternative is "do not build it", the proposal is probably an ordinary feature
+        rather than a decision the project has to settle first.
     validations:
-      required: false
+      required: true
 
   - type: textarea
     id: non_goals
