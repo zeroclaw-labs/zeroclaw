@@ -3,7 +3,8 @@ use reqwest::Client;
 use sha2::{Digest as _, Sha256};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use zeroclaw_api::media::{
     PROVIDER_IMAGE_MIME_TYPES, image_mime_from_extension, image_mime_from_magic,
     is_provider_image_mime,
@@ -185,6 +186,18 @@ impl std::fmt::Display for ImageDataUriRejection {
         f.write_str(reason)
     }
 }
+
+/// Per-image ceiling on the **base64-encoded** payload length accepted by
+/// `split_base64_image_data_uri`: 10 MB. Measured on the encoded payload,
+/// unlike the multimodal config's `max_image_size_mb`, which bounds decoded
+/// bytes. MB is read as 1024 * 1024, the same way `max_image_size_mb` reads
+/// it, so the two ceilings stay consistent with each other. Anthropic
+/// documents 10 MB encoded as its per-image limit for the direct API; its
+/// separate per-request budget (32 MB across all images) is not enforced
+/// here. The adapters pass this same const so the structural check, the
+/// adapter sweeps and the resolvability count cannot drift apart on what an
+/// image may weigh.
+pub(crate) const MAX_ENCODED_IMAGE_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
 
 /// Splits a `data:` image reference into its media type and base64 payload,
 /// checking the structure without decoding it.
@@ -486,6 +499,123 @@ pub fn count_latest_user_image_markers(messages: &[ChatMessage]) -> usize {
         .find(|message| message.role == "user" && !is_prompt_tool_result_message(message))
         .map(|message| parse_image_markers(&message.content).1.len())
         .unwrap_or(0)
+}
+
+/// Count image markers in the latest user message whose references would
+/// actually resolve to an attachment: an inline `data:` URI that passes the
+/// shared structural check, a remote `http(s)` URL when `remote_allowed` is
+/// set (counted without any network access), or a local path that the
+/// caller's `path_allowed` predicate accepts and that exists as a file.
+/// Marker syntax alone does not count, so prose that merely looks
+/// like a marker cannot fail a turn on a text-only model.
+///
+/// A local reference counts only when it is absolute AND `path_allowed`
+/// accepts it. Relative references never count: this module has no agent
+/// workspace of its own, and a bare existence check would resolve a relative
+/// reference against the process working directory instead, which is not
+/// where the runtime's file tools resolve relative paths, so there is no
+/// answer this module could give that matches the loader. The predicate
+/// exists because the ledger of who may read a path is the agent's
+/// filesystem policy in the runtime, which this crate cannot depend on;
+/// callers pass the same check their file tools apply, so "resolvable" means
+/// exactly "the agent could read this file".
+///
+/// This touches at most the markers of the latest user message. The
+/// classification pass over them is inline and I/O-free: a `data:`
+/// reference needs only the shared structural check, a remote URL only
+/// the `remote_allowed` flag, a relative reference never counts, and an
+/// absolute reference only appends to a candidate list. For at most
+/// [`MAX_RESOLVABILITY_CANDIDATES`] absolute candidates the caller's
+/// `path_allowed` predicate and one `std::fs::metadata` existence
+/// probe each run inside a single `tokio::task::spawn_blocking` task,
+/// so no policy-resolution or filesystem work runs on the async
+/// executor thread (a predicate may do arbitrary synchronous
+/// filesystem work; the runtime's resolves symlinks). A path the
+/// predicate rejects is never probed, and neither is a relative
+/// reference, a data URI, or a remote URL. It does no network I/O and
+/// no decoding.
+///
+/// The maximum number of absolute local-path markers in the latest user
+/// message for which ANY work runs, policy resolution and the existence
+/// probe alike: at most this many candidates reach the one
+/// [`tokio::task::spawn_blocking`] task inside
+/// [`count_latest_user_resolvable_image_markers`]. Absolute markers past
+/// the bound count as resolvable with NO policy call and NO probe, so the
+/// caller fails toward its loud capability error, never toward silently
+/// degrading away a real attachment (over budget the count can only
+/// grow). The bound sits BEFORE the policy check, so a message cannot buy
+/// unbounded policy work with unbounded markers; this is a semantic
+/// change from the earlier probe-budget shape, which still ran the policy
+/// for overflow markers. The bound exists because no upstream limit bounds
+/// the marker count of a single inbound user message (transport frame
+/// caps operate at megabytes, not markers). `parse_image_markers` remains
+/// the single source of truth for what a marker reference is, and
+/// `split_base64_image_data_uri` for what a valid inline data URI is.
+pub const MAX_RESOLVABILITY_CANDIDATES: usize = 16;
+
+pub async fn count_latest_user_resolvable_image_markers(
+    messages: &[ChatMessage],
+    remote_allowed: bool,
+    path_allowed: Arc<dyn Fn(&Path) -> bool + Send + Sync>,
+) -> usize {
+    let Some(message) = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user" && !is_prompt_tool_result_message(message))
+    else {
+        return 0;
+    };
+    // Inline, I/O-free classification: `inline` counts references that
+    // resolve without any policy or filesystem work; absolute local
+    // paths become candidates for the one blocking task below.
+    let mut inline = 0;
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    let mut overflow = 0;
+    for reference in parse_image_markers(&message.content).1 {
+        if reference.starts_with("data:") {
+            if split_base64_image_data_uri(&reference, MAX_ENCODED_IMAGE_PAYLOAD_BYTES).is_ok() {
+                inline += 1;
+            }
+        } else if reference.starts_with("http://") || reference.starts_with("https://") {
+            if remote_allowed {
+                inline += 1;
+            }
+        } else if !Path::new(&reference).is_absolute() {
+            // Relative references never count: see the doc comment on
+            // `count_latest_user_resolvable_image_markers`.
+        } else if candidates.len() < MAX_RESOLVABILITY_CANDIDATES {
+            candidates.push(PathBuf::from(reference));
+        } else {
+            // Over the candidate bound: no policy call, no probe, and
+            // the marker counts as resolvable, so the caller fails
+            // toward the loud capability error, never toward silently
+            // stripping an attachment that may be real.
+            overflow += 1;
+        }
+    }
+    if candidates.is_empty() {
+        return inline + overflow;
+    }
+    let candidate_count = candidates.len();
+    // ONE blocking task per gate evaluation, not one per marker: the
+    // predicate and the existence probe do synchronous filesystem work
+    // and must stay off the async executor thread. The `Arc` signature
+    // exists because `spawn_blocking` needs `'static`.
+    let probe = tokio::task::spawn_blocking(move || {
+        candidates
+            .iter()
+            .filter(|path| path_allowed(path) && std::fs::metadata(path).is_ok_and(|m| m.is_file()))
+            .count()
+    });
+    // JoinError means the predicate panicked or the runtime is shutting
+    // down: count every candidate as resolvable, the same
+    // fail-toward-refusal rule as overflow. zeroclaw-providers has no
+    // tracing dependency, so the failure is silent here.
+    let probed = match probe.await {
+        Ok(count) => count,
+        Err(_join_error) => candidate_count,
+    };
+    inline + probed + overflow
 }
 
 /// Media-marker kinds this module recognizes. `IMAGE` is the only kind
@@ -3681,6 +3811,359 @@ mod tests {
             ChatMessage::tool("[IMAGE:/tmp/tool.png]\nGenerated".to_string()),
         ];
         assert_eq!(count_latest_user_image_markers(&trailing_tool_result), 1);
+    }
+
+    #[tokio::test]
+    async fn resolvable_count_ignores_missing_path() {
+        let messages = vec![ChatMessage::user(format!(
+            "look at this [IMAGE:{}]",
+            "/definitely/not/a/real/screenshot.png"
+        ))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false, Arc::new(|_: &Path| true))
+                .await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn resolvable_count_accepts_existing_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("shot.png");
+        std::fs::write(&image_path, b"not a real png; existence is all that counts").unwrap();
+        let messages = vec![ChatMessage::user(format!(
+            "look at this [IMAGE:{}]",
+            image_path.display()
+        ))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false, Arc::new(|_: &Path| true))
+                .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn resolvable_count_accepts_structurally_valid_data_uri() {
+        let uri = format!("data:image/png;base64,{CANONICAL_PNG_B64}");
+        let messages = vec![ChatMessage::user(format!("inline [IMAGE:{uri}]"))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false, Arc::new(|_: &Path| true))
+                .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn resolvable_count_rejects_malformed_data_uri() {
+        let uri = "data:image/png;base64,%%%";
+        let messages = vec![ChatMessage::user(format!("inline [IMAGE:{uri}]"))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false, Arc::new(|_: &Path| true))
+                .await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn resolvable_count_remote_follows_flag() {
+        let reference = "https://example.com/cat.png";
+        let messages = vec![ChatMessage::user(format!("see [IMAGE:{reference}]"))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false, Arc::new(|_: &Path| true))
+                .await,
+            0
+        );
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, true, Arc::new(|_: &Path| true))
+                .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn resolvable_count_looks_only_at_latest_user_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("older.png");
+        std::fs::write(&image_path, b"an older turn's real image").unwrap();
+        let messages = vec![
+            ChatMessage::user(format!("look [IMAGE:{}]", image_path.display())),
+            ChatMessage::user("what is WAL?".to_string()),
+        ];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false, Arc::new(|_: &Path| true))
+                .await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn resolvable_count_skips_local_paths_the_policy_rejects() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("shot.png");
+        std::fs::write(&image_path, b"not a real png; existence is all that counts").unwrap();
+        let messages = vec![ChatMessage::user(format!(
+            "look at this [IMAGE: {}]",
+            image_path.display()
+        ))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(
+                &messages,
+                false,
+                Arc::new(|_: &Path| false)
+            )
+            .await,
+            0,
+            "a local path the policy rejects must never count, file or no file"
+        );
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false, Arc::new(|_: &Path| true))
+                .await,
+            1,
+            "the same message with an accepting policy counts the existing file"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolvable_count_never_counts_relative_local_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("rel.png");
+        std::fs::write(
+            &image_path,
+            b"relative references must not resolve against the process cwd",
+        )
+        .unwrap();
+        let messages = vec![ChatMessage::user(format!(
+            "look at this [IMAGE: {}]",
+            "rel.png"
+        ))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false, Arc::new(|_: &Path| true))
+                .await,
+            0,
+            "a relative reference never counts, even when the predicate accepts everything"
+        );
+        // Contrast: the same file reached by its absolute path does count, so
+        // the zero above comes from relativity, not from a missing file.
+        let absolute = vec![ChatMessage::user(format!(
+            "look at this [IMAGE: {}]",
+            image_path.display()
+        ))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&absolute, false, Arc::new(|_: &Path| true))
+                .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn resolvable_count_does_not_probe_rejected_paths() {
+        let probed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probed_for_predicate = std::sync::Arc::clone(&probed);
+        let path_allowed: Arc<dyn Fn(&Path) -> bool + Send + Sync> =
+            Arc::new(move |_: &Path| -> bool {
+                probed_for_predicate.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                false
+            });
+        // Both local markers name files that do not exist anywhere: a
+        // rejected path must count 0 without the file ever needing to exist.
+        let messages = vec![ChatMessage::user(format!(
+            "compare [IMAGE: {}] with [IMAGE: {}]",
+            "/definitely/not/a/real/left.png", "/definitely/not/a/real/right.png"
+        ))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false, path_allowed.clone())
+                .await,
+            0
+        );
+        assert_eq!(
+            probed.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the predicate runs exactly once per local marker"
+        );
+        // A structurally valid data URI in the same message resolves without
+        // the predicate being consulted for it.
+        let data_uri = format!("data:image/png;base64,{CANONICAL_PNG_B64}");
+        let with_data_uri = vec![ChatMessage::user(format!(
+            "compare [IMAGE: {}] with [IMAGE: {}]",
+            data_uri, "/definitely/not/a/real/right.png"
+        ))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&with_data_uri, false, path_allowed).await,
+            1
+        );
+        assert_eq!(
+            probed.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "only the local markers consulted the predicate; the data URI did not"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolvable_count_stops_all_work_after_candidate_budget() {
+        let probed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probed_for_predicate = std::sync::Arc::clone(&probed);
+        let path_allowed: Arc<dyn Fn(&Path) -> bool + Send + Sync> =
+            Arc::new(move |_: &Path| -> bool {
+                probed_for_predicate.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                true
+            });
+        let temp = tempfile::tempdir().unwrap();
+        // 20 accepted absolute markers, all naming missing files. Only the
+        // first MAX_RESOLVABILITY_CANDIDATES get any work (predicate plus
+        // probe, all missing); the rest count as resolvable with no policy
+        // call and no probe. The returned count is exactly the overflow
+        // remainder, which pins the bound at 16: a bound of 15 would give
+        // count 5 and predicate calls 15; a bound of 17 gives 3 and 17.
+        let markers: Vec<String> = (0..20)
+            .map(|i| {
+                format!(
+                    "[IMAGE: {}]",
+                    temp.path().join(format!("missing-{i}.png")).display()
+                )
+            })
+            .collect();
+        let messages = vec![ChatMessage::user(format!(
+            "look at these {}",
+            markers.join(" ")
+        ))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false, path_allowed).await,
+            20 - MAX_RESOLVABILITY_CANDIDATES,
+            "markers beyond the candidate bound count as resolvable with no work at all"
+        );
+        assert_eq!(
+            probed.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_RESOLVABILITY_CANDIDATES,
+            "the predicate runs only for candidates; overflow markers get no policy call"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolvable_count_probes_all_markers_at_or_below_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        // 16 accepted absolute markers, all missing: every one is probed, so
+        // none counts as resolvable. If the last marker had been
+        // short-circuited by the budget, the count would be 1.
+        let markers: Vec<String> = (0..MAX_RESOLVABILITY_CANDIDATES)
+            .map(|i| {
+                format!(
+                    "[IMAGE: {}]",
+                    temp.path().join(format!("missing-{i}.png")).display()
+                )
+            })
+            .collect();
+        let messages = vec![ChatMessage::user(format!(
+            "look at these {}",
+            markers.join(" ")
+        ))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false, Arc::new(|_: &Path| true))
+                .await,
+            0,
+            "at or below the budget every accepted marker is probed, so missing files count 0"
+        );
+    }
+
+    /// The gate's policy-resolution and existence work must run OFF the
+    /// async executor. The predicate below signals "entered" and then
+    /// blocks on a "release" channel; the `tokio::spawn`ed watcher task
+    /// can only observe "entered" and send the release if the runtime's
+    /// single thread is free, which is only true when the predicate runs
+    /// inside `spawn_blocking` rather than on the executor thread. If the
+    /// predicate ever moves back onto the executor thread, it blocks the
+    /// only runtime thread in `recv_timeout`, the watcher never runs, the
+    /// flag stays false, and this test fails within the 5 s timeout
+    /// instead of hanging. Do NOT "simplify" this onto a multi_thread
+    /// runtime: a second worker thread would schedule the watcher even
+    /// with the predicate inline on an executor thread, and the test
+    /// would silently stop proving anything.
+    #[tokio::test]
+    async fn resolvable_count_runs_predicate_and_probe_off_the_executor() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("shot.png");
+        std::fs::write(&image_path, b"existence is all that counts").unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        // Neither mpsc end is `Sync`, and the predicate must be; the
+        // mutexes make the captured sender and receiver shareable without
+        // changing the handshake (the predicate blocks in `recv_timeout`
+        // inside its mutex while the watcher holds no lock).
+        let entered_tx = std::sync::Mutex::new(entered_tx);
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let released_for_predicate = std::sync::Arc::clone(&released);
+        let path_allowed: Arc<dyn Fn(&Path) -> bool + Send + Sync> =
+            Arc::new(move |_: &Path| -> bool {
+                entered_tx
+                    .lock()
+                    .expect("entered sender lockable")
+                    .send(())
+                    .expect("entered signal sendable");
+                let arrived = release_rx
+                    .lock()
+                    .expect("release receiver lockable")
+                    .recv_timeout(std::time::Duration::from_secs(5));
+                released_for_predicate.store(arrived.is_ok(), std::sync::atomic::Ordering::SeqCst);
+                true
+            });
+        // The watcher runs detached on the runtime's own thread pool via
+        // the sanctioned spawn wrapper (plain `tokio::spawn` is
+        // workspace-disallowed); its handle is intentionally dropped.
+        let _watcher = zeroclaw_spawn::spawn!(async move {
+            loop {
+                if entered_rx.try_recv().is_ok() {
+                    release_tx.send(()).expect("release signal sendable");
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        });
+        let messages = vec![ChatMessage::user(format!(
+            "look at this [IMAGE: {}]",
+            image_path.display()
+        ))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false, path_allowed).await,
+            1,
+            "the existing file resolves through the blocking task"
+        );
+        assert!(
+            released.load(std::sync::atomic::Ordering::SeqCst),
+            "the runtime-thread watcher observed the predicate and released it, \
+             so the predicate ran off the executor thread"
+        );
+    }
+
+    /// Fail toward refusal when the blocking task dies: a predicate that
+    /// panics surfaces as a `JoinError`, and every candidate must then
+    /// count as resolvable so the caller errors loudly instead of
+    /// silently degrading. The panic unwinds on the blocking thread and
+    /// is caught by `spawn_blocking`; test profiles keep unwinding
+    /// (`panic = "abort"` is release-only), so the process does not
+    /// abort. The panic message may appear in captured test output; that
+    /// noise is expected.
+    #[tokio::test]
+    async fn resolvable_count_counts_all_candidates_resolvable_when_blocking_task_panics() {
+        let temp = tempfile::tempdir().unwrap();
+        let path_allowed: Arc<dyn Fn(&Path) -> bool + Send + Sync> =
+            Arc::new(|_: &Path| -> bool { panic!("predicate died") });
+        let markers: Vec<String> = (0..3)
+            .map(|i| {
+                format!(
+                    "[IMAGE: {}]",
+                    temp.path().join(format!("missing-{i}.png")).display()
+                )
+            })
+            .collect();
+        let messages = vec![ChatMessage::user(format!(
+            "look at these {}",
+            markers.join(" ")
+        ))];
+        assert_eq!(
+            count_latest_user_resolvable_image_markers(&messages, false, path_allowed).await,
+            3,
+            "a dead blocking task counts every candidate as resolvable, failing toward refusal"
+        );
     }
 
     #[tokio::test]

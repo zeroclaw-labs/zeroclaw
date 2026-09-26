@@ -143,6 +143,13 @@ pub async fn maybe_run_skill_review(
                         activated_tools: None,
                         model_switch_callback: None,
                         receipt_generator: None,
+                        // `None` on purpose: the review loop's latest user
+                        // message is the runtime-synthesized review prompt,
+                        // never a user-authored marker, so the gate takes no
+                        // branch here and any marker-shaped tool-result echo
+                        // fails closed to the placeholder degrade instead of
+                        // probing the filesystem.
+                        security: None,
                     },
                     crate::agent::loop_::ResolvedRuntimeKnobs {
                         max_tool_iterations: config.max_review_iterations as usize,

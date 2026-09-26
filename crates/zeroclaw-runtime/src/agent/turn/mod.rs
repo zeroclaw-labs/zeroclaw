@@ -976,6 +976,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         observer,
         silent,
         approval,
+        security,
         multimodal_config,
         config,
         max_tool_iterations,
@@ -1253,7 +1254,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             provider_name,
             model,
             dispatch_model,
-        )?;
+            security,
+        )
+        .await?;
 
         let (
             active_model_provider,
@@ -2435,6 +2438,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 observer,
                 silent,
                 approval,
+                security,
                 multimodal_config,
                 config,
                 max_tool_iterations,
@@ -2674,6 +2678,11 @@ pub(crate) struct OwnedAgentExecution {
     /// system prompt reports the same dialect the step will execute under.
     /// `None` for a shell-less runtime.
     shell_profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
+    /// The step agent's own filesystem policy, built by
+    /// `assemble_owned_execution` the same way a fresh agent turn builds it.
+    /// Carried so the nested sub-loop's no-vision image-marker gate applies
+    /// the step agent's read ledger, never the parent's.
+    security: Arc<crate::security::SecurityPolicy>,
 }
 
 /// Re-assemble `alias`'s per-agent execution context the way a fresh agent turn
@@ -2837,6 +2846,9 @@ pub(crate) async fn assemble_owned_execution(
         // Captured from the same adapter this step's tools were built with, so
         // the prompt names the shell the step will actually run under.
         shell_profile,
+        // The same policy the step's tools were built with, carried for the
+        // nested sub-loop's no-vision image-marker gate.
+        security,
     })
 }
 
@@ -2903,6 +2915,11 @@ async fn drive_live_sop_actions(
     observer: &dyn crate::observability::Observer,
     silent: bool,
     approval: Option<&crate::approval::ApprovalManager>,
+    // The enclosing agent's filesystem policy, threaded from the turn loop's
+    // execution context. Same-agent nested SOP steps run under it; a
+    // cross-agent step uses its own re-assembled policy (see
+    // `OwnedAgentExecution::security`).
+    security: Option<&crate::security::SecurityPolicy>,
     multimodal_config: &zeroclaw_config::schema::MultimodalConfig,
     // Full config so the live-SOP sub-turn's vision route resolves the configured
     // `vision_model_provider`'s alias options, exactly as the enclosing turn does.
@@ -3229,6 +3246,14 @@ async fn drive_live_sop_actions(
                                             observer,
                                             silent,
                                             approval: eff_approval,
+                                            // Same-agent steps run under the
+                                            // enclosing agent's policy; a
+                                            // cross-agent step runs under its
+                                            // own re-assembled one.
+                                            security: match owned {
+                                                Some(o) => Some(o.security.as_ref()),
+                                                None => security,
+                                            },
                                             multimodal_config,
                                             config,
                                             hooks,
@@ -5149,6 +5174,7 @@ vision_model_provider = "custom.vision"
                     activated_tools: None,
                     model_switch_callback: None,
                     receipt_generator: None,
+                    security: None,
                 },
                 ResolvedRuntimeKnobs {
                     max_tool_iterations: 3,
@@ -5777,6 +5803,10 @@ mod sop_step_reassembly_tests {
             mcp_tool_names,
             mcp_prompt_section: String::new(),
             shell_profile: None,
+            // Test fixture: no config-backed policy, so the default (its
+            // `workspace_dir` is ".") stands in and the marker gate fails
+            // closed under it.
+            security: Arc::new(crate::security::SecurityPolicy::default()),
         }
     }
 
@@ -5882,6 +5912,8 @@ mod sop_step_reassembly_tests {
             parent_tools,
             observer,
             true,
+            None,
+            // security: no policy on the test path
             None,
             &zeroclaw_config::schema::MultimodalConfig::default(),
             None,
@@ -6530,6 +6562,8 @@ mod sop_step_reassembly_tests {
                 mcp_tool_names: std::collections::HashSet::new(),
                 mcp_prompt_section: String::new(),
                 shell_profile: None,
+                // Test fixture: see the helper above.
+                security: Arc::new(crate::security::SecurityPolicy::default()),
             },
         );
 
@@ -7031,6 +7065,7 @@ mod tool_lifecycle_abandonment_tests {
                 context_limits_resolver: None,
                 receipt_generator: None,
                 knobs: &LoopKnobs::default(),
+                security: None,
             },
             history,
             history_has_trim_breadcrumb: &mut crumb_present,

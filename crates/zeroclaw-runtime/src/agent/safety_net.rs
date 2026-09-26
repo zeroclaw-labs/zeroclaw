@@ -598,6 +598,7 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
                 activated_tools: None,
                 model_switch_callback: None,
                 receipt_generator: None,
+                security: None,
             },
             crate::agent::loop_::ResolvedRuntimeKnobs {
                 max_tool_iterations: 5,
@@ -1012,6 +1013,7 @@ async fn safety_net_task_locals_probe_per_entry_path() {
                         activated_tools: None,
                         model_switch_callback: None,
                         receipt_generator: None,
+                        security: None,
                     },
                     crate::agent::loop_::ResolvedRuntimeKnobs {
                         max_tool_iterations: 5,
@@ -2658,6 +2660,7 @@ async fn safety_net_narration_reaches_both_draft_and_event_channels_once() {
                 observer: &observability::NoopObserver {},
                 silent: true,
                 approval: None,
+                security: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
                 config: None,
                 hooks: None,
@@ -3861,6 +3864,7 @@ async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
                 activated_tools: None,
                 model_switch_callback: Some(Arc::clone(&callback)),
                 receipt_generator: None,
+                security: None,
             },
             ResolvedRuntimeKnobs {
                 max_tool_iterations: 5,

@@ -12,6 +12,7 @@ use crate::agent::tool_receipts::ReceiptGenerator;
 use crate::approval::ApprovalManager;
 use crate::hooks::HookRunner;
 use crate::observability::Observer;
+use crate::security::SecurityPolicy;
 use crate::tools::ActivatedToolSet;
 use crate::tools::scoped::ScopedToolRegistry;
 
@@ -193,6 +194,12 @@ pub struct ResolvedAgentExecution<'a> {
     pub silent: bool,
     /// Approval policy + back-channel; `None` for paths that never prompt.
     pub approval: Option<&'a ApprovalManager>,
+    /// The agent's filesystem policy, applied by the no-vision image-marker
+    /// gate so a local marker counts as resolvable only when the agent's own
+    /// file tools could read it. `None` on configless (test) paths, where the
+    /// gate fails closed to a degrade. The gate lives in
+    /// `crate::agent::turn::vision_route::resolve_vision_provider`.
+    pub security: Option<&'a SecurityPolicy>,
     /// Vision-model routing config.
     pub multimodal_config: &'a MultimodalConfig,
     /// Full config, for resolving the configured `vision_model_provider`'s
@@ -244,6 +251,9 @@ pub struct ResolvedIo<'a> {
     pub observer: &'a dyn Observer,
     pub silent: bool,
     pub approval: Option<&'a ApprovalManager>,
+    /// Filesystem policy for the no-vision image-marker gate; `None` on
+    /// configless (test) paths. See [`ResolvedAgentExecution::security`].
+    pub security: Option<&'a SecurityPolicy>,
     pub multimodal_config: &'a MultimodalConfig,
     /// Full config for vision-route provider-alias resolution; `None` on
     /// configless (test) paths. See [`ResolvedAgentExecution::config`].
@@ -283,6 +293,7 @@ impl<'a> ResolvedAgentExecution<'a> {
             observer: io.observer,
             silent: io.silent,
             approval: io.approval,
+            security: io.security,
             multimodal_config: io.multimodal_config,
             config: io.config,
             max_tool_iterations: runtime.max_tool_iterations,

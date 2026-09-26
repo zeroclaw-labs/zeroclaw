@@ -3890,6 +3890,17 @@ impl DelegateTool {
                         activated_tools: sub_activated.as_ref(),
                         model_switch_callback: None,
                         receipt_generator,
+                        // Gate policy = the policy that assembled this child's
+                        // FILE tools: `target_policy` for independent children
+                        // (it assembled their registry), the parent's
+                        // `self.security` for bounded children (they run the
+                        // parent's prebuilt registry; `bounded_security` is
+                        // only an assembly identity seal, never the
+                        // tool-authoring policy, so it must not gate).
+                        security: match target_mode {
+                            DelegateExecutionMode::Independent => Some(target_policy.as_ref()),
+                            DelegateExecutionMode::Bounded => Some(self.security.as_ref()),
+                        },
                     },
                     ResolvedRuntimeKnobs {
                         max_tool_iterations: loop_runtime.max_tool_iterations,
@@ -6998,6 +7009,56 @@ mod tests {
         assert!(result.success);
         assert!(result.output.contains("(openrouter/model-test, agentic)"));
         assert!(result.output.contains("tool count matched: 1"));
+    }
+
+    /// The bounded agentic child turn gates image markers with the PARENT's
+    /// policy (`self.security`): a marker under the parent policy's
+    /// workspace on a non-vision provider refuses the child turn with the
+    /// capability error, before any provider dispatch. If the child
+    /// `ResolvedIo` regressed to `security: None`, the gate would fail
+    /// closed to the degrade and the child turn would succeed instead.
+    #[tokio::test]
+    async fn bounded_agentic_child_refuses_policy_readable_marker_on_non_vision_provider() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir should create");
+        let image_path = workspace.path().join("shot.png");
+        std::fs::write(&image_path, b"policy-readable marker fixture")
+            .expect("marker fixture should write");
+        let parent_security = Arc::new(SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        });
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, parent_security)
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec!["echo_tool".to_string()]))
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+
+        let model_provider = ToolCountModelProvider { expected_tools: 0 };
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &model_provider,
+                &format!("look at this [IMAGE: {}]", image_path.display()),
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "a policy-readable marker under the parent policy workspace must refuse \
+             the bounded child turn, got error: {:?}",
+            result.error
+        );
+        let error = result.error.as_deref().unwrap_or_default();
+        assert!(
+            error.contains("image marker") && error.contains("vision"),
+            "the refusal must surface the capability error text, got: {error}"
+        );
     }
 
     /// A delegation made from inside a headless SOP step carries that step's
