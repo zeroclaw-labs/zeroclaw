@@ -2680,8 +2680,32 @@ pub(crate) struct OwnedAgentExecution {
 /// SOP so the nested step keeps its SOP tools bound to the same engine. This
 /// connects MCP servers, so the driver memoizes the result per alias across a
 /// drain and re-assembles only on an alias change.
+///
+/// Compatibility adapter for [`assemble_owned_execution_with_capabilities`]
+/// over the config-backed capabilities.
 pub(crate) async fn assemble_owned_execution(
     config: &zeroclaw_config::schema::Config,
+    alias: &str,
+    sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+    sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
+    parent_approval: Option<&crate::approval::ApprovalManager>,
+) -> Result<OwnedAgentExecution> {
+    assemble_owned_execution_with_capabilities(
+        config,
+        &crate::composition::RuntimeCapabilities::config_backed_unobserved(),
+        alias,
+        sop_engine,
+        sop_audit,
+        parent_approval,
+    )
+    .await
+}
+
+/// [`assemble_owned_execution`] with the step agent's memory, provider and any
+/// source-supplied tools obtained from `capabilities`.
+pub(crate) async fn assemble_owned_execution_with_capabilities(
+    config: &zeroclaw_config::schema::Config,
+    capabilities: &crate::composition::RuntimeCapabilities,
     alias: &str,
     sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
     sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
@@ -2707,8 +2731,7 @@ pub(crate) async fn assemble_owned_execution(
     let resolved_key = config
         .resolved_model_provider_for_agent(alias)
         .and_then(|(_, _, cfg)| cfg.api_key.clone());
-    let memory =
-        zeroclaw_memory::create_memory_for_agent(config, alias, resolved_key.as_deref()).await?;
+    let memory = capabilities.agent_memory(config, alias).await?;
 
     // Mirror a fresh agent turn: the headless SOP driver reaches this agent's
     // tools via `crate::agent::run`, which builds its runtime from
@@ -2727,13 +2750,14 @@ pub(crate) async fn assemble_owned_execution(
         (None, None)
     };
 
-    let built = crate::tools::all_tools_with_runtime(
-        Arc::new(config.clone()),
+    let tool_config = Arc::new(config.clone());
+    let mut built = crate::tools::all_tools_with_runtime(
+        Arc::clone(&tool_config),
         &security,
         &risk_profile,
         alias,
         runtime.clone(),
-        memory,
+        Arc::clone(&memory),
         composio_key,
         composio_entity_id,
         &config.browser,
@@ -2749,6 +2773,16 @@ pub(crate) async fn assemble_owned_execution(
         Some(sop_engine),
         sop_audit,
         None,
+    )?;
+    capabilities.bind_registry(
+        &mut built,
+        &crate::composition::ToolRequest {
+            config: &tool_config,
+            agent_alias: alias,
+            security: &security,
+            runtime: &runtime,
+            memory: &memory,
+        },
     )?;
     let skills = crate::skills::load_skills_for_agent_from_config(config, alias);
     // Capture before `runtime` is moved into `ScopedAssembly` below.
@@ -2799,7 +2833,14 @@ pub(crate) async fn assemble_owned_execution(
             ))
         })?;
     let (model_provider, provider_name, model, _model_route_resolver) =
-        crate::agent::agent::build_session_model_provider(config, &provider_ref, None)?;
+        crate::agent::agent::build_session_model_provider_with_capabilities(
+            capabilities,
+            config,
+            alias,
+            &provider_ref,
+            None,
+            None,
+        )?;
     // The step agent's own configured temperature — the same source the
     // headless driver reads for `crate::agent::run`.
     let temperature = config

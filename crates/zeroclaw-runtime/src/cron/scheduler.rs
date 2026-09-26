@@ -797,8 +797,37 @@ fn agent_job_error_message(error: &anyhow::Error) -> String {
         .unwrap_or_else(|| crate::i18n::get_required_cli_string("cron-agent-job-failed"))
 }
 
-async fn run_agent_job(
+/// Compatibility adapter: the turn runs through [`crate::agent::run`], and the
+/// isolated-session purge opens memory through the config-backed source.
+///
+/// Both entry points return the inner future rather than adding an `async fn`
+/// layer: the job future already sits at the auto-trait recursion limit where
+/// the scheduler spawns it.
+fn run_agent_job<'a>(
+    config: &'a Config,
+    security: &'a SecurityPolicy,
+    agent_alias: &'a str,
+    job: &'a CronJob,
+) -> impl std::future::Future<Output = (bool, String)> + 'a {
+    run_agent_job_inner(config, None, security, agent_alias, job)
+}
+
+/// Run an agent job with supplied capabilities: the turn and the
+/// isolated-session purge both obtain their provider and memory from
+/// `capabilities`.
+pub fn run_agent_job_with_capabilities<'a>(
+    config: &'a Config,
+    capabilities: &'a crate::composition::RuntimeCapabilities,
+    security: &'a SecurityPolicy,
+    agent_alias: &'a str,
+    job: &'a CronJob,
+) -> impl std::future::Future<Output = (bool, String)> + 'a {
+    run_agent_job_inner(config, Some(capabilities), security, agent_alias, job)
+}
+
+async fn run_agent_job_inner(
     config: &Config,
+    capabilities: Option<&crate::composition::RuntimeCapabilities>,
     security: &SecurityPolicy,
     agent_alias: &str,
     job: &CronJob,
@@ -870,29 +899,54 @@ async fn run_agent_job(
         // are a separate surface driven by the SOP maintenance tick.
         sop_step_scope: None,
     };
+    let temperature = config
+        .model_provider_for_agent(agent_alias)
+        .and_then(|e| e.temperature);
     let run_result = match job.session_target {
-        SessionTarget::Main | SessionTarget::Isolated => {
-            Box::pin(
-                crate::agent::run(
-                    cron_config,
-                    agent_alias,
-                    Some(prefixed_prompt),
-                    None,
-                    model_override,
-                    config
-                        .model_provider_for_agent(agent_alias)
-                        .and_then(|e| e.temperature),
-                    vec![],
-                    false,
-                    Some(session_path.clone()),
-                    job.allowed_tools.clone(),
-                    zeroclaw_api::ingress::TurnOrigin::Cron,
-                    run_overrides,
+        SessionTarget::Main | SessionTarget::Isolated => match capabilities {
+            Some(capabilities) => {
+                Box::pin(
+                    crate::agent::run_with_capabilities(
+                        cron_config,
+                        capabilities.clone(),
+                        None,
+                        agent_alias,
+                        Some(prefixed_prompt),
+                        None,
+                        model_override,
+                        temperature,
+                        vec![],
+                        false,
+                        Some(session_path.clone()),
+                        job.allowed_tools.clone(),
+                        zeroclaw_api::ingress::TurnOrigin::Cron,
+                        run_overrides,
+                    )
+                    .instrument(subagent_span),
                 )
-                .instrument(subagent_span),
-            )
-            .await
-        }
+                .await
+            }
+            None => {
+                Box::pin(
+                    crate::agent::run(
+                        cron_config,
+                        agent_alias,
+                        Some(prefixed_prompt),
+                        None,
+                        model_override,
+                        temperature,
+                        vec![],
+                        false,
+                        Some(session_path.clone()),
+                        job.allowed_tools.clone(),
+                        zeroclaw_api::ingress::TurnOrigin::Cron,
+                        run_overrides,
+                    )
+                    .instrument(subagent_span),
+                )
+                .await
+            }
+        },
     };
 
     match run_result {
@@ -931,15 +985,15 @@ async fn run_agent_job(
                     "cli:{}",
                     session_path.display()
                 ));
-                if let Ok(mem) = zeroclaw_memory::create_memory_for_agent(
-                    config,
-                    agent_alias,
-                    config
-                        .model_provider_for_agent(agent_alias)
-                        .and_then(|e| e.api_key.as_deref()),
-                )
-                .await
-                {
+                let memory = match capabilities {
+                    Some(capabilities) => capabilities.agent_memory(config, agent_alias).await,
+                    None => {
+                        crate::composition::RuntimeCapabilities::config_backed_unobserved()
+                            .agent_memory(config, agent_alias)
+                            .await
+                    }
+                };
+                if let Ok(mem) = memory {
                     let _ = mem.purge_session(&mem_session_key).await;
                 }
             }
@@ -2507,6 +2561,48 @@ mod tests {
         }
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn run_agent_job_serves_the_job_from_supplied_capabilities() {
+        use crate::composition::test_support::{
+            NoTools, RecordingMemory, RecordingProviders, STUB_REPLY, recording_capabilities,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        if let Some(entry) = config.providers.models.openrouter.get_mut(TEST_AGENT) {
+            entry.base.model = Some("test-model".into());
+        }
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Say hello".into());
+        let security = test_security(&config);
+        let providers = Arc::new(RecordingProviders::default());
+        let memory = Arc::new(RecordingMemory::default());
+        let capabilities = recording_capabilities(
+            Arc::clone(&providers),
+            Arc::clone(&memory),
+            Arc::new(NoTools),
+        );
+
+        let (success, output) = Box::pin(run_agent_job_with_capabilities(
+            &config,
+            &capabilities,
+            &security,
+            TEST_AGENT,
+            &job,
+        ))
+        .await;
+
+        assert!(success, "job failed: {output}");
+        assert!(output.contains(STUB_REPLY), "unexpected output: {output}");
+        let seen = providers.seen.lock();
+        assert_eq!(seen.len(), 1, "one provider for the job: {seen:?}");
+        assert_eq!(seen[0].agent_alias, TEST_AGENT);
+        assert_eq!(seen[0].principal, None);
+        drop(seen);
+        assert!(memory.agents.lock().iter().all(|alias| alias == TEST_AGENT));
     }
 
     #[tokio::test]

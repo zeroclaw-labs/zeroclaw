@@ -6577,8 +6577,14 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 move || zeroclaw_channels::orchestrator::build_channel_map(&config_clone)
             }));
 
-            Box::pin(agent::run(
+            // The CLI resolves no principal for its own user, so it passes none;
+            // with the default capabilities that constructs exactly as the
+            // `agent::run` adapter did.
+            let capabilities = zeroclaw::composition::DefaultCapabilities::from_config(&config);
+            Box::pin(agent::run_with_capabilities(
                 config,
+                capabilities,
+                None,
                 &agent_alias,
                 message,
                 model_provider,
