@@ -87,6 +87,13 @@ enum ResolvedBackend {
     ComputerUse,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentBrowserProbe {
+    Available,
+    Unavailable,
+    TimedOut,
+}
+
 impl BrowserBackendKind {
     fn parse(raw: &str) -> anyhow::Result<Self> {
         let key = raw.trim().to_ascii_lowercase().replace('-', "_");
@@ -259,19 +266,37 @@ impl BrowserTool {
 
     /// Check if agent-browser CLI is available
     pub async fn is_agent_browser_available() -> bool {
+        matches!(
+            Self::probe_agent_browser().await,
+            AgentBrowserProbe::Available
+        )
+    }
+
+    async fn probe_agent_browser() -> AgentBrowserProbe {
         let cmd = if cfg!(target_os = "windows") {
             "agent-browser.cmd"
         } else {
             "agent-browser"
         };
-        Command::new(cmd)
+        let mut child = match Command::new(cmd)
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
-            .await
-            .map(|s| s.success())
-            .unwrap_or(false)
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return AgentBrowserProbe::Unavailable,
+        };
+
+        match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+            Ok(Ok(status)) if status.success() => AgentBrowserProbe::Available,
+            Ok(_) => AgentBrowserProbe::Unavailable,
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                AgentBrowserProbe::TimedOut
+            }
+        }
     }
 
     /// Backward-compatible alias.
@@ -365,10 +390,13 @@ impl BrowserTool {
         let configured = self.configured_backend()?;
 
         match configured {
-            BrowserBackendKind::AgentBrowser => {
-                if Self::is_agent_browser_available().await {
-                    Ok(ResolvedBackend::AgentBrowser)
-                } else {
+            BrowserBackendKind::AgentBrowser => match Self::probe_agent_browser().await {
+                AgentBrowserProbe::Available => Ok(ResolvedBackend::AgentBrowser),
+                AgentBrowserProbe::TimedOut => anyhow::bail!(
+                    "browser.backend='{}' agent-browser availability probe timed out after 5 seconds",
+                    configured.as_str()
+                ),
+                AgentBrowserProbe::Unavailable => {
                     #[cfg(target_os = "windows")]
                     let install_hint = "Install with: npm install -g agent-browser (ensure npm global bin is in PATH)";
                     #[cfg(not(target_os = "windows"))]
@@ -379,7 +407,7 @@ impl BrowserTool {
                         install_hint
                     )
                 }
-            }
+            },
             BrowserBackendKind::RustNative => {
                 if !Self::rust_native_compiled() {
                     anyhow::bail!(
@@ -405,7 +433,8 @@ impl BrowserTool {
                 if Self::rust_native_compiled() && self.rust_native_available() {
                     return Ok(ResolvedBackend::RustNative);
                 }
-                if Self::is_agent_browser_available().await {
+                let agent_browser_probe = Self::probe_agent_browser().await;
+                if agent_browser_probe == AgentBrowserProbe::Available {
                     return Ok(ResolvedBackend::AgentBrowser);
                 }
 
@@ -418,17 +447,20 @@ impl BrowserTool {
                 if Self::rust_native_compiled() {
                     if let Some(err) = computer_use_err {
                         anyhow::bail!(
-                            "browser.backend='auto' found no usable backend (agent-browser missing, rust-native unavailable, computer-use invalid: {err})"
+                            "browser.backend='auto' found no usable backend (agent-browser {}, rust-native unavailable, computer-use invalid: {err})",
+                            agent_browser_probe_description(agent_browser_probe)
                         );
                     }
                     anyhow::bail!(
-                        "browser.backend='auto' found no usable backend (agent-browser missing, rust-native unavailable, computer-use sidecar unreachable)"
+                        "browser.backend='auto' found no usable backend (agent-browser {}, rust-native unavailable, computer-use sidecar unreachable)",
+                        agent_browser_probe_description(agent_browser_probe)
                     )
                 }
 
                 if let Some(err) = computer_use_err {
                     anyhow::bail!(
-                        "browser.backend='auto' needs agent-browser CLI, browser-native, or valid computer-use sidecar (error: {err})"
+                        "browser.backend='auto' needs agent-browser CLI, browser-native, or valid computer-use sidecar (agent-browser {}; error: {err})",
+                        agent_browser_probe_description(agent_browser_probe)
                     );
                 }
 
@@ -2595,6 +2627,14 @@ fn backend_name(backend: ResolvedBackend) -> &'static str {
         ResolvedBackend::AgentBrowser => "agent_browser",
         ResolvedBackend::RustNative => "rust_native",
         ResolvedBackend::ComputerUse => "computer_use",
+    }
+}
+
+fn agent_browser_probe_description(probe: AgentBrowserProbe) -> &'static str {
+    match probe {
+        AgentBrowserProbe::Available => "available",
+        AgentBrowserProbe::Unavailable => "missing or unusable",
+        AgentBrowserProbe::TimedOut => "availability probe timed out",
     }
 }
 
