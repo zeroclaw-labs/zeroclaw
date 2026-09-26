@@ -401,7 +401,7 @@ impl Tool for ShellTool {
         // Inject the warning into whichever field the dispatcher surfaces to the
         // model — `output` on success, `error` on failure — so it is never lost.
         if !self.persistent_writes {
-            result.output = with_ephemeral_workspace_warning(&result.output).into();
+            result.output.map_text(with_ephemeral_workspace_warning);
             if let Some(err) = result.error.take() {
                 result.error = Some(with_ephemeral_workspace_warning(&err));
             }

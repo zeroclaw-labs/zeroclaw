@@ -156,19 +156,19 @@ pub(crate) async fn prepare_messages_for_iteration(
         // Text-only fallback: replace every media marker with the prose
         // placeholder so no filesystem path or data URI reaches the
         // text-only provider, while surrounding text (captions, tool
-        // metadata) survives. An assistant tool-call envelope is rewritten
-        // field-wise instead: signed thinking (`reasoning_content`) and
-        // tool-call signatures (`tool_calls[].extra_content`) must replay
-        // byte-for-byte, and a composite provider (the reliable wrapper)
-        // reports no vision whenever one of its fallbacks lacks it — so the
-        // primary that receives this degraded request may be the very
-        // provider that verifies those signatures.
+        // metadata) survives. Tool-result carriers keep their bodies
+        // verbatim: a carrier's images are its declared attachments, and a
+        // marker in its body text is text. An assistant tool-call envelope
+        // is rewritten field-wise instead: signed thinking
+        // (`reasoning_content`) and tool-call signatures
+        // (`tool_calls[].extra_content`) must replay byte-for-byte, and a
+        // composite provider (the reliable wrapper) reports no vision
+        // whenever one of its fallbacks lacks it — so the primary that
+        // receives this degraded request may be the very provider that
+        // verifies those signatures.
         let stripped: Vec<ChatMessage> = history
             .iter()
-            .map(|m| ChatMessage {
-                role: m.role.clone(),
-                content: multimodal::strip_media_markers_model_visible(m),
-            })
+            .map(multimodal::strip_message_media)
             .collect();
         match image_cache {
             Some(cache) => {
@@ -250,34 +250,6 @@ mod tests {
             first_non_system.role, "user",
             "leading non-user turns must be dropped before dispatch"
         );
-    }
-
-    /// A tool-result `[AUDIO:...]` marker on the non-degrade path must be
-    /// stripped before dispatch so a raw filesystem path never reaches the
-    /// provider as literal text (the silent-hallucination failure mode). This
-    /// exercises the real turn-loop prep entrypoint, not just the provider-layer
-    /// helper, so it covers the degrade/non-degrade branch selection.
-    #[tokio::test]
-    async fn prepare_iteration_strips_tool_result_audio_marker() {
-        let history = vec![
-            ChatMessage::user("what do you hear in the clip?"),
-            ChatMessage::tool("[AUDIO:/tmp/clip.wav] recorded 3:00 PM"),
-        ];
-        let cfg = MultimodalConfig::default();
-        let prepared = prepare_messages_for_iteration(&history, &cfg, false, None)
-            .await
-            .unwrap();
-        let joined = prepared
-            .messages
-            .iter()
-            .map(|m| m.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            !joined.contains("/tmp/clip.wav"),
-            "audio path leaked to the provider payload: {joined}"
-        );
-        assert!(joined.contains(multimodal::MEDIA_PLACEHOLDER));
     }
 
     /// The text-only degrade path used to map `strip_media_markers` over
@@ -743,5 +715,117 @@ model = "vision-model"
             "multimodal.vision_model must override the provider alias model"
         );
         server.abort();
+    }
+    /// DECISIVE, no-vision route: a tool-result carrier with one declared
+    /// attachment and marker-looking body text. The degrade strips exactly
+    /// the declared attachment; the body — including its literal marker —
+    /// survives byte for byte, so a model reading source that mentions the
+    /// marker syntax still sees what the tool printed.
+    #[tokio::test]
+    async fn no_vision_degrade_strips_carrier_attachments_not_bodies() {
+        struct NonVisionPrimary;
+        #[async_trait::async_trait]
+        impl ModelProvider for NonVisionPrimary {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            fn capabilities_for_model(
+                &self,
+                _model: &str,
+            ) -> zeroclaw_api::model_provider::ProviderCapabilities {
+                zeroclaw_api::model_provider::ProviderCapabilities {
+                    vision: false,
+                    ..Default::default()
+                }
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for NonVisionPrimary {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "NonVisionPrimary"
+            }
+        }
+
+        let body = "the source contains [IMAGE:/tmp/example.png] as literal text";
+        let carrier = ChatMessage::tool(
+            serde_json::json!({
+                "tool_call_id": "tc1",
+                "content": body,
+                "attachments": [{"kind": "image", "target": "/tmp/real.png"}],
+            })
+            .to_string(),
+        );
+        let history = vec![
+            ChatMessage::user("read the multimodal source".to_string()),
+            carrier,
+        ];
+
+        let (vision, degrade) = resolve_vision_provider(
+            None,
+            &NonVisionPrimary,
+            &history,
+            &MultimodalConfig::default(),
+            "primary",
+            "primary-model",
+            "primary-model",
+        )
+        .expect("no capability error on a plain degrade");
+        assert!(vision.is_none());
+        assert!(degrade, "the declared attachment must trigger the degrade");
+
+        let prepared =
+            prepare_messages_for_iteration(&history, &MultimodalConfig::default(), true, None)
+                .await
+                .expect("degrade preparation succeeds");
+        let parsed =
+            zeroclaw_api::tool_carrier::parse_native_tool_carrier(&prepared.messages[1].content)
+                .expect("degraded carrier still parses");
+        assert!(
+            parsed.attachments.is_empty(),
+            "the declared attachment is stripped"
+        );
+        assert_eq!(
+            parsed.text, body,
+            "the carrier body, marker syntax included, survives the degrade"
+        );
+
+        // A carrier whose body only LOOKS like it carries images never
+        // triggers the vision machinery at all: its count is zero.
+        let text_only = ChatMessage::tool(
+            serde_json::json!({
+                "tool_call_id": "tc2",
+                "content": body,
+                "attachments": [],
+            })
+            .to_string(),
+        );
+        let history = vec![
+            ChatMessage::user("read the source again".to_string()),
+            text_only.clone(),
+        ];
+        assert_eq!(multimodal::count_image_markers(&history), 0);
+        let (_, degrade) = resolve_vision_provider(
+            None,
+            &NonVisionPrimary,
+            &history,
+            &MultimodalConfig::default(),
+            "primary",
+            "primary-model",
+            "primary-model",
+        )
+        .expect("no capability error");
+        assert!(!degrade, "body markers alone must not degrade anything");
     }
 }

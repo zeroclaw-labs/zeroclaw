@@ -5,12 +5,6 @@ use crate::agent::history::estimate_history_tokens;
 use zeroclaw_api::model_provider::ConversationMessage;
 use zeroclaw_providers::ChatMessage;
 
-/// Prefix the tool loop puts on the user-role message that carries prompt-mode
-/// tool results (see `history_append::append_tool_round_to_history`). Typed
-/// replay preserves that carrier as an ordinary user chat, so span selectors
-/// must not mistake it for the user prompt that opened a turn.
-pub(crate) const TOOL_RESULTS_PREFIX: &str = "[Tool results]";
-
 /// Outcome of a trim pass. `trimmed` is true only when at least one whole turn
 /// was dropped, in which case the caller emits a user-visible event and injects
 /// a breadcrumb so the loss is never silent.
@@ -157,7 +151,10 @@ pub(crate) fn trim_conversation_to_recent_turns(
 }
 
 fn is_turn_boundary(msg: &ChatMessage) -> bool {
-    msg.role == "user" && !msg.content.starts_with(TOOL_RESULTS_PREFIX)
+    msg.role == "user"
+        && !msg
+            .content
+            .starts_with(zeroclaw_api::tool_carrier::TOOL_RESULTS_PREFIX)
 }
 
 fn is_system(msg: &ChatMessage) -> bool {
@@ -419,6 +416,21 @@ mod tests {
     }
     fn tool(c: &str) -> ChatMessage {
         ChatMessage::tool(c)
+    }
+
+    /// A declared native tool-result carrier for one image: the envelope the
+    /// runtime writes, with the attachment at the fixed position.
+    fn image_tool_carrier(target: &str) -> String {
+        let attachments = vec![zeroclaw_api::media::RenderedMarker {
+            target: target.to_string(),
+            kind: zeroclaw_api::media::MarkerKind::Image,
+        }];
+        serde_json::json!({
+            "tool_call_id": "call_image",
+            "content": "",
+            "attachments": zeroclaw_api::tool_carrier::render_native_attachments(&attachments),
+        })
+        .to_string()
     }
 
     fn conversation_system(content: &str) -> ConversationMessage {
@@ -1559,10 +1571,11 @@ mod tests {
             .collect::<Vec<ChatMessage>>()
         };
 
-        // Path markers: five images coming back in one native-tool round.
+        // Path targets: five images coming back in one native-tool round as
+        // declared carriers, the shape the runtime writes.
         let history = image_history(
             (0..5)
-                .map(|index| format!("[IMAGE:/tmp/slide-{index}.png]"))
+                .map(|index| image_tool_carrier(&format!("/tmp/slide-{index}.png")))
                 .collect(),
         );
         assert!(
@@ -1593,12 +1606,14 @@ mod tests {
             "the newest round must keep all five image results whole"
         );
 
-        // The same round as ~600 KB data URIs: per-image pricing keeps the
-        // history under a 20k budget, where per-byte pricing would see ~150k
-        // tokens per result and throw the old turn away.
+        // The same round as ~600 KB data-URI attachments: per-image pricing
+        // keeps the history under a 20k budget, where per-byte pricing would
+        // see ~150k tokens per result and throw the old turn away.
         let history = image_history(
             (0..5)
-                .map(|_| format!("[IMAGE:data:image/png;base64,{}]", "A".repeat(600_000)))
+                .map(|_| {
+                    image_tool_carrier(&format!("data:image/png;base64,{}", "A".repeat(600_000)))
+                })
                 .collect(),
         );
         let before = history.len();
@@ -1618,13 +1633,18 @@ mod tests {
         );
     }
 
+    // Legacy path markers are text under the attachment-identity contract,
+    // so a stale legacy carrier is delivered and priced as its bytes: the
+    // marker syntax stays in the body and nothing is stripped. Thirty short
+    // markers fit the 32k budget by bytes, so a tool round that only ever
+    // quoted markers cannot evict a turn that fits.
     #[test]
     fn stale_tool_images_do_not_force_a_trim() {
         let markers: Vec<String> = (0..30)
             .map(|index| format!("[IMAGE:/tmp/stale-{index}.png]"))
             .collect();
         // The latest message is a genuine user turn, so the whole tool run is
-        // stale and preparation strips every marker before dispatch.
+        // stale: replay delivers it verbatim, and its price is its bytes.
         let history = vec![
             sys("s"),
             user("u"),
@@ -1637,7 +1657,7 @@ mod tests {
 
         assert!(
             !result.trimmed,
-            "stale tool images are stripped before dispatch and must not force a trim"
+            "stale tool images are text, not per-image charges, and must not force a trim"
         );
         assert_eq!(result.dropped_turns, 0);
         assert_eq!(result.history.len(), 5);

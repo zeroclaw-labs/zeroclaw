@@ -6,6 +6,7 @@ use serde_json::json;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use zeroclaw_api::media::{MarkerKind, RenderedMarker};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
@@ -156,8 +157,7 @@ fn format_image_tool_output(
          File: {path_display}\n\
          Size: {size_kb} KB\n\
          Model: {model}\n\
-         Prompt: {prompt}\n\
-         [IMAGE:{path_display}]",
+         Prompt: {prompt}",
     )
 }
 
@@ -461,11 +461,18 @@ impl ImageGenTool {
         let path_display = output_path.display().to_string();
         let output = format_image_tool_output(&path_display, size_kb, model, &prompt);
 
+        // The generated image is declared as an attachment; the body keeps
+        // the durable File: line instead of marker syntax (which is text
+        // under the attachment-identity contract and would never promote).
         Ok(ToolResult {
             success: true,
             output: output.into(),
             error: None,
-        })
+        }
+        .with_attachment(RenderedMarker {
+            target: path_display,
+            kind: MarkerKind::Image,
+        }))
     }
 }
 
@@ -519,14 +526,19 @@ impl Tool for ImageGenTool {
             });
         }
 
-        let mut result = self.generate(args).await?;
-        // A generated image saved to an ephemeral workspace never reaches the
-        // host and is lost at session end; warn loudly on success
-        if !self.persistent_writes && result.success {
-            result.output = with_ephemeral_workspace_warning(&result.output).into();
-        }
-        Ok(result)
+        let result = self.generate(args).await?;
+        Ok(warn_if_ephemeral(self.persistent_writes, result))
     }
+}
+
+/// A generated image saved to an ephemeral workspace never reaches the host
+/// and is lost at session end; warn loudly on success. The warning rewrites
+/// the text only: the declared image attachment must survive it.
+fn warn_if_ephemeral(persistent_writes: bool, mut result: ToolResult) -> ToolResult {
+    if !persistent_writes && result.success {
+        result.output.map_text(with_ephemeral_workspace_warning);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -1045,7 +1057,41 @@ mod tests {
     }
 
     #[test]
-    fn image_output_emits_matching_file_line_and_image_marker() {
+    fn ephemeral_warning_keeps_the_declared_attachment() {
+        let marker = RenderedMarker {
+            target: "/ws/images/generated_image_42.png".into(),
+            kind: MarkerKind::Image,
+        };
+        let generated = ToolResult {
+            success: true,
+            output: "File: /ws/images/generated_image_42.png".into(),
+            error: None,
+        }
+        .with_attachment(marker.clone());
+
+        let warned = warn_if_ephemeral(false, generated.clone());
+        assert!(
+            warned.output.contains("EPHEMERAL WORKSPACE"),
+            "ephemeral warning must be present, got: {}",
+            warned.output
+        );
+        assert!(
+            warned
+                .output
+                .contains("File: /ws/images/generated_image_42.png")
+        );
+        assert_eq!(warned.output.attachments(), std::slice::from_ref(&marker));
+
+        let persistent = warn_if_ephemeral(true, generated);
+        assert!(!persistent.output.contains("EPHEMERAL WORKSPACE"));
+        assert_eq!(
+            persistent.output.attachments(),
+            std::slice::from_ref(&marker)
+        );
+    }
+
+    #[test]
+    fn image_output_carries_file_line_and_no_inline_marker() {
         let path = "/ws/images/generated_image_42.png";
         let out = format_image_tool_output(path, 12, "fal-ai/flux", "a cat");
         assert!(
@@ -1053,8 +1099,8 @@ mod tests {
             "output must carry a durable File: line: {out}"
         );
         assert!(
-            out.contains(&format!("[IMAGE:{path}]")),
-            "output must carry a matching [IMAGE:<path>] marker: {out}"
+            !out.contains("[IMAGE:"),
+            "the body must not carry marker syntax: {out}"
         );
     }
 

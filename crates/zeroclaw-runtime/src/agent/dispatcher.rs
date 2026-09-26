@@ -1,7 +1,8 @@
-use super::history::canonicalize_tool_result_media_markers_for;
 use crate::tools::{Tool, ToolSpec};
 use serde_json::Value;
 use std::fmt::Write;
+use zeroclaw_api::media::RenderedMarker;
+use zeroclaw_api::tool_carrier::{render_native_attachments, render_prompt_tool_carrier};
 use zeroclaw_providers::{ChatMessage, ChatResponse, ConversationMessage, ToolResultMessage};
 
 #[derive(Debug, Clone)]
@@ -108,16 +109,21 @@ impl ToolDispatcher for XmlToolDispatcher {
 
     fn format_results(&self, results: &[ToolExecutionResult]) -> ConversationMessage {
         let mut content = String::new();
+        // Attachments are declared where the tool ran, not here: this typed
+        // replay path carries no declarations, so the carrier declares zero.
+        let attachments: Vec<RenderedMarker> = Vec::new();
         for result in results {
             let status = if result.success { "ok" } else { "error" };
-            let output = canonicalize_tool_result_media_markers_for(&result.name, &result.output);
             let _ = writeln!(
                 content,
                 "<tool_result name=\"{}\" status=\"{}\">\n{}\n</tool_result>",
-                result.name, status, output
+                result.name, status, result.output
             );
         }
-        ConversationMessage::Chat(ChatMessage::user(format!("[Tool results]\n{content}")))
+        ConversationMessage::Chat(ChatMessage::user(render_prompt_tool_carrier(
+            &content,
+            &attachments,
+        )))
     }
 
     fn prompt_instructions(&self, tools: &[Box<dyn Tool>]) -> String {
@@ -147,18 +153,22 @@ impl ToolDispatcher for XmlToolDispatcher {
                 }
                 ConversationMessage::ToolResults(results) => {
                     let mut content = String::new();
+                    // Typed replay carries no declarations; a bare image path
+                    // in stored tool text stays text under the
+                    // attachment-identity boundary: nothing in tool text is
+                    // promoted unless the tool declared it.
+                    let attachments: Vec<RenderedMarker> = Vec::new();
                     for result in results {
-                        let output = canonicalize_tool_result_media_markers_for(
-                            &result.tool_name,
-                            &result.content,
-                        );
                         let _ = writeln!(
                             content,
                             "<tool_result id=\"{}\">\n{}\n</tool_result>",
-                            result.tool_call_id, output
+                            result.tool_call_id, result.content
                         );
                     }
-                    vec![ChatMessage::user(format!("[Tool results]\n{content}"))]
+                    vec![ChatMessage::user(render_prompt_tool_carrier(
+                        &content,
+                        &attachments,
+                    ))]
                 }
             })
             .collect()
@@ -197,13 +207,14 @@ impl ToolDispatcher for NativeToolDispatcher {
                     .tool_call_id
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string()),
-                // Retain the producing tool name so the read path
-                // (`to_provider_messages`) can re-canonicalize provenance-aware
-                // instead of blindly re-promoting a search/listing path back
-                // into an `[IMAGE:...]` marker
+                // Retain the producing tool name as replay metadata. It is
+                // no longer read for promotion: attachments come only from
+                // the producing tool's own declarations.
                 tool_name: result.name.clone(),
-                // Provenance-gated see the XML dispatcher above.
-                content: canonicalize_tool_result_media_markers_for(&result.name, &result.output),
+                // The verbatim output. The body is never rewritten into
+                // marker syntax, and this typed shape carries no attachment
+                // declarations (a known, disclosed replay limitation).
+                content: result.output.clone(),
             })
             .collect();
         ConversationMessage::ToolResults(messages)
@@ -235,13 +246,15 @@ impl ToolDispatcher for NativeToolDispatcher {
                 ConversationMessage::ToolResults(results) => results
                     .iter()
                     .map(|result| {
+                        // Typed replay writes the declared shape (array key
+                        // always present) with no inferred attachments: a
+                        // bare image path in stored tool text stays text.
+                        let attachments: Vec<RenderedMarker> = Vec::new();
                         ChatMessage::tool(
                             serde_json::json!({
                                 "tool_call_id": result.tool_call_id,
-                                "content": canonicalize_tool_result_media_markers_for(
-                                    &result.tool_name,
-                                    &result.content,
-                                ),
+                                "content": result.content,
+                                "attachments": render_native_attachments(&attachments),
                             })
                             .to_string(),
                         )
@@ -460,13 +473,13 @@ mod tests {
     }
 
     #[test]
-    fn format_results_still_promotes_image_producing_tool_paths() {
-        // Default-allow: a genuinely image-producing tool keeps canonicalization
-        // in BOTH dispatchers, so real tool-produced images still route to a
-        // vision provider.
+    fn format_results_does_not_promote_image_producing_tool_paths() {
+        // The attachment-identity boundary applies to every tool: even a
+        // genuinely image-producing tool's bare path in text is text. The
+        // attachment must come from the tool's own declaration, never from a
+        // read-side scan of the text.
         let dir = tempfile::tempdir().unwrap();
         let path = write_temp_image(dir.path(), "generated.png");
-        let expected = format!("[IMAGE:{path}]");
 
         let xml = XmlToolDispatcher;
         let rendered = xml_format_results_text(
@@ -479,9 +492,15 @@ mod tests {
             },
         );
         assert!(
-            rendered.contains(&expected),
-            "image_gen output must be canonicalized into a marker (XML)"
+            !rendered.contains("[IMAGE:"),
+            "a bare image path must not be promoted into a marker (XML): {rendered}"
         );
+        assert!(
+            rendered.contains(&path),
+            "the literal path text must survive (XML)"
+        );
+        // The prompt carrier declares zero attachments for this round.
+        assert!(rendered.contains("[Tool attachments: 0]"));
 
         let native = NativeToolDispatcher;
         let content = native_format_results_content(
@@ -493,15 +512,22 @@ mod tests {
                 tool_call_id: Some("tc1".into()),
             },
         );
-        assert!(
-            content.contains(&expected),
-            "image_gen output must be canonicalized into a marker (native)"
+        // The stored body stays verbatim; no attachment is inferred.
+        assert_eq!(
+            content,
+            format!("saved to {path}"),
+            "native format_results stores the verbatim output"
         );
     }
 
     fn native_tool_message_content(message: &ChatMessage) -> String {
         let payload: serde_json::Value = serde_json::from_str(&message.content).unwrap();
         payload["content"].as_str().unwrap().to_owned()
+    }
+
+    fn native_tool_message_attachments(message: &ChatMessage) -> serde_json::Value {
+        let payload: serde_json::Value = serde_json::from_str(&message.content).unwrap();
+        payload["attachments"].clone()
     }
 
     fn native_round_trip_tool_content(
@@ -543,34 +569,39 @@ mod tests {
     }
 
     #[test]
-    fn native_image_gen_path_still_promotes_through_to_provider_messages() {
-        // Default-allow preserved across the round trip: a real generated image
-        // still becomes an `[IMAGE:...]` marker, so it routes to a vision
-        // provider as before.
+    fn native_image_gen_bare_path_yields_no_attachments() {
+        // The round trip keeps the boundary: typed replay declares no
+        // attachments, so a real generated image's bare path in stored text
+        // yields an empty array and a verbatim body.
         let dir = tempfile::tempdir().unwrap();
         let path = write_temp_image(dir.path(), "generated.png");
         let native = NativeToolDispatcher;
 
-        let rendered = native_round_trip_tool_content(
-            &native,
-            ToolExecutionResult {
-                name: "image_gen".into(),
-                output: format!("saved to {path}"),
-                success: true,
-                tool_call_id: Some("tc1".into()),
-            },
+        let stored = native.format_results(&[ToolExecutionResult {
+            name: "image_gen".into(),
+            output: format!("saved to {path}"),
+            success: true,
+            tool_call_id: Some("tc1".into()),
+        }]);
+        let messages = native.to_provider_messages(&[stored]);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            native_tool_message_content(&messages[0]),
+            format!("saved to {path}")
         );
-        assert!(
-            rendered.contains(&format!("[IMAGE:{path}]")),
-            "image_gen image must still canonicalize through the round trip"
+        assert_eq!(
+            native_tool_message_attachments(&messages[0]),
+            serde_json::json!([]),
+            "no attachment may be inferred from a bare path in replayed text"
         );
     }
 
     #[test]
-    fn native_unknown_provenance_still_promotes_on_read() {
-        // contract preserved: a tool result stored WITHOUT provenance
-        // (empty `tool_name`, e.g. reconstructed from a provider-wire message)
-        // still has a genuine image path canonicalized on the read side.
+    fn native_unknown_provenance_bare_path_yields_no_attachments() {
+        // A tool result stored WITHOUT provenance (empty `tool_name`, e.g.
+        // reconstructed from a provider-wire message) still yields zero
+        // attachments: provenance was never a promotion license, and the
+        // stored text carries no declarations to read.
         let dir = tempfile::tempdir().unwrap();
         let path = write_temp_image(dir.path(), "history.png");
         let native = NativeToolDispatcher;
@@ -582,9 +613,15 @@ mod tests {
         }])];
         let messages = native.to_provider_messages(&history);
         assert_eq!(messages.len(), 1);
-        assert!(
-            native_tool_message_content(&messages[0]).contains(&format!("[IMAGE:{path}]")),
-            "unknown-provenance result must still promote a real image path"
+        assert_eq!(
+            native_tool_message_content(&messages[0]),
+            format!("Saved image to {path}"),
+            "the body must stay verbatim"
+        );
+        assert_eq!(
+            native_tool_message_attachments(&messages[0]),
+            serde_json::json!([]),
+            "unknown-provenance text must not be promoted on the read side"
         );
     }
 

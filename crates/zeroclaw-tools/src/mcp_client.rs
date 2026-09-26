@@ -1143,6 +1143,79 @@ impl McpRegistry {
         }
     }
 
+    /// Test-only: a registry whose single server answers every JSON-RPC
+    /// request with the same canned `result` and advertises `tool`, so
+    /// `call_tool` routes through the production path. Sibling unit-test
+    /// modules (e.g. `mcp_tool`) use this to drive production `execute`
+    /// end to end without spawning a live MCP child.
+    #[cfg(test)]
+    pub(crate) fn for_test_with_tool_server(
+        server_name: &str,
+        tool: &str,
+        result: serde_json::Value,
+    ) -> Self {
+        use crate::mcp_protocol::{JsonRpcRequest, JsonRpcResponse};
+        use async_trait::async_trait;
+
+        struct CannedTransport {
+            result: serde_json::Value,
+        }
+
+        #[async_trait]
+        impl SharedMcpTransportConn for CannedTransport {
+            async fn send_and_recv(
+                &self,
+                request: &JsonRpcRequest,
+                _lifecycle: &McpRequestLifecycle,
+            ) -> Result<JsonRpcResponse> {
+                Ok(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: request.id.clone(),
+                    result: Some(self.result.clone()),
+                    error: None,
+                })
+            }
+
+            async fn close(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let transport: Arc<dyn SharedMcpTransportConn> = Arc::new(CannedTransport { result });
+        let inner = McpServerInner {
+            config: McpServerConfig {
+                name: server_name.to_string(),
+                ..McpServerConfig::default()
+            },
+            #[cfg(target_has_atomic = "64")]
+            next_id: AtomicU64::new(3),
+            #[cfg(not(target_has_atomic = "64"))]
+            next_id: AtomicU32::new(3),
+            tools: vec![McpToolDef {
+                name: tool.to_string(),
+                description: Some("fake tool".into()),
+                input_schema: serde_json::json!({}),
+            }],
+            capabilities: McpServerCapabilities::default(),
+        };
+        let server = McpServer {
+            inner: Arc::new(Mutex::new(inner)),
+            transport,
+            epoch_gate: Arc::new(RwLock::new(0)),
+            serial_gate: None,
+            recovery: Arc::new(RecoveryBarrier::new()),
+        };
+        let mut tool_index = HashMap::new();
+        tool_index.insert(format!("{server_name}__{tool}"), (0usize, tool.to_string()));
+        let mut server_index = HashMap::new();
+        server_index.insert(server_name.to_string(), 0usize);
+        Self {
+            servers: vec![server],
+            tool_index,
+            server_index,
+        }
+    }
+
     /// All prefixed tool names across all connected servers.
     pub fn tool_names(&self) -> Vec<String> {
         self.tool_index.keys().cloned().collect()

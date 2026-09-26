@@ -78,6 +78,7 @@ async fn record_duplicate_tool_call(
     }
     ToolExecutionOutcome {
         output: duplicate.clone(),
+        attachments: Vec::new(),
         success: false,
         error_reason: Some(duplicate),
         duration: Duration::ZERO,
@@ -194,6 +195,7 @@ pub(crate) async fn prepare_tool_calls(
                     }
                     let outcome = ToolExecutionOutcome {
                         output: cancelled,
+                        attachments: Vec::new(),
                         success: false,
                         error_reason: Some(reason),
                         duration: Duration::ZERO,
@@ -528,6 +530,7 @@ mod tests {
             &prepared.stream_calls,
             vec![ToolExecutionOutcome {
                 output: "ok".to_string(),
+                attachments: Vec::new(),
                 output_data: None,
                 success: true,
                 error_reason: None,
@@ -782,6 +785,7 @@ mod tests {
             &prepared.stream_calls,
             vec![ToolExecutionOutcome {
                 output: "ok".to_string(),
+                attachments: Vec::new(),
                 output_data: None,
                 success: true,
                 error_reason: None,

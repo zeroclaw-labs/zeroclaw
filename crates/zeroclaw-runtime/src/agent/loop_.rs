@@ -149,8 +149,7 @@ pub use super::cost::{
 
 // History management moved to `super::history`.
 pub use super::history::{
-    append_or_merge_system_message, canonicalize_tool_result_media_markers,
-    estimate_history_tokens, load_interactive_session_history,
+    append_or_merge_system_message, estimate_history_tokens, load_interactive_session_history,
     load_interactive_session_history_with_crumb, normalize_system_messages,
     save_interactive_session_history, save_interactive_session_history_with_crumb, trim_history,
     truncate_tool_result,

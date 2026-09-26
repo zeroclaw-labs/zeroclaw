@@ -980,7 +980,6 @@ fn warm_lazy_regexes() {
     std::sync::LazyLock::force(&crate::agent::turn::redact::SENSITIVE_KV_REGEX);
     std::sync::LazyLock::force(&crate::agent::turn::redact::SENSITIVE_KEY_REGEX);
     std::sync::LazyLock::force(&crate::agent::loop_::IMAGE_DATA_URI_REGEX);
-    std::sync::LazyLock::force(&crate::agent::history::LOCAL_IMAGE_PATH_RE);
     zeroclaw_providers::multimodal::warm_lazy_regexes();
 }
 

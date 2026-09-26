@@ -750,8 +750,9 @@ pub struct ModelProviderRuntimeOptions {
     pub chat_template_kwargs: Option<serde_json::Value>,
     /// Path to a custom CA certificate file for TLS connections.
     pub tls_ca_cert_path: Option<String>,
-    /// How compatible chat-completions providers handle image markers in
-    /// native role=`tool` results.
+    /// How compatible chat-completions providers handle images a native
+    /// role=`tool` result declared in its `attachments` array; legacy tool
+    /// results (no array key) pass verbatim under both settings.
     pub tool_result_image_policy: zeroclaw_config::schema::ToolResultImagePolicy,
     /// Root `[multimodal]` policy applied when a provider expands
     /// `[IMAGE:...]` markers into inline data URIs.

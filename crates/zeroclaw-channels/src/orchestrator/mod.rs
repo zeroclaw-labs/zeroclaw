@@ -2437,7 +2437,19 @@ fn strip_tool_result_content(text: &str) -> String {
             .expect("TOOL_RESULT_RE regex must compile")
     });
 
-    let cleaned = TOOL_RESULT_RE.replace_all(text, "");
+    // A new-shape carrier opens with a results prefix, an attachments count
+    // line, and that many marker lines before the body. Parse the carrier so
+    // the fixed-position header and marker lines drop out exactly, and only
+    // the body's tool_result blocks are stripped below.
+    let body = if let Some(parts) = zeroclaw_api::tool_carrier::classify("user", text)
+        && parts.declared
+    {
+        parts.text
+    } else {
+        text.to_string()
+    };
+
+    let cleaned = TOOL_RESULT_RE.replace_all(&body, "");
     let cleaned = cleaned.trim();
 
     // If the only remaining content is the header, drop it entirely.

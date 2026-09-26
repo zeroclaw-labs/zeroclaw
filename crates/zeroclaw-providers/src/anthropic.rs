@@ -372,7 +372,8 @@ enum ToolResultBlock {
 }
 
 /// The tool-result envelope this crate's runtime writes for a native tool call:
-/// `{"tool_call_id": …, "content": "…"}`. Parsed, never serialized.
+/// `{"tool_call_id": …, "content": …, "attachments": …}`. Parsed, never
+/// serialized.
 struct ToolResultEnvelope {
     /// `None` when `tool_call_id` is present but not a string — a shape the
     /// current turn engine does not emit but restored or externally supplied
@@ -955,38 +956,60 @@ impl AnthropicModelProvider {
         format!("[{count} image(s) omitted: unsupported or oversized image reference]")
     }
 
-    /// Builds `tool_result.content` from tool-result text, turning image
-    /// markers into nested `image` blocks.
+    /// Builds `tool_result.content` from a tool result's body and its
+    /// declared attachments, turning the image attachments into nested
+    /// `image` blocks.
     ///
-    /// Multimodal preparation normalizes `[IMAGE:<path>]` to a `data:` URI
-    /// whenever the provider reports `vision`. Before nested blocks existed the
-    /// payload was serialized into a text position and billed as prose — tens of
-    /// thousands of tokens the model reads as gibberish rather than as an image.
+    /// Multimodal preparation normalizes a declared local-path attachment to
+    /// a `data:` URI whenever the provider reports `vision`. Before nested
+    /// blocks existed the payload was serialized into a text position and
+    /// billed as prose — tens of thousands of tokens the model reads as
+    /// gibberish rather than as an image.
     ///
-    /// References that fail the shared structural check are dropped and counted
-    /// in an omission note instead. With no markers at all the original string
-    /// is returned unchanged, so the common path is byte-identical to before.
+    /// The body is never scanned for markers: a carrier's images are exactly
+    /// its declared attachments, and a carrier's body — DECLARED or LEGACY —
+    /// is delivered verbatim, quoted data URIs included: no residual sweep,
+    /// no rewrite. Only attachment metadata is validated: references that
+    /// fail the shared structural check are dropped and counted in an
+    /// omission note appended after the untouched body. A LEGACY carrier
+    /// (`None`: no `attachments` key, a non-array `attachments` value, or
+    /// raw non-JSON tool text) declared nothing, so nothing is validated,
+    /// omitted, or swept either.
     ///
     /// Block order is text first, then images, matching Anthropic's own
     /// documented example. (The user-message arm emits images first and text
     /// after; the two arms differ, and the ordering rule Anthropic enforces is
     /// about `tool_result` blocks relative to other blocks in a message, not
     /// about text relative to image inside a block list.)
-    fn tool_result_content(content: &str) -> ToolResultContent {
-        let (cleaned, refs) = crate::multimodal::parse_image_markers(content);
+    fn tool_result_content(
+        content: &str,
+        attachments: Option<&[zeroclaw_api::media::RenderedMarker]>,
+    ) -> ToolResultContent {
+        let Some(attachments) = attachments else {
+            // A legacy carrier is delivered as its bytes: it never declared
+            // attachments, so nothing is validated, omitted, or swept — the
+            // body is text, quoted data URIs included.
+            return ToolResultContent::Text(content.to_string());
+        };
+        // Image references come only from the declared attachments; the body
+        // is never scanned for markers.
+        let refs: Vec<String> = attachments
+            .iter()
+            .filter(|marker| marker.kind == zeroclaw_api::media::MarkerKind::Image)
+            .map(|marker| marker.target.clone())
+            .collect();
         if refs.is_empty() {
-            // The early return still sweeps. An unterminated marker yields zero
-            // references and copies its payload verbatim into the cleaned text,
-            // so returning here without sweeping would leave raw base64 in a
-            // text position on exactly the path that has no references.
-            return ToolResultContent::Text(Self::sweep_residual_image_data(content).into_owned());
+            // Declared with zero image attachments: the body is verbatim,
+            // data URIs included. Nothing was declared, so nothing is
+            // validated, omitted, or swept.
+            return ToolResultContent::Text(content.to_string());
         }
 
         let (sources, omitted) = Self::deliverable_image_sources(&refs);
-        // Unloadable placeholders stay in `cleaned` as prose and never reach
-        // `refs`, so the count only covers references that were recognised and
-        // still could not be sent.
-        let text = Self::text_with_omission_note(&cleaned, omitted);
+        // Rejected references drop out of the block list; the count only
+        // covers attachments that were declared and still could not be sent.
+        // The body itself stays verbatim: only the omission note is appended.
+        let text = Self::text_with_note(content, omitted);
 
         if sources.is_empty() {
             return ToolResultContent::Text(text);
@@ -1025,20 +1048,8 @@ impl AnthropicModelProvider {
         (sources, omitted)
     }
 
-    /// Sweeps residual raw base64 out of marker-cleaned prose and appends the
-    /// omission note when references were rejected.
-    ///
-    /// The tool arm uses this unconditionally, through
-    /// [`Self::tool_result_content`], its only caller: that input is machine
-    /// output, where a quoted data URI is far rarer than a truncated
-    /// screenshot. The user arm sweeps only marker-carrying text and then calls
-    /// [`Self::text_with_note`] directly — see its call site.
-    fn text_with_omission_note(cleaned: &str, omitted: usize) -> String {
-        Self::text_with_note(&Self::sweep_residual_image_data(cleaned), omitted)
-    }
-
-    /// Appends the omission note to text that has already been swept, or that
-    /// deliberately was not.
+    /// Appends the omission note to text that was deliberately not swept
+    /// (declared carrier bodies pass verbatim; only the note is added).
     fn text_with_note(text: &str, omitted: usize) -> String {
         if omitted == 0 {
             return text.to_string();
@@ -1073,12 +1084,14 @@ impl AnthropicModelProvider {
     /// a truncated marker was never a reference. Keeping it out of the count is
     /// what stops the sweep from double-reporting.
     ///
-    /// On the tool arm, prose that legitimately quotes a data URI is
-    /// rewritten too. That is accepted: a documentation-style example in a tool
-    /// result is far rarer than a truncated screenshot, and the replacement says
-    /// what happened. The user arm does **not** accept that trade — a person
-    /// asking what a data URI decodes to must keep their own text — so it runs
-    /// this only on marker-carrying messages, where residue is possible at all.
+    /// This runs in exactly one place: the user arm, on marker-carrying text
+    /// that is not a tool-result carrier at all. Channel media pipelines
+    /// write data-URI markers into ordinary user text, and a truncated or
+    /// undeliverable marker can leave its payload behind as residue; that is
+    /// the residue this sweep exists to remove. No tool-result carrier body
+    /// — declared or legacy — is ever swept: a carrier's images are exactly
+    /// its declared attachments, and its body is delivered as the tool wrote
+    /// it, quoted data URIs included.
     ///
     /// **What this does not cover**, stated so a reader does not credit it with
     /// more than it does:
@@ -1087,8 +1100,8 @@ impl AnthropicModelProvider {
     ///   character, such as `data:imagé/png;base64,…`. Such a header cannot come
     ///   from this crate's preparation code, and loosening the header rule would
     ///   let any `data:` in prose claim a `;base64,` further down the string.
-    /// - Assistant message text. This runs on the tool-result arm
-    ///   unconditionally and on the user arm only for marker-carrying messages.
+    /// - Assistant message text. This runs only on the user arm, for
+    ///   marker-carrying messages that are not tool-result carriers.
     ///   Assistant content is copied to the wire verbatim, so a data URI the
     ///   model itself wrote is left as the model wrote it.
     /// - A bare data URI a user typed with no image marker anywhere in the
@@ -1393,17 +1406,29 @@ impl AnthropicModelProvider {
                 "tool" => {
                     let envelope = Self::parse_tool_result_envelope(&msg.content);
                     // The tool's own output: the envelope's `content` when this
-                    // is an envelope at all, the raw message otherwise.
+                    // is an envelope at all, the raw message otherwise. A
+                    // legacy envelope or raw text carries no declared
+                    // attachments, so its body is text and never scanned.
                     let carrier = match &envelope {
                         Some(parsed) => parsed.content.as_str(),
                         None => msg.content.as_str(),
                     };
+                    // Declaredness and attachments come from the one
+                    // classifier, not from this arm's own envelope read:
+                    // `None` is a legacy carrier (no declaration); `Some` is
+                    // declared, empty list included. The distinction decides
+                    // whether the body may keep the legacy residual sweep.
+                    let parts = zeroclaw_api::tool_carrier::classify("tool", &msg.content);
+                    let attachments = parts
+                        .as_ref()
+                        .filter(|parts| parts.declared)
+                        .map(|parts| parts.attachments.as_slice());
                     let tool_msg = if let Some(tool_use_id) = envelope
                         .as_ref()
                         .and_then(|parsed| parsed.tool_use_id.clone())
                     {
                         run.mark_answered(&tool_use_id);
-                        Self::tool_result_message(tool_use_id, carrier)
+                        Self::tool_result_message(tool_use_id, carrier, attachments)
                     } else if carrier.trim().is_empty() {
                         // No payload and no usable id: there is nothing to
                         // deliver, so the call is left to the backfill below.
@@ -1418,7 +1443,7 @@ impl AnthropicModelProvider {
                         // `backfill_orphaned_tool_uses` from putting a "tool
                         // result missing" stub next to the real result.
                         run.mark_answered(&tool_use_id);
-                        Self::tool_result_message(tool_use_id, carrier)
+                        Self::tool_result_message(tool_use_id, carrier, attachments)
                     } else {
                         // Zero candidates, or two or more: nothing proves which
                         // call this answers. A `tool_result` structurally requires
@@ -1465,8 +1490,15 @@ impl AnthropicModelProvider {
                     // turn before it.
                     run.end();
 
-                    // Parse image markers from user message content
-                    let (text, image_refs) = crate::multimodal::parse_image_markers(&msg.content);
+                    // Carrier-aware user parsing, the same helper every other
+                    // adapter uses: a declared prompt carrier contributes only
+                    // its declared image attachments and its body survives
+                    // verbatim; a legacy carrier contributes nothing; ordinary
+                    // user text keeps its marker behavior. The raw
+                    // `parse_image_markers` call this replaced let a carrier
+                    // body quoting a marker attach the file it named.
+                    let (text, image_refs) =
+                        crate::multimodal::parse_user_message_image_refs(&msg.content);
                     let mut content_blocks: Vec<NativeContentOut> = Vec::new();
                     let mut omitted = 0usize;
 
@@ -1517,27 +1549,37 @@ impl AnthropicModelProvider {
                         });
                     }
 
-                    // The sweep runs only on marker-carrying text here. Residual
-                    // base64 in a user message can only come from this crate's
-                    // own marker normalization, so a message with no marker at
+                    // The sweep runs only on marker-carrying text that is
+                    // not a tool-result carrier at all — ordinary user text.
+                    // Residual base64 in a user message can only come from
+                    // this crate's own
+                    // marker normalization, so a message with no marker at
                     // all has nothing residual in it — and sweeping anyway
-                    // deleted a data URI the author quoted on purpose ("what does
-                    // this data:application/json;base64,… decode to?"). The tool
-                    // arm still sweeps unconditionally: its input is machine
-                    // output, not something a person typed.
+                    // deleted a data URI the author quoted on purpose ("what
+                    // does this data:application/json;base64,… decode to?").
+                    // A prompt carrier quoting marker syntax in its body is
+                    // a tool reading source text — the ordinary shape of a
+                    // file-reading result — so its body is delivered
+                    // verbatim whether it declared its attachments or not,
+                    // the same rule the native arm applies.
                     //
                     // The test is on `text`, the *cleaned* content, not on
-                    // `msg.content`. `parse_image_markers` lifts a loadable marker
-                    // out whole, so its payload is already gone from `text` and
+                    // `msg.content`. For ordinary user text,
+                    // `parse_image_markers` lifts a loadable marker out
+                    // whole, so its payload is already gone from `text` and
                     // its prefix with it; only the two shapes that can leave
-                    // residue — an unterminated marker, and a terminated one whose
-                    // reference will not load — are copied through verbatim, and
-                    // both keep the `[IMAGE:` prefix. Testing the raw message
-                    // instead opened the gate for the entire text of any message
-                    // that merely attached an image, so a quoted data URI sitting
-                    // beside a working attachment was swept — the exact case this
-                    // gate exists to prevent, one message shape over.
-                    let swept = if crate::multimodal::carries_image_marker(&text) {
+                    // residue — an unterminated marker, and a terminated one
+                    // whose reference will not load — are copied through
+                    // verbatim, and both keep the `[IMAGE:` prefix. Testing
+                    // the raw message instead opened the gate for the entire
+                    // text of any message that merely attached an image, so
+                    // a quoted data URI sitting beside a working attachment
+                    // was swept — the exact case this gate exists to
+                    // prevent, one message shape over.
+                    let swept = if zeroclaw_api::tool_carrier::classify(&msg.role, &msg.content)
+                        .is_none()
+                        && crate::multimodal::carries_image_marker(&text)
+                    {
                         Self::sweep_residual_image_data(&text)
                     } else {
                         Cow::Borrowed(text.as_str())
@@ -1617,13 +1659,19 @@ impl AnthropicModelProvider {
     }
 
     /// A user-role message carrying one `tool_result` for `tool_use_id`, which is
-    /// how Anthropic represents a tool's answer.
-    fn tool_result_message(tool_use_id: String, carrier: &str) -> NativeMessage {
+    /// how Anthropic represents a tool's answer. `attachments` is `None` for a
+    /// legacy carrier (no declaration at the fixed position), `Some` for a
+    /// declared one (including an empty declaration).
+    fn tool_result_message(
+        tool_use_id: String,
+        carrier: &str,
+        attachments: Option<&[zeroclaw_api::media::RenderedMarker]>,
+    ) -> NativeMessage {
         NativeMessage {
             role: "user".to_string(),
             content: vec![NativeContentOut::ToolResult {
                 tool_use_id,
-                content: Self::tool_result_content(carrier),
+                content: Self::tool_result_content(carrier, attachments),
                 cache_control: None,
             }],
         }
@@ -3623,6 +3671,36 @@ mod tests {
     /// A history whose last message is a JSON tool-result envelope answering a
     /// single `tool_use`, so the converted `tool_result` is well-formed and the
     /// cache breakpoint lands on it.
+    /// History whose tool result declares image attachments at the carrier's
+    /// fixed position, the shape the runtime writes.
+    fn history_with_tool_attachments(body: &str, images: &[String]) -> Vec<ChatMessage> {
+        let attachments: Vec<serde_json::Value> = images
+            .iter()
+            .map(|target| serde_json::json!({"kind": "image", "target": target}))
+            .collect();
+        vec![
+            ChatMessage::system("You take screenshots."),
+            ChatMessage::user("take a screenshot"),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "toolu_screenshot", "name": "screenshot", "arguments": "{}"}
+                    ]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": "toolu_screenshot",
+                    "content": body,
+                    "attachments": attachments,
+                })
+                .to_string(),
+            ),
+        ]
+    }
+
     fn history_with_tool_result(result_text: &str) -> Vec<ChatMessage> {
         vec![
             ChatMessage::system("You take screenshots."),
@@ -6355,9 +6433,10 @@ data: {\"type\":\"message_stop\"}\n\n";
             .timeout_secs(120)
             .build();
 
-        let messages = history_with_tool_result(&format!(
-            "saved screenshot [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
-        ));
+        let messages = history_with_tool_attachments(
+            "saved screenshot",
+            &[format!("data:image/png;base64,{CANONICAL_PNG_B64}")],
+        );
         let tools = vec![serde_json::json!({
             "type": "function",
             "function": {
@@ -6453,10 +6532,13 @@ data: {\"type\":\"message_stop\"}\n\n";
     /// omission note, so there were zero image blocks.
     #[test]
     fn tool_result_with_several_images() {
-        let messages = history_with_tool_result(&format!(
-            "two shots [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}] \
-             and [IMAGE:data:image/jpeg;base64,{CANONICAL_JPEG_B64}]"
-        ));
+        let messages = history_with_tool_attachments(
+            "two shots",
+            &[
+                format!("data:image/png;base64,{CANONICAL_PNG_B64}"),
+                format!("data:image/jpeg;base64,{CANONICAL_JPEG_B64}"),
+            ],
+        );
 
         let (_, native_msgs) =
             AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
@@ -6499,11 +6581,14 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn tool_result_mixes_valid_and_rejected_images() {
         let svg_payload = "PHN2Zz48L3N2Zz4=";
-        let messages = history_with_tool_result(&format!(
-            "mixed bag [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}] \
-             [IMAGE:data:image/svg+xml;base64,{svg_payload}] \
-             [IMAGE:http://example.com/remote.png]"
-        ));
+        let messages = history_with_tool_attachments(
+            "mixed bag",
+            &[
+                format!("data:image/png;base64,{CANONICAL_PNG_B64}"),
+                format!("data:image/svg+xml;base64,{svg_payload}"),
+                "http://example.com/remote.png".to_string(),
+            ],
+        );
 
         let (_, native_msgs) =
             AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
@@ -6545,15 +6630,303 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
     }
 
+    // ── B1: carrier-aware conversion, both arms ────────────────────────────
+
+    /// A declared prompt carrier with count zero whose body quotes a marker
+    /// for an existing, valid PNG. The catch-all user arm once parsed the
+    /// body directly and attached that file; the carrier-aware helper must
+    /// leave the marker as text with zero image blocks.
+    ///
+    /// Runs the shared preparation first, then the production converter both
+    /// request modes share.
+    #[tokio::test]
+    async fn prompt_carrier_body_marker_is_never_attached() {
+        let temp = tempfile::tempdir().unwrap();
+        let png = temp.path().join("body-marker.png");
+        std::fs::write(&png, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+        let body = format!("source example: [IMAGE:{}]", png.display());
+        let carrier = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(&body, &[]);
+        let messages = vec![ChatMessage::user(carrier.clone())];
+
+        let prepared = crate::multimodal::prepare_messages_for_provider(
+            &messages,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+        )
+        .await
+        .expect("preparation succeeds");
+        assert!(
+            !prepared.contains_images,
+            "a count-zero carrier's body marker is not an image"
+        );
+
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
+        let blocks = top_level_user_blocks(&native_msgs);
+        assert!(
+            blocks.iter().all(|block| block["type"] != "image"),
+            "no image block may be built from carrier body text: {blocks:?}"
+        );
+        let text = blocks
+            .iter()
+            .find(|block| block["type"] == "text")
+            .and_then(|block| block["text"].as_str())
+            .expect("one text block");
+        assert_eq!(text, carrier, "the carrier text is byte-identical");
+        let parsed = zeroclaw_api::tool_carrier::parse_prompt_tool_carrier(text)
+            .expect("delivered text is still a carrier");
+        assert_eq!(parsed.text, body, "the body is byte-identical");
+    }
+
+    /// A declared prompt carrier with count zero whose body quotes a full
+    /// marker wrapping an inline data URI — the ordinary shape of a tool
+    /// reading a source file that contains one. Extraction leaves the quote
+    /// as body text, and the sweep must agree: byte-identical text, zero
+    /// image blocks, no truncation note, no omission note.
+    ///
+    /// Restoring the sweep gate to marker presence alone (dropping the
+    /// declared-carrier check) replaces the quoted payload with the
+    /// truncation note and fails every assertion here.
+    #[tokio::test]
+    async fn prompt_declared_zero_body_quoting_data_uri_passes_verbatim() {
+        let body =
+            format!("source example: [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}] in prose");
+        let carrier = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(&body, &[]);
+        let messages = vec![ChatMessage::user(carrier.clone())];
+
+        let prepared = crate::multimodal::prepare_messages_for_provider(
+            &messages,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+        )
+        .await
+        .expect("preparation succeeds");
+        assert!(
+            !prepared.contains_images,
+            "a count-zero carrier's quoted marker is not an image"
+        );
+
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
+        let blocks = top_level_user_blocks(&native_msgs);
+        assert!(
+            blocks.iter().all(|block| block["type"] != "image"),
+            "no image block may be built from carrier body text: {blocks:?}"
+        );
+        assert_eq!(blocks.len(), 1, "exactly one text block: {blocks:?}");
+        let text = blocks[0]["text"]
+            .as_str()
+            .expect("the single block is a text block");
+        assert_eq!(text, carrier, "the carrier text is byte-identical");
+        let parsed = zeroclaw_api::tool_carrier::parse_prompt_tool_carrier(text)
+            .expect("delivered text is still a carrier");
+        assert_eq!(parsed.text, body, "the body is byte-identical");
+        assert!(
+            !text.contains(TRUNCATED_DATA_NOTE),
+            "a declared carrier's body is never swept: {text}"
+        );
+        assert!(
+            !text.contains(OMISSION_NOTE_ONE),
+            "nothing was declared and nothing rejected, so no omission note: {text}"
+        );
+    }
+
+    /// A declared prompt carrier with one real image attachment (a tempdir
+    /// PNG carrying the signature bytes) whose body also quotes a data URI
+    /// in marker syntax: exactly one image block from the declaration, and
+    /// the body rides the text block byte-identical, quoted data URI
+    /// included.
+    ///
+    /// Restoring the sweep gate to marker presence alone sweeps the quoted
+    /// payload out of the body and fails the byte-identity assertion.
+    #[tokio::test]
+    async fn prompt_carrier_declared_image_body_quoting_data_uri_verbatim() {
+        use base64::Engine as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let png = temp.path().join("declared.png");
+        let signature = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        std::fs::write(&png, signature).unwrap();
+        let body =
+            format!("source example: [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}] in prose");
+        let marker = zeroclaw_api::media::RenderedMarker {
+            target: png.display().to_string(),
+            kind: zeroclaw_api::media::MarkerKind::Image,
+        };
+        let carrier = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(
+            &body,
+            std::slice::from_ref(&marker),
+        );
+        let messages = vec![ChatMessage::user(carrier)];
+
+        let prepared = crate::multimodal::prepare_messages_for_provider(
+            &messages,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+        )
+        .await
+        .expect("preparation succeeds");
+        assert!(prepared.contains_images, "the declared image counts");
+
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
+        let blocks = top_level_user_blocks(&native_msgs);
+        let images: Vec<_> = blocks
+            .iter()
+            .filter(|block| block["type"] == "image")
+            .collect();
+        assert_eq!(images.len(), 1, "exactly one image block: {blocks:?}");
+        assert_eq!(images[0]["source"]["media_type"], "image/png");
+        assert_eq!(
+            images[0]["source"]["data"],
+            base64::engine::general_purpose::STANDARD.encode(signature),
+            "the image block carries the declared file's bytes"
+        );
+        let text = blocks
+            .iter()
+            .find(|block| block["type"] == "text")
+            .and_then(|block| block["text"].as_str())
+            .expect("one text block");
+        assert_eq!(
+            text,
+            zeroclaw_api::tool_carrier::render_prompt_tool_carrier(&body, &[]),
+            "the body rides the text block byte-identical, quoted data URI included"
+        );
+        let wire = serde_json::to_string(&native_msgs).expect("serialize");
+        assert!(
+            !wire.contains(TRUNCATED_DATA_NOTE),
+            "a declared carrier's body is never swept: {wire}"
+        );
+    }
+
+    /// A declared native carrier with `attachments: []` whose body quotes a
+    /// base64 image data URI inside prose. The residual sweep must not touch
+    /// a declared carrier's body: the text block is byte-identical and no
+    /// truncation note appears.
+    #[tokio::test]
+    async fn native_declared_zero_attachments_body_passes_verbatim() {
+        let body = format!("source example: data:image/png;base64,{CANONICAL_PNG_B64} in prose");
+        let messages = history_with_tool_attachments(&body, &[]);
+
+        let prepared = crate::multimodal::prepare_messages_for_provider(
+            &messages,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+        )
+        .await
+        .expect("preparation succeeds");
+        assert!(!prepared.contains_images);
+
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
+        let tool_result = first_tool_result_on_the_wire(&native_msgs);
+        // One text block serializes as a bare string, not a block list.
+        let content = tool_result["content"]
+            .as_str()
+            .expect("zero-declared content is a bare text string");
+        assert_eq!(
+            content, body,
+            "the declared body is byte-identical, data URI included"
+        );
+        assert!(
+            !body.contains(TRUNCATED_DATA_NOTE),
+            "the fixture must not name the note itself"
+        );
+        assert!(
+            !tool_result.to_string().contains(TRUNCATED_DATA_NOTE),
+            "no truncation note may be appended to a declared body: {tool_result}"
+        );
+    }
+
+    /// A declared prompt carrier with one image attachment: exactly one image
+    /// block from the declaration, and the body verbatim in the text block.
+    #[tokio::test]
+    async fn prompt_carrier_declared_image_builds_exactly_one_block() {
+        let body = "<tool_result name=\"image_info\">File: /tmp/a.png</tool_result>";
+        let marker = zeroclaw_api::media::RenderedMarker {
+            target: format!("data:image/png;base64,{CANONICAL_PNG_B64}"),
+            kind: zeroclaw_api::media::MarkerKind::Image,
+        };
+        let carrier = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(
+            body,
+            std::slice::from_ref(&marker),
+        );
+        let messages = vec![ChatMessage::user(carrier)];
+
+        let prepared = crate::multimodal::prepare_messages_for_provider(
+            &messages,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+        )
+        .await
+        .expect("preparation succeeds");
+        assert!(prepared.contains_images, "the declared image counts");
+
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
+        let blocks = top_level_user_blocks(&native_msgs);
+        let images: Vec<_> = blocks
+            .iter()
+            .filter(|block| block["type"] == "image")
+            .collect();
+        assert_eq!(images.len(), 1, "exactly one image block: {blocks:?}");
+        assert_eq!(images[0]["source"]["media_type"], "image/png");
+        assert_eq!(images[0]["source"]["data"], CANONICAL_PNG_B64);
+        let text = blocks
+            .iter()
+            .find(|block| block["type"] == "text")
+            .and_then(|block| block["text"].as_str())
+            .expect("one text block");
+        assert_eq!(
+            text,
+            zeroclaw_api::tool_carrier::render_prompt_tool_carrier(body, &[]),
+            "the body rides the text block verbatim"
+        );
+    }
+
+    /// A legacy native carrier (no `attachments` key) whose body quotes a
+    /// base64 image data URI in prose: the carrier declared nothing, so
+    /// nothing is validated, omitted, or swept — the body reaches the
+    /// serialized `tool_result` verbatim, quoted payload included. This is
+    /// the known limit of the legacy rule: a pre-upgrade carrier body is
+    /// text, and nothing infers, sweeps, or strips it.
+    #[tokio::test]
+    async fn legacy_native_carrier_body_reaches_tool_result_verbatim() {
+        let body = format!(
+            "saved data:image/png;{}{CANONICAL_PNG_B64} payload",
+            "base64,"
+        );
+        let messages = history_with_tool_result(&body);
+
+        let prepared = crate::multimodal::prepare_messages_for_provider(
+            &messages,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+        )
+        .await
+        .expect("preparation succeeds");
+
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&prepared.messages, CacheTtl::default());
+        let tool_result = first_tool_result_on_the_wire(&native_msgs);
+        // One text block serializes as a bare string, not a block list.
+        let content = tool_result["content"]
+            .as_str()
+            .expect("legacy verbatim content is a bare text string");
+        assert_eq!(
+            content, body,
+            "a legacy carrier's body is delivered byte for byte, data URI included"
+        );
+        assert!(
+            !tool_result.to_string().contains(TRUNCATED_DATA_NOTE),
+            "no residual sweep runs on a legacy carrier: {tool_result}"
+        );
+    }
+
     /// An image with no prose around it produces an image block and no empty
     /// text block.
     ///
     /// Before the change the content became the bare omission note.
     #[test]
     fn tool_result_image_only_has_no_empty_text_block() {
-        let messages = history_with_tool_result(&format!(
-            "[IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
-        ));
+        let messages = history_with_tool_attachments(
+            "",
+            &[format!("data:image/png;base64,{CANONICAL_PNG_B64}")],
+        );
 
         let (_, native_msgs) =
             AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
@@ -6601,9 +6974,13 @@ data: {\"type\":\"message_stop\"}\n\n";
         ];
 
         for (label, rejected) in cases {
-            let messages = history_with_tool_result(&format!(
-                "prose [IMAGE:{rejected}] [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
-            ));
+            let messages = history_with_tool_attachments(
+                "prose",
+                &[
+                    rejected.clone(),
+                    format!("data:image/png;base64,{CANONICAL_PNG_B64}"),
+                ],
+            );
 
             let (_, native_msgs) =
                 AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
@@ -6653,9 +7030,10 @@ data: {\"type\":\"message_stop\"}\n\n";
     /// fails before the change.
     #[test]
     fn tool_result_block_list_still_takes_cache_control() {
-        let messages = history_with_tool_result(&format!(
-            "shot [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
-        ));
+        let messages = history_with_tool_attachments(
+            "shot",
+            &[format!("data:image/png;base64,{CANONICAL_PNG_B64}")],
+        );
 
         let (_, mut native_msgs) =
             AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
@@ -6768,24 +7146,22 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
         assert_eq!(tool_results[0]["tool_use_id"], "toolu_only");
 
-        let blocks = tool_results[0]["content"]
-            .as_array()
-            .unwrap_or_else(|| panic!("expected a block list: {}", tool_results[0]));
+        // A raw non-JSON carrier is a legacy shape: its body is text under
+        // the attachment-identity contract, so the tool_result delivers plain
+        // text, never an image block, and the marker syntax survives.
+        let content = tool_results[0]["content"].as_str().unwrap_or_else(|| {
+            panic!(
+                "legacy tool_result content must be text: {}",
+                tool_results[0]
+            )
+        });
         assert!(
-            blocks
-                .iter()
-                .any(|block| block["type"] == "image"
-                    && block["source"]["data"] == CANONICAL_PNG_B64),
-            "the image must be nested in the recovered tool_result: {}",
-            tool_results[0]
+            content.contains("raw output"),
+            "the raw body must survive: {content}"
         );
         assert!(
-            blocks.iter().any(|block| block["type"] == "text"
-                && block["text"]
-                    .as_str()
-                    .is_some_and(|text| text.contains("raw output"))),
-            "the surrounding prose must survive: {}",
-            tool_results[0]
+            content.contains("[IMAGE:"),
+            "the marker syntax in the body stays literal text: {content}"
         );
 
         let wire = serde_json::to_string(&native_msgs).expect("serialize");
@@ -7128,7 +7504,11 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn null_id_envelope_still_delivers_the_image() {
         let envelope = serde_json::json!({
             "tool_call_id": serde_json::Value::Null,
-            "content": format!("shot [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"),
+            "content": "shot",
+            "attachments": [{
+                "kind": "image",
+                "target": format!("data:image/png;base64,{CANONICAL_PNG_B64}")
+            }],
         })
         .to_string();
         let messages = vec![
@@ -7287,7 +7667,11 @@ data: {\"type\":\"message_stop\"}\n\n";
             ChatMessage::tool(
                 serde_json::json!({
                     "tool_call_id": "toolu_a",
-                    "content": format!("second answer [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"),
+                    "content": "second answer",
+                    "attachments": [{
+                        "kind": "image",
+                        "target": format!("data:image/png;base64,{CANONICAL_PNG_B64}")
+                    }],
                 })
                 .to_string(),
             ),
@@ -7558,46 +7942,6 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
     }
 
-    /// A line-wrapped unterminated marker leaves no base64 behind either, and
-    /// ordinary prose after a data URI survives.
-    ///
-    /// `parse_image_markers` only collapses a wrapped marker when it is
-    /// terminated, so a truncated wrapped payload arrives with its newlines
-    /// intact. Sweeping only to the first newline left every later line in a text
-    /// position — tens of thousands of prose tokens, which is the original bug.
-    #[test]
-    fn wrapped_unterminated_marker_leaves_no_base64_in_text() {
-        // Two lines, each a full canonical payload, with no closing bracket.
-        let wrapped =
-            format!("[IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}\n{CANONICAL_PNG_B64}");
-        let messages = history_with_tool_result(&format!("saved {wrapped}"));
-
-        let (_, native_msgs) =
-            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
-        let wire = serde_json::to_string(&native_msgs).expect("serialize");
-        assert!(
-            !wire.contains(CANONICAL_PNG_B64),
-            "no wrapped line may survive on the wire: {wire}"
-        );
-        assert!(
-            wire.contains("[truncated inline data removed]"),
-            "the replacement literal must say what happened: {wire}"
-        );
-
-        // The continuation rule must not eat prose: a short word after the
-        // payload is not a wrapped line.
-        let with_prose = history_with_tool_result(&format!(
-            "[IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}\nthe screenshot was truncated"
-        ));
-        let (_, native_msgs) =
-            AnthropicModelProvider::convert_messages(&with_prose, CacheTtl::default());
-        let wire = serde_json::to_string(&native_msgs).expect("serialize");
-        assert!(
-            wire.contains("the screenshot was truncated"),
-            "prose after a swept run must survive: {wire}"
-        );
-    }
-
     /// The residual sweep makes one pass over its input, and says so by the
     /// clock rather than by hanging.
     ///
@@ -7772,30 +8116,6 @@ data: {\"type\":\"message_stop\"}\n\n";
                 "{label}: no header may survive either: {swept}"
             );
         }
-    }
-
-    /// The payload of an overlapping run reaches no text field on the wire.
-    ///
-    /// The unit test above pins the sweep itself; this pins the property a
-    /// reader actually cares about, through the whole conversion.
-    #[test]
-    fn overlapping_marker_payload_reaches_no_serialized_text_field() {
-        let overlapped =
-            format!("[IMAGE:data:image/png;base64,AAAAdata:image/png;base64,{CANONICAL_PNG_B64}");
-        let messages = history_with_tool_result(&format!("saved {overlapped}"));
-
-        let (_, native_msgs) =
-            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
-        let wire = serde_json::to_string(&native_msgs).expect("serialize");
-
-        assert!(
-            !wire.contains(CANONICAL_PNG_B64),
-            "the overlapped payload must not survive anywhere on the wire: {wire}"
-        );
-        assert!(
-            wire.contains("[truncated inline data removed]"),
-            "the replacement literal must say what happened: {wire}"
-        );
     }
 
     /// A near-miss `base64` parameter is refused by the splitter, so it cannot
@@ -8176,48 +8496,38 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
     }
 
-    /// A marker with no closing `]` leaves raw base64 in a text position:
-    /// `parse_image_markers` copies the remainder verbatim into the cleaned text
-    /// and returns no reference, so the zero-reference early return passed it
-    /// straight through. Asserted on both a tool result and a user message,
-    /// because both consume the same parser.
-    ///
-    /// Fails before the change on both arms: the payload survives in a `text`
-    /// field and no replacement literal is written.
     #[test]
     fn unterminated_marker_leaves_no_base64_in_text() {
-        let unterminated = format!("[IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}");
+        // The sweep's remaining scope is ordinary user text: channel media
+        // pipelines write data-URI markers into user messages, and a
+        // truncated one can leave its payload behind as residue. (A tool
+        // result carrying the same shape is a legacy carrier: its body is
+        // delivered as its bytes, payload included.)
+        let unterminated = format!(
+            "[{}data:image/png;{}{CANONICAL_PNG_B64}",
+            "IMAGE:", "base64,"
+        );
+        let messages = vec![ChatMessage::user(format!("look at {unterminated}"))];
 
-        let tool_messages = history_with_tool_result(&format!("saved {unterminated}"));
-        let user_messages = vec![ChatMessage::user(format!("look at {unterminated}"))];
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
+        // The whole serialized request, not just `text` fields.
+        let wire = serde_json::to_string(&native_msgs).expect("serialize");
 
-        for (label, messages) in [
-            ("tool result", tool_messages),
-            ("user message", user_messages),
-        ] {
-            let (_, native_msgs) =
-                AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
-            // The whole serialized request, not just `text` fields: an
-            // image-free tool result carries its prose as a bare JSON string on
-            // `content`, which is a text position all the same.
-            let wire = serde_json::to_string(&native_msgs).expect("serialize");
-
-            assert!(
-                !wire.contains(CANONICAL_PNG_B64),
-                "{label}: raw base64 must not survive anywhere on the wire: {wire}"
-            );
-            assert!(
-                wire.contains("[truncated inline data removed]"),
-                "{label}: the replacement literal must say what happened: {wire}"
-            );
-            // A truncated marker was never a reference, so it is not counted.
-            assert!(
-                !wire.contains("image(s) omitted"),
-                "{label}: a swept run must not be double-reported as an omission: {wire}"
-            );
-        }
+        assert!(
+            !wire.contains(CANONICAL_PNG_B64),
+            "raw base64 must not survive anywhere on the wire: {wire}"
+        );
+        assert!(
+            wire.contains("[truncated inline data removed]"),
+            "the replacement literal must say what happened: {wire}"
+        );
+        // A truncated marker was never a reference, so it is not counted.
+        assert!(
+            !wire.contains("image(s) omitted"),
+            "a swept run must not be double-reported as an omission: {wire}"
+        );
     }
-
     /// The user arm now runs its data URIs through the same structural check the
     /// tool arm uses. Each rejection class carries a deliverable PNG alongside
     /// it, and the all-rejected case must not claim an image is attached.
@@ -8429,7 +8739,11 @@ data: {\"type\":\"message_stop\"}\n\n";
                     "tool_call_id": "toolu_shot",
                     // Drive-letter paths are loadable references, so this works
                     // on Windows as well as Unix.
-                    "content": format!("saved [IMAGE:{}]", image_path.display()),
+                    "content": "saved",
+                    "attachments": [{
+                        "kind": "image",
+                        "target": image_path.display().to_string()
+                    }],
                 })
                 .to_string(),
             ),
@@ -8443,7 +8757,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         .expect("preparation should succeed for a local PNG");
         assert!(
             prepared.contains_images,
-            "preparation must have found the marker, or the rest asserts nothing"
+            "preparation must have normalized the declared attachment, or the rest asserts nothing"
         );
 
         let (_, native_msgs) =

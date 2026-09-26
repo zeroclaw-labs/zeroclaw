@@ -89,7 +89,7 @@ impl Tool for FileReadTool {
         let is_base64 = args.get("encoding").and_then(|v| v.as_str()) == Some("base64");
         let mut result = self.read_path(args).await?;
         if !self.persistent_writes && result.success && !is_base64 {
-            result.output = with_ephemeral_workspace_warning(&result.output).into();
+            result.output.map_text(with_ephemeral_workspace_warning);
         }
         Ok(result)
     }

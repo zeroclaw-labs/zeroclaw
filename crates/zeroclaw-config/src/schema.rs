@@ -804,17 +804,18 @@ impl WireApi {
     }
 }
 
-/// Policy for image markers embedded in native tool-result content.
+/// Policy for images a native tool-result carrier declared in its
+/// `attachments` array.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
 )]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ToolResultImagePolicy {
-    /// Preserve tool-result image markers as structured `image_url` parts.
+    /// Send declared tool-result images as structured `image_url` parts.
     #[default]
     ImageUrl,
-    /// Remove tool-result image payloads and leave a fixed notice for the model.
+    /// Drop declared tool-result images and leave a fixed notice for the model.
     Omit,
 }
 
@@ -1065,10 +1066,14 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<bool>,
-    /// How native compatible chat-completions providers handle image markers in
-    /// role=`tool` results. `image_url` preserves structured image parts;
-    /// `omit` removes their payloads and appends a fixed notice. This does not
-    /// affect direct user image content or OpenAI Responses providers.
+    /// How native compatible chat-completions providers handle images a
+    /// role=`tool` result declared in its `attachments` array. `image_url`
+    /// sends them as structured image parts; `omit` drops them and appends a
+    /// fixed notice, keeping the result text verbatim. Legacy tool results
+    /// (no array key) pass verbatim under both settings: they declare
+    /// nothing and their bodies are text, so literal marker syntax in a
+    /// tool's output never drives this policy. This does not affect direct
+    /// user image content or OpenAI Responses providers.
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "is_default_tool_result_image_policy")]
     pub tool_result_image_policy: ToolResultImagePolicy,
@@ -7050,16 +7055,17 @@ impl Default for PipelineConfig {
 ///
 /// # Privacy and cost note
 ///
-/// Tool results that print real local image paths (e.g. shell tools doing
-/// `ls /pictures` or `find . -name '*.png'`) are canonicalized into
-/// `[IMAGE:...]` markers and base64-inlined into the next provider request.
-/// This means image bytes that previously stayed local will be uploaded to
-/// the configured provider when surfaced by a tool.
+/// Tool text is never scanned for image paths: a tool result that merely
+/// prints a local path (e.g. shell tools doing `ls /pictures` or
+/// `find . -name '*.png'`) stays text. Image bytes are uploaded only when a
+/// tool explicitly declares an attachment, and a declared attachment is
+/// base64-inlined into the next provider request, so operators running
+/// tools that declare image attachments over personal or sensitive files
+/// should be aware of the upload semantics.
 ///
 /// `max_images` (and the `trim_old_images` LRU policy) bounds the per-request
-/// image budget, but operators running shell-style tools over directories of
-/// personal or sensitive images should be aware of the upload semantics. See
-/// `docs/book/src/contributing/privacy.md` for the project's privacy stance.
+/// image budget. See `docs/book/src/contributing/privacy.md` for the
+/// project's privacy stance.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "multimodal"]

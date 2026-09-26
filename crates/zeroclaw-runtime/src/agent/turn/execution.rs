@@ -80,11 +80,12 @@ impl ResolvedModelAccess<'_> {
         // (`prepare_messages_for_provider`): callers that want images in the
         // request normalize before calling, and the max-iteration graceful
         // summary does. As a fail-closed backstop for every other caller,
-        // loadable audio markers are replaced with a placeholder here, and so
-        // are image markers whose reference is not an inline `data:` URI, so
-        // no filesystem path or URL marker can reach a provider adapter
-        // through this seam. Both helpers borrow the input untouched when
-        // clean.
+        // loadable audio markers are replaced with a placeholder here, and
+        // image references that are not inline `data:` URIs are dropped the
+        // same way: a path or URL marker in a legacy body becomes a
+        // placeholder, while a declared carrier keeps its body verbatim and
+        // loses only the undeliverable attachments from its declared list.
+        // Both helpers borrow the input untouched when clean.
         let ChatRequest {
             messages,
             tools,

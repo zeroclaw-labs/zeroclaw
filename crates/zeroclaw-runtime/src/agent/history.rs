@@ -1,26 +1,16 @@
 use crate::agent::history_pruner::remove_orphaned_tool_messages;
 use anyhow::Result;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::sync::LazyLock;
 use zeroclaw_providers::ChatMessage;
-use zeroclaw_providers::multimodal::IMAGE_MARKER_PREFIX;
 use zeroclaw_providers::multimodal::ImageMarkerDisposition;
 use zeroclaw_providers::multimodal::image_marker_dispositions;
-use zeroclaw_providers::multimodal::image_marker_summary;
+use zeroclaw_providers::multimodal::message_image_summary;
 
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
 /// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
 /// used when callers omit the parameter.
 pub const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
-
-pub(crate) static LOCAL_IMAGE_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?:[A-Za-z]:[\\/]|\\\\[^\s<>'"`\]\)/\\]+[\\/]|/)[^\s<>'"`\]\)]+?\.(?i:png|jpe?g|webp|gif|bmp)"#,
-    )
-    .expect("valid image path regex")
-});
 
 /// Returns the largest UTF-8 character boundary at or before `index`.
 ///
@@ -161,140 +151,6 @@ pub fn truncate_tool_result(output: &str, max_chars: usize) -> String {
     truncate_tool_result_with_metadata(output, max_chars).output
 }
 
-fn is_existing_local_image_path(path: &str) -> bool {
-    let candidate = Path::new(path);
-    candidate.is_absolute()
-        && candidate.is_file()
-        && candidate
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| {
-                matches!(
-                    ext.to_ascii_lowercase().as_str(),
-                    "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp"
-                )
-            })
-}
-
-fn existing_marker_payloads(output: &str) -> std::collections::HashSet<&str> {
-    const OPEN: &str = "[IMAGE:";
-    let mut set = std::collections::HashSet::new();
-    let mut from = 0usize;
-    while let Some(rel) = output[from..].find(OPEN) {
-        let inner_start = from + rel + OPEN.len();
-        let Some(rel_end) = output[inner_start..].find(']') else {
-            break;
-        };
-        let inner_end = inner_start + rel_end;
-        set.insert(output[inner_start..inner_end].trim());
-        from = inner_end + 1;
-    }
-    set
-}
-
-/// Maximum number of bare image paths a single tool result may have promoted
-/// into `[IMAGE:...]` markers.
-///
-/// A tool that genuinely produces images emits a handful of them. A directory
-/// listing or a recursive find over a workspace emits hundreds, and promoting
-/// those uploads unrelated local files to the provider and can push the request
-/// past the model's context window. Beyond this bound the result is treated as
-/// a listing and nothing is promoted.
-///
-/// This is the content-based half of the rule in
-/// `docs/book/src/architecture/memory-payload-lifecycle.md`: "image-path
-/// promotion must only happen for producing tools, not path-listing tools".
-/// [`is_path_listing_tool`] covers the tools we can name; this covers the
-/// generic ones we cannot, such as a shell tool running `find`.
-const MAX_PROMOTED_TOOL_RESULT_IMAGES: usize = 8;
-
-/// Rewrite real local image file paths in tool output into `[IMAGE:...]`
-/// markers so the multimodal pipeline can normalize them before the next
-/// provider call. This targets shell/skill outputs that print filesystem
-/// paths directly rather than returning explicit media markers.
-///
-/// A result carrying more than `MAX_PROMOTED_TOOL_RESULT_IMAGES` promotable
-/// paths is treated as a path listing: nothing is promoted and every path
-/// survives as ordinary text, so the model still sees the listing. Explicit
-/// `[IMAGE:...]` markers already present in the output are never affected —
-/// a producing tool keeps working even when its output also lists files.
-pub fn canonicalize_tool_result_media_markers(output: &str) -> String {
-    let existing_markers = existing_marker_payloads(output);
-
-    // Resolve the promotable spans before rewriting anything, so the count is
-    // known before the decision. Collection stops as soon as the bound is
-    // exceeded, which also spares an enormous listing one filesystem probe per
-    // entry.
-    let mut promotable: Vec<(usize, usize)> = Vec::new();
-    for mat in LOCAL_IMAGE_PATH_RE.find_iter(output) {
-        let start = mat.start();
-        let end = mat.end();
-        let path = &output[start..end];
-
-        // Skip paths that are already part of an explicit media marker.
-        if output[..start].ends_with("[IMAGE:") {
-            continue;
-        }
-
-        // Skip a bare path that already appears inside an explicit marker
-        // elsewhere in the same output — promoting it would double-count the
-        // image (see `existing_marker_payloads`).
-        if existing_markers.contains(path) {
-            continue;
-        }
-
-        if !is_existing_local_image_path(path) {
-            continue;
-        }
-
-        if promotable.len() == MAX_PROMOTED_TOOL_RESULT_IMAGES {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({
-                        "max_promoted_images": MAX_PROMOTED_TOOL_RESULT_IMAGES,
-                    })),
-                "tool result looks like a path listing; leaving image paths as text"
-            );
-            return output.to_string();
-        }
-
-        promotable.push((start, end));
-    }
-
-    if promotable.is_empty() {
-        return output.to_string();
-    }
-
-    let mut rewritten = String::with_capacity(output.len());
-    let mut cursor = 0usize;
-    for (start, end) in promotable {
-        rewritten.push_str(&output[cursor..start]);
-        rewritten.push_str("[IMAGE:");
-        rewritten.push_str(&output[start..end]);
-        rewritten.push(']');
-        cursor = end;
-    }
-
-    rewritten.push_str(&output[cursor..]);
-    rewritten
-}
-
-fn is_path_listing_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name.to_ascii_lowercase().as_str(),
-        "content_search" | "glob_search"
-    )
-}
-
-pub fn canonicalize_tool_result_media_markers_for(tool_name: &str, output: &str) -> String {
-    if is_path_listing_tool(tool_name) {
-        output.to_string()
-    } else {
-        canonicalize_tool_result_media_markers(output)
-    }
-}
-
 /// Truncate a tool message's content, preserving JSON structure when the
 /// message stores `tool_call_id` alongside `content` (native tool-call
 /// format). Without this, `truncate_tool_result` destroys the JSON envelope
@@ -315,8 +171,10 @@ pub fn truncate_tool_message(msg_content: &str, max_chars: usize) -> String {
     truncate_tool_result(msg_content, max_chars)
 }
 
-/// Fixed per-image charge for `[IMAGE:...]` markers in the history estimate.
-/// Approximates the standard-tier Anthropic maximum (1,568 tokens for an image
+/// Fixed per-image charge in the history estimate, applied to the images
+/// preparation dispatches: the markers it lifts from user messages and the
+/// attachments a tool-result carrier declares. Approximates the
+/// standard-tier Anthropic maximum (1,568 tokens for an image
 /// at the 1568px downscale). High-resolution tiers and some models bill more
 /// (Anthropic high-res up to 4,784; GPT-4o-mini base 2,833; Qwen-VL ~4k per
 /// A4 page): this is a heuristic for trimming, not a ceiling, and
@@ -324,42 +182,52 @@ pub fn truncate_tool_message(msg_content: &str, max_chars: usize) -> String {
 pub const IMAGE_TOKEN_ESTIMATE: usize = 1_600;
 
 /// Estimate the token cost of a single message: the ~4 chars/token heuristic
-/// plus ~4 framing tokens (role, delimiters). Loadable `[IMAGE:...]` markers
-/// are charged at [`IMAGE_TOKEN_ESTIMATE`] per image only when preparation
-/// dispatches them as images ([`ImageMarkerDisposition::Normalized`]); stale
-/// tool-result markers are priced as their non-marker text, and system or
-/// assistant content stays literal text. A message whose markers are all
+/// plus ~4 framing tokens (role, delimiters). Images follow preparation
+/// ([`message_image_summary`]): a tool-result carrier is charged for the
+/// attachments it declared, with marker syntax in its body counted as text,
+/// and a user message is charged for the loadable `[IMAGE:...]` markers
+/// preparation lifts. The per-image charge applies only when preparation
+/// dispatches the images ([`ImageMarkerDisposition::Normalized`]); stale
+/// tool-result carriers are priced as their bytes (the same formula as
+/// literal text; see the arm below), and system or assistant content
+/// stays literal text. A message whose markers are all
 /// placeholders keeps the plain-text formula. Single-sourced so the history
 /// and system-floor estimates stay in lock-step.
 fn estimate_message_tokens(message: &ChatMessage, disposition: ImageMarkerDisposition) -> usize {
     let text_estimate = message.content.len().div_ceil(4) + 4;
-    if disposition == ImageMarkerDisposition::Literal
-        || !message.content.contains(IMAGE_MARKER_PREFIX)
-    {
+    if disposition == ImageMarkerDisposition::Literal {
         return text_estimate;
     }
-    let summary = image_marker_summary(&message.content);
-    if summary.image_refs == 0 {
-        return text_estimate; // placeholders stay text, byte-identical to the plain formula
-    }
+    // The summary cannot be skipped on a marker-free fast path: a declared
+    // native carrier carries its images as JSON attachments with no marker
+    // syntax in the content at all.
+    let summary = message_image_summary(message);
     match disposition {
         ImageMarkerDisposition::Normalized => {
             summary.text_bytes.div_ceil(4) + summary.image_refs * IMAGE_TOKEN_ESTIMATE + 4
         }
-        ImageMarkerDisposition::Stripped => summary.text_bytes.div_ceil(4) + 4,
+        // A stale carrier is priced as its bytes: the replay delivers a
+        // legacy carrier verbatim and re-declares a declared one without
+        // touching its body, so the full content length is the price. (A
+        // stale declared envelope still carries its original attachment
+        // list in these bytes; that overcount is the accepted, conservative
+        // known limit.)
+        ImageMarkerDisposition::Stripped => text_estimate,
         // Unreachable after the guard; keeps the arm total.
         ImageMarkerDisposition::Literal => text_estimate,
     }
 }
 
 /// Estimate token count for a message history using the ~4 chars/token
-/// heuristic plus ~4 framing tokens per message. Loadable image markers are
-/// charged per image only where preparation dispatches them: user turns and
-/// the tool-result carriers in the current user turn. Stale tool-result
-/// markers are priced as their remaining text, and system or assistant
-/// content is priced as text. Trim probes estimate history suffixes that
-/// always retain the newest turn, so the current turn's tool-result carriers
-/// carry the same disposition in every probe as in the full history.
+/// heuristic plus ~4 framing tokens per message. Images are charged per
+/// image only where preparation dispatches them: the markers lifted from
+/// user turns and the attachments declared by the tool-result carriers of
+/// the current user turn. Stale tool-result carriers are priced as their
+/// bytes, and system or assistant content is priced
+/// as text. Trim
+/// probes estimate history suffixes that always retain the newest turn, so
+/// the current turn's tool-result carriers carry the same disposition in
+/// every probe as in the full history.
 pub fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
     let dispositions = image_marker_dispositions(history);
     history
@@ -791,47 +659,64 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stale_tool_result_markers_are_not_charged_as_images() {
-        let markers: Vec<String> = (0..30)
-            .map(|index| format!("[IMAGE:/tmp/slide-{index}.png]"))
+    /// A native tool-result carrier in the shape the runtime writes: call
+    /// id, verbatim body, and the attachments array at the fixed position.
+    fn native_image_carrier(body: &str, images: &[&str]) -> ChatMessage {
+        let attachments: Vec<_> = images
+            .iter()
+            .map(|target| zeroclaw_api::media::RenderedMarker {
+                target: (*target).to_string(),
+                kind: zeroclaw_api::media::MarkerKind::Image,
+            })
             .collect();
-        // Bookend prose keeps the non-marker text identical whether the
-        // marker scanner trims the cleaned string or counts raw segment bytes.
-        let tool_content = format!("a\n{}\nb", markers.join("\n"));
-        let tool_text_bytes = "a\n".len() + "\n".len() * (markers.len() - 1) + "\nb".len();
-        let tool = ChatMessage::tool(&tool_content);
+        ChatMessage::tool(
+            serde_json::json!({
+                "tool_call_id": "call-1",
+                "content": body,
+                "attachments": zeroclaw_api::tool_carrier::render_native_attachments(&attachments),
+            })
+            .to_string(),
+        )
+    }
 
-        let prefix = || {
-            vec![
-                ChatMessage::system("s"),
-                ChatMessage::user("u"),
-                ChatMessage::assistant("called tools"),
-            ]
-        };
-
-        // A trailing user turn makes the tool run stale: preparation strips
-        // the markers, so the estimate must price the message as text only.
-        let stale_history = [prefix(), vec![tool.clone(), ChatMessage::user("next")]].concat();
-        let stale_control = [prefix(), vec![ChatMessage::user("next")]].concat();
-        let stale_tool_tokens =
-            estimate_history_tokens(&stale_history) - estimate_history_tokens(&stale_control);
+    #[test]
+    fn declared_tool_attachments_are_charged_not_body_markers() {
+        // A declared carrier in the current turn: one image attachment, a
+        // body quoting two markers. The markers are text; the attachment is
+        // the only image. The expected numbers are computed by hand from the
+        // fixture strings, not by a second estimate call.
+        let body = "see [IMAGE:/x.png] and [IMAGE:/y.png]";
+        let tool = native_image_carrier(body, &["/tmp/declared.png"]);
+        let history = vec![ChatMessage::user("u"), ChatMessage::assistant("c"), tool];
+        let expected = "u".len().div_ceil(4)
+            + 4
+            + "c".len().div_ceil(4)
+            + 4
+            + body.len().div_ceil(4)
+            + IMAGE_TOKEN_ESTIMATE
+            + 4;
         assert_eq!(
-            stale_tool_tokens,
-            tool_text_bytes.div_ceil(4) + 4,
-            "stale tool markers must be priced as their remaining text"
+            estimate_history_tokens(&history),
+            expected,
+            "one declared attachment plus text, never the two body markers"
         );
-        assert!(stale_tool_tokens < IMAGE_TOKEN_ESTIMATE);
 
-        // Without the trailing user message the tool run is the latest one
-        // and its images are dispatched: thirty per-image charges appear.
-        let latest_history = [prefix(), vec![tool]].concat();
-        let latest_control = prefix();
-        let latest_tool_tokens =
-            estimate_history_tokens(&latest_history) - estimate_history_tokens(&latest_control);
+        // A legacy carrier in the same position: two body markers, no
+        // declaration, so preparation promotes nothing and the charge is
+        // text only.
+        let legacy_body = "got [IMAGE:/a.png] plus [IMAGE:/b.png] done";
+        let legacy = ChatMessage::tool(legacy_body);
+        let history = vec![ChatMessage::user("u"), ChatMessage::assistant("c"), legacy];
+        let expected = "u".len().div_ceil(4)
+            + 4
+            + "c".len().div_ceil(4)
+            + 4
+            + legacy_body.len().div_ceil(4)
+            + 4;
         assert_eq!(
-            latest_tool_tokens - stale_tool_tokens,
-            30 * IMAGE_TOKEN_ESTIMATE
+            estimate_history_tokens(&history),
+            expected,
+            "a legacy carrier's body markers are text, never images"
         );
     }
 
@@ -872,161 +757,6 @@ mod tests {
         assert!(
             !msg.contains("agent.max_context_tokens"),
             "remediation must not reference the inert agent.max_context_tokens: {msg}"
-        );
-    }
-
-    #[test]
-    fn canonicalize_tool_result_media_markers_wraps_existing_local_image_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let image = dir.path().join("generated.png");
-        std::fs::write(&image, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
-
-        let input = format!(
-            "Image generated successfully.\nFile: {}",
-            image.display().to_string()
-        );
-        let output = canonicalize_tool_result_media_markers(&input);
-
-        assert!(output.contains("[IMAGE:"));
-        assert!(output.contains(&format!("[IMAGE:{}]", image.display().to_string())));
-    }
-
-    #[test]
-    fn canonicalize_tool_result_media_markers_ignores_missing_paths() {
-        let input = "File: /tmp/definitely-missing-zeroclaw-image.png";
-        let output = canonicalize_tool_result_media_markers(input);
-        assert_eq!(output, input);
-    }
-
-    #[test]
-    fn canonicalize_tool_result_media_markers_preserves_existing_markers() {
-        let input = "Already tagged [IMAGE:/tmp/already-tagged.png]";
-        let output = canonicalize_tool_result_media_markers(input);
-        assert_eq!(output, input);
-    }
-
-    /// Write `count` real PNG files and return a newline-joined listing of
-    /// their absolute paths, shaped like `find`/`fd`/`ls` output.
-    fn image_path_listing(dir: &Path, count: usize) -> String {
-        let mut lines = Vec::with_capacity(count);
-        for index in 0..count {
-            let image = dir.join(format!("asset-{index}.png"));
-            std::fs::write(&image, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
-            lines.push(image.display().to_string());
-        }
-        lines.join("\n")
-    }
-
-    #[test]
-    fn canonicalize_promotes_up_to_the_listing_bound() {
-        let dir = tempfile::tempdir().unwrap();
-        let input = image_path_listing(dir.path(), MAX_PROMOTED_TOOL_RESULT_IMAGES);
-
-        let output = canonicalize_tool_result_media_markers(&input);
-
-        assert_eq!(
-            output.matches("[IMAGE:").count(),
-            MAX_PROMOTED_TOOL_RESULT_IMAGES,
-            "a producing tool emitting up to the bound keeps every promotion"
-        );
-    }
-
-    #[test]
-    fn canonicalize_leaves_path_listings_as_text() {
-        // The regression: a recursive find over a workspace prints real image
-        // paths, and promoting them base64-inlines unrelated local files into
-        // the next provider request.
-        let dir = tempfile::tempdir().unwrap();
-        let input = image_path_listing(dir.path(), MAX_PROMOTED_TOOL_RESULT_IMAGES + 1);
-
-        let output = canonicalize_tool_result_media_markers(&input);
-
-        assert_eq!(
-            output, input,
-            "a result over the bound is a listing: nothing is promoted and the \
-             paths stay visible to the model as text"
-        );
-    }
-
-    #[test]
-    fn canonicalize_for_generic_shell_tool_leaves_path_listings_as_text() {
-        // `is_path_listing_tool` only names dedicated search tools, so the
-        // generic shell tool has to be covered by the content bound.
-        let dir = tempfile::tempdir().unwrap();
-        let input = image_path_listing(dir.path(), MAX_PROMOTED_TOOL_RESULT_IMAGES + 1);
-
-        let output = canonicalize_tool_result_media_markers_for("shell", &input);
-
-        assert_eq!(output, input);
-    }
-
-    #[test]
-    fn canonicalize_listing_still_preserves_an_explicit_marker() {
-        // Suppression must not strip a marker a producing tool emitted
-        // deliberately, even when the same output also lists files.
-        let dir = tempfile::tempdir().unwrap();
-        let listing = image_path_listing(dir.path(), MAX_PROMOTED_TOOL_RESULT_IMAGES + 1);
-        let input = format!("[IMAGE:/tmp/deliberate.png]\n{listing}");
-
-        let output = canonicalize_tool_result_media_markers(&input);
-
-        assert_eq!(output, input);
-        assert!(output.contains("[IMAGE:/tmp/deliberate.png]"));
-        assert_eq!(
-            output.matches("[IMAGE:").count(),
-            1,
-            "only the explicit marker survives; no listing path is promoted"
-        );
-    }
-
-    #[test]
-    fn canonicalize_for_skips_path_listing_tools() {
-        // A search/listing tool that surfaces a real image path must be left
-        // untouched - promoting it to [IMAGE:...] would falsely trigger vision
-        // routing
-        let dir = tempfile::tempdir().unwrap();
-        let image = dir.path().join("hit.png");
-        std::fs::write(&image, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
-        let input = format!("match: {}", image.display());
-
-        for tool in ["content_search", "glob_search", "GLOB_SEARCH"] {
-            let output = canonicalize_tool_result_media_markers_for(tool, &input);
-            assert_eq!(output, input, "{tool} output must be left untouched");
-            assert!(!output.contains("[IMAGE:"));
-        }
-    }
-
-    #[test]
-    fn canonicalize_for_wraps_image_producing_and_fetching_tools() {
-        // Default-allow: image_gen (produces) and file_download (fetches) keep
-        // canonicalization so a genuinely produced/fetched image still routes.
-        let dir = tempfile::tempdir().unwrap();
-        let image = dir.path().join("generated.png");
-        std::fs::write(&image, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
-        let input = format!("Saved to {}", image.display());
-        let expected = format!("[IMAGE:{}]", image.display());
-
-        for tool in ["image_gen", "file_download", "some_future_tool"] {
-            let output = canonicalize_tool_result_media_markers_for(tool, &input);
-            assert!(
-                output.contains(&expected),
-                "{tool} output should be canonicalized into a marker"
-            );
-        }
-    }
-
-    #[test]
-    fn canonicalize_tool_result_media_markers_dedups_path_already_in_marker() {
-        let input = "File: /tmp/pic.png\nFormat: png\n[IMAGE:/tmp/pic.png]";
-        let output = canonicalize_tool_result_media_markers(input);
-        assert_eq!(
-            output, input,
-            "bare path duplicating an existing marker must not be promoted"
-        );
-        assert_eq!(
-            output.matches("[IMAGE:").count(),
-            1,
-            "exactly one image marker expected, got: {output}"
         );
     }
 

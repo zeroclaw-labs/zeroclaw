@@ -11,6 +11,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
+use zeroclaw_api::media::{MarkerKind, RenderedMarker};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
@@ -1185,7 +1186,9 @@ impl BrowserTool {
                         .await
                         .with_context(|| format!("Failed to write screenshot to {path_str}"))?;
 
-                    // Return success with the path information
+                    // Return success with the path information; the written
+                    // PNG is declared as an attachment so the model can see
+                    // it without anyone scanning the text for the path.
                     let output = serde_json::to_string_pretty(&json!({
                         "backend": "computer_use",
                         "action": action,
@@ -1198,7 +1201,11 @@ impl BrowserTool {
                         success: true,
                         output: output.into(),
                         error: None,
-                    });
+                    }
+                    .with_attachment(RenderedMarker {
+                        target: path_str.to_string(),
+                        kind: MarkerKind::Image,
+                    }));
                 }
 
                 let output = parsed
@@ -1270,16 +1277,40 @@ impl BrowserTool {
         backend: ResolvedBackend,
     ) -> anyhow::Result<ToolResult> {
         // Validate screenshot path before any backend writes a file
+        let mut screenshot_target: Option<String> = None;
         if matches!(action, BrowserAction::Screenshot { .. }) {
             self.validate_screenshot_path(&mut action).await?;
+            if let BrowserAction::Screenshot {
+                path: Some(target), ..
+            } = &action
+            {
+                screenshot_target = Some(target.clone());
+            }
         }
 
-        match backend {
+        let result = match backend {
             ResolvedBackend::AgentBrowser => self.execute_agent_browser_action(action).await,
             ResolvedBackend::RustNative => self.execute_rust_native_action(action).await,
             ResolvedBackend::ComputerUse => anyhow::bail!(
                 "Internal error: computer_use backend must be handled before BrowserAction parsing"
             ),
+        };
+
+        // A screenshot the backend wrote to the validated target is a
+        // produced image: declare it so the model can see it. Nothing
+        // downstream infers attachments from the path printed in the text,
+        // and the text itself is unchanged. (A screenshot with no `path`
+        // argument cannot be declared here: the backend picks the target,
+        // and the rust-native path inlines the PNG instead of saving it.)
+        match (result, screenshot_target) {
+            (Ok(mut result), Some(target)) if result.success => {
+                result = result.with_attachment(RenderedMarker {
+                    target,
+                    kind: MarkerKind::Image,
+                });
+                Ok(result)
+            }
+            (result, _) => result,
         }
     }
 
@@ -4123,6 +4154,38 @@ mod tests {
                 "the validated destination must NOT be forwarded to the sidecar: {body}"
             );
         }
+
+        // The written screenshot is declared as the one image attachment; the
+        // JSON text (including the printed path) is unchanged, and nothing
+        // about the declaration rewrites the output.
+        assert!(result.success, "precondition: the screenshot succeeded");
+        assert_eq!(
+            result.output.attachments().len(),
+            1,
+            "a written screenshot declares exactly one attachment"
+        );
+        assert_eq!(
+            result.output.attachments()[0].kind,
+            zeroclaw_api::media::MarkerKind::Image
+        );
+        let expected_target = std::fs::canonicalize(ws.join("screenshot.png"))
+            .expect("canonical target")
+            .display()
+            .to_string();
+        assert_eq!(
+            result.output.attachments()[0].target,
+            expected_target,
+            "the declared target is the validated local destination"
+        );
+        assert!(
+            result.output.as_str().contains("\"path\""),
+            "the text still carries the path field verbatim: {}",
+            result.output.as_str()
+        );
+        assert!(
+            !result.output.as_str().contains("[IMAGE:"),
+            "the declaration never rides the text as marker syntax"
+        );
     }
 
     /// Fail-closed contract for a path-bearing screenshot: the tool must NOT

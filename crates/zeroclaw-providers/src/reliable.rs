@@ -1312,7 +1312,7 @@ fn provider_exhausted_attrs(
 
 fn is_context_turn_boundary(message: &ChatMessage) -> bool {
     message.role == "user"
-        && !crate::multimodal::is_prompt_tool_result_message(message)
+        && !zeroclaw_api::tool_carrier::is_tool_result_carrier(&message.role, &message.content)
         && !message.is_pruned_context_separator()
 }
 

@@ -3156,9 +3156,9 @@ impl Agent {
                                     .and_then(|c| c.as_str())
                                     .unwrap_or_default()
                                     .to_string(),
-                                // Provider-wire tool messages do not carry the
-                                // producing tool name; replayed results fall back
-                                // to blind canonicalization
+                                // No producing tool name on the wire shape;
+                                // typed replay leaves it empty, and the dispatcher
+                                // writes an explicit zero-attachment declaration
                                 tool_name: String::new(),
                             })
                         })
@@ -3180,8 +3180,9 @@ impl Agent {
                             .and_then(|c| c.as_str())
                             .unwrap_or_default()
                             .to_string(),
-                        // No provenance on the provider-wire shape; blind canon
-                        // applies as before
+                        // No provenance on the provider-wire shape; the
+                        // dispatcher writes an explicit zero-attachment
+                        // declaration, never scanning the text
                         tool_name: String::new(),
                     };
                     push_tool_results(&mut replayed, vec![result]);
@@ -14929,11 +14930,14 @@ vision_model_provider = "custom.vision"
                 serde_json::json!({"type": "object", "properties": {}})
             }
             async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
-                Ok(crate::tools::ToolResult {
-                    success: true,
-                    output: format!("here it is [IMAGE:{}]", self.path).into(),
-                    error: None,
-                })
+                // The producer declares its image; under the attachment
+                // contract nothing in the result text is promoted.
+                Ok(crate::tools::ToolResult::ok("here it is").with_attachment(
+                    zeroclaw_api::media::RenderedMarker {
+                        target: self.path.clone(),
+                        kind: zeroclaw_api::media::MarkerKind::Image,
+                    },
+                ))
             }
         }
         impl zeroclaw_api::attribution::Attributable for AttachImage {
