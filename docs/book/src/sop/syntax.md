@@ -202,6 +202,10 @@ Parser behavior:
 - Unrecognized sub-bullets and other non-empty continuation lines are appended to the step body.
 <!-- >>> end generated:sop-parser-behavior <<< -->
 
+When reviewing a step that contains both `switch` and `next`, treat the
+switch ports as the complete routing decision: `next` is intentionally ignored
+when the top-level `when` guard permits switch evaluation.
+
 ### Copyable conditional-routing example
 
 This complete `SOP.md` routes critical alerts through an approved remediation
