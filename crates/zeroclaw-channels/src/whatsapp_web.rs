@@ -8,10 +8,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::select;
 use waproto::whatsapp::device_props::PlatformType;
+#[cfg(feature = "whatsapp-web")]
+use whatsapp_rust::features::{
+    GroupCreateOptions, GroupDescription, GroupParticipantOptions, GroupSubject,
+    ParticipantChangeResponse,
+};
 use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelConversationScope,
     ChannelMessage, SendMessage,
 };
+#[cfg(feature = "whatsapp-web")]
+use zeroclaw_api::channel::{RoomCreationOptions, RoomVisibility};
 #[cfg(feature = "whatsapp-web")]
 use zeroclaw_api::media::MediaAttachment;
 use zeroclaw_runtime::i18n;
@@ -397,6 +404,15 @@ pub struct WhatsAppWebChannel {
     /// immediately, which is what an already-elapsed `tokio::time::timeout`
     /// does and the safer of the two readings of zero.
     approval_timeout_secs: u64,
+    /// Whether `create_room` and `invite_user` may reach WhatsApp. Read from
+    /// `[channels.whatsapp.<alias>].room_management` in
+    /// [`WhatsAppWebChannel::new`]; a daemon reload rebuilds the channel, so
+    /// the key takes effect on reload like `approval_timeout_secs`.
+    room_management: bool,
+    /// Whether a privacy refusal in `invite_user` may be answered with the
+    /// single-use group invite WhatsApp returns. Read in
+    /// [`WhatsAppWebChannel::new`], like `room_management`.
+    room_invite_fallback: bool,
     /// Bot handle for shutdown.
     /// Handle returned by `Bot::spawn` in whatsapp-rust 0.7 (a Future + abort)
     /// rather than a tokio JoinHandle directly.
@@ -494,6 +510,8 @@ impl WhatsAppWebChannel {
         let group_policy = config.group_policy.clone();
         let self_chat_mode = config.self_chat_mode;
         let approval_timeout_secs = config.approval_timeout_secs;
+        let room_management = config.room_management;
+        let room_invite_fallback = config.room_invite_fallback;
 
         // Seed bot_phone from pair_phone (digits only)
         let bot_phone = pair_phone
@@ -558,6 +576,8 @@ impl WhatsAppWebChannel {
             group_policy,
             self_chat_mode,
             approval_timeout_secs,
+            room_management,
+            room_invite_fallback,
             allowed_groups_resolver,
             bot_handle: Arc::new(Mutex::new(None)),
             client: Arc::new(Mutex::new(None)),
@@ -724,6 +744,24 @@ impl WhatsAppWebChannel {
     #[cfg(feature = "whatsapp-web")]
     fn phone_matches(entry: &str, phone: &str) -> bool {
         crate::whatsapp::phone_matches(entry, phone)
+    }
+
+    /// Like [`Self::is_number_allowed`], except that a `*` entry admits no one.
+    /// "May message whoever writes to us" does not imply "may add anyone to a
+    /// group", so a group participant needs an entry naming its number.
+    ///
+    /// Everything else about the policy is unchanged, because this asks the
+    /// same deny-aware matcher admission uses. Reading the entries directly
+    /// here, as an earlier revision did, dropped the `!` that marks a deny
+    /// during phone normalization, so `ignore = ["+15550001111"]` authorized
+    /// exactly the number the operator wrote down to keep out.
+    #[cfg(feature = "whatsapp-web")]
+    fn is_number_explicitly_allowed(&self, phone: &str) -> bool {
+        crate::allowlist::is_identity_named_by(
+            &(self.peer_resolver)(),
+            &[phone],
+            Self::phone_matches,
+        )
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -1330,6 +1368,179 @@ impl WhatsAppWebChannel {
         }
 
         Ok(wacore_binary::jid::Jid::pn(digits))
+    }
+
+    // ── Room management helpers (used by create_room / invite_user) ──
+
+    #[cfg(feature = "whatsapp-web")]
+    fn ensure_room_management_enabled(&self) -> Result<()> {
+        if !self.room_management {
+            anyhow::bail!(
+                "room management is disabled for this channel; set room_management = true \
+                 under [channels.whatsapp.{}] to allow it",
+                self.alias
+            );
+        }
+        Ok(())
+    }
+
+    /// Resolve a group participant and check it against the strict allowlist.
+    ///
+    /// Only phone numbers and phone-number JIDs are accepted. Allowlist entries
+    /// are phone numbers, and nothing available here proves which number a LID
+    /// belongs to. The returned JID is rebuilt from the digits that were
+    /// checked, so what is sent is exactly what was authorized.
+    #[cfg(feature = "whatsapp-web")]
+    fn group_participant_jid(&self, user_id: &str) -> Result<wacore_binary::jid::Jid> {
+        let user_id = user_id.trim();
+        let jid = self.recipient_to_jid(user_id)?;
+        let phone = if jid.is_pn() {
+            Self::normalize_phone_token(jid.user_base())
+        } else {
+            None
+        };
+        let Some(phone) = phone else {
+            anyhow::bail!(
+                "participant `{user_id}` must be a phone number or a phone-number JID \
+                 (`<digits>@s.whatsapp.net`)"
+            );
+        };
+        if !self.is_number_explicitly_allowed(&phone) {
+            anyhow::bail!(
+                "participant `{user_id}` is not in this channel's allowlist; group \
+                 participants need an explicit entry (a `*` entry does not count)"
+            );
+        }
+        Ok(wacore_binary::jid::Jid::pn(phone.trim_start_matches('+')))
+    }
+
+    /// Map `channel_room` options onto a group creation request.
+    ///
+    /// Every check runs here, before a client is involved, so a refused
+    /// request creates nothing. One participant that is not allowed refuses the
+    /// whole request: dropping it would create a group other than the one asked
+    /// for.
+    #[cfg(feature = "whatsapp-web")]
+    fn group_create_options(&self, options: &RoomCreationOptions) -> Result<GroupCreateOptions> {
+        if options.visibility == Some(RoomVisibility::Public) {
+            anyhow::bail!("WhatsApp groups cannot be public; omit visibility or set it to private");
+        }
+        if options.encryption == Some(false) {
+            anyhow::bail!(
+                "WhatsApp groups are always end-to-end encrypted; encryption = false \
+                 is not supported"
+            );
+        }
+
+        let name = options.name.as_deref().map(str::trim).unwrap_or_default();
+        if name.is_empty() {
+            anyhow::bail!("a group name is required; WhatsApp does not allow a group without one");
+        }
+        let subject = GroupSubject::new(name)?.into_string();
+        let description = options
+            .topic
+            .as_deref()
+            .map(str::trim)
+            .filter(|topic| !topic.is_empty())
+            .map(GroupDescription::new)
+            .transpose()?;
+
+        let mut participants: Vec<GroupParticipantOptions> =
+            Vec::with_capacity(options.invites.len());
+        for user_id in &options.invites {
+            let jid = self.group_participant_jid(user_id)?;
+            if !participants.iter().any(|existing| existing.jid == jid) {
+                participants.push(GroupParticipantOptions::from_phone(jid));
+            }
+        }
+
+        Ok(GroupCreateOptions::builder()
+            .subject(subject)
+            .participants(participants)
+            .maybe_description(description)
+            .build())
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn group_jid(room_id: &str) -> Result<wacore_binary::jid::Jid> {
+        use wacore_binary::jid::JidExt as _;
+
+        let room_id = room_id.trim();
+        room_id
+            .parse::<wacore_binary::jid::Jid>()
+            .ok()
+            .filter(|jid| jid.is_group() && !jid.user.is_empty())
+            .ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "room_id `{room_id}` is not a WhatsApp group JID (expected `<id>@g.us`)"
+                ))
+            })
+    }
+
+    /// The invite to send in place of a refused add: the single-use code
+    /// WhatsApp returns when the participant's privacy settings refused it
+    /// (`error="403"` with `<add_request>`), and only when the operator
+    /// enabled `room_invite_fallback`.
+    #[cfg(feature = "whatsapp-web")]
+    fn fallback_invite<'r>(
+        &self,
+        responses: &'r [ParticipantChangeResponse],
+    ) -> Option<&'r wacore::iq::groups::AddRequestInfo> {
+        if !self.room_invite_fallback {
+            return None;
+        }
+        responses
+            .iter()
+            .find(|response| response.error.as_deref() == Some("403"))
+            .and_then(|response| response.add_request.as_ref())
+    }
+
+    /// The invite card WhatsApp clients send for a refused participant. No
+    /// caption: the card itself names the group.
+    #[cfg(feature = "whatsapp-web")]
+    fn group_invite_message(
+        group: &wacore_binary::jid::Jid,
+        group_name: Option<String>,
+        invite: &wacore::iq::groups::AddRequestInfo,
+    ) -> waproto::whatsapp::Message {
+        waproto::whatsapp::Message {
+            group_invite_message: waproto::whatsapp::message::GroupInviteMessage {
+                group_jid: Some(group.to_string()),
+                invite_code: Some(invite.code.clone()),
+                invite_expiration: i64::try_from(invite.expiration).ok(),
+                group_name,
+                ..Default::default()
+            }
+            .into(),
+            ..Default::default()
+        }
+    }
+
+    /// `add_participants` succeeds at the request level even when WhatsApp
+    /// refused the participant, so the per-participant statuses decide.
+    #[cfg(feature = "whatsapp-web")]
+    fn participant_add_outcome(
+        user_id: &str,
+        responses: &[ParticipantChangeResponse],
+    ) -> Result<()> {
+        let user_id = user_id.trim();
+        if let Some(refused) = responses.iter().find(|response| !response.is_ok()) {
+            let code = refused.error.as_deref().unwrap_or("unknown");
+            let reason = match code {
+                "403" => {
+                    " (the contact's privacy settings only allow joining through an invite link)"
+                }
+                "409" => " (already a participant)",
+                _ => "",
+            };
+            anyhow::bail!(
+                "WhatsApp did not add participant `{user_id}` to the group: error {code}{reason}"
+            );
+        }
+        if responses.is_empty() {
+            anyhow::bail!("WhatsApp did not confirm that participant `{user_id}` was added");
+        }
+        Ok(())
     }
 
     // ── Reconnect state-machine helpers (used by listen() and tested directly) ──
@@ -3823,6 +4034,74 @@ impl Channel for WhatsAppWebChannel {
             &format!("stop typing for {}", recipient)
         );
         Ok(())
+    }
+
+    /// Creating a WhatsApp group and adding people to it is visible to every
+    /// participant and cannot be undone from here, so this channel refuses to
+    /// do either unless an operator approves the call.
+    fn room_management_requires_approval(&self) -> bool {
+        true
+    }
+
+    async fn create_room(&self, options: &RoomCreationOptions) -> Result<String> {
+        self.ensure_room_management_enabled()?;
+        let request = self.group_create_options(options)?;
+        let client = self.client.lock().clone();
+        let Some(client) = client else {
+            anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
+        };
+
+        let created = Box::pin(client.groups().create_group(request))
+            .await
+            .map_err(|e| anyhow::Error::msg(format!("failed to create WhatsApp group: {e}")))?;
+        Ok(created.metadata.id.to_string())
+    }
+
+    async fn invite_user(&self, room_id: &str, user_id: &str) -> Result<()> {
+        self.ensure_room_management_enabled()?;
+        let group = Self::group_jid(room_id)?;
+        let participant = self.group_participant_jid(user_id)?;
+        let client = self.client.lock().clone();
+        let Some(client) = client else {
+            anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
+        };
+
+        let responses = Box::pin(
+            client
+                .groups()
+                .add_participants(group.clone(), std::slice::from_ref(&participant)),
+        )
+        .await
+        .map_err(|e| {
+            anyhow::Error::msg(format!(
+                "failed to add participant `{}` to WhatsApp group: {e}",
+                user_id.trim()
+            ))
+        })?;
+
+        if let Some(invite) = self.fallback_invite(&responses) {
+            let user_id = user_id.trim();
+            // The subject only labels the card; a failed lookup still sends it.
+            let group_name = Box::pin(client.groups().get_metadata(&group))
+                .await
+                .ok()
+                .map(|metadata| metadata.subject);
+            let message = Self::group_invite_message(&group, group_name, invite);
+            Box::pin(client.send_message(participant, message))
+                .await
+                .map_err(|e| {
+                    anyhow::Error::msg(format!(
+                        "WhatsApp did not add participant `{user_id}` to the group because of \
+                         their privacy settings, and sending them a group invite failed: {e}"
+                    ))
+                })?;
+            anyhow::bail!(
+                "WhatsApp did not add participant `{user_id}` to the group because of their \
+                 privacy settings; a group invite was sent to them instead. They are not a \
+                 member until they accept it, so do not retry"
+            );
+        }
+        Self::participant_add_outcome(user_id, &responses)
     }
 
     /// Ask the operator to approve a tool call, over the chat this request came
@@ -8768,6 +9047,268 @@ mod tests {
         }
     }
 
+    // ── Room management (create_room / invite_user) ──
+
+    #[cfg(feature = "whatsapp-web")]
+    fn room_channel(room_management: bool, peers: &[&str]) -> WhatsAppWebChannel {
+        let cfg = zeroclaw_config::schema::WhatsAppConfig {
+            enabled: true,
+            session_path: Some("/tmp/test-whatsapp.db".into()),
+            room_management,
+            ..Default::default()
+        };
+        let peers: Vec<String> = peers.iter().map(|peer| (*peer).to_string()).collect();
+        WhatsAppWebChannel::new(
+            &cfg,
+            "room_test_alias",
+            Arc::new(move || peers.clone()),
+            Arc::new(Vec::new),
+        )
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn room_options(name: &str, invites: &[&str]) -> RoomCreationOptions {
+        RoomCreationOptions {
+            name: Some(name.to_string()),
+            invites: invites.iter().map(|invite| (*invite).to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn participant_response(jid: &str, error: Option<&str>) -> ParticipantChangeResponse {
+        participant_response_with_invite(jid, error, None)
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn participant_response_with_invite(
+        jid: &str,
+        error: Option<&str>,
+        invite: Option<(&str, u64)>,
+    ) -> ParticipantChangeResponse {
+        use wacore::protocol::ProtocolNode as _;
+        use wacore_binary::builder::NodeBuilder;
+
+        let jid: Jid = jid.parse().expect("valid participant JID");
+        let mut node = NodeBuilder::new("participant").attr("jid", jid);
+        if let Some(error) = error {
+            node = node.attr("error", error);
+        }
+        if let Some((code, expiration)) = invite {
+            node = node.children([NodeBuilder::new("add_request")
+                .attr("code", code)
+                .attr("expiration", expiration)
+                .build()]);
+        }
+        ParticipantChangeResponse::try_from_node(&node.build()).expect("valid participant node")
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn fallback_channel(room_invite_fallback: bool) -> WhatsAppWebChannel {
+        let cfg = zeroclaw_config::schema::WhatsAppConfig {
+            enabled: true,
+            session_path: Some("/tmp/test-whatsapp.db".into()),
+            room_management: true,
+            room_invite_fallback,
+            ..Default::default()
+        };
+        WhatsAppWebChannel::new(
+            &cfg,
+            "room_test_alias",
+            Arc::new(|| vec!["+15550001111".into()]),
+            Arc::new(Vec::new),
+        )
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn room_management_is_off_by_default() {
+        assert!(!zeroclaw_config::schema::WhatsAppConfig::default().room_management);
+    }
+
+    /// The gate is checked before the client, so with the key off a request
+    /// is refused even on a channel that could otherwise send it.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn room_methods_refuse_while_room_management_is_off() {
+        let ch = room_channel(false, &["+15550001111"]);
+
+        let err = ch
+            .create_room(&room_options("example-group", &["+15550001111"]))
+            .await
+            .expect_err("create_room must be refused");
+        assert!(
+            err.to_string().contains("room management is disabled"),
+            "{err}"
+        );
+
+        let err = ch
+            .invite_user("120363000000000001@g.us", "+15550001111")
+            .await
+            .expect_err("invite_user must be refused");
+        assert!(
+            err.to_string().contains("room management is disabled"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn room_methods_report_not_connected_without_client() {
+        let ch = room_channel(true, &["+15550001111"]);
+
+        let err = ch
+            .create_room(&room_options("example-group", &["+15550001111"]))
+            .await
+            .expect_err("no client");
+        assert!(err.to_string().contains("not connected"), "{err}");
+
+        let err = ch
+            .invite_user("120363000000000001@g.us", "+15550001111")
+            .await
+            .expect_err("no client");
+        assert!(err.to_string().contains("not connected"), "{err}");
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn group_create_options_map_name_topic_and_invites() {
+        let ch = room_channel(true, &["+15550001111", "+15550002222"]);
+        let options = RoomCreationOptions {
+            name: Some("  example-group  ".into()),
+            topic: Some("Order follow-up".into()),
+            invites: vec![
+                "+1 555 000 1111".into(),
+                "15550002222@s.whatsapp.net".into(),
+                "15550001111".into(),
+            ],
+            visibility: Some(RoomVisibility::Private),
+            encryption: Some(true),
+        };
+
+        let request = ch.group_create_options(&options).expect("valid options");
+        assert_eq!(request.subject, "example-group");
+        assert_eq!(
+            request.description.as_ref().map(GroupDescription::as_str),
+            Some("Order follow-up")
+        );
+        let participants: Vec<String> = request
+            .participants
+            .iter()
+            .map(|participant| participant.jid.to_string())
+            .collect();
+        assert_eq!(
+            participants,
+            ["15550001111@s.whatsapp.net", "15550002222@s.whatsapp.net"],
+            "each invite maps to its phone JID once"
+        );
+
+        let bare = ch
+            .group_create_options(&room_options("example-group", &[]))
+            .expect("name alone is enough");
+        assert!(bare.description.is_none());
+        assert!(bare.participants.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn group_create_options_require_a_name_within_the_subject_limit() {
+        let ch = room_channel(true, &[]);
+        for name in [None, Some(""), Some("   ")] {
+            let options = RoomCreationOptions {
+                name: name.map(str::to_string),
+                ..Default::default()
+            };
+            let err = ch
+                .group_create_options(&options)
+                .expect_err("a group needs a name");
+            assert!(err.to_string().contains("group name is required"), "{err}");
+        }
+
+        let limit = wacore::iq::groups::GROUP_SUBJECT_MAX_LENGTH;
+        assert!(
+            ch.group_create_options(&room_options(&"a".repeat(limit), &[]))
+                .is_ok()
+        );
+        assert!(
+            ch.group_create_options(&room_options(&"a".repeat(limit + 1), &[]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn group_create_options_reject_public_and_unencrypted_groups() {
+        let ch = room_channel(true, &[]);
+
+        let public = RoomCreationOptions {
+            visibility: Some(RoomVisibility::Public),
+            ..room_options("example-group", &[])
+        };
+        let err = ch.group_create_options(&public).expect_err("public");
+        assert!(err.to_string().contains("cannot be public"), "{err}");
+
+        let unencrypted = RoomCreationOptions {
+            encryption: Some(false),
+            ..room_options("example-group", &[])
+        };
+        let err = ch
+            .group_create_options(&unencrypted)
+            .expect_err("unencrypted");
+        assert!(err.to_string().contains("end-to-end encrypted"), "{err}");
+    }
+
+    /// `send` treats `*` as "anyone"; adding someone to a group does not.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn group_participants_need_an_explicit_allowlist_entry() {
+        let wildcard = room_channel(true, &["*"]);
+        assert!(wildcard.is_number_allowed("+15550001111"));
+        let err = wildcard
+            .group_participant_jid("+15550001111")
+            .expect_err("a wildcard authorizes no participant");
+        assert!(err.to_string().contains("allowlist"), "{err}");
+
+        let explicit = room_channel(true, &["*", "+15550001111"]);
+        assert_eq!(
+            explicit
+                .group_participant_jid("15550001111@s.whatsapp.net")
+                .expect("explicitly allowed")
+                .to_string(),
+            "15550001111@s.whatsapp.net"
+        );
+        assert!(explicit.group_participant_jid("+15550002222").is_err());
+    }
+
+    /// A deny is how an operator says "not this person", and a resolved peer
+    /// list carries one `!number` for every `ignore` entry. Reading the entries
+    /// as plain numbers turned each of those into permission to add or contact
+    /// exactly the person it named.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn a_denied_participant_is_refused_however_the_deny_is_written() {
+        for entries in [
+            // Nothing but a deny: no grant was ever written.
+            vec!["!+15550001111"],
+            // The deny overrides the grant, as it does for admission.
+            vec!["+15550001111", "!+15550001111"],
+            // A deny written in another accepted spelling of the same number.
+            vec!["+15550001111", "!15550001111@s.whatsapp.net"],
+            // `ignore = ["*"]` denies everyone, grants notwithstanding.
+            vec!["+15550001111", "!*"],
+        ] {
+            let ch = room_channel(true, &entries);
+            assert!(
+                ch.group_participant_jid("+15550001111").is_err(),
+                "{entries:?} must not authorize the number it denies"
+            );
+        }
+
+        // The deny is not a blanket refusal: a grant it does not name stands.
+        let ch = room_channel(true, &["+15550002222", "!+15550001111"]);
+        assert!(ch.group_participant_jid("+15550002222").is_ok());
+    }
+
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn markdown_inline_markers_collapse_to_whatsapp_syntax() {
@@ -8806,9 +9347,83 @@ mod tests {
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
+    fn group_participants_must_be_phone_numbers() {
+        let ch = room_channel(true, &["+15550001111"]);
+        for user_id in ["15550001111@lid", "15550001111@g.us", "not-a-number", ""] {
+            assert!(
+                ch.group_participant_jid(user_id).is_err(),
+                "`{user_id}` must be refused"
+            );
+        }
+    }
+
+    /// One disallowed invite refuses the whole request, and it is refused
+    /// before the client is looked up, so nothing is created.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn create_room_refuses_everything_when_one_invite_is_not_allowed() {
+        let ch = room_channel(true, &["+15550001111"]);
+        let err = ch
+            .create_room(&room_options(
+                "example-group",
+                &["+15550001111", "+15550002222"],
+            ))
+            .await
+            .expect_err("one invite is not allowed");
+        let message = err.to_string();
+        assert!(message.contains("+15550002222"), "{message}");
+        assert!(!message.contains("not connected"), "{message}");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn invite_user_validates_the_group_and_the_participant() {
+        let ch = room_channel(true, &["+15550001111"]);
+
+        let err = ch
+            .invite_user("15550001111@s.whatsapp.net", "+15550001111")
+            .await
+            .expect_err("not a group");
+        assert!(
+            err.to_string().contains("not a WhatsApp group JID"),
+            "{err}"
+        );
+
+        let err = ch
+            .invite_user("120363000000000001@g.us", "+15550002222")
+            .await
+            .expect_err("participant not allowed");
+        assert!(err.to_string().contains("allowlist"), "{err}");
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
     fn whatsapp_native_constructs_pass_through() {
         let native = "- first\n- second\n1. one\n2. two\n> quoted\n`inline code`";
         assert_eq!(markdown_to_whatsapp(native), native);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn group_jid_accepts_only_group_jids() {
+        assert_eq!(
+            WhatsAppWebChannel::group_jid(" 120363000000000001@g.us ")
+                .expect("group JID")
+                .to_string(),
+            "120363000000000001@g.us"
+        );
+        for room_id in [
+            "120363000000000001",
+            "15550001111@s.whatsapp.net",
+            "15550001111@lid",
+            "@g.us",
+            "",
+        ] {
+            assert!(
+                WhatsAppWebChannel::group_jid(room_id).is_err(),
+                "`{room_id}` must be refused"
+            );
+        }
     }
 
     #[test]
@@ -8824,6 +9439,70 @@ mod tests {
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
+    fn participant_add_outcome_names_the_participant_whatsapp_refused() {
+        let added = [participant_response("15550001111@s.whatsapp.net", None)];
+        assert!(WhatsAppWebChannel::participant_add_outcome("+15550001111", &added).is_ok());
+
+        let refused = [participant_response(
+            "15550001111@s.whatsapp.net",
+            Some("403"),
+        )];
+        let err = WhatsAppWebChannel::participant_add_outcome("+15550001111", &refused)
+            .expect_err("a refused participant is a failure");
+        let message = err.to_string();
+        assert!(message.contains("+15550001111"), "{message}");
+        assert!(message.contains("403"), "{message}");
+        assert!(message.contains("invite link"), "{message}");
+
+        let err = WhatsAppWebChannel::participant_add_outcome("+15550001111", &[])
+            .expect_err("no confirmation is not success");
+        assert!(err.to_string().contains("+15550001111"), "{err}");
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn room_invite_fallback_is_off_by_default() {
+        assert!(!zeroclaw_config::schema::WhatsAppConfig::default().room_invite_fallback);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn fallback_invite_needs_the_key_and_a_privacy_refusal_with_a_code() {
+        let jid = "15550001111@s.whatsapp.net";
+        let refused = [participant_response_with_invite(
+            jid,
+            Some("403"),
+            Some(("AbCdEf123456", 1_900_000_000)),
+        )];
+
+        let invite = fallback_channel(true)
+            .fallback_invite(&refused)
+            .expect("403 with a code is answered with the invite");
+        assert_eq!(invite.code, "AbCdEf123456");
+        assert_eq!(invite.expiration, 1_900_000_000);
+
+        assert!(
+            fallback_channel(false).fallback_invite(&refused).is_none(),
+            "the key is off by default and must stay off"
+        );
+
+        let enabled = fallback_channel(true);
+        for responses in [
+            vec![participant_response(jid, Some("403"))],
+            vec![participant_response_with_invite(
+                jid,
+                Some("409"),
+                Some(("AbCdEf123456", 1_900_000_000)),
+            )],
+            vec![participant_response(jid, None)],
+            Vec::new(),
+        ] {
+            assert!(enabled.fallback_invite(&responses).is_none());
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
     fn leading_list_marker_is_not_read_as_bold() {
         assert_eq!(markdown_to_whatsapp("* item one"), "* item one");
         assert_eq!(
@@ -8831,6 +9510,29 @@ mod tests {
             "* item one\n* item two"
         );
         assert_eq!(markdown_to_whatsapp("* **hot** item"), "* *hot* item");
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn group_invite_message_carries_the_group_and_the_code() {
+        let group: Jid = "120363000000000001@g.us".parse().expect("group JID");
+        let invite = wacore::iq::groups::AddRequestInfo {
+            code: "AbCdEf123456".into(),
+            expiration: 1_900_000_000,
+        };
+
+        let message =
+            WhatsAppWebChannel::group_invite_message(&group, Some("example-group".into()), &invite);
+        let card = message
+            .group_invite_message
+            .as_option()
+            .expect("the message is a group invite");
+        assert_eq!(card.group_jid.as_deref(), Some("120363000000000001@g.us"));
+        assert_eq!(card.invite_code.as_deref(), Some("AbCdEf123456"));
+        assert_eq!(card.invite_expiration, Some(1_900_000_000));
+        assert_eq!(card.group_name.as_deref(), Some("example-group"));
+        assert!(card.caption.is_none());
+        assert!(message.conversation.is_none());
     }
 
     #[test]

@@ -524,6 +524,12 @@ impl Channel for PacedChannel {
         self.inner.invite_user(room_id, user_id).await
     }
 
+    /// Forwarded: without this the wrapper would report that the inner
+    /// channel needs no approval to create groups.
+    fn room_management_requires_approval(&self) -> bool {
+        self.inner.room_management_requires_approval()
+    }
+
     /// Forwarded rather than paced: a poll is one stanza, and the inner
     /// channel owns whatever limits apply to it.
     fn supports_native_polls(&self) -> bool {

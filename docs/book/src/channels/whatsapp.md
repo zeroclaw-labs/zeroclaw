@@ -88,6 +88,86 @@ session_path = "/var/lib/zeroclaw/wa.db"
 allowed_groups = ["120363012345678901@g.us", "120363098765432109"]
 ```
 
+## Creating groups (`room_management`)
+
+In Web mode the `channel_room` tool can create a WhatsApp group
+(`create_room`) and add a participant to an existing one (`invite_user`). Both
+are off until the operator opts the alias in:
+
+```toml
+[channels.whatsapp.myaccount]
+room_management = true   # default: false
+```
+
+While `room_management` is `false`, both actions fail with "room management is
+disabled for this channel" before anything is sent to WhatsApp.
+
+With it on:
+
+- `create_room` requires `name`, which becomes the group subject (up to 100
+  characters). `topic` becomes the group description (up to 2048 characters).
+  `invites` are the initial participants. The result is the new group JID
+  (`<id>@g.us`).
+- `invite_user` takes that group JID as `room_id` and one participant as
+  `user_id`.
+- Participants are phone numbers (`+15550001111`) or phone-number JIDs
+  (`15550001111@s.whatsapp.net`). Each one must match an explicit entry in the
+  channel's peer allowlist. A `*` entry does **not** count here: it lets the
+  agent answer anyone who writes, not add anyone to a group. If one participant
+  is not allowed, the whole request fails and no group is created.
+- WhatsApp groups are always end-to-end encrypted and never publicly listed, so
+  `visibility = "public"` and `encryption = false` are rejected instead of
+  ignored.
+- WhatsApp can refuse a participant even when the request itself succeeds,
+  most often because the contact's privacy settings only allow joining through
+  an invite link. `invite_user` reports that as an error naming the
+  participant.
+
+### Invite instead of add (`room_invite_fallback`)
+
+When WhatsApp refuses a participant because of their privacy settings, it
+returns a single-use invite code for that person. With
+`room_invite_fallback = true` (default `false`, and only together with
+`room_management = true`), `invite_user` sends that participant the group
+invite card in a direct chat, the same card the WhatsApp apps send. It still
+returns an error saying the participant was not added and an invite was sent:
+they join only if they accept it, and the agent should not retry.
+
+Turning this on means the channel can send an **unsolicited direct message** to
+that participant: an invite card in a chat they did not start. It only reaches
+someone the operator both allowlisted and named in an `invite_user` call, and
+only for the privacy refusal above, but it is a message the person did not ask
+for. Leave it off unless that is wanted.
+
+```toml
+[channels.whatsapp.myaccount]
+room_management = true
+room_invite_fallback = true   # default: false
+```
+
+The invite goes only to the participant that was asked for, who already
+matched an explicit allowlist entry, and at most one invite is sent per call.
+A refusal without an invite code, or any other error, sends nothing.
+`create_room` cannot fall back this way: WhatsApp's reply to a group creation
+does not say which participants were refused, so create the group first and
+then call `invite_user` for anyone who has to be invited.
+
+A group created this way is not added to `allowed_groups`. Whether the agent
+reads and answers in it is still the operator's decision; add its JID to
+`allowed_groups` if it should.
+
+Creating groups and adding people is visible outside the deployment, and
+WhatsApp may restrict a number that creates groups nobody asked for. Consider
+adding `channel_room` to `always_ask` in the agent's risk profile (see
+[Autonomy](../security/autonomy.md)) so each call waits for an operator reply,
+as described in the next section.
+
+That approval is **required**, not advisory: with `room_management = true` but
+`channel_room` missing from `always_ask`, the tool refuses and says so. Creating
+a group and adding people to it is visible to everyone in it and cannot be undone
+from here, so it is not something the model does unattended. `always_ask` holds
+even under Full autonomy.
+
 ## Polls
 
 The `poll` tool posts a native WhatsApp poll in Web mode instead of the numbered text fallback used on channels without native polls. The tool accepts 2–10 options; the WhatsApp library accepts up to 12, but the tool schema does not expose 11–12. `multi_select` lets a voter select multiple options.

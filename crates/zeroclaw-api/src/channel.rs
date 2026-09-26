@@ -1302,6 +1302,17 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         anyhow::bail!("channel does not support room creation")
     }
 
+    /// Whether this channel refuses room management unless the caller is
+    /// gated behind an operator approval.
+    ///
+    /// Creating a group and adding people to it is visible to third parties
+    /// and cannot be undone from here, so a channel that says `true` will not
+    /// act on a risk profile that would let the model do it unattended. The
+    /// caller enforces this; the channel only states the requirement.
+    fn room_management_requires_approval(&self) -> bool {
+        false
+    }
+
     /// Post a native poll when the channel supports it.
     async fn send_poll(&self, _poll: &PollRequest) -> anyhow::Result<()> {
         anyhow::bail!("channel does not support native polls")
