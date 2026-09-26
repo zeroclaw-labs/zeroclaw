@@ -341,6 +341,23 @@ pub(crate) async fn consume_provider_streaming_response(
     // Final forward may null delta_sender on send failure; mark it read.
     let _ = delta_sender;
     outcome.suppressed_protocol = text_guard.suppressed_protocol;
+    if text_guard.suppressed_protocol
+        && let Some(diagnostic) = text_guard.suppression
+    {
+        // Attributes carry only the detector and the candidate offset so a
+        // false positive can be diagnosed without logging the withheld text.
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(serde_json::json!({
+                    "detector": diagnostic.detector,
+                    "candidate_offset": diagnostic.candidate_offset,
+                })),
+            "streaming text guard suppressed protocol candidate"
+        );
+    }
 
     if outcome.response_text.trim().is_empty() && outcome.tool_calls.is_empty() {
         ::zeroclaw_log::record!(

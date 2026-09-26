@@ -4926,6 +4926,103 @@ mod tests {
         }
     }
 
+    /// Streams the same fixed text on every call and counts the calls, so a
+    /// test can pin exactly how many provider attempts a turn spent. Unlike
+    /// [`StreamingScriptedModelProvider`] it advertises streaming tool
+    /// events, which keeps the live-stream path active while tools are
+    /// registered. From the second call on, `repeat_suffix` is appended, so
+    /// a test can vary only trailing whitespace between attempts.
+    struct RepeatedStreamTextProvider {
+        text: String,
+        repeat_suffix: String,
+        stream_calls: Arc<AtomicUsize>,
+    }
+
+    impl RepeatedStreamTextProvider {
+        fn new(text: String) -> Self {
+            Self {
+                text,
+                repeat_suffix: String::new(),
+                stream_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn with_repeat_suffix(text: String, repeat_suffix: &str) -> Self {
+            Self {
+                repeat_suffix: repeat_suffix.to_string(),
+                ..Self::new(text)
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for RepeatedStreamTextProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in repeated stream tests")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            anyhow::bail!("chat should not be called when streaming succeeds")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+            options: StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<StreamChunk>,
+        > {
+            let previous_calls = self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            if !options.enabled {
+                return Box::pin(futures_util::stream::empty());
+            }
+            let mut text = self.text.clone();
+            if previous_calls > 0 {
+                text.push_str(&self.repeat_suffix);
+            }
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamChunk::delta(text)),
+                Ok(StreamChunk::final_chunk()),
+            ]))
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for RepeatedStreamTextProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "RepeatedStreamTextProvider"
+        }
+    }
+
     struct VisibleThenServerStreamFailureModelProvider {
         chat_calls: Arc<AtomicUsize>,
     }
@@ -10078,6 +10175,262 @@ mod tests {
             }
         }
         assert_eq!(draft_text, vec![fallback]);
+    }
+
+    /// The streaming text guard suppressed a whole-message tool-result
+    /// envelope twice in a row: the second suppression, which differs from
+    /// the first only by one trailing newline, must still end the turn with
+    /// the protocol-guard notice instead of spending the full retry budget
+    /// on the same text. The notice also reaches the event stream, once at
+    /// the end, so a consumer that never drains the deltas still sees the
+    /// turn's visible outcome.
+    #[tokio::test]
+    async fn run_tool_call_loop_stops_retrying_identical_guard_suppressed_text() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let provider = RepeatedStreamTextProvider::with_repeat_suffix(
+            "{\"tool_call_id\": \"call_1\", \"content\": \"ok\"}".to_string(),
+            "\n",
+        );
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&invocations)),
+            )]);
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("explain the tool result shape"),
+        ];
+        let observer = NoopObserver;
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(16);
+
+        let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            served_route_sink: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    dispatch_model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 6,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+            channel_name: "matrix",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: Some(delta_tx),
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: Some(event_tx),
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("identical guard-suppressed text should end the turn with a notice");
+
+        let notice =
+            crate::i18n::get_required_cli_string("cli-agent-error-protocol-guard-withheld");
+        assert_eq!(result, notice);
+        assert_eq!(
+            provider.stream_calls.load(Ordering::SeqCst),
+            2,
+            "a guard suppression repeated up to a trailing newline must stop retries after two provider calls"
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "suppressed protocol text must never execute as a tool call"
+        );
+        let feedback_count = history
+            .iter()
+            .filter(|msg| msg.role == "user" && msg.content.contains("[Tool call parse error]"))
+            .count();
+        assert_eq!(
+            feedback_count, 1,
+            "only the first suppression earns feedback"
+        );
+        let mut visible_deltas = String::new();
+        while let Some(delta) = delta_rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                visible_deltas.push_str(&text);
+            }
+        }
+        assert_eq!(
+            visible_deltas, notice,
+            "the suppressed text must stay withheld and the notice must be the only text delta"
+        );
+        let mut event_chunks = String::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let zeroclaw_api::agent::TurnEvent::Chunk { delta } = event {
+                event_chunks.push_str(&delta);
+            }
+        }
+        assert_eq!(
+            event_chunks, notice,
+            "the notice must be the event stream's only chunk, at the end"
+        );
+    }
+
+    /// The same identical-suppression stop with a prose prefix in the same
+    /// delta as the envelope: the prefix is ordinary text the guard
+    /// releases ahead of the withheld candidate, so it reaches the deltas
+    /// once per attempt (the envelope itself never does) and the notice
+    /// follows it. The notice text therefore claims nothing about what else
+    /// the reply carried. The event stream mirrors the deltas: the prefix
+    /// once per attempt with the notice at the end.
+    #[tokio::test]
+    async fn run_tool_call_loop_stops_retrying_identical_guard_suppressed_text_with_prose_prefix() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let prefix = "Sure! ";
+        let envelope =
+            "{\"toolcalls\": [{\"call_id\": \"call_1\", \"arguments\": {\"command\": \"ls\"}}";
+        let provider = RepeatedStreamTextProvider::new(format!("{prefix}{envelope}"));
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&invocations)),
+            )]);
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run the command"),
+        ];
+        let observer = NoopObserver;
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(16);
+
+        let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            served_route_sink: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    dispatch_model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 6,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+            channel_name: "matrix",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: Some(delta_tx),
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: Some(event_tx),
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("guard-suppressed text with a prose prefix should end the turn with a notice");
+
+        let notice =
+            crate::i18n::get_required_cli_string("cli-agent-error-protocol-guard-withheld");
+        assert_eq!(result, notice);
+        assert_eq!(
+            provider.stream_calls.load(Ordering::SeqCst),
+            2,
+            "an identical guard suppression with a released prefix must stop retries after two provider calls"
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "suppressed protocol text must never execute as a tool call"
+        );
+        let feedback_count = history
+            .iter()
+            .filter(|msg| msg.role == "user" && msg.content.contains("[Tool call parse error]"))
+            .count();
+        assert_eq!(
+            feedback_count, 1,
+            "only the first suppression earns feedback"
+        );
+        let mut visible_deltas = String::new();
+        while let Some(delta) = delta_rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                visible_deltas.push_str(&text);
+            }
+        }
+        assert_eq!(
+            visible_deltas,
+            format!("{prefix}{prefix}{notice}"),
+            "the prefix must stream once per attempt with the notice after it, and the envelope must never reach the deltas"
+        );
+        let mut event_chunks = String::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let zeroclaw_api::agent::TurnEvent::Chunk { delta } = event {
+                event_chunks.push_str(&delta);
+            }
+        }
+        assert_eq!(
+            event_chunks,
+            format!("{prefix}{prefix}{notice}"),
+            "the event stream must mirror the deltas: the prefix once per attempt with the notice at the end"
+        );
     }
 
     #[tokio::test]
