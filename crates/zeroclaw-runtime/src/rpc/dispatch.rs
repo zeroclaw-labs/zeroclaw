@@ -38,6 +38,8 @@ pub const RPC_PROTOCOL_VERSION: u64 = 1;
 mod notification {
     pub const SESSION_UPDATE: &str = "session/update";
     pub const LOGS_EVENT: &str = "logs/event";
+    pub const EVENTS_EVENT: &str = "events/event";
+    pub const SUBSCRIPTION_LAGGED: &str = "subscription/lagged";
 }
 
 #[derive(Debug)]
@@ -103,6 +105,12 @@ pub enum Method {
     SessionDelete,
     SessionApprove,
     SessionKill,
+    SessionSteer,
+    SessionAbort,
+    SessionAppend,
+    SessionRename,
+    SessionRunOnce,
+    SessionAttach,
 
     // Memory
     MemoryList,
@@ -166,6 +174,9 @@ pub enum Method {
     LogsSubscribe,
     LogsQuery,
     LogsGet,
+    EventsHistory,
+    EventsSubscribe,
+    SubscriptionCancel,
 
     // TUI
     TuiList,
@@ -228,6 +239,12 @@ impl Method {
         (Method::SessionDelete, "session/delete"),
         (Method::SessionApprove, "session/approve"),
         (Method::SessionKill, "session/kill"),
+        (Method::SessionSteer, "session/steer"),
+        (Method::SessionAbort, "session/abort"),
+        (Method::SessionAppend, "session/append"),
+        (Method::SessionRename, "session/rename"),
+        (Method::SessionRunOnce, "session/run-once"),
+        (Method::SessionAttach, "session/attach"),
         // Memory
         (Method::MemoryList, "memory/list"),
         (Method::MemorySearch, "memory/search"),
@@ -284,6 +301,9 @@ impl Method {
         // Logs
         (Method::LogsSubscribe, "logs/subscribe"),
         (Method::LogsQuery, "logs/query"),
+        (Method::EventsHistory, "events/history"),
+        (Method::EventsSubscribe, "events/subscribe"),
+        (Method::SubscriptionCancel, "subscription/cancel"),
         (Method::LogsGet, "logs/get"),
         // TUI
         (Method::TuiList, "tui/list"),
@@ -361,15 +381,30 @@ impl Method {
             M::DoctorRun => (Resource::System, Verb::Execute),
 
             M::SessionNew => (Resource::Sessions, Verb::Create),
-            M::SessionPrompt => (Resource::Sessions, Verb::Execute),
-            M::SessionConfigure | M::SessionApprove => (Resource::Sessions, Verb::Update),
+            // Steering feeds the running turn, so it needs the same grant as
+            // starting one. Run-once also creates its transient session; the
+            // handler checks `sessions:create` on top of this.
+            M::SessionPrompt | M::SessionSteer | M::SessionRunOnce => {
+                (Resource::Sessions, Verb::Execute)
+            }
+            M::SessionConfigure | M::SessionApprove | M::SessionAppend | M::SessionRename => {
+                (Resource::Sessions, Verb::Update)
+            }
+            // Attaching only views a session the caller already owns; it
+            // starts and changes nothing.
             M::SessionList
             | M::SessionListAcp
             | M::SessionMessages
             | M::SessionState
-            | M::SessionGitBranch => (Resource::Sessions, Verb::Read),
+            | M::SessionGitBranch
+            | M::SessionAttach => (Resource::Sessions, Verb::Read),
             M::SessionClose | M::SessionCancel => (Resource::Sessions, Verb::Update),
-            M::SessionDelete | M::SessionKill => (Resource::Sessions, Verb::Delete),
+            // Abort interrupts a turn regardless of which client started it,
+            // so it takes the operator verb `session/kill` uses rather than
+            // `session/cancel`'s owner-only update.
+            M::SessionDelete | M::SessionKill | M::SessionAbort => {
+                (Resource::Sessions, Verb::Delete)
+            }
 
             M::MemoryList | M::MemorySearch | M::MemoryGet => (Resource::Memory, Verb::Read),
             M::MemoryStore => (Resource::Memory, Verb::Create),
@@ -412,7 +447,15 @@ impl Method {
             }
             M::PersonalityPut => (Resource::Personality, Verb::Update),
 
-            M::LogsSubscribe | M::LogsQuery | M::LogsGet => (Resource::Logs, Verb::Read),
+            M::LogsSubscribe
+            | M::LogsQuery
+            | M::LogsGet
+            | M::EventsHistory
+            | M::EventsSubscribe => (Resource::Logs, Verb::Read),
+            // Ends only a subscription this connection opened (the id is looked
+            // up in the connection's own registry), so it needs no more than
+            // any authenticated caller holds.
+            M::SubscriptionCancel => (Resource::System, Verb::Read),
 
             M::TuiList => (Resource::Tui, Verb::Read),
 
@@ -458,6 +501,14 @@ pub enum MethodAuthz {
 }
 
 type RpcResult = Result<Value, JsonRpcError>;
+
+/// Optional `TurnComplete` payload beyond the outcome and text. Refusals
+/// and missing-session completions carry neither.
+#[derive(Default)]
+struct TurnCompleteExtras {
+    safeguard_fallback: Option<crate::rpc::types::SafeguardFallbackWire>,
+    usage: Option<crate::rpc::types::TurnUsageTotals>,
+}
 type BoxRpcFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = RpcResult> + Send + 'a>>;
 
 fn rpc_err(code: i32, msg: impl Into<String>) -> JsonRpcError {
@@ -846,6 +897,17 @@ pub struct RpcDispatcher {
     /// one (direct dispatcher construction outside an accepted connection).
     connection_activity: Option<crate::rpc::ConnectionActivity>,
     prompt_tasks: Vec<JoinHandle<()>>,
+    /// Open subscriptions on this connection, by id. Shared with every
+    /// [`Self::spawn_handle`] clone; each token is a child of
+    /// `connection_cancel`, so teardown ends them all.
+    subscriptions: Arc<parking_lot::Mutex<std::collections::HashMap<String, CancellationToken>>>,
+    /// Who owns this connection's prompted turns, from
+    /// `clientCapabilities.turn_lifetime` at `initialize`.
+    turn_lifetime: TurnLifetime,
+    /// Identifies this connection among a session's viewers, so a prompt
+    /// does not attach the connection a second time. Shared with every
+    /// [`Self::spawn_handle`] clone.
+    connection_nonce: u64,
     /// SHA-256 fingerprint of the client certificate presented on the mTLS
     /// handshake (remote WSS plane only; `None` on the local socket). This is the
     /// transport identity: it keys the issued-cert ledger, so the renew RPC gates
@@ -941,6 +1003,9 @@ impl RpcDispatcher {
             owns_connection: true,
             connection_activity: None,
             prompt_tasks: Vec::new(),
+            subscriptions: Arc::default(),
+            turn_lifetime: TurnLifetime::Connection,
+            connection_nonce: next_connection_nonce(),
             peer_cert_fingerprint: None,
         }
     }
@@ -2210,6 +2275,9 @@ impl RpcDispatcher {
             // until that task's future is dropped.
             connection_activity: self.connection_activity.clone(),
             prompt_tasks: Vec::new(),
+            subscriptions: Arc::clone(&self.subscriptions),
+            turn_lifetime: self.turn_lifetime,
+            connection_nonce: self.connection_nonce,
             peer_cert_fingerprint: self.peer_cert_fingerprint.clone(),
         }
     }
@@ -2500,7 +2568,14 @@ impl RpcDispatcher {
                 // TurnComplete notification, not by this method's response.
                 // The response (empty {} or error) is kept only so legacy
                 // request-form callers don't park forever.
-                let handle = self.spawn_handle();
+                let mut handle = self.spawn_handle();
+                let detached = self.turn_lifetime == TurnLifetime::Session;
+                if detached {
+                    // A session-lifetime turn belongs to the session, so it
+                    // must not keep this connection counted for the reload
+                    // drain, and teardown must neither join nor abort it.
+                    handle.connection_activity = None;
+                }
                 let id_clone = req_id.clone();
                 let params_clone = req.params.clone();
                 let is_notif = is_notification;
@@ -2514,7 +2589,9 @@ impl RpcDispatcher {
                         }
                     }
                 });
-                self.prompt_tasks.push(task);
+                if !detached {
+                    self.prompt_tasks.push(task);
+                }
                 return;
             }
             Method::SessionConfigure => self.handle_session_configure(&req.params).await,
@@ -2527,6 +2604,32 @@ impl RpcDispatcher {
             Method::SessionDelete => self.handle_session_delete(&req.params).await,
             Method::SessionApprove => self.handle_session_approve(&req.params).await,
             Method::SessionKill => self.handle_session_kill(&req.params).await,
+            Method::SessionSteer => Box::pin(self.handle_session_steer(&req.params)).await,
+            Method::SessionAttach => Box::pin(self.handle_session_attach(&req.params)).await,
+            Method::SessionAbort => Box::pin(self.handle_session_abort(&req.params)).await,
+            Method::SessionAppend => Box::pin(self.handle_session_append(&req.params)).await,
+            Method::SessionRename => Box::pin(self.handle_session_rename(&req.params)).await,
+            Method::SessionRunOnce => {
+                // Spawned like `session/prompt`: the call spans a whole turn,
+                // and this connection must keep reading so the caller can
+                // approve tools, steer, or cancel while it runs.
+                let handle = self.spawn_handle();
+                let id_clone = req_id.clone();
+                let params_clone = req.params.clone();
+                let is_notif = is_notification;
+                self.prompt_tasks.retain(|task| !task.is_finished());
+                let task = zeroclaw_spawn::spawn!(async move {
+                    let result = Box::pin(handle.handle_session_run_once(&params_clone)).await;
+                    if !is_notif {
+                        match result {
+                            Ok(value) => handle.send_result(id_clone, value).await,
+                            Err(e) => handle.send_error(id_clone, e.code, &e.message).await,
+                        }
+                    }
+                });
+                self.prompt_tasks.push(task);
+                return;
+            }
 
             // Memory
             Method::MemoryList => self.handle_memory_list(&req.params).await,
@@ -2606,8 +2709,11 @@ impl RpcDispatcher {
             }
 
             // Logs
-            Method::LogsSubscribe => self.handle_logs_subscribe().await,
+            Method::LogsSubscribe => self.handle_logs_subscribe(&req.params),
+            Method::EventsSubscribe => self.handle_events_subscribe(&req.params),
+            Method::SubscriptionCancel => self.handle_subscription_cancel(&req.params),
             Method::LogsQuery => self.handle_logs_query(&req.params).await,
+            Method::EventsHistory => self.handle_events_history(),
             Method::LogsGet => self.handle_logs_get(&req.params).await,
 
             // TUI
@@ -2686,6 +2792,8 @@ impl RpcDispatcher {
             .and_then(|c| c.get("elicitation"));
         self.client_elicitation_caps =
             zeroclaw_api::elicitation::ElicitationCapabilities::from_value(elicitation);
+        self.turn_lifetime =
+            TurnLifetime::from_client_capabilities(req.client_capabilities.as_ref());
 
         // Authenticate FIRST: bind a principal or reject, before any
         // registry mutation. The tui_id/tui_sig continuity below grants no
@@ -2806,6 +2914,7 @@ impl RpcDispatcher {
             commands,
             auth_methods: self.ctx.auth.provider_names(),
             principal_id: Some(principal_id),
+            turn_lifetime: Some(self.turn_lifetime),
         })
     }
 
@@ -3123,13 +3232,16 @@ impl RpcDispatcher {
         agent: Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
         session_id: String,
     ) {
-        let approval_channel = Arc::new(crate::rpc::approval_channel::RpcApprovalChannel::new(
-            "rpc",
-            session_id,
-            Arc::clone(&self.rpc),
-            Arc::clone(&self.ctx.approval_pending),
-            self.client_elicitation_caps,
-        ));
+        let approval_channel = Arc::new(
+            crate::rpc::approval_channel::RpcApprovalChannel::new(
+                "rpc",
+                session_id,
+                Arc::clone(&self.rpc),
+                Arc::clone(&self.ctx.approval_pending),
+                self.client_elicitation_caps,
+            )
+            .with_subscriptions(Arc::clone(&self.ctx.subscriptions)),
+        );
         if let Ok(mut guard) = agent.try_lock() {
             guard.set_channel_name("rpc".to_string());
             guard
@@ -3570,13 +3682,16 @@ impl RpcDispatcher {
             resolved_interaction_surface.map(crate::agent::prompt::InteractionSurface::resolve),
         );
 
-        let approval_ch = Arc::new(crate::rpc::approval_channel::RpcApprovalChannel::new(
-            "rpc",
-            session_id.clone(),
-            Arc::clone(&self.rpc),
-            Arc::clone(&self.ctx.approval_pending),
-            self.client_elicitation_caps,
-        ));
+        let approval_ch = Arc::new(
+            crate::rpc::approval_channel::RpcApprovalChannel::new(
+                "rpc",
+                session_id.clone(),
+                Arc::clone(&self.rpc),
+                Arc::clone(&self.ctx.approval_pending),
+                self.client_elicitation_caps,
+            )
+            .with_subscriptions(Arc::clone(&self.ctx.subscriptions)),
+        );
         // Align agent.channel_name with the registered back-channel key so
         // ask_user/poll/escalate default to this conversation (not an arbitrary
         // external channel from the seeded channel map).
@@ -4050,6 +4165,7 @@ impl RpcDispatcher {
         {
             return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
         }
+        self.ctx.subscriptions.release_session(&req.session_id);
         if let Some(ref hooks) = self.ctx.hooks {
             hooks.fire_session_end(&req.session_id, "rpc").await;
         }
@@ -4164,6 +4280,7 @@ impl RpcDispatcher {
             .kill_session_generation(sid, live_generation)
             .await;
         if killed {
+            self.ctx.subscriptions.release_session(sid);
             if let Some(ref hooks) = self.ctx.hooks {
                 hooks.fire_session_end(sid, "rpc").await;
             }
@@ -4388,13 +4505,16 @@ impl RpcDispatcher {
         };
         agent.set_interaction_context(interaction_context);
 
-        let approval_ch = Arc::new(crate::rpc::approval_channel::RpcApprovalChannel::new(
-            "rpc",
-            sid.to_string(),
-            Arc::clone(&self.rpc),
-            Arc::clone(&self.ctx.approval_pending),
-            self.client_elicitation_caps,
-        ));
+        let approval_ch = Arc::new(
+            crate::rpc::approval_channel::RpcApprovalChannel::new(
+                "rpc",
+                sid.to_string(),
+                Arc::clone(&self.rpc),
+                Arc::clone(&self.ctx.approval_pending),
+                self.client_elicitation_caps,
+            )
+            .with_subscriptions(Arc::clone(&self.ctx.subscriptions)),
+        );
         // See session/new: channel_name must match the registered back-channel
         // key so interactive tools default to this conversation.
         agent.set_channel_name("rpc".to_string());
@@ -4650,6 +4770,23 @@ impl RpcDispatcher {
 
     async fn handle_session_prompt(&self, params: &Value) -> RpcResult {
         let req: SessionPromptParams = parse_params(params)?;
+        let (result, _usage) = self.run_session_prompt(req).await?;
+        to_result(result)
+    }
+
+    /// The `session/prompt` turn, shared with `session/run-once`. Returns the
+    /// prompt result together with the usage totals the terminal
+    /// `TurnComplete` carried.
+    async fn run_session_prompt(
+        &self,
+        req: SessionPromptParams,
+    ) -> Result<
+        (
+            SessionPromptResult,
+            Option<crate::rpc::types::TurnUsageTotals>,
+        ),
+        JsonRpcError,
+    > {
         let sid = &req.session_id;
         let authorized = self
             .authorize_session_owner(sid, Method::SessionPrompt)
@@ -4720,6 +4857,7 @@ impl RpcDispatcher {
                             "turn cancelled by daemon: session_not_found".to_string(),
                             req.client_turn_generation,
                             None,
+                            TurnCompleteExtras::default(),
                         )
                         .await;
                         return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
@@ -4754,6 +4892,34 @@ impl RpcDispatcher {
         self.revalidate_admitted_session(sid, authorized.as_ref())
             .await?;
 
+        // A session-lifetime turn delivers through the session's ring from
+        // here on, the terminal frame included. The prompting connection
+        // views the ring like any other viewer, attached now (unless it
+        // already is) so it sees every frame of this turn.
+        let session_lifetime = self.turn_lifetime == TurnLifetime::Session;
+        let _session_route = session_lifetime.then(|| {
+            let hub = &self.ctx.subscriptions;
+            let source = hub.session_source(sid);
+            if !hub.viewed_by(sid, self.connection_nonce) {
+                let head = hub.head_seq(source);
+                let _ = self.start_subscription(
+                    source,
+                    Method::SessionPrompt,
+                    notification::SESSION_UPDATE,
+                    Some(head),
+                    Some(sid),
+                );
+            }
+            hub.route_session(sid)
+        });
+        let sink = match self.ctx.subscriptions.routed_source(sid) {
+            Some(source) if session_lifetime => TurnSink::Ring {
+                hub: Arc::clone(&self.ctx.subscriptions),
+                source,
+            },
+            _ => TurnSink::Connection(self.rpc.clone()),
+        };
+
         // Registration is the first operation after admission and the RAII
         // handle removes this exact generation on every exit path. Removal
         // handlers signal before waiting on the same queue, so they cannot
@@ -4763,6 +4929,14 @@ impl RpcDispatcher {
             .ctx
             .sessions
             .register_cancel_token_guard(sid, cancel.clone());
+        // Steering shares the cancel token's generation, so the same exit
+        // that unregisters the token closes this turn to steering.
+        let (steering_tx, steering_rx) = tokio::sync::mpsc::channel::<String>(32);
+        if let Some(generation) = cancel_registration.generation() {
+            self.ctx
+                .sessions
+                .register_steering(sid, generation, steering_tx);
+        }
         self.ctx
             .sessions
             .wait_test_prompt_registration_pause()
@@ -5039,7 +5213,6 @@ impl RpcDispatcher {
             (alias, mp, m)
         };
 
-        let rpc = self.rpc.clone();
         let sid_owned = sid.to_string();
         // Clone of the session store so the turn-event closure can persist
         // the latest TodoWrite plan (store-then-emit) before the plan
@@ -5066,6 +5239,10 @@ impl RpcDispatcher {
             )
             .with_agent_alias(&attribution_agent_alias)
         });
+        let usage_fold = Arc::new(parking_lot::Mutex::new(
+            super::turn::TurnUsageFold::default(),
+        ));
+        let usage_fold_for_events = Arc::clone(&usage_fold);
         let turn = execute_turn(
             agent,
             prompt.clone(),
@@ -5078,12 +5255,17 @@ impl RpcDispatcher {
                 channel: "rpc",
             },
             cost_context,
-            self.connection_activity.clone(),
+            // A session-lifetime turn does not keep the connection counted.
+            (!session_lifetime)
+                .then(|| self.connection_activity.clone())
+                .flatten(),
+            Some(steering_rx),
             move |event| {
-                let rpc = rpc.clone();
+                let sink = sink.clone();
                 let sid = sid_owned.clone();
                 let acp_token_store = acp_token_store.clone();
                 let sessions_for_plan = sessions_for_plan.clone();
+                usage_fold_for_events.lock().apply(&event);
                 async move {
                     if let (
                         Some(store),
@@ -5104,22 +5286,29 @@ impl RpcDispatcher {
                     }
                     persist_plan_if_any(&sessions_for_plan, acp_token_store.as_ref(), &sid, &event)
                         .await;
-                    forward_turn_event(&rpc, &sid, &event).await;
+                    sink.forward(&sid, &event).await;
                 }
             },
         );
         tokio::pin!(turn);
-        let outcome = tokio::select! {
-            biased;
-            _ = self.connection_cancel.cancelled() => {
-                self.ctx.sessions.record_cancel_cause_if_absent(
-                    sid,
-                    crate::rpc::session::CancelCause::ConnectionClosed,
-                );
-                cancel.cancel();
-                turn.await
+        // Only a connection-lifetime turn ends with its connection. A
+        // session-lifetime turn runs on when the prompting connection closes;
+        // only session/cancel, session/abort, and session removal stop it.
+        let outcome = if session_lifetime {
+            turn.await
+        } else {
+            tokio::select! {
+                biased;
+                _ = self.connection_cancel.cancelled() => {
+                    self.ctx.sessions.record_cancel_cause_if_absent(
+                        sid,
+                        crate::rpc::session::CancelCause::ConnectionClosed,
+                    );
+                    cancel.cancel();
+                    turn.await
+                }
+                outcome = &mut turn => outcome,
             }
-            outcome = &mut turn => outcome,
         };
 
         // Drain the cancel cause BEFORE removing the token (removal clears the
@@ -5261,11 +5450,16 @@ impl RpcDispatcher {
             Ok(TurnOutcome::Completed {
                 text,
                 safeguard_fallback,
+                final_context_limits,
                 ..
             }) => {
                 if persist_session_state && let Some(ref backend) = self.ctx.session_backend {
                     let _ = backend.set_session_state(&session_key, "idle", None);
                 }
+                let usage = usage_fold.lock().totals(final_context_limits);
+                let safeguard_wire = safeguard_fallback
+                    .as_ref()
+                    .map(crate::rpc::types::SafeguardFallbackWire::from);
                 let text = crate::agent::append_safeguard_fallback_notice(
                     text,
                     safeguard_fallback.as_ref(),
@@ -5276,13 +5470,20 @@ impl RpcDispatcher {
                     text.clone(),
                     req.client_turn_generation,
                     message_count,
+                    TurnCompleteExtras {
+                        safeguard_fallback: safeguard_wire,
+                        usage: usage.clone(),
+                    },
                 )
                 .await;
-                to_result(SessionPromptResult {
-                    session_id: req.session_id,
-                    stop_reason: "end_turn".to_string(),
-                    content: text,
-                })
+                Ok((
+                    SessionPromptResult {
+                        session_id: req.session_id,
+                        stop_reason: "end_turn".to_string(),
+                        content: text,
+                    },
+                    usage,
+                ))
             }
             Ok(TurnOutcome::Cancelled { partial_text, .. }) => {
                 if persist_session_state && let Some(ref backend) = self.ctx.session_backend {
@@ -5318,19 +5519,28 @@ impl RpcDispatcher {
                         })),
                     "turn cancelled; emitting attributed TurnComplete so the client exits the working state"
                 );
+                // A cancelled turn still billed every call it made.
+                let usage = usage_fold.lock().totals(None);
                 self.emit_turn_complete(
                     &req.session_id,
                     crate::rpc::types::TurnCompletionOutcome::Cancelled,
                     cancel_message,
                     req.client_turn_generation,
                     message_count,
+                    TurnCompleteExtras {
+                        safeguard_fallback: None,
+                        usage: usage.clone(),
+                    },
                 )
                 .await;
-                to_result(SessionPromptResult {
-                    session_id: req.session_id,
-                    stop_reason: "cancelled".to_string(),
-                    content: partial_text,
-                })
+                Ok((
+                    SessionPromptResult {
+                        session_id: req.session_id,
+                        stop_reason: "cancelled".to_string(),
+                        content: partial_text,
+                    },
+                    usage,
+                ))
             }
             Err(e) => {
                 if persist_session_state && let Some(ref backend) = self.ctx.session_backend {
@@ -5352,6 +5562,8 @@ impl RpcDispatcher {
                         })),
                     "turn failed; emitting TurnComplete so the client exits the working state"
                 );
+                // Bound first: the fold's guard must not live across the await.
+                let failed_usage = usage_fold.lock().totals(None);
                 self.emit_turn_complete(
                     &req.session_id,
                     crate::rpc::types::TurnCompletionOutcome::Failed,
@@ -5360,6 +5572,10 @@ impl RpcDispatcher {
                         .unwrap_or_else(|| format!("turn failed: {e}")),
                     req.client_turn_generation,
                     message_count,
+                    TurnCompleteExtras {
+                        safeguard_fallback: None,
+                        usage: failed_usage,
+                    },
                 )
                 .await;
                 Err(rpc_err(
@@ -5389,6 +5605,7 @@ impl RpcDispatcher {
             format!("turn refused by daemon: {}", denied.message),
             client_turn_generation,
             None,
+            TurnCompleteExtras::default(),
         )
         .await;
         denied
@@ -5404,6 +5621,7 @@ impl RpcDispatcher {
         content: String,
         client_turn_generation: Option<u64>,
         message_count: Option<usize>,
+        extras: TurnCompleteExtras,
     ) {
         let update = SessionUpdateEvent::TurnComplete {
             session_id: session_id.to_string(),
@@ -5411,8 +5629,16 @@ impl RpcDispatcher {
             content,
             client_turn_generation,
             message_count,
+            safeguard_fallback: extras.safeguard_fallback,
+            usage: extras.usage.map(Box::new),
         };
         if let Ok(params) = serde_json::to_value(update) {
+            // A session-lifetime turn's terminal frame goes where its other
+            // frames went: the ring, for every viewer.
+            if let Some(source) = self.ctx.subscriptions.routed_source(session_id) {
+                self.ctx.subscriptions.publish(source, params);
+                return;
+            }
             let n = JsonRpcNotification::new(notification::SESSION_UPDATE, params);
             if let Ok(s) = serde_json::to_string(&n) {
                 let _ = self.rpc.send_raw(s).await;
@@ -5617,17 +5843,39 @@ impl RpcDispatcher {
             .sessions
             .session_owner_tui_id(&req.session_id)
             .await;
-        let allowed = match (
+        let owning_client = match (
             owner.as_ref().and_then(|o| o.as_deref()),
             self.tui_id.as_deref(),
         ) {
             (Some(o), Some(c)) => o == c,
             _ => false,
         };
+        // The session's authenticated owner may cancel from any of its
+        // clients: a session-lifetime turn outlives the client that started
+        // it, and a reconnecting client need not carry the same TUI id. The
+        // unauthenticated shared operator has no owner identity, so this
+        // never widens its access.
+        let owning_principal = match (
+            self.ctx
+                .sessions
+                .session_owner_principal(&req.session_id)
+                .await,
+            self.owner_principal_id(),
+        ) {
+            (Some(Some(owner)), Some(me)) => owner == me,
+            _ => false,
+        };
+        let allowed = owning_client || owning_principal;
         if !allowed {
+            // `try_lock`: a running turn holds the Agent for its whole
+            // duration, and awaiting it here would stall this connection's
+            // dispatch loop until that turn ends just to label a refusal.
             let (agent_alias, model_provider, model) =
                 match self.ctx.sessions.get_agent(&req.session_id).await {
-                    Some(agent) => agent.lock().await.attribution_fields(),
+                    Some(agent) => agent
+                        .try_lock()
+                        .map(|agent| agent.attribution_fields())
+                        .unwrap_or_default(),
                     None => (String::new(), String::new(), String::new()),
                 };
             let span = ::zeroclaw_log::info_span!(
@@ -5673,6 +5921,316 @@ impl RpcDispatcher {
         }
     }
 
+    /// Check a grant a composite method needs beyond its own classification.
+    /// Re-resolves against the accepted policy like the admission rechecks;
+    /// an unbound dispatcher (direct unit-test handlers) passes.
+    fn require_additional_grant(
+        &self,
+        method: Method,
+        resource: zeroclaw_api::grants::Resource,
+        verb: zeroclaw_api::grants::Verb,
+    ) -> Result<(), JsonRpcError> {
+        let Some(grants) = self.recheck_authority_after_admission(method)? else {
+            return Ok(());
+        };
+        if grants.permits(resource, verb) {
+            return Ok(());
+        }
+        let denied = crate::rpc::auth::AuthDenied::forbidden(format!(
+            "Principal is not granted {resource}:{verb} (required by {})",
+            method.wire_name()
+        ));
+        self.audit_auth_denial(method, &denied);
+        Err(rpc_err(denied.code, denied.message))
+    }
+
+    /// Feed a message into the session's running turn. The agent folds it in
+    /// as its own user turn before the next model round, as the gateway chat
+    /// socket does for a message sent mid-turn.
+    async fn handle_session_steer(&self, params: &Value) -> RpcResult {
+        let req: SessionSteerParams = parse_params(params)?;
+        if req.content.trim().is_empty() {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "session/steer requires a non-empty `content`",
+            ));
+        }
+        self.authorize_session_owner(&req.session_id, Method::SessionSteer)
+            .await?;
+        match self
+            .ctx
+            .sessions
+            .steer_session(&req.session_id, req.content)
+        {
+            crate::rpc::session::SteerOutcome::Accepted => to_result(SessionSteerResult {
+                session_id: req.session_id,
+                accepted: true,
+            }),
+            crate::rpc::session::SteerOutcome::QueueFull => Err(rpc_err(
+                SESSION_BUSY,
+                "Steering queue is full for the running turn",
+            )),
+            crate::rpc::session::SteerOutcome::NoActiveTurn => Err(rpc_err(
+                SESSION_NOT_FOUND,
+                "No active turn for this session",
+            )),
+        }
+    }
+
+    /// View a session's turns from this connection: replay what its ring
+    /// still holds after `since_seq`, then stream live. Closing the
+    /// connection (or `subscription/cancel`) only detaches this viewer.
+    async fn handle_session_attach(&self, params: &Value) -> RpcResult {
+        let req: SessionAttachParams = parse_params(params)?;
+        let record = self
+            .authorize_session_owner(&req.session_id, Method::SessionAttach)
+            .await?;
+        if record.is_none() {
+            return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+        }
+        let source = self.ctx.subscriptions.session_source(&req.session_id);
+        let (subscription_id, seq) = self.start_subscription(
+            source,
+            Method::SessionAttach,
+            notification::SESSION_UPDATE,
+            req.since_seq,
+            Some(&req.session_id),
+        );
+        to_result(SessionAttachResult {
+            running: self.ctx.sessions.has_inflight_turn(&req.session_id),
+            session_id: req.session_id,
+            subscription_id,
+            seq,
+        })
+    }
+
+    /// Operator interrupt: cancel the session's running turn whichever
+    /// client started it. `session/cancel` stays limited to the owning
+    /// client; this is the RPC counterpart of the gateway's abort route.
+    /// Principal ownership still applies, so a scoped principal can abort
+    /// only its own sessions.
+    async fn handle_session_abort(&self, params: &Value) -> RpcResult {
+        let req: SessionIdParams = parse_params(params)?;
+        self.authorize_session_owner(&req.session_id, Method::SessionAbort)
+            .await?;
+        if !self.ctx.sessions.abort_session(&req.session_id) {
+            return Err(rpc_err(
+                SESSION_NOT_FOUND,
+                "No active turn for this session",
+            ));
+        }
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_attrs(::serde_json::json!({
+                    "session_id": req.session_id,
+                    "principal_id": self
+                        .auth
+                        .as_ref()
+                        .map(|auth| auth.principal.id.as_str().to_owned()),
+                    "caller_tui_id": self.tui_id.as_deref(),
+                    "peer_label": &self.peer_label,
+                })),
+            "session/abort: operator interrupted the running turn"
+        );
+        to_result(SessionCancelResult {
+            session_id: req.session_id,
+            cancelled: true,
+        })
+    }
+
+    /// The durable chat key an append or rename writes, from a resolved
+    /// session record. ACP transcripts live in their own store, which has no
+    /// display names and replays structured turns, so both are refused there.
+    fn durable_chat_key(
+        record: Option<crate::rpc::session::SessionRecord>,
+        method: Method,
+    ) -> Result<String, JsonRpcError> {
+        match record.and_then(|rec| rec.durable) {
+            Some(DurableSession::Chat { key }) => Ok(key),
+            Some(DurableSession::Acp) => Err(rpc_err(
+                INVALID_PARAMS,
+                format!("{} is not supported for ACP sessions", method.wire_name()),
+            )),
+            None => Err(rpc_err(SESSION_NOT_FOUND, "Session not found")),
+        }
+    }
+
+    /// Append an assistant message to a session transcript without running
+    /// a turn, the RPC counterpart of the gateway's message POST.
+    async fn handle_session_append(&self, params: &Value) -> RpcResult {
+        let req: SessionAppendParams = parse_params(params)?;
+        if req.content.trim().is_empty() {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "session/append requires a non-empty `content`",
+            ));
+        }
+        let sid = &req.session_id;
+        let authorized = self
+            .authorize_session_owner(sid, Method::SessionAppend)
+            .await?;
+        let backend = self
+            .ctx
+            .session_backend
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
+        // Admission orders the append between turns: a running turn replaces
+        // the durable transcript with its own history when it finishes, which
+        // would erase an append written underneath it.
+        let _guard = self
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(sid)
+            .await
+            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+        let admitted = self
+            .revalidate_admitted_session(sid, authorized.as_ref())
+            .await?;
+        let key = Self::durable_chat_key(admitted, Method::SessionAppend)?;
+        let message = zeroclaw_providers::ChatMessage::assistant(&req.content);
+        backend.append(&key, &message).map_err(|e| {
+            rpc_err(
+                INTERNAL_ERROR,
+                format!("Failed to append session message: {e}"),
+            )
+        })?;
+        // A live agent persists its own history over the durable row after
+        // its next turn, so it has to see the append too.
+        if self.ctx.sessions.get_agent(sid).await.is_some() {
+            self.ctx
+                .sessions
+                .seed_history(sid, std::slice::from_ref(&message))
+                .await;
+        }
+        if let Some(event_tx) = self.ctx.event_tx.as_ref() {
+            let _ = event_tx.send(serde_json::json!({
+                "type": "message",
+                "session_id": sid,
+                "role": "assistant",
+                "content": req.content,
+                "source": "rpc",
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            }));
+        }
+        to_result(SessionAppendResult {
+            session_id: req.session_id.clone(),
+            message_count: backend.load(&key).len(),
+        })
+    }
+
+    /// Set a session's display name.
+    async fn handle_session_rename(&self, params: &Value) -> RpcResult {
+        const MAX_SESSION_NAME_CHARS: usize = 200;
+        let req: SessionRenameParams = parse_params(params)?;
+        let name = req.name.trim();
+        if name.is_empty() {
+            return Err(rpc_err(INVALID_PARAMS, "session/rename requires a `name`"));
+        }
+        if name.chars().count() > MAX_SESSION_NAME_CHARS {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!("session name exceeds {MAX_SESSION_NAME_CHARS} characters"),
+            ));
+        }
+        let record = self
+            .authorize_session_owner(&req.session_id, Method::SessionRename)
+            .await?;
+        let backend = self
+            .ctx
+            .session_backend
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
+        let key = Self::durable_chat_key(record, Method::SessionRename)?;
+        backend
+            .set_session_name(&key, name)
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to rename session: {e}")))?;
+        to_result(SessionRenameResult {
+            session_id: req.session_id.clone(),
+            name: name.to_string(),
+        })
+    }
+
+    /// Create a chat session, run one prompt, and close the session: the
+    /// four-call new/prompt/wait/close sequence as one request. The turn
+    /// streams `session/update` like `session/prompt`, and the session's
+    /// transcript stays in the durable store after the close.
+    async fn handle_session_run_once(&self, params: &Value) -> RpcResult {
+        let req: SessionRunOnceParams = parse_params(params)?;
+        if req.prompt.trim().is_empty() {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "session/run-once requires a non-empty `prompt`",
+            ));
+        }
+        self.require_additional_grant(
+            Method::SessionRunOnce,
+            zeroclaw_api::grants::Resource::Sessions,
+            zeroclaw_api::grants::Verb::Create,
+        )?;
+        // The session is closed when the turn ends, so the call must not
+        // adopt one that already exists under a caller-chosen id.
+        let session_id = match req.session_id {
+            Some(sid) => {
+                if self.resolve_session_record(&sid).await?.is_some() {
+                    return Err(rpc_err(
+                        INVALID_PARAMS,
+                        "session/run-once requires a session_id that does not exist yet",
+                    ));
+                }
+                sid
+            }
+            None => format!("run-once-{}", uuid::Uuid::new_v4()),
+        };
+        let new_params = serde_json::to_value(SessionNewParams {
+            agent_alias: req.agent_alias,
+            cwd: req.cwd,
+            session_id: Some(session_id.clone()),
+            tui_id: None,
+            exclude_memory: req.exclude_memory,
+            chat_mode: Some(ChatMode::Chat),
+            interaction_surface: None,
+            // A transient session must not evict the caller's own sessions.
+            keep_siblings: Some(true),
+        })
+        .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?;
+        Box::pin(self.handle_session_new(&new_params)).await?;
+
+        let turn = self
+            .run_session_prompt(SessionPromptParams {
+                session_id: session_id.clone(),
+                prompt: req.prompt,
+                client_turn_generation: None,
+                attachments: Vec::new(),
+            })
+            .await;
+
+        let close = serde_json::json!({ "session_id": session_id });
+        if let Err(e) = Box::pin(self.handle_session_close(&close)).await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "session_id": session_id,
+                        "error": e.message,
+                    })),
+                "session/run-once: could not close the transient session"
+            );
+        }
+
+        let (result, usage) = turn?;
+        to_result(SessionRunOnceResult {
+            session_id: result.session_id,
+            stop_reason: result.stop_reason,
+            content: result.content,
+            usage,
+        })
+    }
+
     async fn handle_session_git_branch(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
         self.authorize_session_owner(&req.session_id, Method::SessionGitBranch)
@@ -5715,6 +6273,25 @@ impl RpcDispatcher {
             backend.list_sessions_with_metadata()
         };
 
+        // A running RPC chat session is one with a live turn: its durable
+        // state row is only as fresh as the last turn that wrote it. Gateway
+        // and channel sessions are judged by that durable state.
+        let durable_running: Option<std::collections::HashSet<String>> =
+            req.running.unwrap_or(false).then(|| {
+                backend
+                    .list_running_sessions()
+                    .into_iter()
+                    .map(|meta| meta.key)
+                    .collect()
+            });
+        let is_running = |key: &str| match &durable_running {
+            None => true,
+            Some(durable) => match key.strip_prefix("rpc_") {
+                Some(sid) => self.ctx.sessions.has_inflight_turn(sid),
+                None => durable.contains(key),
+            },
+        };
+
         // Scoped principals see only their own sessions; legacy NULL-owner
         // rows stay invisible to them rather than shared.
         let scope = self.scoped_principal_id();
@@ -5724,6 +6301,7 @@ impl RpcDispatcher {
                 Some(mine) => meta.principal_id.as_deref() == Some(mine),
                 None => true,
             })
+            .filter(|meta| is_running(&meta.key))
             .filter(|meta| meta.agent_alias.is_some() || meta.channel_id.is_some())
             .map(|meta| {
                 let agent_alias = meta.agent_alias.clone().or_else(|| {
@@ -5954,6 +6532,9 @@ impl RpcDispatcher {
             }
             None => false,
         };
+        if live_removed {
+            self.ctx.subscriptions.release_session(&req.session_id);
+        }
         if live_removed && let Some(ref hooks) = self.ctx.hooks {
             hooks.fire_session_end(&req.session_id, "rpc").await;
         }
@@ -7804,72 +8385,139 @@ impl RpcDispatcher {
 
     // ── Logs handler ─────────────────────────────────────────────
 
-    async fn handle_logs_subscribe(&self) -> RpcResult {
+    fn handle_logs_subscribe(&self, params: &Value) -> RpcResult {
+        let (subscription_id, seq) = self.open_subscription(
+            crate::rpc::subscription::Source::Logs,
+            Method::LogsSubscribe,
+            notification::LOGS_EVENT,
+            params,
+        )?;
+        to_result(LogsSubscribeResult {
+            subscribed: true,
+            subscription_id,
+            seq,
+        })
+    }
+
+    /// Observer frames only (agent, tool, LLM, history-trim, error): the
+    /// live twin of `events/history`, from the daemon's bus.
+    fn handle_events_subscribe(&self, params: &Value) -> RpcResult {
+        let (subscription_id, seq) = self.open_subscription(
+            crate::rpc::subscription::Source::Events,
+            Method::EventsSubscribe,
+            notification::EVENTS_EVENT,
+            params,
+        )?;
+        to_result(LogsSubscribeResult {
+            subscribed: true,
+            subscription_id,
+            seq,
+        })
+    }
+
+    fn handle_subscription_cancel(&self, params: &Value) -> RpcResult {
+        let p: SubscriptionCancelParams = parse_params(params)?;
+        let token = self.subscriptions.lock().remove(&p.subscription_id);
+        if let Some(token) = &token {
+            token.cancel();
+        }
+        to_result(SubscriptionCancelResult {
+            cancelled: token.is_some(),
+        })
+    }
+
+    /// Open a subscription on `source` for this connection and start its
+    /// delivery task. Returns the id and the newest sequence number.
+    ///
+    /// The hub holds the frames; the task only moves a cursor. `since_seq`
+    /// replays what is still buffered, and any gap, whether evicted, lost on
+    /// the bus, or from before a restart, is reported as
+    /// `subscription/lagged` before delivery resumes. A subscription outlives
+    /// the call that opened it, so every delivery is held to the connection's
+    /// authority: the credential must still be live and, whenever the
+    /// accepted policy has moved, the principal is resolved again against
+    /// `method`. The first refusal ends the stream. An unbound dispatcher (the
+    /// direct unit-test handlers) has nothing to recheck.
+    fn open_subscription(
+        &self,
+        source: crate::rpc::subscription::Source,
+        method: Method,
+        notification_method: &'static str,
+        params: &Value,
+    ) -> Result<(String, u64), JsonRpcError> {
+        let p: SubscribeParams = if params.is_null() {
+            SubscribeParams::default()
+        } else {
+            parse_params(params)?
+        };
         let event_tx = self
             .ctx
             .event_tx
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Event streaming is not available"))?;
-        let mut rx = event_tx.subscribe();
-        let rpc = self.rpc.clone();
-        // A subscription outlives the call that opened it, so the gate alone
-        // cannot end it. Hold every delivery to the connection's authority:
-        // the credential must still be live, and whenever the accepted policy
-        // has moved, the principal is resolved again and must still hold
-        // `Logs:Read`. The first refusal ends the stream. An unbound
-        // dispatcher (the direct unit-test handlers) has nothing to recheck.
-        let inbound = Arc::clone(&self.ctx.auth);
-        let binding = self.auth.clone();
-        let mut checked_generation = binding.as_ref().map(|auth| auth.generation);
-        zeroclaw_spawn::spawn!(async move {
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = rpc.closed() => break,
-                    event = rx.recv() => match event {
-                        Ok(mut event) => {
-                            if let Some(auth) = binding.as_ref() {
-                                let generation = inbound.generation();
-                                let authority = if checked_generation == Some(generation) {
-                                    credential_is_live(&inbound, auth)
-                                } else {
-                                    current_authority(&inbound, auth, Method::LogsSubscribe)
-                                        .map(|_| ())
-                                };
-                                if let Err(denied) = authority {
-                                    audit_denial(Some(auth), Method::LogsSubscribe, &denied);
-                                    break;
-                                }
-                                checked_generation = Some(generation);
-                            }
-                            // Pairing secrets (QR payloads, one-shot pair codes)
-                            // ride the shared broadcast bus stamped with the
-                            // ephemeral marker. `logs/subscribe` is NOT the
-                            // bearer-authenticated SSE surface those credentials
-                            // are scoped to — a fresh remote RPC client can
-                            // `initialize` and subscribe over WSS without the
-                            // gateway bearer check — so fail closed: withhold
-                            // marked frames entirely and strip the internal
-                            // marker from everything else (public shape
-                            // unchanged). See `zeroclaw_gateway::sse`.
-                            if zeroclaw_log::frame_carries_ephemeral_credentials(&event) {
-                                continue;
-                            }
-                            zeroclaw_log::strip_ephemeral_broadcast_marker(&mut event);
-                            let notification =
-                                JsonRpcNotification::new(notification::LOGS_EVENT, event);
-                            if let Ok(json) = serde_json::to_string(&notification)
-                                && !rpc.send_raw(json).await
-                            {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    },
-                }
-            }
-        });
-        to_result(LogsSubscribeResult { subscribed: true })
+        self.ctx.subscriptions.attach_bus(event_tx);
+        Ok(self.start_subscription(source, method, notification_method, p.since_seq, None))
+    }
+
+    /// Start one subscription's delivery task on this connection. Returns
+    /// the id and the newest sequence number. `viewer_of` names the session
+    /// when this is a viewer of a session ring, so the session's viewer set
+    /// tracks it for as long as it delivers.
+    fn start_subscription(
+        &self,
+        source: crate::rpc::subscription::Source,
+        method: Method,
+        notification_method: &'static str,
+        since_seq: Option<u64>,
+        viewer_of: Option<&str>,
+    ) -> (String, u64) {
+        let hub = Arc::clone(&self.ctx.subscriptions);
+        let head = hub.head_seq(source);
+        let cursor = since_seq.map_or(head + 1, |since| since.saturating_add(1));
+        let subscription_id = uuid::Uuid::new_v4().to_string();
+        let cancel = self.connection_cancel.child_token();
+        self.subscriptions
+            .lock()
+            .insert(subscription_id.clone(), cancel.clone());
+        if let Some(session_id) = viewer_of {
+            hub.add_viewer(
+                session_id,
+                &subscription_id,
+                self.connection_nonce,
+                cancel.clone(),
+            );
+        }
+        let delivery = SubscriptionDelivery {
+            hub,
+            source,
+            subscription_id: subscription_id.clone(),
+            cursor,
+            rpc: self.rpc.clone(),
+            cancel,
+            notification_method,
+            method,
+            inbound: Arc::clone(&self.ctx.auth),
+            binding: self.auth.clone(),
+            registry: Arc::clone(&self.subscriptions),
+            viewer_of: viewer_of.map(str::to_string),
+        };
+        zeroclaw_spawn::spawn!(deliver_subscription(delivery));
+        (subscription_id, head)
+    }
+
+    /// Recent observer frames (agent, tool, LLM, history-trim, error), oldest
+    /// first: the RPC twin of the gateway's `/api/events/history`, read from
+    /// the daemon's bus so it works without the gateway. Pairing credentials
+    /// are never replayed.
+    fn handle_events_history(&self) -> RpcResult {
+        let history = self
+            .ctx
+            .event_history
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Event history is not available"))?;
+        to_result(EventsHistoryResult {
+            events: crate::observability::broadcast::history_events(history),
+        })
     }
 
     #[allow(deprecated)] // we still forward the legacy cursor for backwards compat
@@ -9076,6 +9724,174 @@ impl Drop for RpcDispatcher {
 
 // ── Helpers ──────────────────────────────────────────────────────
 
+/// Everything one subscription's delivery task owns.
+struct SubscriptionDelivery {
+    hub: Arc<crate::rpc::subscription::SubscriptionHub>,
+    source: crate::rpc::subscription::Source,
+    subscription_id: String,
+    cursor: u64,
+    rpc: Arc<RpcOutbound>,
+    cancel: CancellationToken,
+    notification_method: &'static str,
+    method: Method,
+    inbound: Arc<crate::rpc::auth::RpcInboundAuth>,
+    binding: Option<crate::rpc::auth::ConnectionAuth>,
+    registry: Arc<parking_lot::Mutex<std::collections::HashMap<String, CancellationToken>>>,
+    /// The session this subscription views, when it reads a session ring.
+    viewer_of: Option<String>,
+}
+
+/// Move one subscription's cursor through the hub until it is cancelled, the
+/// connection closes, a write fails, or the caller loses its authority.
+async fn deliver_subscription(delivery: SubscriptionDelivery) {
+    use crate::rpc::subscription::{READ_BATCH, Read};
+    let SubscriptionDelivery {
+        hub,
+        source,
+        subscription_id,
+        mut cursor,
+        rpc,
+        cancel,
+        notification_method,
+        method,
+        inbound,
+        binding,
+        registry,
+        viewer_of,
+    } = delivery;
+    let finish = || {
+        registry.lock().remove(&subscription_id);
+        if let Some(session_id) = viewer_of.as_deref() {
+            hub.remove_viewer(session_id, &subscription_id);
+        }
+    };
+    let lagged = |from_seq: u64, resume_seq: u64| {
+        serde_json::to_string(&JsonRpcNotification::new(
+            notification::SUBSCRIPTION_LAGGED,
+            serde_json::json!(SubscriptionLagged {
+                subscription_id: subscription_id.clone(),
+                from_seq,
+                resume_seq,
+            }),
+        ))
+        .ok()
+    };
+    let mut checked_generation = binding.as_ref().map(|auth| auth.generation);
+
+    // A `since_seq` past the head means this hub started after the client's
+    // last frame (a daemon restart): continuity is broken, so say so.
+    let next = hub.head_seq(source) + 1;
+    if cursor > next {
+        if let Some(json) = lagged(cursor, next)
+            && !rpc.send_raw(json).await
+        {
+            finish();
+            return;
+        }
+        cursor = next;
+    }
+
+    'deliver: loop {
+        let notifier = hub.notifier(source);
+        let notified = notifier.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        match hub.read(source, cursor, READ_BATCH) {
+            Read::Lagged {
+                from_seq,
+                resume_seq,
+            } => {
+                let Some(json) = lagged(from_seq, resume_seq) else {
+                    break 'deliver;
+                };
+                if !rpc.send_raw(json).await {
+                    break 'deliver;
+                }
+                cursor = resume_seq;
+                continue;
+            }
+            Read::Frames(frames) if !frames.is_empty() => {
+                for (seq, frame) in frames {
+                    if cancel.is_cancelled() {
+                        break 'deliver;
+                    }
+                    if let Some(auth) = binding.as_ref() {
+                        let generation = inbound.generation();
+                        let authority = if checked_generation == Some(generation) {
+                            credential_is_live(&inbound, auth)
+                        } else {
+                            current_authority(&inbound, auth, method).map(|_| ())
+                        };
+                        if let Err(denied) = authority {
+                            audit_denial(Some(auth), method, &denied);
+                            break 'deliver;
+                        }
+                        checked_generation = Some(generation);
+                    }
+                    let mut params = (*frame).clone();
+                    if let Some(object) = params.as_object_mut() {
+                        object.insert("subscription_id".into(), serde_json::json!(subscription_id));
+                        object.insert("seq".into(), serde_json::json!(seq));
+                    }
+                    let notification = JsonRpcNotification::new(notification_method, params);
+                    let Ok(json) = serde_json::to_string(&notification) else {
+                        break 'deliver;
+                    };
+                    if !rpc.send_raw(json).await {
+                        break 'deliver;
+                    }
+                    cursor = seq + 1;
+                }
+                tokio::task::yield_now().await;
+                continue;
+            }
+            Read::Frames(_) => {}
+        }
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => break,
+            () = rpc.closed() => break,
+            () = &mut notified => {}
+        }
+    }
+    finish();
+}
+
+/// A process-unique id for each accepted connection. See
+/// `RpcDispatcher::connection_nonce`.
+fn next_connection_nonce() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Where a turn's `session/update` frames go.
+#[derive(Clone)]
+enum TurnSink {
+    /// Straight to the prompting connection (connection lifetime).
+    Connection(Arc<RpcOutbound>),
+    /// Onto the session's ring, for every attached viewer (session
+    /// lifetime). Publishing never waits on a viewer.
+    Ring {
+        hub: Arc<crate::rpc::subscription::SubscriptionHub>,
+        source: crate::rpc::subscription::Source,
+    },
+}
+
+impl TurnSink {
+    async fn forward(&self, session_id: &str, event: &TurnEvent) {
+        match self {
+            Self::Connection(rpc) => {
+                forward_turn_event(rpc, session_id, event).await;
+            }
+            Self::Ring { hub, source } => {
+                if let Some(params) = session_update_params(session_id, event) {
+                    hub.publish(*source, params);
+                }
+            }
+        }
+    }
+}
+
 fn parse_params<T: DeserializeOwned>(params: &Value) -> Result<T, JsonRpcError> {
     serde_json::from_value(params.clone()).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))
 }
@@ -9257,6 +10073,14 @@ fn plan_replay_notification(
 }
 
 fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<String> {
+    let params = session_update_params(session_id, event)?;
+    let n = JsonRpcNotification::new(notification::SESSION_UPDATE, params);
+    serde_json::to_string(&n).ok()
+}
+
+/// The `session/update` params for a turn event, or `None` for events that
+/// are not forwarded.
+fn session_update_params(session_id: &str, event: &TurnEvent) -> Option<Value> {
     let update = match event {
         TurnEvent::Chunk { delta } => SessionUpdateEvent::AgentMessageChunk {
             session_id: session_id.to_string(),
@@ -9343,9 +10167,7 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<St
         _ => return None,
     };
 
-    let params = serde_json::to_value(update).ok()?;
-    let n = JsonRpcNotification::new(notification::SESSION_UPDATE, params);
-    serde_json::to_string(&n).ok()
+    serde_json::to_value(update).ok()
 }
 
 /// Forward a turn event through the outbound RPC writer as a
@@ -16295,7 +17117,7 @@ mod tests {
         let d = RpcDispatcher::new(ctx, writer_tx, "remote:wss=1,uid=anon".into());
 
         assert!(
-            d.handle_logs_subscribe().await.is_ok(),
+            d.handle_logs_subscribe(&json!({})).is_ok(),
             "a fresh client should be able to subscribe"
         );
 
@@ -16347,6 +17169,351 @@ mod tests {
             !seen.contains(zeroclaw_log::EPHEMERAL_BROADCAST_MARKER),
             "the internal fail-closed marker must be stripped from forwarded frames: {seen:?}"
         );
+    }
+
+    /// G2a: the daemon owns the observer hook, so with no gateway running a
+    /// `logs/subscribe` client still receives the agent, tool, and LLM frames
+    /// recorded through any factory-built observer, each exactly once, and
+    /// `events/history` replays them.
+    #[tokio::test]
+    async fn logs_subscribe_carries_observer_frames_without_a_gateway() {
+        use crate::observability::{EventBus, ObserverEvent};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let _hook = crate::observability::HOOK_TEST_LOCK.lock().await;
+        crate::observability::clear_broadcast_hook();
+
+        // What `daemon::run` does, and nothing the gateway does.
+        let bus = EventBus::with_capacities(64, 16);
+        let _daemon_hook = bus.install_hook();
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_event_bus(
+            zeroclaw_config::schema::Config::default(),
+            sessions,
+            &bus,
+        );
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let d = RpcDispatcher::new(ctx, writer_tx, "local:uid=0".into());
+        assert!(d.handle_logs_subscribe(&json!({})).is_ok());
+
+        let observer =
+            crate::observability::create_observer(&zeroclaw_config::schema::ObservabilityConfig {
+                backend: zeroclaw_config::schema::ObservabilityBackend::None,
+                ..Default::default()
+            });
+        let turn = Some("g2a-turn".to_string());
+        observer.record_event(&ObserverEvent::AgentStart {
+            model_provider: "p".into(),
+            model: "m".into(),
+            channel: None,
+            agent_alias: None,
+            turn_id: turn.clone(),
+        });
+        observer.record_event(&ObserverEvent::LlmRequest {
+            model_provider: "p".into(),
+            model: "m".into(),
+            messages_count: 1,
+            channel: None,
+            agent_alias: None,
+            parent_agent_alias: None,
+            turn_id: turn.clone(),
+        });
+        observer.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
+            tool: "shell".into(),
+            tool_call_id: None,
+            duration: std::time::Duration::from_millis(1),
+            success: true,
+            arguments: None,
+            result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: turn.clone(),
+        });
+
+        let mut kinds = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while kinds.len() < 3 {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let Ok(Some(frame)) = tokio::time::timeout(remaining, writer_rx.recv()).await else {
+                break;
+            };
+            let frame: Value = serde_json::from_str(&frame).expect("notification is JSON");
+            if frame["method"] == json!(notification::LOGS_EVENT)
+                && frame["params"]["turn_id"] == json!("g2a-turn")
+            {
+                kinds.push(
+                    frame["params"]["type"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+        }
+        assert_eq!(kinds, ["agent_start", "llm_request", "tool_call"]);
+        // `logs/subscribe` carries every frame on the process-wide bus, and
+        // tests running in parallel record onto it too, so only this turn's
+        // frames can show a duplicate.
+        let quiet_until = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+        while let Ok(Some(frame)) = tokio::time::timeout_at(quiet_until, writer_rx.recv()).await {
+            let frame: Value = serde_json::from_str(&frame).expect("notification is JSON");
+            assert_ne!(
+                frame["params"]["turn_id"],
+                json!("g2a-turn"),
+                "each observer event must be delivered once: {frame}"
+            );
+        }
+
+        // The hook is process-wide, so turns other tests run in parallel land
+        // in this history too; judge only this turn's frames.
+        let history = d.handle_events_history().expect("history is available");
+        let types: Vec<_> = history["events"]
+            .as_array()
+            .expect("events array")
+            .iter()
+            .filter(|event| event["turn_id"] == json!("g2a-turn"))
+            .map(|event| event["type"].clone())
+            .collect();
+        assert_eq!(
+            types,
+            [
+                json!("agent_start"),
+                json!("llm_request"),
+                json!("tool_call")
+            ]
+        );
+
+        crate::observability::clear_broadcast_hook();
+    }
+
+    /// `events/history` is classified `Logs:Read`: a principal without that
+    /// grant is refused, and one holding it reads the daemon's history.
+    #[tokio::test]
+    async fn events_history_requires_logs_read() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        assert_eq!(
+            Method::EventsHistory.authz(),
+            MethodAuthz::Requires(Resource::Logs, Verb::Read)
+        );
+        let bus = crate::observability::EventBus::with_capacities(16, 16);
+        bus.history()
+            .push(json!({"type": "tool_call", "source": "observability", "tool": "SENTINEL"}));
+
+        let denied_config = roster_config(4242);
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_event_bus(denied_config, sessions, &bus);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let response = rpc(&mut alice, &mut rx, 1, "events/history", json!({})).await;
+        assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
+        assert!(
+            !response.to_string().contains("SENTINEL"),
+            "a denied caller must not see history: {response}"
+        );
+
+        let mut granted_config = roster_config(4242);
+        granted_config
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the fixture profile exists")
+            .grants
+            .insert(Resource::Logs, vec![Verb::Read]);
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_event_bus(granted_config, sessions, &bus);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let response = rpc(&mut alice, &mut rx, 1, "events/history", json!({})).await;
+        assert_eq!(
+            response["result"]["events"][0]["tool"],
+            json!("SENTINEL"),
+            "{response}"
+        );
+    }
+
+    /// A dispatcher on a context whose hub has `max_frames` per ring and no
+    /// byte limits, plus the writer receiving its frames.
+    fn subscription_dispatcher(
+        max_frames: usize,
+    ) -> (
+        RpcDispatcher,
+        tokio::sync::mpsc::Receiver<String>,
+        Arc<crate::rpc::subscription::SubscriptionHub>,
+    ) {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let hub = Arc::new(crate::rpc::subscription::SubscriptionHub::with_limits(
+            crate::rpc::subscription::RingLimits {
+                max_frames,
+                max_bytes: usize::MAX,
+            },
+            usize::MAX,
+        ));
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(16);
+        let ctx = RpcContext::minimal_with_subscription_hub(
+            zeroclaw_config::schema::Config::default(),
+            sessions,
+            event_tx,
+            Arc::clone(&hub),
+        );
+        let (writer_tx, writer_rx) = tokio::sync::mpsc::channel::<String>(256);
+        (
+            RpcDispatcher::new(ctx, writer_tx, "local:uid=0".into()),
+            writer_rx,
+            hub,
+        )
+    }
+
+    /// Notifications until `count` arrive or two seconds pass.
+    async fn notifications(
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+        count: usize,
+    ) -> Vec<Value> {
+        let mut seen = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while seen.len() < count {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some(frame)) => seen.push(serde_json::from_str(&frame).expect("JSON frame")),
+                _ => break,
+            }
+        }
+        seen
+    }
+
+    async fn assert_quiet(rx: &mut tokio::sync::mpsc::Receiver<String>) {
+        let extra = tokio::time::timeout(std::time::Duration::from_millis(150), rx.recv()).await;
+        assert!(extra.is_err(), "unexpected frame: {extra:?}");
+    }
+
+    fn seqs(frames: &[Value]) -> Vec<u64> {
+        frames
+            .iter()
+            .map(|frame| frame["params"]["seq"].as_u64().expect("seq on every frame"))
+            .collect()
+    }
+
+    /// F3a: resuming with `since_seq` replays exactly the missing range, then
+    /// continues live, and every notification carries its subscription id.
+    #[tokio::test]
+    async fn events_subscribe_resumes_exactly_the_missing_range() {
+        use crate::rpc::subscription::Source;
+        let (d, mut rx, hub) = subscription_dispatcher(64);
+        for n in 1..=10 {
+            hub.publish(Source::Events, json!({"source": "observability", "n": n}));
+        }
+
+        let opened = d
+            .handle_events_subscribe(&json!({"since_seq": 6}))
+            .expect("subscribe");
+        assert_eq!(opened["seq"], json!(10));
+        let id = opened["subscription_id"].as_str().expect("id").to_string();
+
+        let replay = notifications(&mut rx, 4).await;
+        assert_eq!(seqs(&replay), [7, 8, 9, 10]);
+        for frame in &replay {
+            assert_eq!(frame["method"], json!(notification::EVENTS_EVENT));
+            assert_eq!(frame["params"]["subscription_id"], json!(id));
+        }
+        assert_quiet(&mut rx).await;
+
+        hub.publish(Source::Events, json!({"source": "observability", "n": 11}));
+        assert_eq!(seqs(&notifications(&mut rx, 1).await), [11]);
+        assert_quiet(&mut rx).await;
+    }
+
+    /// F3a: a cursor that fell behind the ring gets `subscription/lagged` with
+    /// the resume point, then the stream continues. It never just ends.
+    #[tokio::test]
+    async fn overflow_is_reported_as_lagged_and_delivery_continues() {
+        use crate::rpc::subscription::Source;
+        let (d, mut rx, hub) = subscription_dispatcher(4);
+        for n in 1..=10 {
+            hub.publish(Source::Logs, json!({"n": n}));
+        }
+
+        let opened = d
+            .handle_logs_subscribe(&json!({"since_seq": 0}))
+            .expect("subscribe");
+        let id = opened["subscription_id"].as_str().expect("id").to_string();
+
+        let frames = notifications(&mut rx, 5).await;
+        assert_eq!(
+            frames[0]["method"],
+            json!(notification::SUBSCRIPTION_LAGGED)
+        );
+        assert_eq!(
+            frames[0]["params"],
+            json!({"subscription_id": id, "from_seq": 1, "resume_seq": 7})
+        );
+        assert_eq!(seqs(&frames[1..]), [7, 8, 9, 10]);
+
+        hub.publish(Source::Logs, json!({"n": 11}));
+        assert_eq!(seqs(&notifications(&mut rx, 1).await), [11]);
+    }
+
+    /// A `since_seq` past the head (a client from before a restart) cannot be
+    /// satisfied; it is reported as a gap rather than silently skipped.
+    #[tokio::test]
+    async fn a_since_seq_past_the_head_is_reported() {
+        use crate::rpc::subscription::Source;
+        let (d, mut rx, hub) = subscription_dispatcher(64);
+        hub.publish(Source::Logs, json!({"n": 1}));
+        d.handle_logs_subscribe(&json!({"since_seq": 40}))
+            .expect("subscribe");
+        let frames = notifications(&mut rx, 1).await;
+        assert_eq!(
+            frames[0]["method"],
+            json!(notification::SUBSCRIPTION_LAGGED)
+        );
+        assert_eq!(frames[0]["params"]["from_seq"], json!(41));
+        assert_eq!(frames[0]["params"]["resume_seq"], json!(2));
+    }
+
+    #[tokio::test]
+    async fn subscription_cancel_ends_only_that_subscription() {
+        use crate::rpc::subscription::Source;
+        let (d, mut rx, hub) = subscription_dispatcher(64);
+        let logs = d.handle_logs_subscribe(&json!({})).expect("logs");
+        let events = d.handle_events_subscribe(&json!({})).expect("events");
+
+        let cancelled = d
+            .handle_subscription_cancel(&json!({"subscription_id": logs["subscription_id"]}))
+            .expect("cancel");
+        assert_eq!(cancelled["cancelled"], json!(true));
+        let again = d
+            .handle_subscription_cancel(&json!({"subscription_id": logs["subscription_id"]}))
+            .expect("cancel again");
+        assert_eq!(again["cancelled"], json!(false));
+
+        hub.publish(Source::Logs, json!({"n": 1}));
+        hub.publish(Source::Events, json!({"source": "observability", "n": 1}));
+        let frames = notifications(&mut rx, 1).await;
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["method"], json!(notification::EVENTS_EVENT));
+        assert_eq!(
+            frames[0]["params"]["subscription_id"],
+            events["subscription_id"]
+        );
+        assert_quiet(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn events_subscribe_requires_logs_read() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        assert_eq!(
+            Method::EventsSubscribe.authz(),
+            MethodAuthz::Requires(Resource::Logs, Verb::Read)
+        );
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (event_tx, _rx0) = tokio::sync::broadcast::channel(16);
+        let ctx = RpcContext::minimal_with_event_tx(roster_config(4242), sessions, event_tx);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let response = rpc(&mut alice, &mut rx, 1, "events/subscribe", json!({})).await;
+        assert_eq!(response["error"]["code"], json!(FORBIDDEN), "{response}");
     }
 
     async fn next_frame_containing(
@@ -19115,6 +20282,7 @@ mod tests {
             commands: vec![],
             auth_methods: Vec::new(),
             principal_id: None,
+            turn_lifetime: None,
         };
         let val = to_result(r).unwrap();
         assert_eq!(val["protocol_version"], 1);
@@ -21091,6 +22259,7 @@ mod tests {
             text: "new-assistant".into(),
             messages: new_messages.clone(),
             safeguard_fallback: None,
+            final_context_limits: None,
         });
         // The caller's snapshot of the agent's authoritative post-turn
         // history — here, the agent's loop retained everything and appended
@@ -21136,6 +22305,7 @@ mod tests {
             text: "new-assistant".into(),
             messages: new_messages.clone(),
             safeguard_fallback: None,
+            final_context_limits: None,
         });
         // Simulate the agent's loop dropping the oldest 8 turns to fit the
         // budget: the caller's authoritative snapshot has only the newest 2
@@ -24750,6 +25920,8 @@ mod tests {
             memory: None,
             cost_tracker: None,
             event_tx: None,
+            event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
@@ -24799,6 +25971,8 @@ mod tests {
             memory: None,
             cost_tracker: None,
             event_tx: None,
+            event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
@@ -24907,6 +26081,8 @@ mod tests {
             memory: None,
             cost_tracker: None,
             event_tx: None,
+            event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
@@ -28488,5 +29664,1151 @@ mod tests {
             .await
             .expect("an aborted shutdown must still end the prompt it was joining")
             .expect_err("the prompt must be aborted rather than run to completion");
+    }
+
+    // ── Turn parity over RPC ──────────────────────────────────────────
+    //
+    // Steering, operator abort, append/rename, the running filter, the
+    // TurnComplete totals, and run-once: what the gateway chat socket and
+    // session routes offer, on the RPC surface.
+
+    /// Provider whose first `chat` call parks on `release` (when gated) and
+    /// whose every call records the request it saw and reports usage.
+    struct ScriptedTurnProvider {
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+        release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        requests: Arc<tokio::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for ScriptedTurnProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            let seen = request
+                .messages
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let call = {
+                let mut requests = self.requests.lock().await;
+                requests.push(seen);
+                requests.len()
+            };
+            let _ = self.started.send(());
+            let gate = self.release.lock().await.take();
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some(format!("reply-{call}")),
+                tool_calls: vec![],
+                usage: Some(zeroclaw_api::model_provider::TokenUsage {
+                    input_tokens: Some(11),
+                    output_tokens: Some(4),
+                    ..Default::default()
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for ScriptedTurnProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "scripted-provider"
+        }
+    }
+
+    type ScriptedTurnHandles = (
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+        Arc<tokio::sync::Mutex<Vec<String>>>,
+    );
+
+    fn scripted_turn_provider() -> (ScriptedTurnProvider, ScriptedTurnHandles) {
+        let (started_tx, started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        (
+            ScriptedTurnProvider {
+                started: started_tx,
+                release: tokio::sync::Mutex::new(Some(release_rx)),
+                requests: Arc::clone(&requests),
+            },
+            (started_rx, release_tx, requests),
+        )
+    }
+
+    /// A persistence-backed context with one live chat session driven by a
+    /// [`ScriptedTurnProvider`]. The session has no principal owner, as the
+    /// shared local operator creates it.
+    async fn parity_fixture(
+        tmp: &tempfile::TempDir,
+        sid: &str,
+        owner_tui_id: Option<&str>,
+    ) -> (
+        Arc<RpcContext>,
+        Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        ScriptedTurnHandles,
+    ) {
+        let config = session_cwd_config(tmp, 4242, None);
+        let workspace = config.agent_workspace_dir("test-agent");
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (provider, handles) = scripted_turn_provider();
+        install_state_test_session_at(
+            &ctx.sessions,
+            &chat_backend,
+            sid,
+            provider,
+            owner_tui_id,
+            &workspace,
+        )
+        .await;
+        (ctx, chat_backend, handles)
+    }
+
+    async fn await_provider_start(started: &mut tokio::sync::mpsc::UnboundedReceiver<()>) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), started.recv())
+            .await
+            .expect("the turn must reach the provider")
+            .expect("the provider stays alive");
+    }
+
+    fn turn_complete_for<'a>(notifications: &'a [Value], session_id: &str) -> &'a Value {
+        notifications
+            .iter()
+            .find(|frame| {
+                frame["method"] == notification::SESSION_UPDATE
+                    && frame["params"]["type"] == "turn_complete"
+                    && frame["params"]["session_id"] == session_id
+            })
+            .unwrap_or_else(|| panic!("no TurnComplete for {session_id}: {notifications:?}"))
+    }
+
+    fn listed_session_ids(response: &Value) -> Vec<String> {
+        response["result"]["sessions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("session/list result: {response}"))
+            .iter()
+            .filter_map(|entry| entry["session_id"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn session_steer_reaches_the_running_turn_and_turn_complete_carries_totals() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-steer";
+        let (ctx, _backend, (mut started, release, requests)) =
+            parity_fixture(&tmp, sid, None).await;
+        let (mut driver, mut driver_rx) = local_operator(&ctx).await;
+        let (mut other, mut other_rx) = local_operator(&ctx).await;
+
+        send_prompt(&mut driver, 1, sid, 5).await;
+        await_provider_start(&mut started).await;
+
+        let steered = rpc(
+            &mut other,
+            &mut other_rx,
+            2,
+            "session/steer",
+            json!({"session_id": sid, "content": "steer me"}),
+        )
+        .await;
+        assert_eq!(steered["result"]["accepted"], json!(true), "{steered}");
+        release.send(()).unwrap();
+
+        let (response, notifications) = response_and_notifications(&mut driver_rx, 1).await;
+        assert!(response.get("error").is_none(), "{response}");
+        let done = turn_complete_for(&notifications, sid);
+        assert_eq!(done["params"]["outcome"], json!("completed"), "{done}");
+        assert_eq!(done["params"]["client_turn_generation"], json!(5));
+
+        let seen = requests.lock().await.clone();
+        assert_eq!(seen.len(), 2, "steering must add a model round: {seen:?}");
+        assert!(
+            seen[1].contains("steer me") && !seen[0].contains("steer me"),
+            "the steered message joins the next round, not the first: {seen:?}"
+        );
+
+        // Both rounds are billed on the terminal event.
+        let usage = &done["params"]["usage"];
+        assert_eq!(usage["input_tokens"], json!(22), "{done}");
+        assert_eq!(usage["output_tokens"], json!(8), "{done}");
+        assert_eq!(usage["tokens_used"], json!(30), "{done}");
+        assert!(
+            done["params"].get("safeguard_fallback").is_none(),
+            "no safeguard fallback happened: {done}"
+        );
+
+        let late = rpc(
+            &mut other,
+            &mut other_rx,
+            3,
+            "session/steer",
+            json!({"session_id": sid, "content": "too late"}),
+        )
+        .await;
+        assert_eq!(
+            late["error"]["code"],
+            json!(SESSION_NOT_FOUND),
+            "a finished turn takes no steering: {late}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_abort_interrupts_a_turn_another_client_started() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-abort";
+        let (ctx, _backend, (mut started, _release, _requests)) =
+            parity_fixture(&tmp, sid, Some("owning-tui")).await;
+        let (mut driver, mut driver_rx) = local_operator(&ctx).await;
+        let (mut operator, mut operator_rx) = local_operator(&ctx).await;
+
+        send_prompt(&mut driver, 1, sid, 1).await;
+        await_provider_start(&mut started).await;
+
+        let refused = rpc(
+            &mut operator,
+            &mut operator_rx,
+            2,
+            "session/cancel",
+            json!({"session_id": sid}),
+        )
+        .await;
+        assert_eq!(
+            refused["error"]["code"],
+            json!(SESSION_NOT_OWNED),
+            "session/cancel keeps its owning-client rule: {refused}"
+        );
+
+        let aborted = rpc(
+            &mut operator,
+            &mut operator_rx,
+            3,
+            "session/abort",
+            json!({"session_id": sid}),
+        )
+        .await;
+        assert_eq!(aborted["result"]["cancelled"], json!(true), "{aborted}");
+
+        let (_response, notifications) = response_and_notifications(&mut driver_rx, 1).await;
+        let done = turn_complete_for(&notifications, sid);
+        assert_eq!(done["params"]["outcome"], json!("cancelled"), "{done}");
+        assert!(
+            done["params"]["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("operator_abort")),
+            "the cancel is attributed to the operator abort: {done}"
+        );
+
+        let idle = rpc(
+            &mut operator,
+            &mut operator_rx,
+            4,
+            "session/abort",
+            json!({"session_id": sid}),
+        )
+        .await;
+        assert_eq!(idle["error"]["code"], json!(SESSION_NOT_FOUND), "{idle}");
+    }
+
+    #[tokio::test]
+    async fn session_list_running_filter_tracks_the_live_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-running";
+        let (ctx, _backend, (mut started, release, _requests)) =
+            parity_fixture(&tmp, sid, None).await;
+        let (mut driver, mut driver_rx) = local_operator(&ctx).await;
+        let (mut viewer, mut viewer_rx) = local_operator(&ctx).await;
+
+        let idle = rpc(
+            &mut viewer,
+            &mut viewer_rx,
+            2,
+            "session/list",
+            json!({"running": true}),
+        )
+        .await;
+        assert!(
+            !listed_session_ids(&idle).contains(&sid.to_string()),
+            "{idle}"
+        );
+
+        send_prompt(&mut driver, 1, sid, 1).await;
+        await_provider_start(&mut started).await;
+        let running = rpc(
+            &mut viewer,
+            &mut viewer_rx,
+            3,
+            "session/list",
+            json!({"running": true}),
+        )
+        .await;
+        assert_eq!(
+            listed_session_ids(&running),
+            vec![sid.to_string()],
+            "{running}"
+        );
+
+        release.send(()).unwrap();
+        let _ = response_and_notifications(&mut driver_rx, 1).await;
+        let after = rpc(
+            &mut viewer,
+            &mut viewer_rx,
+            4,
+            "session/list",
+            json!({"running": true}),
+        )
+        .await;
+        assert!(listed_session_ids(&after).is_empty(), "{after}");
+        let everything = rpc(&mut viewer, &mut viewer_rx, 5, "session/list", json!({})).await;
+        assert!(
+            listed_session_ids(&everything).contains(&sid.to_string()),
+            "without the filter every session is listed: {everything}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_append_and_rename_write_the_durable_and_live_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-append";
+        let (ctx, backend, _handles) = parity_fixture(&tmp, sid, None).await;
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+
+        let appended = rpc(
+            &mut operator,
+            &mut rx,
+            1,
+            "session/append",
+            json!({"session_id": sid, "content": "a note from the operator"}),
+        )
+        .await;
+        assert_eq!(appended["result"]["message_count"], json!(1), "{appended}");
+        let durable = zeroclaw_infra::session_backend::SessionBackend::load(
+            backend.as_ref(),
+            &format!("rpc_{sid}"),
+        );
+        assert_eq!(durable.len(), 1);
+        assert_eq!(durable[0].role, "assistant");
+        assert_eq!(durable[0].content, "a note from the operator");
+        let agent = ctx
+            .sessions
+            .get_agent(sid)
+            .await
+            .expect("the session is live");
+        assert!(
+            agent.lock().await.history().iter().any(|message| matches!(
+                message,
+                ConversationMessage::Chat(chat) if chat.content == "a note from the operator"
+            )),
+            "the live agent must see the append, or its next turn overwrites it"
+        );
+
+        let renamed = rpc(
+            &mut operator,
+            &mut rx,
+            2,
+            "session/rename",
+            json!({"session_id": sid, "name": "  Nightly run  "}),
+        )
+        .await;
+        assert_eq!(renamed["result"]["name"], json!("Nightly run"), "{renamed}");
+        let listed = rpc(&mut operator, &mut rx, 3, "session/list", json!({})).await;
+        let entry = listed["result"]["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["session_id"] == sid)
+            .unwrap_or_else(|| panic!("{listed}"))
+            .clone();
+        assert_eq!(entry["name"], json!("Nightly run"), "{entry}");
+
+        for (id, method, params) in [
+            (
+                4,
+                "session/rename",
+                json!({"session_id": sid, "name": "   "}),
+            ),
+            (
+                5,
+                "session/append",
+                json!({"session_id": sid, "content": ""}),
+            ),
+        ] {
+            let response = rpc(&mut operator, &mut rx, id, method, params).await;
+            assert_eq!(
+                response["error"]["code"],
+                json!(INVALID_PARAMS),
+                "{method}: {response}"
+            );
+        }
+        let missing = rpc(
+            &mut operator,
+            &mut rx,
+            6,
+            "session/rename",
+            json!({"session_id": "nope", "name": "x"}),
+        )
+        .await;
+        assert_eq!(
+            missing["error"]["code"],
+            json!(SESSION_NOT_FOUND),
+            "{missing}"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_session_methods_are_denied_without_their_grants() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-denied";
+        let mut config = session_cwd_config(&tmp, 4242, None);
+        // Alice may read and run turns but not create sessions, so run-once's
+        // additional `sessions:create` check is what refuses it.
+        config
+            .permission_profiles
+            .get_mut("session-scoped")
+            .expect("the fixture profile exists")
+            .grants
+            .insert(
+                zeroclaw_api::grants::Resource::Sessions,
+                vec![
+                    zeroclaw_api::grants::Verb::Read,
+                    zeroclaw_api::grants::Verb::Execute,
+                ],
+            );
+        let workspace = config.agent_workspace_dir("test-agent");
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (provider, _handles) = scripted_turn_provider();
+        install_state_test_session_owned_at(
+            &ctx.sessions,
+            &chat_backend,
+            sid,
+            provider,
+            None,
+            Some("user:alice"),
+            &workspace,
+        )
+        .await;
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        for (id, method, params) in [
+            (
+                1,
+                "session/append",
+                json!({"session_id": sid, "content": "x"}),
+            ),
+            (2, "session/rename", json!({"session_id": sid, "name": "x"})),
+            (3, "session/abort", json!({"session_id": sid})),
+            (
+                4,
+                "session/run-once",
+                json!({"agent_alias": "test-agent", "prompt": "hi", "session_id": "s-once"}),
+            ),
+        ] {
+            let response = rpc(&mut alice, &mut rx, id, method, params).await;
+            assert_eq!(
+                response["error"]["code"],
+                json!(FORBIDDEN),
+                "{method}: {response}"
+            );
+        }
+        assert!(
+            ctx.sessions.get_agent("s-once").await.is_none(),
+            "a refused run-once must not create its session"
+        );
+        let renamed = chat_backend
+            .get_session_metadata(&format!("rpc_{sid}"))
+            .and_then(|meta| meta.name);
+        assert_eq!(renamed, None, "a refused rename must not write");
+
+        // Steering is a turn-execution grant alice holds; it reaches the
+        // handler and finds no running turn.
+        let steer = rpc(
+            &mut alice,
+            &mut rx,
+            5,
+            "session/steer",
+            json!({"session_id": sid, "content": "x"}),
+        )
+        .await;
+        assert_eq!(steer["error"]["code"], json!(SESSION_NOT_FOUND), "{steer}");
+    }
+
+    #[test]
+    fn new_session_methods_are_classified() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        for (wire, verb) in [
+            ("session/steer", Verb::Execute),
+            ("session/run-once", Verb::Execute),
+            ("session/append", Verb::Update),
+            ("session/rename", Verb::Update),
+            ("session/abort", Verb::Delete),
+            ("session/attach", Verb::Read),
+        ] {
+            let method = Method::from_wire(wire).unwrap_or_else(|| panic!("{wire} is registered"));
+            assert_eq!(
+                method.authz(),
+                MethodAuthz::Requires(Resource::Sessions, verb),
+                "{wire}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn session_run_once_refuses_an_existing_session_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-existing";
+        let (ctx, _backend, _handles) = parity_fixture(&tmp, sid, None).await;
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+
+        let response = rpc(
+            &mut operator,
+            &mut rx,
+            1,
+            "session/run-once",
+            json!({"agent_alias": "test-agent", "prompt": "hi", "session_id": sid}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(INVALID_PARAMS),
+            "{response}"
+        );
+        assert!(
+            ctx.sessions.get_agent(sid).await.is_some(),
+            "run-once must not close a session it did not create"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_run_once_runs_one_turn_and_closes_its_session() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "output_text": "pong",
+                "output": [],
+                "usage": {"input_tokens": 5, "output_tokens": 2}
+            })))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = session_cwd_config(&tmp, 4242, None);
+        config
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .expect("the fixture provider exists")
+            .uri = Some(server.uri());
+        let (ctx, backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+
+        let line = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/run-once",
+            "params": {"agent_alias": "test-agent", "prompt": "ping", "session_id": "s-once"},
+        })
+        .to_string();
+        operator.process_line(&line).await;
+        let (response, notifications) = response_and_notifications(&mut rx, 1).await;
+
+        assert_eq!(response["result"]["content"], json!("pong"), "{response}");
+        assert_eq!(response["result"]["stop_reason"], json!("end_turn"));
+        assert_eq!(
+            response["result"]["usage"]["input_tokens"],
+            json!(5),
+            "{response}"
+        );
+        let done = turn_complete_for(&notifications, "s-once");
+        assert_eq!(done["params"]["outcome"], json!("completed"), "{done}");
+        assert!(
+            ctx.sessions.get_agent("s-once").await.is_none(),
+            "run-once closes its transient session"
+        );
+        assert!(
+            !zeroclaw_infra::session_backend::SessionBackend::load(backend.as_ref(), "rpc_s-once")
+                .is_empty(),
+            "the transcript stays in the durable store after the close"
+        );
+    }
+
+    // ── Turns with no viewer, and detached turns ──────────────────────
+    //
+    // An RPC turn's viewer is the connection that prompted it. A viewer can
+    // stop reading (its writer is gone) while the connection stays up; the
+    // turn then runs on with nobody receiving its notifications, and abort
+    // and cancel must still end it. Closing the connection detaches the turn,
+    // which is cancelled as `connection_closed` and must leave no live
+    // handles behind for abort, cancel, steer, or the running filter.
+
+    /// Wait until the session has no registered turn.
+    async fn await_turn_end(ctx: &Arc<RpcContext>, sid: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while ctx.sessions.has_inflight_turn(sid) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the turn must end");
+    }
+
+    fn durable_turn_state(
+        backend: &Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        sid: &str,
+    ) -> Option<String> {
+        zeroclaw_infra::session_backend::SessionBackend::get_session_state(
+            backend.as_ref(),
+            &format!("rpc_{sid}"),
+        )
+        .expect("the state row is readable")
+        .map(|state| state.state)
+    }
+
+    /// Drain `rx` until the session's TurnComplete arrives or the writer
+    /// closes, and return that TurnComplete.
+    async fn drain_to_turn_complete(
+        rx: &mut tokio::sync::mpsc::Receiver<String>,
+        sid: &str,
+    ) -> Value {
+        loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv())
+                .await
+                .expect("a frame within 15s")
+                .unwrap_or_else(|| panic!("the writer closed before TurnComplete for {sid}"));
+            let value: Value = serde_json::from_str(&frame).expect("valid JSON-RPC frame");
+            if value["method"] == notification::SESSION_UPDATE
+                && value["params"]["type"] == "turn_complete"
+                && value["params"]["session_id"] == sid
+            {
+                return value;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn session_abort_ends_a_turn_whose_viewer_stopped_reading() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-abort-viewerless";
+        let (ctx, backend, (mut started, _release, _requests)) =
+            parity_fixture(&tmp, sid, Some("owning-tui")).await;
+        let (mut driver, driver_rx) = local_operator(&ctx).await;
+        let (mut operator, mut operator_rx) = local_operator(&ctx).await;
+
+        send_prompt(&mut driver, 1, sid, 1).await;
+        await_provider_start(&mut started).await;
+        assert_eq!(
+            durable_turn_state(&backend, sid).as_deref(),
+            Some("running")
+        );
+        // The viewer is gone; its connection is not closed, so nothing
+        // cancels the turn on its behalf.
+        drop(driver_rx);
+
+        let aborted = rpc(
+            &mut operator,
+            &mut operator_rx,
+            2,
+            "session/abort",
+            json!({"session_id": sid}),
+        )
+        .await;
+        assert_eq!(aborted["result"]["cancelled"], json!(true), "{aborted}");
+        await_turn_end(&ctx, sid).await;
+        assert_eq!(
+            durable_turn_state(&backend, sid).as_deref(),
+            Some("idle"),
+            "a viewerless cancel still settles the durable state"
+        );
+
+        let again = rpc(
+            &mut operator,
+            &mut operator_rx,
+            3,
+            "session/abort",
+            json!({"session_id": sid}),
+        )
+        .await;
+        assert_eq!(again["error"]["code"], json!(SESSION_NOT_FOUND), "{again}");
+        driver.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn session_cancel_by_the_owning_client_ends_a_viewerless_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-cancel-viewerless";
+        let (ctx, backend, (mut started, _release, _requests)) =
+            parity_fixture(&tmp, sid, Some("owning-tui")).await;
+        let (mut driver, driver_rx) = local_operator(&ctx).await;
+        let (mut owner, mut owner_rx) = local_operator(&ctx).await;
+        owner.set_tui_id_for_test(Some("owning-tui".into()));
+
+        send_prompt(&mut driver, 1, sid, 1).await;
+        await_provider_start(&mut started).await;
+        drop(driver_rx);
+
+        let cancelled = rpc(
+            &mut owner,
+            &mut owner_rx,
+            2,
+            "session/cancel",
+            json!({"session_id": sid}),
+        )
+        .await;
+        assert_eq!(cancelled["result"]["cancelled"], json!(true), "{cancelled}");
+        await_turn_end(&ctx, sid).await;
+        assert_eq!(durable_turn_state(&backend, sid).as_deref(), Some("idle"));
+
+        let again = rpc(
+            &mut owner,
+            &mut owner_rx,
+            3,
+            "session/cancel",
+            json!({"session_id": sid}),
+        )
+        .await;
+        assert_eq!(again["error"]["code"], json!(SESSION_NOT_FOUND), "{again}");
+        driver.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_detached_turn_is_cancelled_and_leaves_no_live_turn_handles() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-detached";
+        let (ctx, backend, (mut started, _release, _requests)) =
+            parity_fixture(&tmp, sid, Some("owning-tui")).await;
+        let (mut driver, mut driver_rx) = local_operator(&ctx).await;
+        let (mut operator, mut operator_rx) = local_operator(&ctx).await;
+        let (mut owner, mut owner_rx) = local_operator(&ctx).await;
+        owner.set_tui_id_for_test(Some("owning-tui".into()));
+
+        send_prompt(&mut driver, 1, sid, 1).await;
+        await_provider_start(&mut started).await;
+
+        // Closing the prompting connection detaches the turn; shutdown joins
+        // the prompt task, so the turn has fully ended when it returns.
+        tokio::time::timeout(std::time::Duration::from_secs(15), driver.shutdown())
+            .await
+            .expect("closing the connection must end its detached turn");
+        assert!(!ctx.sessions.has_inflight_turn(sid));
+        assert_eq!(durable_turn_state(&backend, sid).as_deref(), Some("idle"));
+        let done = drain_to_turn_complete(&mut driver_rx, sid).await;
+        assert_eq!(done["params"]["outcome"], json!("cancelled"), "{done}");
+        assert!(
+            done["params"]["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("connection_closed")),
+            "a detached turn is attributed to the closed connection: {done}"
+        );
+
+        let abort = rpc(
+            &mut operator,
+            &mut operator_rx,
+            2,
+            "session/abort",
+            json!({"session_id": sid}),
+        )
+        .await;
+        assert_eq!(abort["error"]["code"], json!(SESSION_NOT_FOUND), "{abort}");
+        let cancel = rpc(
+            &mut owner,
+            &mut owner_rx,
+            3,
+            "session/cancel",
+            json!({"session_id": sid}),
+        )
+        .await;
+        assert_eq!(
+            cancel["error"]["code"],
+            json!(SESSION_NOT_FOUND),
+            "{cancel}"
+        );
+        let steer = rpc(
+            &mut operator,
+            &mut operator_rx,
+            4,
+            "session/steer",
+            json!({"session_id": sid, "content": "anyone there?"}),
+        )
+        .await;
+        assert_eq!(
+            steer["error"]["code"],
+            json!(SESSION_NOT_FOUND),
+            "a detached turn's steering channel is closed with it: {steer}"
+        );
+        let running = rpc(
+            &mut operator,
+            &mut operator_rx,
+            5,
+            "session/list",
+            json!({"running": true}),
+        )
+        .await;
+        assert!(listed_session_ids(&running).is_empty(), "{running}");
+        assert!(
+            ctx.sessions.get_agent(sid).await.is_some(),
+            "detaching ends the turn, not the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_abort_before_the_viewer_disconnects_keeps_its_attribution() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-abort-then-close";
+        let (ctx, _backend, (mut started, _release, _requests)) =
+            parity_fixture(&tmp, sid, None).await;
+        let (mut driver, mut driver_rx) = local_operator(&ctx).await;
+        let (mut operator, mut operator_rx) = local_operator(&ctx).await;
+
+        send_prompt(&mut driver, 1, sid, 1).await;
+        await_provider_start(&mut started).await;
+        let aborted = rpc(
+            &mut operator,
+            &mut operator_rx,
+            2,
+            "session/abort",
+            json!({"session_id": sid}),
+        )
+        .await;
+        assert_eq!(aborted["result"]["cancelled"], json!(true), "{aborted}");
+        tokio::time::timeout(std::time::Duration::from_secs(15), driver.shutdown())
+            .await
+            .expect("shutdown joins the aborted turn");
+
+        let done = drain_to_turn_complete(&mut driver_rx, sid).await;
+        let content = done["params"]["content"].as_str().unwrap_or_default();
+        assert!(
+            content.contains("operator_abort") && !content.contains("connection_closed"),
+            "the disconnect must not overwrite the operator's cause: {done}"
+        );
+    }
+
+    // ── Session-owned turns (turn_lifetime = "session") ───────────────
+    //
+    // A connection that initializes with `clientCapabilities.turn_lifetime:
+    // "session"` hands its turns to the session: frames go to the session's
+    // ring, every attached viewer reads them, and closing a connection only
+    // detaches a viewer.
+
+    async fn session_lifetime_operator(
+        ctx: &Arc<RpcContext>,
+    ) -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>, Value) {
+        let (mut dispatcher, rx) = local_peer(
+            ctx,
+            crate::security::auth_provider::PeercredAuthProvider::current_process_uid(),
+        );
+        let initialized = dispatcher
+            .handle_initialize(&json!({"clientCapabilities": {"turn_lifetime": "session"}}))
+            .await
+            .expect("the daemon's own uid is the trusted local operator");
+        (dispatcher, rx, initialized)
+    }
+
+    fn is_turn_complete(frame: &Value, sid: &str) -> bool {
+        frame["method"] == notification::SESSION_UPDATE
+            && frame["params"]["type"] == "turn_complete"
+            && frame["params"]["session_id"] == sid
+    }
+
+    #[tokio::test]
+    async fn turn_lifetime_defaults_to_the_connection_and_is_echoed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, _backend, _handles) = parity_fixture(&tmp, "s-echo", None).await;
+        let (_session_client, _rx, initialized) = session_lifetime_operator(&ctx).await;
+        assert_eq!(
+            initialized["turn_lifetime"],
+            json!("session"),
+            "{initialized}"
+        );
+
+        let (mut legacy, _legacy_rx) = local_peer(
+            &ctx,
+            crate::security::auth_provider::PeercredAuthProvider::current_process_uid(),
+        );
+        let initialized = legacy.handle_initialize(&json!({})).await.unwrap();
+        assert_eq!(
+            initialized["turn_lifetime"],
+            json!("connection"),
+            "a client that asks for nothing keeps connection-owned turns: {initialized}"
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_the_prompting_connection_does_not_end_a_session_owned_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-owned";
+        let (ctx, backend, (mut started, release, _requests)) =
+            parity_fixture(&tmp, sid, None).await;
+        let (mut driver, _driver_rx, _) = session_lifetime_operator(&ctx).await;
+
+        send_prompt(&mut driver, 1, sid, 1).await;
+        await_provider_start(&mut started).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), driver.shutdown())
+            .await
+            .expect("teardown must neither join nor wait for a session-owned turn");
+        assert!(
+            ctx.sessions.has_inflight_turn(sid),
+            "closing the prompting connection must not end the turn"
+        );
+
+        let (mut viewer, mut viewer_rx) = local_operator(&ctx).await;
+        let attached = rpc(
+            &mut viewer,
+            &mut viewer_rx,
+            2,
+            "session/attach",
+            json!({"session_id": sid, "since_seq": 0}),
+        )
+        .await;
+        assert_eq!(attached["result"]["running"], json!(true), "{attached}");
+
+        release.send(()).unwrap();
+        let done = drain_to_turn_complete(&mut viewer_rx, sid).await;
+        assert_eq!(done["params"]["outcome"], json!("completed"), "{done}");
+        assert!(
+            done["params"]["seq"].as_u64().is_some(),
+            "ring frames carry their sequence number: {done}"
+        );
+        await_turn_end(&ctx, sid).await;
+        assert_eq!(durable_turn_state(&backend, sid).as_deref(), Some("idle"));
+    }
+
+    #[tokio::test]
+    async fn attach_replays_the_ring_and_then_streams_live() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-replay";
+        let (ctx, _backend, (mut started, release, _requests)) =
+            parity_fixture(&tmp, sid, None).await;
+        let (mut driver, mut driver_rx, _) = session_lifetime_operator(&ctx).await;
+
+        send_prompt(&mut driver, 1, sid, 1).await;
+        await_provider_start(&mut started).await;
+        release.send(()).unwrap();
+        let first = drain_to_turn_complete(&mut driver_rx, sid).await;
+        let first_seq = first["params"]["seq"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("the prompting connection reads the ring: {first}"));
+        await_turn_end(&ctx, sid).await;
+
+        let (mut viewer, mut viewer_rx) = local_operator(&ctx).await;
+        let line = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/attach",
+            "params": {"session_id": sid, "since_seq": 0},
+        })
+        .to_string();
+        viewer.process_line(&line).await;
+        let (response, seen) = response_and_notifications(&mut viewer_rx, 2).await;
+        assert_eq!(response["result"]["running"], json!(false), "{response}");
+        assert!(
+            response["result"]["seq"].as_u64().unwrap_or(0) >= first_seq,
+            "{response}"
+        );
+        let replayed = match seen.iter().find(|frame| is_turn_complete(frame, sid)) {
+            Some(frame) => frame.clone(),
+            None => drain_to_turn_complete(&mut viewer_rx, sid).await,
+        };
+        assert_eq!(
+            replayed["params"]["seq"],
+            json!(first_seq),
+            "the viewer replays the same frame the prompter saw: {replayed}"
+        );
+
+        send_prompt(&mut driver, 3, sid, 2).await;
+        let live = drain_to_turn_complete(&mut viewer_rx, sid).await;
+        assert_eq!(live["params"]["client_turn_generation"], json!(2), "{live}");
+        assert!(
+            live["params"]["seq"].as_u64().unwrap_or(0) > first_seq,
+            "the next turn streams live after the replay: {live}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_viewer_that_stops_reading_does_not_hold_up_the_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-slow-viewer";
+        let (ctx, _backend, (mut started, release, _requests)) =
+            parity_fixture(&tmp, sid, None).await;
+        let (mut driver, mut driver_rx, _) = session_lifetime_operator(&ctx).await;
+        let (mut slow, mut slow_rx) = local_operator(&ctx).await;
+        let attached = rpc(
+            &mut slow,
+            &mut slow_rx,
+            2,
+            "session/attach",
+            json!({"session_id": sid}),
+        )
+        .await;
+        assert!(attached.get("error").is_none(), "{attached}");
+
+        // The slow viewer never reads again. Fill its writer well past its
+        // capacity straight through the ring before the turn starts.
+        let source = ctx.subscriptions.session_source(sid);
+        for n in 0..500 {
+            ctx.subscriptions
+                .publish(source, json!({"type": "noise", "session_id": sid, "n": n}));
+        }
+
+        send_prompt(&mut driver, 1, sid, 1).await;
+        await_provider_start(&mut started).await;
+        release.send(()).unwrap();
+        let done = drain_to_turn_complete(&mut driver_rx, sid).await;
+        assert_eq!(done["params"]["outcome"], json!("completed"), "{done}");
+        await_turn_end(&ctx, sid).await;
+        drop(slow_rx);
+    }
+
+    #[tokio::test]
+    async fn the_owning_principal_can_cancel_from_another_client() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-owner-cancel";
+        let mut config = session_cwd_config(&tmp, 4242, None);
+        config
+            .permission_profiles
+            .get_mut("session-scoped")
+            .expect("the fixture profile exists")
+            .grants
+            .insert(
+                zeroclaw_api::grants::Resource::Sessions,
+                vec![
+                    zeroclaw_api::grants::Verb::Create,
+                    zeroclaw_api::grants::Verb::Read,
+                    zeroclaw_api::grants::Verb::Execute,
+                    zeroclaw_api::grants::Verb::Update,
+                ],
+            );
+        let workspace = config.agent_workspace_dir("test-agent");
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (provider, (mut started, _release, _requests)) = scripted_turn_provider();
+        install_state_test_session_owned_at(
+            &ctx.sessions,
+            &chat_backend,
+            sid,
+            provider,
+            Some("tui-that-started-it"),
+            Some("user:alice"),
+            &workspace,
+        )
+        .await;
+        let (mut first, mut first_rx) = roster_peer(&ctx, 4242).await;
+        let (mut second, mut second_rx) = roster_peer(&ctx, 4242).await;
+
+        send_prompt(&mut first, 1, sid, 1).await;
+        await_provider_start(&mut started).await;
+        let cancelled = rpc(
+            &mut second,
+            &mut second_rx,
+            2,
+            "session/cancel",
+            json!({"session_id": sid}),
+        )
+        .await;
+        assert_eq!(
+            cancelled["result"]["cancelled"],
+            json!(true),
+            "the session's owner may cancel from a client that did not start the turn: {cancelled}"
+        );
+        let done = drain_to_turn_complete(&mut first_rx, sid).await;
+        assert_eq!(done["params"]["outcome"], json!("cancelled"), "{done}");
+    }
+
+    #[tokio::test]
+    async fn attach_requires_ownership_and_an_existing_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = session_cwd_config(&tmp, 4242, None);
+        let workspace = config.agent_workspace_dir("test-agent");
+        let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
+        let (provider, _handles) = scripted_turn_provider();
+        install_state_test_session_owned_at(
+            &ctx.sessions,
+            &chat_backend,
+            "s-bob",
+            provider,
+            None,
+            Some("user:bob"),
+            &workspace,
+        )
+        .await;
+
+        let (mut alice, mut alice_rx) = roster_peer(&ctx, 4242).await;
+        let refused = rpc(
+            &mut alice,
+            &mut alice_rx,
+            1,
+            "session/attach",
+            json!({"session_id": "s-bob"}),
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], json!(FORBIDDEN), "{refused}");
+        assert_eq!(ctx.subscriptions.viewer_count("s-bob"), 0);
+
+        let (mut operator, mut operator_rx) = local_operator(&ctx).await;
+        let missing = rpc(
+            &mut operator,
+            &mut operator_rx,
+            2,
+            "session/attach",
+            json!({"session_id": "nope"}),
+        )
+        .await;
+        assert_eq!(
+            missing["error"]["code"],
+            json!(SESSION_NOT_FOUND),
+            "{missing}"
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_a_session_ends_its_viewers() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-close-viewers";
+        let (ctx, _backend, _handles) = parity_fixture(&tmp, sid, None).await;
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+        let attached = rpc(
+            &mut operator,
+            &mut rx,
+            1,
+            "session/attach",
+            json!({"session_id": sid}),
+        )
+        .await;
+        assert!(attached.get("error").is_none(), "{attached}");
+        assert_eq!(ctx.subscriptions.viewer_count(sid), 1);
+
+        let closed = rpc(
+            &mut operator,
+            &mut rx,
+            2,
+            "session/close",
+            json!({"session_id": sid}),
+        )
+        .await;
+        assert_eq!(closed["result"]["closed"], json!(true), "{closed}");
+        assert_eq!(ctx.subscriptions.viewer_count(sid), 0);
     }
 }

@@ -32,6 +32,10 @@ pub struct RpcApprovalChannel {
     pending: Arc<ApprovalPendingMap>,
     approval_timeout: Duration,
     client_caps: ElicitationCapabilities,
+    /// The daemon's subscription hub. While the session's turn delivers
+    /// through its ring (session turn lifetime), approval prompts go there
+    /// too, so any attached viewer can answer them.
+    subscriptions: Option<Arc<crate::rpc::subscription::SubscriptionHub>>,
 }
 
 impl RpcApprovalChannel {
@@ -49,8 +53,45 @@ impl RpcApprovalChannel {
             pending,
             approval_timeout: DEFAULT_APPROVAL_TIMEOUT,
             client_caps,
+            subscriptions: None,
         }
     }
+
+    /// Route approval prompts through the session's ring while its turn is
+    /// session-owned.
+    #[must_use]
+    pub fn with_subscriptions(
+        mut self,
+        subscriptions: Arc<crate::rpc::subscription::SubscriptionHub>,
+    ) -> Self {
+        self.subscriptions = Some(subscriptions);
+        self
+    }
+}
+
+/// Only an answered prompt is an operator decision. The other outcomes deny
+/// because the client went away or never answered, and say so.
+fn attributed_outcome(
+    outcome: Result<
+        Result<ChannelApprovalResponse, tokio::sync::oneshot::error::RecvError>,
+        tokio::time::error::Elapsed,
+    >,
+) -> zeroclaw_api::channel::AttributedApprovalResponse {
+    match outcome {
+        Ok(Ok(response)) => zeroclaw_api::channel::AttributedApprovalResponse::operator(response),
+        Ok(Err(_)) => unreachable_deny(),
+        Err(_) => zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+            ChannelApprovalResponse::Deny,
+            zeroclaw_api::channel::ApprovalSource::TimedOut,
+        ),
+    }
+}
+
+fn unreachable_deny() -> zeroclaw_api::channel::AttributedApprovalResponse {
+    zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+        ChannelApprovalResponse::Deny,
+        zeroclaw_api::channel::ApprovalSource::Unreachable,
+    )
 }
 
 impl Attributable for RpcApprovalChannel {
@@ -179,42 +220,44 @@ impl RpcApprovalChannel {
             self.pending
                 .register(request_id.clone(), self.session_id.clone(), tx);
 
-        self.rpc
-            .notify(
-                "session/update",
-                json!({
-                    "type": "approval_request",
-                    "session_id": self.session_id,
-                    "request_id": request_id,
-                    "tool_name": request.tool_name,
-                    "arguments_summary": request.arguments_summary,
-                    "timeout_secs": timeout.as_secs(),
-                }),
-            )
-            .await;
-
-        // Only the answered arm is an operator decision. The other two deny
-        // because the client went away or never answered, and say so.
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(response)) => {
-                pending_request.disarm();
-                Ok(Some(
-                    zeroclaw_api::channel::AttributedApprovalResponse::operator(response),
-                ))
+        let frame = json!({
+            "type": "approval_request",
+            "session_id": self.session_id,
+            "request_id": request_id,
+            "tool_name": request.tool_name,
+            "arguments_summary": request.arguments_summary,
+            "timeout_secs": timeout.as_secs(),
+        });
+        let ring = self.subscriptions.as_ref().and_then(|hub| {
+            hub.routed_source(&self.session_id)
+                .map(|source| (hub, source))
+        });
+        let outcome = match ring {
+            None => {
+                self.rpc.notify("session/update", frame).await;
+                tokio::time::timeout(timeout, rx).await
             }
-            Ok(Err(_)) => Ok(Some(
-                zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
-                    ChannelApprovalResponse::Deny,
-                    zeroclaw_api::channel::ApprovalSource::Unreachable,
-                ),
-            )),
-            Err(_) => Ok(Some(
-                zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
-                    ChannelApprovalResponse::Deny,
-                    zeroclaw_api::channel::ApprovalSource::TimedOut,
-                ),
-            )),
+            // A session-owned turn: any attached viewer may answer. With
+            // nobody attached, or once the last viewer detaches, the prompt
+            // fails closed as unreachable instead of parking for the whole
+            // timeout.
+            Some((hub, _)) if hub.viewer_count(&self.session_id) == 0 => {
+                return Ok(Some(unreachable_deny()));
+            }
+            Some((hub, source)) => {
+                hub.publish(source, frame);
+                tokio::select! {
+                    outcome = tokio::time::timeout(timeout, rx) => outcome,
+                    () = hub.viewers_gone(&self.session_id) => {
+                        return Ok(Some(unreachable_deny()));
+                    }
+                }
+            }
+        };
+        if matches!(outcome, Ok(Ok(_))) {
+            pending_request.disarm();
         }
+        Ok(Some(attributed_outcome(outcome)))
     }
 
     async fn request_choice_via_elicitation(
@@ -623,5 +666,153 @@ mod tests {
         // matching `AcpChannel`. Even with the form capability advertised
         // the channel cannot yet answer a no-choices `ask_user`.
         assert!(!ch.supports_free_form_ask());
+    }
+
+    // ── Session-owned turns ───────────────────────────────────────────
+
+    fn shell_request() -> ChannelApprovalRequest {
+        ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls".to_string(),
+            raw_arguments: None,
+            position: None,
+        }
+    }
+
+    fn ring_channel(
+        rpc: Arc<RpcOutbound>,
+        pending: Arc<crate::rpc::context::ApprovalPendingMap>,
+        hub: &Arc<crate::rpc::subscription::SubscriptionHub>,
+    ) -> RpcApprovalChannel {
+        make_channel_no_caps(rpc, pending).with_subscriptions(Arc::clone(hub))
+    }
+
+    #[tokio::test]
+    async fn a_session_owned_prompt_with_no_viewer_fails_closed_as_unreachable() {
+        let (rpc, mut write_rx) = make_rpc();
+        let hub = Arc::new(crate::rpc::subscription::SubscriptionHub::new());
+        let _route = hub.route_session("sess-1");
+        let ch = ring_channel(rpc, make_pending(), &hub);
+
+        let outcome = ch
+            .request_approval_attributed_with_timeout("", &shell_request(), Duration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("an outcome");
+        assert_eq!(outcome.response, ChannelApprovalResponse::Deny);
+        assert!(matches!(
+            outcome.source,
+            zeroclaw_api::channel::ApprovalSource::Unreachable
+        ));
+        assert!(
+            write_rx.try_recv().is_err(),
+            "a session-owned prompt never goes to the creating connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_owned_prompt_goes_to_the_ring_and_any_viewer_can_answer() {
+        let (rpc, mut write_rx) = make_rpc();
+        let pending = make_pending();
+        let hub = Arc::new(crate::rpc::subscription::SubscriptionHub::new());
+        let _route = hub.route_session("sess-1");
+        hub.add_viewer(
+            "sess-1",
+            "viewer",
+            1,
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let source = hub.session_source("sess-1");
+        let ch = ring_channel(rpc, Arc::clone(&pending), &hub);
+
+        let task = zeroclaw_spawn::spawn!(async move {
+            ch.request_approval_attributed_with_timeout(
+                "",
+                &shell_request(),
+                Duration::from_secs(60),
+            )
+            .await
+        });
+        let frame = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let crate::rpc::subscription::Read::Frames(frames) = hub.read(source, 1, 8)
+                    && let Some((_, frame)) = frames.into_iter().next()
+                {
+                    return frame;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the prompt reaches the ring");
+        assert_eq!(frame["type"], "approval_request");
+        let request_id = frame["request_id"].as_str().unwrap().to_string();
+        assert!(pending.resolve(&request_id, ChannelApprovalResponse::Approve));
+
+        let outcome = task.await.unwrap().unwrap().expect("an outcome");
+        assert_eq!(outcome.response, ChannelApprovalResponse::Approve);
+        assert!(matches!(
+            outcome.source,
+            zeroclaw_api::channel::ApprovalSource::Operator
+        ));
+        assert!(write_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_pending_session_owned_prompt_fails_closed_when_the_last_viewer_detaches() {
+        let (rpc, _write_rx) = make_rpc();
+        let pending = make_pending();
+        let hub = Arc::new(crate::rpc::subscription::SubscriptionHub::new());
+        let _route = hub.route_session("sess-1");
+        hub.add_viewer(
+            "sess-1",
+            "viewer",
+            1,
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let ch = ring_channel(rpc, Arc::clone(&pending), &hub);
+        let task = {
+            let hub = Arc::clone(&hub);
+            zeroclaw_spawn::spawn!(async move {
+                let outcome = ch
+                    .request_approval_attributed_with_timeout(
+                        "",
+                        &shell_request(),
+                        Duration::from_secs(60),
+                    )
+                    .await;
+                drop(hub);
+                outcome
+            })
+        };
+        let source = hub.session_source("sess-1");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while hub.head_seq(source) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the prompt is published before the viewer leaves");
+        let crate::rpc::subscription::Read::Frames(frames) = hub.read(source, 1, 8) else {
+            panic!("the ring holds the prompt");
+        };
+        let request_id = frames[0].1["request_id"].as_str().unwrap().to_string();
+        hub.remove_viewer("sess-1", "viewer");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the prompt must not park for its whole timeout")
+            .unwrap()
+            .unwrap()
+            .expect("an outcome");
+        assert_eq!(outcome.response, ChannelApprovalResponse::Deny);
+        assert!(matches!(
+            outcome.source,
+            zeroclaw_api::channel::ApprovalSource::Unreachable
+        ));
+        assert!(
+            !pending.contains(&request_id),
+            "the pending entry is dropped"
+        );
     }
 }
