@@ -3779,6 +3779,10 @@ pub struct ResolvedRuntime {
     /// triggers. `None` preserves the legacy absolute-budget behavior.
     pub context_compact_ratio: Option<f64>,
     pub parallel_tools: bool,
+    /// Pre-turn tool-elicitation hints: scan the inbound message against
+    /// activated tools' invocation triggers and nudge the model on a hit.
+    /// Distinct from ACP elicitation (user-facing multiple-choice prompts).
+    pub tool_elicitation: bool,
     pub tool_dispatcher: String,
     pub strict_tool_parsing: bool,
     pub tool_call_dedup_exempt: Vec<String>,
@@ -3937,6 +3941,7 @@ impl Default for ResolvedRuntime {
             model_context_window_source: ModelContextWindowSource::CompatibilityFallback,
             context_compact_ratio: None,
             parallel_tools: false,
+            tool_elicitation: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
             strict_tool_parsing: false,
             tool_call_dedup_exempt: Vec::new(),
@@ -4782,6 +4787,13 @@ impl Config {
     }
 
     #[must_use]
+    pub fn effective_tool_elicitation(&self, agent_alias: &str) -> bool {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.tool_elicitation)
+            .unwrap_or(false)
+    }
+
+    #[must_use]
     pub fn effective_tool_dispatcher(&self, agent_alias: &str) -> String {
         self.runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.tool_dispatcher.as_ref())
@@ -4847,6 +4859,7 @@ impl Config {
             context_compact_ratio: self.effective_context_compact_ratio(agent_alias),
             compact_context: self.effective_compact_context(agent_alias),
             parallel_tools: self.effective_parallel_tools(agent_alias),
+            tool_elicitation: self.effective_tool_elicitation(agent_alias),
             tool_dispatcher: self.effective_tool_dispatcher(agent_alias),
             tool_call_dedup_exempt: self.effective_tool_call_dedup_exempt(agent_alias),
             max_system_prompt_chars: self.effective_max_system_prompt_chars(agent_alias),
@@ -14527,6 +14540,9 @@ pub struct RuntimeProfileConfig {
     pub compact_context: Option<bool>,
     /// Enable parallel tool execution per iteration. `None` inherits.
     pub parallel_tools: Option<bool>,
+    /// Enable pre-turn tool-elicitation hints (prefilter + ephemeral hint).
+    /// `None` inherits (default off).
+    pub tool_elicitation: Option<bool>,
     /// Tool dispatch strategy (e.g. `"auto"`). `None` inherits.
     pub tool_dispatcher: Option<String>,
     /// Tools exempt from within-turn dedup check.
@@ -14581,6 +14597,7 @@ impl Default for RuntimeProfileConfig {
             context_compact_ratio: None,
             compact_context: None,
             parallel_tools: None,
+            tool_elicitation: None,
             tool_dispatcher: None,
             tool_call_dedup_exempt: Vec::new(),
             max_system_prompt_chars: None,
@@ -33024,6 +33041,38 @@ runtime_profile = "fast"
 "#;
         let parsed = parse_test_config(raw);
         assert_eq!(parsed.effective_max_tool_iterations("default"), 25);
+    }
+
+    #[test]
+    async fn runtime_profile_tool_elicitation_is_honored() {
+        let raw = r#"
+[runtime_profiles.hinted]
+tool_elicitation = true
+
+[agents.default]
+runtime_profile = "hinted"
+"#;
+        let parsed = parse_test_config(raw);
+        assert!(parsed.effective_tool_elicitation("default"));
+        assert!(
+            parsed
+                .resolved_agent_config("default")
+                .expect("agent resolves")
+                .resolved
+                .tool_elicitation
+        );
+    }
+
+    #[test]
+    async fn tool_elicitation_defaults_off() {
+        let parsed = parse_test_config(
+            r#"
+[agents.default]
+runtime_profile = "default"
+"#,
+        );
+        assert!(!parsed.effective_tool_elicitation("default"));
+        assert!(!AliasedAgentConfig::default().resolved.tool_elicitation);
     }
 
     #[test]

@@ -70,7 +70,9 @@ pub(crate) struct ToolDispatchContext<'a> {
     pub model_switch_callback: Option<&'a ModelSwitchCallback>,
 }
 
-fn is_excluded_tool(name: &str, excluded_tools: &[String]) -> bool {
+/// Exclusion predicate shared with elicitation: a tool the executor would
+/// refuse must never be advertised, executed, or hinted.
+pub(crate) fn is_excluded_tool(name: &str, excluded_tools: &[String]) -> bool {
     let name = name.trim();
     excluded_tools
         .iter()

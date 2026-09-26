@@ -245,6 +245,16 @@ impl ActivatedToolSet {
         self.tools.values().map(|t| t.spec()).collect()
     }
 
+    /// Snapshot of the activated tool objects in lexicographic name order —
+    /// deterministic for callers whose scan order is observable (the map
+    /// itself iterates in arbitrary order). Arcs are cloned so the caller
+    /// can drop the mutex guard before working with them.
+    pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        let mut entries: Vec<_> = self.tools.iter().collect();
+        entries.sort_by_key(|(name, _)| *name);
+        entries.into_iter().map(|(_, t)| Arc::clone(t)).collect()
+    }
+
     pub fn tool_names(&self) -> Vec<&str> {
         self.tools.keys().map(|s| s.as_str()).collect()
     }
