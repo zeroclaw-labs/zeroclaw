@@ -14302,6 +14302,142 @@ impl PermissionProfileConfig {
 
 // ── Profiles & Bundles ───────────────────────────────────────────
 
+/// Filesystem and network policy for OS-level sandbox backends
+/// (`[risk_profiles.<alias>.sandbox_policy]`).
+///
+/// **Canonical policy model.** Two distinct compatibility mechanisms exist:
+///
+/// 1. **TOML aliases** — within this `[sandbox_policy]` subtable only, `forbidden_paths`
+///    is an alias for `deny_read` and `allowed_roots` is an alias for `allow_read`.
+///    These are serde parse-time aliases; they do not read the top-level
+///    `RiskProfileConfig.forbidden_paths` / `allowed_roots` fields. Note that the
+///    `allowed_roots` TOML alias populates only `allow_read` — not `allow_write`. The
+///    runtime resolver (mechanism 2) maps the top-level `allowed_roots` to *both* fields.
+///
+/// 2. **Runtime compat mapping** — the four path-policy fields (`deny_read`, `allow_read`,
+///    `allow_write`, `deny_write`) are `Option<Vec<String>>`, not `Vec<String>`, so
+///    "omitted" and "explicitly empty" are distinguishable. `SandboxPolicy::from_risk_profile`
+///    (`zeroclaw-config::sandbox_policy`) is the single resolver both OS-sandbox and
+///    app-layer (`SecurityPolicy::from_profiles`) enforcement consume:
+///    - `deny_read: None` falls back to the top-level `RiskProfileConfig.forbidden_paths`.
+///    - `allow_read: None` falls back to the top-level `RiskProfileConfig.allowed_roots`.
+///    - `allow_write: None` with effective `workspace_only = true` scopes the implicit
+///      grant to the workspace root; otherwise `None` falls back to [`DEFAULT_ALLOW_WRITE`]
+///      merged with the legacy `allowed_roots` compat field. An explicit `Some(v)` is
+///      authoritative regardless of `workspace_only`.
+///    - `deny_write` stays operator-only in the effective inputs; the
+///      [`MANDATORY_DENY_WRITE`] guardrail list is always active on top of it
+///      (RFC 6996: no all-or-nothing switch), relaxable per entry via
+///      `guardrail_exceptions`.
+///
+///    An explicit `Some(v)` — even one shaped identically to a prior default — always wins
+///    outright over the legacy fallback; only `None` (the field was never written) triggers
+///    compat mapping. New configs should use `sandbox_policy.*` directly.
+///
+/// **Enforcement matrix.** `deny_read`/`allow_read`/`allow_write`/`deny_write` are enforced
+/// today at the app layer for file tools (`file_write`, `file_edit`, `git_operations`, and
+/// `PathGuardedTool` read paths) via `SecurityPolicy`, regardless of which OS sandbox backend
+/// (if any) is active. They are NOT enforced against arbitrary shell/script child-process I/O
+/// until per-backend OS sandbox wiring lands (tracked per RFC 6996 Phase 2 as follow-up PRs,
+/// one per backend).
+///
+/// **No network fields.** Per RFC 6996, this filesystem slice exposes no network-shaped
+/// fields: `allowed_domains`, `denied_domains`, `allow_unix_sockets`, and raw
+/// `bubblewrap_args` escape-hatch flags are rejected at parse time rather than accepted
+/// and silently ignored. A public schema field with no enforcement behind it is worse than
+/// no field at all — an operator cannot distinguish "no policy configured" from "policy
+/// accepted but silently ignored" by reading the schema alone. They are reintroduced only
+/// alongside the separately reviewed network-policy RFC and its enforcing consumer.
+///
+/// Filesystem read semantics: deny-then-allow (`allow_read` overrides `deny_read`).
+/// Filesystem write semantics: allow-only (`deny_write` overrides `allow_write`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(default, deny_unknown_fields)]
+pub struct SandboxPolicyConfig {
+    /// Paths denied for read access. `~` is expanded to the user home directory.
+    /// Accepts `forbidden_paths` as a compat alias within the `sandbox_policy` table.
+    ///
+    /// Presence-preserving: omitted (`None`) falls back to the top-level
+    /// `RiskProfileConfig.forbidden_paths` compat field; an explicit `[]` clears
+    /// that fallback outright; an explicit non-empty value wins outright, even if
+    /// it happens to equal a prior default shape.
+    #[serde(alias = "forbidden_paths", default)]
+    pub deny_read: Option<Vec<String>>,
+    /// Paths re-allowed for read within denied regions. Takes precedence over `deny_read`.
+    /// Accepts `allowed_roots` as a compat alias within the `sandbox_policy` table.
+    /// Same `Option` presence semantics as `deny_read` (falls back to
+    /// `RiskProfileConfig.allowed_roots` when omitted).
+    #[serde(alias = "allowed_roots", default)]
+    pub allow_read: Option<Vec<String>>,
+    /// Paths allowed for write access. All other paths are denied for writes.
+    /// Same `Option` presence semantics as `deny_read`: omitted falls back to
+    /// [`DEFAULT_ALLOW_WRITE`] merged with the legacy `allowed_roots` compat field;
+    /// an explicit value (including one shaped like the default) wins outright.
+    #[serde(default)]
+    pub allow_write: Option<Vec<String>>,
+    /// Write exceptions within `allow_write` regions. Takes precedence over `allow_write`.
+    /// Same `Option` presence semantics as `deny_read`. Operator entries are
+    /// absolute and exception-proof; the always-on [`MANDATORY_DENY_WRITE`]
+    /// guardrail list is enforced on top of them (see `guardrail_exceptions`
+    /// for the per-entry relaxation).
+    #[serde(default)]
+    pub deny_write: Option<Vec<String>>,
+    /// Per-entry exceptions to the default write guardrail list
+    /// ([`MANDATORY_DENY_WRITE`]) — RFC 6996. There is deliberately no switch
+    /// that disables the whole default list at once: an exception entry uses
+    /// the same matching rules as a guardrail entry and re-permits only the
+    /// named file or subtree for writes; every sibling default entry stays
+    /// enforced. Exceptions never relax operator-supplied `deny_write`
+    /// entries (those are absolute) and never weaken `deny_read`. A
+    /// non-empty list emits a visible WARN at policy construction.
+    #[serde(default)]
+    pub guardrail_exceptions: Vec<String>,
+}
+
+/// Default `allow_write` roots used when `SandboxPolicyConfig.allow_write` is
+/// omitted (`None`): workspace root (`.`, resolved relative to the effective
+/// workspace) plus `/tmp` scratch space for OS-sandbox bind-mount needs.
+pub const DEFAULT_ALLOW_WRITE: &[&str] = &[".", "/tmp"];
+
+/// Default `deny_write` guardrail entries merged into the resolved policy
+/// regardless of whether `deny_write` was configured (RFC 6996: there is no
+/// switch that disables the whole list; relaxation is per-entry via
+/// `SandboxPolicyConfig::guardrail_exceptions`). Covers shell configs, git
+/// hooks, and other files an agent should never be able to rewrite even with
+/// broad write access. Directory entries (trailing `/`) cover the directory
+/// and all its descendants; a bare entry matches that file name at any depth
+/// under a covered root.
+pub const MANDATORY_DENY_WRITE: &[&str] = &[
+    ".bashrc",
+    ".bash_profile",
+    ".zshrc",
+    ".zprofile",
+    ".profile",
+    ".gitconfig",
+    ".gitmodules",
+    ".git/hooks/",
+    ".git/config",
+    ".env",
+    ".mcp.json",
+    ".claude/agents/",
+    ".vscode/",
+    ".idea/",
+    // ZeroClaw's own control surfaces (RFC 6996 closing record — the addition
+    // was pre-approved inside the accepted rollout): install config, the
+    // install secret key, provider auth profiles, per-agent identity/SOP
+    // files, and the install-shared skill bundles. An agent must not be able
+    // to rewrite any of these even with broad write access. Per-agent skills
+    // under an agent's own workspace are deliberately NOT listed — the
+    // skill_manage tool owns that surface by design.
+    "config.toml",
+    ".secret_key",
+    "auth-profiles.json",
+    "IDENTITY.md",
+    "SOUL.md",
+    "shared/skills/",
+];
+
 /// Named risk/autonomy profile (`[risk_profiles.<alias>]`).
 ///
 /// Unified policy surface. Agents reference a profile by alias and the
@@ -14319,10 +14455,22 @@ pub struct RiskProfileConfig {
     /// Autonomy level applied to this profile. Default: `supervised`.
     pub level: AutonomyLevel,
     /// Restrict filesystem access to workspace-relative paths. Default: `false`.
+    /// Compatibility field: `workspace_only = true` scopes the IMPLICIT workspace
+    /// read and write grants (preserving the legacy behavior); it does not
+    /// override the canonical `sandbox_policy` lists. An explicit canonical
+    /// `sandbox_policy.allow_write` (including an explicit empty list) is
+    /// authoritative regardless of `workspace_only` — name `"."` in the list to
+    /// keep the workspace writable — and an explicit `sandbox_policy.allow_read`
+    /// is authoritative the same way. `deny_read` and `deny_write` always win
+    /// over any workspace-scoped grant, including the workspace grant itself.
+    /// At `Full` autonomy `workspace_only` is always treated as `false`, with
+    /// `deny_read` still enforced. Prefer `sandbox_policy` for new configs.
     pub workspace_only: bool,
     /// Allowlist of executable names for shell execution.
     pub allowed_commands: Vec<String>,
-    /// Explicit path denylist.
+    /// Explicit path denylist applied at the application layer.
+    /// Compatibility field: the runtime resolver maps this into `sandbox_policy.deny_read`.
+    /// Prefer `sandbox_policy.deny_read` for new configs.
     pub forbidden_paths: Vec<String>,
     /// Require approval for medium-risk operations.
     pub require_approval_for_medium_risk: bool,
@@ -14336,6 +14484,9 @@ pub struct RiskProfileConfig {
     /// Tools that always require approval in this profile.
     pub always_ask: Vec<String>,
     /// Extra directory roots the agent may access.
+    /// Compatibility field: the runtime resolver maps this into `sandbox_policy.allow_read`
+    /// and `sandbox_policy.allow_write`. Prefer `sandbox_policy.allow_read` / `allow_write`
+    /// for new configs.
     #[serde(alias = "allowed_path", alias = "allowed_paths")]
     pub allowed_roots: Vec<String>,
     /// Whether agents using this profile may initiate delegation. Defaults to
@@ -14400,6 +14551,17 @@ pub struct RiskProfileConfig {
     pub sandbox_backend: Option<String>,
     /// Extra arguments forwarded to firejail when sandbox_backend = "firejail".
     pub firejail_args: Vec<String>,
+    /// OS-level sandbox filesystem and network policy. Canonical model.
+    /// `forbidden_paths`, `allowed_roots`, and `workspace_only` are compatibility
+    /// inputs translated into this struct by `SandboxPolicy::from_risk_profile`.
+    ///
+    /// `#[nested]` is required for the `Configurable` tree to descend into the
+    /// struct: without it the property tree exposes only the object root, so
+    /// `zeroclaw config get/set`, the config API, and environment overrides
+    /// cannot reach `deny_read`, `allow_write`, or any other leaf.
+    #[serde(default)]
+    #[nested]
+    pub sandbox_policy: SandboxPolicyConfig,
     /// Container image the docker sandbox runs commands in when
     /// `sandbox_backend = "docker"`. `None` inherits the built-in default.
     /// Set this to pin a digest or a specific tag so the sandbox stops
@@ -14428,6 +14590,7 @@ impl Default for RiskProfileConfig {
             sandbox_enabled: None,
             sandbox_backend: None,
             firejail_args: Vec::new(),
+            sandbox_policy: SandboxPolicyConfig::default(),
             sandbox_image: None,
         }
     }
@@ -27501,6 +27664,10 @@ impl HasPropKind for crate::autonomy::DelegationPolicy {
     const PROP_KIND: PropKind = PropKind::Enum;
 }
 
+impl HasPropKind for SandboxPolicyConfig {
+    const PROP_KIND: PropKind = PropKind::Object;
+}
+
 impl HasPropKind for serde_json::Value {
     // `serde_json::Value` is an arbitrary JSON document, not an enum.
     // Classifying it as `Enum` previously made `enum_variants_for::<Value>()`
@@ -35021,6 +35188,113 @@ default_temperature = 0.7
     }
 
     #[test]
+    async fn sandbox_policy_config_defaults() {
+        let p = SandboxPolicyConfig::default();
+        assert!(
+            p.guardrail_exceptions.is_empty(),
+            "guardrail exceptions must default to empty (every default entry enforced)"
+        );
+        // allow_write/deny_read/etc default to None (omitted) — presence,
+        // not shape, distinguishes "operator never set this" from "operator
+        // explicitly set it to an empty/default-shaped list". The concrete
+        // default write roots live in `DEFAULT_ALLOW_WRITE`, applied by the
+        // runtime resolver (`sandbox_policy::EffectiveSandboxInputs`) when
+        // `allow_write` is `None`, not baked into the schema default itself.
+        assert!(p.allow_write.is_none());
+        assert!(
+            DEFAULT_ALLOW_WRITE.contains(&"."),
+            "default allow_write must include workspace"
+        );
+        assert!(
+            DEFAULT_ALLOW_WRITE.contains(&"/tmp"),
+            "default allow_write must include /tmp"
+        );
+        assert!(p.deny_read.is_none(), "default deny_read must be omitted");
+    }
+
+    #[test]
+    async fn sandbox_policy_config_deserialize_roundtrip() {
+        let toml_in = r#"
+            deny_read = ["~/.ssh"]
+            allow_write = ["."]
+            guardrail_exceptions = [".vscode/settings.json"]
+        "#;
+        let p: SandboxPolicyConfig =
+            toml::from_str(toml_in).expect("deserialize SandboxPolicyConfig");
+        assert_eq!(p.deny_read, Some(vec!["~/.ssh".to_string()]));
+        assert_eq!(p.allow_write, Some(vec![".".to_string()]));
+        assert_eq!(
+            p.guardrail_exceptions,
+            vec![".vscode/settings.json".to_string()]
+        );
+        // fields not set in the TOML must fall back to None (omitted), not
+        // an empty Vec — an operator writing `allow_read = []` explicitly is
+        // a materially different config from never mentioning `allow_read`.
+        assert!(p.allow_read.is_none());
+        assert!(p.deny_write.is_none());
+    }
+
+    #[test]
+    async fn sandbox_policy_config_rejects_network_fields() {
+        // RFC 6996: no network-shaped fields without an enforcing consumer.
+        // Parsing must fail closed with a clear error, never accept-and-ignore.
+        for network_key in [
+            "allowed_domains = [\"api.example.com\"]",
+            "denied_domains = []",
+            "allow_unix_sockets = []",
+            "bubblewrap_args = [\"--unshare-net\"]",
+        ] {
+            let toml_in = format!("deny_read = [\"~/.ssh\"]\n{network_key}\n");
+            let err = toml::from_str::<SandboxPolicyConfig>(&toml_in)
+                .expect_err("network fields must be rejected by the filesystem slice");
+            assert!(
+                err.to_string()
+                    .contains(network_key.split_whitespace().next().unwrap_or("")),
+                "error for {network_key} must name the rejected key, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    async fn mandatory_deny_write_defaults_flow_through_policy() {
+        // The schema-level default no longer bakes the guardrail list in
+        // directly (deny_write is None until resolved); MANDATORY_DENY_WRITE
+        // is the source of truth the runtime resolver merges in.
+        assert!(SandboxPolicyConfig::default().deny_write.is_none());
+        assert!(
+            !MANDATORY_DENY_WRITE.is_empty(),
+            "default deny_write guardrail list must not be empty"
+        );
+        assert!(MANDATORY_DENY_WRITE.contains(&".env"), "must block .env");
+        assert!(
+            MANDATORY_DENY_WRITE.contains(&".git/hooks/"),
+            "must block .git/hooks/"
+        );
+        assert!(
+            MANDATORY_DENY_WRITE.contains(&".bashrc"),
+            "must block .bashrc"
+        );
+        assert!(
+            MANDATORY_DENY_WRITE.contains(&".mcp.json"),
+            "must block .mcp.json"
+        );
+    }
+
+    #[test]
+    async fn sandbox_policy_config_serde_aliases_deserialize() {
+        // `forbidden_paths` is an alias for `deny_read` inside a `[sandbox_policy]` table.
+        // `allowed_roots` is an alias for `allow_read`.
+        let toml_in = r#"
+            forbidden_paths = ["/sensitive"]
+            allowed_roots = ["/shared"]
+        "#;
+        let p: SandboxPolicyConfig =
+            toml::from_str(toml_in).expect("alias keys must deserialize via serde alias");
+        assert_eq!(p.deny_read, Some(vec!["/sensitive".to_string()]));
+        assert_eq!(p.allow_read, Some(vec!["/shared".to_string()]));
+    }
+
+    #[test]
     async fn checklist_risk_profile_default_is_workspace_scoped() {
         let a = RiskProfileConfig::default();
         assert!(a.workspace_only, "Default profile must be workspace_only");
@@ -39533,6 +39807,62 @@ enabled = false
         assert_eq!(
             config.get_prop("transcription.max_audio_bytes").unwrap(),
             "<unset>"
+        );
+    }
+
+    #[test]
+    async fn sandbox_policy_leaves_are_exposed_in_the_property_tree() {
+        // `sandbox_policy` needs `#[nested]`, not just `#[serde(default)]`:
+        // without it the derive stops at the object root and every leaf is
+        // invisible to `zeroclaw config get/set`, the config API, and env
+        // overrides — TOML deserialization alone is not the public contract.
+        let mut config = Config::default();
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+
+        let paths: Vec<String> = config.prop_fields().into_iter().map(|f| f.name).collect();
+        for leaf in [
+            "deny_read",
+            "allow_read",
+            "allow_write",
+            "deny_write",
+            "guardrail_exceptions",
+        ] {
+            let expected = format!("risk_profiles.default.sandbox_policy.{leaf}");
+            assert!(
+                paths.contains(&expected),
+                "sandbox_policy leaf `{leaf}` missing from the property tree: {paths:?}"
+            );
+        }
+    }
+
+    #[test]
+    async fn sandbox_policy_leaf_round_trips_through_get_and_set_prop() {
+        let mut config = Config::default();
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+
+        let path = "risk_profiles.default.sandbox_policy.deny_read";
+        config.set_prop(path, "/etc/shadow,.env").unwrap();
+        assert_eq!(
+            config.risk_profiles["default"].sandbox_policy.deny_read,
+            Some(vec!["/etc/shadow".to_string(), ".env".to_string()]),
+        );
+        let shown = config.get_prop(path).unwrap();
+        assert!(
+            shown.contains("/etc/shadow") && shown.contains(".env"),
+            "get_prop must report the configured denials, got {shown}"
+        );
+
+        let bool_path = "risk_profiles.default.sandbox_policy.guardrail_exceptions";
+        config.set_prop(bool_path, ".vscode/settings.json").unwrap();
+        assert_eq!(
+            config.risk_profiles["default"]
+                .sandbox_policy
+                .guardrail_exceptions,
+            vec![".vscode/settings.json".to_string()]
         );
     }
 

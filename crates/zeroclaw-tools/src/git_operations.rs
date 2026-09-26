@@ -295,7 +295,7 @@ impl GitOperationsTool {
 
     fn metadata_path_is_authorized(&self, path: &Path, requires_write_access: bool) -> bool {
         self.security.is_resolved_path_readable(path)
-            && (!requires_write_access || self.security.is_resolved_path_allowed(path))
+            && (!requires_write_access || self.security.is_resolved_managed_store_writable(path))
     }
 
     /// Validate the complete, currently reachable repository metadata tree before
@@ -5542,6 +5542,41 @@ mod tests {
         assert!(
             status_out.trim().is_empty(),
             "expected clean tree after -u stash, got: {status_out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_deny_write_on_git_dir_still_refuses_git_writes() {
+        // Git metadata checks skip the built-in write guardrails
+        // (`.git/config`, `.git/hooks/`) but an operator `deny_write` entry
+        // stays absolute: denying the repository's `.git` directory must
+        // refuse every Git write while reads keep working.
+        let tmp = TempDir::new().unwrap();
+        git_init_no_sign(tmp.path(), &[]);
+        std::fs::write(tmp.path().join("a.txt"), "a").unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: tmp.path().to_path_buf(),
+            deny_write: vec![tmp.path().join(".git").canonicalize().unwrap()],
+            ..SecurityPolicy::default()
+        });
+        let tool = test_tool_with_security(security);
+
+        let add = tool
+            .execute(json!({"operation": "add", "paths": "a.txt"}))
+            .await
+            .unwrap();
+        assert!(
+            !add.success,
+            "an operator deny_write on .git must refuse Git writes"
+        );
+
+        let status = tool.execute(json!({"operation": "status"})).await.unwrap();
+        assert!(
+            status.success,
+            "reads must not need write access to metadata: {:?}",
+            status.error
         );
     }
 

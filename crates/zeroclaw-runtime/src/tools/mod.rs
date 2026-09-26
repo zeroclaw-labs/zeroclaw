@@ -121,7 +121,7 @@ pub use zeroclaw_tools::tool_search::ToolSearchTool;
 pub use zeroclaw_tools::weather_tool::WeatherTool;
 pub use zeroclaw_tools::web_fetch::WebFetchTool;
 pub use zeroclaw_tools::web_search_tool::WebSearchTool;
-pub use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
+pub use zeroclaw_tools::wrappers::{PathAccessMode, PathGuardedTool, RateLimitedTool};
 
 // Traits from zeroclaw-api
 pub use zeroclaw_api::schema::{CleaningStrategy, SchemaCleanr};
@@ -165,6 +165,7 @@ pub use verifiable_intent::VerifiableIntentTool;
 pub const REENTRANT_AGENT_TOOLS: &[&str] = &[SpawnSubagentTool::NAME, DelegateTool::NAME];
 
 use crate::platform::{NativeRuntime, RuntimeAdapter};
+use crate::security::policy::SandboxPolicy;
 use crate::security::{Sandbox, SecurityPolicy, create_sandbox};
 use crate::sop::audit::SopAuditLogger;
 use crate::sop::engine::SopEngine;
@@ -343,17 +344,23 @@ pub fn default_tools_with_runtime(
             PathGuardedTool::new(
                 FileReadTool::new_with_persistence(security.clone(), persistent_writes),
                 security.clone(),
+                PathAccessMode::Read,
             ),
             security.clone(),
         )),
         Box::new(RateLimitedTool::new(
-            PathGuardedTool::new(DeliverFileTool::new(security.clone()), security.clone()),
+            PathGuardedTool::new(
+                DeliverFileTool::new(security.clone()),
+                security.clone(),
+                PathAccessMode::Read,
+            ),
             security.clone(),
         )),
         Box::new(RateLimitedTool::new(
             PathGuardedTool::new(
                 FileWriteTool::new_with_persistence(security.clone(), persistent_writes),
                 security.clone(),
+                PathAccessMode::Write,
             ),
             security.clone(),
         )),
@@ -361,15 +368,24 @@ pub fn default_tools_with_runtime(
             PathGuardedTool::new(
                 FileEditTool::new_with_persistence(security.clone(), persistent_writes),
                 security.clone(),
+                PathAccessMode::Write,
             ),
             security.clone(),
         )),
         Box::new(RateLimitedTool::new(
-            PathGuardedTool::new(GlobSearchTool::new(security.clone()), security.clone()),
+            PathGuardedTool::new(
+                GlobSearchTool::new(security.clone()),
+                security.clone(),
+                PathAccessMode::Legacy,
+            ),
             security.clone(),
         )),
         Box::new(RateLimitedTool::new(
-            PathGuardedTool::new(ContentSearchTool::new(security.clone()), security.clone()),
+            PathGuardedTool::new(
+                ContentSearchTool::new(security.clone()),
+                security.clone(),
+                PathAccessMode::Legacy,
+            ),
             security,
         )),
     ]
@@ -716,6 +732,7 @@ fn runtime_shell_assembly(
     root_config: &Config,
 ) -> RuntimeShellAssembly {
     let sandbox_cfg = risk_profile.sandbox_config();
+    let sandbox_policy = SandboxPolicy::from_risk_profile(risk_profile, &security.workspace_dir);
     let sandbox_extra_roots = crate::security::SandboxExtraRoots {
         read_write: security.allowed_roots.clone(),
         read_only: security.allowed_roots_read_only.clone(),
@@ -723,6 +740,7 @@ fn runtime_shell_assembly(
     };
     let sandbox = create_sandbox(
         &sandbox_cfg,
+        &sandbox_policy,
         root_config.runtime.kind,
         Some(&security.workspace_dir),
         &sandbox_extra_roots,
@@ -1210,17 +1228,23 @@ fn all_tools_with_runtime_on_thread(
             PathGuardedTool::new(
                 FileReadTool::new_with_persistence(security.clone(), persistent_writes),
                 security.clone(),
+                PathAccessMode::Read,
             ),
             security.clone(),
         )),
         Arc::new(RateLimitedTool::new(
-            PathGuardedTool::new(DeliverFileTool::new(security.clone()), security.clone()),
+            PathGuardedTool::new(
+                DeliverFileTool::new(security.clone()),
+                security.clone(),
+                PathAccessMode::Read,
+            ),
             security.clone(),
         )),
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
                 FileWriteTool::new_with_persistence(security.clone(), persistent_writes),
                 security.clone(),
+                PathAccessMode::Write,
             ),
             security.clone(),
         )),
@@ -1228,15 +1252,24 @@ fn all_tools_with_runtime_on_thread(
             PathGuardedTool::new(
                 FileEditTool::new_with_persistence(security.clone(), persistent_writes),
                 security.clone(),
+                PathAccessMode::Write,
             ),
             security.clone(),
         )),
         Arc::new(RateLimitedTool::new(
-            PathGuardedTool::new(GlobSearchTool::new(security.clone()), security.clone()),
+            PathGuardedTool::new(
+                GlobSearchTool::new(security.clone()),
+                security.clone(),
+                PathAccessMode::Legacy,
+            ),
             security.clone(),
         )),
         Arc::new(RateLimitedTool::new(
-            PathGuardedTool::new(ContentSearchTool::new(security.clone()), security.clone()),
+            PathGuardedTool::new(
+                ContentSearchTool::new(security.clone()),
+                security.clone(),
+                PathAccessMode::Legacy,
+            ),
             security.clone(),
         )),
         Arc::new(CronAddTool::new_with_runtime(
@@ -1883,7 +1916,11 @@ fn all_tools_with_runtime_on_thread(
     // Vision tools are always available
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(RateLimitedTool::new(
-        PathGuardedTool::new(ImageInfoTool::new(security.clone()), security.clone()),
+        PathGuardedTool::new(
+            ImageInfoTool::new(security.clone()),
+            security.clone(),
+            PathAccessMode::Read,
+        ),
         security.clone(),
     )));
 
@@ -2505,6 +2542,132 @@ mod tests {
         ApprovalGroupConfig, ApprovalPolicyConfig, BrowserConfig, Config, MemoryConfig,
         SopApprovalConfig,
     };
+
+    /// RFC 6996 canonical boundary coverage: every tool in the default
+    /// registry whose arguments name filesystem paths, with one DENIED and
+    /// one ALLOWED probe per boundary. `shell` is intentionally absent — it
+    /// owns its own dialect-aware command validation and must not be wrapped
+    /// in the generic POSIX `PathGuardedTool` (see `default_tools`).
+    ///
+    /// This list doubles as the CI guard: a tool added to `default_tools`
+    /// whose name is missing here fails
+    /// `default_registry_names_are_all_classified`, and a probe whose
+    /// policy-denied path stops being denied fails the coverage loop — a new
+    /// tool cannot ship without a conscious boundary classification.
+    /// Config-gated tools with their own internal canonical checks
+    /// (`file_upload`, `file_upload_bundle`, `file_download`,
+    /// `git_operations`, `image_info`) enforce the same resolver at their own
+    /// operation boundary and are covered by their per-tool tests.
+    fn boundary_probes() -> Vec<(&'static str, serde_json::Value, serde_json::Value)> {
+        vec![
+            (
+                "file_read",
+                serde_json::json!({"path": "/outside/secret.txt"}),
+                serde_json::json!({"path": "probe.txt"}),
+            ),
+            (
+                "deliver_file",
+                serde_json::json!({"path": "/outside/secret.txt"}),
+                serde_json::json!({"path": "probe.txt"}),
+            ),
+            (
+                "file_write",
+                serde_json::json!({"path": "/outside/new.txt", "content": "x"}),
+                serde_json::json!({"path": "out.txt", "content": "x"}),
+            ),
+            (
+                "file_edit",
+                serde_json::json!({"path": "/outside/edit.txt", "old_string": "a", "new_string": "b"}),
+                serde_json::json!({"path": "edit.txt", "old_string": "hello", "new_string": "world"}),
+            ),
+            (
+                "glob_search",
+                serde_json::json!({"pattern": "*.txt", "path": "/outside"}),
+                serde_json::json!({"pattern": "*.txt"}),
+            ),
+            (
+                "content_search",
+                serde_json::json!({"pattern": "x", "path": "/outside"}),
+                serde_json::json!({"pattern": "hello"}),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn default_registry_path_boundaries_enforce_canonical_policy() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("probe.txt"), "hello probe").unwrap();
+        std::fs::write(tmp.path().join("edit.txt"), "hello").unwrap();
+
+        let profile = zeroclaw_config::schema::RiskProfileConfig {
+            workspace_only: true,
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
+        };
+        let security = Arc::new(SecurityPolicy::from_profiles(&profile, None, tmp.path()));
+        let tools = default_tools(security);
+
+        for (name, denied_args, allowed_args) in boundary_probes() {
+            let tool = tools.iter().find(|t| t.name() == name).unwrap_or_else(|| {
+                panic!("boundary probe tool {name} missing from default registry")
+            });
+
+            // DENIED: the canonical resolver must refuse the out-of-workspace
+            // path before the tool runs.
+            let denied = tool
+                .execute(denied_args.clone())
+                .await
+                .expect("policy denial is a ToolResult, not an Err");
+            assert!(
+                !denied.success
+                    && denied
+                        .error
+                        .as_deref()
+                        .is_some_and(|e| e.to_lowercase().contains("polic")),
+                "{name}: expected a policy denial for {denied_args}, got success={} error={:?}",
+                denied.success,
+                denied.error
+            );
+
+            // ALLOWED: the in-workspace probe must NOT be policy-denied (the
+            // tool may still fail for its own reasons — missing context,
+            // schema strictness — but never with a policy error).
+            let allowed = tool.execute(allowed_args.clone()).await;
+            let policy_blocked = match &allowed {
+                Ok(r) => {
+                    !r.success
+                        && r.error
+                            .as_deref()
+                            .is_some_and(|e| e.to_lowercase().contains("polic"))
+                }
+                Err(e) => e.to_string().to_lowercase().contains("polic"),
+            };
+            assert!(
+                !policy_blocked,
+                "{name}: in-workspace probe {allowed_args} must not be policy-denied, got {allowed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_registry_names_are_all_classified() {
+        let profile = zeroclaw_config::schema::RiskProfileConfig::default();
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::from_profiles(&profile, None, tmp.path()));
+        let tools = default_tools(security);
+
+        let mut known: Vec<&str> = boundary_probes().iter().map(|(name, _, _)| *name).collect();
+        known.push("shell"); // own dialect-aware validation, see `default_tools`.
+        for tool in &tools {
+            assert!(
+                known.contains(&tool.name()),
+                "tool `{}` is registered in `default_tools` but has no RFC 6996 boundary \
+                 classification: either add a deny+allow probe to `boundary_probes` (and a \
+                 guard, if it names filesystem paths) or document why it is not a \
+                 filesystem boundary",
+                tool.name()
+            );
+        }
+    }
 
     #[test]
     fn git_write_boundary_rejects_docker_runtime_writes() {
@@ -5013,6 +5176,94 @@ permissions = ["http_client"]
         assert!(names.contains(&"file_edit"));
         assert!(names.contains(&"glob_search"));
         assert!(names.contains(&"content_search"));
+    }
+
+    #[tokio::test]
+    async fn registered_file_read_wrapper_denies_absolute_workspace_deny_read_target() {
+        // Through the actual registered stack (RateLimitedTool(PathGuardedTool(
+        // FileReadTool))). `FileReadTool` also re-checks `deny_read` internally
+        // at its own read boundary, so this is a defense-in-depth/non-regression
+        // proof for the full pipeline, not proof of the wrapper's own decision
+        // in isolation — see `wrappers::tests::path_guard_read_mode_denies_*`
+        // in `zeroclaw-tools` for that (there, the mock inner tool has no
+        // internal check, so only the wrapper's own logic can produce the
+        // denial).
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("secret.txt"), "top secret").unwrap();
+        std::fs::write(tmp.path().join("public.txt"), "hello").unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: tmp.path().to_path_buf(),
+            forbidden_paths: vec!["secret.txt".to_string()],
+            ..SecurityPolicy::default()
+        });
+        let tools = default_tools(security);
+        let file_read = tools
+            .iter()
+            .find(|t| t.name() == "file_read")
+            .expect("file_read must be registered");
+
+        let denied = file_read
+            .execute(serde_json::json!({"path": tmp.path().join("secret.txt").to_str().unwrap()}))
+            .await
+            .unwrap();
+        assert!(
+            !denied.success,
+            "a deny_read target must be refused through the registered wrapper"
+        );
+
+        let allowed = file_read
+            .execute(serde_json::json!({"path": tmp.path().join("public.txt").to_str().unwrap()}))
+            .await
+            .unwrap();
+        assert!(
+            allowed.success,
+            "an unrelated file must still be readable: {:?}",
+            allowed.error
+        );
+    }
+
+    #[tokio::test]
+    async fn registered_glob_search_wrapper_still_finds_files_under_deny_read() {
+        // `glob_search` is registered in `PathAccessMode::Legacy` (its argument
+        // is a glob pattern, not a literal path) but still enforces `deny_read`
+        // internally per matched file — this proves the Legacy wrapper mode
+        // does not itself break that enforcement.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("secret")).unwrap();
+        std::fs::write(tmp.path().join("secret").join("a.txt"), "hidden").unwrap();
+        std::fs::write(tmp.path().join("public.txt"), "hello").unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: tmp.path().to_path_buf(),
+            forbidden_paths: vec!["secret".to_string()],
+            ..SecurityPolicy::default()
+        });
+        let tools = default_tools(security);
+        let glob_search = tools
+            .iter()
+            .find(|t| t.name() == "glob_search")
+            .expect("glob_search must be registered");
+
+        let result = glob_search
+            .execute(serde_json::json!({"pattern": "**/*.txt"}))
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "glob_search call must succeed: {:?}",
+            result.error
+        );
+        assert!(
+            !result.output.contains("secret"),
+            "a deny_read directory must not appear in results: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("public.txt"),
+            "an unrelated file must still be found: {}",
+            result.output
+        );
     }
 
     #[test]
