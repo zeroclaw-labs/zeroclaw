@@ -26,3 +26,6 @@ mod publish_contract;
 
 #[path = "architecture/ci_runner_labels.rs"]
 mod ci_runner_labels;
+
+#[path = "architecture/rpc_proto_boundary.rs"]
+mod rpc_proto_boundary;

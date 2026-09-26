@@ -563,6 +563,7 @@ pub const BASELINE_TIMEOUT_SECS: u64 = 120;
 pub const BASELINE_WIRE_API: &str = "chat_completions";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ModelPricing {
     /// Input/prompt tokens per-token rate (USD per token, e.g. `"0.000005"` = $5/1M tokens).
     #[serde(default, skip_serializing_if = "Option::is_none")]

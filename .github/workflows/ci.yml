@@ -1245,6 +1245,8 @@ jobs:
         run: cargo generate installers --check
       - name: Check source-backed SOP syntax reference
         run: cargo generate sop-syntax --check
+      - name: Check the OpenRPC contract matches zeroclaw-rpc-proto
+        run: cargo generate openrpc --check
       - name: Resolve canonical all-feature selection
         id: all_features
         run: |

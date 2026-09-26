@@ -42,6 +42,10 @@ The kernel ABI. Defines the core public traits, including:
 
 The runtime depends only on these traits, not on concrete implementations. This is what makes provider/channel/tool additions a matter of implementing a trait rather than patching the core.
 
+### `zeroclaw-rpc-proto`
+
+The wire contract of the daemon RPC: the `Method` enum with its single wire-name table and per-method params/result contract, every wire-stable request, response and notification payload type, the notification names and the error codes. Pure data with serde derives; it depends on `zeroclaw-api`, `zeroclaw-config` and `zeroclaw-sop-graph` and never on the runtime or on async I/O, so an RPC client can link it without linking the daemon. `cargo generate openrpc` renders it into the tracked OpenRPC document (see [RPC socket](rpc-socket.md#contract-document)). The authorization classification of each method stays in the runtime.
+
 ## Layer: Edge
 
 ### `zeroclaw-providers`
