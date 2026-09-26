@@ -332,6 +332,7 @@ pub(crate) struct StartReservation {
     sop: Sop,
     deterministic: bool,
     decided_mode: Option<SopExecutionMode>,
+    decisions: std::collections::BTreeMap<u32, f64>,
 }
 
 impl StartReservation {
@@ -344,6 +345,12 @@ impl StartReservation {
     /// activation, because activation already gates the first step.
     pub(crate) fn set_decided_mode(&mut self, mode: Option<SopExecutionMode>) {
         self.decided_mode = mode;
+    }
+
+    /// Conditional-part answers (step -> p(yes)) for this run, set before
+    /// activation because activation dispatches step 1.
+    pub(crate) fn set_decisions(&mut self, decisions: std::collections::BTreeMap<u32, f64>) {
+        self.decisions = decisions;
     }
 }
 
@@ -1965,8 +1972,10 @@ impl SopEngine {
         sop_name: &str,
         event: SopEvent,
         decided_mode: Option<SopExecutionMode>,
+        decisions: std::collections::BTreeMap<u32, f64>,
     ) -> Result<SopRunAction> {
         let mut reservation = self.reserve_run_slot(sop_name)?;
+        reservation.set_decisions(decisions);
         reservation.set_decided_mode(decided_mode);
         self.activate_reserved_run(reservation, event, None)
     }
@@ -2023,6 +2032,7 @@ impl SopEngine {
             sop,
             deterministic,
             decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         })
     }
 
@@ -2049,6 +2059,7 @@ impl SopEngine {
             sop,
             deterministic,
             decided_mode,
+            decisions,
         } = reservation;
 
         let run = SopRun {
@@ -2069,6 +2080,7 @@ impl SopEngine {
             revision: 0,
             revision_base: 0,
             decided_mode,
+            decisions,
         };
         let first_input = step_input_value(&run, 1);
         self.active_runs.insert(run_id.clone(), run);
@@ -2499,7 +2511,7 @@ impl SopEngine {
             });
         }
 
-        let run_data = RunData::from_step_results(&run.step_results);
+        let run_data = RunData::from_step_results(&run.step_results).with_decisions(&run.decisions);
         Ok(route::resolve_next(&RouteCtx {
             sop,
             run,
@@ -2606,6 +2618,79 @@ impl SopEngine {
         )?))
     }
 
+    /// Skip a conditional-part step whose decision says it does not apply to
+    /// this run (`decide` answered no, or `unless_decided` named a step answered
+    /// yes), record why, and continue with the next step in order — handing it
+    /// this step's input, since a skipped step produces no output. Returns
+    /// `None` when the step should run. Checked before any approval gate, so a
+    /// skipped part never asks for approval.
+    fn skip_for_decision(
+        &mut self,
+        run_id: &str,
+        sop: &Sop,
+        step: &SopStep,
+        input_override: Option<Value>,
+        deterministic: bool,
+    ) -> Result<Option<SopRunAction>> {
+        let (reason, input) = {
+            let Some(run) = self.active_runs.get(run_id) else {
+                return Ok(None);
+            };
+            let Some(reason) = decision_skip_reason(sop, step, &run.decisions) else {
+                return Ok(None);
+            };
+            let input = input_override.unwrap_or_else(|| step_input_value(run, step.number));
+            (reason, input)
+        };
+        let now = now_iso8601();
+        self.record_step_result(
+            run_id,
+            SopStepResult {
+                step_number: step.number,
+                status: SopStepStatus::Skipped,
+                output: reason.clone(),
+                started_at: now.clone(),
+                completed_at: Some(now),
+                effective_agent: None,
+                tool_calls: Vec::new(),
+            },
+        )?;
+        self.record_transition_event(
+            run_id,
+            "step_skipped",
+            Some(reason.clone()),
+            ::serde_json::json!({"step": step.number, "status": "decision"}),
+        );
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"run_id": run_id, "step": step.number})),
+            &format!("SOP run {run_id}: {reason}")
+        );
+        let next = sop
+            .steps
+            .iter()
+            .position(|s| s.number == step.number)
+            .and_then(|i| sop.steps.get(i + 1))
+            .map(|s| s.number);
+        let action = match next {
+            Some(next) if deterministic => {
+                self.dispatch_deterministic_step(run_id, sop, next, input)?
+            }
+            Some(next) => self.dispatch_llm_step(run_id, sop, next, Some(input))?,
+            None => self.apply_route_decision(
+                run_id,
+                sop,
+                step.number,
+                NextStep::Complete,
+                deterministic,
+                None,
+                None,
+            )?,
+        };
+        Ok(Some(action))
+    }
+
     fn dispatch_llm_step(
         &mut self,
         run_id: &str,
@@ -2622,6 +2707,12 @@ impl SopEngine {
             run.current_step = step_number;
             run.status = SopRunStatus::Running;
             run.waiting_since = None;
+        }
+
+        if let Some(action) =
+            self.skip_for_decision(run_id, sop, &step, input_override.clone(), false)?
+        {
+            return Ok(action);
         }
 
         let run_data = {
@@ -2796,6 +2887,12 @@ impl SopEngine {
             run.current_step = step_number;
             run.status = SopRunStatus::Running;
             run.waiting_since = None;
+        }
+
+        if let Some(action) =
+            self.skip_for_decision(run_id, sop, &step, Some(input.clone()), true)?
+        {
+            return Ok(action);
         }
 
         self.resolve_deterministic_action(sop, run_id, &step, input)
@@ -6471,8 +6568,14 @@ fn format_step_context(sop: &Sop, run: &SopRun, step: &SopStep, config: &SopConf
         marker_id,
     ));
 
-    // Previous step summary
-    if let Some(prev) = run.step_results.last() {
+    // Previous step summary. A step skipped by its decision passes its input
+    // along, so the summary is the last step that actually ran.
+    if let Some(prev) = run
+        .step_results
+        .iter()
+        .rev()
+        .find(|result| !is_decision_skip(result))
+    {
         let _ = writeln!(
             ctx,
             "Previous: Step {} {} — {}",
@@ -6496,7 +6599,14 @@ fn format_step_context(sop: &Sop, run: &SopRun, step: &SopStep, config: &SopConf
 }
 
 pub(crate) fn step_input_value(run: &SopRun, step_number: u32) -> Value {
-    if step_number <= 1 {
+    // A step skipped by its decision produced no output, so it passes the
+    // input along: the next step sees the last real result (or the trigger).
+    let last_real = run
+        .step_results
+        .iter()
+        .rev()
+        .find(|result| !is_decision_skip(result));
+    if step_number <= 1 || last_real.is_none() {
         return run
             .trigger_event
             .payload
@@ -6505,10 +6615,47 @@ pub(crate) fn step_input_value(run: &SopRun, step_number: u32) -> Value {
             .unwrap_or(Value::Null);
     }
 
-    run.step_results
-        .last()
-        .map(step_result_value)
-        .unwrap_or(Value::Null)
+    last_real.map(step_result_value).unwrap_or(Value::Null)
+}
+
+/// Prefix of the recorded output for a step skipped by its decision.
+const DECISION_SKIP_PREFIX: &str = "skipped by decision:";
+
+fn is_decision_skip(result: &SopStepResult) -> bool {
+    result.status == SopStepStatus::Skipped && result.output.starts_with(DECISION_SKIP_PREFIX)
+}
+
+/// Why a conditional-part step does not apply to this run, if it does not:
+/// its own `decide` question was answered below `part_threshold`, or the step
+/// its `unless_decided` names was answered at or above it. A missing answer
+/// (model unavailable or malformed) never skips.
+fn decision_skip_reason(
+    sop: &Sop,
+    step: &SopStep,
+    decisions: &std::collections::BTreeMap<u32, f64>,
+) -> Option<String> {
+    let threshold = sop.decision.as_ref().map_or(0.5, |d| d.part_threshold);
+    if let (Some(question), Some(p)) = (&step.decide, decisions.get(&step.number))
+        && *p < threshold
+    {
+        // The question can carry long context; the reason names it, not repeats it.
+        let question = match question.char_indices().nth(80) {
+            Some((cut, _)) => format!("{}…", &question[..cut]),
+            None => question.clone(),
+        };
+        return Some(format!(
+            "{DECISION_SKIP_PREFIX} answered no to \"{question}\" (p(yes) {p:.2} < {threshold:.2})"
+        ));
+    }
+    if let Some(n) = step.unless_decided
+        && let Some(p) = decisions.get(&n)
+        && *p >= threshold
+    {
+        return Some(format!(
+            "{DECISION_SKIP_PREFIX} step {n}'s question was answered yes (p(yes) {p:.2} >= {threshold:.2})"
+        ));
+    }
+    None
 }
 
 /// Gate re-presentations per checkpoint a `Revise` may spend before the gate
@@ -6711,6 +6858,7 @@ mod tests {
     use crate::sop::approval::{ApprovalDecision, ApprovalPrincipal, ResolveOutcome};
     use crate::sop::step_contract::StepFailure;
     use crate::sop::types::{SopExecutionMode, StepSchema};
+    use std::collections::BTreeMap;
 
     /// Clear a WaitingApproval gate through the production out-of-band chokepoint
     /// (a CLI principal), returning the resumed action. Mirrors what a real
@@ -7522,6 +7670,151 @@ mod tests {
     fn start_run_unknown_sop_fails() {
         let mut engine = engine_with_sops(vec![]);
         assert!(engine.start_run("nonexistent", manual_event()).is_err());
+    }
+
+    /// A three-step SOP whose step 1 asks "out of scope?", step 2 is a
+    /// conditional review part, and step 3 runs unless step 1 was yes.
+    fn parts_sop() -> Sop {
+        let mut sop = test_sop("parts", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.decision = Some(
+            toml::from_str::<crate::sop::decision::SopDecisionSpec>("model = \"jev\"").unwrap(),
+        );
+        sop.steps[0].decide = Some("Out of scope?".into());
+        sop.steps[1].decide = Some("Touches security?".into());
+        let mut compose = sop.steps[1].clone();
+        compose.number = 3;
+        compose.title = "Compose".into();
+        compose.decide = None;
+        compose.unless_decided = Some(1);
+        sop.steps.push(compose);
+        sop
+    }
+
+    fn completed(step_number: u32, output: &str) -> SopStepResult {
+        SopStepResult {
+            step_number,
+            status: SopStepStatus::Completed,
+            output: output.into(),
+            started_at: now_iso8601(),
+            completed_at: Some(now_iso8601()),
+            effective_agent: None,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn decision_parts_skip_declined_steps_and_pass_input_through() {
+        let mut engine = engine_with_sops(vec![parts_sop()]);
+        let event = SopEvent {
+            payload: Some(r#"{"pr":1}"#.into()),
+            ..manual_event()
+        };
+        // Step 1 (out of scope) answered no: skipped. Step 2 (security) yes.
+        let decisions = BTreeMap::from([(1, 0.1), (2, 0.9)]);
+        let action = engine
+            .start_run_with_mode("parts", event, None, decisions)
+            .unwrap();
+        let SopRunAction::ExecuteStep {
+            run_id,
+            step,
+            context,
+        } = action
+        else {
+            panic!("expected step 2 to execute, got {action:?}");
+        };
+        assert_eq!(step.number, 2);
+        assert!(
+            context.contains(r#""pr""#),
+            "step 2 gets the trigger payload: {context}"
+        );
+        assert!(
+            !context.contains("Previous:"),
+            "a skip is not a previous result: {context}"
+        );
+        let run = &engine.active_runs()[&run_id];
+        assert_eq!(run.step_results.len(), 1);
+        assert_eq!(run.step_results[0].status, SopStepStatus::Skipped);
+        assert!(run.step_results[0].output.contains("Out of scope?"));
+
+        // Step 3 runs because step 1 was no, and reads step 2's output.
+        let action = engine
+            .advance_step(&run_id, completed(2, "review"))
+            .unwrap();
+        let SopRunAction::ExecuteStep { step, context, .. } = action else {
+            panic!("expected step 3, got {action:?}");
+        };
+        assert_eq!(step.number, 3);
+        assert!(
+            context.contains("Previous: Step 2 completed — review"),
+            "{context}"
+        );
+        let action = engine.advance_step(&run_id, completed(3, "done")).unwrap();
+        assert!(matches!(action, SopRunAction::Completed { .. }));
+    }
+
+    #[test]
+    fn unless_decided_skips_to_completion_when_the_named_step_was_yes() {
+        let mut engine = engine_with_sops(vec![parts_sop()]);
+        // Out of scope (yes) runs step 1; security no skips step 2; step 3 is
+        // skipped by `unless_decided: 1`, and the run completes after step 1.
+        let decisions = BTreeMap::from([(1, 0.8), (2, 0.2)]);
+        let action = engine
+            .start_run_with_mode("parts", manual_event(), None, decisions)
+            .unwrap();
+        let SopRunAction::ExecuteStep { run_id, step, .. } = action else {
+            panic!("expected step 1, got {action:?}");
+        };
+        assert_eq!(step.number, 1);
+        let action = engine.advance_step(&run_id, completed(1, "hold")).unwrap();
+        assert!(
+            matches!(action, SopRunAction::Completed { .. }),
+            "{action:?}"
+        );
+        let run = &engine.finished_runs(Some("parts"))[0];
+        let statuses: Vec<_> = run
+            .step_results
+            .iter()
+            .map(|r| (r.step_number, r.status))
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                (1, SopStepStatus::Completed),
+                (2, SopStepStatus::Skipped),
+                (3, SopStepStatus::Skipped),
+            ]
+        );
+    }
+
+    #[test]
+    fn skip_reason_shortens_a_long_question() {
+        let mut sop = parts_sop();
+        sop.steps[0].decide = Some(format!("Scope check. {}", "context ".repeat(500)));
+        let reason =
+            decision_skip_reason(&sop, &sop.steps[0], &BTreeMap::from([(1, 0.1)])).unwrap();
+        assert!(reason.chars().count() < 200, "{reason}");
+        assert!(reason.contains("Scope check.") && reason.contains('…'));
+    }
+
+    #[test]
+    fn decision_parts_without_an_answer_run() {
+        let mut engine = engine_with_sops(vec![parts_sop()]);
+        let action = engine
+            .start_run_with_mode("parts", manual_event(), None, BTreeMap::new())
+            .unwrap();
+        let SopRunAction::ExecuteStep { step, .. } = action else {
+            panic!("expected step 1, got {action:?}");
+        };
+        assert_eq!(step.number, 1);
+    }
+
+    #[test]
+    fn when_conditions_can_read_decisions() {
+        let run_data = RunData::default().with_decisions(&BTreeMap::from([(2, 0.75)]));
+        assert_eq!(
+            run_data.get_path("$.decisions.2"),
+            Some(serde_json::json!(0.75))
+        );
     }
 
     #[test]
@@ -9098,6 +9391,7 @@ mod tests {
                 revision: 0,
                 revision_base: 0,
                 decided_mode: None,
+                decisions: std::collections::BTreeMap::new(),
             },
         );
         assert_eq!(
@@ -9151,6 +9445,7 @@ mod tests {
                     revision: 0,
                     revision_base: 0,
                     decided_mode: None,
+                    decisions: std::collections::BTreeMap::new(),
                 },
             );
         }
@@ -9197,6 +9492,7 @@ mod tests {
                 revision: 0,
                 revision_base: 0,
                 decided_mode: None,
+                decisions: std::collections::BTreeMap::new(),
             },
         );
         let step = SopStep {
@@ -9880,6 +10176,7 @@ mod tests {
                 revision: 0,
                 revision_base: 0,
                 decided_mode: None,
+                decisions: std::collections::BTreeMap::new(),
             };
             store
                 .save_run(&PersistedRun::new(
@@ -10414,6 +10711,7 @@ mod tests {
             revision: 0,
             revision_base: 0,
             decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         };
         let ctx = format_step_context(&sop, &run, &sop.steps[0], &SopConfig::default());
         assert!(ctx.contains("pump-shutdown"));
@@ -11301,6 +11599,7 @@ mod tests {
             revision: 0,
             revision_base: 0,
             decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         };
         store
             .save_run(&PersistedRun::new(
@@ -11357,6 +11656,7 @@ mod tests {
             revision: 0,
             revision_base: 0,
             decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         };
         store
             .save_run(&PersistedRun::new(parked, now, SopTriggerSource::Manual))
@@ -11428,6 +11728,7 @@ mod tests {
             revision: 0,
             revision_base: 0,
             decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         };
         store
             .save_run(&PersistedRun::new(
@@ -13195,6 +13496,7 @@ mod tests {
                 revision: 0,
                 revision_base: 0,
                 decided_mode: None,
+                decisions: std::collections::BTreeMap::new(),
             },
         );
         let out = engine
@@ -13822,6 +14124,68 @@ type = "manual"
             agent: None,
             decision: None,
         }
+    }
+
+    #[test]
+    fn deterministic_decision_part_is_skipped_and_its_input_passed_on() {
+        let mut sop = deterministic_sop_all_execute("det-parts");
+        sop.decision = Some(
+            toml::from_str::<crate::sop::decision::SopDecisionSpec>("model = \"jev\"").unwrap(),
+        );
+        sop.steps[1].decide = Some("Needs step two?".into());
+        let mut three = sop.steps[1].clone();
+        three.number = 3;
+        three.title = "Step three".into();
+        three.decide = None;
+        sop.steps.push(three);
+        let mut engine = engine_with_sops(vec![sop]);
+
+        let action = engine
+            .start_run_with_mode(
+                "det-parts",
+                manual_event(),
+                None,
+                BTreeMap::from([(2, 0.1)]),
+            )
+            .unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        assert!(
+            matches!(action, SopRunAction::DeterministicStep { ref step, .. } if step.number == 1)
+        );
+
+        let action = engine
+            .advance_deterministic_step(&run_id, serde_json::json!({"a": 1}), None)
+            .unwrap();
+        let SopRunAction::DeterministicStep { step, input, .. } = action else {
+            panic!("expected step 3, got {action:?}");
+        };
+        assert_eq!(step.number, 3);
+        assert_eq!(
+            input,
+            serde_json::json!({"a": 1}),
+            "step 1's output passes over the skip"
+        );
+
+        let action = engine
+            .advance_deterministic_step(&run_id, serde_json::json!({"b": 2}), None)
+            .unwrap();
+        assert!(
+            matches!(action, SopRunAction::Completed { .. }),
+            "{action:?}"
+        );
+        let statuses: Vec<_> = engine.finished_runs(Some("det-parts"))[0]
+            .step_results
+            .iter()
+            .map(|r| (r.step_number, r.status))
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                (1, SopStepStatus::Completed),
+                (2, SopStepStatus::Skipped),
+                (3, SopStepStatus::Completed),
+            ]
+        );
     }
 
     #[test]
@@ -16156,6 +16520,7 @@ type = "manual"
             revision: 0,
             revision_base: 0,
             decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         };
         store
             .save_run(&PersistedRun::new(
@@ -16203,6 +16568,7 @@ type = "manual"
             revision: 0,
             revision_base: 0,
             decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         };
         engine.active_runs.insert(run.run_id.clone(), run.clone());
 
@@ -16802,6 +17168,7 @@ type = "manual"
             revision: 0,
             revision_base: 0,
             decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         };
         store
             .save_run(&PersistedRun::new(

@@ -1018,8 +1018,13 @@ fn load_sop(sop_dir: &Path, default_execution_mode: SopExecutionMode) -> Result<
         decision: manifest.decision,
     };
     if let Some(spec) = &sop.decision {
-        spec.validate(&sop.name, sop.deterministic)?;
+        spec.validate(
+            &sop.name,
+            sop.deterministic,
+            !decision::part_steps(&sop).is_empty(),
+        )?;
     }
+    decision::validate_parts(&sop)?;
     capability::SopCapabilityRegistry::with_builtins().validate_sop(&sop)?;
     Ok(sop)
 }
@@ -1073,6 +1078,8 @@ pub enum SopStepSyntaxKey {
     Prompt,
     Policy,
     Edit,
+    Decide,
+    UnlessDecided,
     ContinuationBody,
 }
 
@@ -1100,6 +1107,8 @@ impl SopStepSyntaxKey {
             Self::Prompt => &["prompt:"],
             Self::Policy => &["policy:"],
             Self::Edit => &["edit:"],
+            Self::Decide => &["decide:"],
+            Self::UnlessDecided => &["unless_decided:", "unless-decided:"],
             Self::StepsSection | Self::NumberedItem | Self::BoldTitle | Self::ContinuationBody => {
                 &[]
             }
@@ -1213,6 +1222,14 @@ pub const SOP_STEP_SYNTAX_CATALOG: &[SopStepSyntaxSpec] = &[
     SopStepSyntaxSpec {
         key: SopStepSyntaxKey::Edit,
         description: "`- edit:` opts a checkpoint into editing the named field before resume.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Decide,
+        description: "`- decide:` makes the step a conditional part: a yes/no question the SOP's `[decision]` model answers about the triggering event when the run starts. The step runs only on yes; on no it is recorded as skipped and the run continues. If the model cannot answer, the step runs.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::UnlessDecided,
+        description: "`- unless_decided: N` skips the step when step N's `decide` question was answered yes, so one decision can switch between alternative sets of steps.",
     },
     SopStepSyntaxSpec {
         key: SopStepSyntaxKey::ContinuationBody,
@@ -1354,6 +1371,15 @@ pub fn parse_steps(md: &str) -> Vec<SopStep> {
                             current.gate_prompt = Some(val.to_string());
                         }
                     }
+                    SopStepSyntaxKey::Decide => {
+                        let val = val.trim();
+                        if !val.is_empty() {
+                            current.decide = Some(val.to_string());
+                        }
+                    }
+                    SopStepSyntaxKey::UnlessDecided => {
+                        current.unless_decided = val.trim().parse::<u32>().ok();
+                    }
                     SopStepSyntaxKey::Policy => {
                         let val = val.trim();
                         current.policy = if val.is_empty() {
@@ -1424,6 +1450,8 @@ struct StepParseState {
     policy: Option<String>,
     gate_prompt: Option<String>,
     edit: Option<String>,
+    decide: Option<String>,
+    unless_decided: Option<u32>,
 }
 
 impl StepParseState {
@@ -1458,6 +1486,8 @@ impl StepParseState {
             policy: self.policy.take(),
             gate_prompt: self.gate_prompt.take(),
             edit: self.edit.take(),
+            decide: self.decide.take(),
+            unless_decided: self.unless_decided.take(),
         });
         *self = Self::default();
     }
@@ -1664,6 +1694,12 @@ fn render_step_bullets(step: &SopStep) -> Vec<String> {
     }
     if let Some(agent) = &step.agent {
         bullets.push(format!("agent: {agent}"));
+    }
+    if let Some(question) = &step.decide {
+        bullets.push(format!("decide: {question}"));
+    }
+    if let Some(n) = step.unless_decided {
+        bullets.push(format!("unless_decided: {n}"));
     }
     for call in &step.calls {
         if let Ok(rendered) = serde_json::to_string(call) {
@@ -1989,8 +2025,15 @@ pub fn validate_sop_strict(sop: &Sop) -> SopValidation {
     // The loader rejects an invalid `[decision]` table, so saving one would
     // make the SOP disappear on the next reload.
     if let Some(spec) = &sop.decision
-        && let Err(e) = spec.validate(&sop.name, sop.deterministic)
+        && let Err(e) = spec.validate(
+            &sop.name,
+            sop.deterministic,
+            !decision::part_steps(sop).is_empty(),
+        )
     {
+        blocking.push(e.to_string());
+    }
+    if let Err(e) = decision::validate_parts(sop) {
         blocking.push(e.to_string());
     }
 
@@ -3321,6 +3364,7 @@ mod tests {
             modes: vec![],
             mode_instructions: None,
             min_confidence: 0.7,
+            part_threshold: 0.5,
         });
         let v = validate_sop_strict(&sop);
         assert!(
@@ -3358,6 +3402,25 @@ mod tests {
         assert_eq!(failures[0].0, "bad");
         assert!(failures[0].1.contains("model"), "{}", failures[0].1);
     }
+    #[test]
+    fn parse_steps_reads_decision_part_bullets_and_round_trips() {
+        let steps = parse_steps(
+            r#"
+## Steps
+1. **Hold** - Draft a scope comment.
+   - decide: Does this add a feature outside the roadmap?
+2. **Review** - Review the change.
+   - unless-decided: 1
+"#,
+        );
+        assert_eq!(
+            steps[0].decide.as_deref(),
+            Some("Does this add a feature outside the roadmap?")
+        );
+        assert_eq!(steps[1].unless_decided, Some(1));
+        assert_eq!(parse_steps(&render_steps(&steps)), steps);
+    }
+
     #[test]
     fn parse_steps_keeps_legacy_tools_hint() {
         let steps = parse_steps(

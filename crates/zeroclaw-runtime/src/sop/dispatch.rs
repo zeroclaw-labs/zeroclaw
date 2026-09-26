@@ -531,15 +531,24 @@ fn remember_dispatch_start(
 
 // ── Core dispatch ───────────────────────────────────────────────
 
+/// What the decision model settled for one SOP's run: the execution mode it
+/// chose (if any) and its p(yes) for each conditional-part step.
+#[derive(Default)]
+struct RunDecision {
+    mode: Option<SopExecutionMode>,
+    parts: std::collections::BTreeMap<u32, f64>,
+}
+
 /// Consult the engine's decision model for each matched SOP that declares a
 /// `[decision]` table. Returns the names that should still start; declined
-/// SOPs are pushed to `results` as `Skipped`, and chosen modes land in
-/// `decided_modes`. SOPs without a `[decision]` table pass through untouched.
+/// SOPs are pushed to `results` as `Skipped`, and the chosen mode and part
+/// answers land in `decided`. SOPs without a `[decision]` table pass through
+/// untouched.
 async fn apply_decisions(
     engine: &Arc<Mutex<SopEngine>>,
     event: &SopEvent,
     matched_names: Vec<String>,
-    decided_modes: &mut HashMap<String, SopExecutionMode>,
+    decided: &mut HashMap<String, RunDecision>,
     results: &mut Vec<DispatchResult>,
 ) -> Vec<String> {
     let gated = match engine.lock() {
@@ -572,6 +581,7 @@ async fn apply_decisions(
                     "sop_name": sop.name,
                     "start": decision.start,
                     "mode": decision.mode.map(|m| m.to_string()),
+                    "parts": decision.parts,
                     "input_tokens": decision.input_tokens,
                 })
             ),
@@ -586,8 +596,14 @@ async fn apply_decisions(
                 reason: format!("decision gate declined: {}", decision.rationale),
             });
             declined.push(sop.name);
-        } else if let Some(mode) = decision.mode {
-            decided_modes.insert(sop.name, mode);
+        } else {
+            decided.insert(
+                sop.name,
+                RunDecision {
+                    mode: decision.mode,
+                    parts: decision.parts,
+                },
+            );
         }
     }
     matched_names
@@ -754,15 +770,9 @@ async fn dispatch_sop_event_filtered(
     // this event should start them and in which mode. Awaited with no engine
     // lock held; a declined SOP is reported as Skipped and never reserves a slot.
     let mut results = Vec::new();
-    let mut decided_modes = HashMap::new();
-    let matched_names = apply_decisions(
-        engine,
-        &event,
-        matched_names,
-        &mut decided_modes,
-        &mut results,
-    )
-    .await;
+    let mut decided: HashMap<String, RunDecision> = HashMap::new();
+    let matched_names =
+        apply_decisions(engine, &event, matched_names, &mut decided, &mut results).await;
     if matched_names.is_empty() {
         return results;
     }
@@ -1031,7 +1041,9 @@ async fn dispatch_sop_event_filtered(
             for sop_name in &admit_names {
                 match eng.reserve_run_slot(sop_name) {
                     Ok(mut reservation) => {
-                        reservation.set_decided_mode(decided_modes.get(sop_name).copied());
+                        let decision = decided.remove(sop_name).unwrap_or_default();
+                        reservation.set_decided_mode(decision.mode);
+                        reservation.set_decisions(decision.parts);
                         reservations.push(reservation);
                     }
                     Err(e) => {
@@ -1188,10 +1200,12 @@ async fn dispatch_sop_event_filtered(
                     }
                     SopAdmission::Admit => {}
                 }
+                let decision = decided.remove(sop_name).unwrap_or_default();
                 match eng.start_run_with_mode(
                     sop_name,
                     event.clone(),
-                    decided_modes.get(sop_name).copied(),
+                    decision.mode,
+                    decision.parts,
                 ) {
                     Ok(action) => {
                         let result =
@@ -3782,6 +3796,7 @@ mod tests {
                 ],
                 mode_instructions: None,
                 min_confidence: 0.7,
+                part_threshold: 0.5,
             }
         }
 
@@ -4001,6 +4016,62 @@ mod tests {
                 )]
             );
             assert_eq!(jev.calls.load(Ordering::SeqCst), 0);
+        }
+
+        /// A part SOP: no gate or modes, step 1 asks its own question.
+        fn part_sop() -> Sop {
+            let spec = SopDecisionSpec {
+                gate: None,
+                modes: vec![],
+                ..spec()
+            };
+            let mut sop = webhook_sop("review", SopExecutionMode::Auto, Some(spec));
+            sop.steps[0].decide = Some("Does this touch security?".into());
+            let mut compose = sop.steps[0].clone();
+            compose.number = 2;
+            compose.decide = None;
+            sop.steps.push(compose);
+            sop
+        }
+
+        fn active_run(engine: &Arc<Mutex<SopEngine>>) -> SopRun {
+            engine
+                .lock()
+                .unwrap()
+                .active_runs()
+                .values()
+                .next()
+                .cloned()
+                .expect("a run started")
+        }
+
+        #[tokio::test]
+        async fn one_model_call_decides_which_steps_run() {
+            let model = Arc::new(Scripted {
+                answers: Some(Answers {
+                    model: None,
+                    answers: BTreeMap::from([("part_1".to_string(), Answer::Noul { noul: 0.1 })]),
+                    usage: None,
+                }),
+                calls: AtomicUsize::new(0),
+            });
+            let engine = engine_with(vec![part_sop()], Some(model.clone()));
+            dispatch_sop_event(&engine, &test_audit(), ticket("typo fix")).await;
+            let run = active_run(&engine);
+            assert_eq!(run.decisions, BTreeMap::from([(1, 0.1)]));
+            assert_eq!(run.current_step, 2, "step 1 was answered no and skipped");
+            assert_eq!(run.step_results[0].status, SopStepStatus::Skipped);
+            assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn model_outage_runs_every_step() {
+            let engine = engine_with(vec![part_sop()], Some(Scripted::down()));
+            dispatch_sop_event(&engine, &test_audit(), ticket("typo fix")).await;
+            let run = active_run(&engine);
+            assert!(run.decisions.is_empty());
+            assert_eq!(run.current_step, 1, "no answer: the conditional step runs");
+            assert!(run.step_results.is_empty());
         }
 
         #[tokio::test]

@@ -313,6 +313,7 @@ function StepEditor({
   onMove,
   agentAliases,
   parentAgent,
+  hasDecision,
 }: {
   step: SopStep;
   index: number;
@@ -323,6 +324,7 @@ function StepEditor({
   onMove: (dir: -1 | 1) => void;
   agentAliases: string[];
   parentAgent?: string | null;
+  hasDecision: boolean;
 }) {
   const rowRef = useRef<HTMLDivElement | null>(null);
   const routing = step.routing ?? {};
@@ -442,6 +444,33 @@ function StepEditor({
           </HelpTip>
         </label>
       </div>
+      {hasDecision || step.decide || step.unless_decided ? (
+        <div className="mb-2 grid grid-cols-3 gap-2 border-t border-pc-border pt-2 text-xs">
+          <div className="col-span-2">
+            <TextField
+              label={t('sops.step_decide')}
+              value={step.decide ?? ''}
+              placeholder={t('sops.step_decide_placeholder')}
+              help={sopFieldHelp('SopStep', 'decide')}
+              onChange={(v) => onChange({ decide: v.trim() === '' ? null : v })}
+            />
+          </div>
+          <Field label={t('sops.step_unless_decided')} help={sopFieldHelp('SopStep', 'unless_decided')}>
+            <input
+              type="number"
+              min={1}
+              value={step.unless_decided ?? ''}
+              onChange={(e) =>
+                onChange({
+                  unless_decided: e.target.value ? parseInt(e.target.value, 10) : null,
+                })
+              }
+              placeholder="—"
+              className={INPUT_CLS}
+            />
+          </Field>
+        </div>
+      ) : null}
       <div className="grid grid-cols-3 gap-2 border-t border-pc-border pt-2 text-xs">
         <TextField
           label={t('sops.routing_depends_on')}
@@ -1149,6 +1178,7 @@ function DecisionEditor({
       modes: [],
       mode_instructions: null,
       min_confidence: 0.7,
+      part_threshold: 0.5,
     });
   const set = (patch: Partial<SopDecisionSpec>) => {
     if (decision) onChange({ ...decision, ...patch });
@@ -1267,6 +1297,21 @@ function DecisionEditor({
               </Field>
             </>
           ) : null}
+          <Field
+            label={t('sops.decision_part_threshold')}
+            help={help('part_threshold')}
+            hint={t('sops.decision_parts_hint')}
+          >
+            <input
+              type="number"
+              min={0}
+              max={1}
+              step={0.05}
+              value={decision.part_threshold ?? 0.5}
+              onChange={(e) => set({ part_threshold: probability(e.target.value) })}
+              className={INPUT_CLS}
+            />
+          </Field>
         </>
       ) : null}
     </div>
@@ -1489,6 +1534,7 @@ function StepInspector({
       onMove={(dir) => onMoveStep(index, dir)}
       agentAliases={agentAliases}
       parentAgent={draft.agent}
+      hasDecision={draft.decision != null}
     />
   );
 }

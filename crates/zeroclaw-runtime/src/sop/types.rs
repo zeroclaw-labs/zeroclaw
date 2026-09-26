@@ -406,6 +406,18 @@ pub struct SopStep {
     /// resumes (the gate prompt gains an "Edit" choice). Absent = no editing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edit: Option<String>,
+    /// Conditional part (`- decide:` bullet): a yes/no question the SOP's
+    /// decision model answers about the triggering event when the run starts,
+    /// in the same call as the SOP's gate. The step runs only on "yes"
+    /// (p(yes) at or above `[decision] part_threshold`); on "no" it is recorded
+    /// as skipped and the run moves on. If the model cannot answer, it runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decide: Option<String>,
+    /// Skip this step when step N's `decide` question was answered "yes"
+    /// (`- unless_decided: N` bullet). Lets one decision select between
+    /// alternative sets of steps, e.g. a scope hold instead of a full review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unless_decided: Option<u32>,
 }
 
 impl Default for SopStep {
@@ -430,6 +442,8 @@ impl Default for SopStep {
             policy: None,
             gate_prompt: None,
             edit: None,
+            decide: None,
+            unless_decided: None,
         }
     }
 }
@@ -866,6 +880,12 @@ pub struct SopRun {
     /// step-level confirmations and checkpoints still apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decided_mode: Option<SopExecutionMode>,
+    /// p(yes) the decision model gave each conditional-part step (`decide`)
+    /// at dispatch, keyed by step number. A step whose answer is below the
+    /// SOP's `part_threshold` is skipped; a step missing here runs. Also
+    /// exposed to `when:` conditions as `$.decisions.<step>`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub decisions: std::collections::BTreeMap<u32, f64>,
 }
 
 impl ::zeroclaw_api::attribution::Attributable for SopRun {
@@ -1603,6 +1623,7 @@ path = "/sop/test"
             revision: 0,
             revision_base: 0,
             decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         };
         let json = serde_json::to_string(&run).unwrap();
         let parsed: SopRun = serde_json::from_str(&json).unwrap();
