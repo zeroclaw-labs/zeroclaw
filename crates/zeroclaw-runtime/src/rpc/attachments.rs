@@ -283,7 +283,6 @@ pub async fn process_file_entry(
     sessions: &SessionStore,
 ) -> Result<FileEntryResult, JsonRpcError> {
     use base64::{Engine, engine::general_purpose::STANDARD};
-    use sha2::{Digest, Sha256};
 
     // 1. Resolve bytes + filename + mime_type.
     let (bytes, filename) = if let Some(ref b64) = entry.data_b64 {
@@ -359,6 +358,24 @@ pub async fn process_file_entry(
         ));
     };
 
+    persist_upload_bytes(bytes, &filename, session_id, upload_root, sessions).await
+}
+
+/// Hash, deduplicate, persist, and index one uploaded payload for a session.
+///
+/// Shared by `file/attach` and `file/upload/commit`, so both paths name, store,
+/// and mark uploads identically: the on-disk name is the content hash, written
+/// through the hardened content-addressed writer, and a repeat of the same
+/// bytes in the same session returns the existing entry.
+pub async fn persist_upload_bytes(
+    bytes: Vec<u8>,
+    filename: &str,
+    session_id: &str,
+    upload_root: &str,
+    sessions: &SessionStore,
+) -> Result<FileEntryResult, JsonRpcError> {
+    use sha2::{Digest, Sha256};
+
     // 2. SHA-256 → ref_id.
     let hash = Sha256::digest(&bytes);
     let hex = format!("{hash:x}");
@@ -376,7 +393,7 @@ pub async fn process_file_entry(
     }
 
     // 4. Sanitize filename (display only; the on-disk name is the content hash).
-    let sanitized = sanitize_filename(&filename);
+    let sanitized = sanitize_filename(filename);
 
     // 5. Persist through the shared hardened content-addressed writer: full-digest
     // storage name and a directory-handle-bound, no-follow atomic write. This makes

@@ -1300,6 +1300,56 @@ rpc_type! {
     }
 }
 
+rpc_type! {
+    /// Parameters for `file/upload/begin`: announce one upload for a session.
+    pub struct FileUploadBeginParams {
+        pub session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub filename: Option<String>,
+        /// Exact decoded size of the whole payload.
+        pub size_bytes: u64,
+        /// Optional hex SHA-256 of the whole payload, verified at commit.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub sha256: Option<String>,
+    }
+}
+
+rpc_type! {
+    pub struct FileUploadBeginResult {
+        /// Identifies the upload on this connection only.
+        pub upload_id: String,
+        /// Largest decoded chunk `file/upload/chunk` accepts.
+        pub chunk_bytes: u64,
+        /// Largest payload an upload may declare.
+        pub max_bytes: u64,
+    }
+}
+
+rpc_type! {
+    /// Parameters for `file/upload/chunk`. Chunks arrive in order: `offset`
+    /// must equal the bytes received so far. Resending an already-accepted
+    /// chunk with identical bytes is acknowledged without change.
+    pub struct FileUploadChunkParams {
+        pub upload_id: String,
+        pub offset: u64,
+        pub data_b64: String,
+    }
+}
+
+rpc_type! {
+    pub struct FileUploadChunkResult {
+        pub received_bytes: u64,
+    }
+}
+
+rpc_type! {
+    /// Parameters for `file/upload/commit`. The result is the same
+    /// `FileEntryResult` that `file/attach` returns for one file.
+    pub struct FileUploadCommitParams {
+        pub upload_id: String,
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // ── Session approval ─────────────────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════

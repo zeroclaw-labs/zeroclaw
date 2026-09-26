@@ -48,6 +48,19 @@ named pipes carry the same byte stream as Unix sockets.
 {"jsonrpc":"2.0","result":{"protocolVersion":1,"serverVersion":"0.8.5"},"id":1}\n
 ```
 
+## Connection limits
+
+The local endpoint bounds what one client can hold:
+
+| Limit | Value | What the client sees |
+|---|---|---|
+| Frame size | 8 MiB per line | One `-32600` error with `id: null` and `data: {"reason": "frame_too_large", "limit_bytes": 8388608}`, then end of stream. The rest of the oversized line is never read, so the connection cannot continue. |
+| Write stall | 30 s per frame | A client that stops reading for 30 s while the daemon has output queued for it is disconnected. Other connections are unaffected. Disconnecting ends the turns that connection started, as any other disconnect does. That includes a suspended client: a zerocode stopped with Ctrl-Z, or frozen with Ctrl-S, while a turn streams has that turn cancelled after 30 s, where before it finished once the client resumed. |
+| Open connections | `rpc.max_local_connections`, default 512 | A connection past the ceiling receives one `-32004` error with `id: null` and `data: {"reason": "connection_limit", "limit": N}`, then end of stream. The daemon logs one warning when it starts refusing. The value is read when the listener starts. |
+
+Payloads larger than a frame travel as a chunked upload rather than in one
+line. See [Chunked uploads](#chunked-uploads).
+
 ## Handshake
 
 The first RPC call must be `initialize`. The daemon rejects all other methods
@@ -82,6 +95,7 @@ the operating system:
 | `session/cancel` | client -> daemon | Cancel an in-flight turn |
 | `session/state` | client -> daemon | Read live session lifecycle state, active turn identity, and the optional current plan; active or queued work is represented by `state: "running"` so recovery clients can confirm terminal status before releasing retained work |
 | `status` | client -> daemon | Server version, protocol version, active session list |
+| `file/upload/begin`, `file/upload/chunk`, `file/upload/commit` | client -> daemon | Upload one file in ordered chunks; see [Chunked uploads](#chunked-uploads) |
 | `session/update` | daemon -> client | Streaming notification during a turn (text chunks, tool calls, approvals) |
 | `elicitation/create` | daemon -> client | Request interactive input for ask-user and poll flows |
 
@@ -129,6 +143,39 @@ events:
 
 Event types: `agent_message_chunk`, `agent_thought_chunk`, `tool_call`,
 `tool_result`, `approval_request`.
+
+### Chunked uploads
+
+`file/attach` carries a whole file in one frame, which caps it well below the
+per-file limit once base64 is counted. `file/upload/begin`, `file/upload/chunk`,
+and `file/upload/commit` carry the same upload in pieces and land it exactly as
+`file/attach` does: in the session agent's workspace, under its content hash,
+deduplicated per session, with the same marker in the result.
+
+1. `file/upload/begin` with `session_id`, `size_bytes`, and optionally
+   `filename` and `sha256` (hex). The result gives an `upload_id`,
+   `chunk_bytes` (1 MiB), and `max_bytes` (the 10 MB per-file limit).
+2. `file/upload/chunk` with `upload_id`, `offset`, and `data_b64`, in order.
+   `offset` must equal the bytes received so far; the result reports
+   `received_bytes`. Resending an accepted chunk with the same bytes is
+   acknowledged unchanged, so a client can retry after a lost response.
+3. `file/upload/commit` with `upload_id` once every declared byte has arrived.
+   A declared `sha256` must match. The result is a `file/attach` file entry.
+
+An upload belongs to the connection that began it: no other connection can
+name it, and it is discarded when that connection closes. The limits:
+
+- A connection may stage four uploads at a time.
+- The daemon stages at most 256 MiB across all connections.
+- An upload idle for five minutes is discarded. When a new upload does not
+  fit in the budget, the daemon first reclaims every upload idle past that
+  deadline, even one whose connection is still open, so a silent client
+  cannot hold the budget.
+
+The three methods are served on local connections only; a WSS peer gets
+`-32012`. They need the `files:create` grant, and `begin` and `commit` each
+check that the principal may use the session's agent, so a grant withdrawn
+mid-upload stops the commit before anything is written.
 
 ## Ephemeral mode
 
@@ -197,6 +244,7 @@ The dispatch layer lives in `crates/zeroclaw-runtime/src/rpc/`:
 | `local.rs` | `LocalTransport` + listener (Unix socket / Windows named pipe) |
 | `wss.rs` | WSS (WebSocket Secure) transport + TLS acceptor |
 | `attachments.rs` | File upload processing, dedup, marker generation |
+| `upload.rs` | Chunked-upload staging: ordering, per-connection and process-wide bounds |
 
 The `RpcTransport` trait is designed so that additional transports (vsock,
 custom IPC) slot in without touching the dispatch or session logic. The

@@ -25,6 +25,87 @@ const MAX_FRAME_BYTES: u64 = 8 * 1024 * 1024;
 /// cancellation. Windows named-pipe shutdown can wait on a non-reading peer.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Deadline for writing one frame to a local peer. A peer that stops reading
+/// for this long is disconnected, the same bound the WSS plane applies with
+/// its `PEER_WRITE_TIMEOUT`, so one stalled client cannot park the producers
+/// that feed its queue indefinitely.
+const LOCAL_PEER_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the reader waits for a terminal error frame to reach the peer
+/// before it closes the connection anyway.
+const TERMINAL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Deadline for telling a refused client why it was refused.
+const REFUSAL_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Refusal notices in flight at once. Past this, further refused clients are
+/// closed without the notice, so a flood cannot grow unbounded work.
+const MAX_PENDING_REFUSALS: usize = 16;
+
+/// Limits the local listener applies to every connection it accepts.
+#[derive(Debug, Clone, Copy)]
+pub struct LocalListenerLimits {
+    /// Ceiling on concurrently open connections (`rpc.max_local_connections`).
+    pub max_connections: usize,
+    /// Deadline for writing one frame to a peer.
+    pub write_timeout: Duration,
+}
+
+impl LocalListenerLimits {
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            max_connections: config.rpc.max_local_connections.max(1),
+            write_timeout: LOCAL_PEER_WRITE_TIMEOUT,
+        }
+    }
+}
+
+/// A last frame for the peer, written ahead of the ordinary queue. The writer
+/// stops after it, so the peer reads the frame and then end of stream.
+struct TerminalFrame {
+    line: String,
+    written: tokio::sync::oneshot::Sender<()>,
+}
+
+/// Serialize a JSON-RPC error response with a null id, for failures that are
+/// not attributable to a request the peer sent.
+fn unattributed_error_line(code: i32, message: String, data: serde_json::Value) -> String {
+    let response = zeroclaw_api::jsonrpc::JsonRpcResponse {
+        jsonrpc: zeroclaw_api::jsonrpc::JSONRPC_VERSION,
+        result: None,
+        error: Some(zeroclaw_api::jsonrpc::JsonRpcError {
+            code,
+            message,
+            data: Some(data),
+        }),
+        id: serde_json::Value::Null,
+    };
+    // Serializing a response built from strings and JSON values cannot fail;
+    // an empty line would only mean the peer sees end of stream without it.
+    let mut line = serde_json::to_string(&response).unwrap_or_default();
+    line.push('\n');
+    line
+}
+
+fn frame_too_large_line() -> String {
+    unattributed_error_line(
+        zeroclaw_api::jsonrpc::error_codes::INVALID_REQUEST,
+        format!("Frame exceeds the {MAX_FRAME_BYTES}-byte local RPC frame limit"),
+        serde_json::json!({ "reason": "frame_too_large", "limit_bytes": MAX_FRAME_BYTES }),
+    )
+}
+
+fn connection_limit_line(limit: usize) -> String {
+    unattributed_error_line(
+        zeroclaw_api::jsonrpc::error_codes::CONNECTION_LIMIT_REACHED,
+        format!(
+            "The daemon already has {limit} local RPC connections open; close idle \
+             clients or raise rpc.max_local_connections"
+        ),
+        serde_json::json!({ "reason": "connection_limit", "limit": limit }),
+    )
+}
+
 /// Backoff after a transient `accept()` error so the serve loop does not
 /// hot-spin while the condition (e.g. fd exhaustion) clears.
 const ACCEPT_ERROR_BACKOFF_MS: u64 = 50;
@@ -65,6 +146,7 @@ type LocalReadHalf = tokio::io::ReadHalf<LocalStream>;
 pub struct LocalTransport {
     reader: BufReader<LocalReadHalf>,
     writer_tx: mpsc::Sender<String>,
+    terminal_tx: mpsc::Sender<TerminalFrame>,
     peer_label: String,
     /// Kernel-reported peer uid (Unix). `None` on Windows named pipes or
     /// when the kernel query fails — absence of a credential, never a
@@ -72,56 +154,162 @@ pub struct LocalTransport {
     peer_uid: Option<u32>,
 }
 
+/// Timing bounds for one connection's writer task.
+#[derive(Debug, Clone, Copy)]
+struct WriterTimeouts {
+    /// Deadline for one frame; past it the connection is cancelled.
+    write: Duration,
+    /// Deadline for the final half-close.
+    shutdown: Duration,
+}
+
+enum WriteOutcome {
+    Written,
+    Stopped,
+}
+
+/// Write one frame under the per-frame deadline. A peer that does not drain
+/// the frame in time is disconnected by cancelling the connection token, which
+/// also ends the dispatcher reading from it.
+async fn write_frame<W>(
+    writer: &mut W,
+    line: &str,
+    cancel: &CancellationToken,
+    write_timeout: Duration,
+    peer_label: &str,
+) -> WriteOutcome
+where
+    W: AsyncWrite + Unpin,
+{
+    let result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return WriteOutcome::Stopped,
+        result = tokio::time::timeout(write_timeout, writer.write_all(line.as_bytes())) => result,
+    };
+    match result {
+        Ok(Ok(())) => WriteOutcome::Written,
+        Ok(Err(_)) => WriteOutcome::Stopped,
+        Err(_) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "peer": peer_label,
+                        "write_timeout_secs": write_timeout.as_secs(),
+                    })),
+                "local RPC peer stopped reading; closing its connection"
+            );
+            cancel.cancel();
+            WriteOutcome::Stopped
+        }
+    }
+}
+
 async fn run_writer<W>(
     mut writer: W,
     mut writer_rx: mpsc::Receiver<String>,
+    mut terminal_rx: mpsc::Receiver<TerminalFrame>,
     cancel: CancellationToken,
-    shutdown_timeout: Duration,
+    timeouts: WriterTimeouts,
+    peer_label: String,
 ) where
     W: AsyncWrite + Unpin,
 {
     loop {
-        let mut line = tokio::select! {
+        tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
-            line = writer_rx.recv() => match line {
-                Some(line) => line,
-                None => break,
-            },
-        };
-        if !line.ends_with('\n') {
-            line.push('\n');
-        }
-        let written = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => false,
-            result = writer.write_all(line.as_bytes()) => result.is_ok(),
-        };
-        if !written {
-            break;
+            Some(terminal) = terminal_rx.recv() => {
+                let outcome =
+                    write_frame(&mut writer, &terminal.line, &cancel, timeouts.write, &peer_label)
+                        .await;
+                if matches!(outcome, WriteOutcome::Written) {
+                    let _ = terminal.written.send(());
+                }
+                break;
+            }
+            line = writer_rx.recv() => {
+                let Some(mut line) = line else { break };
+                if !line.ends_with('\n') {
+                    line.push('\n');
+                }
+                let outcome =
+                    write_frame(&mut writer, &line, &cancel, timeouts.write, &peer_label).await;
+                if matches!(outcome, WriteOutcome::Stopped) {
+                    break;
+                }
+            }
         }
     }
-    let _ = tokio::time::timeout(shutdown_timeout, writer.shutdown()).await;
+    // Release any producer parked on a full queue before the bounded
+    // half-close, as the WSS writer does.
+    drop(writer_rx);
+    drop(terminal_rx);
+    let _ = tokio::time::timeout(timeouts.shutdown, writer.shutdown()).await;
 }
 
 impl LocalTransport {
-    pub fn new(stream: LocalStream, cancel: CancellationToken) -> Self {
+    pub fn new(stream: LocalStream, cancel: CancellationToken, write_timeout: Duration) -> Self {
         let peer_label = platform::peer_label_from(&stream);
         let peer_uid = platform::peer_uid_from(&stream);
         let (read_half, write_half) = tokio::io::split(stream);
 
         let (writer_tx, writer_rx) = mpsc::channel::<String>(64);
+        let (terminal_tx, terminal_rx) = mpsc::channel::<TerminalFrame>(1);
         // Session approval channels and log forwarders retain writer senders
         // past disconnect, so channel closure alone cannot end this task.
         // Cancellation interrupts both queue waits and an in-flight write;
-        // shutdown is bounded for suspended local peers.
-        zeroclaw_spawn::spawn!(run_writer(write_half, writer_rx, cancel, SHUTDOWN_TIMEOUT));
+        // each write and the final shutdown are bounded for suspended peers.
+        let writer_peer_label = peer_label.clone();
+        zeroclaw_spawn::spawn!(run_writer(
+            write_half,
+            writer_rx,
+            terminal_rx,
+            cancel,
+            WriterTimeouts {
+                write: write_timeout,
+                shutdown: SHUTDOWN_TIMEOUT,
+            },
+            writer_peer_label,
+        ));
 
         Self {
             reader: BufReader::new(read_half),
             writer_tx,
+            terminal_tx,
             peer_label,
             peer_uid,
+        }
+    }
+
+    /// Tell the peer why its connection is closing, then let the caller end
+    /// it. The frame bypasses the ordinary queue, which may be full, and the
+    /// writer stops once it is written, so the peer sees the error followed
+    /// by end of stream. Bounded: a peer that will not read it is closed
+    /// anyway once [`TERMINAL_FRAME_TIMEOUT`] passes.
+    async fn send_terminal(&self, line: String) {
+        let (written, written_rx) = tokio::sync::oneshot::channel();
+        let delivered = tokio::time::timeout(TERMINAL_FRAME_TIMEOUT, async {
+            if self
+                .terminal_tx
+                .send(TerminalFrame { line, written })
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let _ = written_rx.await;
+        })
+        .await;
+        if delivered.is_err() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"peer": self.peer_label})),
+                "local RPC peer did not accept the closing error frame in time"
+            );
         }
     }
 }
@@ -139,6 +327,20 @@ impl RpcTransport for LocalTransport {
             Ok(0) => None,
             Ok(_) => {
                 if buf.len() as u64 > MAX_FRAME_BYTES {
+                    // The rest of the oversized frame is still unread, so
+                    // there is no next frame boundary to resynchronize on:
+                    // report the limit and close.
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "peer": self.peer_label,
+                                "limit_bytes": MAX_FRAME_BYTES,
+                            })),
+                        "local RPC frame exceeded the size limit; closing the connection"
+                    );
+                    self.send_terminal(frame_too_large_line()).await;
                     return None;
                 }
                 Some(String::from_utf8_lossy(&buf).into_owned())
@@ -166,16 +368,35 @@ impl RpcTransport for LocalTransport {
 /// Run the local IPC RPC listener as a daemon subsystem.
 /// `client_count` is incremented on connect, decremented on disconnect.
 /// The daemon uses it for `--ephemeral` shutdown logic.
+///
+/// Limits come from `[rpc]` in the configuration current at listener start.
 pub async fn run_local_listener(
     ctx: Arc<RpcContext>,
     cancel: CancellationToken,
     client_count: Arc<AtomicUsize>,
     readiness: Option<crate::daemon::SocketReadinessReporter>,
 ) -> Result<()> {
+    let limits = LocalListenerLimits::from_config(&ctx.config.read());
+    run_local_listener_with_limits(ctx, cancel, client_count, readiness, limits).await
+}
+
+/// [`run_local_listener`] with explicit limits.
+pub async fn run_local_listener_with_limits(
+    ctx: Arc<RpcContext>,
+    cancel: CancellationToken,
+    client_count: Arc<AtomicUsize>,
+    readiness: Option<crate::daemon::SocketReadinessReporter>,
+    limits: LocalListenerLimits,
+) -> Result<()> {
     let path = {
         let config = ctx.config.read();
         socket_path(&config)
     };
+    let connection_permits = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
+    let refusal_permits = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_REFUSALS));
+    // Set while connections are being refused, so a flood logs once when the
+    // ceiling is reached rather than once per refused connection.
+    let mut refusing = false;
 
     platform::prepare_parent(&path).await?;
     let (mut listener, _endpoint_guard) = platform::bind(&path)
@@ -230,16 +451,57 @@ pub async fn run_local_listener(
                     }
                 };
 
+                let Ok(permit) = connection_permits.clone().try_acquire_owned() else {
+                    // Over the ceiling: tell the client why and close. The
+                    // notice is written off the accept loop under a short
+                    // deadline and a cap on concurrent notices, so a flood
+                    // cannot stall accepting; a client that is refused is not
+                    // counted as connected for `--ephemeral` shutdown.
+                    if let Ok(notice_permit) = refusal_permits.clone().try_acquire_owned() {
+                        let notice = connection_limit_line(limits.max_connections);
+                        zeroclaw_spawn::spawn!(async move {
+                            let _notice_permit = notice_permit;
+                            let mut stream = stream;
+                            let _ = tokio::time::timeout(
+                                REFUSAL_WRITE_TIMEOUT,
+                                stream.write_all(notice.as_bytes()),
+                            )
+                            .await;
+                            let _ =
+                                tokio::time::timeout(REFUSAL_WRITE_TIMEOUT, stream.shutdown()).await;
+                        });
+                    }
+                    if !refusing {
+                        refusing = true;
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "limit": limits.max_connections,
+                                    "setting": "rpc.max_local_connections",
+                                })),
+                            "local RPC connection ceiling reached; refusing new connections \
+                             until one closes"
+                        );
+                    }
+                    continue;
+                };
+                refusing = false;
+
                 let ctx = ctx.clone();
                 let conn_cancel = cancel.child_token();
 
                 // Counted here rather than inside the task so an accepted
                 // connection is visible to the daemon immediately.
                 let activity = crate::rpc::ConnectionActivity::new(client_count.clone());
+                let write_timeout = limits.write_timeout;
 
                 connection_tasks.spawn(async move {
+                    let _permit = permit;
                     let _count_guard = activity.clone();
-                    let mut transport = LocalTransport::new(stream, conn_cancel.clone());
+                    let mut transport =
+                        LocalTransport::new(stream, conn_cancel.clone(), write_timeout);
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
                     let mut dispatcher = RpcDispatcher::new_with_connection_cancel(
@@ -860,6 +1122,22 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         panic!("socket never appeared at {}", path.display());
+    }
+
+    /// Whether a read result means the daemon closed the connection. Linux
+    /// resets a Unix socket that closes with unread data in its receive
+    /// buffer, so the peer sees `ConnectionReset` where macOS reports end of
+    /// stream, and a Windows named pipe reports `BrokenPipe` once the server
+    /// closes its end. All of them mean the same thing here.
+    fn is_closed_by_peer(read: &std::io::Result<usize>) -> bool {
+        match read {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(error) => matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+            ),
+        }
     }
 
     /// Wait for the server-side client count to reach `expected`, or fail with
@@ -2211,13 +2489,21 @@ mod tests {
     async fn cancellation_interrupts_non_reading_peer_write_and_bounds_shutdown() {
         let (server, mut non_reading_peer) = tokio::io::duplex(1);
         let (writer_tx, writer_rx) = mpsc::channel::<String>(1);
+        let (_terminal_tx, terminal_rx) = mpsc::channel::<TerminalFrame>(1);
         let cancel = CancellationToken::new();
         let writer_cancel = cancel.clone();
+        // The write deadline is far longer than the test, so cancellation,
+        // not the timeout, is what releases the writer here.
         let writer_task = zeroclaw_spawn::spawn!(run_writer(
             server,
             writer_rx,
+            terminal_rx,
             writer_cancel,
-            Duration::from_millis(50),
+            WriterTimeouts {
+                write: Duration::from_secs(600),
+                shutdown: Duration::from_millis(50),
+            },
+            "test".to_string(),
         ));
 
         // Preload a frame larger than the duplex capacity. With the peer
@@ -2255,6 +2541,457 @@ mod tests {
         .expect("released local stream must reach EOF")
         .expect("read buffered prefix");
         drop(writer_tx);
+    }
+
+    #[tokio::test]
+    async fn write_timeout_cancels_the_connection_of_a_peer_that_stops_reading() {
+        let (server, mut non_reading_peer) = tokio::io::duplex(1);
+        let (writer_tx, writer_rx) = mpsc::channel::<String>(4);
+        let (_terminal_tx, terminal_rx) = mpsc::channel::<TerminalFrame>(1);
+        let cancel = CancellationToken::new();
+        let writer_cancel = cancel.clone();
+        let writer_task = zeroclaw_spawn::spawn!(run_writer(
+            server,
+            writer_rx,
+            terminal_rx,
+            writer_cancel,
+            WriterTimeouts {
+                write: Duration::from_millis(100),
+                shutdown: Duration::from_millis(50),
+            },
+            "test".to_string(),
+        ));
+
+        writer_tx.send("x".repeat(64 * 1024)).await.unwrap();
+        let mut first_byte = [0_u8; 1];
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            non_reading_peer.read_exact(&mut first_byte),
+        )
+        .await
+        .expect("writer must start the queued frame")
+        .expect("read first queued byte");
+
+        // Nothing else is read, so the write stalls and its deadline must
+        // tear the connection down rather than park the writer forever.
+        tokio::time::timeout(Duration::from_secs(2), cancel.cancelled())
+            .await
+            .expect("a stalled write cancels the connection");
+        tokio::time::timeout(Duration::from_secs(1), writer_task)
+            .await
+            .expect("the writer ends after a stalled write")
+            .expect("writer task must not panic");
+        drop(writer_tx);
+    }
+
+    #[tokio::test]
+    async fn terminal_frame_is_written_ahead_of_queued_frames_then_the_stream_ends() {
+        let (server, mut peer) = tokio::io::duplex(64 * 1024);
+        let (writer_tx, writer_rx) = mpsc::channel::<String>(4);
+        let (terminal_tx, terminal_rx) = mpsc::channel::<TerminalFrame>(1);
+        let (written, written_rx) = tokio::sync::oneshot::channel();
+
+        // Both are ready before the writer starts, so the terminal lane's
+        // priority, not arrival order, decides what the peer sees.
+        writer_tx
+            .send(r#"{"jsonrpc":"2.0","result":{},"id":1}"#.to_string())
+            .await
+            .unwrap();
+        terminal_tx
+            .send(TerminalFrame {
+                line: frame_too_large_line(),
+                written,
+            })
+            .await
+            .unwrap();
+        let writer_task = zeroclaw_spawn::spawn!(run_writer(
+            server,
+            writer_rx,
+            terminal_rx,
+            CancellationToken::new(),
+            WriterTimeouts {
+                write: Duration::from_secs(5),
+                shutdown: Duration::from_secs(1),
+            },
+            "test".to_string(),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), written_rx)
+            .await
+            .expect("the terminal frame is acknowledged")
+            .expect("the writer reports the terminal frame written");
+        let mut received = String::new();
+        tokio::time::timeout(Duration::from_secs(1), peer.read_to_string(&mut received))
+            .await
+            .expect("the stream ends after the terminal frame")
+            .expect("read the terminal frame");
+        assert_eq!(
+            received.lines().count(),
+            1,
+            "only the terminal frame: {received}"
+        );
+        let frame: serde_json::Value = serde_json::from_str(received.trim()).unwrap();
+        assert_eq!(
+            frame["error"]["code"],
+            zeroclaw_api::jsonrpc::error_codes::INVALID_REQUEST
+        );
+        assert_eq!(frame["error"]["data"]["reason"], "frame_too_large");
+        assert!(frame["id"].is_null());
+        tokio::time::timeout(Duration::from_secs(1), writer_task)
+            .await
+            .expect("the writer stops after its terminal frame")
+            .expect("writer task must not panic");
+        drop(writer_tx);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oversized_frame_gets_frame_too_large_then_eof() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let sock_path = ctx.config.read().data_dir.join("daemon.sock");
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let server_ctx = ctx.clone();
+        zeroclaw_spawn::spawn!(async move {
+            let _ = run_local_listener(server_ctx, server_cancel, test_client_count(), None).await;
+        });
+        wait_for_socket(&sock_path).await;
+
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = tokio::io::BufReader::new(reader);
+        // 9 MiB in one line. The daemon stops reading at the limit, so the
+        // rest of the write may never complete; it runs on its own task.
+        let oversized_frame = zeroclaw_spawn::spawn!(async move {
+            let mut frame = vec![b'a'; 9 * 1024 * 1024];
+            frame.push(b'\n');
+            let _ = writer.write_all(&frame).await;
+            writer
+        });
+
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
+            .await
+            .expect("the daemon answers an oversized frame")
+            .expect("read the error frame");
+        let frame: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(
+            frame["error"]["code"],
+            zeroclaw_api::jsonrpc::error_codes::INVALID_REQUEST,
+            "{frame}"
+        );
+        assert_eq!(frame["error"]["data"]["reason"], "frame_too_large");
+        assert_eq!(frame["error"]["data"]["limit_bytes"], MAX_FRAME_BYTES);
+        assert!(frame["id"].is_null(), "{frame}");
+
+        let mut rest = String::new();
+        let read = tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut rest))
+            .await
+            .expect("the connection closes after the error");
+        assert!(
+            is_closed_by_peer(&read),
+            "the connection closes after the error: {read:?} {rest}"
+        );
+
+        oversized_frame.abort();
+        cancel.cancel();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stalled_reader_is_dropped_while_other_connections_proceed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let sock_path = ctx.config.read().data_dir.join("daemon.sock");
+        let cancel = CancellationToken::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let server_cancel = cancel.clone();
+        let server_ctx = ctx.clone();
+        let server_count = count.clone();
+        zeroclaw_spawn::spawn!(async move {
+            let _ = run_local_listener_with_limits(
+                server_ctx,
+                server_cancel,
+                server_count,
+                None,
+                LocalListenerLimits {
+                    max_connections: 8,
+                    write_timeout: Duration::from_secs(2),
+                },
+            )
+            .await;
+        });
+        wait_for_socket(&sock_path).await;
+
+        // The stalled client floods requests and never reads a response, so
+        // the daemon's writes to it back up and hit the deadline.
+        let (mut stalled_reader, mut stalled_writer) = do_initialize(&sock_path).await;
+        let flood = zeroclaw_spawn::spawn!(async move {
+            let request = rpc_request(Method::Status, &serde_json::json!({}), 2);
+            for _ in 0..50_000 {
+                if stalled_writer.write_all(request.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        wait_for_client_count(&count, 1).await;
+
+        // Another client is served normally while the first is stalled.
+        let (mut reader, mut writer) = do_initialize(&sock_path).await;
+        writer
+            .write_all(rpc_request(Method::Status, &serde_json::json!({}), 2).as_bytes())
+            .await
+            .unwrap();
+        let (_frame, _status): (_, StatusResult) =
+            tokio::time::timeout(Duration::from_secs(1), read_result(&mut reader))
+                .await
+                .expect("a healthy client is answered while another is stalled");
+        assert_eq!(count.load(Ordering::Relaxed), 2);
+
+        // The stalled connection is closed at its write deadline; the healthy
+        // one stays open.
+        wait_for_client_count(&count, 1).await;
+        let mut drained = Vec::new();
+        let read = tokio::time::timeout(
+            Duration::from_secs(10),
+            stalled_reader.read_to_end(&mut drained),
+        )
+        .await
+        .expect("the stalled client reaches end of stream");
+        // `read_to_end` reports the byte count it drained, so only an error
+        // other than a reset means the connection was not closed.
+        assert!(
+            read.is_ok() || is_closed_by_peer(&read),
+            "the stalled client's connection is closed: {read:?}"
+        );
+        writer
+            .write_all(rpc_request(Method::Status, &serde_json::json!({}), 3).as_bytes())
+            .await
+            .unwrap();
+        let (_frame, _status): (_, StatusResult) =
+            tokio::time::timeout(Duration::from_secs(1), read_result(&mut reader))
+                .await
+                .expect("the healthy client is still served");
+
+        flood.abort();
+        cancel.cancel();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connections_past_the_ceiling_get_a_diagnostic_and_are_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let sock_path = ctx.config.read().data_dir.join("daemon.sock");
+        let cancel = CancellationToken::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let server_cancel = cancel.clone();
+        let server_ctx = ctx.clone();
+        let server_count = count.clone();
+        zeroclaw_spawn::spawn!(async move {
+            let _ = run_local_listener_with_limits(
+                server_ctx,
+                server_cancel,
+                server_count,
+                None,
+                LocalListenerLimits {
+                    max_connections: 1,
+                    write_timeout: LOCAL_PEER_WRITE_TIMEOUT,
+                },
+            )
+            .await;
+        });
+        wait_for_socket(&sock_path).await;
+
+        let first = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        wait_for_client_count(&count, 1).await;
+
+        let refused = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let mut refused = tokio::io::BufReader::new(refused);
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), refused.read_line(&mut line))
+            .await
+            .expect("a refused client is told why")
+            .expect("read the refusal");
+        let frame: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(
+            frame["error"]["code"],
+            zeroclaw_api::jsonrpc::error_codes::CONNECTION_LIMIT_REACHED,
+            "{frame}"
+        );
+        assert_eq!(frame["error"]["data"]["limit"], 1);
+        assert!(
+            frame["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("rpc.max_local_connections")),
+            "the diagnostic names the setting: {frame}"
+        );
+        let mut rest = String::new();
+        let read = tokio::time::timeout(Duration::from_secs(5), refused.read_line(&mut rest))
+            .await
+            .expect("the refused connection closes")
+            .expect("read end of stream");
+        assert_eq!(read, 0);
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "a refused client is never counted as connected"
+        );
+
+        // Closing the first connection frees its slot.
+        drop(first);
+        wait_for_client_count(&count, 0).await;
+        let (_reader, _writer) = do_initialize(&sock_path).await;
+        wait_for_client_count(&count, 1).await;
+
+        cancel.cancel();
+    }
+
+    #[test]
+    fn listener_limits_come_from_the_rpc_section() {
+        let mut config = Config::default();
+        assert_eq!(
+            LocalListenerLimits::from_config(&config).max_connections,
+            512
+        );
+        config.rpc.max_local_connections = 0;
+        assert_eq!(
+            LocalListenerLimits::from_config(&config).max_connections,
+            1,
+            "a zero ceiling still admits one connection"
+        );
+        assert_eq!(
+            LocalListenerLimits::from_config(&config).write_timeout,
+            LOCAL_PEER_WRITE_TIMEOUT
+        );
+    }
+
+    /// Connect to the listener's named pipe, retrying until the server has a
+    /// pending instance ready.
+    #[cfg(windows)]
+    async fn open_pipe_client(pipe_name: &str) -> tokio::net::windows::named_pipe::NamedPipeClient {
+        use tokio::net::windows::named_pipe::ClientOptions;
+
+        for _ in 0..250 {
+            match ClientOptions::new().open(pipe_name) {
+                Ok(client) => return client,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        panic!("named pipe {pipe_name} never accepted a client");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn pipe_oversized_frame_gets_frame_too_large_then_close() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let pipe_name = socket_path(&ctx.config.read())
+            .to_string_lossy()
+            .into_owned();
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let server_ctx = ctx.clone();
+        let server = zeroclaw_spawn::spawn!(async move {
+            run_local_listener(server_ctx, server_cancel, test_client_count(), None).await
+        });
+
+        let client = open_pipe_client(&pipe_name).await;
+        let (read_half, mut write_half) = tokio::io::split(client);
+        let mut reader = tokio::io::BufReader::new(read_half);
+        let oversized_frame = zeroclaw_spawn::spawn!(async move {
+            let mut frame = vec![b'a'; 9 * 1024 * 1024];
+            frame.push(b'\n');
+            let _ = write_half.write_all(&frame).await;
+            write_half
+        });
+
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
+            .await
+            .expect("the daemon answers an oversized frame")
+            .expect("read the error frame");
+        let frame: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(
+            frame["error"]["code"],
+            zeroclaw_api::jsonrpc::error_codes::INVALID_REQUEST,
+            "{frame}"
+        );
+        assert_eq!(frame["error"]["data"]["reason"], "frame_too_large");
+        assert!(frame["id"].is_null(), "{frame}");
+
+        let mut rest = String::new();
+        let read = tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut rest))
+            .await
+            .expect("the pipe closes after the error");
+        assert!(
+            is_closed_by_peer(&read),
+            "the pipe closes after the error: {read:?} {rest}"
+        );
+
+        oversized_frame.abort();
+        cancel.cancel();
+        let _ = server.await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn pipe_connections_past_the_ceiling_get_a_diagnostic_and_are_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let pipe_name = socket_path(&ctx.config.read())
+            .to_string_lossy()
+            .into_owned();
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let server_ctx = ctx.clone();
+        let server = zeroclaw_spawn::spawn!(async move {
+            run_local_listener_with_limits(
+                server_ctx,
+                server_cancel,
+                test_client_count(),
+                None,
+                LocalListenerLimits {
+                    max_connections: 1,
+                    write_timeout: LOCAL_PEER_WRITE_TIMEOUT,
+                },
+            )
+            .await
+        });
+
+        // The accept loop takes the first client's slot before it creates the
+        // pipe instance the second client can open, so the second is past
+        // the ceiling by the time it is accepted.
+        let first = open_pipe_client(&pipe_name).await;
+        let refused = open_pipe_client(&pipe_name).await;
+        let mut refused = tokio::io::BufReader::new(refused);
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), refused.read_line(&mut line))
+            .await
+            .expect("a refused client is told why")
+            .expect("read the refusal");
+        let frame: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(
+            frame["error"]["code"],
+            zeroclaw_api::jsonrpc::error_codes::CONNECTION_LIMIT_REACHED,
+            "{frame}"
+        );
+        assert_eq!(frame["error"]["data"]["limit"], 1);
+
+        let mut rest = String::new();
+        let read = tokio::time::timeout(Duration::from_secs(5), refused.read_line(&mut rest))
+            .await
+            .expect("the refused pipe closes");
+        assert!(
+            is_closed_by_peer(&read),
+            "the refused pipe closes: {read:?} {rest}"
+        );
+
+        drop(first);
+        cancel.cancel();
+        let _ = server.await;
     }
 
     #[cfg(windows)]
