@@ -6185,6 +6185,10 @@ impl RpcDispatcher {
             expr: req.schedule,
             tz: req.tz,
         };
+        // An RPC request is not an approval. The command goes through the same
+        // supervised-autonomy gate as the CLI and the gateway, so a medium- or
+        // high-risk command is refused here instead of being stored as though
+        // an operator had approved it.
         let job = crate::cron::add_shell_job_with_approval(
             &config,
             &req.agent,
@@ -6192,7 +6196,7 @@ impl RpcDispatcher {
             schedule,
             req.command.as_deref().unwrap_or(""),
             req.delivery,
-            true, // RPC calls are pre-approved
+            false,
         )
         .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron add failed: {e}")))?;
         to_result(job)
@@ -6228,7 +6232,7 @@ impl RpcDispatcher {
         if let Some(command) = patch.command.as_deref()
             && !command.trim().is_empty()
         {
-            crate::cron::validate_shell_command(&config, &owner.agent_alias, command, true)
+            crate::cron::validate_shell_command(&config, &owner.agent_alias, command, false)
                 .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron patch rejected: {e}")))?;
         }
         let job = if self.has_admin_grants() {
@@ -11090,6 +11094,112 @@ mod tests {
             "a rejected patch must leave the stored command unchanged"
         );
         assert_eq!(reread.name.as_deref(), job.name.as_deref());
+    }
+
+    /// The fixture's agents run supervised with medium-risk approval required,
+    /// and `touch` is allowlisted but medium-risk, so only the approval gate
+    /// stands between it and the store.
+    fn cron_supervised_touch_config_in(
+        tmp: &tempfile::TempDir,
+        uid: u32,
+    ) -> zeroclaw_config::schema::Config {
+        let mut config = cron_roster_config_in(tmp, uid);
+        let profile = config
+            .risk_profiles
+            .get_mut("cron-profile")
+            .expect("the cron fixture defines its risk profile");
+        profile.allowed_commands = vec!["echo".into(), "touch".into()];
+        assert_eq!(
+            profile.level,
+            zeroclaw_config::autonomy::AutonomyLevel::Supervised
+        );
+        assert!(profile.require_approval_for_medium_risk);
+        config
+    }
+
+    /// An RPC request is not an operator approval: a medium-risk shell job
+    /// added over RPC must meet the same supervised gate as the CLI and the
+    /// gateway, and must not be stored as pre-approved.
+    #[tokio::test]
+    async fn cron_add_does_not_pre_approve_a_medium_risk_shell_job() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_supervised_touch_config_in(&tmp, 4242);
+        let ctx = enforcement_ctx(config.clone());
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let response = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "cron/add",
+            json!({"agent": "alpha", "schedule": "*/5 * * * *", "command": "touch marker"}),
+        )
+        .await;
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("requires explicit approval")),
+            "a medium-risk command must hit the approval gate: {response}"
+        );
+        assert!(
+            crate::cron::list_jobs(&config)
+                .expect("the store is readable")
+                .is_empty(),
+            "an unapproved medium-risk command must not be stored"
+        );
+
+        // A low-risk command on the same agent is still accepted.
+        let response = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "cron/add",
+            json!({"agent": "alpha", "schedule": "*/5 * * * *", "command": "echo hi"}),
+        )
+        .await;
+        assert_eq!(
+            response["result"]["agent_alias"],
+            json!("alpha"),
+            "{response}"
+        );
+    }
+
+    /// The patch path must not pre-approve a replacement command either.
+    #[tokio::test]
+    async fn cron_patch_does_not_pre_approve_a_medium_risk_command() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = cron_supervised_touch_config_in(&tmp, 4242);
+        let ctx = enforcement_ctx(config.clone());
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let response = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "cron/add",
+            json!({"agent": "alpha", "schedule": "*/5 * * * *", "command": "echo hi"}),
+        )
+        .await;
+        let id = response["result"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a low-risk job is added: {response}"))
+            .to_string();
+
+        let response = rpc(
+            &mut alice,
+            &mut rx,
+            2,
+            "cron/patch",
+            json!({"id": id, "agent": "alpha", "command": "touch marker"}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(INVALID_PARAMS),
+            "an unapproved medium-risk command must not patch the job: {response}"
+        );
+        let reread = crate::cron::get_job(&config, &id).expect("the job still exists");
+        assert_eq!(reread.command, "echo hi");
     }
 
     #[tokio::test]
