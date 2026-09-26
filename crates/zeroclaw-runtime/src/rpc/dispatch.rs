@@ -11247,7 +11247,7 @@ mod tests {
                 "{sid}: {response}"
             );
             let message = response["error"]["message"].as_str().unwrap().to_string();
-            messages.push(message.replace(&*cwd.to_string_lossy(), "<cwd>"));
+            messages.push(message.replace(&format!("{:?}", cwd.to_string_lossy()), "<cwd>"));
         }
         assert!(
             messages.windows(2).all(|pair| pair[0] == pair[1]),
@@ -12623,6 +12623,7 @@ mod tests {
     /// authorization and read consume the SAME resolution and there is no
     /// second, raw-path resolution the swap could exploit. The upload is named
     /// from the resolved target, not the alias spelling.
+    #[cfg(unix)]
     #[tokio::test]
     async fn file_attach_by_path_binds_the_read_to_the_authorized_resolved_target() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -12633,7 +12634,6 @@ mod tests {
 
         // A symlink INSIDE the workspace pointing at the allowed in-root file.
         let alias = agent_workspace.join("alias.link");
-        #[cfg(unix)]
         std::os::unix::fs::symlink(&inside, &alias).unwrap();
 
         let attached = rpc(
@@ -13174,31 +13174,30 @@ mod tests {
     #[tokio::test]
     async fn scoped_listing_refuses_parent_components_whether_or_not_the_path_exists() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let outside = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
         let config = fs_listing_config(&tmp, 4242, None);
-        let workspace = config
-            .agent_workspace_dir("test-agent")
-            .canonicalize()
-            .unwrap();
+        let workspace = config.agent_workspace_dir("test-agent");
         let ctx = enforcement_ctx(config);
         let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
 
-        // Climb from a probe back to the root and then down into the entitled
-        // workspace. Resolving this succeeds only if the probe exists.
-        let back_into_workspace = |probe: &std::path::Path| {
-            let depth = probe
-                .canonicalize()
-                .unwrap_or_else(|_| probe.to_path_buf())
-                .components()
-                .count();
-            let mut path = probe.to_path_buf();
-            for _ in 0..depth {
-                path.push("..");
-            }
-            path.join(workspace.strip_prefix("/").unwrap())
-        };
-        let existing = back_into_workspace(outside.path());
-        let absent = back_into_workspace(&outside.path().join("absent"));
+        // Keep the non-verbatim spelling: joining `..` to a canonicalized
+        // Windows path would remove the component before the RPC sees it.
+        let workspace_from_root = workspace.strip_prefix(root).unwrap();
+        let existing = outside.join("..").join(workspace_from_root);
+        let absent = outside
+            .join("absent")
+            .join("..")
+            .join("..")
+            .join(workspace_from_root);
+        for path in [&existing, &absent] {
+            assert!(
+                path.components()
+                    .any(|part| matches!(part, std::path::Component::ParentDir)),
+                "the probe must retain a parent component: {path:?}"
+            );
+        }
         let mut codes = Vec::new();
         for path in [
             existing.as_path(),
