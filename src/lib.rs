@@ -539,9 +539,13 @@ Examples:
         /// progress output (resolving, installed, audited) is unaffected.
         #[arg(long)]
         no_tier_banner: bool,
-        /// Install a single named skill from a git catalog repo (its `skills/<name>/` directory).
+        /// Install a single named skill from a git catalog repo (its `skills/<name>/` directory),
+        /// or from an HTTPS well-known index when used with --well-known.
         #[arg(long)]
         skill: Option<String>,
+        /// Discover and install one selected skill from an HTTPS well-known index.
+        #[arg(long)]
+        well_known: bool,
     },
     /// Remove an installed skill
     Remove {
