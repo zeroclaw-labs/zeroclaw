@@ -87,6 +87,9 @@ libc = "0.2"
 rand = "0.10"
 rcgen = "0.13"
 tempfile = "3.26"
+# Resolves the dashboard web manifest's relative URLs in tests the way a
+# browser does. Already in the graph through sibling crates.
+url = "2.5"
 # Enables the runtime's deterministic clock seam for production-shaped cache
 # fixtures; this feature is dev-only and is not part of the shipped gateway.
 zeroclaw-runtime = { workspace = true, features = ["test-util"] }
