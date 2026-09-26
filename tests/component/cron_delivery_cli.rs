@@ -279,8 +279,9 @@ fn cron_update_patches_delivery_without_dropping_unspecified_fields() {
 
 /// A config that declares a `[cron.<id>]` job and an agent that claims it, so
 /// the daemon materializes it with `source = "declarative"`. `agent_for_cron_job`
-/// resolves the owner from `[agents.<x>].cron_jobs`; without that membership the
-/// sync skips the entry as an orphan and nothing is materialized.
+/// resolves the owner as the single enabled agent whose `[agents.<x>].cron_jobs`
+/// lists it; without exactly one such claim the sync skips the entry and nothing
+/// is materialized.
 const DECLARATIVE_CONFIG_TOML: &str = r#"schema_version = 3
 locale = "en"
 

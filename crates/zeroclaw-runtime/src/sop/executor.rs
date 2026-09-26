@@ -911,6 +911,13 @@ async fn drive_headless_run(
                                 crate::agent::loop_::AgentRunOverrides {
                                     security: Some(Arc::new(policy)),
                                     sop_step_scope: Some(scope),
+                                    // Runtime-owned step identifier, matching
+                                    // the engine's nested-SOP turn-id shape.
+                                    internal_principal: Some(
+                                        zeroclaw_api::ingress::InternalPrincipal::Daemon {
+                                            task: format!("sop:{run_id}:step:{}", step.number),
+                                        },
+                                    ),
                                     ..Default::default()
                                 },
                             ));

@@ -372,8 +372,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         // Build the config so we can wire the imperative job's UUID
         // into test-agent's cron_jobs list before wrapping in Arc —
-        // otherwise execute_job_now's reverse-lookup can't find the
-        // owning agent.
+        // otherwise the single-enabled-claimant fallback that resolves an
+        // owner for a row without a usable stored alias finds nobody.
         let mut config = Config {
             data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),

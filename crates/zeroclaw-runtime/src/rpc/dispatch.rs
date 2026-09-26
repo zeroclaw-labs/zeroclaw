@@ -10921,8 +10921,28 @@ mod tests {
         let config = cron_roster_config_in(&tmp, 4242);
         let alpha = seed_cron_job(&config, "alpha", "alpha-job");
         let now = chrono::Utc::now();
-        crate::cron::record_run(&config, &alpha.id, now, now, "ok", Some("done"), 5)
-            .expect("the fixture run is recorded");
+        crate::cron::record_run(
+            &config,
+            &alpha.id,
+            now,
+            now,
+            "ok",
+            crate::cron::RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            // The fixture run belongs to the agent that owns the job, so the
+            // scoped read below has an owner to match on.
+            crate::cron::RunProvenance {
+                principal: None,
+                executing_agent: Some("alpha"),
+                job_source: Some("imperative"),
+            },
+            Some("done"),
+            5,
+        )
+        .expect("the fixture run is recorded");
         let ctx = enforcement_ctx(config);
         let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
 
