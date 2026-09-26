@@ -1440,6 +1440,13 @@ Examples:
         auth_command: AuthCommands,
     },
 
+    /// Enroll with an inbound OIDC identity provider to obtain an RPC auth token
+    #[cfg(feature = "agent-runtime")]
+    Oidc {
+        #[command(subcommand)]
+        oidc_command: OidcCommands,
+    },
+
     /// Discover and introspect USB hardware
     // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
@@ -5278,6 +5285,23 @@ enum AuthCommands {
     },
 }
 
+#[cfg(feature = "agent-runtime")]
+#[derive(Subcommand, Debug)]
+enum OidcCommands {
+    /// Sign in via the Device Authorization Grant (RFC 8628): shows a
+    /// verification code, waits for approval, prints the access token on stdout
+    Login {
+        /// Alias of the [oidc.<alias>] config entry to enroll against
+        alias: String,
+    },
+    /// Obtain a service token via the client_credentials grant (requires the
+    /// entry's client_secret); prints the access token on stdout
+    Token {
+        /// Alias of the [oidc.<alias>] config entry to enroll against
+        alias: String,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 enum ModelCommands {
     /// Refresh and cache model_provider models
@@ -6346,6 +6370,18 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
     // The daemon reload arm calls the same helper against its reloaded config.
     #[cfg(feature = "agent-runtime")]
     warn_verifiable_intent_withheld(&config);
+    // Enrollment's contract is that stdout carries exactly the token and
+    // nothing else, so the `oidc` commands are dispatched before any
+    // startup prelude that may print: the OTP prelude below discloses a
+    // freshly minted seed's enrollment URI on stdout, which must never be
+    // captured alongside an access token by a command substitution.
+    #[cfg(feature = "agent-runtime")]
+    if matches!(cli.command, Commands::Oidc { .. }) {
+        let Commands::Oidc { oidc_command } = cli.command else {
+            unreachable!("matched the Oidc variant above")
+        };
+        return handle_oidc_command(oidc_command, &config).await;
+    }
     #[cfg(feature = "agent-runtime")]
     if config.security.otp.enabled {
         let config_dir = config
@@ -8585,6 +8621,9 @@ Add pricing to the active provider profile or supply a catalog entry."
         }
 
         Commands::Auth { auth_command } => handle_auth_command(auth_command, &config).await,
+
+        #[cfg(feature = "agent-runtime")]
+        Commands::Oidc { oidc_command } => handle_oidc_command(oidc_command, &config).await,
 
         Commands::Hardware { hardware_command } => {
             hardware::handle_command(hardware_command.clone(), &config)
@@ -11075,6 +11114,116 @@ async fn run_anthropic_setup_token_inline(alias: &str, config: &mut Config) -> R
             "  Saved Claude setup token.",
         )
     );
+    Ok(())
+}
+
+#[cfg(feature = "agent-runtime")]
+async fn handle_oidc_command(oidc_command: OidcCommands, config: &Config) -> Result<()> {
+    use zeroclaw_runtime::security::auth_provider::{DevicePollOutcome, Enrollment};
+
+    let (alias, want_client_credentials) = match &oidc_command {
+        OidcCommands::Login { alias } => (alias.clone(), false),
+        OidcCommands::Token { alias } => (alias.clone(), true),
+    };
+    let Some(entry) = config.oidc.get(&alias) else {
+        let mut known: Vec<&str> = config.oidc.keys().map(String::as_str).collect();
+        known.sort_unstable();
+        let known = if known.is_empty() {
+            "(none)".to_string()
+        } else {
+            known.join(", ")
+        };
+        bail!(ta(
+            "cli-oidc-unknown-alias",
+            &[("alias", &alias), ("known", &known)],
+            format!("No [oidc.{alias}] entry in the config. Configured entries: {known}"),
+        ));
+    };
+    let enrollment = Enrollment::new(&alias, entry.clone())?;
+
+    let token = if want_client_credentials {
+        enrollment.client_credentials().await?
+    } else {
+        let start = enrollment.device_grant_start().await?;
+        let uri = start
+            .verification_uri_complete
+            .clone()
+            .unwrap_or_else(|| start.verification_uri.clone());
+        let expires = start.expires_in.to_string();
+        eprintln!(
+            "{}",
+            ta(
+                "cli-oidc-device-visit",
+                &[("uri", &uri), ("code", &start.user_code)],
+                format!("To sign in, visit {uri} and enter code {}", start.user_code),
+            )
+        );
+        eprintln!(
+            "{}",
+            ta(
+                "cli-oidc-device-waiting",
+                &[("seconds", &expires)],
+                format!(
+                    "Waiting for identity-provider approval (the code expires in {expires} seconds)..."
+                ),
+            )
+        );
+        // The device code's lifetime bounds everything below: sleeps are
+        // clipped to what remains, no poll is sent after expiry, and the
+        // arithmetic is checked so an absurd `expires_in` cannot wrap.
+        let lifetime = std::time::Duration::from_secs(start.expires_in.min(3600));
+        let deadline = std::time::Instant::now()
+            .checked_add(lifetime)
+            .context("device code lifetime overflows the clock")?;
+        let expired = || {
+            anyhow::Error::msg(t(
+                "cli-oidc-device-expired",
+                "The device code expired before approval; run the command again.",
+            ))
+        };
+        let mut interval = start.interval.clamp(1, 300);
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(expired());
+            }
+            let wait = std::time::Duration::from_secs(interval)
+                .min(deadline.saturating_duration_since(now));
+            tokio::time::sleep(wait).await;
+            if std::time::Instant::now() >= deadline {
+                return Err(expired());
+            }
+            match enrollment.device_grant_poll(&start.device_code).await? {
+                DevicePollOutcome::Pending => {}
+                DevicePollOutcome::SlowDown => interval = interval.saturating_add(5).min(300),
+                DevicePollOutcome::Token(token) => break *token,
+            }
+        }
+    };
+
+    eprintln!(
+        "{}",
+        ta(
+            "cli-oidc-enrolled",
+            &[("alias", &alias)],
+            format!(
+                "Enrolled with [oidc.{alias}]. The access token is on stdout; present it as \
+                 auth_token in the RPC handshake or export it as ZEROCLAW_AUTH_TOKEN."
+            ),
+        )
+    );
+    if let Some(secs) = token.expires_in {
+        let secs = secs.to_string();
+        eprintln!(
+            "{}",
+            ta(
+                "cli-oidc-token-expiry",
+                &[("seconds", &secs)],
+                format!("The token expires in {secs} seconds."),
+            )
+        );
+    }
+    println!("{}", token.access_token);
     Ok(())
 }
 

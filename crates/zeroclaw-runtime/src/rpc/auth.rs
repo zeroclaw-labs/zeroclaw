@@ -1356,4 +1356,176 @@ mod tests {
             "a revision that has not been published yet fails closed"
         );
     }
+
+    // ── Stage 6 evidence: two IdPs coexist; policy rollback fails closed ──
+
+    async fn introspection_idp(subject: &str, groups: &[&str]) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "introspection_endpoint": format!("{issuer}/introspect"),
+            })))
+            .mount(&server)
+            .await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        Mock::given(method("POST"))
+            .and(path("/introspect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "active": true,
+                "token_type": "Bearer",
+                "client_id": "daemon-client",
+                "iss": issuer,
+                "sub": subject,
+                "aud": "zeroclaw",
+                "exp": now + 600,
+                "groups": groups,
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn oidc_entry(issuer: &str, group: &str, profile: &str) -> zeroclaw_config::schema::OidcConfig {
+        zeroclaw_config::schema::OidcConfig {
+            issuer: issuer.to_string(),
+            audience: "zeroclaw".into(),
+            client_id: "daemon".into(),
+            client_secret: Some("s3cret".into()),
+            validation: zeroclaw_config::schema::OidcValidation::Introspection,
+            claim_path: "groups".into(),
+            profile_map: std::collections::HashMap::from([(
+                group.to_string(),
+                profile.to_string(),
+            )]),
+            // The provider classifies the actor from an operator declaration;
+            // an undeclared client is refused however well the token verifies.
+            // These fixtures stand in for interactive human sign-ins.
+            interactive_clients: vec!["daemon-client".into()],
+            ..zeroclaw_config::schema::OidcConfig::default()
+        }
+    }
+
+    /// Two independent issuers verify side by side, resolve to distinct
+    /// canonical principals with their own grant sets, and never accept
+    /// each other's tokens. Removing one entry from config and refreshing
+    /// policy revokes that issuer's resolution (fail closed) while the
+    /// other keeps working: the rollback path is a config edit away.
+    #[tokio::test]
+    async fn two_idps_coexist_and_config_rollback_revokes_one() {
+        let corp = introspection_idp("alice", &["ops"]).await;
+        let partner = introspection_idp("bob", &["ext"]).await;
+
+        let mut config = base_config();
+        config.permission_profiles.insert(
+            "operator".into(),
+            PermissionProfileConfig {
+                grants: std::collections::HashMap::from([(
+                    Resource::Sessions,
+                    vec![Verb::Read, Verb::Create],
+                )]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.permission_profiles.insert(
+            "guest".into(),
+            PermissionProfileConfig {
+                grants: std::collections::HashMap::from([(Resource::Sessions, vec![Verb::Read])]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config
+            .oidc
+            .insert("corp".into(), oidc_entry(&corp.uri(), "ops", "operator"));
+        config
+            .oidc
+            .insert("partner".into(), oidc_entry(&partner.uri(), "ext", "guest"));
+
+        let auth = auth_for(&config, &[]);
+
+        // Both issuers verify, to DISTINCT canonical principals.
+        let corp_conn = auth
+            .authenticate(
+                TransportKind::Wss,
+                Credential::None,
+                Some("corp-at"),
+                Some("oidc.corp"),
+            )
+            .await
+            .expect("corp verifies");
+        let partner_conn = auth
+            .authenticate(
+                TransportKind::Wss,
+                Credential::None,
+                Some("partner-at"),
+                Some("oidc.partner"),
+            )
+            .await
+            .expect("partner verifies");
+        assert_ne!(
+            corp_conn.principal.id, partner_conn.principal.id,
+            "issuer+subject keying keeps the principals distinct"
+        );
+        assert!(corp_conn.grants.permits(Resource::Sessions, Verb::Create));
+        assert!(
+            !partner_conn
+                .grants
+                .permits(Resource::Sessions, Verb::Create)
+        );
+        assert!(partner_conn.grants.permits(Resource::Sessions, Verb::Read));
+
+        // Explicit selection: a corp token presented to the partner
+        // provider is that provider's denial, never a cross-check.
+        let cross = auth
+            .authenticate(
+                TransportKind::Wss,
+                Credential::None,
+                Some("corp-at"),
+                Some("oidc.partner"),
+            )
+            .await
+            .expect("the partner IdP answers for tokens sent to it");
+        assert_ne!(
+            cross.principal.id, corp_conn.principal.id,
+            "the partner introspection authority answers with its own subject"
+        );
+
+        // Rollback: drop [oidc.partner] from config and refresh. Alias
+        // lookup is policy driven, so the dropped alias is no longer a
+        // known provider and the connection must authenticate afresh:
+        // it fails closed immediately, before any token is examined.
+        config.oidc.remove("partner");
+        auth.refresh_from_config(&config)
+            .expect("dropping an alias is a valid refresh");
+        let denied = auth
+            .authenticate(
+                TransportKind::Wss,
+                Credential::None,
+                Some("partner-at"),
+                Some("oidc.partner"),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            denied.code, AUTH_REQUIRED,
+            "revoked issuer fails closed: a dropped alias is an unknown provider"
+        );
+        let still_ok = auth
+            .authenticate(
+                TransportKind::Wss,
+                Credential::None,
+                Some("corp-at"),
+                Some("oidc.corp"),
+            )
+            .await
+            .expect("the surviving issuer is unaffected");
+        assert_eq!(still_ok.principal.id, corp_conn.principal.id);
+    }
 }

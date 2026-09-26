@@ -19248,10 +19248,26 @@ pub struct SecurityConfig {
     #[nested]
     pub estop: EstopConfig,
 
-    /// Nevis IAM integration for SSO/MFA authentication and role-based access.
-    #[serde(default)]
-    #[nested]
-    pub nevis: NevisConfig,
+    /// DEPRECATED and ignored: the Nevis IAM integration was removed in
+    /// favor of the shared authentication stack (`[oidc.<alias>]`
+    /// verification, the `[users]` roster, and `[permission_profiles]`
+    /// grants). A legacy `[security.nevis]` table still parses so existing
+    /// configs keep loading, but enabling it does nothing and config
+    /// validation logs a warning naming the replacement.
+    ///
+    /// Its content is discarded on load: only a content-free presence marker
+    /// is retained (so validation can warn once), and the field is never
+    /// serialized. A legacy table may carry a plaintext `client_secret`, so
+    /// keeping it would let `GET /api/config` disclose that credential to a
+    /// `config:read` principal (the raw value sits outside the derived
+    /// `mask_secrets`). Discarding it here keeps the dead secret out of both
+    /// the API response and the next on-disk save.
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "deserialize_inert_nevis"
+    )]
+    pub nevis: Option<serde_json::Value>,
 
     /// WebAuthn / FIDO2 hardware key authentication configuration.
     #[serde(default)]
@@ -19267,11 +19283,24 @@ impl Default for SecurityConfig {
             leak_detection: LeakDetectionConfig::default(),
             otp: OtpConfig::default(),
             estop: EstopConfig::default(),
-            nevis: NevisConfig::default(),
+            nevis: None,
             webauthn: WebAuthnConfig::default(),
             nat64_prefixes: Vec::new(),
         }
     }
+}
+
+/// Accept a legacy `[security.nevis]` table so old configs keep loading, but
+/// discard every value it carries. Only a content-free presence marker
+/// (`Some(Value::Null)`) is returned, so validation can warn once while the
+/// removed integration's fields — including any plaintext `client_secret` —
+/// never reach memory, `GET /api/config`, or the next on-disk save.
+fn deserialize_inert_nevis<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let present = Option::<serde_json::Value>::deserialize(deserializer)?.is_some();
+    Ok(present.then_some(serde_json::Value::Null))
 }
 
 /// Outbound credential leak detection configuration.
@@ -19490,169 +19519,6 @@ impl Default for EstopConfig {
             require_otp_to_resume: true,
         }
     }
-}
-
-/// Nevis IAM integration configuration.
-///
-/// When `enabled` is true, ZeroClaw validates incoming requests against a Nevis
-/// Security Suite instance and maps Nevis roles to tool/workspace permissions.
-#[derive(Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "security.nevis"]
-#[serde(deny_unknown_fields)]
-pub struct NevisConfig {
-    /// Enable Nevis IAM integration. Defaults to false for backward compatibility.
-    #[serde(default)]
-    pub enabled: bool,
-
-    /// Base URL of the Nevis instance (e.g. `https://nevis.example.com`).
-    #[serde(default)]
-    pub instance_url: String,
-
-    /// Nevis realm to authenticate against.
-    #[serde(default = "default_nevis_realm")]
-    pub realm: String,
-
-    /// OAuth2 client ID registered in Nevis.
-    #[serde(default)]
-    pub client_id: String,
-
-    /// OAuth2 client secret. Encrypted via SecretStore when stored on disk.
-    #[serde(default)]
-    #[secret]
-    #[credential_class = "encrypted_secret"]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub client_secret: Option<String>,
-
-    /// Token validation strategy: `"local"` (JWKS) or `"remote"` (introspection).
-    #[serde(default = "default_nevis_token_validation")]
-    pub token_validation: String,
-
-    /// JWKS endpoint URL for local token validation.
-    #[serde(default)]
-    pub jwks_url: Option<String>,
-
-    /// Nevis role to ZeroClaw permission mappings.
-    #[serde(default)]
-    pub role_mapping: Vec<NevisRoleMappingConfig>,
-
-    /// Require MFA verification for all Nevis-authenticated requests.
-    #[serde(default)]
-    pub require_mfa: bool,
-
-    /// Session timeout in seconds.
-    #[serde(default = "default_nevis_session_timeout_secs")]
-    pub session_timeout_secs: u64,
-}
-
-impl std::fmt::Debug for NevisConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NevisConfig")
-            .field("enabled", &self.enabled)
-            .field("instance_url", &self.instance_url)
-            .field("realm", &self.realm)
-            .field("client_id", &self.client_id)
-            .field(
-                "client_secret",
-                &self.client_secret.as_ref().map(|_| "[REDACTED]"),
-            )
-            .field("token_validation", &self.token_validation)
-            .field("jwks_url", &self.jwks_url)
-            .field("role_mapping", &self.role_mapping)
-            .field("require_mfa", &self.require_mfa)
-            .field("session_timeout_secs", &self.session_timeout_secs)
-            .finish()
-    }
-}
-
-impl NevisConfig {
-    /// Validate that required fields are present when Nevis is enabled.
-    ///
-    /// Call at config load time to fail fast on invalid configuration rather
-    /// than deferring errors to the first authentication request.
-    pub fn validate(&self) -> Result<(), String> {
-        if !self.enabled {
-            return Ok(());
-        }
-
-        if self.instance_url.trim().is_empty() {
-            return Err("nevis.instance_url is required when Nevis IAM is enabled".into());
-        }
-
-        if self.client_id.trim().is_empty() {
-            return Err("nevis.client_id is required when Nevis IAM is enabled".into());
-        }
-
-        if self.realm.trim().is_empty() {
-            return Err("nevis.realm is required when Nevis IAM is enabled".into());
-        }
-
-        match self.token_validation.as_str() {
-            "local" | "remote" => {}
-            other => {
-                return Err(format!(
-                    "nevis.token_validation has invalid value '{other}': \
-                     expected 'local' or 'remote'"
-                ));
-            }
-        }
-
-        if self.token_validation == "local" && self.jwks_url.is_none() {
-            return Err("nevis.jwks_url is required when token_validation is 'local'".into());
-        }
-
-        if self.session_timeout_secs == 0 {
-            return Err("nevis.session_timeout_secs must be greater than 0".into());
-        }
-
-        Ok(())
-    }
-}
-
-fn default_nevis_realm() -> String {
-    "master".into()
-}
-
-fn default_nevis_token_validation() -> String {
-    "local".into()
-}
-
-fn default_nevis_session_timeout_secs() -> u64 {
-    3600
-}
-
-impl Default for NevisConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            instance_url: String::new(),
-            realm: default_nevis_realm(),
-            client_id: String::new(),
-            client_secret: None,
-            token_validation: default_nevis_token_validation(),
-            jwks_url: None,
-            role_mapping: Vec::new(),
-            require_mfa: false,
-            session_timeout_secs: default_nevis_session_timeout_secs(),
-        }
-    }
-}
-
-/// Maps a Nevis role to ZeroClaw tool permissions and workspace access.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields)]
-pub struct NevisRoleMappingConfig {
-    /// Nevis role name (case-insensitive).
-    pub nevis_role: String,
-
-    /// Tool names this role can access. Use `"all"` for unrestricted tool access.
-    #[serde(default)]
-    pub zeroclaw_permissions: Vec<String>,
-
-    /// Workspace names this role can access. Use `"all"` for unrestricted.
-    #[serde(default)]
-    pub workspace_access: Vec<String>,
 }
 
 /// Sandbox configuration for OS-level isolation
@@ -24805,9 +24671,16 @@ impl Config {
             }
         }
 
-        // Nevis IAM — delegate to NevisConfig::validate() for field-level checks
-        if let Err(msg) = self.security.nevis.validate() {
-            anyhow::bail!("security.nevis: {msg}");
+        // Nevis IAM was removed; the table is tolerated but inert.
+        if self.security.nevis.is_some() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "[security.nevis] is deprecated and ignored: the Nevis integration was \
+                 removed. Configure [oidc.<alias>] with [users] / [permission_profiles] \
+                 instead; the table will be dropped on the next config save."
+            );
         }
 
         // Delegate tool global defaults
@@ -40441,183 +40314,48 @@ url = "http://localhost:8080/mcp"
         }
     }
 
-    #[tokio::test]
-    async fn nevis_client_secret_encrypt_decrypt_roundtrip() {
-        let dir = std::env::temp_dir().join(format!(
-            "zeroclaw_test_nevis_secret_{}",
-            uuid::Uuid::new_v4()
-        ));
-        fs::create_dir_all(&dir).await.unwrap();
-
-        let plaintext_secret = "nevis-test-client-secret-value";
-
-        let mut config = Config {
-            data_dir: dir.join("workspace"),
-            config_path: dir.join("config.toml"),
-            ..Default::default()
-        };
-        config.security.nevis.client_secret = Some(plaintext_secret.into());
-
-        // Save (triggers encryption)
-        config.save().await.unwrap();
-
-        // Read raw TOML and verify plaintext secret is NOT present
-        let raw_toml = tokio::fs::read_to_string(&config.config_path)
-            .await
-            .unwrap();
-        assert!(
-            !raw_toml.contains(plaintext_secret),
-            "Saved TOML must not contain the plaintext client_secret"
-        );
-
-        // Parse stored TOML and verify the value is encrypted
-        let stored: Config = toml::from_str(&raw_toml).unwrap();
-        let stored_secret = stored.security.nevis.client_secret.as_ref().unwrap();
-        assert!(
-            crate::secrets::SecretStore::is_encrypted(stored_secret),
-            "Stored client_secret must be marked as encrypted"
-        );
-
-        // Decrypt and verify it matches the original plaintext
-        let store = crate::secrets::SecretStore::new(&dir, true);
-        assert_eq!(store.decrypt(stored_secret).unwrap(), plaintext_secret);
-
-        // Simulate a full load: deserialize then decrypt (mirrors load_or_init logic)
-        let mut loaded: Config = toml::from_str(&raw_toml).unwrap();
-        loaded.config_path = dir.join("config.toml");
-        let load_store = crate::secrets::SecretStore::new(&dir, loaded.secrets.encrypt);
-        loaded.decrypt_secrets(&load_store).unwrap();
+    #[test]
+    async fn legacy_nevis_table_parses_and_is_ignored() {
+        // Compat shim: a config carrying the removed [security.nevis] table
+        // must keep loading, but its content is discarded on load. Only a
+        // content-free presence marker is retained (so validation can warn),
+        // and the table is never serialized. A legacy table may carry a
+        // plaintext client_secret; retaining it would let `GET /api/config`
+        // disclose that credential to a `config:read` principal, since the raw
+        // value sits outside the derived mask_secrets.
+        let raw = r#"
+[security.nevis]
+enabled = true
+instance_url = "https://nevis.example.com"
+realm = "corp"
+client_secret = "enc:v1:abc"
+role_mapping = [{ nevis_role = "admin", zeroclaw_permissions = ["all"] }]
+"#;
+        let config: Config = toml::from_str(raw).expect("legacy nevis table still parses");
         assert_eq!(
-            loaded.security.nevis.client_secret.as_deref().unwrap(),
-            plaintext_secret,
-            "Loaded client_secret must match the original plaintext after decryption"
+            config.security.nevis,
+            Some(serde_json::Value::Null),
+            "the shim keeps only a content-free presence marker"
         );
 
-        let _ = fs::remove_dir_all(&dir).await;
-    }
-
-    // ══════════════════════════════════════════════════════════
-    // Nevis config validation tests
-    // ══════════════════════════════════════════════════════════
-
-    #[test]
-    async fn nevis_config_validate_disabled_accepts_empty_fields() {
-        let cfg = NevisConfig::default();
-        assert!(!cfg.enabled);
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    async fn nevis_config_validate_rejects_empty_instance_url() {
-        let cfg = NevisConfig {
-            enabled: true,
-            instance_url: String::new(),
-            client_id: "test-client".into(),
-            ..NevisConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(err.contains("instance_url"));
-    }
-
-    #[test]
-    async fn nevis_config_validate_rejects_empty_client_id() {
-        let cfg = NevisConfig {
-            enabled: true,
-            instance_url: "https://nevis.example.com".into(),
-            client_id: String::new(),
-            ..NevisConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(err.contains("client_id"));
-    }
-
-    #[test]
-    async fn nevis_config_validate_rejects_empty_realm() {
-        let cfg = NevisConfig {
-            enabled: true,
-            instance_url: "https://nevis.example.com".into(),
-            client_id: "test-client".into(),
-            realm: String::new(),
-            ..NevisConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(err.contains("realm"));
-    }
-
-    #[test]
-    async fn nevis_config_validate_rejects_local_without_jwks() {
-        let cfg = NevisConfig {
-            enabled: true,
-            instance_url: "https://nevis.example.com".into(),
-            client_id: "test-client".into(),
-            token_validation: "local".into(),
-            jwks_url: None,
-            ..NevisConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(err.contains("jwks_url"));
-    }
-
-    #[test]
-    async fn nevis_config_validate_rejects_zero_session_timeout() {
-        let cfg = NevisConfig {
-            enabled: true,
-            instance_url: "https://nevis.example.com".into(),
-            client_id: "test-client".into(),
-            token_validation: "remote".into(),
-            session_timeout_secs: 0,
-            ..NevisConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(err.contains("session_timeout_secs"));
-    }
-
-    #[test]
-    async fn nevis_config_validate_accepts_valid_enabled_config() {
-        let cfg = NevisConfig {
-            enabled: true,
-            instance_url: "https://nevis.example.com".into(),
-            realm: "master".into(),
-            client_id: "test-client".into(),
-            token_validation: "remote".into(),
-            session_timeout_secs: 3600,
-            ..NevisConfig::default()
-        };
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    async fn nevis_config_validate_rejects_invalid_token_validation() {
-        let cfg = NevisConfig {
-            enabled: true,
-            instance_url: "https://nevis.example.com".into(),
-            realm: "master".into(),
-            client_id: "test-client".into(),
-            token_validation: "invalid_mode".into(),
-            session_timeout_secs: 3600,
-            ..NevisConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
+        // The loaded config must never re-emit the dead table or its secret,
+        // whether through the next save or `GET /api/config` (which serializes
+        // the config). Discarding the content on load means the raw value is
+        // never in memory to leak. This is the disclosure the shim must avoid.
+        let serialized = toml::to_string(&config).unwrap();
         assert!(
-            err.contains("invalid value 'invalid_mode'"),
-            "Expected invalid token_validation error, got: {err}"
-        );
-    }
-
-    #[test]
-    async fn nevis_config_debug_redacts_client_secret() {
-        let cfg = NevisConfig {
-            client_secret: Some("super-secret".into()),
-            ..NevisConfig::default()
-        };
-        let debug_output = format!("{:?}", cfg);
-        assert!(
-            !debug_output.contains("super-secret"),
-            "Debug output must not contain the raw client_secret"
+            !serialized.contains("nevis"),
+            "a loaded legacy table must not be serialized back"
         );
         assert!(
-            debug_output.contains("[REDACTED]"),
-            "Debug output must show [REDACTED] for client_secret"
+            !serialized.contains("client_secret") && !serialized.contains("enc:v1:abc"),
+            "the legacy client_secret must not survive into serialized config"
+        );
+
+        let serialized_default = toml::to_string(&Config::default()).unwrap();
+        assert!(
+            !serialized_default.contains("nevis"),
+            "default configs must not emit the removed table"
         );
     }
 
