@@ -1166,7 +1166,10 @@ where
     }
 
     // Challenge / verify: prove possession of the private key over a fresh nonce.
-    let mut nonce = [0u8; 32];
+    // The length is pinned by the protocol (see `REGISTRATION_NONCE_LEN`): the
+    // daemon refuses to sign a challenge of any other size, because that key
+    // also signs its claim ownership proof.
+    let mut nonce = [0u8; zeroclaw_relay_proto::REGISTRATION_NONCE_LEN];
     if SystemRandom::new().fill(&mut nonce).is_err() {
         let _ = send_setup_control(&mut ws, &Control::error("internal", "rng"), deadline).await;
         return Ok(());

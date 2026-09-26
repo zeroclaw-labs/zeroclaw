@@ -42,6 +42,18 @@ pub const PEER_HINT_ENROLL: &str = "enroll";
 /// are tiny; anything larger is hostile or a bug.
 pub const MAX_CONTROL_FRAME: usize = 64 * 1024;
 
+/// Exact decoded length of a registration `Challenge.nonce`, in bytes.
+///
+/// This is a SECURITY bound, not a formatting detail. The daemon signs the
+/// challenge with the same Ed25519 key it uses for other proofs (notably the
+/// `zeroclaw relay claim` ownership proof), so a registration signer that will
+/// sign arbitrary relay-supplied bytes is a signing oracle: a hostile relay
+/// could send a complete tagged claim message as the "nonce" and collect a
+/// valid signature over it, since it already learns the public key from
+/// `Hello`. Pinning the length to a fixed 32 bytes keeps a challenge
+/// structurally incapable of being any longer tagged message.
+pub const REGISTRATION_NONCE_LEN: usize = 32;
+
 /// Maximum inner payload carried in a single binary `DATA` message. Larger inner
 /// writes are chunked across multiple `DATA` messages so one connection cannot
 /// monopolize a multiplexed daemon link (head-of-line mitigation).

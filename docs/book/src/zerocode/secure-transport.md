@@ -217,7 +217,9 @@ mode = "open"
 allow = []
 deny  = []
 # A public (non-loopback) relay MUST gate registration: set a shared secret here
-# (each daemon presents it via [relay] relay_token) or use mode = "allowlist".
+# (each daemon presents it via [relay] token) or use mode = "allowlist".
+# A relay that serves daemons enrolled with `zeroclaw relay claim` must use
+# mode = "allowlist" and leave relay_token unset (see 2d).
 # Otherwise an OPEN, tokenless relay on a public bind refuses to start, because
 # any daemon on the internet could register and squat unclaimed node-ids. (A
 # loopback bind for local development is exempt; a deliberate open public relay
@@ -256,6 +258,12 @@ control. `allowlist` mode keys on the daemon's registration pubkey fingerprint
 add fingerprints to `allow` (and reload with `kill -HUP <pid>`). A node-id is
 bound to its first registrant's pubkey, so a different key cannot hijack a live
 node-id (it gets `node_taken`).
+
+The relay checks `relay_token` before the allow list, in every mode. A relay that
+serves self-serve claims (2d) must therefore use `allowlist` with `relay_token`
+unset: a claim never delivers the shared token, so a claimed daemon would be
+refused with `forbidden: bad relay token`. The allow list already gates a public
+relay on its own, so the token adds nothing there.
 
 **Docker.** `apps/zerorelay/Dockerfile` runs distroless with
 `CMD ["--config", "/etc/zerorelay/relay.toml"]` and a shell-less
@@ -312,6 +320,44 @@ For a relay that authenticates daemons on the outer layer too, set the
 relay's `[admission].outer_client_auth = "required"` + `outer_client_ca`, and on
 the daemon `[relay].outer_client_cert` / `outer_client_key`. This is additive on
 the outer TLS and never touches the inner mTLS.
+
+### 2d. Self-serve enrollment with `zeroclaw relay claim`
+
+When the relay is run alongside a ZeroRelay control plane, an operator can enroll
+a daemon with a one-time claim token instead of editing the relay's allow list by
+hand. The control plane issues the token and prints the command to run on the
+daemon host:
+
+```sh
+zeroclaw relay claim <TOKEN> --control https://control.example.com
+```
+
+The daemon signs the claim with its existing registration key, so the fingerprint
+the control plane allow-lists is exactly the key the daemon registers with. On a
+verified success the control plane adds that fingerprint to the relay's allow
+list and reloads the relay, and the daemon writes `[relay]` `enabled`, `url`,
+`node_id`, and `relay_host`. Start or restart the daemon to register.
+
+Before claiming:
+
+- **The relay must admit by fingerprint alone.** Use `mode = "allowlist"` and
+  leave `relay_token` unset (see 2a). A claim does not deliver the shared token.
+- **Enable `[wss]`.** The relay refuses registration until the WSS listener is
+  enabled. A claim made without it is still saved, and takes effect on the next
+  start after `[wss]` is enabled.
+- **Configure trust for the relay's outer certificate first**, as in 2b
+  (`relay_ca_path`, `tofu`, or public roots). The claim writes only the four
+  fields above and leaves the rest of `[relay]` alone.
+- **Do not set the claim-managed fields through environment overrides.** If
+  `relay.enabled`, `relay.url`, `relay.node_id`, or `relay.relay_host` is
+  overridden, the claim refuses before sending anything, because the override
+  would discard the written values.
+
+`--control` must be `https`, or `http` on a loopback address. Redirects and
+proxies are disabled so the token cannot reach another origin. Every refusal says
+`no config was written`. A token is single-use: once the control plane accepts
+it, it is spent, even if the daemon then refuses the response (for example an
+unusable relay address). In that case, fix the cause and mint a new token.
 
 ---
 

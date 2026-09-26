@@ -168,8 +168,14 @@ async fn serve_stub_conn(
         return;
     }
 
+    // A CONFORMING nonce: the daemon refuses to sign a challenge of any other
+    // size, because the registration key also signs its relay-claim ownership
+    // proof (see `REGISTRATION_NONCE_LEN`). This stub previously sent 27 bytes,
+    // which a real relay never does.
+    let mut nonce = [0u8; zeroclaw_relay_proto::REGISTRATION_NONCE_LEN];
+    nonce[..b"relay-bridge-liveness-nonce".len()].copy_from_slice(b"relay-bridge-liveness-nonce");
     let challenge = Control::Challenge {
-        nonce: B64.encode(b"relay-bridge-liveness-nonce"),
+        nonce: B64.encode(nonce),
     };
     if ws.send(Message::text(challenge.to_json())).await.is_err() {
         return;
