@@ -252,13 +252,10 @@ fn map_options_cap(specs: &mut Vec<DiscordSlashCommandSpec>) {
     }
 }
 
-/// The desired global-command set: `/ask` plus one command per skill spec,
-/// each taking a single required string `input`. Also the registration
-/// fingerprint input — its JSON string hashes into the skip-if-unchanged
-/// gate.
-pub(crate) fn slash_command_registration_body(
-    specs: &[DiscordSlashCommandSpec],
-) -> serde_json::Value {
+/// The built-in `/ask <prompt>` command exactly as we register it, including
+/// its compiled-in localizations. Also the ownership reference the reconcile
+/// compares against before reaping an `/ask`.
+pub(crate) fn builtin_ask_command() -> serde_json::Value {
     let mut ask = json!({
         "name": "ask",
         "description": "Ask the agent a question",
@@ -276,7 +273,21 @@ pub(crate) fn slash_command_registration_body(
     if let Some(loc) = localizations_object(builtin_localizations::ASK_PROMPT_OPTION) {
         ask["options"][0]["description_localizations"] = loc;
     }
-    let mut commands = vec![ask];
+    ask
+}
+
+/// The desired command set: the built-in `/ask` (unless the channel opted
+/// out via `slash_builtin_ask = false`) plus one command per skill spec. Also
+/// the registration fingerprint input: its JSON string hashes into the
+/// skip-if-unchanged gate, so toggling the built-in forces a reconcile.
+pub(crate) fn slash_command_registration_body(
+    specs: &[DiscordSlashCommandSpec],
+    include_builtin_ask: bool,
+) -> serde_json::Value {
+    let mut commands = Vec::with_capacity(specs.len() + 1);
+    if include_builtin_ask {
+        commands.push(builtin_ask_command());
+    }
     for spec in specs {
         // A skill that declares no typed options keeps the legacy single
         // required string `input` (backward-compatible + the ownership marker
@@ -488,12 +499,14 @@ pub(crate) async fn reconcile_slash_commands(
             vec![global_base],
         ),
     };
-    // The canonical `/ask` we would register, used to prove ownership before
-    // reaping a `/ask` from the inactive scope a foreign `/ask` whose
-    // projection differs is left untouched.
-    let expected_ask = desired
-        .iter()
-        .find(|c| c.get("name").and_then(|n| n.as_str()) == Some("ask"));
+    // The canonical `/ask` we register, used to prove ownership before reaping
+    // a `/ask` from the inactive scope: a foreign `/ask` whose projection
+    // differs is left untouched. Resolved from the constructor rather than
+    // from `desired`, so a channel that opted out of the built-in still reaps
+    // its own `/ask` from the inactive scope.
+    let canonical_ask = builtin_ask_command();
+    let expected_ask = Some(&canonical_ask);
+    let ask_desired = desired_names.contains("ask");
     // Best-effort cleanup of the now-inactive scope first; a 429 surfaces the
     // cooldown like any active-scope pass would.
     for base in &inactive {
@@ -506,7 +519,8 @@ pub(crate) async fn reconcile_slash_commands(
     // Reconcile each active endpoint (one for Global; one per guild for Guild).
     for base in &active {
         if let ReconcileOutcome::RateLimited { until } =
-            reconcile_one_endpoint(client, &auth, base, desired, &desired_names).await?
+            reconcile_one_endpoint(client, &auth, base, desired, &desired_names, ask_desired)
+                .await?
         {
             return Ok(ReconcileOutcome::RateLimited { until });
         }
@@ -602,8 +616,27 @@ async fn reap_all_owned_commands(
     Ok(ReconcileOutcome::Reconciled)
 }
 
+/// True when `cmd` has the built-in `/ask` signature: exactly one required
+/// string option named `prompt`. Used to reap a disabled `/ask` from the
+/// active endpoint. Deliberately shape-based rather than a full projection
+/// match: a `/ask` being disabled was typically registered by an earlier build
+/// whose description or localizations may differ from today's, and a
+/// projection match would leave it registered. A `/ask` with any other
+/// option set is someone else's and is left alone.
+fn is_builtin_ask_shape(cmd: &serde_json::Value) -> bool {
+    let Some(options) = cmd.get("options").and_then(|o| o.as_array()) else {
+        return false;
+    };
+    let [only] = options.as_slice() else {
+        return false;
+    };
+    only.get("name").and_then(|n| n.as_str()) == Some("prompt")
+        && only.get("type").and_then(serde_json::Value::as_u64) == Some(3)
+        && only.get("required").and_then(serde_json::Value::as_bool) == Some(true)
+}
+
 /// Reconcile the skill command set at a single endpoint (`base`): reap stale
-/// skill commands, then upsert each desired command whose projection differs
+/// skill commands (and our own `/ask` when the built-in is disabled), then upsert each desired command whose projection differs
 /// from what's registered. Steady-state restarts converge to ~zero writes.
 async fn reconcile_one_endpoint(
     client: &reqwest::Client,
@@ -611,6 +644,7 @@ async fn reconcile_one_endpoint(
     base: &str,
     desired: &[serde_json::Value],
     desired_names: &std::collections::HashSet<&str>,
+    ask_desired: bool,
 ) -> anyhow::Result<ReconcileOutcome> {
     // Reap stale skill commands first so the 100-command cap never blocks
     // the upserts that follow. Delete failures are counted, not fatal
@@ -639,7 +673,10 @@ async fn reconcile_one_endpoint(
         resp.json().await.map_err(reqwest::Error::without_url)?;
     for cmd in &existing {
         let name = cmd.get("name").and_then(|n| n.as_str()).unwrap_or("");
-        if name == "ask" || desired_names.contains(name) || !is_skill_command_shape(cmd) {
+        let reap_disabled_ask = name == "ask" && !ask_desired && is_builtin_ask_shape(cmd);
+        if !reap_disabled_ask
+            && (name == "ask" || desired_names.contains(name) || !is_skill_command_shape(cmd))
+        {
             continue;
         }
         let Some(id) = cmd.get("id").and_then(|i| i.as_str()) else {
@@ -765,8 +802,48 @@ mod typed_option_tests {
     }
 
     #[test]
+    fn builtin_ask_is_first_when_enabled_and_absent_when_disabled() {
+        let specs = [spec_with(Vec::new())];
+        let on = slash_command_registration_body(&specs, true);
+        let off = slash_command_registration_body(&specs, false);
+        let names = |b: &serde_json::Value| -> Vec<String> {
+            b.as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(names(&on), vec!["ask", "s"]);
+        assert_eq!(names(&off), vec!["s"]);
+        assert_eq!(on.as_array().unwrap()[0], builtin_ask_command());
+        // The body is the fingerprint input, so flipping the flag must change
+        // it and force a reconcile on the next READY.
+        assert_ne!(on.to_string(), off.to_string());
+        assert_eq!(slash_command_registration_body(&[], false), json!([]));
+    }
+
+    #[test]
+    fn builtin_ask_shape_matches_ours_and_older_wording_only() {
+        assert!(is_builtin_ask_shape(&builtin_ask_command()));
+        let older = json!({"name": "ask", "options": [
+            {"name": "prompt", "type": 3, "required": true, "description": "old"}
+        ]});
+        assert!(is_builtin_ask_shape(&older));
+        let foreign = json!({"name": "ask", "options": [
+            {"name": "query", "type": 3, "required": true}
+        ]});
+        assert!(!is_builtin_ask_shape(&foreign));
+        let extra = json!({"name": "ask", "options": [
+            {"name": "prompt", "type": 3, "required": true},
+            {"name": "model", "type": 3, "required": false}
+        ]});
+        assert!(!is_builtin_ask_shape(&extra));
+        assert!(!is_builtin_ask_shape(&json!({"name": "ask"})));
+    }
+
+    #[test]
     fn no_options_falls_back_to_the_legacy_input() {
-        let body = slash_command_registration_body(&[spec_with(Vec::new())]);
+        let body = slash_command_registration_body(&[spec_with(Vec::new())], true);
         let cmd = &body.as_array().unwrap()[1]; // [0] is /ask
         let opts = cmd["options"].as_array().unwrap();
         assert_eq!(opts.len(), 1);
@@ -780,7 +857,7 @@ mod typed_option_tests {
 
     #[test]
     fn builtin_commands_carry_compiled_in_localizations() {
-        let body = slash_command_registration_body(&[spec_with(Vec::new())]);
+        let body = slash_command_registration_body(&[spec_with(Vec::new())], true);
         let cmds = body.as_array().unwrap();
         // /ask command + its prompt option are localized.
         let ask = &cmds[0];
@@ -827,7 +904,7 @@ mod typed_option_tests {
         );
         assert!(!spec.description_localizations.contains_key("xx-INVALID"));
 
-        let body = slash_command_registration_body(&specs);
+        let body = slash_command_registration_body(&specs, true);
         let cmd = &body.as_array().unwrap()[1]; // [0] is /ask
         assert_eq!(
             cmd["description_localizations"]["fr"],
@@ -847,7 +924,7 @@ mod typed_option_tests {
         limit.max = Some(50.0);
         let mut query = opt("query", OptKind::String, true);
         query.min_length = Some(1);
-        let body = slash_command_registration_body(&[spec_with(vec![query, limit])]);
+        let body = slash_command_registration_body(&[spec_with(vec![query, limit])], true);
         let opts = body.as_array().unwrap()[1]["options"].as_array().unwrap();
         assert_eq!(opts.len(), 2);
         assert_eq!(opts[0]["name"], json!("query"));
@@ -897,7 +974,7 @@ Write it.
             "the slash-tagged MD skill yields one command"
         );
 
-        let body = slash_command_registration_body(&specs);
+        let body = slash_command_registration_body(&specs, true);
         let arr = body.as_array().unwrap();
         let draft = arr
             .iter()

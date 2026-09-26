@@ -135,6 +135,10 @@ pub struct DiscordChannel {
     /// each `guild_ids` entry (instant propagation); empty `guild_ids` falls
     /// back to global at reconcile time.
     slash_command_scope: zeroclaw_config::schema::SlashCommandScope,
+    /// Whether the built-in `/ask` joins the registered command set, wired
+    /// from `DiscordConfig.slash_builtin_ask` (default true). Reloads rebuild
+    /// the channel, so config stays the source of truth.
+    slash_builtin_ask: bool,
     /// Live interaction credentials, held channel-locally so the bearer
     /// token never enters reply targets, logs, session keys, or memory
     /// rows. Keyed by interaction id; swept on insert; entries expire with
@@ -195,6 +199,7 @@ impl DiscordChannel {
             gateway_session: Mutex::new(DiscordGatewaySession::default()),
             slash_commands: false,
             slash_command_scope: zeroclaw_config::schema::SlashCommandScope::Global,
+            slash_builtin_ask: true,
             pending_interactions: Arc::new(Mutex::new(HashMap::new())),
             pending_components: Arc::new(Mutex::new(pending::PendingComponents::default())),
             slash_command_resolver: None,
@@ -222,6 +227,14 @@ impl DiscordChannel {
         scope: zeroclaw_config::schema::SlashCommandScope,
     ) -> Self {
         self.slash_command_scope = scope;
+        self
+    }
+
+    /// Include or omit the built-in `/ask` in the registered command set,
+    /// wired from `DiscordConfig.slash_builtin_ask`. Only consulted when slash
+    /// commands are enabled.
+    pub fn with_slash_builtin_ask(mut self, enabled: bool) -> Self {
+        self.slash_builtin_ask = enabled;
         self
     }
 
@@ -2252,6 +2265,7 @@ impl Channel for DiscordChannel {
                                     let resolver = self.slash_command_resolver.clone();
                                     let workspace_dir = self.workspace_dir.clone();
                                     let slash_command_scope = self.slash_command_scope;
+                                    let slash_builtin_ask = self.slash_builtin_ask;
                                     let guild_ids = self.guild_ids.clone();
                                     zeroclaw_spawn::spawn!(async move {
                                         let specs = match resolver {
@@ -2266,7 +2280,11 @@ impl Channel for DiscordChannel {
                                             }
                                             None => Vec::new(),
                                         };
-                                        let body = slash_command_registration_body(&specs);
+                                        let body = slash_command_registration_body(&specs, slash_builtin_ask);
+                                        let command_count = body.as_array().map_or(0, Vec::len);
+                                        if command_count == 0 {
+                                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "slash_commands = true but slash_builtin_ask = false and no slash-tagged skills resolved; no slash commands will be registered (previously registered ones are still reaped)");
+                                        }
                                         // Resolve the registration target: `guild` with no guild_ids
                                         // can't register anywhere, so fall back to global.
                                         let effective_scope = match slash_command_scope {
@@ -2313,13 +2331,13 @@ impl Channel for DiscordChannel {
                                         // reconcile. The fingerprint is persisted, so an unchanged
                                         // set is skipped after a restart too (no daily-budget churn).
                                         if state.fingerprint == Some(fingerprint) {
-                                            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"commands": specs.len() + 1})), "discord slash command set unchanged; skipping re-registration");
+                                            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"commands": command_count})), "discord slash command set unchanged; skipping re-registration");
                                             return;
                                         }
                                         match reconcile_slash_commands(&client, &bot_token, &app_id, &body, DISCORD_API_BASE, effective_scope, &guild_ids).await {
                                             Ok(ReconcileOutcome::Reconciled) => {
                                                 SlashReconcileState::record_success(workspace_dir.as_deref(), &app_id, fingerprint, now);
-                                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"commands": specs.len() + 1})), "discord slash commands registered");
+                                                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"commands": command_count})), "discord slash commands registered");
                                             }
                                             Ok(ReconcileOutcome::RateLimited { until }) => {
                                                 // Persist the cooldown (keeping the prior fingerprint)
@@ -4930,7 +4948,7 @@ mod tests {
             description_localizations: Default::default(),
             options: Vec::new(),
         }];
-        let body = slash_command_registration_body(&specs);
+        let body = slash_command_registration_body(&specs, true);
         let commands = body.as_array().unwrap();
         assert_eq!(commands.len(), 2);
         assert_eq!(commands[0]["name"], "ask");
@@ -5021,7 +5039,7 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let desired = slash_command_registration_body(&[]);
+        let desired = slash_command_registration_body(&[], true);
         let err = reconcile_slash_commands(
             &client,
             "tok",
@@ -5062,7 +5080,7 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let desired = slash_command_registration_body(&[]);
+        let desired = slash_command_registration_body(&[], true);
         reconcile_slash_commands(
             &client,
             "tok",
@@ -5104,7 +5122,7 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let desired = slash_command_registration_body(&[]);
+        let desired = slash_command_registration_body(&[], true);
         reconcile_slash_commands(
             &client,
             "tok",
@@ -5130,7 +5148,10 @@ mod tests {
         // `description_localizations`, which the reaper's listing requests via
         // `with_localizations=true`) plus a server-side id - so its projection
         // matches ours and the ownership check reaps it
-        let mut stale_ask = slash_command_registration_body(&[]).as_array().unwrap()[0].clone();
+        let mut stale_ask = slash_command_registration_body(&[], true)
+            .as_array()
+            .unwrap()[0]
+            .clone();
         stale_ask["id"] = serde_json::json!("a1");
         Mock::given(method("GET"))
             .and(path("/applications/app1/commands"))
@@ -5165,7 +5186,7 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let desired = slash_command_registration_body(&[]);
+        let desired = slash_command_registration_body(&[], true);
         reconcile_slash_commands(
             &client,
             "tok",
@@ -5229,7 +5250,7 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let desired = slash_command_registration_body(&[]);
+        let desired = slash_command_registration_body(&[], true);
         reconcile_slash_commands(
             &client,
             "tok",
@@ -5251,7 +5272,10 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
-        let mut existing_ask = slash_command_registration_body(&[]).as_array().unwrap()[0].clone();
+        let mut existing_ask = slash_command_registration_body(&[], true)
+            .as_array()
+            .unwrap()[0]
+            .clone();
         existing_ask["id"] = serde_json::json!("a1");
         let foreign = serde_json::json!({
             "id": "f1", "name": "run",
@@ -5274,7 +5298,7 @@ mod tests {
         // would 404 the mock server and fail the reconcile.
 
         let client = reqwest::Client::new();
-        let desired = slash_command_registration_body(&[]);
+        let desired = slash_command_registration_body(&[], true);
         reconcile_slash_commands(
             &client,
             "tok",
@@ -5283,6 +5307,216 @@ mod tests {
             &server.uri(),
             SlashScope::Global,
             &[],
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A `/ask` as an earlier build registered it: same signature as today's
+    /// built-in, different wording and no localizations.
+    fn older_builds_ask(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "name": "ask", "description": "Ask the bot", "type": 1,
+            "options": [{
+                "name": "prompt", "type": 3, "required": true,
+                "description": "Your question"
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn disabled_builtin_ask_is_reaped_from_the_active_endpoint() {
+        // slash_builtin_ask = false: our `/ask` must be deregistered even when
+        // an older build registered it with different wording, and nothing is
+        // upserted in its place.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([older_builds_ask("a1")])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/applications/app1/commands/a1"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let desired = slash_command_registration_body(&[], false);
+        assert_eq!(desired, serde_json::json!([]));
+        reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Global,
+            &[],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn disabled_builtin_ask_keeps_skill_commands_and_spares_a_foreign_ask() {
+        // Opting out removes only our `/ask`. A `/ask` with a different option
+        // set belongs to other tooling and stays; the skill command is
+        // registered as usual.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let foreign_ask = serde_json::json!({
+            "id": "f1", "name": "ask", "description": "other tool", "type": 1,
+            "options": [{"name": "query", "type": 3, "required": true, "description": "q"}]
+        });
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([foreign_ask])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/applications/app1/commands"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"name": "zeroclaw"}),
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let spec = DiscordSlashCommandSpec {
+            skill_name: "zeroclaw".to_string(),
+            slug: "zeroclaw".to_string(),
+            description: "Ask the community assistant".to_string(),
+            description_localizations: Default::default(),
+            options: Vec::new(),
+        };
+        let client = reqwest::Client::new();
+        let desired = slash_command_registration_body(&[spec], false);
+        reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Global,
+            &[],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn enabled_builtin_ask_is_never_deleted() {
+        // Default behaviour is unchanged: with the built-in enabled, an `/ask`
+        // registered by an older build is updated in place (POST upsert),
+        // never deleted.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([older_builds_ask("a1")])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/applications/app1/commands"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"name": "ask"}),
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let desired = slash_command_registration_body(&[], true);
+        reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Global,
+            &[],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn disabled_builtin_ask_is_reaped_from_the_inactive_scope_too() {
+        // Guild scope with the built-in disabled: our canonical `/ask` left on
+        // the now-inactive global endpoint is still reaped, so the opt-out
+        // does not leave a stray global `/ask` behind.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let mut stale_ask = builtin_ask_command();
+        stale_ask["id"] = serde_json::json!("a1");
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([stale_ask])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/applications/app1/commands/a1"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/guilds/g1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let desired = slash_command_registration_body(&[], false);
+        reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Guild,
+            &["g1".to_string()],
         )
         .await
         .unwrap();
@@ -5310,7 +5544,7 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let desired = slash_command_registration_body(&[]); // /ask → one POST
+        let desired = slash_command_registration_body(&[], true); // /ask → one POST
         let now = crate::discord_slash_state::now_unix();
         let outcome = reconcile_slash_commands(
             &client,

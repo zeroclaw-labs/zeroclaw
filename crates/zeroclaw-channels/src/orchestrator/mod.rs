@@ -13608,6 +13608,7 @@ fn build_configured_discord_channel(
     .with_approval_timeout_secs(dc.approval_timeout_secs)
     .with_slash_commands(dc.slash_commands)
     .with_slash_command_scope(dc.slash_command_scope)
+    .with_slash_builtin_ask(dc.slash_builtin_ask)
     .with_intents_mask(dc.intents_mask)
     .with_reaction_notifications(dc.reaction_notifications);
 

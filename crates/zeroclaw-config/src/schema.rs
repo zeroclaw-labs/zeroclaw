@@ -16746,6 +16746,17 @@ pub struct DiscordConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub slash_command_scope: SlashCommandScope,
+    /// When true (default), register the built-in `/ask <prompt>` command
+    /// alongside any `slash`-tagged skill commands. Set false when several
+    /// Discord applications share one server and each registers its own
+    /// `/ask`, so members see only the entry that will answer them. Disabling
+    /// deregisters a previously registered `/ask` on the next reconcile; a
+    /// channel with no skill commands then registers nothing. Messages that
+    /// @-mention the bot are unaffected. Only meaningful when
+    /// `slash_commands = true`.
+    #[tab(Behavior)]
+    #[serde(default = "default_true")]
+    pub slash_builtin_ask: bool,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
@@ -34119,6 +34130,7 @@ stream_mode = "single_message"
             mention_only: false,
             slash_commands: false,
             slash_command_scope: SlashCommandScope::default(),
+            slash_builtin_ask: true,
             proxy_url: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
@@ -34138,6 +34150,23 @@ stream_mode = "single_message"
     }
 
     #[test]
+    async fn discord_config_slash_builtin_ask_defaults_on() {
+        // Existing configs predate the field; omitting it must keep `/ask`
+        // registered exactly as before. Default() goes through serde, so both
+        // construction paths agree.
+        let parsed: DiscordConfig = serde_json::from_str(r#"{"bot_token":"t"}"#).unwrap();
+        assert!(parsed.slash_builtin_ask);
+        assert!(DiscordConfig::default().slash_builtin_ask);
+    }
+
+    #[test]
+    async fn discord_config_slash_builtin_ask_opts_out() {
+        let parsed: DiscordConfig =
+            toml::from_str("bot_token = \"t\"\nslash_builtin_ask = false\n").unwrap();
+        assert!(!parsed.slash_builtin_ask);
+    }
+
+    #[test]
     async fn discord_config_empty_guild_ids() {
         let dc = DiscordConfig {
             enabled: true,
@@ -34150,6 +34179,7 @@ stream_mode = "single_message"
             mention_only: false,
             slash_commands: false,
             slash_command_scope: SlashCommandScope::default(),
+            slash_builtin_ask: true,
             proxy_url: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
