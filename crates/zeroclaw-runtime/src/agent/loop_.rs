@@ -6302,7 +6302,7 @@ mod tests {
     #[tokio::test]
     async fn image_recovery_continuation_requires_new_input_to_restore_images() {
         for (resubmit, max_tool_iterations) in [(false, 3), (true, 3), (false, 1)] {
-            let image = "data:image/png;base64,iVBORw0KGgoBAgME";
+            let image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
             let original = format!("inspect [IMAGE:{image}]");
             let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel(4);
             let model_provider = ImageRecoveryContinuationProvider {
