@@ -1379,6 +1379,12 @@ impl MessageContent {
     /// turn's rolling breakpoint. Empty text is never marked, because the
     /// wire format rejects empty text blocks that carry `cache_control`.
     fn apply_cache_control(&mut self, cache_ttl: CacheTtl) -> bool {
+        // Caching disabled: place nothing and leave the wire shape untouched.
+        // The block conversion below exists only to host a breakpoint, so
+        // converting here would perturb the request for no gain.
+        let Some(control) = crate::anthropic::CacheControl::ephemeral_with_ttl(cache_ttl) else {
+            return false;
+        };
         match self {
             MessageContent::Text(text) => {
                 if text.is_empty() {
@@ -1386,9 +1392,7 @@ impl MessageContent {
                 }
                 *self = MessageContent::Parts(vec![MessagePart::Text {
                     text: std::mem::take(text),
-                    cache_control: Some(crate::anthropic::CacheControl::ephemeral_with_ttl(
-                        cache_ttl,
-                    )),
+                    cache_control: Some(control),
                 }]);
                 true
             }
@@ -1400,9 +1404,7 @@ impl MessageContent {
                     } = part
                         && !text.is_empty()
                     {
-                        *cache_control = Some(crate::anthropic::CacheControl::ephemeral_with_ttl(
-                            cache_ttl,
-                        ));
+                        *cache_control = Some(control.clone());
                         return true;
                     }
                 }
@@ -4957,6 +4959,64 @@ mod tests {
         let msgs = body["messages"].as_array().expect("messages array");
         assert_eq!(msgs[0]["content"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(msgs[3]["content"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    /// `off` behind the flag: no breakpoint anywhere, and the wire shape is
+    /// untouched — a message that would have carried a breakpoint does not
+    /// convert to block form, so the body is byte-identical to the same
+    /// request with `cache_passthrough` off.
+    #[tokio::test]
+    async fn cache_ttl_off_leaves_the_compat_wire_unmarked() {
+        let messages = vec![
+            ChatMessage::system("be brief"),
+            ChatMessage::user("first question"),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::user("second question"),
+        ];
+
+        let (provider, captured, server) =
+            mock_cache_capture_with_ttl(true, Some(CacheTtl::Off)).await;
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("off request failed: {error}"));
+        let off_body = captured.lock().unwrap()[0].clone();
+        assert!(
+            !off_body.to_string().contains("cache_control"),
+            "off must emit no cache_control key anywhere: {off_body}"
+        );
+
+        // Control run: same request, flag off. `off` must be indistinguishable
+        // from not asking for caching at all.
+        let (provider, captured, server) =
+            mock_cache_capture_with_ttl(false, Some(CacheTtl::Off)).await;
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("control request failed: {error}"));
+        let control_body = captured.lock().unwrap()[0].clone();
+        assert_eq!(
+            off_body, control_body,
+            "off must leave the compat wire byte-identical to the flag-off wire"
+        );
     }
 
     /// D3: `cache_ttl` without `cache_passthrough` is inert — the structured

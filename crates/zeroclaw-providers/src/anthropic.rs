@@ -496,18 +496,20 @@ impl CacheControl {
         }
     }
 
-    /// Ephemeral breakpoint carrying the configured cache entry lifetime.
-    /// `FiveMinutes` serializes exactly like [`Self::ephemeral`] — the API
-    /// default needs no explicit `ttl` — so call sites can pass the
-    /// resolved TTL unconditionally without perturbing default-config
-    /// requests.
-    pub(crate) fn ephemeral_with_ttl(ttl: CacheTtl) -> Self {
+    /// Ephemeral breakpoint carrying the configured cache entry lifetime, or
+    /// `None` when caching is disabled (`CacheTtl::Off`) so no breakpoint is
+    /// written at all. `FiveMinutes` serializes exactly like
+    /// [`Self::ephemeral`] — the API default needs no explicit `ttl` — so
+    /// call sites can pass the resolved TTL unconditionally without
+    /// perturbing default-config requests.
+    pub(crate) fn ephemeral_with_ttl(ttl: CacheTtl) -> Option<Self> {
         match ttl {
-            CacheTtl::FiveMinutes => Self::ephemeral(),
-            CacheTtl::OneHour => Self {
+            CacheTtl::FiveMinutes => Some(Self::ephemeral()),
+            CacheTtl::OneHour => Some(Self {
                 cache_type: "ephemeral".to_string(),
                 ttl: Some("1h".to_string()),
-            },
+            }),
+            CacheTtl::Off => None,
         }
     }
 }
@@ -790,7 +792,7 @@ impl AnthropicModelProvider {
         let prefix = SystemBlock {
             block_type: "text".to_string(),
             text: "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
-            cache_control: Some(CacheControl::ephemeral_with_ttl(cache_ttl)),
+            cache_control: CacheControl::ephemeral_with_ttl(cache_ttl),
         };
         match system {
             Some(SystemPrompt::Blocks(mut blocks)) => {
@@ -802,7 +804,7 @@ impl AnthropicModelProvider {
                 SystemBlock {
                     block_type: "text".to_string(),
                     text: s,
-                    cache_control: Some(CacheControl::ephemeral_with_ttl(cache_ttl)),
+                    cache_control: CacheControl::ephemeral_with_ttl(cache_ttl),
                 },
             ])),
             None => Some(SystemPrompt::Blocks(vec![prefix])),
@@ -845,7 +847,7 @@ impl AnthropicModelProvider {
             match content {
                 NativeContentOut::Text { cache_control, .. }
                 | NativeContentOut::ToolResult { cache_control, .. } => {
-                    *cache_control = Some(CacheControl::ephemeral_with_ttl(cache_ttl));
+                    *cache_control = CacheControl::ephemeral_with_ttl(cache_ttl);
                     return true;
                 }
                 NativeContentOut::ToolUse { .. }
@@ -879,7 +881,7 @@ impl AnthropicModelProvider {
         // Cache the last tool definition (caches all tools); the tools
         // marker carries the configured cache entry lifetime.
         if let Some(last_tool) = native_tools.last_mut() {
-            last_tool.cache_control = Some(CacheControl::ephemeral_with_ttl(self.cache_ttl));
+            last_tool.cache_control = CacheControl::ephemeral_with_ttl(self.cache_ttl);
         }
 
         Some(native_tools)
@@ -1593,7 +1595,7 @@ impl AnthropicModelProvider {
             SystemPrompt::Blocks(vec![SystemBlock {
                 block_type: "text".to_string(),
                 text,
-                cache_control: Some(CacheControl::ephemeral_with_ttl(cache_ttl)),
+                cache_control: CacheControl::ephemeral_with_ttl(cache_ttl),
             }])
         });
 
@@ -4485,20 +4487,27 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     /// D5 pin: the default (5m) lifetime serializes byte-identically to the
-    /// pre-TTL wire, and only the 1h lifetime adds the `ttl` field.
+    /// pre-TTL wire, only the 1h lifetime adds the `ttl` field, and `off`
+    /// produces no marker at all.
     #[test]
     fn cache_control_ttl_serialization_pinned() {
-        let five_minutes = CacheControl::ephemeral_with_ttl(CacheTtl::FiveMinutes);
+        let five_minutes =
+            CacheControl::ephemeral_with_ttl(CacheTtl::FiveMinutes).expect("5m produces a marker");
         assert_eq!(
             serde_json::to_string(&five_minutes).unwrap(),
             r#"{"type":"ephemeral"}"#,
             "5m must serialize exactly like the pre-TTL default marker"
         );
-        let one_hour = CacheControl::ephemeral_with_ttl(CacheTtl::OneHour);
+        let one_hour =
+            CacheControl::ephemeral_with_ttl(CacheTtl::OneHour).expect("1h produces a marker");
         assert_eq!(
             serde_json::to_string(&one_hour).unwrap(),
             r#"{"type":"ephemeral","ttl":"1h"}"#,
             "1h must emit exactly one added field, in declaration order"
+        );
+        assert!(
+            CacheControl::ephemeral_with_ttl(CacheTtl::Off).is_none(),
+            "off must place no breakpoint at all"
         );
     }
 
@@ -4671,6 +4680,27 @@ data: {\"type\":\"message_stop\"}\n\n";
                 serde_json::to_string(control).unwrap(),
                 r#"{"type":"ephemeral"}"#,
                 "default markers serialize byte-identically to the pre-TTL wire"
+            );
+        }
+
+        // off: no breakpoint anywhere — not the system block, not the last
+        // tool definition, not the rolling last message.
+        let off = run_request(CacheTtl::Off).await;
+        assert!(
+            !off.to_string().contains("cache_control"),
+            "off must emit no cache_control key anywhere: {off}"
+        );
+        let mut controls = Vec::new();
+        collect_cache_controls(&off, &mut controls);
+        assert!(controls.is_empty(), "off must place zero markers: {off}");
+        for site in ["system", "tools", "messages"] {
+            assert!(
+                off.get(site).is_some(),
+                "request body must carry the {site} key: {off}"
+            );
+            assert!(
+                !off[site].to_string().contains("cache_control"),
+                "off must leave the {site} breakpoint site unmarked: {off}"
             );
         }
     }
