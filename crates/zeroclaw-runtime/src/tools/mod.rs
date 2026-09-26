@@ -1450,6 +1450,7 @@ fn all_tools_with_runtime_on_thread(
                 max_coordinate_x: browser_config.computer_use.max_coordinate_x,
                 max_coordinate_y: browser_config.computer_use.max_coordinate_y,
             },
+            browser_config.timeout_secs,
             browser_config.allowed_private_hosts.clone(),
         ) {
             Ok(tool) => {
