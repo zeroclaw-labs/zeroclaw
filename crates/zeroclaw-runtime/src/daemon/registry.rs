@@ -18,6 +18,10 @@ pub type StarterFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 pub struct GatewayReloadControls {
     pub shutdown_tx: watch::Sender<bool>,
     pub reload_tx: watch::Sender<bool>,
+    /// The generation's in-process RPC connector, so the supervised gateway
+    /// can dial the dispatcher over an in-memory duplex instead of the
+    /// socket. `None` for a standalone gateway, which has no daemon to dial.
+    pub inproc: Option<crate::rpc::inproc::InprocConnector>,
 }
 
 pub type GatewayStarter = Box<

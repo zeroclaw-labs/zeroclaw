@@ -19,11 +19,11 @@ use zeroclaw_config::schema::Config;
 
 use platform::LocalStream;
 
-const MAX_FRAME_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const MAX_FRAME_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Best-effort deadline for half-closing a local stream after daemon
 /// cancellation. Windows named-pipe shutdown can wait on a non-reading peer.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+pub(crate) const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Backoff after a transient `accept()` error so the serve loop does not
 /// hot-spin while the condition (e.g. fd exhaustion) clears.
@@ -72,7 +72,7 @@ pub struct LocalTransport {
     peer_uid: Option<u32>,
 }
 
-async fn run_writer<W>(
+pub(crate) async fn run_writer<W>(
     mut writer: W,
     mut writer_rx: mpsc::Receiver<String>,
     cancel: CancellationToken,

@@ -564,6 +564,11 @@ pub async fn run(
         config.gateway.pairing_code,
     ));
 
+    // In-process RPC seam for the supervised gateway. Created before the
+    // gateway starts and bound once this generation's RPC context exists;
+    // the gateway's connect waits for that bind.
+    let inproc_connector = crate::rpc::inproc::InprocConnector::new(channels_cancel.child_token());
+
     if let Some(gateway_start) = registry.take_gateway_start() {
         gateway_required = true;
         let gateway_cfg = config.clone();
@@ -573,6 +578,7 @@ pub async fn run(
         let gateway_reload_controls = GatewayReloadControls {
             shutdown_tx: gateway_shutdown_tx.clone(),
             reload_tx: reload_tx.clone(),
+            inproc: Some(inproc_connector.clone()),
         };
         let gateway_tui_registry = tui_registry.clone();
         let gateway_start = std::sync::Arc::new(gateway_start);
@@ -846,6 +852,10 @@ pub async fn run(
     } else {
         None
     };
+
+    if let Some(ctx) = rpc_ctx.as_ref() {
+        inproc_connector.bind(std::sync::Arc::clone(ctx));
+    }
 
     // Local IPC RPC listener (Unix socket on Unix, Named Pipe on Windows).
     if let Some(socket_start) = registry.take_socket_start() {

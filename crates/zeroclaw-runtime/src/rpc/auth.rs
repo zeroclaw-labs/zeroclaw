@@ -569,6 +569,14 @@ impl RpcInboundAuth {
                         crate::i18n::get_required_cli_string("rpc-auth-remote-token-required"),
                     ));
                 }
+                // An in-process duplex is same-host but vouched for by
+                // nothing: no socket mode, no pipe ACL, no peer uid. It gets
+                // no compatibility path, roster or not.
+                TransportKind::Inproc => {
+                    return Err(AuthDenied::auth_required(
+                        crate::i18n::get_required_cli_string("rpc-auth-required-token"),
+                    ));
+                }
             }
         };
 
@@ -648,6 +656,33 @@ mod tests {
             .expect("legacy local path");
         assert_eq!(conn.principal.id.as_str(), PrincipalId::SHARED_OPERATOR);
         assert!(conn.grants.admin, "single-operator behavior is unchanged");
+    }
+
+    #[tokio::test]
+    async fn inproc_with_no_roster_gets_no_compatibility_path() {
+        // Same daemon state as the legacy local path above; the in-process
+        // duplex still has to present a credential.
+        let auth = auth_for(&base_config(), &[]);
+        let denied = auth
+            .authenticate(TransportKind::Inproc, Credential::None, None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code, AUTH_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn inproc_with_a_paired_token_authenticates_as_that_token_does_elsewhere() {
+        let auth = auth_for(&base_config(), &["zc_tok"]);
+        let conn = auth
+            .authenticate(
+                TransportKind::Inproc,
+                Credential::None,
+                Some("zc_tok"),
+                None,
+            )
+            .await
+            .expect("paired token is accepted on the duplex");
+        assert_eq!(conn.principal.id.as_str(), PrincipalId::SHARED_OPERATOR);
     }
 
     #[tokio::test]

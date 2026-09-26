@@ -32,13 +32,11 @@ use zeroclaw_api::model_provider::ConversationMessage;
 use zeroclaw_api::runtime_status::{RuntimeConfigKind, RuntimeShellProfile};
 use zeroclaw_commands::{CommandSurface, commands_for_surface};
 
-/// Wire protocol version. Bump on breaking changes.
-pub const RPC_PROTOCOL_VERSION: u64 = 1;
-
-mod notification {
-    pub const SESSION_UPDATE: &str = "session/update";
-    pub const LOGS_EVENT: &str = "logs/event";
-}
+// The method table, wire types, notification names and protocol version are
+// the client-facing contract and live in `zeroclaw-rpc-proto`; the runtime
+// re-exports them here so existing `crate::rpc::dispatch::Method` paths keep
+// resolving. Authorization classification stays below: it names runtime grants.
+pub use zeroclaw_rpc_proto::{Method, RPC_PROTOCOL_VERSION, notification};
 
 #[derive(Debug)]
 struct StatusRuntimeContext {
@@ -74,269 +72,14 @@ fn status_runtime_context(
     })
 }
 
-// ── Method registry ──────────────────────────────────────────────
+// ── Method authorization ─────────────────────────────────────────
 //
-// Single source of truth. Every variant maps to exactly one wire
-// string. `from_wire` is a table scan — no hand-written string
-// matching anywhere in this file.
+// `Method` and its wire-name table are defined in `zeroclaw-rpc-proto`. The
+// authorization classification is an extension trait here because it names
+// runtime grants; it keeps the same `method.authz()` call shape.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Method {
-    // Core
-    Initialize,
-    Status,
-    Health,
-    DoctorRun,
-
-    // Sessions (agent chat lives here — session/prompt + session/update
-    // notifications is the RPC equivalent of the gateway's ws/chat)
-    SessionNew,
-    SessionClose,
-    SessionPrompt,
-    SessionConfigure,
-    SessionCancel,
-    SessionGitBranch,
-    SessionList,
-    SessionListAcp,
-    SessionMessages,
-    SessionState,
-    SessionDelete,
-    SessionApprove,
-    SessionKill,
-
-    // Memory
-    MemoryList,
-    MemorySearch,
-    MemoryGet,
-    MemoryStore,
-    MemoryDelete,
-
-    // Cron
-    CronList,
-    CronGet,
-    CronAdd,
-    CronPatch,
-    CronDelete,
-    CronRuns,
-    CronTrigger,
-    CronSettings,
-
-    // Config
-    ConfigGet,
-    ConfigSet,
-    ConfigValidate,
-    ConfigReload,
-    ConfigList,
-    ConfigDelete,
-    ConfigMapKeys,
-    ConfigResolveAliasSource,
-    ConfigMapKeyCreate,
-    ConfigMapKeyDelete,
-    ConfigMapKeyRename,
-    ConfigTemplates,
-
-    // Agents
-    AgentsList,
-    AgentsStatus,
-
-    // Cost
-    CostQuery,
-    CostOrg,
-
-    // Skills
-    SkillsBundles,
-    SkillsList,
-    SkillsRead,
-    SkillsWrite,
-    SkillsDelete,
-
-    // Personality
-    PersonalityList,
-    PersonalityGet,
-    PersonalityPut,
-    PersonalityTemplates,
-
-    // Config introspection (sections, catalog, status)
-    ConfigSections,
-    ConfigStatus,
-    ConfigCatalog,
-    ConfigCatalogModels,
-
-    // Logs / Events
-    LogsSubscribe,
-    LogsQuery,
-    LogsGet,
-
-    // TUI
-    TuiList,
-
-    // Files
-    FileAttach,
-    FsListDir,
-
-    // Locales
-    LocalesList,
-    LocalesFetch,
-
-    // Quickstart (TUI mirror of `/api/quickstart/*` HTTP routes)
-    QuickstartState,
-    QuickstartFields,
-    QuickstartValidate,
-    QuickstartApply,
-    QuickstartDismiss,
-
-    // Certificates (mTLS client-cert lifecycle)
-    CertRenew,
-
-    SopsList,
-    SopsGet,
-    SopsGraph,
-    SopsRun,
-    SopsRuns,
-    SopsRunDetail,
-    SopsRunOverlay,
-    SopsValidate,
-    SopsSave,
-    SopsCreate,
-    SopsDelete,
-    SopsRename,
-    SopsDecide,
-    SopsWireDraft,
-    SopsGraphDraft,
-    SopsTriggerSources,
-    ToolsParamOptions,
-}
-
-impl Method {
-    /// The single table. Wire name ↔ variant, defined once.
-    pub const ALL: &[(Method, &str)] = &[
-        (Method::Initialize, "initialize"),
-        (Method::Status, "status"),
-        (Method::Health, "health"),
-        (Method::DoctorRun, "doctor/run"),
-        // Sessions
-        (Method::SessionNew, "session/new"),
-        (Method::SessionClose, "session/close"),
-        (Method::SessionPrompt, "session/prompt"),
-        (Method::SessionConfigure, "session/configure"),
-        (Method::SessionCancel, "session/cancel"),
-        (Method::SessionGitBranch, "session/git_branch"),
-        (Method::SessionList, "session/list"),
-        (Method::SessionListAcp, "session/list-acp"),
-        (Method::SessionMessages, "session/messages"),
-        (Method::SessionState, "session/state"),
-        (Method::SessionDelete, "session/delete"),
-        (Method::SessionApprove, "session/approve"),
-        (Method::SessionKill, "session/kill"),
-        // Memory
-        (Method::MemoryList, "memory/list"),
-        (Method::MemorySearch, "memory/search"),
-        (Method::MemoryGet, "memory/get"),
-        (Method::MemoryStore, "memory/store"),
-        (Method::MemoryDelete, "memory/delete"),
-        // Cron
-        (Method::CronList, "cron/list"),
-        (Method::CronGet, "cron/get"),
-        (Method::CronAdd, "cron/add"),
-        (Method::CronPatch, "cron/patch"),
-        (Method::CronDelete, "cron/delete"),
-        (Method::CronRuns, "cron/runs"),
-        (Method::CronTrigger, "cron/trigger"),
-        (Method::CronSettings, "cron/settings"),
-        // Config
-        (Method::ConfigGet, "config/get"),
-        (Method::ConfigSet, "config/set"),
-        (Method::ConfigValidate, "config/validate"),
-        (Method::ConfigReload, "config/reload"),
-        (Method::ConfigList, "config/list"),
-        (Method::ConfigDelete, "config/delete"),
-        (Method::ConfigMapKeys, "config/map-keys"),
-        (
-            Method::ConfigResolveAliasSource,
-            "config/resolve-alias-source",
-        ),
-        (Method::ConfigMapKeyCreate, "config/map-key-create"),
-        (Method::ConfigMapKeyDelete, "config/map-key-delete"),
-        (Method::ConfigMapKeyRename, "config/map-key-rename"),
-        (Method::ConfigTemplates, "config/templates"),
-        // Agents
-        (Method::AgentsList, "agents/list"),
-        (Method::AgentsStatus, "agents/status"),
-        // Cost
-        (Method::CostQuery, "cost/query"),
-        (Method::CostOrg, "cost/org"),
-        // Skills
-        (Method::SkillsBundles, "skills/bundles"),
-        (Method::SkillsList, "skills/list"),
-        (Method::SkillsRead, "skills/read"),
-        (Method::SkillsWrite, "skills/write"),
-        (Method::SkillsDelete, "skills/delete"),
-        // Personality
-        (Method::PersonalityList, "personality/list"),
-        (Method::PersonalityGet, "personality/get"),
-        (Method::PersonalityPut, "personality/put"),
-        (Method::PersonalityTemplates, "personality/templates"),
-        // Config introspection
-        (Method::ConfigSections, "config/sections"),
-        (Method::ConfigStatus, "config/status"),
-        (Method::ConfigCatalog, "config/catalog"),
-        (Method::ConfigCatalogModels, "config/catalog-models"),
-        // Logs
-        (Method::LogsSubscribe, "logs/subscribe"),
-        (Method::LogsQuery, "logs/query"),
-        (Method::LogsGet, "logs/get"),
-        // TUI
-        (Method::TuiList, "tui/list"),
-        // Files
-        (Method::FileAttach, "file/attach"),
-        (Method::FsListDir, "fs/list_dir"),
-        // Locales
-        (Method::LocalesList, "locales/list"),
-        (Method::LocalesFetch, "locales/fetch"),
-        // Quickstart
-        (Method::QuickstartState, "quickstart/state"),
-        (Method::QuickstartFields, "quickstart/fields"),
-        (Method::QuickstartValidate, "quickstart/validate"),
-        (Method::QuickstartApply, "quickstart/apply"),
-        (Method::QuickstartDismiss, "quickstart/dismiss"),
-        (Method::CertRenew, "cert/renew"),
-        (Method::SopsList, "sops/list"),
-        (Method::SopsGet, "sops/get"),
-        (Method::SopsGraph, "sops/graph"),
-        (Method::SopsRun, "sops/run"),
-        (Method::SopsRuns, "sops/runs"),
-        (Method::SopsRunDetail, "sops/run-detail"),
-        (Method::SopsRunOverlay, "sops/run-overlay"),
-        (Method::SopsValidate, "sops/validate"),
-        (Method::SopsSave, "sops/save"),
-        (Method::SopsCreate, "sops/create"),
-        (Method::SopsDelete, "sops/delete"),
-        (Method::SopsRename, "sops/rename"),
-        (Method::SopsDecide, "sops/decide"),
-        (Method::SopsWireDraft, "sops/wire-draft"),
-        (Method::SopsGraphDraft, "sops/graph-draft"),
-        (Method::SopsTriggerSources, "sops/trigger-sources"),
-        (Method::ToolsParamOptions, "tools/param-options"),
-    ];
-
-    /// Resolve a wire method name to a variant. Table scan, no hand-written
-    /// string matching.
-    pub fn from_wire(s: &str) -> Option<Self> {
-        Self::ALL
-            .iter()
-            .find(|(_, wire)| *wire == s)
-            .map(|(m, _)| *m)
-    }
-
-    /// Wire name for this variant.
-    pub fn wire_name(self) -> &'static str {
-        Self::ALL
-            .iter()
-            .find(|(m, _)| *m == self)
-            .map(|(_, wire)| *wire)
-            .expect("every variant is in ALL")
-    }
-
+/// Authorization classification for every RPC [`Method`].
+pub trait MethodAuthzExt {
     /// Authorization classification (RFC 7141 gate-by-construction). The
     /// match is arm-complete over the closed `Method` enum, so adding a
     /// variant without classifying it is a COMPILE ERROR — a new method
@@ -344,7 +87,11 @@ impl Method {
     /// [`MethodAuthz::Handshake`] sentinel (rather than an `Option`) keeps
     /// every ungated method greppable and deliberate; initialize and mTLS
     /// certificate renewal are the only transport-authenticated ones.
-    pub fn authz(self) -> MethodAuthz {
+    fn authz(self) -> MethodAuthz;
+}
+
+impl MethodAuthzExt for Method {
+    fn authz(self) -> MethodAuthz {
         use Method as M;
         use zeroclaw_api::grants::{Resource, Verb};
         let (resource, verb) = match self {
@@ -448,7 +195,7 @@ impl Method {
 }
 
 /// How a method relates to authorization: the handshake itself, or a
-/// required resource-verb grant. See [`Method::authz`].
+/// required resource-verb grant. See [`MethodAuthzExt::authz`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MethodAuthz {
     /// Runs before a principal is bound. Only the handshake qualifies.

@@ -1,0 +1,6012 @@
+{
+  "components": {
+    "schemas": {
+      "AgentEntry": {
+        "properties": {
+          "alias": {
+            "type": "string"
+          },
+          "channels": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "alias",
+          "enabled",
+          "channels"
+        ],
+        "type": "object"
+      },
+      "AgentIdentity": {
+        "description": "Agent identity payload from the Agent step. Personality file\nauthoring is handled by the existing `PersonalityEditor` widget;\nQuickstart passes only the chosen `personality_file` path here.",
+        "properties": {
+          "name": {
+            "description": "Agent alias — also the key written to `agents.<name>`. Must\nnot collide with an existing agent alias; runtime validation\nrejects collisions before apply.",
+            "type": "string"
+          },
+          "personality_file": {
+            "description": "Optional personality file path written to\n`agents.<name>.personality_file`. `None` ships the agent with\nno personality file (the existing optional pattern).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "personality_files": {
+            "default": [],
+            "description": "Staged personality file contents to write into the agent's\nworkspace during the atomic apply. Empty list = no files\nwritten. Surfaces validate the filename against the canonical\n`EDITABLE_PERSONALITY_FILES` list before staging.",
+            "items": {
+              "$ref": "#/components/schemas/QuickstartPersonalityFile"
+            },
+            "type": "array"
+          },
+          "system_prompt": {
+            "description": "System prompt text. Sourced from the personality template\npicker in the UI (`default` or `blank`); Quickstart does not\npre-fill this field itself.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "system_prompt"
+        ],
+        "type": "object"
+      },
+      "AgentStatusEntry": {
+        "properties": {
+          "alias": {
+            "type": "string"
+          },
+          "channels": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "live_sessions": {
+            "default": 0,
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "persisted_sessions": {
+            "default": 0,
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "alias",
+          "enabled"
+        ],
+        "type": "object"
+      },
+      "AgentsListResult": {
+        "properties": {
+          "agents": {
+            "items": {
+              "$ref": "#/components/schemas/AgentEntry"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "agents"
+        ],
+        "type": "object"
+      },
+      "AgentsStatusResult": {
+        "properties": {
+          "agents": {
+            "items": {
+              "$ref": "#/components/schemas/AgentStatusEntry"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "agents"
+        ],
+        "type": "object"
+      },
+      "AliasSource": {
+        "enum": [
+          "model_providers",
+          "tts_providers",
+          "transcription_providers",
+          "channels",
+          "risk_profiles",
+          "runtime_profiles",
+          "agents",
+          "skill_bundles",
+          "knowledge_bundles",
+          "mcp_bundles"
+        ],
+        "type": "string"
+      },
+      "BuilderSubmission": {
+        "description": "Complete builder submission consumed by the shared Quickstart apply path.",
+        "properties": {
+          "agent": {
+            "$ref": "#/components/schemas/AgentIdentity",
+            "description": "Agent identity (always create-new — there's no reuse path)."
+          },
+          "channels": {
+            "description": "Channels step. 0..N entries. Each is either a freshly-built\n[`ChannelQuickStart`] or the alias of an existing channel.\nThe agent's `channels` field is auto-bound to every entry in\nthis vec at apply time.",
+            "items": {
+              "$ref": "#/components/schemas/SelectorChoice4"
+            },
+            "type": "array"
+          },
+          "memory": {
+            "$ref": "#/components/schemas/SelectorChoice3",
+            "description": "Memory step. Either a fresh [`MemoryChoice`] or the alias of\nan existing `storage.<type>.<alias>` entry."
+          },
+          "model_provider": {
+            "$ref": "#/components/schemas/SelectorChoice",
+            "description": "Model provider step submission. Always a `Create new` shape\nin this initial cut — `Use existing` is represented by\n[`SelectorChoice::Existing`] in the wrapper enum below."
+          },
+          "peer_groups": {
+            "default": [],
+            "description": "Peer groups to materialize. Each entry can reference either a\nstaged channel from `channels` (above) or an already-configured\nchannel ref. Empty list = no peer-group rows written.",
+            "items": {
+              "$ref": "#/components/schemas/QuickstartPeerGroup"
+            },
+            "type": "array"
+          },
+          "risk_profile": {
+            "$ref": "#/components/schemas/SelectorChoice2",
+            "description": "Risk profile preset key from [`RISK_PRESETS`], or the alias\nof an existing `risk-profiles.<alias>`."
+          },
+          "runtime_profile": {
+            "$ref": "#/components/schemas/SelectorChoice2",
+            "description": "Runtime profile preset key from [`RUNTIME_PRESETS`], or the\nalias of an existing `runtime-profiles.<alias>`."
+          }
+        },
+        "required": [
+          "model_provider",
+          "risk_profile",
+          "runtime_profile",
+          "memory",
+          "channels",
+          "agent"
+        ],
+        "type": "object"
+      },
+      "CatalogModelProvider": {
+        "description": "Consolidates gateway `CatalogModelProvider`.",
+        "properties": {
+          "display_name": {
+            "type": "string"
+          },
+          "local": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "display_name",
+          "local"
+        ],
+        "type": "object"
+      },
+      "CatalogModelsParams": {
+        "properties": {
+          "model_provider": {
+            "description": "Accepts `model_provider` or aliased `provider` (gateway compat).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model_provider"
+        ],
+        "type": "object"
+      },
+      "CatalogModelsResult": {
+        "description": "Consolidates gateway `ModelsResponse`.",
+        "properties": {
+          "live": {
+            "type": "boolean"
+          },
+          "local": {
+            "type": "boolean"
+          },
+          "model_provider": {
+            "type": "string"
+          },
+          "models": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "pricing": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ModelPricing"
+            },
+            "description": "Optional pricing data keyed by model id. Populated when the\nprovider's `/models` endpoint returns pricing (Kilo Gateway,\nOpenRouter, etc.). Absent for catalog fallbacks without pricing.",
+            "type": [
+              "object",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "model_provider",
+          "models",
+          "local",
+          "live"
+        ],
+        "type": "object"
+      },
+      "CatalogResponse": {
+        "description": "Consolidates gateway `CatalogResponse`.",
+        "properties": {
+          "model_providers": {
+            "items": {
+              "$ref": "#/components/schemas/CatalogModelProvider"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "model_providers"
+        ],
+        "type": "object"
+      },
+      "ChannelQuickStart": {
+        "description": "One channel selection submitted by the Quickstart builder.",
+        "properties": {
+          "alias": {
+            "description": "User-named alias for this channel entry. Defaults to\n`channel_type` in the UI; users override when stacking\nmultiple aliases of the same channel type.",
+            "type": "string"
+          },
+          "channel_type": {
+            "description": "Channel type identifier (`cli`, `telegram`, `discord`, `web`\nin the FTUE-supported set).",
+            "type": "string"
+          },
+          "fields": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Round-trip of every field the daemon described in\n`quickstart/fields`. Surfaces echo back exactly what was\nemitted; the daemon writes each entry under `<prefix>.<key>`\nusing its own schema knowledge.",
+            "type": "object"
+          }
+        },
+        "required": [
+          "channel_type",
+          "alias"
+        ],
+        "type": "object"
+      },
+      "CommandDescriptor": {
+        "description": "Command identity and accepted tokens advertised to an RPC client.",
+        "properties": {
+          "aliases": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "type": "object"
+      },
+      "ConfigDeleteParams": {
+        "properties": {
+          "prop": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "prop"
+        ],
+        "type": "object"
+      },
+      "ConfigDeleteResult": {
+        "properties": {
+          "deleted": {
+            "type": "boolean"
+          },
+          "prop": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "prop",
+          "deleted"
+        ],
+        "type": "object"
+      },
+      "ConfigGetParams": {
+        "properties": {
+          "prop": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ConfigListParams": {
+        "properties": {
+          "prefix": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ConfigListResult": {
+        "properties": {
+          "entries": {
+            "items": true,
+            "type": "array"
+          }
+        },
+        "required": [
+          "entries"
+        ],
+        "type": "object"
+      },
+      "ConfigMapKeyCreateParams": {
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "key"
+        ],
+        "type": "object"
+      },
+      "ConfigMapKeyCreateResult": {
+        "properties": {
+          "created": {
+            "type": "boolean"
+          },
+          "key": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "key",
+          "created"
+        ],
+        "type": "object"
+      },
+      "ConfigMapKeyDeleteParams": {
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "key"
+        ],
+        "type": "object"
+      },
+      "ConfigMapKeyDeleteResult": {
+        "properties": {
+          "deleted": {
+            "type": "boolean"
+          },
+          "key": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "key",
+          "deleted"
+        ],
+        "type": "object"
+      },
+      "ConfigMapKeyRenameParams": {
+        "properties": {
+          "from": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "to": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "from",
+          "to"
+        ],
+        "type": "object"
+      },
+      "ConfigMapKeyRenameResult": {
+        "properties": {
+          "from": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "renamed": {
+            "type": "boolean"
+          },
+          "to": {
+            "type": "string"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "path",
+          "from",
+          "to",
+          "renamed"
+        ],
+        "type": "object"
+      },
+      "ConfigMapKeysParams": {
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "ConfigMapKeysResult": {
+        "properties": {
+          "keys": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "keys"
+        ],
+        "type": "object"
+      },
+      "ConfigReloadResult": {
+        "properties": {
+          "reloading": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "reloading"
+        ],
+        "type": "object"
+      },
+      "ConfigResolveAliasSourceParams": {
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/AliasSource"
+          }
+        },
+        "required": [
+          "source"
+        ],
+        "type": "object"
+      },
+      "ConfigResolveAliasSourceResult": {
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/AliasSource"
+          },
+          "values": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "source",
+          "values"
+        ],
+        "type": "object"
+      },
+      "ConfigSectionEntry": {
+        "description": "A config section entry for the dashboard sidebar / TUI section list.",
+        "properties": {
+          "completed": {
+            "type": "boolean"
+          },
+          "cost_category": {
+            "default": "",
+            "type": "string"
+          },
+          "group": {
+            "default": "",
+            "description": "Display group for the dashboard sidebar.",
+            "type": "string"
+          },
+          "group_key": {
+            "default": "",
+            "description": "Stable locale-independent group identifier.",
+            "type": "string"
+          },
+          "has_picker": {
+            "type": "boolean"
+          },
+          "help": {
+            "type": "string"
+          },
+          "is_quickstart": {
+            "default": false,
+            "description": "`true` when this section is part of the canonical Quickstart list.",
+            "type": "boolean"
+          },
+          "key": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "ready": {
+            "default": false,
+            "description": "Whether the section currently has enough usable config for the\nfirst-run path.",
+            "type": "boolean"
+          },
+          "shape": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SectionShape"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Editor shape (direct form / one-tier alias map / typed-family map /\nbackend picker)."
+          }
+        },
+        "required": [
+          "key",
+          "label",
+          "help",
+          "has_picker",
+          "completed"
+        ],
+        "type": "object"
+      },
+      "ConfigSectionsResult": {
+        "description": "Response for `config/sections`.",
+        "properties": {
+          "sections": {
+            "items": {
+              "$ref": "#/components/schemas/ConfigSectionEntry"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "sections"
+        ],
+        "type": "object"
+      },
+      "ConfigSetParams": {
+        "description": "Value is polymorphic: a JSON string passes through as-is (backward\ncompat); any other JSON type is coerced via `coerce_for_set_prop`.",
+        "properties": {
+          "prop": {
+            "type": "string"
+          },
+          "value": true
+        },
+        "required": [
+          "prop",
+          "value"
+        ],
+        "type": "object"
+      },
+      "ConfigSetResult": {
+        "properties": {
+          "prop": {
+            "type": "string"
+          },
+          "set": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "prop",
+          "set"
+        ],
+        "type": "object"
+      },
+      "ConfigStatusResult": {
+        "description": "Config readiness status for the dashboard/TUI.",
+        "properties": {
+          "has_partial_state": {
+            "type": "boolean"
+          },
+          "missing": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "needs_quickstart": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "needs_quickstart",
+          "reason",
+          "has_partial_state",
+          "missing"
+        ],
+        "type": "object"
+      },
+      "ConfigTemplateEntry": {
+        "description": "Owned wire representation of a [`zeroclaw_config::traits::MapKeySection`].\nThe upstream type uses `&'static str` fields that can't round-trip\nthrough `Deserialize`, so this owned copy serves as the wire format.",
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/MapKeyKind"
+          },
+          "path": {
+            "type": "string"
+          },
+          "value_type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "kind",
+          "value_type",
+          "description"
+        ],
+        "type": "object"
+      },
+      "ConfigTemplatesResult": {
+        "properties": {
+          "templates": {
+            "items": {
+              "$ref": "#/components/schemas/ConfigTemplateEntry"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "templates"
+        ],
+        "type": "object"
+      },
+      "ConfigValidateResult": {
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "valid": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "valid"
+        ],
+        "type": "object"
+      },
+      "CostQueryParams": {
+        "description": "Params for `cost/query`. Consolidates gateway `CostQuery`.",
+        "properties": {
+          "agent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "from": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "to": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "CronDeleteResult": {
+        "properties": {
+          "deleted": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "deleted"
+        ],
+        "type": "object"
+      },
+      "CronIdParams": {
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "CronPatchParams": {
+        "description": "Params for `cron/patch`. Consolidates gateway `CronPatchBody`.",
+        "properties": {
+          "agent": {
+            "type": "string"
+          },
+          "clear_tz": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "command": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prompt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "schedule": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tz": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "agent"
+        ],
+        "type": "object"
+      },
+      "CronRunsParams": {
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "limit": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "CronTriggerResult": {
+        "properties": {
+          "duration_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "finished_at": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "output": {
+            "type": "string"
+          },
+          "started_at": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "success": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "success",
+          "status",
+          "output",
+          "duration_ms",
+          "started_at",
+          "finished_at"
+        ],
+        "type": "object"
+      },
+      "FileAttachParams": {
+        "properties": {
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/FileEntry"
+            },
+            "type": "array"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "files"
+        ],
+        "type": "object"
+      },
+      "FileAttachResult": {
+        "properties": {
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/FileEntryResult"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "files"
+        ],
+        "type": "object"
+      },
+      "FileEntry": {
+        "description": "A single file entry in a `file/attach` request. Either `path` (daemon\nreads from local disk — Unix socket only) or `data_b64` (client sends\nbase64-encoded bytes) must be present.",
+        "properties": {
+          "data_b64": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "filename": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mime_type": {
+            "description": "Advisory only, retained for wire compatibility. The image/document\nmarker decision is made from the filename and payload bytes via the\ncanonical provider-loadable contract, never from this field.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "$ref": "#/components/schemas/FileSource",
+            "default": "file"
+          }
+        },
+        "type": "object"
+      },
+      "FileEntryResult": {
+        "description": "Result for a single file in a `file/attach` response.",
+        "properties": {
+          "deduplicated": {
+            "type": "boolean"
+          },
+          "marker": {
+            "type": "string"
+          },
+          "ref_id": {
+            "type": "string"
+          },
+          "size_bytes": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "workspace_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ref_id",
+          "marker",
+          "workspace_path",
+          "size_bytes",
+          "deduplicated"
+        ],
+        "type": "object"
+      },
+      "FileSource": {
+        "description": "Source hint for how the client obtained the file.",
+        "enum": [
+          "clipboard",
+          "file"
+        ],
+        "type": "string"
+      },
+      "FlowRole": {
+        "description": "Why a flow wire exists. Mirrors the `StepRouting`/`StepFailure` field it\nwas derived from, so an editor can write edits back to the right place.",
+        "oneOf": [
+          {
+            "const": "sequence",
+            "description": "Implicit fallthrough or explicit `routing.next`.",
+            "type": "string"
+          },
+          {
+            "const": "dependency",
+            "description": "`routing.depends_on` fan-in: source must complete before target runs.",
+            "type": "string"
+          },
+          {
+            "const": "failure",
+            "description": "`on_failure: goto` recovery edge.",
+            "type": "string"
+          },
+          {
+            "const": "switch",
+            "description": "Named conditional port from `routing.switch`.",
+            "type": "string"
+          },
+          {
+            "const": "trigger",
+            "description": "Derived from the SOP's triggers; read-only, never hand-wired.",
+            "type": "string"
+          }
+        ]
+      },
+      "GraphDiagnostic": {
+        "description": "A validation finding anchored to a step. Errors block saving\n(`validate_sop_strict`); warnings render but do not block.",
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "severity": {
+            "$ref": "#/components/schemas/GraphSeverity"
+          },
+          "step": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "severity",
+          "step",
+          "message"
+        ],
+        "type": "object"
+      },
+      "GraphLayout": {
+        "description": "Deterministic auto-layout so every surface renders the same picture\nwithout a client-side layout engine.",
+        "properties": {
+          "columns": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "geometry": {
+            "$ref": "#/components/schemas/LayoutGeometry",
+            "default": {
+              "col_gap": 130.0,
+              "node_h": 84.0,
+              "node_w": 210.0,
+              "origin": 24.0,
+              "row_gap": 46.0
+            }
+          },
+          "positions": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/NodePosition"
+            },
+            "type": "array"
+          },
+          "rows": {
+            "default": 0,
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "GraphNode": {
+        "description": "A node in the projected graph: one SOP step, or one synthetic trigger\nentry (`step >= TRIGGER_NODE_BASE`, `trigger_index` set).",
+        "properties": {
+          "inputs": {
+            "items": {
+              "$ref": "#/components/schemas/GraphPin"
+            },
+            "type": "array"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/NodeKind",
+            "default": "step"
+          },
+          "outputs": {
+            "items": {
+              "$ref": "#/components/schemas/GraphPin"
+            },
+            "type": "array"
+          },
+          "step": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "subtitle": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": "string"
+          },
+          "trigger_index": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "step",
+          "title",
+          "inputs",
+          "outputs"
+        ],
+        "type": "object"
+      },
+      "GraphPin": {
+        "description": "One connection point on a node. Flow pins order execution; data pins\ncarry the step's declared input/output schema type.",
+        "properties": {
+          "class": {
+            "$ref": "#/components/schemas/PinClass"
+          },
+          "data_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "required": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "class",
+          "name",
+          "required"
+        ],
+        "type": "object"
+      },
+      "GraphSeverity": {
+        "enum": [
+          "warning",
+          "error"
+        ],
+        "type": "string"
+      },
+      "GraphWire": {
+        "description": "A directed edge between two nodes. `flow_role` is set for flow wires;\ndata wires carry the producer/consumer pin names instead.",
+        "properties": {
+          "class": {
+            "$ref": "#/components/schemas/PinClass"
+          },
+          "flow_role": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FlowRole"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "from_pin": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "from_step": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "to_pin": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "to_step": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "class",
+          "from_step",
+          "to_step"
+        ],
+        "type": "object"
+      },
+      "InitializeParams": {
+        "properties": {
+          "auth_provider": {
+            "description": "Which configured provider verifies `auth_token` (e.g. `native`,\n`oidc.corp`). Defaults to `native`. Selection is explicit and\nfinal: the selected provider's denial never falls through to\nanother provider.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "auth_token": {
+            "description": "Explicit credential for authentication (a native pairing token\nor an OIDC access token). Wins over the transport-intrinsic\npeer credential when present.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "clientCapabilities": true,
+          "env": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Shell environment from the TUI process, used to forward the user's\nreal env (PATH, credentials, etc.) to subprocesses spawned by the\ndaemon on their behalf. Omitted by older clients; defaults to empty.",
+            "type": "object"
+          },
+          "protocol_version": {
+            "default": 1,
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tui_id": {
+            "description": "TUI ID from a previous connection (reconnection).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tui_sig": {
+            "description": "HMAC signature proving ownership of the claimed TUI ID.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "InitializeResult": {
+        "properties": {
+          "auth_methods": {
+            "description": "Configured auth provider selection keys (e.g. `native`,\n`peercred`, `oidc.corp`).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "capabilities": {
+            "description": "Supported RPC method names (e.g. \"session/prompt\", \"memory/list\").",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "commands": {
+            "default": [],
+            "description": "Shared command catalogue entries available on the TUI surface.\n\nAlways serialized so a new daemon's authoritative empty catalogue\nremains distinguishable from an older daemon that predates this\nfield.",
+            "items": {
+              "$ref": "#/components/schemas/CommandDescriptor"
+            },
+            "type": "array"
+          },
+          "principal_id": {
+            "description": "Canonical principal id this connection is bound to.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "protocol_version": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "server_pid": {
+            "description": "OS process ID of the daemon serving this connection.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "server_version": {
+            "type": "string"
+          },
+          "tui_id": {
+            "description": "Assigned TUI session UID.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tui_sig": {
+            "description": "HMAC signature for reconnection. Pass back in next initialize.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "protocol_version",
+          "server_version",
+          "server_pid"
+        ],
+        "type": "object"
+      },
+      "LayoutGeometry": {
+        "description": "Canvas geometry carried on every serialized graph so the web canvas reads\nplacement pitch from the wire instead of a local literal. The values are\nfixed by [`LayoutGeometry::CANONICAL`]; the struct rides on `GraphLayout`\nonly to expose them to non-Rust surfaces.",
+        "properties": {
+          "col_gap": {
+            "format": "double",
+            "type": "number"
+          },
+          "node_h": {
+            "format": "double",
+            "type": "number"
+          },
+          "node_w": {
+            "format": "double",
+            "type": "number"
+          },
+          "origin": {
+            "format": "double",
+            "type": "number"
+          },
+          "row_gap": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "node_w",
+          "node_h",
+          "col_gap",
+          "row_gap",
+          "origin"
+        ],
+        "type": "object"
+      },
+      "LogsGetParams": {
+        "description": "`logs/get` params — fetch a single event by id.",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "LogsGetResult": {
+        "description": "`logs/get` result. `event` is the full `LogEvent` payload\n(attributes, attribution map, span ids, …) that the Logs pane\nonly renders inside the detail modal — list rows store\npreview-only data.",
+        "properties": {
+          "event": true
+        },
+        "required": [
+          "event"
+        ],
+        "type": "object"
+      },
+      "LogsQueryParams": {
+        "properties": {
+          "action": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "category": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "hide_internal": {
+            "default": false,
+            "type": "boolean"
+          },
+          "limit": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "outcome": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "q": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "severity_min": {
+            "default": null,
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "since_ts": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sop_run_id": {
+            "default": null,
+            "description": "Exact SOP run correlation. Uses the canonical persisted-log\nattribution filter, including its compatibility bridge for older rows.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "trace_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "until_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "until_line_offset": {
+            "default": null,
+            "description": "Byte offset to resume reading from. Set from the previous\n`LogsQueryResult::next_cursor_line_offset` for deterministic\npagination regardless of id ordering.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "until_segment_cursor": {
+            "default": null,
+            "description": "Segment-aware cursor. Set from `LogsQueryResult::next_segment_cursor`\nto paginate across rotated archive files. Takes precedence over\n`until_line_offset` when both are supplied.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "until_ts": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "LogsQueryResult": {
+        "properties": {
+          "at_end": {
+            "type": "boolean"
+          },
+          "events": {
+            "items": true,
+            "type": "array"
+          },
+          "incomplete": {
+            "description": "True when a retained segment could not be read and was left out of\nthis page. `at_end` then means \"no older events among the segments\nthat could be read\", which is weaker than \"no older events exist\",\nso a client that stops paging on `at_end` should say the history is\npartial rather than present it as complete.",
+            "type": "boolean"
+          },
+          "log_path": {
+            "description": "Resolved path of the active installed persistence writer.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_cursor": {
+            "deprecated": true,
+            "description": "Legacy cursor. Deprecated since 0.8.0; tracked for removal in\n<https://github.com/zeroclaw-labs/zeroclaw/issues/8012>.",
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "next_cursor_line_offset": {
+            "description": "Byte offset past the last event on this page. Callers should\npass this back as `until_line_offset` on the next request to\nresume without re-scanning already-read bytes.\n\nFor multi-segment deployments, this is `None` when the oldest event\non the page is in an archive file — use `next_segment_cursor` instead.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "next_segment_cursor": {
+            "description": "Segment-aware cursor for the oldest event on this page. Pass back\nas `until_segment_cursor` to walk older pages across segment\nboundaries. Supersedes `next_cursor_line_offset` for `rotating`-mode\ndeployments with multiple retained segments.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "events",
+          "at_end",
+          "incomplete"
+        ],
+        "type": "object"
+      },
+      "LogsSubscribeResult": {
+        "properties": {
+          "subscribed": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "subscribed"
+        ],
+        "type": "object"
+      },
+      "MapKeyKind": {
+        "description": "Stable wire-form for an addable section — a `HashMap<String, T>` (Map) or\n`Vec<T>` (List) field whose value type implements `Configurable`. The\ndashboard / CLI use this to surface `+ Add` affordances without\nhardcoding the section list. Auto-discovered by the `Configurable` derive.",
+        "oneOf": [
+          {
+            "const": "map",
+            "description": "`HashMap<String, T>` — key is user-supplied; new value is default.",
+            "type": "string"
+          },
+          {
+            "const": "list",
+            "description": "`Vec<T>` — entries are appended; the user-supplied \"key\" is stored\nin the value type's natural identifier field (e.g. `name`, `hint`).",
+            "type": "string"
+          }
+        ]
+      },
+      "MemoryBackendKind": {
+        "description": "Selects the memory backend used by an agent.",
+        "oneOf": [
+          {
+            "const": "none",
+            "description": "No memory backend. Recall returns empty; stores are no-ops.",
+            "type": "string"
+          },
+          {
+            "const": "sqlite",
+            "description": "Embedded SQLite (`crates/zeroclaw-memory/src/sqlite.rs`). Default for\nnew installs because every supported platform can run it without\nextra services.",
+            "type": "string"
+          },
+          {
+            "const": "postgres",
+            "description": "PostgreSQL with optional pgvector\n(`crates/zeroclaw-memory/src/postgres.rs`, feature `memory-postgres`).",
+            "type": "string"
+          },
+          {
+            "const": "qdrant",
+            "description": "Qdrant vector store (`crates/zeroclaw-memory/src/qdrant.rs`).",
+            "type": "string"
+          },
+          {
+            "const": "markdown",
+            "description": "Markdown files in the agent's workspace\n(`crates/zeroclaw-memory/src/markdown.rs`).",
+            "type": "string"
+          },
+          {
+            "const": "lucid",
+            "description": "Hybrid local SQLite + external Lucid CLI\n(`crates/zeroclaw-memory/src/lucid.rs`).",
+            "type": "string"
+          }
+        ]
+      },
+      "MemoryDeleteParams": {
+        "description": "Params for `memory/delete`. Consolidates gateway `MemoryDeleteQuery`.",
+        "properties": {
+          "agent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "type": "object"
+      },
+      "MemoryDeleteResult": {
+        "properties": {
+          "deleted": {
+            "type": "boolean"
+          },
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "deleted"
+        ],
+        "type": "object"
+      },
+      "MemoryGetParams": {
+        "description": "`memory/get` params — fetch one entry's full content by key.",
+        "properties": {
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "type": "object"
+      },
+      "MemoryGetResult": {
+        "description": "`memory/get` result. `entry` carries the full content\nthe Memory pane only renders inside the detail modal —\nlist rows store preview-only data.",
+        "properties": {
+          "entry": true
+        },
+        "type": "object"
+      },
+      "MemoryListParams": {
+        "description": "Params for `memory/list`. Consolidates gateway `MemoryQuery` (list mode).",
+        "properties": {
+          "agent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "category": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "MemoryListResult": {
+        "properties": {
+          "count": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "entries": {
+            "items": true,
+            "type": "array"
+          }
+        },
+        "required": [
+          "entries",
+          "count"
+        ],
+        "type": "object"
+      },
+      "MemorySearchParams": {
+        "description": "Params for `memory/search`. Consolidates gateway `MemoryQuery` (search mode).",
+        "properties": {
+          "agent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "default": 10,
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "query": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "since": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "until": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "MemorySearchResult": {
+        "properties": {
+          "count": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "entries": {
+            "items": true,
+            "type": "array"
+          }
+        },
+        "required": [
+          "entries",
+          "count"
+        ],
+        "type": "object"
+      },
+      "MemoryStoreParams": {
+        "description": "Params for `memory/store`. Consolidates gateway `MemoryStoreBody`.",
+        "properties": {
+          "agent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "category": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "content": {
+            "type": "string"
+          },
+          "key": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "key",
+          "content"
+        ],
+        "type": "object"
+      },
+      "MemoryStoreResult": {
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "stored": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "key",
+          "stored"
+        ],
+        "type": "object"
+      },
+      "MessageEntry": {
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/MessageEntryKind",
+            "default": "message"
+          },
+          "role": {
+            "type": "string"
+          },
+          "tool_call_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tool_input": true,
+          "tool_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tool_output": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "role",
+          "content"
+        ],
+        "type": "object"
+      },
+      "MessageEntryKind": {
+        "enum": [
+          "message",
+          "tool_call",
+          "tool_result"
+        ],
+        "type": "string"
+      },
+      "ModelPricing": {
+        "properties": {
+          "completion": {
+            "description": "Output/completion tokens per-token rate (USD per token, e.g. `\"0.000020\"` = $20/1M tokens).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "input_cache_read": {
+            "description": "Cached input read rate — per-token charge for reading cached prompt data\n(USD per token, e.g. `\"0.000001\"` = $1/1M tokens). Kilo Gateway specific.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "input_cache_write": {
+            "description": "Cached input write rate — per-token charge for writing prompt data to cache\n(USD per token, e.g. `\"0.000001\"` = $1/1M tokens). Kilo Gateway specific.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prompt": {
+            "description": "Input/prompt tokens per-token rate (USD per token, e.g. `\"0.000005\"` = $5/1M tokens).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ModelProviderChoice": {
+        "description": "Model provider selection submitted by the Quickstart builder.",
+        "properties": {
+          "alias": {
+            "description": "User-named alias. Defaults to `\"default\"` in the UI; users\noverride when stacking multiple aliases of the same provider\ntype (e.g. `anthropic-work`, `anthropic-personal`).",
+            "type": "string"
+          },
+          "fields": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Round-trip of every field the daemon described in\n`quickstart/fields`. Surfaces echo back exactly what was\nemitted; the daemon writes each entry under `<prefix>.<key>`\nusing its own schema knowledge.",
+            "type": "object"
+          },
+          "model": {
+            "description": "Model id written to `providers.models.<type>.<alias>.model` at\napply time.",
+            "type": "string"
+          },
+          "provider_type": {
+            "description": "Provider type identifier (`anthropic`, `openai`, `openrouter`,\n`ollama`, etc.). Used as the type segment in the TOML path.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider_type",
+          "alias",
+          "model"
+        ],
+        "type": "object"
+      },
+      "NodeKind": {
+        "oneOf": [
+          {
+            "const": "step",
+            "description": "An executable SOP step.",
+            "type": "string"
+          },
+          {
+            "const": "trigger",
+            "description": "A synthetic entry node representing one of the SOP's triggers.",
+            "type": "string"
+          }
+        ]
+      },
+      "NodePosition": {
+        "description": "Grid placement for one node: column = longest flow path from an entry,\nrow = order of insertion within that column. `x`/`y` carry a persisted\ncanvas coordinate when the node has been dragged; absent otherwise.",
+        "properties": {
+          "col": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "row": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "step": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "x": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "y": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "step",
+          "col",
+          "row"
+        ],
+        "type": "object"
+      },
+      "PersonalityFileEntry": {
+        "description": "Consolidates gateway `PersonalityIndexEntry`.",
+        "properties": {
+          "exists": {
+            "type": "boolean"
+          },
+          "filename": {
+            "type": "string"
+          },
+          "mtime_ms": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "size": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "filename",
+          "exists"
+        ],
+        "type": "object"
+      },
+      "PersonalityGetParams": {
+        "properties": {
+          "agent": {
+            "type": "string"
+          },
+          "filename": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent",
+          "filename"
+        ],
+        "type": "object"
+      },
+      "PersonalityGetResult": {
+        "description": "Consolidates gateway `PersonalityFileResponse`.",
+        "properties": {
+          "content": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "exists": {
+            "type": "boolean"
+          },
+          "filename": {
+            "type": "string"
+          },
+          "mtime_ms": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "truncated": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "filename",
+          "exists"
+        ],
+        "type": "object"
+      },
+      "PersonalityListParams": {
+        "properties": {
+          "agent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "PersonalityListResult": {
+        "description": "Consolidates gateway `PersonalityIndex`.",
+        "properties": {
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/PersonalityFileEntry"
+            },
+            "type": "array"
+          },
+          "max_chars": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "files",
+          "max_chars"
+        ],
+        "type": "object"
+      },
+      "PersonalityPutParams": {
+        "properties": {
+          "agent": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          },
+          "filename": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent",
+          "filename",
+          "content"
+        ],
+        "type": "object"
+      },
+      "PersonalityPutResult": {
+        "description": "Consolidates gateway `PersonalityPutResponse`.",
+        "properties": {
+          "bytes_written": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "mtime_ms": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "bytes_written"
+        ],
+        "type": "object"
+      },
+      "PersonalityTemplatesParams": {
+        "properties": {
+          "agent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "PersonalityTemplatesResult": {
+        "description": "Consolidates gateway `TemplateResponse`.",
+        "properties": {
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/TemplateFileEntry"
+            },
+            "type": "array"
+          },
+          "preset": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "preset",
+          "files"
+        ],
+        "type": "object"
+      },
+      "PinClass": {
+        "oneOf": [
+          {
+            "const": "flow",
+            "description": "Execution-order edge: which step runs after which.",
+            "type": "string"
+          },
+          {
+            "const": "data",
+            "description": "Typed data edge derived from a `{{steps.N}}` binding.",
+            "type": "string"
+          }
+        ]
+      },
+      "PlanEntry": {
+        "description": "A single plan entry. ACP-shaped (`content`/`priority`/`status`) plus\nthe optional ZeroClaw `active_form` extension.",
+        "properties": {
+          "activeForm": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "content": {
+            "type": "string"
+          },
+          "priority": {
+            "$ref": "#/components/schemas/PlanPriority",
+            "default": "medium"
+          },
+          "status": {
+            "$ref": "#/components/schemas/PlanStatus",
+            "default": "pending"
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "type": "object"
+      },
+      "PlanPriority": {
+        "description": "Relative importance of a plan entry. Defaults to `Medium` when a\ncaller omits it; ACP requires `priority` on the outward projection,\nso normalization to a concrete value happens at parse time here.",
+        "enum": [
+          "high",
+          "medium",
+          "low"
+        ],
+        "type": "string"
+      },
+      "PlanStatus": {
+        "description": "Execution status of a single plan entry. Snake-case on the wire to\nmatch ACP (`in_progress`).",
+        "enum": [
+          "pending",
+          "in_progress",
+          "completed"
+        ],
+        "type": "string"
+      },
+      "QuickstartApplyParams": {
+        "properties": {
+          "submission": {
+            "$ref": "#/components/schemas/BuilderSubmission"
+          }
+        },
+        "required": [
+          "submission"
+        ],
+        "type": "object"
+      },
+      "QuickstartDismissResult": {
+        "properties": {
+          "recorded": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "recorded"
+        ],
+        "type": "object"
+      },
+      "QuickstartPeerGroup": {
+        "description": "Peer-group entry staged in the Quickstart. Maps 1:1 to a\n`[peer_groups.<name>]` table written at apply time. The `channel`\nfield carries a `<type>.<alias>` ref pointing at either a staged\nchannel from the same submission or a pre-existing one.",
+        "properties": {
+          "channel": {
+            "description": "Channel ref (`<type>.<alias>`) the peer group authorizes.",
+            "type": "string"
+          },
+          "external_peers": {
+            "default": [],
+            "description": "External (non-agent) peer usernames the channel should accept.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ignore": {
+            "default": [],
+            "description": "Per-group blocklist applied to the resolved peer set.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "name": {
+            "description": "Map key written to `peer_groups.<name>`. Synthesized by surfaces\nfrom the channel ref so no `match` table is involved.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "channel"
+        ],
+        "type": "object"
+      },
+      "QuickstartPersonalityFile": {
+        "description": "One personality file staged for write during Quickstart apply.\nThe runtime writes `<workspace>/<filename>` with `content`,\noverwriting if the path already exists.",
+        "properties": {
+          "content": {
+            "description": "File body. Subject to `MAX_FILE_CHARS` at apply time.",
+            "type": "string"
+          },
+          "filename": {
+            "description": "Filename from `EDITABLE_PERSONALITY_FILES`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "filename",
+          "content"
+        ],
+        "type": "object"
+      },
+      "QuickstartStateResult": {
+        "description": "Mirrors `zeroclaw_gateway::api_quickstart::QuickstartState`.",
+        "properties": {
+          "agents": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "channel_types": {
+            "description": "Picker rows for \"Create new channel\" — sourced from the\nschema's `ChannelsConfig` by walking its serialised\ntop-level keys, so adding a channel family in the schema\nsurfaces here automatically.",
+            "items": {
+              "$ref": "#/components/schemas/QuickstartTypeOption"
+            },
+            "type": "array"
+          },
+          "channels": {
+            "description": "`<channel_type>.<alias>` refs.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "default_runtime_profile": {
+            "default": null,
+            "description": "Canonical runtime fallback for providers without a recommendation.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model_provider_types": {
+            "description": "Picker rows for \"Create new model provider\" — sourced from\nthe canonical `zeroclaw_providers::list_model_providers()`\nregistry by the runtime's `quickstart::snapshot_state`.",
+            "items": {
+              "$ref": "#/components/schemas/QuickstartTypeOption"
+            },
+            "type": "array"
+          },
+          "model_providers": {
+            "description": "`<provider_type>.<alias>` refs.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "quickstart_completed": {
+            "type": "boolean"
+          },
+          "risk_profiles": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "runtime_profiles": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "storage": {
+            "description": "`<storage_type>.<alias>` refs.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "unassigned_channels": {
+            "default": [],
+            "description": "Subset of `channels` not yet bound to any agent — safe to\nreuse without breaking the one-channel-one-agent invariant.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "quickstart_completed",
+          "agents",
+          "risk_profiles",
+          "runtime_profiles",
+          "model_providers",
+          "channels",
+          "storage",
+          "model_provider_types",
+          "channel_types"
+        ],
+        "type": "object"
+      },
+      "QuickstartTypeOption": {
+        "description": "One row in the Quickstart \"Create new …\" picker. The TUI and\nweb surfaces both render this list as-is — no hardcoded\noption lists on either side.",
+        "properties": {
+          "default_runtime_profile": {
+            "description": "Daemon-derived runtime preset to auto-select for this provider.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display_name": {
+            "description": "Human-readable picker label.",
+            "type": "string"
+          },
+          "kind": {
+            "description": "Canonical kebab-case identifier written into config\n(`anthropic`, `telegram`, `wecom-ws`, …).",
+            "type": "string"
+          },
+          "local": {
+            "description": "`true` when the entry runs locally and needs no remote\ncredential. Always `false` for channels.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "kind",
+          "display_name",
+          "local"
+        ],
+        "type": "object"
+      },
+      "QuickstartValidateParams": {
+        "properties": {
+          "submission": {
+            "$ref": "#/components/schemas/BuilderSubmission"
+          }
+        },
+        "required": [
+          "submission"
+        ],
+        "type": "object"
+      },
+      "RuntimeConfigKind": {
+        "enum": [
+          "default",
+          "custom",
+          "temporary"
+        ],
+        "type": "string"
+      },
+      "RuntimeShellFamily": {
+        "enum": [
+          "posix",
+          "cmd",
+          "powershell"
+        ],
+        "type": "string"
+      },
+      "RuntimeShellProfile": {
+        "properties": {
+          "family": {
+            "$ref": "#/components/schemas/RuntimeShellFamily"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "family"
+        ],
+        "type": "object"
+      },
+      "SectionShape": {
+        "description": "UI rendering shape for a section. Drives picker / form dispatch on\nthe `/config` curated section explorer and the Quickstart flow.",
+        "oneOf": [
+          {
+            "const": "direct_form",
+            "description": "`<section>` renders a schema-driven form with no picker step.",
+            "type": "string"
+          },
+          {
+            "const": "one_tier_alias_map",
+            "description": "`<section>.<alias>` map of structured entries; the section page\nshows an alias list with `+ Add` and clicking an alias opens its\nschema form.",
+            "type": "string"
+          },
+          {
+            "const": "typed_family_map",
+            "description": "`<section>.<type>.<alias>` two-tier map. Picker chooses `<type>`,\nalias-list step chooses `<alias>`, then the schema form opens.",
+            "type": "string"
+          },
+          {
+            "const": "backend_picker",
+            "description": "Single non-alias choice (memory backend, tunnel provider). Picker\nflips a top-level field, then the schema form for the chosen\nbackend/provider renders.",
+            "type": "string"
+          }
+        ]
+      },
+      "SelectorChoice": {
+        "description": "Selects either an existing configured value or a fresh builder value.",
+        "oneOf": [
+          {
+            "description": "Use an already-configured alias under the corresponding\nsection. Carries only the alias key — the runtime resolves\nagainst the live config at apply time.",
+            "properties": {
+              "mode": {
+                "const": "existing",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "mode",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Create a new entry from the carried value.",
+            "properties": {
+              "mode": {
+                "const": "fresh",
+                "type": "string"
+              },
+              "value": {
+                "$ref": "#/components/schemas/ModelProviderChoice"
+              }
+            },
+            "required": [
+              "mode",
+              "value"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SelectorChoice2": {
+        "description": "Selects either an existing configured value or a fresh builder value.",
+        "oneOf": [
+          {
+            "description": "Use an already-configured alias under the corresponding\nsection. Carries only the alias key — the runtime resolves\nagainst the live config at apply time.",
+            "properties": {
+              "mode": {
+                "const": "existing",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "mode",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Create a new entry from the carried value.",
+            "properties": {
+              "mode": {
+                "const": "fresh",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "mode",
+              "value"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SelectorChoice3": {
+        "description": "Selects either an existing configured value or a fresh builder value.",
+        "oneOf": [
+          {
+            "description": "Use an already-configured alias under the corresponding\nsection. Carries only the alias key — the runtime resolves\nagainst the live config at apply time.",
+            "properties": {
+              "mode": {
+                "const": "existing",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "mode",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Create a new entry from the carried value.",
+            "properties": {
+              "mode": {
+                "const": "fresh",
+                "type": "string"
+              },
+              "value": {
+                "$ref": "#/components/schemas/MemoryBackendKind"
+              }
+            },
+            "required": [
+              "mode",
+              "value"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SelectorChoice4": {
+        "description": "Selects either an existing configured value or a fresh builder value.",
+        "oneOf": [
+          {
+            "description": "Use an already-configured alias under the corresponding\nsection. Carries only the alias key — the runtime resolves\nagainst the live config at apply time.",
+            "properties": {
+              "mode": {
+                "const": "existing",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "mode",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Create a new entry from the carried value.",
+            "properties": {
+              "mode": {
+                "const": "fresh",
+                "type": "string"
+              },
+              "value": {
+                "$ref": "#/components/schemas/ChannelQuickStart"
+              }
+            },
+            "required": [
+              "mode",
+              "value"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SessionApproveParams": {
+        "properties": {
+          "decision": {
+            "type": "string"
+          },
+          "replacement": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "request_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "request_id",
+          "decision"
+        ],
+        "type": "object"
+      },
+      "SessionApproveResult": {
+        "properties": {
+          "acknowledged": {
+            "type": "boolean"
+          },
+          "request_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "request_id",
+          "acknowledged"
+        ],
+        "type": "object"
+      },
+      "SessionCancelResult": {
+        "properties": {
+          "cancelled": {
+            "type": "boolean"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "cancelled"
+        ],
+        "type": "object"
+      },
+      "SessionCloseResult": {
+        "properties": {
+          "closed": {
+            "type": "boolean"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "closed"
+        ],
+        "type": "object"
+      },
+      "SessionConfigureParams": {
+        "properties": {
+          "overrides": {
+            "$ref": "#/components/schemas/SessionOverrides",
+            "default": {}
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "SessionConfigureResult": {
+        "properties": {
+          "overrides": {
+            "$ref": "#/components/schemas/SessionOverrides"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "overrides"
+        ],
+        "type": "object"
+      },
+      "SessionDeleteResult": {
+        "properties": {
+          "deleted": {
+            "type": "boolean"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "deleted"
+        ],
+        "type": "object"
+      },
+      "SessionEntry": {
+        "properties": {
+          "agent_alias": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "channel_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "last_activity": {
+            "type": "string"
+          },
+          "message_count": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "session_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "session_key",
+          "created_at",
+          "last_activity",
+          "message_count"
+        ],
+        "type": "object"
+      },
+      "SessionGitBranchResult": {
+        "properties": {
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "hash": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "SessionIdParams": {
+        "description": "Shared param for methods that only need a session ID:\n`session/close`, `session/cancel`, `session/messages`,\n`session/state`, `session/delete`.",
+        "properties": {
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "SessionKillParams": {
+        "properties": {
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "SessionKillResult": {
+        "properties": {
+          "killed": {
+            "type": "boolean"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "killed"
+        ],
+        "type": "object"
+      },
+      "SessionListParams": {
+        "properties": {
+          "limit": {
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "query": {
+            "description": "Full-text search query. When present, only sessions whose message\ncontent matches (via FTS5) are returned.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "SessionListResult": {
+        "properties": {
+          "sessions": {
+            "items": {
+              "$ref": "#/components/schemas/SessionEntry"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "sessions"
+        ],
+        "type": "object"
+      },
+      "SessionMessagesParams": {
+        "properties": {
+          "before_index": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "limit": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "SessionMessagesResult": {
+        "properties": {
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/MessageEntry"
+            },
+            "type": "array"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "start": {
+            "default": 0,
+            "description": "Index of the first entry in `messages` relative to the\nfull projected history. Pair with `total` to compute\n\"page N of M\" / \"load older\" affordances.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "default": 0,
+            "description": "Total projected entries for this session. Lets the TUI know how\nmany pages remain before it reaches the head.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "session_id",
+          "messages"
+        ],
+        "type": "object"
+      },
+      "SessionNewResult": {
+        "properties": {
+          "agent_alias": {
+            "type": "string"
+          },
+          "message_count": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "workspace_dir": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "agent_alias",
+          "message_count",
+          "workspace_dir"
+        ],
+        "type": "object"
+      },
+      "SessionOverrides": {
+        "description": "Per-session model and sampling overrides carried by `session/configure`.",
+        "properties": {
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model_provider": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "temperature": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "SessionPromptParams": {
+        "properties": {
+          "attachments": {
+            "description": "Inline file attachments. Processed identically to `file/attach`\nentries — markers are appended to the prompt before the turn runs.",
+            "items": {
+              "$ref": "#/components/schemas/FileEntry"
+            },
+            "type": "array"
+          },
+          "client_turn_generation": {
+            "description": "Optional client-local turn identity echoed by `TurnComplete`.\nOlder clients omit this field and retain session-scoped behavior.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "prompt"
+        ],
+        "type": "object"
+      },
+      "SessionPromptResult": {
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "stop_reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "stop_reason",
+          "content"
+        ],
+        "type": "object"
+      },
+      "SessionStateResult": {
+        "properties": {
+          "plan": {
+            "description": "Authoritative live-session TodoWrite plan. Older/persisted\nsessions omit this field because they have no runtime plan owner.",
+            "items": {
+              "$ref": "#/components/schemas/PlanEntry"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          },
+          "turn_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "turn_started_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "session_id",
+          "state"
+        ],
+        "type": "object"
+      },
+      "SessionUpdateEvent": {
+        "description": "Typed session update events pushed via `session/update` notifications.\nReplaces the hand-built `notification_for_turn_event` function.",
+        "oneOf": [
+          {
+            "properties": {
+              "session_id": {
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "const": "agent_message_chunk",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "text"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "session_id": {
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "const": "agent_thought_chunk",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "text"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "raw_input": true,
+              "session_id": {
+                "type": "string"
+              },
+              "tool_call_id": {
+                "type": "string"
+              },
+              "type": {
+                "const": "tool_call",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "tool_call_id",
+              "name",
+              "raw_input"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "raw_output": {
+                "type": "string"
+              },
+              "session_id": {
+                "type": "string"
+              },
+              "tool_call_id": {
+                "type": "string"
+              },
+              "type": {
+                "const": "tool_result",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "tool_call_id",
+              "name",
+              "raw_output"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "arguments_summary": {
+                "type": "string"
+              },
+              "request_id": {
+                "type": "string"
+              },
+              "session_id": {
+                "type": "string"
+              },
+              "timeout_secs": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "tool_name": {
+                "type": "string"
+              },
+              "type": {
+                "const": "approval_request",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "request_id",
+              "tool_name",
+              "arguments_summary",
+              "timeout_secs"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Per-LLM-call token usage. `input_tokens` is the cumulative context size\nfor this turn. `max_context_tokens` is the preemptive-trim budget (the\nresolved `effective_context_budget`), preserving its original meaning as\nthe value the meter fills toward. `model_context_window` is the model's\nfull context window (provider `context_window`), exposed distinctly so a\nclient can render capacity and budget separately. Any may be absent when\nthe provider doesn't report usage or the value can't be resolved.",
+            "properties": {
+              "input_tokens": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "max_context_tokens": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "model_context_window": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "session_id": {
+                "type": "string"
+              },
+              "type": {
+                "const": "context_usage",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "session_id"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Emitted when the TodoWrite tool produces a plan. The `entries` array\ncarries the normalized `PlanEntry` values (content, status, priority,\noptional activeForm) so the client can render the live tracker.",
+            "properties": {
+              "entries": {
+                "items": {
+                  "$ref": "#/components/schemas/PlanEntry"
+                },
+                "type": "array"
+              },
+              "session_id": {
+                "type": "string"
+              },
+              "type": {
+                "const": "plan",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "entries"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Terminal event for a turn. Replaces the response of `session/prompt`.\n`outcome` distinguishes a clean finish from a user-initiated cancel.",
+            "properties": {
+              "client_turn_generation": {
+                "description": "Optional client-local turn identity, echoed from `session/prompt`.\nAbsent for legacy callers that do not send one.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "content": {
+                "description": "Final assistant text (Completed) or partial accumulated text\nat cancel point (Cancelled).",
+                "type": "string"
+              },
+              "message_count": {
+                "description": "Authoritative projected conversation-entry count after this turn.\nAbsent for legacy or missing-session terminal events.",
+                "format": "uint",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "outcome": {
+                "$ref": "#/components/schemas/TurnCompletionOutcome"
+              },
+              "session_id": {
+                "type": "string"
+              },
+              "type": {
+                "const": "turn_complete",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "outcome",
+              "content"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Emitted whenever older whole turns were dropped from structured history\nto fit a token budget or message cap. Surfaces a user-visible \"context\nwas cut here\" marker so trimming is never silent. `dropped_messages` is\nthe count of conversation messages removed; `dropped_turns` and\n`kept_turns` describe the user-facing whole-turn accounting.",
+            "properties": {
+              "dropped_messages": {
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "dropped_turns": {
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kept_turns": {
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "session_id": {
+                "type": "string"
+              },
+              "token_budget": {
+                "description": "Configured context token budget in effect at trim time. `None` for\nmessage-limit trims, which carry no token accounting.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "tokens_after": {
+                "description": "Token count after trimming.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "tokens_after_source": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/TokenCountSource"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Provenance of `tokens_after` (\"provider\", \"estimate\", \"calibrated\")."
+              },
+              "tokens_before": {
+                "description": "Token count before trimming.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "tokens_before_source": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/TokenCountSource"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Provenance of `tokens_before` (\"provider\", \"estimate\", \"calibrated\")."
+              },
+              "type": {
+                "const": "history_trimmed",
+                "type": "string"
+              },
+              "unsatisfiable_floor": {
+                "description": "The retained provider-facing request cannot be brought under the\nconfigured budget (protected newest turn plus schemas). History MAY\nhave been trimmed on the way to that floor, so this flag — not\n`dropped_messages == 0` — is the authoritative \"unsatisfiable\"\nsignal. Absent for ordinary trims.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "dropped_messages",
+              "dropped_turns",
+              "kept_turns",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SkillBundleEntry": {
+        "description": "Wire representation of a skill bundle. Consolidates gateway `BundleEntry`.",
+        "properties": {
+          "alias": {
+            "type": "string"
+          },
+          "directory": {
+            "type": "string"
+          },
+          "exclude": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "include": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "alias",
+          "directory",
+          "include",
+          "exclude"
+        ],
+        "type": "object"
+      },
+      "SkillsBundlesResult": {
+        "properties": {
+          "bundles": {
+            "items": {
+              "$ref": "#/components/schemas/SkillBundleEntry"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "bundles"
+        ],
+        "type": "object"
+      },
+      "SkillsDeleteParams": {
+        "properties": {
+          "bundle": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "bundle",
+          "name"
+        ],
+        "type": "object"
+      },
+      "SkillsDeleteResult": {
+        "properties": {
+          "bundle": {
+            "type": "string"
+          },
+          "deleted": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "bundle",
+          "name",
+          "deleted"
+        ],
+        "type": "object"
+      },
+      "SkillsListParams": {
+        "properties": {
+          "bundle": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "SkillsReadParams": {
+        "properties": {
+          "bundle": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "bundle",
+          "name"
+        ],
+        "type": "object"
+      },
+      "SkillsWriteResult": {
+        "properties": {
+          "bundle": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "written": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "bundle",
+          "name",
+          "written"
+        ],
+        "type": "object"
+      },
+      "SopGraph": {
+        "description": "The full projected graph: nodes, wires, validation diagnostics, and a\nprecomputed layout. Serialized as-is over RPC (`sops/graph`) and HTTP.",
+        "properties": {
+          "diagnostics": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/GraphDiagnostic"
+            },
+            "type": "array"
+          },
+          "layout": {
+            "$ref": "#/components/schemas/GraphLayout",
+            "default": {
+              "columns": 0,
+              "geometry": {
+                "col_gap": 130.0,
+                "node_h": 84.0,
+                "node_w": 210.0,
+                "origin": 24.0,
+                "row_gap": 46.0
+              },
+              "positions": [],
+              "rows": 0
+            }
+          },
+          "nodes": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/GraphNode"
+            },
+            "type": "array"
+          },
+          "wires": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/GraphWire"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "StatusResult": {
+        "properties": {
+          "active_sessions": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "config_dir": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "config_file": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "config_kind": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RuntimeConfigKind"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "local_ipc_endpoint": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "protocol_version": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "server_version": {
+            "type": "string"
+          },
+          "session_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "shell_profile": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RuntimeShellProfile"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "server_version",
+          "protocol_version",
+          "active_sessions",
+          "session_ids"
+        ],
+        "type": "object"
+      },
+      "TemplateFileEntry": {
+        "description": "Consolidates gateway `TemplateFile`.",
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "filename": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "filename",
+          "content"
+        ],
+        "type": "object"
+      },
+      "TokenCountSource": {
+        "description": "Provenance of a token count carried on a history-trim event. Lets clients\ndistinguish provider-reported usage from a local estimate and from a mix of\nthe two (the reported-budget trim path scales an estimate to a\nprovider-reported figure).",
+        "oneOf": [
+          {
+            "const": "provider",
+            "description": "Count comes from provider-reported usage.",
+            "type": "string"
+          },
+          {
+            "const": "estimate",
+            "description": "Count is locally estimated.",
+            "type": "string"
+          },
+          {
+            "const": "calibrated",
+            "description": "Count is calibrated from provider-reported usage and a local estimate.",
+            "type": "string"
+          }
+        ]
+      },
+      "TuiListEntry": {
+        "properties": {
+          "connected_at": {
+            "description": "RFC 3339 timestamp (for gateway API / web frontend).",
+            "type": "string"
+          },
+          "connected_at_unix": {
+            "description": "Unix epoch seconds (for TUI client relative-time display\nwithout requiring chrono).",
+            "format": "int64",
+            "type": "integer"
+          },
+          "peer_label": {
+            "type": "string"
+          },
+          "transport": {
+            "description": "Transport protocol: `\"unix\"` or `\"wss\"`.",
+            "type": "string"
+          },
+          "tui_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "tui_id",
+          "connected_at",
+          "connected_at_unix",
+          "peer_label",
+          "transport"
+        ],
+        "type": "object"
+      },
+      "TuiListResult": {
+        "properties": {
+          "tuis": {
+            "items": {
+              "$ref": "#/components/schemas/TuiListEntry"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "tuis"
+        ],
+        "type": "object"
+      },
+      "TurnCompletionOutcome": {
+        "description": "Wire-stable subset of the runtime's `rpc::turn::TurnOutcome` for\n`TurnComplete`. `messages` is intentionally not on the wire — the TUI\nrebuilds from streamed chunks.",
+        "enum": [
+          "completed",
+          "cancelled",
+          "failed"
+        ],
+        "type": "string"
+      }
+    }
+  },
+  "info": {
+    "description": "JSON-RPC 2.0 methods served by `zeroclaw daemon` over the local socket or named pipe, framed as newline-delimited JSON. Generated by `cargo generate openrpc` from `zeroclaw-rpc-proto`; do not edit by hand. Framing, the handshake and transport rules are described in `rpc-socket.md`.",
+    "title": "ZeroClaw daemon RPC",
+    "version": "1"
+  },
+  "methods": [
+    {
+      "name": "initialize",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/InitializeParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/InitializeResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "handshake"
+      }
+    },
+    {
+      "name": "status",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/StatusResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "system",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "health",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "Free-form JSON shaped by the daemon at runtime."
+        },
+        "x-zeroclaw-shape": "untyped"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "system",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "doctor/run",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "`DoctorRunResult`, defined in `zeroclaw-runtime`; no schema is exported yet."
+        },
+        "x-zeroclaw-owner": "zeroclaw-runtime",
+        "x-zeroclaw-shape": "external"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "system",
+        "verb": "execute"
+      }
+    },
+    {
+      "name": "session/new",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "description": "`SessionNewParams`, defined in `zeroclaw-runtime`; no schema is exported yet."
+          },
+          "x-zeroclaw-owner": "zeroclaw-runtime",
+          "x-zeroclaw-shape": "external"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionNewResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sessions",
+        "verb": "create"
+      }
+    },
+    {
+      "name": "session/close",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/SessionIdParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionCloseResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sessions",
+        "verb": "update"
+      }
+    },
+    {
+      "name": "session/prompt",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/SessionPromptParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionPromptResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sessions",
+        "verb": "execute"
+      }
+    },
+    {
+      "name": "session/configure",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/SessionConfigureParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionConfigureResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sessions",
+        "verb": "update"
+      }
+    },
+    {
+      "name": "session/cancel",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/SessionIdParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionCancelResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sessions",
+        "verb": "update"
+      }
+    },
+    {
+      "name": "session/git_branch",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/SessionIdParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionGitBranchResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sessions",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "session/list",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/SessionListParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionListResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sessions",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "session/list-acp",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionListResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sessions",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "session/messages",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/SessionMessagesParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionMessagesResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sessions",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "session/state",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/SessionIdParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionStateResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sessions",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "session/delete",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/SessionIdParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionDeleteResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sessions",
+        "verb": "delete"
+      }
+    },
+    {
+      "name": "session/approve",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/SessionApproveParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionApproveResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sessions",
+        "verb": "update"
+      }
+    },
+    {
+      "name": "session/kill",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/SessionKillParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionKillResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sessions",
+        "verb": "delete"
+      }
+    },
+    {
+      "name": "memory/list",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/MemoryListParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/MemoryListResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "memory",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "memory/search",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/MemorySearchParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/MemorySearchResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "memory",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "memory/get",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/MemoryGetParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/MemoryGetResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "memory",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "memory/store",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/MemoryStoreParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/MemoryStoreResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "memory",
+        "verb": "create"
+      }
+    },
+    {
+      "name": "memory/delete",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/MemoryDeleteParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/MemoryDeleteResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "memory",
+        "verb": "delete"
+      }
+    },
+    {
+      "name": "cron/list",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "`CronListResult`, defined in `zeroclaw-runtime`; no schema is exported yet."
+        },
+        "x-zeroclaw-owner": "zeroclaw-runtime",
+        "x-zeroclaw-shape": "external"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "cron",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "cron/get",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/CronIdParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "`CronJob`, defined in `zeroclaw-runtime`; no schema is exported yet."
+        },
+        "x-zeroclaw-owner": "zeroclaw-runtime",
+        "x-zeroclaw-shape": "external"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "cron",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "cron/add",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "description": "`CronAddParams`, defined in `zeroclaw-runtime`; no schema is exported yet."
+          },
+          "x-zeroclaw-owner": "zeroclaw-runtime",
+          "x-zeroclaw-shape": "external"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "`CronJob`, defined in `zeroclaw-runtime`; no schema is exported yet."
+        },
+        "x-zeroclaw-owner": "zeroclaw-runtime",
+        "x-zeroclaw-shape": "external"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "cron",
+        "verb": "create"
+      }
+    },
+    {
+      "name": "cron/patch",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/CronPatchParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "`CronJob`, defined in `zeroclaw-runtime`; no schema is exported yet."
+        },
+        "x-zeroclaw-owner": "zeroclaw-runtime",
+        "x-zeroclaw-shape": "external"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "cron",
+        "verb": "update"
+      }
+    },
+    {
+      "name": "cron/delete",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/CronIdParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/CronDeleteResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "cron",
+        "verb": "delete"
+      }
+    },
+    {
+      "name": "cron/runs",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/CronRunsParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "`CronRunsResult`, defined in `zeroclaw-runtime`; no schema is exported yet."
+        },
+        "x-zeroclaw-owner": "zeroclaw-runtime",
+        "x-zeroclaw-shape": "external"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "cron",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "cron/trigger",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/CronIdParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/CronTriggerResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "cron",
+        "verb": "execute"
+      }
+    },
+    {
+      "name": "cron/settings",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "description": "Free-form JSON shaped by the daemon at runtime."
+          },
+          "x-zeroclaw-shape": "untyped"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "Free-form JSON shaped by the daemon at runtime."
+        },
+        "x-zeroclaw-shape": "untyped"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "cron",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "config/get",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/ConfigGetParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "Free-form JSON shaped by the daemon at runtime."
+        },
+        "x-zeroclaw-shape": "untyped"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "config",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "config/set",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/ConfigSetParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ConfigSetResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "config",
+        "verb": "update"
+      }
+    },
+    {
+      "name": "config/validate",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ConfigValidateResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "config",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "config/reload",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ConfigReloadResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "config",
+        "verb": "update"
+      }
+    },
+    {
+      "name": "config/list",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/ConfigListParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ConfigListResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "config",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "config/delete",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/ConfigDeleteParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ConfigDeleteResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "config",
+        "verb": "delete"
+      }
+    },
+    {
+      "name": "config/map-keys",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/ConfigMapKeysParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ConfigMapKeysResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "config",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "config/resolve-alias-source",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/ConfigResolveAliasSourceParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ConfigResolveAliasSourceResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "config",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "config/map-key-create",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/ConfigMapKeyCreateParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ConfigMapKeyCreateResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "config",
+        "verb": "create"
+      }
+    },
+    {
+      "name": "config/map-key-delete",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/ConfigMapKeyDeleteParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ConfigMapKeyDeleteResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "config",
+        "verb": "delete"
+      }
+    },
+    {
+      "name": "config/map-key-rename",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/ConfigMapKeyRenameParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ConfigMapKeyRenameResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "config",
+        "verb": "update"
+      }
+    },
+    {
+      "name": "config/templates",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ConfigTemplatesResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "config",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "agents/list",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/AgentsListResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "agents",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "agents/status",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/AgentsStatusResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "agents",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "cost/query",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/CostQueryParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "`CostSummary`, defined in `zeroclaw-config`; no schema is exported yet."
+        },
+        "x-zeroclaw-owner": "zeroclaw-config",
+        "x-zeroclaw-shape": "external"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "cost",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "cost/org",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "Free-form JSON shaped by the daemon at runtime."
+        },
+        "x-zeroclaw-shape": "untyped"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "cost",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "skills/bundles",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SkillsBundlesResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "skills",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "skills/list",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/SkillsListParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "`SkillsListResult`, defined in `zeroclaw-runtime`; no schema is exported yet."
+        },
+        "x-zeroclaw-owner": "zeroclaw-runtime",
+        "x-zeroclaw-shape": "external"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "skills",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "skills/read",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/SkillsReadParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "`SkillsReadResult`, defined in `zeroclaw-runtime`; no schema is exported yet."
+        },
+        "x-zeroclaw-owner": "zeroclaw-runtime",
+        "x-zeroclaw-shape": "external"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "skills",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "skills/write",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "description": "`SkillsWriteParams`, defined in `zeroclaw-runtime`; no schema is exported yet."
+          },
+          "x-zeroclaw-owner": "zeroclaw-runtime",
+          "x-zeroclaw-shape": "external"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SkillsWriteResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "skills",
+        "verb": "update"
+      }
+    },
+    {
+      "name": "skills/delete",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/SkillsDeleteParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SkillsDeleteResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "skills",
+        "verb": "delete"
+      }
+    },
+    {
+      "name": "personality/list",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/PersonalityListParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/PersonalityListResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "personality",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "personality/get",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/PersonalityGetParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/PersonalityGetResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "personality",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "personality/put",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/PersonalityPutParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/PersonalityPutResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "personality",
+        "verb": "update"
+      }
+    },
+    {
+      "name": "personality/templates",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/PersonalityTemplatesParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/PersonalityTemplatesResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "personality",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "config/sections",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ConfigSectionsResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "config",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "config/status",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ConfigStatusResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "config",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "config/catalog",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/CatalogResponse"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "config",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "config/catalog-models",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/CatalogModelsParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/CatalogModelsResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "config",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "logs/subscribe",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/LogsSubscribeResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "logs",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "logs/query",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/LogsQueryParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/LogsQueryResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "logs",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "logs/get",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/LogsGetParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/LogsGetResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "logs",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "tui/list",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/TuiListResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "tui",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "file/attach",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/FileAttachParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/FileAttachResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "files",
+        "verb": "create"
+      }
+    },
+    {
+      "name": "fs/list_dir",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "description": "`FsListDirRequest`, defined in `zeroclaw-api`; no schema is exported yet."
+          },
+          "x-zeroclaw-owner": "zeroclaw-api",
+          "x-zeroclaw-shape": "external"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "`FsListDirResponse`, defined in `zeroclaw-api`; no schema is exported yet."
+        },
+        "x-zeroclaw-owner": "zeroclaw-api",
+        "x-zeroclaw-shape": "external"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "files",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "locales/list",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "Free-form JSON shaped by the daemon at runtime."
+        },
+        "x-zeroclaw-shape": "untyped"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "locales",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "locales/fetch",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "description": "Free-form JSON shaped by the daemon at runtime."
+          },
+          "x-zeroclaw-shape": "untyped"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "Free-form JSON shaped by the daemon at runtime."
+        },
+        "x-zeroclaw-shape": "untyped"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "locales",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "quickstart/state",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/QuickstartStateResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "quickstart",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "quickstart/fields",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "description": "`QuickstartFieldsParams`, defined in `zeroclaw-runtime`; no schema is exported yet."
+          },
+          "x-zeroclaw-owner": "zeroclaw-runtime",
+          "x-zeroclaw-shape": "external"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "`QuickstartFieldsResult`, defined in `zeroclaw-runtime`; no schema is exported yet."
+        },
+        "x-zeroclaw-owner": "zeroclaw-runtime",
+        "x-zeroclaw-shape": "external"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "quickstart",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "quickstart/validate",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/QuickstartValidateParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "`QuickstartValidateResult`, defined in `zeroclaw-runtime`; no schema is exported yet."
+        },
+        "x-zeroclaw-owner": "zeroclaw-runtime",
+        "x-zeroclaw-shape": "external"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "quickstart",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "quickstart/apply",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/QuickstartApplyParams"
+          },
+          "x-zeroclaw-shape": "typed"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "`QuickstartApplyResult`, defined in `zeroclaw-runtime`; no schema is exported yet."
+        },
+        "x-zeroclaw-owner": "zeroclaw-runtime",
+        "x-zeroclaw-shape": "external"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "quickstart",
+        "verb": "execute"
+      }
+    },
+    {
+      "name": "quickstart/dismiss",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "description": "`QuickstartDismissParams`, defined in `zeroclaw-runtime`; no schema is exported yet."
+          },
+          "x-zeroclaw-owner": "zeroclaw-runtime",
+          "x-zeroclaw-shape": "external"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/QuickstartDismissResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "quickstart",
+        "verb": "update"
+      }
+    },
+    {
+      "name": "cert/renew",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "description": "Free-form JSON shaped by the daemon at runtime."
+          },
+          "x-zeroclaw-shape": "untyped"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "Free-form JSON shaped by the daemon at runtime."
+        },
+        "x-zeroclaw-shape": "untyped"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "handshake"
+      }
+    },
+    {
+      "name": "sops/list",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "Free-form JSON shaped by the daemon at runtime."
+        },
+        "x-zeroclaw-shape": "untyped"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sops",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "sops/get",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "description": "`SopSelectRequest`, defined in `zeroclaw-api`; no schema is exported yet."
+          },
+          "x-zeroclaw-owner": "zeroclaw-api",
+          "x-zeroclaw-shape": "external"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "`Sop`, defined in `zeroclaw-runtime`; no schema is exported yet."
+        },
+        "x-zeroclaw-owner": "zeroclaw-runtime",
+        "x-zeroclaw-shape": "external"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sops",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "sops/graph",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "description": "`SopSelectRequest`, defined in `zeroclaw-api`; no schema is exported yet."
+          },
+          "x-zeroclaw-owner": "zeroclaw-api",
+          "x-zeroclaw-shape": "external"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SopGraph"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sops",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "sops/run",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "description": "`SopRunRequest`, defined in `zeroclaw-api`; no schema is exported yet."
+          },
+          "x-zeroclaw-owner": "zeroclaw-api",
+          "x-zeroclaw-shape": "external"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "`SopRunResponse`, defined in `zeroclaw-api`; no schema is exported yet."
+        },
+        "x-zeroclaw-owner": "zeroclaw-api",
+        "x-zeroclaw-shape": "external"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sops",
+        "verb": "execute"
+      }
+    },
+    {
+      "name": "sops/runs",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "description": "`SopRunsRequest`, defined in `zeroclaw-api`; no schema is exported yet."
+          },
+          "x-zeroclaw-owner": "zeroclaw-api",
+          "x-zeroclaw-shape": "external"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "Free-form JSON shaped by the daemon at runtime."
+        },
+        "x-zeroclaw-shape": "untyped"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sops",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "sops/run-detail",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "description": "`SopRunDetailRequest`, defined in `zeroclaw-api`; no schema is exported yet."
+          },
+          "x-zeroclaw-owner": "zeroclaw-api",
+          "x-zeroclaw-shape": "external"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "Free-form JSON shaped by the daemon at runtime."
+        },
+        "x-zeroclaw-shape": "untyped"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sops",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "sops/run-overlay",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "description": "`SopRunOverlayRequest`, defined in `zeroclaw-api`; no schema is exported yet."
+          },
+          "x-zeroclaw-owner": "zeroclaw-api",
+          "x-zeroclaw-shape": "external"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "`RunOverlay`, defined in `zeroclaw-runtime`; no schema is exported yet."
+        },
+        "x-zeroclaw-owner": "zeroclaw-runtime",
+        "x-zeroclaw-shape": "external"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sops",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "sops/validate",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "description": "Free-form JSON shaped by the daemon at runtime."
+          },
+          "x-zeroclaw-shape": "untyped"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "Free-form JSON shaped by the daemon at runtime."
+        },
+        "x-zeroclaw-shape": "untyped"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sops",
+        "verb": "execute"
+      }
+    },
+    {
+      "name": "sops/save",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "description": "`SopSaveRequest`, defined in `zeroclaw-api`; no schema is exported yet."
+          },
+          "x-zeroclaw-owner": "zeroclaw-api",
+          "x-zeroclaw-shape": "external"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "Free-form JSON shaped by the daemon at runtime."
+        },
+        "x-zeroclaw-shape": "untyped"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sops",
+        "verb": "update"
+      }
+    },
+    {
+      "name": "sops/create",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "description": "`SopSaveRequest`, defined in `zeroclaw-api`; no schema is exported yet."
+          },
+          "x-zeroclaw-owner": "zeroclaw-api",
+          "x-zeroclaw-shape": "external"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "Free-form JSON shaped by the daemon at runtime."
+        },
+        "x-zeroclaw-shape": "untyped"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sops",
+        "verb": "create"
+      }
+    },
+    {
+      "name": "sops/delete",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "description": "`SopSelectRequest`, defined in `zeroclaw-api`; no schema is exported yet."
+          },
+          "x-zeroclaw-owner": "zeroclaw-api",
+          "x-zeroclaw-shape": "external"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "Free-form JSON shaped by the daemon at runtime."
+        },
+        "x-zeroclaw-shape": "untyped"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sops",
+        "verb": "delete"
+      }
+    },
+    {
+      "name": "sops/rename",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "description": "`SopRenameRequest`, defined in `zeroclaw-api`; no schema is exported yet."
+          },
+          "x-zeroclaw-owner": "zeroclaw-api",
+          "x-zeroclaw-shape": "external"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "Free-form JSON shaped by the daemon at runtime."
+        },
+        "x-zeroclaw-shape": "untyped"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sops",
+        "verb": "update"
+      }
+    },
+    {
+      "name": "sops/decide",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "description": "`SopDecideRequest`, defined in `zeroclaw-api`; no schema is exported yet."
+          },
+          "x-zeroclaw-owner": "zeroclaw-api",
+          "x-zeroclaw-shape": "external"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "`RunOverlay`, defined in `zeroclaw-runtime`; no schema is exported yet."
+        },
+        "x-zeroclaw-owner": "zeroclaw-runtime",
+        "x-zeroclaw-shape": "external"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sops",
+        "verb": "execute"
+      }
+    },
+    {
+      "name": "sops/wire-draft",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "description": "Free-form JSON shaped by the daemon at runtime."
+          },
+          "x-zeroclaw-shape": "untyped"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "Free-form JSON shaped by the daemon at runtime."
+        },
+        "x-zeroclaw-shape": "untyped"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sops",
+        "verb": "execute"
+      }
+    },
+    {
+      "name": "sops/graph-draft",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "description": "Free-form JSON shaped by the daemon at runtime."
+          },
+          "x-zeroclaw-shape": "untyped"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SopGraph"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sops",
+        "verb": "execute"
+      }
+    },
+    {
+      "name": "sops/trigger-sources",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "`TriggerSourceRegistry`, defined in `zeroclaw-runtime`; no schema is exported yet."
+        },
+        "x-zeroclaw-owner": "zeroclaw-runtime",
+        "x-zeroclaw-shape": "external"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sops",
+        "verb": "read"
+      }
+    },
+    {
+      "name": "tools/param-options",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "params",
+          "required": true,
+          "schema": {
+            "description": "Free-form JSON shaped by the daemon at runtime."
+          },
+          "x-zeroclaw-shape": "untyped"
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "description": "Free-form JSON shaped by the daemon at runtime."
+        },
+        "x-zeroclaw-shape": "untyped"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "tools",
+        "verb": "read"
+      }
+    }
+  ],
+  "openrpc": "1.3.2",
+  "x-error-codes": {
+    "-32000": "SESSION_NOT_FOUND",
+    "-32001": "SESSION_LIMIT_REACHED",
+    "-32002": "SESSION_BUSY",
+    "-32003": "SESSION_NOT_OWNED",
+    "-32010": "AUTH_REQUIRED",
+    "-32011": "VERSION_MISMATCH",
+    "-32012": "FORBIDDEN",
+    "-32020": "SOP_ALREADY_EXISTS",
+    "-32021": "SOP_NOT_FOUND",
+    "-32600": "INVALID_REQUEST",
+    "-32601": "METHOD_NOT_FOUND",
+    "-32602": "INVALID_PARAMS",
+    "-32603": "INTERNAL_ERROR",
+    "-32700": "PARSE_ERROR",
+    "4001": "FS_NOT_FOUND",
+    "4002": "FS_PERMISSION_DENIED",
+    "4003": "FS_INVALID_PATH"
+  },
+  "x-notifications": [
+    {
+      "name": "session/update",
+      "params": {
+        "name": "params",
+        "schema": {
+          "$ref": "#/components/schemas/SessionUpdateEvent"
+        }
+      }
+    },
+    {
+      "name": "logs/event",
+      "params": {
+        "name": "params",
+        "schema": {
+          "description": "Untyped event object.",
+          "type": "object"
+        }
+      }
+    }
+  ],
+  "x-zeroclaw": {
+    "framing": "ndjson",
+    "generator": "cargo generate openrpc",
+    "protocol_version": 1,
+    "source": "crates/zeroclaw-rpc-proto",
+    "transports": [
+      "unix-socket",
+      "windows-named-pipe",
+      "wss"
+    ]
+  }
+}
