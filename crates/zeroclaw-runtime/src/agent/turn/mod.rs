@@ -7627,7 +7627,7 @@ mod tool_lifecycle_abandonment_tests {
         let provider = ImageRecoveryProvider {
             requests: Mutex::new(Vec::new()),
         };
-        let retained_user = "inspect [IMAGE:data:image/png;base64,aGVsbG8=]";
+        let retained_user = "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
         let mut history = vec![
             ChatMessage::system("You are helpful."),
             ChatMessage::user(format!("discarded-old-turn {}", "old ".repeat(10_000))),

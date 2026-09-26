@@ -2187,7 +2187,7 @@ mod streaming_fallback_tests {
                 .expect("serve compatible recovery responses");
         });
         let original = [ChatMessage::user(
-            "inspect [IMAGE:data:image/png;base64,AAAA]",
+            "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]",
         )];
         let recovery = [ChatMessage::user("inspect")];
         let provider = zeroclaw_providers::create_resilient_model_provider_with_options(
