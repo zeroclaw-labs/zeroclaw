@@ -2,6 +2,7 @@
 mod acp_cli;
 #[cfg(feature = "channel-acp-server")]
 mod acp_session_cwd_stdio;
+mod agent_shell_cli_refusal;
 #[cfg(feature = "agent-runtime")]
 mod config_dir_locale_regression;
 mod config_patch_cli;

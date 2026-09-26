@@ -302,6 +302,19 @@ impl Tool for ShellTool {
             }
         }
 
+        // Unconditional, unlike the session key above: the `zeroclaw` CLI runs
+        // with the operator's authority and no agent policy anywhere in the
+        // process, so it has to be able to recognise a model caller on every
+        // path, scoped turn or not.
+        //
+        // This assignment is deliberately the LAST word on this variable, after
+        // the TUI overlay above. The registry stores the client's whole shell
+        // environment, so a TUI started with `ZEROCLAW_AGENT_SHELL=` would
+        // otherwise overwrite the marker with an empty value — and the CLI's
+        // refusal treats empty as absent, which would hand an agent shell the
+        // operator authority this marker exists to deny.
+        cmd.env(zeroclaw_api::AGENT_SHELL_ENV_VAR, "1");
+
         // Android: platform tools (sh, getprop, am, dumpsys, content, pm, ...)
         // live in /system/bin and /system/xbin. The cleared+rebuilt PATH above
         // may omit them, leaving the shell unable to resolve any platform tool.
@@ -1628,6 +1641,29 @@ mod tests {
         );
     }
 
+    /// The `zeroclaw` CLI refuses to run when it sees this marker, because the
+    /// CLI carries operator authority and an agent invoking it escalates. The
+    /// marker has to be unconditional: `ZEROCLAW_SESSION_ID` looks like the same
+    /// signal but is only set on scoped turns, which would leave one-shot and
+    /// webhook paths silently unmarked.
+    #[tokio::test]
+    async fn shell_marks_every_spawned_command_as_agent_invoked() {
+        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
+
+        let result = tool
+            .execute(json!({"command": env_print_command()}))
+            .await
+            .expect("environment print command should succeed");
+
+        assert!(result.success);
+        assert!(
+            env_output_contains_key(&result.output, zeroclaw_api::AGENT_SHELL_ENV_VAR),
+            "{} must be set on every agent-spawned command, got: {}",
+            zeroclaw_api::AGENT_SHELL_ENV_VAR,
+            result.output
+        );
+    }
+
     #[tokio::test]
     #[cfg(not(target_os = "windows"))]
     async fn shell_blocks_plain_variable_expansion() {
@@ -1979,6 +2015,43 @@ mod tests {
     }
 
     // ── TUI env overlay tests ─────────────────────────────────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tui_env_cannot_erase_the_agent_shell_marker() {
+        // The escalation this closes: the TUI registry stores the client's
+        // whole shell environment, so an operator whose terminal exported
+        // `ZEROCLAW_AGENT_SHELL=` (or any other value) used to have that
+        // overlay land after the trusted assignment. The CLI refusal reads an
+        // empty marker as absent, so the agent's own shell would have been
+        // handed operator authority.
+        for hostile in ["", "0"] {
+            let tool =
+                ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(Some({
+                    let mut m = std::collections::HashMap::new();
+                    m.insert(
+                        zeroclaw_api::AGENT_SHELL_ENV_VAR.to_string(),
+                        hostile.to_string(),
+                    );
+                    m
+                }));
+
+            let result = tool
+                .execute(json!({"command": env_print_command()}))
+                .await
+                .expect("environment print command should succeed");
+
+            assert!(result.success);
+            assert!(
+                env_output_contains_assignment(
+                    &result.output,
+                    zeroclaw_api::AGENT_SHELL_ENV_VAR,
+                    "1"
+                ),
+                "a TUI value of {hostile:?} must not replace the agent marker, got:\n{}",
+                result.output
+            );
+        }
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn shell_tui_env_is_passed_to_subprocess() {

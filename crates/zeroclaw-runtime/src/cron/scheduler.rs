@@ -1254,6 +1254,7 @@ async fn run_job_command_with_runtime_and_timeout(
     };
 
     command
+        .env(zeroclaw_api::AGENT_SHELL_ENV_VAR, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
