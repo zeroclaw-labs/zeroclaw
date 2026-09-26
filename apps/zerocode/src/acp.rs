@@ -129,8 +129,12 @@ impl Acp {
         self.inner.in_browse_mode()
     }
 
-    pub(crate) fn wants_quit_chord(&self) -> bool {
-        self.inner.wants_quit_chord()
+    pub(crate) fn wants_quit_chord(&self, key: &KeyEvent) -> bool {
+        self.inner.wants_quit_chord(key)
+    }
+
+    pub(crate) fn copy_composer_selection(&self, key: &KeyEvent) -> bool {
+        self.inner.copy_composer_selection(key)
     }
 
     pub(crate) fn take_help_request(&mut self) -> bool {

@@ -1,8 +1,9 @@
 //! Reusable input bar widget with text editing, file attachments,
 //! file explorer, and clipboard paste support.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use directories::UserDirs;
 
@@ -26,6 +27,11 @@ use crate::turn_status::TurnStatus;
 
 /// Maximum number of visible content rows before the input bar scrolls.
 const MAX_INPUT_ROWS: u16 = 5;
+
+const MAX_EDIT_HISTORY: usize = 100;
+
+/// Spaces stay in a typing run; pausing to think starts a fresh undo group.
+const TYPING_GROUP_IDLE: Duration = Duration::from_secs(2);
 
 /// Maximum number of attachment rows visible in the manager before it scrolls.
 const MAX_ATTACHMENT_MANAGER_ROWS: usize = 8;
@@ -661,6 +667,16 @@ fn attachment_manager_key_labels() -> (Vec<String>, Vec<String>, Vec<String>) {
 
 // ── State ────────────────────────────────────────────────────────
 
+/// Historical text only: attachments and their temporary files keep their
+/// existing owner and are never restored by undo.
+#[derive(Debug)]
+struct EditSnapshot {
+    input: String,
+    cursor: usize,
+    selection: Option<(usize, usize)>,
+    selection_anchor: Option<usize>,
+}
+
 /// Input bar state. Each pane (Chat, ACP) owns its own instance.
 #[derive(Debug)]
 pub(crate) struct InputBarState {
@@ -669,6 +685,10 @@ pub(crate) struct InputBarState {
     /// Byte offset of the editing cursor within `input`.
     /// Kept on a grapheme boundary after each completed edit operation.
     cursor: usize,
+    undo: VecDeque<EditSnapshot>,
+    redo: Vec<EditSnapshot>,
+    /// Only consecutive typing may extend the latest undo transaction.
+    last_typing_at: Option<Instant>,
     pending_attachments: Vec<PendingAttachment>,
     attachment_manager: Option<AttachmentManagerState>,
     /// Latest composer and modal list geometry for mouse hit-testing.
@@ -741,6 +761,9 @@ impl InputBarState {
             command_registry: SlashCommandRegistry::new(shared),
             input: String::new(),
             cursor: 0,
+            undo: VecDeque::new(),
+            redo: Vec::new(),
+            last_typing_at: None,
             pending_attachments: Vec::new(),
             attachment_manager: None,
             last_attachment_area: None,
@@ -833,7 +856,72 @@ impl InputBarState {
 
     // ── Selection helpers ────────────────────────────────────
 
+    pub(crate) fn has_selection(&self) -> bool {
+        self.selection.is_some_and(|(start, end)| start < end)
+    }
+
+    /// Purely local clipboard output; safe without a daemon connection.
+    pub(crate) fn copy_selection(&self) -> bool {
+        if let Some((start, end)) = self.selection.filter(|(start, end)| start < end) {
+            mouse::copy_osc52(&self.input[start..end]);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Resolve ownership through the same configured action table as dispatch.
+    pub(crate) fn claims_edit_key(&self, key: &KeyEvent) -> bool {
+        use crate::keymap::InputBarAction as A;
+        match A::from_chord(key) {
+            Some(A::CopySelection | A::Cut) => self.has_selection(),
+            Some(
+                A::Undo
+                | A::Redo
+                | A::SelectAll
+                | A::SelectLeft
+                | A::SelectRight
+                | A::SelectUp
+                | A::SelectDown
+                | A::SelectStart
+                | A::SelectEnd
+                | A::SelectWordLeft
+                | A::SelectWordRight
+                | A::DeleteNextWord,
+            ) => true,
+            _ => false,
+        }
+    }
+
+    fn select_to(&mut self, cursor: usize) {
+        self.last_typing_at = None;
+        let anchor = *self.selection_anchor.get_or_insert(self.cursor);
+        self.cursor = cursor;
+        self.selection = (anchor != cursor).then_some((anchor.min(cursor), anchor.max(cursor)));
+    }
+
+    fn select_vertical(&mut self, delta: i32) {
+        self.last_typing_at = None;
+        let width = self.last_inner_width;
+        if width > 0 {
+            let (row, col) = cursor_to_visual(&self.input, self.cursor, width);
+            let last = wrapped_line_count(&self.input, width).saturating_sub(1);
+            let row = (i32::from(row) + delta).clamp(0, i32::from(last)) as u16;
+            self.select_to(visual_to_cursor(&self.input, row, col, width));
+        }
+    }
+
+    fn line_edge(&self, end: bool) -> usize {
+        let width = self.last_inner_width;
+        if width == 0 {
+            return if end { self.input.len() } else { 0 };
+        }
+        let (row, _) = cursor_to_visual(&self.input, self.cursor, width);
+        visual_to_cursor(&self.input, row, if end { width } else { 0 }, width)
+    }
+
     fn clear_selection(&mut self) {
+        self.last_typing_at = None;
         self.selection = None;
         self.selection_anchor = None;
     }
@@ -960,23 +1048,25 @@ impl InputBarState {
     /// autocomplete kicks in immediately). An argument choice rewrites only the
     /// value after the command prefix.
     fn apply_autocomplete_choice(&mut self, choice: &str) {
-        match self.autocomplete_target {
-            AutocompleteTarget::Command => {
-                let takes_arg = choice == "/model" || choice == "/model-provider";
-                self.input = if takes_arg {
-                    format!("{choice} ")
-                } else {
-                    choice.to_string()
-                };
+        self.edit(|state| {
+            match state.autocomplete_target {
+                AutocompleteTarget::Command => {
+                    let takes_arg = choice == "/model" || choice == "/model-provider";
+                    state.input = if takes_arg {
+                        format!("{choice} ")
+                    } else {
+                        choice.to_string()
+                    };
+                }
+                AutocompleteTarget::ModelArg => {
+                    state.input = format!("/model {choice}");
+                }
+                AutocompleteTarget::ModelProviderArg => {
+                    state.input = format!("/model-provider {choice}");
+                }
             }
-            AutocompleteTarget::ModelArg => {
-                self.input = format!("/model {choice}");
-            }
-            AutocompleteTarget::ModelProviderArg => {
-                self.input = format!("/model-provider {choice}");
-            }
-        }
-        self.cursor = self.input.len();
+            state.cursor = state.input.len();
+        });
     }
 
     fn accept_completion_on_submit(&mut self) -> InputBarAction {
@@ -999,32 +1089,110 @@ impl InputBarState {
 
     // ── Text editing ─────────────────────────────────────────
 
+    fn snapshot(&self) -> EditSnapshot {
+        EditSnapshot {
+            input: self.input.clone(),
+            cursor: self.cursor,
+            selection: self.selection,
+            selection_anchor: self.selection_anchor,
+        }
+    }
+
+    /// Every semantic text mutation enters here, including non-key callers.
+    /// A replacement's deletion and insertion are one undo transaction.
+    fn edit(&mut self, change: impl FnOnce(&mut Self)) {
+        self.edit_grouped(false, change);
+    }
+
+    fn edit_grouped(&mut self, extend_typing: bool, change: impl FnOnce(&mut Self)) -> bool {
+        // Only a plain character insertion can extend typing. It always changes
+        // text, and the group's initial snapshot already owns its undo point.
+        let before = (!extend_typing).then(|| self.snapshot());
+        let replaced_selection = self.has_selection();
+        change(self);
+        self.cursor = crate::text_navigation::normalize_grapheme_cursor(&self.input, self.cursor);
+        self.clear_selection();
+        self.update_autocomplete();
+        let changed = before
+            .as_ref()
+            .is_none_or(|before| before.input != self.input);
+        if changed || replaced_selection {
+            self.redo.clear();
+        }
+        if changed && let Some(before) = before {
+            self.undo.push_back(before);
+            if self.undo.len() > MAX_EDIT_HISTORY {
+                self.undo.pop_front();
+            }
+        }
+        changed
+    }
+
+    fn restore(&mut self, snapshot: EditSnapshot) {
+        self.input = snapshot.input;
+        self.cursor = snapshot.cursor;
+        self.selection = snapshot.selection;
+        self.selection_anchor = snapshot.selection_anchor;
+        self.scroll_offset = 0;
+        self.update_autocomplete();
+    }
+
+    fn undo(&mut self) {
+        self.last_typing_at = None;
+        if let Some(previous) = self.undo.pop_back() {
+            self.redo.push(self.snapshot());
+            self.restore(previous);
+        }
+    }
+
+    fn redo(&mut self) {
+        self.last_typing_at = None;
+        if let Some(next) = self.redo.pop() {
+            self.undo.push_back(self.snapshot());
+            self.restore(next);
+        }
+    }
+
+    fn reset_edit_history(&mut self) {
+        self.last_typing_at = None;
+        self.undo.clear();
+        self.redo.clear();
+    }
+
     /// Insert `c` at the cursor position and advance the cursor.
     pub fn push_input_char(&mut self, c: char) {
-        self.delete_selection();
-        self.input.insert(self.cursor, c);
-        self.cursor += c.len_utf8();
-        self.cursor = crate::text_navigation::normalize_grapheme_cursor(&self.input, self.cursor);
-        self.update_autocomplete();
+        let now = Instant::now();
+        let typing = c != '\n';
+        let extend_typing = typing
+            && !self.has_selection()
+            && self
+                .last_typing_at
+                .is_some_and(|previous| now.duration_since(previous) < TYPING_GROUP_IDLE);
+        let changed = self.edit_grouped(extend_typing, |state| {
+            state.delete_selection();
+            state.input.insert(state.cursor, c);
+            state.cursor += c.len_utf8();
+        });
+        // No-op replacement must not make later typing reuse an older entry.
+        if typing && changed {
+            self.last_typing_at = Some(now);
+        }
     }
 
     /// Delete the grapheme cluster immediately before the cursor (backspace).
     pub fn pop_input_char(&mut self) {
-        if self.selection.is_some() {
-            self.delete_selection();
-            self.cursor =
-                crate::text_navigation::normalize_grapheme_cursor(&self.input, self.cursor);
-            self.update_autocomplete();
+        self.last_typing_at = None;
+        if self.cursor == 0 && !self.has_selection() {
             return;
         }
-        if self.cursor > 0 {
-            let prev_start =
-                crate::text_navigation::previous_grapheme_boundary(&self.input, self.cursor);
-            self.input.replace_range(prev_start..self.cursor, "");
-            self.cursor =
-                crate::text_navigation::normalize_grapheme_cursor(&self.input, prev_start);
-            self.update_autocomplete();
-        }
+        self.edit(|state| {
+            if state.delete_selection().is_none() && state.cursor > 0 {
+                let prev_start =
+                    crate::text_navigation::previous_grapheme_boundary(&state.input, state.cursor);
+                state.input.replace_range(prev_start..state.cursor, "");
+                state.cursor = prev_start;
+            }
+        });
     }
 
     /// Delete the grapheme cluster immediately after the cursor (forward
@@ -1032,37 +1200,45 @@ impl InputBarState {
     /// input there is nothing after the cursor, so it is a no-op rather than a
     /// cursor move.
     pub fn delete_next_char(&mut self) {
-        if self.selection.is_some() {
-            self.delete_selection();
-            self.cursor =
-                crate::text_navigation::normalize_grapheme_cursor(&self.input, self.cursor);
-            self.update_autocomplete();
+        self.last_typing_at = None;
+        if self.cursor == self.input.len() && !self.has_selection() {
             return;
         }
-        if self.cursor < self.input.len() {
-            let next_end = crate::text_navigation::next_grapheme_boundary(&self.input, self.cursor);
-            self.input.replace_range(self.cursor..next_end, "");
-            self.cursor =
-                crate::text_navigation::normalize_grapheme_cursor(&self.input, self.cursor);
-            self.update_autocomplete();
-        }
+        self.edit(|state| {
+            if state.delete_selection().is_none() && state.cursor < state.input.len() {
+                let next_end =
+                    crate::text_navigation::next_grapheme_boundary(&state.input, state.cursor);
+                state.input.replace_range(state.cursor..next_end, "");
+            }
+        });
     }
 
     pub fn delete_previous_word(&mut self) {
-        if self.selection.is_some() {
-            self.delete_selection();
-            self.cursor =
-                crate::text_navigation::normalize_grapheme_cursor(&self.input, self.cursor);
-            self.update_autocomplete();
+        self.last_typing_at = None;
+        if self.cursor == 0 && !self.has_selection() {
             return;
         }
-        if self.cursor == 0 {
+        self.edit(|state| {
+            if state.delete_selection().is_none() {
+                let start =
+                    crate::text_navigation::previous_word_boundary(&state.input, state.cursor);
+                state.input.replace_range(start..state.cursor, "");
+                state.cursor = start;
+            }
+        });
+    }
+
+    fn delete_next_word(&mut self) {
+        self.last_typing_at = None;
+        if self.cursor == self.input.len() && !self.has_selection() {
             return;
         }
-        let delete_from = crate::text_navigation::previous_word_boundary(&self.input, self.cursor);
-        self.input.replace_range(delete_from..self.cursor, "");
-        self.cursor = crate::text_navigation::normalize_grapheme_cursor(&self.input, delete_from);
-        self.update_autocomplete();
+        self.edit(|state| {
+            if state.delete_selection().is_none() {
+                let end = crate::text_navigation::next_word_boundary(&state.input, state.cursor);
+                state.input.replace_range(state.cursor..end, "");
+            }
+        });
     }
 
     pub fn move_cursor_left(&mut self) {
@@ -1118,6 +1294,7 @@ impl InputBarState {
 
     /// Extract the input text and reset the cursor.
     pub fn take_input(&mut self) -> String {
+        self.reset_edit_history();
         self.cursor = 0;
         self.scroll_offset = 0;
         self.clear_selection();
@@ -1127,11 +1304,11 @@ impl InputBarState {
 
     /// Insert a string at the cursor position (bulk paste).
     pub fn insert_text(&mut self, text: &str) {
-        self.delete_selection();
-        self.input.insert_str(self.cursor, text);
-        self.cursor += text.len();
-        self.cursor = crate::text_navigation::normalize_grapheme_cursor(&self.input, self.cursor);
-        self.update_autocomplete();
+        self.edit(|state| {
+            state.delete_selection();
+            state.input.insert_str(state.cursor, text);
+            state.cursor += text.len();
+        });
     }
 
     pub fn claims_pane_navigation(&self, key: &KeyEvent) -> bool {
@@ -1147,6 +1324,7 @@ impl InputBarState {
     }
 
     pub fn load_for_edit(&mut self, text: String, attachments: Vec<PendingAttachment>) {
+        self.reset_edit_history();
         self.input = text;
         self.cursor = self.input.len();
         self.scroll_offset = 0;
@@ -1209,6 +1387,7 @@ impl InputBarState {
 
     /// Reset all input state (called when switching sessions).
     pub fn reset(&mut self) {
+        self.reset_edit_history();
         self.input.clear();
         self.cursor = 0;
         self.scroll_offset = 0;
@@ -1222,14 +1401,14 @@ impl InputBarState {
         self.cleanup_temps();
     }
 
-    /// Clear the typed text without disturbing pending attachments, history,
+    /// Clear text as one undoable edit without disturbing pending attachments
     /// or clipboard temps. Bound to the ClearInput action.
     pub fn clear_input(&mut self) {
-        self.input.clear();
-        self.cursor = 0;
-        self.scroll_offset = 0;
-        self.clear_selection();
-        self.dismiss_autocomplete();
+        self.edit(|state| {
+            state.input.clear();
+            state.cursor = 0;
+            state.scroll_offset = 0;
+        });
     }
 
     /// Remove clipboard temp files (called after turn completes).
@@ -1249,6 +1428,21 @@ impl InputBarState {
 
     /// Process a key event. Returns an action for the parent pane.
     pub fn handle_key(&mut self, key: KeyEvent) -> InputBarAction {
+        use crate::keymap::{GlobalAction, InputBarAction as IbWidgetAction};
+        let action = IbWidgetAction::from_chord(&key);
+
+        // Even a consumed/no-op command ends typing (for example Left at the
+        // start or a completion-popup navigation key).
+        if !matches!(key.code, KeyCode::Char(_))
+            || key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+            || action.is_some()
+            || self.file_explorer.is_some()
+            || self.attachment_manager.is_some()
+        {
+            self.last_typing_at = None;
+        }
         // File explorer overlay intercepts all keys when open.
         if let Some(explorer) = &mut self.file_explorer {
             match explorer.handle_key(key) {
@@ -1289,19 +1483,80 @@ impl InputBarState {
             return self.handle_attachment_manager_key(key);
         }
 
-        use crate::keymap::{GlobalAction, InputBarAction as IbWidgetAction};
-        let action = IbWidgetAction::from_chord(&key);
-
-        if GlobalAction::from_chord(&key) == Some(GlobalAction::Quit) {
-            if let Some((start, end)) = self.selection {
-                let selected = &self.input[start..end];
-                mouse::copy_osc52(selected);
-                return InputBarAction::Consumed;
-            }
+        if GlobalAction::from_chord(&key) == Some(GlobalAction::Quit) && !self.claims_edit_key(&key)
+        {
             return InputBarAction::NotHandled;
         }
 
         match action {
+            Some(IbWidgetAction::Undo) => {
+                self.undo();
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::Redo) => {
+                self.redo();
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::CopySelection | IbWidgetAction::Cut) => {
+                if self.copy_selection() {
+                    if action == Some(IbWidgetAction::Cut) {
+                        self.edit(|state| {
+                            state.delete_selection();
+                        });
+                    }
+                    return InputBarAction::Consumed;
+                }
+                return InputBarAction::NotHandled;
+            }
+            Some(IbWidgetAction::SelectAll) => {
+                self.selection_anchor = Some(0);
+                self.select_to(self.input.len());
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::SelectLeft) => {
+                self.select_to(crate::text_navigation::previous_grapheme_boundary(
+                    &self.input,
+                    self.cursor,
+                ));
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::SelectRight) => {
+                self.select_to(crate::text_navigation::next_grapheme_boundary(
+                    &self.input,
+                    self.cursor,
+                ));
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::SelectWordLeft) => {
+                self.select_to(crate::text_navigation::previous_word_boundary(
+                    &self.input,
+                    self.cursor,
+                ));
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::SelectWordRight) => {
+                self.select_to(crate::text_navigation::next_word_boundary(
+                    &self.input,
+                    self.cursor,
+                ));
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::SelectUp | IbWidgetAction::SelectDown) => {
+                self.select_vertical(if action == Some(IbWidgetAction::SelectUp) {
+                    -1
+                } else {
+                    1
+                });
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::SelectStart | IbWidgetAction::SelectEnd) => {
+                self.select_to(self.line_edge(action == Some(IbWidgetAction::SelectEnd)));
+                return InputBarAction::Consumed;
+            }
+            Some(IbWidgetAction::DeleteNextWord) => {
+                self.delete_next_word();
+                return InputBarAction::Consumed;
+            }
             Some(IbWidgetAction::Paste) => {
                 return self.handle_clipboard_image();
             }
@@ -1367,22 +1622,13 @@ impl InputBarState {
                 return InputBarAction::Consumed;
             }
             Some(IbWidgetAction::CursorStart) => {
-                let width = self.last_inner_width;
-                if width > 0 {
-                    let (row, _) = cursor_to_visual(&self.input, self.cursor, width);
-                    self.cursor = visual_to_cursor(&self.input, row, 0, width);
-                    self.clear_selection();
-                }
+                self.cursor = self.line_edge(false);
+                self.clear_selection();
                 return InputBarAction::Consumed;
             }
             Some(IbWidgetAction::CursorEnd) => {
-                let width = self.last_inner_width;
-                if width > 0 {
-                    let (row, _) = cursor_to_visual(&self.input, self.cursor, width);
-                    // Move to the end of this visual row by targeting max col.
-                    self.cursor = visual_to_cursor(&self.input, row, width, width);
-                    self.clear_selection();
-                }
+                self.cursor = self.line_edge(true);
+                self.clear_selection();
                 return InputBarAction::Consumed;
             }
             Some(IbWidgetAction::CursorLeft) => {
@@ -1434,6 +1680,7 @@ impl InputBarState {
 
     /// Handle bracketed paste event.
     pub fn handle_paste(&mut self, text: &str) -> InputBarAction {
+        self.last_typing_at = None;
         let trimmed = text.trim();
         if clipboard::looks_like_file_path(trimmed)
             && let Ok(att) = PendingAttachment::from_path(trimmed)
@@ -1452,6 +1699,12 @@ impl InputBarState {
     /// Handle mouse events for the input bar.
     /// Returns `true` if the event was consumed.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if matches!(
+            mouse.kind,
+            MouseEventKind::Down(_) | MouseEventKind::Drag(_)
+        ) {
+            self.last_typing_at = None;
+        }
         // File explorer overlay takes priority.
         if let Some(explorer) = &mut self.file_explorer {
             let action = explorer.handle_mouse(mouse);
@@ -2315,6 +2568,322 @@ mod tests {
 
     fn input_bar_with_shared_commands() -> InputBarState {
         InputBarState::with_shared_commands(&shared_commands())
+    }
+
+    #[test]
+    fn replacement_undo_restores_graphemes_cursor_and_selection() {
+        let mut bar = input_bar_with_shared_commands();
+        let original = "a e\u{301}👩‍💻 z";
+        bar.load_for_edit(original.into(), vec![test_attachment("image.png")]);
+        bar.cursor = 2;
+        bar.select_to(original.len() - 2);
+        let selection = bar.selection;
+        let cursor = bar.cursor;
+        bar.handle_paste("replacement");
+        assert_eq!(bar.input(), "a replacement z");
+        bar.undo();
+        assert_eq!(bar.input(), original);
+        assert_eq!(bar.selection, selection);
+        assert_eq!(bar.selection_anchor, Some(2));
+        assert_eq!(bar.cursor, cursor);
+        bar.redo();
+        assert_eq!(bar.input(), "a replacement z");
+        assert_eq!(bar.selection, None);
+        assert_eq!(bar.pending_attachments().len(), 1);
+        bar.undo();
+        bar.clear_input();
+        bar.undo();
+        assert_eq!(bar.input(), original);
+        assert_eq!(bar.pending_attachments().len(), 1);
+    }
+
+    #[test]
+    fn typing_groups_keep_prior_text_and_break_after_idle() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let mut bar = input_bar_with_shared_commands();
+        bar.load_for_edit("existing ".into(), Vec::new());
+        for c in "several new words e\u{301}👩‍💻".chars() {
+            bar.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let typed = bar.input().to_owned();
+        bar.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        assert_eq!(bar.input(), "existing ");
+        bar.redo();
+        assert_eq!(bar.input(), typed);
+
+        bar.push_input_char('!');
+        bar.last_typing_at = Some(Instant::now() - TYPING_GROUP_IDLE);
+        bar.push_input_char('?');
+        bar.undo();
+        assert_eq!(bar.input(), format!("{typed}!"));
+        bar.undo();
+        assert_eq!(bar.input(), typed, "typing after redo starts a new group");
+    }
+
+    #[test]
+    fn typing_groups_end_on_navigation_and_atomic_edits() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.load_for_edit("original ".into(), Vec::new());
+        for c in "first run".chars() {
+            bar.push_input_char(c);
+        }
+        bar.move_cursor_left();
+        bar.move_cursor_right();
+        for c in " second run".chars() {
+            bar.push_input_char(c);
+        }
+        bar.undo();
+        assert_eq!(bar.input(), "original first run");
+        bar.push_input_char('!');
+        bar.redo();
+        assert_eq!(bar.input(), "original first run!");
+        bar.undo();
+        assert_eq!(bar.input(), "original first run");
+
+        bar.insert_text(" pasted");
+        bar.push_input_char('x');
+        bar.pop_input_char();
+        bar.push_input_char('y');
+        bar.undo();
+        assert_eq!(bar.input(), "original first run pasted");
+        bar.undo();
+        assert_eq!(bar.input(), "original first run pastedx");
+        bar.undo();
+        assert_eq!(bar.input(), "original first run pasted");
+        bar.undo();
+        assert_eq!(bar.input(), "original first run");
+        bar.undo();
+        assert_eq!(bar.input(), "original ");
+    }
+
+    #[test]
+    fn typed_replacement_groups_restore_selection_without_reusing_noop_history() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.load_for_edit("old e\u{301}👩‍💻".into(), Vec::new());
+        bar.select_to(0);
+        let original_selection = bar.selection;
+        for c in "new words".chars() {
+            bar.push_input_char(c);
+        }
+        bar.undo();
+        assert_eq!(bar.input(), "old e\u{301}👩‍💻");
+        assert_eq!(bar.selection, original_selection);
+        bar.redo();
+        assert_eq!(bar.input(), "new words");
+
+        bar.select_to(bar.input.len() - 1);
+        bar.push_input_char('s'); // Same text, but the selection is consumed.
+        bar.push_input_char('!');
+        bar.undo();
+        assert_eq!(
+            bar.input(),
+            "new words",
+            "do not undo the older replacement"
+        );
+        bar.select_to(bar.input.len() - 1);
+        bar.push_input_char('s');
+        bar.redo();
+        assert_eq!(
+            bar.input(),
+            "new words",
+            "same-text replacement discards redo"
+        );
+    }
+
+    #[test]
+    fn mouse_click_at_cursor_ends_typing_group() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.load_for_edit("old ".into(), Vec::new());
+        bar.push_input_char('x');
+        render_input_bar(&mut bar, 40, 12);
+        let area = bar.last_input_area;
+        assert!(bar.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + 1 + bar.cursor() as u16,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        }));
+        bar.push_input_char('y');
+        bar.undo();
+        assert_eq!(bar.input(), "old x");
+        bar.undo();
+        assert_eq!(bar.input(), "old ");
+    }
+
+    #[test]
+    fn history_is_bounded_and_movement_does_not_invalidate_redo() {
+        let mut bar = input_bar_with_shared_commands();
+        for _ in 0..MAX_EDIT_HISTORY + 1 {
+            bar.insert_text("x");
+        }
+        for _ in 0..MAX_EDIT_HISTORY + 1 {
+            bar.undo();
+        }
+        assert_eq!(bar.input(), "x", "evict only complete oldest edits");
+        bar.move_cursor_left();
+        bar.redo();
+        assert_eq!(bar.input(), "xx");
+        bar.undo();
+        bar.push_input_char('y');
+        let edited = bar.input().to_owned();
+        bar.redo();
+        assert_eq!(
+            bar.input(),
+            edited,
+            "a new edit discards the old redo branch"
+        );
+        assert_eq!(bar.undo.len() + bar.redo.len(), 1);
+    }
+
+    #[test]
+    fn draft_boundaries_do_not_resurrect_previous_text() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("submitted");
+        assert_eq!(bar.take_input(), "submitted");
+        bar.undo();
+        assert!(bar.input().is_empty());
+        bar.insert_text("discarded");
+        bar.reset();
+        bar.undo();
+        assert!(bar.input().is_empty());
+        bar.insert_text("previous draft");
+        bar.undo();
+        bar.load_for_edit("queued draft".into(), Vec::new());
+        bar.undo();
+        bar.redo();
+        assert_eq!(bar.input(), "queued draft");
+    }
+
+    #[test]
+    fn completion_is_atomic_but_submitting_completion_resets_history() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/mod");
+        assert!(matches!(
+            bar.accept_completion_on_submit(),
+            InputBarAction::Consumed
+        ));
+        assert_eq!(bar.input(), "/model ");
+        bar.undo();
+        assert_eq!(bar.input(), "/mod");
+        assert!(bar.autocomplete_active);
+        bar.redo();
+        assert_eq!(bar.input(), "/model ");
+        bar.load_for_edit("/hel".into(), Vec::new());
+        bar.update_autocomplete();
+        assert!(matches!(
+            bar.accept_completion_on_submit(),
+            InputBarAction::OpenHelp
+        ));
+        bar.undo();
+        assert!(bar.input().is_empty());
+    }
+
+    #[test]
+    fn keyboard_selection_cut_and_undo_use_resolved_actions() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let mut bar = input_bar_with_shared_commands();
+        bar.load_for_edit("e\u{301}👩‍💻".into(), Vec::new());
+        bar.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        assert_eq!(bar.selection, Some((3, bar.input.len())));
+        bar.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+        assert!(!bar.has_selection());
+        bar.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(bar.selection, Some((0, bar.input.len())));
+        assert!(!bar.has_file_explorer());
+        bar.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        assert_eq!(bar.input(), "");
+        bar.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        assert_eq!(bar.input(), "e\u{301}👩‍💻");
+        assert!(bar.has_selection());
+        bar.handle_key(KeyEvent::new(
+            KeyCode::Char('Z'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(bar.input(), "");
+        bar.undo();
+        bar.handle_key(KeyEvent::new(
+            KeyCode::Char('z'),
+            crate::keymap::Chord::primary('z').effective_modifiers() | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(
+            bar.input(),
+            "",
+            "enhanced lowercase shifted events also redo"
+        );
+    }
+
+    #[test]
+    fn explicit_input_binding_replaces_selection_default_and_claim() {
+        use crate::keymap::{Chord, InputBarAction as KeymapInputBarAction, overrides};
+
+        let _guard = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        overrides::reset();
+        let key = KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT);
+        overrides::set_row(
+            KeymapInputBarAction::TAG,
+            "cursor_left",
+            vec![Chord::shift(KeyCode::Left)],
+        );
+        let mut bar = InputBarState::with_shared_commands(&[]);
+        bar.insert_text("draft");
+        assert_eq!(
+            KeymapInputBarAction::from_chord(&key),
+            Some(KeymapInputBarAction::CursorLeft)
+        );
+        assert!(!bar.claims_edit_key(&key));
+
+        overrides::reset();
+        overrides::set_row(KeymapInputBarAction::TAG, "copy_selection", Vec::new());
+        let mut bar = InputBarState::with_shared_commands(&[]);
+        bar.insert_text("draft");
+        bar.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert!(bar.has_selection());
+        let copy = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(!bar.claims_edit_key(&copy));
+        assert!(matches!(bar.handle_key(copy), InputBarAction::NotHandled));
+        overrides::reset();
+    }
+
+    #[test]
+    fn keyboard_selection_uses_visual_rows_and_word_boundaries() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let mut bar = input_bar_with_shared_commands();
+        bar.load_for_edit("hello world\nnext".into(), Vec::new());
+        bar.last_inner_width = 20;
+        bar.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::SHIFT));
+        assert_eq!(bar.selection, Some((12, 16)));
+        bar.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
+        assert_eq!(bar.selection, Some((0, 16)));
+        bar.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        assert_eq!(bar.selection, Some((12, 16)));
+        bar.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::SHIFT));
+        assert!(!bar.has_selection());
+        bar.move_cursor_word_left();
+        bar.handle_key(KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(
+            &bar.input[bar.selection.unwrap().0..bar.selection.unwrap().1],
+            "world\n"
+        );
+        bar.move_cursor_left();
+        let original = bar.input.clone();
+        bar.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::ALT));
+        assert_ne!(bar.input(), original);
+        bar.undo();
+        assert_eq!(bar.input(), original);
     }
 
     #[test]

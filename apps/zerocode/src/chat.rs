@@ -3228,6 +3228,13 @@ impl Chat {
             return false;
         }
 
+        // The focused composer owns its editing chords before queue shortcuts
+        // or transcript copy. Modals and browse mode retain first refusal.
+        if state.composer_owns_text_input() && state.input_bar.claims_edit_key(&key) {
+            state.input_bar.handle_key(key);
+            return false;
+        }
+
         {
             use crate::keymap::ChatTabAction as QAction;
             let qaction = QAction::from_chord(&key);
@@ -4659,10 +4666,22 @@ impl Chat {
         }
     }
 
-    pub(crate) fn wants_quit_chord(&self) -> bool {
+    /// Copy is local even when normal pane dispatch is disabled after a
+    /// disconnect. Do not call the general handler: other keys can send RPCs.
+    pub(crate) fn copy_composer_selection(&self, key: &KeyEvent) -> bool {
+        matches!(&self.phase, ChatPhase::Active(state)
+            if state.composer_owns_text_input()
+                && state.input_bar.has_selection()
+                && crate::keymap::InputBarAction::from_chord(key)
+                    == Some(crate::keymap::InputBarAction::CopySelection)
+                && state.input_bar.copy_selection())
+    }
+
+    pub(crate) fn wants_quit_chord(&self, key: &KeyEvent) -> bool {
         match &self.phase {
             ChatPhase::Active(s) => {
-                s.turn_in_flight && !matches!(s.turn_status, TurnStatus::Cancelling)
+                (s.composer_owns_text_input() && s.input_bar.claims_edit_key(key))
+                    || (s.turn_in_flight && !matches!(s.turn_status, TurnStatus::Cancelling))
             }
             _ => false,
         }
@@ -13137,6 +13156,9 @@ mod tests {
 
     #[tokio::test]
     async fn wants_quit_chord_tracks_in_flight_turn_state() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
@@ -13144,7 +13166,7 @@ mod tests {
         chat.phase = ChatPhase::Active(Box::new(state()));
 
         assert!(
-            !chat.wants_quit_chord(),
+            !chat.wants_quit_chord(&key),
             "idle pane must leave Ctrl+C to the quit modal"
         );
 
@@ -13152,7 +13174,7 @@ mod tests {
             s.turn_in_flight = true;
         }
         assert!(
-            chat.wants_quit_chord(),
+            chat.wants_quit_chord(&key),
             "an in-flight turn must consume Ctrl+C to cancel before quit"
         );
 
@@ -13160,7 +13182,7 @@ mod tests {
             s.enter_cancelling();
         }
         assert!(
-            !chat.wants_quit_chord(),
+            !chat.wants_quit_chord(&key),
             "an already-cancelling turn must not re-consume Ctrl+C"
         );
     }
@@ -21994,6 +22016,90 @@ mod tests {
         active
     }
 
+    // Keymap overrides are process-global; retain the existing test lock across
+    // async dispatch so another override test cannot change the routing basis.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn composer_editing_precedes_queue_and_cancel_in_chat_and_code() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        for kind in [PaneKind::Chat, PaneKind::Acp] {
+            let (tx, mut rx) = mpsc::channel::<String>(16);
+            let rpc = Arc::new(RpcOutbound::new(tx));
+            let client = Arc::new(RpcClient::with_rpc(rpc));
+            let mut chat = Chat::new(client, kind);
+            let mut active = state();
+            active
+                .input_bar
+                .load_for_edit("alpha beta".into(), Vec::new());
+            active.enqueue_message("queued".into(), Vec::new()).unwrap();
+            let width = active.queue_sidebar_cols;
+            chat.phase = ChatPhase::Active(Box::new(active));
+            let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+                crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+                ratatui::TerminalOptions {
+                    viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+                },
+            )
+            .unwrap();
+            chat.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT), &mut term)
+                .await;
+            assert!(active_state(&mut chat).input_bar.has_selection());
+            assert_eq!(active_state(&mut chat).queue_sidebar_cols, width);
+            let copy = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+            assert!(
+                chat.wants_quit_chord(&copy),
+                "idle selection must bypass app quit"
+            );
+            assert!(!chat.handle_key(copy, &mut term).await);
+            active_state(&mut chat).turn_in_flight = true;
+            assert!(!chat.handle_key(copy, &mut term).await);
+            assert!(
+                rx.try_recv().is_err(),
+                "copy must never send session/cancel"
+            );
+            assert!(!matches!(
+                active_state(&mut chat).turn_status,
+                TurnStatus::Cancelling
+            ));
+            chat.handle_key(
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+                &mut term,
+            )
+            .await;
+            assert_eq!(active_state(&mut chat).input_bar.input(), "alpha bet");
+            chat.handle_key(
+                KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
+                &mut term,
+            )
+            .await;
+            assert_eq!(active_state(&mut chat).input_bar.input(), "alpha beta");
+
+            // A higher modal owns even these newly added editing keys.
+            active_state(&mut chat).set_pending_elicitation(single_elicitation());
+            chat.handle_key(
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+                &mut term,
+            )
+            .await;
+            assert_eq!(active_state(&mut chat).input_bar.input(), "alpha beta");
+            active_state(&mut chat).pending_elicitation = None;
+            active_state(&mut chat).turn_in_flight = false;
+            active_state(&mut chat).browse_cursor = Some(0);
+            assert!(
+                !chat.wants_quit_chord(&copy),
+                "browse mode must not claim input copy"
+            );
+            chat.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT), &mut term)
+                .await;
+            assert_ne!(active_state(&mut chat).queue_sidebar_cols, width);
+        }
+    }
+
     #[tokio::test]
     async fn active_turn_paste_populates_composer_and_queues_on_submit() {
         let mut chat = chat_with_active_input(PaneKind::Chat);
@@ -22091,11 +22197,13 @@ mod tests {
         cases.push(("attachment manager", chat));
 
         let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat)
+            .input_bar
+            .load_for_edit("/attach".into(), Vec::new());
         assert!(matches!(
-            active_state(&mut chat).input_bar.handle_key(KeyEvent::new(
-                KeyCode::Char('a'),
-                crate::keymap::Chord::primary('a').effective_modifiers(),
-            )),
+            active_state(&mut chat)
+                .input_bar
+                .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE,)),
             InputBarAction::Consumed
         ));
         cases.push(("file explorer", chat));

@@ -44,7 +44,12 @@ pub fn help_bypasses_text_input(event: &KeyEvent) -> bool {
 pub fn input_bar_claims_pane_navigation(event: &KeyEvent) -> bool {
     matches!(
         InputBarAction::from_chord(event),
-        Some(InputBarAction::CursorWordLeft | InputBarAction::CursorWordRight)
+        Some(
+            InputBarAction::CursorWordLeft
+                | InputBarAction::CursorWordRight
+                | InputBarAction::SelectWordLeft
+                | InputBarAction::SelectWordRight
+        )
     )
 }
 
@@ -80,8 +85,8 @@ pub fn reserved_chords() -> &'static [(Chord, &'static str)] {
 /// Whether `chord` is a reserved bare control chord; returns the reason
 /// when it is, so the capture widget can explain the rejection.
 ///
-/// Compared with `same_key`: `strip_redundant_shift` drops `SHIFT` from every
-/// character chord on every platform, so `shift+space` is the reserved
+/// Compared with `same_key`: `strip_redundant_shift` drops `SHIFT` from space
+/// on every platform, so `shift+space` is the reserved
 /// selection-toggle key at dispatch and an `Eq` test would have let the capture
 /// widget bind it.
 pub fn reserved_reason(chord: &Chord) -> Option<&'static str> {
@@ -353,8 +358,8 @@ mod tests {
     }
 
     /// The capture widget refuses reserved chords, and that refusal has to use
-    /// dispatch semantics too. `strip_redundant_shift` drops `SHIFT` from every
-    /// character chord on every platform, so `shift+space` *is* the reserved
+    /// dispatch semantics too. `strip_redundant_shift` drops `SHIFT` from space
+    /// on every platform, so `shift+space` *is* the reserved
     /// selection-toggle key once it reaches `match_chord`. An `Eq` test let the
     /// widget bind it and the binding then did something else.
     #[test]
@@ -418,7 +423,7 @@ mod tests {
     /// The darwin-only half of the precedence contract. Platform-primary
     /// intent resolves to the same event as literal Super there, so
     /// an operator's explicit `super+a` and the earlier-declared
-    /// `OpenFileBrowser`'s retained `primary+a` default are one chord at dispatch
+    /// `SelectAll`'s retained `primary+a` default are one chord at dispatch
     /// and two on the wire. Comparing raw values left the shadowed default in
     /// the table, and the operator's own binding lost to it by declaration
     /// order while Help advertised the chord twice.
@@ -439,7 +444,7 @@ mod tests {
                 "the operator's explicit binding must win over a normalized default"
             );
             assert!(
-                !action_key_labels(InputBarAction::OpenFileBrowser).contains(&super_a.display()),
+                !action_key_labels(InputBarAction::SelectAll).contains(&super_a.display()),
                 "the shadowed primary+a default must leave Help too"
             );
             assert_eq!(

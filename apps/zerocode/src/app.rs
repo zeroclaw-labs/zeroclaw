@@ -1676,11 +1676,25 @@ pub async fn run(
                     continue;
                 }
 
-                let pane_wants_quit_chord = match mode {
-                    Mode::Chat => chat_pane.wants_quit_chord(),
-                    Mode::Acp => acp_pane.wants_quit_chord(),
-                    _ => false,
-                };
+                // Retained selected text can still be copied after a network
+                // failure. This path cannot issue RPCs or clear the draft.
+                if copy_disconnected_composer(
+                    &dispatch_state,
+                    reload_confirm || help_overlay.is_some() || sidebar.picker_open(),
+                    mode,
+                    &chat_pane,
+                    &acp_pane,
+                    &key,
+                ) {
+                    continue;
+                }
+
+                let pane_wants_quit_chord = global == Some(GlobalAction::Quit)
+                    && match mode {
+                        Mode::Chat => chat_pane.wants_quit_chord(&key),
+                        Mode::Acp => acp_pane.wants_quit_chord(&key),
+                        _ => false,
+                    };
                 if global == Some(GlobalAction::Quit)
                     && should_handle_global_quit(&dispatch_state, pane_wants_quit_chord)
                 {
@@ -2084,6 +2098,23 @@ fn pane_switch_delta(
         Some(GlobalAction::PaneNavRight) => Some(1),
         _ => None,
     }
+}
+
+fn copy_disconnected_composer(
+    dispatch_state: &PostPollDispatchState,
+    app_modal_owns_keys: bool,
+    mode: Mode,
+    chat: &chat::Chat,
+    acp: &acp::Acp,
+    key: &KeyEvent,
+) -> bool {
+    !app_modal_owns_keys
+        && !dispatch_state.rpc_allowed()
+        && match mode {
+            Mode::Chat => chat.copy_composer_selection(key),
+            Mode::Acp => acp.copy_composer_selection(key),
+            _ => false,
+        }
 }
 
 fn should_handle_global_quit(
@@ -3991,6 +4022,91 @@ mod tests {
         let dispatch_state = PostPollDispatchState::new(ConnectionState::Connected);
         assert!(!should_handle_global_quit(&dispatch_state, true));
         assert!(should_handle_global_quit(&dispatch_state, false));
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn selected_code_composer_copy_bypasses_app_quit_confirmation() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
+        let outbound = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
+        let client = Arc::new(crate::client::RpcClient::with_rpc(outbound));
+        let chat = chat::Chat::new(client.clone(), chat::PaneKind::Chat);
+        let mut pane = acp::Acp::new(client);
+        pane.activate_session_for_test("editor-test");
+        pane.handle_paste("selected draft");
+        let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+            crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+            },
+        )
+        .unwrap();
+        let copy = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let connected = PostPollDispatchState::new(ConnectionState::Connected);
+        assert!(should_handle_global_quit(
+            &connected,
+            pane.wants_quit_chord(&copy)
+        ));
+        pane.handle_key(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            &mut term,
+        )
+        .await;
+        assert!(!should_handle_global_quit(
+            &connected,
+            pane.wants_quit_chord(&copy)
+        ));
+        assert!(!pane.handle_key(copy, &mut term).await);
+        assert!(rx.try_recv().is_err());
+        let disconnected = PostPollDispatchState::new(ConnectionState::Disconnected {
+            reason: "test".into(),
+        });
+        assert!(copy_disconnected_composer(
+            &disconnected,
+            false,
+            Mode::Acp,
+            &chat,
+            &pane,
+            &copy
+        ));
+        assert!(
+            !copy_disconnected_composer(&disconnected, true, Mode::Acp, &chat, &pane, &copy,),
+            "an app-level overlay must exclude hidden composer copy"
+        );
+        assert!(!copy_disconnected_composer(
+            &disconnected,
+            false,
+            Mode::Acp,
+            &chat,
+            &pane,
+            &KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "disconnected copy must not dispatch RPC"
+        );
+        pane.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &mut term)
+            .await;
+        assert!(should_handle_global_quit(
+            &connected,
+            pane.wants_quit_chord(&copy)
+        ));
+        assert!(!copy_disconnected_composer(
+            &disconnected,
+            false,
+            Mode::Acp,
+            &chat,
+            &pane,
+            &copy
+        ));
+        assert!(should_handle_global_quit(
+            &disconnected,
+            pane.wants_quit_chord(&copy)
+        ));
     }
 
     #[test]

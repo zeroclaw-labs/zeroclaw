@@ -45,6 +45,26 @@ events, not native platform text-field events. On macOS, system text
 replacements therefore work only when your terminal expands them before
 zerocode receives the input.
 
+### Composer editing
+
+The Chat and Code composers support these defaults. “Primary” means Command on macOS and Control elsewhere; literal Control aliases also work when your terminal delivers them.
+
+| Action | Default shortcut |
+| --- | --- |
+| Undo / redo | Primary+Z / Primary+Shift+Z (also Control+Z / Control+Shift+Z) |
+| Select all | Primary+A (also Control+A) |
+| Copy / cut selection | Primary+C / Primary+X (also Control+C / Control+X) |
+| Extend selection | Shift+arrows, Shift+Home/End |
+| Extend selection by word | Alt+Shift+Left/Right |
+| Delete next word | Alt+Delete |
+| Clear text | Primary+U (also Control+U) |
+
+Undo history belongs to the current draft and retains at most 100 edit groups. Consecutive typing, including spaces, undoes in one step. A pause of two seconds, cursor or selection movement, a mouse click or drag, or another editing command ends the typing group. Pasted text, completion, cut, clear, and newline each form a separate edit. Typing over a selection starts a new group; undo restores the selected text and selection. Cursor movement does not create an edit. A new text edit after undo discards redo. Undo and redo restore text, cursor, and selection, but never add or remove attachments. Sending, switching sessions, or loading a queued message for editing starts fresh history.
+
+Selection shortcuts act on the focused composer, not the queue sidebar. Copying selected input does not cancel a running turn or quit; with no input selection, Control+C retains its cancel/quit behavior. Dialogs and transcript browsing keep their own shortcuts. Use `/attach` to browse files; the configurable **browse files** action has no default shortcut because Primary+A now selects text. The Help overlay shows the current configured bindings.
+
+Terminal or operating-system shortcuts may intercept Command, Control, or clipboard events before zerocode sees them. Clipboard copy uses the terminal's OSC 52 support; bracketed paste remains available.
+
 ## CLI flags
 
 | Flag | Description |
