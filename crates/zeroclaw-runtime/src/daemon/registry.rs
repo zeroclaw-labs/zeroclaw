@@ -1,10 +1,9 @@
 use anyhow::Result;
-use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::{Config, MqttConfig};
 
@@ -25,7 +24,8 @@ pub type GatewayStarter = Box<
             String,
             u16,
             Config,
-            Option<broadcast::Sender<Value>>,
+            // The daemon's event bus; its observer hook is already installed.
+            Option<crate::observability::EventBus>,
             Option<GatewayReloadControls>,
             Option<Arc<TuiRegistry>>,
             // The daemon's canonical live pairing authority. Shared with

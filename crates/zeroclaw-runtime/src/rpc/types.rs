@@ -1327,8 +1327,70 @@ rpc_type! {
 // ══════════════════════════════════════════════════════════════════════
 
 rpc_type! {
+    /// Parameters shared by every `X/subscribe` method.
+    #[derive(Default)]
+    pub struct SubscribeParams {
+        /// Resume after this sequence number: frames from `since_seq + 1`
+        /// that are still buffered are replayed before live delivery. Omit
+        /// for live frames only.
+        #[serde(default)]
+        pub since_seq: Option<u64>,
+        /// The `epoch` the client's `since_seq` came from (returned by the
+        /// subscribe result). Sequence numbers restart in every hub, so
+        /// `since_seq` resumes only when this matches the current epoch;
+        /// otherwise, or when omitted, every frame still buffered is replayed
+        /// after a `subscription/lagged` with `epoch_changed: true`.
+        #[serde(default)]
+        pub epoch: Option<String>,
+    }
+}
+
+rpc_type! {
+    /// Every notification of the subscription carries `subscription_id` and
+    /// its `seq`. `seq` here is the newest sequence number at subscribe time.
     pub struct LogsSubscribeResult {
         pub subscribed: bool,
+        pub subscription_id: String,
+        pub seq: u64,
+        /// The hub's epoch: pass it back with `since_seq` to resume.
+        pub epoch: String,
+    }
+}
+
+rpc_type! {
+    pub struct SubscriptionCancelParams {
+        pub subscription_id: String,
+    }
+}
+
+rpc_type! {
+    pub struct SubscriptionCancelResult {
+        /// `false` when no subscription with that id is open on this
+        /// connection (already ended, or never existed).
+        pub cancelled: bool,
+    }
+}
+
+rpc_type! {
+    /// `subscription/lagged`: frames `from_seq` up to (not including)
+    /// `resume_seq` are gone; delivery continues at `resume_seq`.
+    pub struct SubscriptionLagged {
+        pub subscription_id: String,
+        pub from_seq: u64,
+        pub resume_seq: u64,
+        /// The client's `since_seq` came from another epoch (the daemon
+        /// restarted or reloaded). Nothing it saw can be matched here: this
+        /// epoch's frames from `resume_seq` on are replayed, and those before
+        /// it are gone.
+        #[serde(default)]
+        pub epoch_changed: bool,
+    }
+}
+
+rpc_type! {
+    /// `events/history`: recent observer frames, oldest first.
+    pub struct EventsHistoryResult {
+        pub events: Vec<serde_json::Value>,
     }
 }
 
