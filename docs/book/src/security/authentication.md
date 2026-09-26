@@ -124,6 +124,16 @@ operator, or a roster principal with `admin = true`) on a local connection.
 Every other principal, and every remote connection, gets the daemon's own
 environment instead.
 
+Eligibility is checked again when a session is built or restored. An existing
+session that retains a non-empty forwarded environment can be resumed or
+prompted only by a currently authorized local operator. Reconnecting over WSS,
+or losing `admin` while a prompt is queued, does not carry that environment into
+the next turn: the request is refused before execution. Create a new session to
+continue without the forwarded environment. Sessions without forwarded values
+remain eligible for normal resume, subject to the other authorization checks.
+The retained environment is immutable for the lifetime of its session; refusing
+a later request does not rewrite it underneath an already running turn.
+
 #### Recovery
 
 A remote authentication bypass is never offered: a remote connection always

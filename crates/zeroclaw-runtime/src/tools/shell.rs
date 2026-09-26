@@ -1,7 +1,7 @@
 use crate::platform::RuntimeAdapter;
 use crate::security::SecurityPolicy;
 use crate::security::traits::Sandbox;
-use crate::tools::shell_env::SAFE_SHELL_ENV_VARS;
+use crate::tools::shell_env::{ForwardedEnvironment, SAFE_SHELL_ENV_VARS};
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -69,12 +69,17 @@ pub struct ShellTool {
     /// real shell environment (PATH, credentials, etc.) reach subprocesses
     /// even though the daemon itself may have a stripped-down env.
     ///
-    /// Behind a `RwLock` because a sealed registry stores this tool inside an
-    /// `Arc<dyn Tool>` (see `ArcDelegatingTool`): a session RESUMED by a
-    /// different connection must re-derive this environment through
-    /// `rebind_forwarded_env(&self, ..)`, which needs interior mutability since
-    /// `&mut` cannot reach through the shared `Arc`.
-    tui_env: std::sync::RwLock<Option<HashMap<String, String>>>,
+    /// The value is an immutable [`ForwardedEnvironment`] (`Arc<HashMap>`): the
+    /// SAME handle is shared with the owning `Agent` and the RPC session so
+    /// admission can inspect the incarnation without copying values into a
+    /// second authorization cache. Behind a `RwLock` because a sealed registry
+    /// stores this tool inside an `Arc<dyn Tool>` (see `ArcDelegatingTool`): a
+    /// session RESUMED by a different connection re-derives this environment
+    /// through `rebind_forwarded_env(&self, ..)`, which needs interior
+    /// mutability since `&mut` cannot reach through the shared `Arc`. Rebinding
+    /// swaps the handle wholesale; it never mutates a map an in-flight turn is
+    /// already executing with.
+    tui_env: std::sync::RwLock<Option<ForwardedEnvironment>>,
     persistent_writes: bool,
 }
 
@@ -122,6 +127,14 @@ impl ShellTool {
     /// Pass `Some(env)` to enable forwarding; `None` is a no-op (same as not
     /// calling this method at all).
     pub fn with_tui_env(mut self, env: Option<HashMap<String, String>>) -> Self {
+        self.tui_env = std::sync::RwLock::new(env.map(Arc::new));
+        self
+    }
+
+    /// Install an already-shared [`ForwardedEnvironment`] handle. Callers that
+    /// also hand the same `Arc` to the `Agent`/RPC session use this so the
+    /// tool, the agent and admission all observe one immutable map.
+    pub(crate) fn with_shared_tui_env(mut self, env: Option<ForwardedEnvironment>) -> Self {
         self.tui_env = std::sync::RwLock::new(env);
         self
     }
@@ -194,10 +207,14 @@ impl Tool for ShellTool {
     /// swaps through the `RwLock` because the sealed registry holds this tool
     /// behind a shared `Arc`.
     fn rebind_forwarded_env(&self, env: Option<std::collections::HashMap<String, String>>) {
+        // An empty map installs `None` so `execute` skips the overlay branch
+        // entirely; a non-empty map is wrapped in a fresh `Arc` and swapped in
+        // wholesale, so an in-flight turn keeps the handle it began with.
         *self
             .tui_env
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = env.filter(|map| !map.is_empty());
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            env.filter(|map| !map.is_empty()).map(Arc::new);
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -317,14 +334,15 @@ impl Tool for ShellTool {
         // Overlay TUI env on top of the safe-env snapshot. TUI vars win on
         // conflict — the user's real PATH etc. should take precedence over
         // whatever the daemon process inherited. Snapshot once: the value can
-        // be rebound on session resume, so read it under the lock and clone out.
+        // be rebound on session resume, so read it under the lock and clone the
+        // `Arc` handle out (cheap; no map copy).
         let tui_env_snapshot = self
             .tui_env
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         if let Some(ref tui_env) = tui_env_snapshot {
-            for (k, v) in tui_env {
+            for (k, v) in tui_env.iter() {
                 cmd.env(k, v);
             }
         }

@@ -84,6 +84,9 @@ pub struct UploadEntry {
 
 pub struct RpcSession {
     pub agent: Arc<Mutex<Agent>>,
+    /// The same immutable map the Agent's shell tool executes with. Sharing
+    /// it lets admission inspect the incarnation without locking an active turn.
+    forwarded_environment: Option<crate::tools::ForwardedEnvironment>,
     /// Orders provider refreshes and configuration within this session.
     model_provider_update: Arc<Mutex<()>>,
     pub created_at: Instant,
@@ -170,6 +173,7 @@ impl RpcSession {
         chat_mode: crate::rpc::types::ChatMode,
     ) -> Self {
         Self {
+            forwarded_environment: agent.forwarded_environment(),
             agent: Arc::new(Mutex::new(agent)),
             model_provider_update: Arc::new(Mutex::new(())),
             created_at: Instant::now(),
@@ -460,7 +464,8 @@ impl SessionStore {
     /// be adopted. A scoped mismatch is reported as absent, never as a
     /// distinguishable denial.
     ///
-    /// `authorize` then judges that record's agent alias and workspace before
+    /// `authorize` then judges the record's agent alias, workspace and
+    /// forwarded environment before
     /// anything changes, under the same lock that guards the claim, so a
     /// caller it refuses neither takes ownership nor observes a session that
     /// was swapped in after the check. Its refusal comes back as `Ok(Some(Err))`.
@@ -473,7 +478,7 @@ impl SessionStore {
         chat_mode: &crate::rpc::types::ChatMode,
         owner_tui_id: Option<String>,
         expected_owner: Option<&str>,
-        authorize: impl FnOnce(&str, &str) -> Result<(), E>,
+        authorize: impl FnOnce(&str, &str, bool) -> Result<(), E>,
     ) -> Result<Option<Result<ResumedRpcSession, E>>, &'static str> {
         let mut sessions = self.sessions.lock().await;
         let Some(session) = sessions.get_mut(id) else {
@@ -490,7 +495,14 @@ impl SessionStore {
         if &session.chat_mode != chat_mode {
             return Err("session uses a different chat mode");
         }
-        if let Err(refused) = authorize(&session.agent_alias, &session.workspace_dir) {
+        if let Err(refused) = authorize(
+            &session.agent_alias,
+            &session.workspace_dir,
+            session
+                .forwarded_environment
+                .as_ref()
+                .is_some_and(|env| !env.is_empty()),
+        ) {
             return Ok(Some(Err(refused)));
         }
 
@@ -513,6 +525,15 @@ impl SessionStore {
 
     pub async fn get_agent(&self, id: &str) -> Option<Arc<Mutex<Agent>>> {
         self.sessions.lock().await.get(id).map(|s| s.agent.clone())
+    }
+
+    pub(crate) async fn has_forwarded_environment(&self, id: &str) -> Option<bool> {
+        self.sessions.lock().await.get(id).map(|session| {
+            session
+                .forwarded_environment
+                .as_ref()
+                .is_some_and(|env| !env.is_empty())
+        })
     }
 
     pub(crate) async fn lock_model_provider_update(

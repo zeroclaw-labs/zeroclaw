@@ -1758,8 +1758,7 @@ impl RpcDispatcher {
         if env.is_empty() {
             return env;
         }
-        let local = self.transport_kind == crate::rpc::transport::TransportKind::Local;
-        if local && auth.grants.admin {
+        if self.may_use_forwarded_environment(Some(&auth.grants)) {
             return env;
         }
         let transport = self.transport_kind;
@@ -1775,6 +1774,48 @@ impl RpcDispatcher {
             "forwarded client environment is not retained for this connection"
         );
         std::collections::HashMap::new()
+    }
+
+    fn may_use_forwarded_environment(
+        &self,
+        grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
+    ) -> bool {
+        self.transport_kind == crate::rpc::transport::TransportKind::Local
+            && grants.is_some_and(|grants| grants.admin)
+    }
+
+    fn session_tui_env(
+        &self,
+        grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
+    ) -> Option<std::collections::HashMap<String, String>> {
+        if !self.may_use_forwarded_environment(grants) {
+            return None;
+        }
+        self.tui_registration()
+            .and_then(|(id, epoch)| self.ctx.tui_registry.env_for_registration(id, epoch))
+    }
+
+    fn authorize_session_environment(
+        &self,
+        method: Method,
+        grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
+        has_forwarded_environment: bool,
+    ) -> Result<(), JsonRpcError> {
+        if has_forwarded_environment && !self.may_use_forwarded_environment(grants) {
+            let denied = rpc_err(
+                FORBIDDEN,
+                "Session retains a local operator environment; create a new session on this connection",
+            );
+            self.audit_auth_denial(
+                method,
+                &crate::rpc::auth::AuthDenied {
+                    code: denied.code,
+                    message: denied.message.clone(),
+                },
+            );
+            return Err(denied);
+        }
+        Ok(())
     }
 
     /// Apply a principal's posture to an agent: narrow its tool surface to the
@@ -3330,10 +3371,14 @@ impl RpcDispatcher {
                     &chat_mode,
                     self.tui_id.clone(),
                     resume_scope.as_deref(),
-                    // Nothing has waited yet, so the stamped grants are as
-                    // current as the gate that just ran.
-                    |alias, workspace| {
-                        self.authorize_resumed_session(self.stamped_grants(), alias, workspace)
+                    |alias, workspace, has_environment| {
+                        let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
+                        self.authorize_resumed_session(grants.as_ref(), alias, workspace)?;
+                        self.authorize_session_environment(
+                            Method::SessionNew,
+                            grants.as_ref(),
+                            has_environment,
+                        )
                     },
                 )
                 .await
@@ -3407,8 +3452,14 @@ impl RpcDispatcher {
                     &chat_mode,
                     self.tui_id.clone(),
                     resume_scope.as_deref(),
-                    |alias, workspace| {
-                        self.authorize_resumed_session(grants.as_ref(), alias, workspace)
+                    |alias, workspace, has_environment| {
+                        let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
+                        self.authorize_resumed_session(grants.as_ref(), alias, workspace)?;
+                        self.authorize_session_environment(
+                            Method::SessionNew,
+                            grants.as_ref(),
+                            has_environment,
+                        )
                     },
                 )
                 .await
@@ -3607,9 +3658,7 @@ impl RpcDispatcher {
         // from a request field. The captured environment carries the user's
         // real shell, credential sockets included, so a caller must not be
         // able to name someone else's TUI and inherit it.
-        let tui_env = self
-            .tui_registration()
-            .and_then(|(id, epoch)| self.ctx.tui_registry.env_for_registration(id, epoch));
+        let tui_env = self.session_tui_env(grants.as_ref());
         let chat_mode = req
             .chat_mode
             .clone()
@@ -4440,9 +4489,8 @@ impl RpcDispatcher {
         }
 
         let cwd_path = Some(std::path::Path::new(&data.workspace_dir));
-        let tui_env = self
-            .tui_registration()
-            .and_then(|(id, epoch)| self.ctx.tui_registry.env_for_registration(id, epoch));
+        let environment_grants = self.recheck_authority_after_admission(Method::SessionPrompt)?;
+        let tui_env = self.session_tui_env(environment_grants.as_ref());
         let exclude_memory = true;
         // Rehydration is a reader in the route-generation transaction, like
         // `session/new`. Take the config writer gate so the Agent is built and
@@ -4964,6 +5012,22 @@ impl RpcDispatcher {
             }
         }
 
+        let has_environment = self
+            .ctx
+            .sessions
+            .has_forwarded_environment(sid)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        if let Err(denied) = self.authorize_session_environment(
+            Method::SessionPrompt,
+            grants.as_ref(),
+            has_environment,
+        ) {
+            return Err(self
+                .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
+                .await);
+        }
+
         // Process inline attachments: upload each, append markers to prompt.
         let mut prompt = req.prompt.clone();
         if !req.attachments.is_empty() {
@@ -5097,6 +5161,27 @@ impl RpcDispatcher {
                 ));
             }
         };
+
+        // Provider reconciliation can wait after admission. Re-resolve before
+        // executing so an environment-bearing session cannot use pre-wait grants.
+        let environment_grants = match self.recheck_authority_after_admission(Method::SessionPrompt)
+        {
+            Ok(grants) => grants,
+            Err(denied) => {
+                return Err(self
+                    .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
+                    .await);
+            }
+        };
+        if let Err(denied) = self.authorize_session_environment(
+            Method::SessionPrompt,
+            environment_grants.as_ref(),
+            has_environment,
+        ) {
+            return Err(self
+                .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
+                .await);
+        }
 
         // Resolve the canonical Agent only after admission and reconciliation;
         // this prevents executing through an orphaned predecessor handle.
@@ -14138,6 +14223,347 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forwarded_environment_remote_resume_and_prompt_are_refused_without_mutation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        config.gateway.paired_tokens = vec!["zc_env_test".into()];
+        config.risk_profiles.get_mut("test-profile").unwrap().level =
+            zeroclaw_config::autonomy::AutonomyLevel::Full;
+        config
+            .risk_profiles
+            .get_mut("test-profile")
+            .unwrap()
+            .allowed_commands = vec!["env".into()];
+        let ctx = enforcement_ctx(config);
+        let (tx, mut local_rx) = tokio::sync::mpsc::channel(64);
+        let mut local = RpcDispatcher::new(Arc::clone(&ctx), tx, "local:env".into());
+        local
+            .handle_initialize(&json!({"env": {"ZEROCLAW_ENV_SENTINEL": "local-only"}}))
+            .await
+            .unwrap();
+        let params = json!({"agent_alias": "test-agent", "session_id": "env-resume"});
+        let created = rpc(&mut local, &mut local_rx, 1, "session/new", params.clone()).await;
+        assert_eq!(created["result"]["session_id"], "env-resume", "{created}");
+        let original = ctx.sessions.get_agent("env-resume").await.unwrap();
+        let owner = ctx.sessions.session_owner_tui_id("env-resume").await;
+        let generation = ctx.sessions.get_generation("env-resume").await;
+        #[cfg(unix)]
+        assert!(
+            session_shell_env(&ctx, "env-resume")
+                .await
+                .contains("ZEROCLAW_ENV_SENTINEL=local-only")
+        );
+
+        let (tx, mut remote_rx) = tokio::sync::mpsc::channel(64);
+        let mut remote = RpcDispatcher::new(Arc::clone(&ctx), tx, "wss:env".into()).with_transport(
+            crate::rpc::transport::TransportKind::Wss,
+            crate::security::auth_provider::Credential::None,
+        );
+        remote
+            .handle_initialize(&json!({"auth_token": "zc_env_test"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            local.auth.as_ref().unwrap().principal.id,
+            remote.auth.as_ref().unwrap().principal.id
+        );
+
+        // A held Agent represents the execution lock of an in-flight turn.
+        // Neither successful local reattachment nor remote refusal may wait
+        // for it or replace its environment.
+        let mut active = original.lock().await;
+        active.set_model_provider(Box::new(FailingProvider));
+        let resumed = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            rpc(&mut local, &mut local_rx, 2, "session/new", params.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(resumed.get("error").is_none(), "{resumed}");
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            rpc(&mut remote, &mut remote_rx, 3, "session/new", params),
+        )
+        .await
+        .unwrap();
+        assert_eq!(refused["error"]["code"], FORBIDDEN, "{refused}");
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("local operator environment")
+        );
+        assert_eq!(
+            active
+                .forwarded_environment()
+                .unwrap()
+                .get("ZEROCLAW_ENV_SENTINEL")
+                .map(String::as_str),
+            Some("local-only")
+        );
+        drop(active);
+        let refused = remote.handle_session_prompt(&json!({
+            "session_id": "env-resume", "prompt": "must not execute", "client_turn_generation": 7,
+        })).await.unwrap_err();
+        assert_eq!(refused.code, FORBIDDEN);
+        assert!(refused.message.contains("local operator environment"));
+        let mut notifications = Vec::new();
+        while let Ok(frame) = remote_rx.try_recv() {
+            notifications.push(serde_json::from_str::<Value>(&frame).unwrap());
+        }
+        assert_turn_refused(&notifications, "env-resume", 7);
+        assert_eq!(ctx.sessions.session_owner_tui_id("env-resume").await, owner);
+        assert_eq!(ctx.sessions.get_generation("env-resume").await, generation);
+        assert!(Arc::ptr_eq(
+            &original,
+            &ctx.sessions.get_agent("env-resume").await.unwrap()
+        ));
+        #[cfg(unix)]
+        assert!(
+            session_shell_env(&ctx, "env-resume")
+                .await
+                .contains("ZEROCLAW_ENV_SENTINEL=local-only")
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarded_environment_empty_session_can_resume_remotely() {
+        for env in [Value::Null, json!({})] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = make_acp_test_config(&tmp);
+            config.gateway.paired_tokens = vec!["zc_env_test".into()];
+            let ctx = enforcement_ctx(config);
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let mut local = RpcDispatcher::new(Arc::clone(&ctx), tx, "local:empty".into());
+            let mut init = json!({});
+            if !env.is_null() {
+                init["env"] = env;
+            }
+            local.handle_initialize(&init).await.unwrap();
+            let params = json!({"agent_alias": "test-agent", "session_id": "env-empty"});
+            local.handle_session_new_for_test(&params).await.unwrap();
+            let original = ctx.sessions.get_agent("env-empty").await.unwrap();
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let mut remote = RpcDispatcher::new(Arc::clone(&ctx), tx, "wss:empty".into())
+                .with_transport(
+                    crate::rpc::transport::TransportKind::Wss,
+                    crate::security::auth_provider::Credential::None,
+                );
+            remote
+                .handle_initialize(&json!({"auth_token": "zc_env_test"}))
+                .await
+                .unwrap();
+            remote.handle_session_new_for_test(&params).await.unwrap();
+            assert!(Arc::ptr_eq(
+                &original,
+                &ctx.sessions.get_agent("env-empty").await.unwrap()
+            ));
+            original
+                .lock()
+                .await
+                .set_model_provider(Box::new(FailingProvider));
+            if let Err(error) = remote
+                .handle_session_prompt(&json!({
+                    "session_id": "env-empty", "prompt": "allowed without forwarded values",
+                }))
+                .await
+            {
+                assert_ne!(error.code, FORBIDDEN, "{error:?}");
+                assert_ne!(error.code, AUTH_REQUIRED, "{error:?}");
+            }
+        }
+    }
+
+    async fn environment_principal_fixture(tmp: &tempfile::TempDir) -> RpcDispatcher {
+        let mut config = principal_test_config(tmp, &["*"], &["*"]);
+        config
+            .permission_profiles
+            .get_mut("principal-test")
+            .unwrap()
+            .admin = true;
+        let (dispatcher, _) = make_acp_test_dispatcher(config);
+        let mut dispatcher = dispatcher.with_transport(
+            crate::rpc::transport::TransportKind::Local,
+            crate::security::auth_provider::Credential::Peercred { uid: 4242 },
+        );
+        dispatcher
+            .handle_initialize(&json!({"env": {"ZEROCLAW_ENV_SENTINEL": "before-demotion"}}))
+            .await
+            .unwrap();
+        dispatcher
+            .handle_session_new_for_test(
+                &json!({"agent_alias": "test-agent", "session_id": "env-demotion"}),
+            )
+            .await
+            .unwrap();
+        dispatcher
+            .ctx
+            .sessions
+            .get_agent("env-demotion")
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .set_model_provider(Box::new(FailingProvider));
+        dispatcher
+    }
+
+    fn demote_environment_principal(dispatcher: &RpcDispatcher) {
+        let mut config = dispatcher.ctx.config.write();
+        config
+            .permission_profiles
+            .get_mut("principal-test")
+            .unwrap()
+            .admin = false;
+        dispatcher.ctx.auth.refresh_from_config(&config).unwrap();
+    }
+
+    #[tokio::test]
+    async fn forwarded_environment_demotion_while_queued_refuses_prompt_and_resume() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = environment_principal_fixture(&tmp).await;
+        let ctx = Arc::clone(&dispatcher.ctx);
+        let permit = ctx
+            .sessions
+            .session_queue
+            .acquire("env-demotion")
+            .await
+            .unwrap();
+        let handle = dispatcher.spawn_handle();
+        let task = zeroclaw_spawn::spawn!(async move {
+            handle
+                .handle_session_prompt(&json!({"session_id": "env-demotion", "prompt": "queued"}))
+                .await
+        });
+        wait_for_session_admission_waiter(&ctx, "env-demotion").await;
+        demote_environment_principal(&dispatcher);
+        drop(permit);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, FORBIDDEN);
+        assert!(
+            error.message.contains("local operator environment"),
+            "{error:?}"
+        );
+        let error = dispatcher
+            .handle_session_new_for_test(
+                &json!({"agent_alias": "test-agent", "session_id": "env-demotion"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, FORBIDDEN);
+        assert!(
+            error.message.contains("local operator environment"),
+            "{error:?}"
+        );
+        dispatcher.handle_session_new_for_test(&json!({"agent_alias": "test-agent", "session_id": "env-fresh", "keep_siblings": true})).await.unwrap();
+        assert_eq!(
+            ctx.sessions.has_forwarded_environment("env-fresh").await,
+            Some(false)
+        );
+        assert_eq!(
+            ctx.sessions.has_forwarded_environment("env-demotion").await,
+            Some(true)
+        );
+        assert!(
+            !registered_env(&ctx, &dispatcher).is_empty(),
+            "the test retains the stale registration"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarded_environment_demotion_during_provider_wait_refuses_prompt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = environment_principal_fixture(&tmp).await;
+        let ctx = Arc::clone(&dispatcher.ctx);
+        let update = ctx
+            .sessions
+            .lock_model_provider_update("env-demotion")
+            .await
+            .unwrap();
+        let waiting = ctx.sessions.model_provider_update_waiting();
+        let handle = dispatcher.spawn_handle();
+        let task = zeroclaw_spawn::spawn!(async move {
+            handle
+                .handle_session_prompt(
+                    &json!({"session_id": "env-demotion", "prompt": "waiting for provider"}),
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting.notified())
+            .await
+            .unwrap();
+        demote_environment_principal(&dispatcher);
+        drop(update);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, FORBIDDEN);
+        assert!(
+            error.message.contains("local operator environment"),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarded_environment_rehydration_uses_current_eligibility() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = principal_test_config(&tmp, &["*"], &["*"]);
+        config
+            .permission_profiles
+            .get_mut("principal-test")
+            .unwrap()
+            .admin = true;
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _backend, store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let mut dispatcher = dispatcher.with_transport(
+            crate::rpc::transport::TransportKind::Local,
+            crate::security::auth_provider::Credential::Peercred { uid: 4242 },
+        );
+        dispatcher
+            .handle_initialize(&json!({"env": {"ZEROCLAW_ENV_SENTINEL": "rehydration"}}))
+            .await
+            .unwrap();
+        let sid = "env-rehydrate";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent", "session_id": sid, "chat_mode": "acp",
+            }))
+            .await
+            .unwrap();
+        assert!(store.load_session(sid).unwrap().is_some());
+        assert_eq!(sessions.has_forwarded_environment(sid).await, Some(true));
+        assert!(sessions.remove(sid).await);
+        dispatcher
+            .rehydrate_reaped_session(sid, dispatcher.stamped_grants())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            sessions.has_forwarded_environment(sid).await,
+            Some(true),
+            "local admin keeps forwarding on rehydration"
+        );
+        assert!(sessions.remove(sid).await);
+        demote_environment_principal(&dispatcher);
+        // Deliberately pass the stamped pre-demotion grants: environment
+        // selection must resolve current eligibility at construction time.
+        dispatcher
+            .rehydrate_reaped_session(sid, dispatcher.stamped_grants())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sessions.has_forwarded_environment(sid).await, Some(false));
+        assert!(!registered_env(&dispatcher.ctx, &dispatcher).is_empty());
+    }
+
+    #[tokio::test]
     async fn wss_initialize_drops_the_forwarded_environment() {
         let mut config = zeroclaw_config::schema::Config::default();
         config.gateway.paired_tokens = vec!["zc_tok".to_string()];
@@ -15517,7 +15943,7 @@ mod tests {
                 &ChatMode::Acp,
                 None,
                 Some("user:alice"),
-                |_, _| Ok::<(), JsonRpcError>(()),
+                |_, _, _| Ok::<(), JsonRpcError>(()),
             )
             .await;
         assert!(
@@ -15535,7 +15961,7 @@ mod tests {
                     &ChatMode::Acp,
                     None,
                     Some("user:bob"),
-                    |_, _| Ok::<(), JsonRpcError>(()),
+                    |_, _, _| Ok::<(), JsonRpcError>(()),
                 )
                 .await
                 .unwrap()
@@ -15550,7 +15976,7 @@ mod tests {
                     &ChatMode::Acp,
                     None,
                     None,
-                    |_, _| Ok::<(), JsonRpcError>(()),
+                    |_, _, _| Ok::<(), JsonRpcError>(()),
                 )
                 .await
                 .unwrap()
