@@ -17,11 +17,12 @@ use super::store::{
 };
 use super::types::{
     DeterministicRunState, DeterministicSavings, FilesystemEventKind, Sop, SopAdmission,
-    SopAdmissionPolicy, SopEvent, SopExecutionMode, SopPriority, SopRun, SopRunAction,
-    SopRunStatus, SopRunSummary, SopStep, SopStepKind, SopStepResult, SopStepStatus, SopTrigger,
-    SopTriggerSource,
+    SopAdmissionPolicy, SopEvent, SopExecutionMode, SopExecutionWitness, SopPriority, SopRun,
+    SopRunAction, SopRunStatus, SopRunSummary, SopStep, SopStepKind, SopStepResult, SopStepStatus,
+    SopTrigger, SopTriggerSource,
 };
 use crate::calendar::{CALENDAR_NO_SHOW_TOPIC, CalendarNoShowEvent};
+use crate::live_config_authority::AgentExecutionCapability;
 use crate::security::{ContentSafety, new_marker_id};
 use serde_json::Value;
 use zeroclaw_config::schema::SopConfig;
@@ -107,6 +108,9 @@ pub struct SopEngine {
     /// until maintenance can persist the terminal `Failed` transition. This set
     /// creates the safe-boundary fact; it does not duplicate durable run state.
     step_budget_finalization_ready: std::collections::HashSet<String>,
+    /// Authority capability used to capture target admissions on executable
+    /// actions. Unmanaged standalone engines leave this unset.
+    execution_capability: Option<AgentExecutionCapability>,
     /// Run IDs currently owned by a headless driver task. A resumed action can
     /// be scheduled from several surfaces (HTTP approve, WS, channel, RPC), and
     /// two drivers over one run execute the same step twice and hand the engine
@@ -388,6 +392,7 @@ impl SopEngine {
             claims_retained_after_terminal_rollback: std::collections::HashSet::new(),
             cancellation_finalization_ready: std::collections::HashSet::new(),
             step_budget_finalization_ready: std::collections::HashSet::new(),
+            execution_capability: None,
             headless_drivers: std::collections::HashSet::new(),
             pending_orphan_settlements: std::collections::HashMap::new(),
             decision_models: HashMap::new(),
@@ -452,6 +457,20 @@ impl SopEngine {
     pub fn with_capabilities(mut self, capabilities: Arc<SopCapabilityRegistry>) -> Self {
         self.capabilities = capabilities;
         self
+    }
+
+    /// Bind executable SOP actions to the daemon-owned authority. The binding
+    /// must be installed before managed producers can create actions.
+    pub fn with_execution_capability(
+        mut self,
+        execution_capability: AgentExecutionCapability,
+    ) -> Self {
+        self.execution_capability = Some(execution_capability);
+        self
+    }
+
+    pub fn has_execution_capability(&self) -> bool {
+        self.execution_capability.is_some()
     }
 
     /// Inject the approval broker (built from `[sop.approval]` config). Defaults to
@@ -2665,8 +2684,10 @@ impl SopEngine {
         // SOP-level mode needs it (strictly stronger than the old
         // approval_mode-conditional escalation), so the mode param is gone.
         let decided_mode = self.active_runs.get(run_id).and_then(|r| r.decided_mode);
+        let sop = sop_for_run(sop, decided_mode);
         let action = resolve_step_action(
-            &sop_for_run(sop, decided_mode),
+            self.execution_capability.as_ref(),
+            &sop,
             &step,
             run_id.to_string(),
             context,
@@ -2686,9 +2707,9 @@ impl SopEngine {
         // the parked snapshot is durably persisted (else keep the claim, fail
         // closed).
         if parked_for_approval {
-            if let Some(reason) = self.pending_pool_full_reason(sop) {
+            if let Some(reason) = self.pending_pool_full_reason(&sop) {
                 Self::log_pending_capacity_full(run_id, &reason);
-                return Ok(self.mark_step_pending(run_id, sop, step.number, reason));
+                return Ok(self.mark_step_pending(run_id, &sop, step.number, reason));
             }
             if let Some(run) = self.active_runs.get_mut(run_id) {
                 run.status = SopRunStatus::WaitingApproval;
@@ -2702,9 +2723,9 @@ impl SopEngine {
                 // keeps the claim and the maintenance retry issues the notice later.
                 ParkPersistOutcome::Released => self.notify_park_request(run_id),
                 ParkPersistOutcome::CapacityFull => {
-                    let reason = self.pending_pool_capacity_raced_reason(sop);
+                    let reason = self.pending_pool_capacity_raced_reason(&sop);
                     Self::log_pending_capacity_full(run_id, &reason);
-                    return Ok(self.mark_step_pending(run_id, sop, step.number, reason));
+                    return Ok(self.mark_step_pending(run_id, &sop, step.number, reason));
                 }
                 ParkPersistOutcome::PersistFailed => {
                     let reason =
@@ -4324,17 +4345,14 @@ impl SopEngine {
         run.waiting_since = None;
         let context = format_step_context(&sop, run, &step, &self.config);
 
-        let mut step = step;
-        step.agent = step
-            .effective_agent(sop.agent.as_deref())
-            .map(str::to_string);
-
         Ok(GateClearTransition::Active {
-            action: Box::new(SopRunAction::ExecuteStep {
-                run_id: run_id.to_string(),
-                step,
+            action: Box::new(execute_step_action(
+                self.execution_capability.as_ref(),
+                &sop,
+                &step,
+                run_id.to_string(),
                 context,
-            }),
+            )),
             follow_up: None,
         })
     }
@@ -6428,7 +6446,16 @@ fn pending_step_blocks_direct_advance(sop: &Sop, step: &SopStep) -> bool {
 }
 
 /// Determine the action for a step based on the effective execution mode.
-fn resolve_step_action(sop: &Sop, step: &SopStep, run_id: String, context: String) -> SopRunAction {
+/// Executable actions capture their authority admission here, before any
+/// caller can queue or spawn them. Approval actions remain lease-free while
+/// parked and acquire only when the gate produces the resumed action.
+fn resolve_step_action(
+    capability: Option<&AgentExecutionCapability>,
+    sop: &Sop,
+    step: &SopStep,
+    run_id: String,
+    context: String,
+) -> SopRunAction {
     let mut step = step.clone();
     step.agent = step
         .effective_agent(sop.agent.as_deref())
@@ -6442,11 +6469,26 @@ fn resolve_step_action(sop: &Sop, step: &SopStep, run_id: String, context: Strin
             context,
         }
     } else {
-        SopRunAction::ExecuteStep {
-            run_id,
-            step: step.clone(),
-            context,
-        }
+        execute_step_action(capability, sop, step, run_id, context)
+    }
+}
+
+fn execute_step_action(
+    capability: Option<&AgentExecutionCapability>,
+    sop: &Sop,
+    step: &SopStep,
+    run_id: String,
+    context: String,
+) -> SopRunAction {
+    let mut step = step.clone();
+    step.agent = step
+        .effective_agent(sop.agent.as_deref())
+        .map(str::to_string);
+    SopRunAction::ExecuteStep {
+        run_id,
+        step,
+        context,
+        execution_witness: capability.map(SopExecutionWitness::capture),
     }
 }
 
@@ -7485,6 +7527,60 @@ mod tests {
         assert!(run_id.starts_with("run-"));
         assert!(matches!(action, SopRunAction::ExecuteStep { .. }));
         assert_eq!(engine.active_runs().len(), 1);
+    }
+
+    #[test]
+    fn managed_execute_step_witness_survives_step_advance_and_blocks_delete() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.agents.insert(
+            "alpha".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let authority = crate::live_config_authority::LiveConfigAuthority::new(config);
+        let mut engine = engine_with_sops(vec![test_sop(
+            "witnessed",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )])
+        .with_execution_capability(authority.execution_capability());
+
+        let action = engine.start_run("witnessed", manual_event()).unwrap();
+        let (run_id, witness) = match action {
+            SopRunAction::ExecuteStep {
+                run_id,
+                execution_witness: Some(witness),
+                ..
+            } => (run_id, witness),
+            other => panic!("expected witnessed ExecuteStep, got {other:?}"),
+        };
+        let admission = witness.admit("alpha").unwrap();
+        assert_eq!(admission.alias(), "alpha");
+        assert_eq!(admission.generation(), 0);
+
+        let next = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Completed,
+                    output: "done".to_string(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                    effective_agent: Some("alpha".to_string()),
+                    tool_calls: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(next, SopRunAction::ExecuteStep { .. }));
+        assert!(matches!(
+            authority.agent_lifecycle().begin_delete("alpha"),
+            Err(crate::live_config_authority::AgentDeleteBlocker::ActiveTurns { .. })
+        ));
+
+        drop(next);
+        drop(witness);
+        drop(admission);
+        assert!(authority.agent_lifecycle().begin_delete("alpha").is_ok());
     }
 
     #[test]

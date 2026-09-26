@@ -481,6 +481,21 @@ pub async fn handle_api_cron_add(
         shell_output_format,
     } = body;
 
+    let _reservation = match state
+        .agent_lifecycle
+        .reserve_config_mutation(agent_alias.trim())
+    {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": error.to_string()
+                })),
+            )
+                .into_response();
+        }
+    };
     let config = state.config.read().clone();
     if config.agent(&agent_alias).is_none() {
         return (
@@ -647,6 +662,11 @@ pub async fn handle_api_cron_run(
         return e.into_response();
     }
 
+    let selection = zeroclaw_runtime::live_config_authority::AgentExecutionCapability::from_parts(
+        std::sync::Arc::clone(&state.config),
+        state.agent_lifecycle.clone(),
+    )
+    .capture_selection();
     let config = state.config.read().clone();
 
     let job = match zeroclaw_runtime::cron::get_job(&config, &id) {
@@ -661,11 +681,12 @@ pub async fn handle_api_cron_run(
     };
 
     let event_tx = Some(state.event_tx.clone());
-    let result = zeroclaw_runtime::cron::scheduler::run_manual_job(
+    let result = zeroclaw_runtime::cron::scheduler::run_manual_job_with_selection(
         &config,
         &job,
         zeroclaw_runtime::cron::scheduler::CronDeliveryContext::GatewayManual,
         &event_tx,
+        Some(selection),
     )
     .await;
 
@@ -2389,6 +2410,7 @@ pub(crate) mod tests {
         AppState {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider: Arc::new(MockModelProvider),
             model: "test-model".into(),
             temperature: None,
@@ -4223,6 +4245,44 @@ pub(crate) mod tests {
             "state handler must accept underscore display ids from the sessions list"
         );
         assert_eq!(display_json["turn_id"], "turn-1");
+    }
+
+    #[tokio::test]
+    async fn cron_add_refuses_alias_during_destructive_cleanup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = with_test_agent(zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        });
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(config.clone());
+        let mut cleanup = state.agent_lifecycle.begin_delete("test-agent").unwrap();
+        cleanup.commit_destructive_mutation();
+        let body = || {
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "agent": "test-agent", "schedule": "*/5 * * * *", "command": "echo hello"
+                }))
+                .unwrap(),
+            )
+        };
+        let response = handle_api_cron_add(State(state.clone()), HeaderMap::new(), body())
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(
+            zeroclaw_runtime::cron::list_jobs(&config)
+                .unwrap()
+                .is_empty()
+        );
+        drop(cleanup);
+        let response = handle_api_cron_add(State(state), HeaderMap::new(), body())
+            .await
+            .into_response();
+        let result = response_json(response).await;
+        assert_eq!(result["status"], "ok", "{result}");
+        assert_eq!(zeroclaw_runtime::cron::list_jobs(&config).unwrap().len(), 1);
     }
 
     #[tokio::test]

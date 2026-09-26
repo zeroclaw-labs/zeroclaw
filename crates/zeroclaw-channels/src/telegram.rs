@@ -933,7 +933,7 @@ pub struct TelegramChannel {
     /// Resolves inbound external peers from canonical state at message-time.
     /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
-    persist: Option<Arc<RwLock<Config>>>,
+    persist: Option<zeroclaw_runtime::LiveConfigAuthority>,
     pairing: Option<PairingGuard>,
     typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     stream_mode: StreamMode,
@@ -1858,6 +1858,7 @@ impl TelegramChannel {
         let Some(config) = &self.persist else {
             return false;
         };
+        let config = config.config();
         let live = config.read();
         let Some(context) =
             Self::model_picker_context(&live, &self.alias, state.runtime_routes.as_ref())
@@ -1918,6 +1919,7 @@ impl TelegramChannel {
             return ModelPickerCallbackOutcome::Rejected;
         }
         let context = {
+            let config = config.config();
             let live = config.read();
             let Some(mut context) =
                 Self::model_picker_context(&live, &self.alias, state.runtime_routes.as_ref())
@@ -2744,6 +2746,7 @@ impl TelegramChannel {
             .as_ref()
             .and_then(|config| {
                 config
+                    .config()
                     .read()
                     .channels
                     .telegram
@@ -3562,11 +3565,21 @@ impl TelegramChannel {
         value.trim().trim_start_matches('@').to_string()
     }
 
-    /// write a paired user into `peer_groups` and save. The long-running
-    /// daemon sets this from the orchestrator; tests and one-shot
-    /// callers leave it unset (pairing works at runtime, doesn't persist).
+    /// Write a paired user into `peer_groups` and save. Standalone callers
+    /// may provide a config Arc through [`Self::with_persistence`], which
+    /// pairs it with a local mutation witness; supervised callers use
+    /// [`Self::with_persistence_authority`] to share the daemon witness.
     pub fn with_persistence(mut self, config: Arc<RwLock<Config>>) -> Self {
-        self.persist = Some(config);
+        self.persist = Some(zeroclaw_runtime::LiveConfigAuthority::from_config(config));
+        self
+    }
+
+    /// Wire the daemon generation's live-config authority for pairing writes.
+    pub fn with_persistence_authority(
+        mut self,
+        authority: zeroclaw_runtime::LiveConfigAuthority,
+    ) -> Self {
+        self.persist = Some(authority);
         self
     }
 
@@ -3574,7 +3587,7 @@ impl TelegramChannel {
     ///
     /// Asked before `try_pair`, because pairing consumes the one-time code.
     fn pairing_deny_conflict(&self, identities: &[String]) -> Option<String> {
-        let config = self.persist.as_ref()?;
+        let config = self.persist.as_ref()?.config();
         // The same set `is_any_user_allowed` judges at message time. Checking
         // only the identity that would be *written* lets an `ignore` naming the
         // username pass a bind whose numeric id is the one persisted, and every
@@ -3595,7 +3608,7 @@ impl TelegramChannel {
     }
 
     async fn persist_allowed_identity(&self, identity: &str) -> anyhow::Result<()> {
-        let Some(config) = &self.persist else {
+        let Some(authority) = &self.persist else {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -3615,7 +3628,7 @@ impl TelegramChannel {
         // group happened to be named `telegram_<alias>`, even one whose
         // `channel` points at a different instance, and reported success.
         crate::identity_persist::persist_external_peer(
-            Some(config),
+            Some(authority),
             "telegram",
             &self.alias,
             &normalized,
@@ -7379,6 +7392,7 @@ impl Channel for TelegramChannel {
                 .collect::<Vec<_>>(),
         );
         let context = {
+            let config = config.config();
             let live = config.read();
             let Some(mut context) =
                 Self::model_picker_context(&live, &self.alias, runtime_routes.as_ref())
@@ -8695,6 +8709,60 @@ mod tests {
             );
             self.with_api_base(api_base)
         }
+    }
+
+    #[test]
+    fn authority_persistence_preserves_live_handle_identity() {
+        let authority = zeroclaw_runtime::LiveConfigAuthority::new(Config::default());
+        let channel = TelegramChannel::new(
+            "test-token".into(),
+            "default",
+            Arc::new(Vec::<String>::new),
+            false,
+        )
+        .with_persistence_authority(authority.clone());
+        let stored = channel.persist.as_ref().expect("authority is stored");
+
+        assert!(Arc::ptr_eq(&authority.config(), &stored.config()));
+        assert!(Arc::ptr_eq(
+            &authority.config_write_lock(),
+            &stored.config_write_lock()
+        ));
+    }
+
+    #[tokio::test]
+    async fn paired_identity_save_failure_does_not_publish_telegram_peer() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let blocked_parent = temp.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, "file").unwrap();
+        let mut config = Config::default();
+        config
+            .channels
+            .telegram
+            .insert("default".to_string(), Default::default());
+        config.config_path = blocked_parent.join("config.toml");
+        config.data_dir = temp.path().join("data");
+        let authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+        let channel = TelegramChannel::new(
+            "test-token".into(),
+            "default",
+            Arc::new(Vec::<String>::new),
+            false,
+        )
+        .with_persistence_authority(authority.clone());
+
+        channel
+            .persist_allowed_identity("someone")
+            .await
+            .expect_err("save failure must reject paired identity");
+
+        assert!(
+            authority
+                .config()
+                .read()
+                .channel_external_peers("telegram", "default")
+                .is_empty()
+        );
     }
 
     #[test]
