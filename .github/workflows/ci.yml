@@ -28,7 +28,9 @@ env:
 # The Rust-compiling jobs below (lint, build, check, check-plugin-backends,
 # check-32bit, bench, test, test-channel-features, memory-postgres-test, msrv, parallel-runtime-test,
 # installer-drift) and the Linux `build` matrix entry name their runner label
-# directly, so they start as soon as the run does.
+# directly, so runner selection does not wait for fmt. Only the separate
+# windows-task-owner-recovery job waits for path-changes; the build matrix
+# starts immediately.
 # `tests/architecture/ci_runner_labels.rs` fails the workspace suite if those
 # labels or their cache-provider inputs drift apart, so moving the fleet stays
 # one reviewed edit even though the constant is written more than once.
@@ -150,11 +152,17 @@ jobs:
       - name: Test release version preparation failures
         run: python3 scripts/release/bump-version.test.py
 
+      - name: Test early Apple release credential validation
+        run: python3 scripts/release/apple_preflight_test.py
+
       - name: Test monthly outdated result classification
         run: bash scripts/ci/monthly_outdated_result.test.sh
 
       - name: Test release tool installer mappings
         run: bash scripts/ci/install_release_tool.test.sh
+
+      - name: Test crates.io publish ordering and preflight
+        run: python3 scripts/release/publish_crates_test.py
 
       - name: Test apt install timeout and retry behavior
         run: bash scripts/ci/apt_install.test.sh
@@ -169,6 +177,9 @@ jobs:
 
       - name: Test release announcement composer
         run: bash scripts/ci/release_post_text.test.sh
+
+      - name: Test docs stable metadata promotion
+        run: python3 scripts/docs/promote_stable_test.py
 
   relay-container-smoke-changes:
     name: Detect Relay Container Smoke changes
@@ -365,7 +376,6 @@ jobs:
 
   build:
     name: ${{ matrix.label }} ${{ matrix.target }}
-    needs: [path-changes]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     strategy:
@@ -450,16 +460,47 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+
+  # Split out of the Windows build leg so the recovery harness compiles in
+  # parallel with `cargo check` and voice-wake instead of after them. The three
+  # compiles share nothing (check metadata cannot feed a test-profile build), so
+  # running them serially made the Windows leg the most common pacing job.
+  # Recovery-filter invariant and retirement condition: README.md bespoke CI gate registry.
+  windows-task-owner-recovery:
+    name: Test Windows task-owner recovery
+    needs: [path-changes]
+    if: needs.path-changes.outputs.windows_recovery != 'false'
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.98.0
+          targets: x86_64-pc-windows-msvc
+      # Restore the Windows build leg's master-seeded cache (registry, git, and
+      # shared dependency artifacts) under the same key, and never write: a
+      # second Windows cache would compete for the repository's cache quota.
+      - uses: ./.github/actions/rust-cache
+        with:
+          use-blacksmith: 'false'
+          shared-key: build
+          save-if: 'false'
+      - name: Ensure web/dist placeholder exists
+        shell: bash
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Test Windows task-owner recovery
-        if: runner.os == 'Windows' && needs.path-changes.outputs.windows_recovery != 'false'
         shell: bash
         run: |
-          cargo test --profile ci --locked -p zeroclaw-runtime --lib \
+          set -euo pipefail
+          cargo test --locked -p zeroclaw-runtime --lib \
             --target x86_64-pc-windows-msvc \
-            control_plane::authority::tests::windows_process_exit_is_detected -- --exact
-          cargo test --profile ci --locked -p zeroclaw-runtime --lib \
+            control_plane::authority::tests::windows_process_exit_is_detected -- --exact 2>&1 | tee "$RUNNER_TEMP/windows-owner-exit.log"
+          grep -Fq 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/windows-owner-exit.log"
+          cargo test --locked -p zeroclaw-runtime --lib \
             --target x86_64-pc-windows-msvc \
-            control_plane::boot::tests::recovery_retains_live_foreign_process_then_reclaims_after_exit -- --exact
+            control_plane::boot::tests::recovery_retains_live_foreign_process_then_reclaims_after_exit -- --exact 2>&1 | tee "$RUNNER_TEMP/windows-owner-recovery.log"
+          grep -Fq 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/windows-owner-recovery.log"
 
   check:
     name: Check (${{ matrix.name }})
@@ -472,6 +513,11 @@ jobs:
       matrix:
         include:
           - name: no default features
+            # Cache key must stay distinct per leg: both legs share the same
+            # RUSTFLAGS, so without it they resolve to one key and the leg
+            # that saves first hands the other a mismatched dependency set.
+            # `check` preserves this leg's existing warm key.
+            cache-key: check
             args: --workspace --exclude zeroclaw-desktop --no-default-features
             sys_deps: ""
             rustflags: -D warnings
@@ -481,6 +527,7 @@ jobs:
           # drift lands green. This row compiles the test targets on the
           # default surface, where that mismatch is visible.
           - name: default features, all targets
+            cache-key: check-all-targets
             args: --workspace --exclude zeroclaw-desktop --all-targets
             sys_deps: ""
             rustflags: -D warnings
@@ -493,6 +540,7 @@ jobs:
         id: rust-cache
         with:
           use-blacksmith: 'true'
+          shared-key: ${{ matrix.cache-key }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install system dependencies
@@ -514,15 +562,23 @@ jobs:
           - name: plugins cranelift backend
             features: plugins-wasm-cranelift
             suite: components
+            # Own key: this leg builds the cranelift + component-test
+            # dependency set, which the pulley/runtime-only legs sharing
+            # `check-plugin-backends` never produce, so under the shared key
+            # it recompiled ~620 dependency crates on every run.
+            cache-key: plugins-cranelift-components
           - name: plugins cranelift runtime
             features: plugins-wasm-cranelift
             suite: runtime
+            cache-key: plugins-cranelift-runtime
           - name: plugins pulley backend
             features: plugins-wasm-pulley
             suite: check
+            cache-key: check-plugin-backends
           - name: plugins runtime-only backend
             features: plugins-wasmtime
             suite: check
+            cache-key: check-plugin-backends
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -548,7 +604,7 @@ jobs:
         with:
           use-blacksmith: 'true'
           # Keep the new runtime build separate from the existing backend caches.
-          shared-key: ${{ matrix.suite == 'runtime' && 'plugins-cranelift-runtime' || '' }}
+          shared-key: ${{ matrix.cache-key }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Check
@@ -590,6 +646,19 @@ jobs:
       - name: Run channel egress boundary e2e
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
         run: cargo test --locked --features plugins-wasm-cranelift --test channel_egress_e2e
+      # The root binary's tests with plugin support compiled in. `mod plugins`,
+      # the plugin registry and the plugin CLI's tests in `main.rs` only
+      # compile under `plugins-wasm`, so the default-feature Test job never sees
+      # them; this is the one required step that runs them. The whole suite
+      # runs rather than a name filter: the ceremony tests in `main.rs` share no
+      # common name, and a filter silently skipped most of them. The component
+      # tests drive the real binary through `plugin info` and `plugin list
+      # --verify` against an installed component that does not load.
+      - name: Run root CLI plugin tests
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'runtime'
+        run: |
+          cargo test --locked --features plugins-wasm-cranelift --bin zeroclaw
+          cargo test --locked --features plugins-wasm-cranelift --test component -- plugin_info_cli
 
   msrv:
     name: MSRV (declared floor)
@@ -1219,6 +1288,12 @@ jobs:
       - name: Run turn-stream regressions
         working-directory: web
         run: npm run test:contexts
+      - name: Run run-surface regressions
+        working-directory: web
+        run: npm run test:sops
+      - name: Run SOP editor regressions
+        working-directory: web
+        run: npm run test:sop-editor
 
   # ── Required gate ─────────────────────────────────────────────────────────
   # Branch protection requires only this single job — internal structure
@@ -1227,7 +1302,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, msrv, check-32bit, bench, test, test-channel-features, memory-postgres-test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
+    needs: [fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, build, windows-task-owner-recovery, check, check-plugin-backends, msrv, check-32bit, bench, test, test-channel-features, memory-postgres-test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Check results

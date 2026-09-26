@@ -11,7 +11,13 @@ observer event, and history entry, see
 
 Before adding a built-in tool or replacing one with an external integration,
 use the [Built-In Tool Inventory](../developing/tool-inventory.md)
-to choose the smallest durable home.
+to choose the smallest durable home. Working built-in integrations stay
+available until a replacement is real, documented, and independently reviewed;
+that replacement-first rule is the accepted
+[RFC #6165](https://github.com/zeroclaw-labs/zeroclaw/issues/6165) policy,
+recorded in the inventory's
+[Replacement-First Policy](../developing/tool-inventory.md#replacement-first-policy)
+section.
 
 ## Built-in tools
 

@@ -198,10 +198,47 @@ impl ConnectionSection {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Hand-written so `auth_token` cannot reach a log, a panic message or a
+/// diagnostic dump. Every other field is ordinary connection metadata and is
+/// printed as usual.
+impl std::fmt::Debug for WssSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WssSection")
+            .field("uri", &self.uri)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("auth_token_file", &self.auth_token_file)
+            .field("auth_provider", &self.auth_provider)
+            .field("tls", &self.tls)
+            .field("relay_url", &self.relay_url)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct WssSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
+    /// Bearer presented as `auth_token` in the initialize handshake (a
+    /// gateway pairing token, or an OIDC access token together with
+    /// `auth_provider`). Remote daemons require it since the RFC 7141
+    /// enforcement boundary. The `ZEROCLAW_AUTH_TOKEN` environment
+    /// variable overrides this value, so the token can stay out of the
+    /// config file entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
+    /// Path to a file holding the bearer, as an alternative to writing it
+    /// into this file. The file must be readable by its owner only; a
+    /// group- or world-readable one is refused rather than used. Takes
+    /// precedence over `auth_token` and yields to `ZEROCLAW_AUTH_TOKEN`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token_file: Option<String>,
+    /// Provider selection for `auth_token` (e.g. `oidc.corp`). Defaults
+    /// to the daemon's `native` pairing provider when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_provider: Option<String>,
     #[serde(default, skip_serializing_if = "WssTlsSection::is_empty")]
     pub tls: WssTlsSection,
     /// Reach the daemon through a nominated relay at this `host:port` instead of
@@ -234,6 +271,9 @@ impl WssSection {
             && self.direct_attempts.is_none()
             && self.direct_timeout_secs.is_none()
             && self.reprobe_secs.is_none()
+            && self.auth_token.is_none()
+            && self.auth_token_file.is_none()
+            && self.auth_provider.is_none()
     }
 }
 
@@ -659,10 +699,17 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
 
     let path = config_path(config_dir);
     if !path.exists() {
+        // Another writer may save a real config between the check above and
+        // this write, so the default is only ever created, never swapped in
+        // over a file that appeared meanwhile.
         let default = ZerocodeConfig::default();
         let body = toml::to_string_pretty(&default).context("serializing default config")?;
-        std::fs::write(&path, body)
+        crate::secure_file::create_private_if_absent(&path, body.as_bytes())
             .with_context(|| format!("writing default {}", path.display()))?;
+    } else {
+        // An existing file may predate the owner-only rule, and reading it
+        // does not go through the write funnel.
+        crate::secure_file::restrict_to_owner(&path, config_dir)?;
     }
 
     let mut doc = load_document(&path)?;
@@ -789,8 +836,17 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
 /// Load the on-disk file as a raw `toml::Table`. A missing or empty file
 /// yields an empty table; any other section the running struct does not
 /// model is carried through untouched so a partial write never clobbers it.
+///
+/// Any other read failure is an error, not an empty table: every persist
+/// rebuilds the whole file from this document and publishes it by rename, so
+/// treating an unreadable file as empty would replace the user's config,
+/// its `[connection.wss]` bearer included, with whatever is being saved.
 fn load_document(path: &Path) -> Result<toml::Table> {
-    let raw = std::fs::read_to_string(path).unwrap_or_default();
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
     if raw.trim().is_empty() {
         return Ok(toml::Table::new());
     }
@@ -798,9 +854,17 @@ fn load_document(path: &Path) -> Result<toml::Table> {
 }
 
 /// Serialize a mutated document table back to disk.
+///
+/// The configuration file carries a hand-written `[connection.wss]
+/// auth_token` whenever the operator uses the persistent path instead of
+/// `ZEROCLAW_AUTH_TOKEN`, and every persist here rewrites the whole file. So
+/// this is the one funnel that decides the file's mode, and it writes
+/// owner-only and atomically: a partial rewrite cannot lose a token that was
+/// already there, and a file that predates this is repaired rather than left
+/// world-readable.
 fn write_document(path: &Path, doc: &toml::Table) -> Result<()> {
     let body = toml::to_string_pretty(doc).context("serializing config")?;
-    std::fs::write(path, body).with_context(|| format!("writing {}", path.display()))
+    crate::secure_file::write_private_atomic(path, body.as_bytes())
 }
 
 /// Mutable borrow of `key`'s sub-table, inserting an empty one when absent.
@@ -1441,6 +1505,24 @@ mod tests {
     }
 
     #[test]
+    fn a_config_that_cannot_be_read_is_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        // Not valid UTF-8, so the read fails for a reason other than absence.
+        let bytes: &[u8] = b"[connection.wss]\nauth_token = \"keep-me\"\n\xff\xfe\n";
+        std::fs::write(config_path(dir.path()), bytes).unwrap();
+
+        assert!(
+            persist_theme(dir.path(), "gruvbox").is_err(),
+            "a persist must not treat an unreadable config as empty"
+        );
+        assert_eq!(
+            std::fs::read(config_path(dir.path())).unwrap(),
+            bytes,
+            "the unreadable config must be left as it was"
+        );
+    }
+
+    #[test]
     fn persist_theme_preserves_unmodeled_sections() {
         let dir = tempfile::tempdir().unwrap();
         seed(
@@ -1812,6 +1894,121 @@ mod tests {
         assert_eq!(doc["theme"]["name"].as_str(), Some("gruvbox"));
     }
 
+    // ── The config file is owner-only and written atomically ─────────
+    //
+    // The operator may keep the WSS bearer in `[connection.wss] auth_token`
+    // rather than `ZEROCLAW_AUTH_TOKEN`, and every persist rewrites the whole
+    // file, so this one funnel decides the file's mode and its atomicity.
+
+    #[cfg(unix)]
+    #[test]
+    fn write_document_creates_the_config_file_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        persist_theme(dir.path(), "gruvbox").unwrap();
+
+        let file_mode = std::fs::metadata(config_path(dir.path()))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let dir_mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600, "a fresh config file must be owner-only");
+        assert_eq!(dir_mode, 0o700, "the config dir must be owner-only");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_document_repairs_a_world_readable_config_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[connection.wss]\nuri = \"wss://daemon.example:8443\"\nauth_token = \"hand-written-bearer\"\n",
+        );
+        std::fs::set_permissions(
+            config_path(dir.path()),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        persist_theme(dir.path(), "gruvbox").unwrap();
+
+        let mode = std::fs::metadata(config_path(dir.path()))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "an existing world-readable file must be repaired"
+        );
+        let body = read(dir.path());
+        assert!(
+            body.contains("hand-written-bearer"),
+            "repairing the mode must not lose the operator's token:\n{body}"
+        );
+    }
+
+    #[test]
+    fn write_document_is_atomic_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        persist_theme(dir.path(), "gruvbox").unwrap();
+        persist_locale(dir.path(), "fr").unwrap();
+
+        let entries: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![FILE_NAME.to_string()],
+            "the publish must leave no staging file behind: {entries:?}"
+        );
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["theme"]["name"].as_str(), Some("gruvbox"));
+        assert_eq!(doc["locale"].as_str(), Some("fr"));
+    }
+
+    #[test]
+    fn persisted_auth_token_survives_unrelated_section_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[connection.wss]\nuri = \"wss://daemon.example:8443\"\nauth_token = \"hand-written-bearer\"\n",
+        );
+
+        persist_locale(dir.path(), "fr").unwrap();
+
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(
+            doc["connection"]["wss"]["auth_token"].as_str(),
+            Some("hand-written-bearer"),
+            "an unrelated persist must carry the token through untouched"
+        );
+        assert_eq!(doc["locale"].as_str(), Some("fr"));
+    }
+
+    #[test]
+    fn wss_section_debug_redacts_the_bearer() {
+        let section = WssSection {
+            uri: Some("wss://daemon.example:8443".into()),
+            auth_token: Some("super-secret-bearer".into()),
+            auth_provider: Some("oidc.corp".into()),
+            ..WssSection::default()
+        };
+        let rendered = format!("{section:?}");
+        assert!(
+            !rendered.contains("super-secret-bearer"),
+            "the bearer must never reach a diagnostic: {rendered}"
+        );
+        assert!(rendered.contains("REDACTED"), "{rendered}");
+        assert!(
+            rendered.contains("oidc.corp"),
+            "ordinary connection metadata still prints: {rendered}"
+        );
+    }
+
     #[test]
     fn sidebar_section_round_trips() {
         let _guard = env_test_lock();
@@ -1888,6 +2085,19 @@ mod tests {
         assert_eq!(
             back.connection.wss.tls.skip_verify_routes,
             vec!["wss://host:9781"]
+        );
+    }
+
+    #[test]
+    fn a_token_file_alone_keeps_the_connection_section() {
+        let mut c = ZerocodeConfig::default();
+        c.connection.wss.auth_token_file = Some("/etc/zeroclaw/zerocode-bearer".to_string());
+        let body = toml::to_string_pretty(&c).unwrap();
+        let back: ZerocodeConfig = toml::from_str(&body).unwrap();
+        assert_eq!(
+            back.connection.wss.auth_token_file.as_deref(),
+            Some("/etc/zeroclaw/zerocode-bearer"),
+            "got:\n{body}"
         );
     }
 

@@ -20,6 +20,7 @@ pub async fn run_mqtt_sop_listener(
     config: &MqttConfig,
     engine: Arc<Mutex<SopEngine>>,
     audit: Arc<SopAuditLogger>,
+    driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
 ) -> Result<()> {
     config.validate()?;
 
@@ -69,7 +70,11 @@ pub async fn run_mqtt_sop_listener(
         match eventloop.poll().await {
             Ok(Event::Incoming(Packet::Publish(msg))) => {
                 let payload_raw = String::from_utf8_lossy(&msg.payload);
-                SopIngress::new(Some(&engine), Some(audit.as_ref()))
+                let mut ingress = SopIngress::new(Some(&engine), Some(audit.as_ref()));
+                if let Some(sink) = driver_sink.as_ref() {
+                    ingress = ingress.with_driver_sink(sink);
+                }
+                ingress
                     .dispatch(
                         SopTriggerSource::Mqtt,
                         Some(&msg.topic),

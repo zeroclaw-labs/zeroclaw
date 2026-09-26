@@ -902,7 +902,7 @@ fn parse_xml_tool_calls(xml_content: &str) -> Option<Vec<ParsedToolCall>> {
         }
 
         calls.push(ParsedToolCall {
-            name: tool_name,
+            name: map_tool_name_alias(&tool_name).to_string(),
             arguments: serde_json::Value::Object(args),
             tool_call_id: None,
         });
@@ -981,7 +981,7 @@ fn parse_minimax_invoke_calls(response: &str) -> Option<(String, Vec<ParsedToolC
         }
 
         calls.push(ParsedToolCall {
-            name: name.to_string(),
+            name: map_tool_name_alias(name).to_string(),
             arguments: serde_json::Value::Object(args),
             tool_call_id: None,
         });
@@ -2409,7 +2409,7 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                         serde_json::Value::Object(serde_json::Map::new())
                     };
                     calls.push(ParsedToolCall {
-                        name: tool_name.to_string(),
+                        name: map_tool_name_alias(tool_name).to_string(),
                         arguments,
                         tool_call_id: None,
                     });
@@ -5307,6 +5307,61 @@ Let me check the result."#;
         let input = r#"[1, 2, 3]{"key": "value"}"#;
         let result = extract_json_values(input);
         assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn tool_alias_format_parity() {
+        let arguments = serde_json::json!({
+            "path": "example.txt",
+            "content": "{\"keep\":\"a string\"}",
+            "options": {"enabled": true},
+        });
+        for (raw, expected) in [
+            ("readfile", "file_read"),
+            ("bash", "shell"),
+            ("send_message", "message_send"),
+            ("file_read", "file_read"),
+            ("custom_tool", "custom_tool"),
+            ("Bash", "Bash"),
+        ] {
+            let bodies = [
+                format!("<tool_call><{raw}>{arguments}</{raw}></tool_call>"),
+                format!("<invoke name=\"{raw}\">{arguments}</invoke>"),
+                format!("```tool {raw}\n{arguments}\n```"),
+                format!(r#"<tool_call>{{"name":"{raw}","arguments":{arguments}}}</tool_call>"#),
+            ];
+            for body in bodies {
+                let response = format!("Before\n{body}\nAfter");
+                let (text, calls) = parse_tool_calls(&response);
+                assert_eq!(text, "Before\nAfter", "{response}");
+                assert_eq!(calls.len(), 1, "{response}");
+                assert_eq!(calls[0].name, expected, "{response}");
+                assert_eq!(calls[0].arguments, arguments, "{response}");
+                assert_eq!(calls[0].tool_call_id, None, "{response}");
+            }
+        }
+    }
+
+    #[test]
+    fn tool_alias_format_parity_for_dotted_minimax_names() {
+        for (raw, expected) in [
+            ("default_api.readfile", "file_read"),
+            ("tools.bash", "shell"),
+            ("tools.custom_tool", "custom_tool"),
+            ("tools.Bash", "Bash"),
+        ] {
+            let json = format!(r#"{{"name":"{raw}","arguments":{{"path":"example.txt"}}}}"#);
+            let minimax = format!(
+                "<invoke name=\"{raw}\"><parameter name=\"path\">example.txt</parameter></invoke>"
+            );
+            let (_, json_calls) = parse_tool_calls(&json);
+            let (_, minimax_calls) = parse_tool_calls(&minimax);
+            assert_eq!(json_calls.len(), 1, "{json}");
+            assert_eq!(minimax_calls.len(), 1, "{minimax}");
+            assert_eq!(minimax_calls[0].name, expected);
+            assert_eq!(minimax_calls[0].name, json_calls[0].name);
+            assert_eq!(minimax_calls[0].arguments, json_calls[0].arguments);
+        }
     }
 
     #[test]

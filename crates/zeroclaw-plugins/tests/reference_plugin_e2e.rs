@@ -13,6 +13,8 @@
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
+mod support;
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -26,6 +28,8 @@ use zeroclaw_plugins::instance::PluginInstanceScope;
 use zeroclaw_plugins::runtime;
 use zeroclaw_plugins::services::PluginHostServices;
 use zeroclaw_plugins::{PluginCapability, PluginManifest, PluginPermission};
+
+use support::state_service;
 
 /// The fixture package's manifest: the single source of truth for both the
 /// seeded `manifest.toml` and the instance key its config entry is stored under.
@@ -96,6 +100,16 @@ fn fixture() -> PathBuf {
             wasm
         })
         .clone()
+}
+
+fn fixture_limits() -> PluginLimits {
+    PluginLimits {
+        call_fuel: 1_000_000_000,
+        max_memory_bytes: 256 * 1024 * 1024,
+        max_table_elements: 100_000,
+        max_instances: 64,
+        call_timeout: std::time::Duration::from_secs(30),
+    }
 }
 
 /// Lay out a disposable config dir the way `zeroclaw plugin install` does.
@@ -237,9 +251,12 @@ async fn reference_plugin_from_config_subprocess() {
 
     let resolver_manifest = manifest.clone();
     let resolver_section = section.clone();
-    let services = PluginHostServices::new(PluginConfigResolver::new(move |scope| {
-        resolve_plugin_config(&resolver_manifest, scope, Some(&resolver_section))
-    }));
+    let services = PluginHostServices::new(
+        PluginConfigResolver::new(move |scope| {
+            resolve_plugin_config(&resolver_manifest, scope, Some(&resolver_section))
+        }),
+        state_service(),
+    );
     let mut plugin = runtime::create_plugin(
         wasm_path,
         &scope,
@@ -272,5 +289,34 @@ async fn reference_plugin_from_config_subprocess() {
     assert_eq!(
         result.output.as_str(),
         "label=masked|uppercase=true|max_len=5|keys=3|text=HELLO"
+    );
+}
+
+/// Install-time load verification. The real fixture instantiates against this
+/// host's `tool-plugin` world, and a non-component artifact is refused with the
+/// load diagnostic — this is the check `zeroclaw plugin install` runs so a
+/// wrong-ABI plugin fails at the CLI instead of installing cleanly and then
+/// being silently skipped at daemon startup.
+#[tokio::test]
+async fn verify_component_loads_accepts_the_fixture_and_rejects_a_non_component() {
+    let manifest: PluginManifest = toml::from_str(FIXTURE_MANIFEST).unwrap();
+
+    let admitted = support::admit_fixture(&fixture(), &manifest);
+    zeroclaw_plugins::validate::verify_component_loads(&admitted, &manifest, fixture_limits())
+        .await
+        .expect("the in-tree tool fixture must load against this host");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let garbage = tmp.path().join("not-a-component.wasm");
+    fs::write(&garbage, b"not a wasm component").unwrap();
+    let garbage = support::admit_fixture(&garbage, &manifest);
+    let err =
+        zeroclaw_plugins::validate::verify_component_loads(&garbage, &manifest, fixture_limits())
+            .await
+            .expect_err("a non-component artifact must be refused, not accepted");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("failed to load WASM component"),
+        "the rejection should name the load failure; got: {msg}"
     );
 }

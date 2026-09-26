@@ -18,6 +18,26 @@ Route an event type to a SOP on the channel (an `events` entry with `sop = "<nam
 
 If nothing starts, confirm the event type is routed to `sop` (not left at the conversational default), the SOP's `channel` trigger names `channel = "git"` (and the right `alias`), and the `condition` holds against the payload. See the [fan-in overview troubleshooting table](./overview.md#troubleshooting).
 
+### Reconciliation sweep without duplicate runs
+
+A periodic reconciliation sweep can remain as a backstop for forge events that
+arrive while the polling channel is offline. Send the Git event's stable work
+item ID as `dedup_key` when the sweep starts the same SOP through the gateway or
+`sops/run` RPC. For a pull request, the Git channel key is
+`ghpr_<owner>/<repo>#<number>`:
+
+```json
+{
+  "payload": "{\"pr\":42}",
+  "dedup_key": "ghpr_octocat/example#42"
+}
+```
+
+The key is scoped to the SOP name. A channel event and a fresh sweep submission
+with the same key coalesce into the same run while it is active; after the run
+becomes terminal, the same key may start a retry. Omitting `dedup_key` preserves
+the normal manual-run behavior. Keys longer than 512 bytes are rejected.
+
 ## Approve and observe
 
 Runs that hit a checkpoint pause as `WaitingApproval`. Clear or inspect them with the CLI (`zeroclaw sop list`, `zeroclaw sop approve`) or out-of-band over the [gateway API](../../gateway/api.md) approval endpoints (`GET /admin/sop/pending`, `POST /admin/sop/approve`, `POST /admin/sop/deny`).

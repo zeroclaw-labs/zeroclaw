@@ -6,7 +6,10 @@ package, or use an MCP or CLI-backed integration.
 
 This is a classification map, not a removal plan. Do not remove or externalize a
 tool until the replacement preserves the operator contract: config, security
-policy, tool receipts, audit visibility, compatibility, and rollback.
+policy, tool receipts, audit visibility, compatibility, and rollback. That rule
+is the accepted lighter-core policy from
+[RFC #6165](https://github.com/zeroclaw-labs/zeroclaw/issues/6165); see
+[Replacement-First Policy](#replacement-first-policy).
 
 The runtime registry source of truth is
 `crates/zeroclaw-runtime/src/tools/mod.rs`, especially `default_tools`,
@@ -97,6 +100,30 @@ evidence:
 - Session reset/delete tools: implementations exist, but the agent registry does
   not register the destructive unscoped variants by default. Keep that boundary
   unless an operator/admin surface explicitly needs them.
+
+## Replacement-First Policy
+
+[RFC #6165](https://github.com/zeroclaw-labs/zeroclaw/issues/6165) is the
+accepted policy for moving working built-in integrations out of the core. Cite
+it in every removal, feature-gate, or migration review, and hold the proposal
+to these rules:
+
+- A working built-in integration stays available until its replacement is
+  real, documented, and independently reviewed.
+- The replacement review must cover configuration migration, security policy,
+  tool receipts or audit behavior where applicable, compatibility, and
+  rollback.
+- Each concrete removal, feature gate, or migration needs its own issue and PR
+  that carries that replacement evidence.
+- The RFC does not pre-approve any individual removal, feature gate, migration,
+  or runtime behavior change.
+- Schema V4 cleanup is a separate decision under
+  [#8310](https://github.com/zeroclaw-labs/zeroclaw/issues/8310). It does not
+  create a blanket exception for removing a working integration without a
+  replacement path.
+
+The [Migration Rules](#migration-rules) below are the questions that review
+must answer before a built-in tool leaves the core.
 
 ## Migration Rules
 

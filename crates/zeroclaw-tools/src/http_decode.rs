@@ -342,6 +342,15 @@ impl BoundedDecode {
         if self.stopped_early {
             return Ok(false);
         }
+        // An empty chunk carries no new bytes, so it can neither overshoot a
+        // budget nor advance decoding. Skip it before the allowance check:
+        // otherwise an empty trailing chunk arriving after the input allowance
+        // is exactly spent would flip `stopped_early` and report a complete,
+        // within-budget response as truncated. Any nonempty input past the
+        // allowance still stops below.
+        if chunk.is_empty() {
+            return Ok(true);
+        }
         // Clip the chunk to the remaining compressed-input allowance before the
         // decoder sees any of it. Feeding the whole transport chunk first would
         // let one chunk overshoot the allowance by its full size, which is
@@ -702,6 +711,42 @@ mod tests {
                 "ordinary EOF exactly at the input allowance must finalize the decoder"
             );
         }
+    }
+
+    #[test]
+    fn empty_trailing_chunk_after_exact_allowance_is_not_truncated() {
+        // A complete stream that spends the input allowance exactly, followed by
+        // an empty trailing chunk before EOF, must not be reported as truncated:
+        // the empty chunk adds no bytes.
+        let (body, limit) = empty_gzip_members_past_input_slack();
+
+        let empty: &[u8] = &[];
+        let chunks: Vec<&[u8]> = vec![body.as_slice(), empty];
+        let (bytes, truncated, _) = decode_chunks(&["gzip"], Some(limit), &chunks).unwrap();
+
+        assert!(bytes.is_empty(), "the complete stream decodes to nothing");
+        assert!(
+            !truncated,
+            "an empty chunk before EOF must not turn a within-budget response into a truncated one"
+        );
+
+        // The stop for genuine overflow must survive: nonempty input past the
+        // allowance still truncates. Reuse the low-yield builder so the extra
+        // input is real compressed bytes, not padding.
+        let empty_member = gzip_member(b"");
+        let over_budget = empty_member.len();
+        let mut spill = body.clone();
+        spill.extend_from_slice(&empty_member);
+        let (_, truncated_over, _) = decode_chunks(
+            &["gzip"],
+            Some(limit.saturating_sub(over_budget)),
+            &[spill.as_slice()],
+        )
+        .unwrap();
+        assert!(
+            truncated_over,
+            "nonempty input beyond the allowance must still be reported as truncated"
+        );
     }
 
     #[test]

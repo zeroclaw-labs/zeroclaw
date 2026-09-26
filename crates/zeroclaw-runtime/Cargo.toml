@@ -55,7 +55,7 @@ rand = "0.10"
 regex = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring", "blocking", "multipart", "stream", "socks"] }
 ring = "0.17"
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
 schemars = { version = "1.2", optional = true }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
@@ -78,6 +78,7 @@ tokio-stream = { version = "0.1.18", default-features = false, features = ["fs",
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7", default-features = false }
 toml = "1.0"
+toml_edit = "0.25"
 tower = { optional = true, version = "0.5", default-features = false, features = ["util"] }
 tower-http = { optional = true, version = "0.6", default-features = false, features = ["limit", "timeout"] }
 urlencoding = "2.1"
@@ -89,9 +90,9 @@ zeroclaw-macros.workspace = true
 
 # Optional deps
 prometheus = { version = "0.14", default-features = false, optional = true }
-opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics"], optional = true }
-opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics"], optional = true }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots"], optional = true }
+opentelemetry = { version = "0.33", default-features = false, features = ["trace", "metrics", "logs"], optional = true }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "metrics", "logs"], optional = true }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "metrics", "logs", "http-proto", "reqwest-blocking-client", "reqwest-rustls"], optional = true }
 # Optional deps for specific features
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -123,20 +124,26 @@ plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasmtime"]
 plugins-wasm-cranelift = ["plugins-wasm", "zeroclaw-plugins/plugins-wasm-cranelift"]
 webauthn = []
 sandbox-bubblewrap = []
-# Exposes the test-only `ScopedToolRegistry::from_raw_for_test` constructor to
-# OTHER crates' test builds (e.g. zeroclaw-channels dev-tests, which must mint a
-# sealed registry for `ChannelRuntimeContext` fixtures). Off by default and never
-# enabled by any production dependency edge, so the assemble()-only seal on
-# `ScopedToolRegistry` remains intact in shipped builds.
+# Exposes test-only helpers (including `ScopedToolRegistry::from_raw_for_test`
+# and the deterministic Agent clock seam) to OTHER crates' test builds (e.g.
+# zeroclaw-channels and zeroclaw-gateway). Off by default and never enabled by
+# any production dependency edge, so these helpers are absent from shipped
+# builds.
 test-util = []
 
 [dev-dependencies]
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "logs"] }
+prost = { version = "0.14", default-features = false, features = ["derive"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 # Enable the shared cert/CSR test fixtures for the enrollment + relay tests.
 zeroclaw-tls = { workspace = true, features = ["testing"] }
+# Real relay for the relay full-path and frontdoor enrollment tests. This is the
+# only edge between the two crates: zerorelay must not dev-depend back on the
+# runtime, or publishing in dependency order becomes impossible.
 zerorelay = { workspace = true }
+rustls-pemfile = "2"
 futures-util = "0.3"
 tempfile = "3.26"
 # `test-util` enables tokio's paused-clock test runtime, which is what the relay

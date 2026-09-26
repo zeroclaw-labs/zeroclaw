@@ -36,7 +36,7 @@ use zeroclaw_plugins::services::PluginHostServices;
 use zeroclaw_plugins::signature;
 use zeroclaw_plugins::{PluginCapability, PluginManifest, PluginPermission};
 
-use support::admit_fixture;
+use support::{admit_fixture, state_service};
 
 /// Build the in-tree tool fixture once per test binary and return its component.
 fn fixture() -> PathBuf {
@@ -139,9 +139,12 @@ fn host_services(
     manifest: PluginManifest,
     configured: Option<HashMap<String, String>>,
 ) -> PluginHostServices {
-    PluginHostServices::new(PluginConfigResolver::new(move |scope| {
-        resolve_plugin_config(&manifest, scope, configured.as_ref())
-    }))
+    PluginHostServices::new(
+        PluginConfigResolver::new(move |scope| {
+            resolve_plugin_config(&manifest, scope, configured.as_ref())
+        }),
+        state_service(),
+    )
 }
 
 /// Admit the fixture from a package directory the caller keeps alive.

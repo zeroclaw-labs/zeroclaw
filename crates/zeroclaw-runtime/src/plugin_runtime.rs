@@ -248,7 +248,10 @@ pub(crate) fn plugin_host(config: &Config) -> Result<Arc<PluginHost>, PluginErro
 }
 
 #[cfg(feature = "plugins-wasm")]
-pub(crate) fn plugin_limits(config: &Config) -> zeroclaw_plugins::component::PluginLimits {
+/// Materialize the configured store limits used by every plugin constructor.
+/// CLI load verification uses this same resolver so its result cannot diverge
+/// from the limits applied when the daemon later constructs the plugin.
+pub fn plugin_limits(config: &Config) -> zeroclaw_plugins::component::PluginLimits {
     zeroclaw_plugins::component::PluginLimits {
         call_fuel: config.plugins.limits.call_fuel,
         max_memory_bytes: config

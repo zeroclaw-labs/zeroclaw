@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use super::approval::{BrokerOutcome, ResolveOutcome};
 use super::audit::SopAuditLogger;
 use super::engine::SopEngine;
-use super::types::{SopRun, SopRunAction, SopStepResult, StepToolCall};
+use super::types::{SopRun, SopRunAction, SopStep, SopStepResult, StepToolCall};
 
 use crate::agent::history::truncate_tool_result;
 use crate::agent::turn::redact::{scrub_credentials, scrub_credentials_value};
@@ -149,6 +149,35 @@ pub(crate) fn drain_live_actions(queue: &LiveActionQueue) -> Vec<QueuedSopAction
     }
 }
 
+/// Failure recorded for a headless step whose scoped tool policy could not be
+/// built. The step fails instead of running under an unscoped policy.
+pub(crate) const STEP_TURN_SCOPE_UNAVAILABLE: &str =
+    "SOP step turn not run: its scoped tool policy could not be built";
+
+/// The agent's own security policy with the SOP control tools
+/// ([`crate::sop::active_scope::SOP_CONTROL_TOOLS`]) excluded:
+/// the tool scope for a headless step turn. Mirrors what the live turn path
+/// does for a nested step in `sop_step_excluded_tools`.
+pub(crate) fn step_turn_security(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> Result<zeroclaw_config::policy::SecurityPolicy> {
+    let mut policy = zeroclaw_config::policy::SecurityPolicy::for_agent(config, agent_alias)?;
+    let excluded = policy.excluded_tools.get_or_insert_with(Vec::new);
+    for tool in crate::sop::active_scope::SOP_CONTROL_TOOLS {
+        // Dedup with the consumer's comparison. `SecurityPolicy::is_tool_excluded`
+        // matches exclusions exactly, so skipping `sop_advance` because the
+        // profile happens to carry `SOP_ADVANCE` would leave the registered
+        // lowercase tool visible to the step turn - the exact bypass this
+        // helper exists to close. A duplicate entry is harmless; a missing one
+        // is not.
+        if !excluded.iter().any(|existing| existing == tool) {
+            excluded.push(tool.to_string());
+        }
+    }
+    Ok(policy)
+}
+
 /// Upper bound on steps a single headless drive may execute, so a routing
 /// cycle can never pin a background task forever.
 pub(crate) const MAX_HEADLESS_DRIVE_STEPS: usize = 128;
@@ -228,15 +257,416 @@ pub(crate) async fn drive_shared_deterministic_run(
 /// `ExecuteStep` runs through a fresh agent loop under the step's resolved
 /// agent, `DeterministicStep` routes through the engine's headless
 /// deterministic driver, and every other action is already parked or terminal.
+///
+/// Returns the driver's task handle. A caller whose `config` and engine belong
+/// to a bounded lifetime (the daemon's SOP maintenance tick, which is rebuilt on
+/// reload) must keep it and drain or cancel the driver when that lifetime ends;
+/// otherwise the driver keeps running against superseded configuration. Callers
+/// with no such boundary `drop` it to detach.
+/// A daemon generation's set of headless driver handles, plus whether that
+/// generation has finalized it.
+///
+/// Registration and finalization race by construction: an approval can resolve
+/// on a connection task whose listener has already stopped accepting, so a
+/// driver can be produced after the drain has taken the set. A bare vector
+/// accepts that handle into a collection nobody drains again, and the driver
+/// runs on under superseded config and permissions — the exact escape the
+/// generation boundary exists to prevent. Closing the set makes the late
+/// registration fail instead.
+#[derive(Debug, Default)]
+pub struct SopDriverRegistry {
+    drivers: Vec<RegisteredSopDriver>,
+    closed: bool,
+}
+
+/// One driver a generation owns, with the run it drives when that is known.
+///
+/// The run is what teardown needs when it has to abort a driver: the task
+/// handle alone cannot say which durable run was left `Running` and claimed
+/// with nothing to advance it. A driver admitted without a run (a test, or a
+/// caller with no single run) is still owned and drained; it just has nothing
+/// to settle.
+pub struct RegisteredSopDriver {
+    /// The driver task.
+    pub handle: tokio::task::JoinHandle<()>,
+    /// The run this driver advances, and the engine that holds it.
+    pub run: Option<(String, Arc<Mutex<SopEngine>>)>,
+}
+
+impl std::fmt::Debug for RegisteredSopDriver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegisteredSopDriver")
+            .field("finished", &self.handle.is_finished())
+            .field("run_id", &self.run.as_ref().map(|(run_id, _)| run_id))
+            .finish()
+    }
+}
+
+impl SopDriverRegistry {
+    /// Handles this generation currently tracks.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.drivers.len()
+    }
+
+    /// Whether this generation currently tracks no drivers.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.drivers.is_empty()
+    }
+
+    /// Whether the owning generation has finalized this set.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Take every tracked handle and close the set. Taking and closing are one
+    /// operation deliberately: a caller that took the handles without closing
+    /// would leave later registrations landing in a set it no longer drains.
+    pub fn close_and_take(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
+        self.close_and_take_owned()
+            .into_iter()
+            .map(|driver| driver.handle)
+            .collect()
+    }
+
+    /// [`Self::close_and_take`], keeping each driver's run. The teardown that
+    /// may have to abort a driver uses this, so it can settle the run the
+    /// aborted driver will never advance.
+    pub fn close_and_take_owned(&mut self) -> Vec<RegisteredSopDriver> {
+        self.closed = true;
+        std::mem::take(&mut self.drivers)
+    }
+}
+
+/// Shared handle set for headless run drivers, so every trigger source's
+/// drivers are owned by the same drain/reload boundary.
+pub type SopDriverHandles = std::sync::Arc<std::sync::Mutex<SopDriverRegistry>>;
+
+/// Owned spawner for headless run drivers at an ingress boundary.
+///
+/// Channel-triggered runs previously ended at `process_headless_results`,
+/// which only logs that an `ExecuteStep` is ready: nothing executed the run
+/// (the channel half of the headless-driver gap). Attaching this sink to [`SopIngress`](crate::sop::dispatch::SopIngress) routes
+/// every `Started` action from ANY caller into the same supervised handle set
+/// the daemon's SOP maintenance drains, so reload and cancellation ownership
+/// cannot diverge by trigger source — the alternative, each caller spawning
+/// and dropping its own `JoinHandle`, is exactly what this exists to prevent.
+#[derive(Clone)]
+pub struct SopDriverSink {
+    config: Arc<zeroclaw_config::schema::Config>,
+    engine: Arc<Mutex<SopEngine>>,
+    audit: Option<Arc<SopAuditLogger>>,
+    handles: SopDriverHandles,
+}
+
+impl SopDriverSink {
+    #[must_use]
+    pub fn new(
+        config: zeroclaw_config::schema::Config,
+        engine: Arc<Mutex<SopEngine>>,
+        audit: Option<Arc<SopAuditLogger>>,
+        handles: SopDriverHandles,
+    ) -> Self {
+        Self {
+            config: Arc::new(config),
+            engine,
+            audit,
+            handles,
+        }
+    }
+
+    /// The handle set this sink registers drivers into, for the owner that
+    /// drains them across reload and shutdown.
+    #[must_use]
+    pub fn handles(&self) -> SopDriverHandles {
+        Arc::clone(&self.handles)
+    }
+
+    /// Drive one dispatch action if it needs a headless driver. Finished
+    /// handles are pruned on the way in so a long-lived daemon does not
+    /// accumulate them.
+    pub fn drive(&self, action: &SopRunAction) {
+        if !matches!(
+            action,
+            SopRunAction::ExecuteStep { .. } | SopRunAction::DeterministicStep { .. }
+        ) {
+            return;
+        }
+        spawn_and_register_sop_driver(
+            &self.handles,
+            self.config.as_ref().clone(),
+            Arc::clone(&self.engine),
+            self.audit.clone(),
+            action.clone(),
+        );
+    }
+}
+
+/// Start a headless run driver **without** registering it with a generation.
+///
+/// Only for a caller that has no generation to register with, where the
+/// process itself bounds the driver's life. Every generation-owned surface uses
+/// [`spawn_and_register_sop_driver`], which cannot create a driver that the
+/// generation has not already accepted.
 pub fn spawn_headless_run_driver(
     config: zeroclaw_config::schema::Config,
     engine: Arc<Mutex<SopEngine>>,
     audit: Option<Arc<SopAuditLogger>>,
     first_action: SopRunAction,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
+    let lease = lease_for_first_action(&engine, &first_action).ok()?;
+    Some(spawn_leased_driver(
+        config,
+        engine,
+        audit,
+        first_action,
+        lease,
+    ))
+}
+
+/// Take the per-run driver lease for an action that will execute steps.
+///
+/// `Ok(None)` for a parked or terminal action, which drives nothing. `Err` when
+/// another driver already owns the run: one resumed action can be scheduled
+/// from several approval surfaces, and that driver will reach the same next
+/// action itself, so this one must not start.
+fn lease_for_first_action(
+    engine: &Arc<Mutex<SopEngine>>,
+    action: &SopRunAction,
+) -> std::result::Result<Option<HeadlessDriverLease>, ()> {
+    let Some(run_id) = driven_run_id(action) else {
+        return Ok(None);
+    };
+    match HeadlessDriverLease::acquire(engine, run_id) {
+        Some(lease) => Ok(Some(lease)),
+        None => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({ "run_id": run_id })),
+                "SOP headless driver: run already has a driver; refusing a second one"
+            );
+            Err(())
+        }
+    }
+}
+
+fn spawn_leased_driver(
+    config: zeroclaw_config::schema::Config,
+    engine: Arc<Mutex<SopEngine>>,
+    audit: Option<Arc<SopAuditLogger>>,
+    first_action: SopRunAction,
+    lease: Option<HeadlessDriverLease>,
+) -> tokio::task::JoinHandle<()> {
     zeroclaw_spawn::spawn!(async move {
-        drive_headless_run(config, engine, audit, first_action).await;
+        // The driver hands the lease back the moment it produces an action it
+        // will not keep driving; holding it here is the safety net for every
+        // other exit path (advance failure, budget exhausted, terminal).
+        drive_headless_run(config, engine, audit, first_action, lease).await;
+    })
+}
+
+/// Admit a headless driver into a generation-owned handle set, creating the
+/// task only once the generation has accepted it.
+///
+/// `spawn` is called while the registry lock is held, so the admission check
+/// and the task's creation are one indivisible step that `close_and_take`
+/// cannot interleave with. That ordering is the whole point. Spawning first and
+/// registering afterwards leaves a window in which Tokio can poll the driver
+/// before registration discovers the generation is closed: the rejected driver
+/// can already be mutating the SOP engine under superseded configuration and
+/// permissions. Cancelling it afterwards does not close that window either,
+/// because `abort` only requests cancellation at the next await point — a
+/// driver that reaches none would have to be abandoned mid-flight.
+///
+/// Returns `false` when the set is already closed, in which case `spawn` is
+/// never called. No task exists to cancel, own, or lose: the work is refused
+/// before its body can run, which is the guarantee the generation boundary
+/// needs. Prunes finished entries on the way in so a long-lived daemon does not
+/// accumulate them.
+pub fn admit_sop_driver<F>(handles: &SopDriverHandles, spawn: F) -> bool
+where
+    F: FnOnce() -> tokio::task::JoinHandle<()>,
+{
+    admit_driver(handles, None, spawn)
+}
+
+/// [`admit_sop_driver`] for a driver that advances one known run, recorded so
+/// a teardown that has to abort the driver can settle that run.
+pub fn admit_sop_driver_for_run<F>(
+    handles: &SopDriverHandles,
+    run_id: &str,
+    engine: &Arc<Mutex<SopEngine>>,
+    spawn: F,
+) -> bool
+where
+    F: FnOnce() -> tokio::task::JoinHandle<()>,
+{
+    admit_driver(
+        handles,
+        Some((run_id.to_string(), Arc::clone(engine))),
+        spawn,
+    )
+}
+
+fn admit_driver<F>(
+    handles: &SopDriverHandles,
+    run: Option<(String, Arc<Mutex<SopEngine>>)>,
+    spawn: F,
+) -> bool
+where
+    F: FnOnce() -> tokio::task::JoinHandle<()>,
+{
+    let mut guard = match handles.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.is_closed() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+            "Refused a SOP driver whose generation had already drained; it was never started, so \
+             no step ran under superseded configuration"
+        );
+        return false;
+    }
+    guard
+        .drivers
+        .retain(|existing| !existing.handle.is_finished());
+    let handle = spawn();
+    guard.drivers.push(RegisteredSopDriver { handle, run });
+    true
+}
+
+/// Start a headless run driver and register it with its generation in one
+/// atomic step.
+///
+/// The supported way for a generation-owned surface — cron, channel ingress,
+/// the dashboard, an approval resume — to start a driver: [`admit_sop_driver`]
+/// holds the registry lock across both halves, so a driver either belongs to an
+/// open generation or is never created. A caller with no generation to belong
+/// to (a one-shot command, whose process ends with it) uses
+/// [`spawn_headless_run_driver`] directly instead.
+pub fn spawn_and_register_sop_driver(
+    handles: &SopDriverHandles,
+    config: zeroclaw_config::schema::Config,
+    engine: Arc<Mutex<SopEngine>>,
+    audit: Option<Arc<SopAuditLogger>>,
+    first_action: SopRunAction,
+) -> bool {
+    // Captured before the closure consumes the action, because a refusal has to
+    // name the run it is abandoning.
+    let run_id = crate::sop::dispatch::extract_run_id_from_action(&first_action).to_string();
+    // A second driver for a run that already has one is refused here, and its
+    // run is NOT settled: the driver that owns the run is alive and will advance
+    // it. Only a closed generation, where no driver exists or ever will, settles
+    // the run below.
+    let Ok(lease) = lease_for_first_action(&engine, &first_action) else {
+        return false;
+    };
+    let engine_for_refusal = Arc::clone(&engine);
+    let engine_for_spawn = Arc::clone(&engine);
+    let admitted = admit_sop_driver_for_run(handles, &run_id, &engine, move || {
+        spawn_leased_driver(config, engine_for_spawn, audit, first_action, lease)
     });
+    if !admitted {
+        settle_refused_run(&engine_for_refusal, &run_id);
+    }
+    admitted
+}
+
+/// Take the run a refused driver would have advanced to a terminal state.
+///
+/// Refusing the driver is only half the boundary. The producers reach here with
+/// the run already started and persisted — an approval resume, for instance,
+/// writes the resumed run as `Running` before it asks for a driver — so
+/// declining to start one leaves a durable `Running` row that nothing will ever
+/// advance. A later engine rebuild restores it and renews its execution claim,
+/// and maintenance keeps renewing, so expiry never recovers it: the run holds
+/// concurrency capacity for as long as the daemon lives.
+///
+/// Settling it here, at the single point every generation-owned producer funnels
+/// through, is what keeps that from depending on each caller remembering to.
+/// The engine lock is taken only after `admit_sop_driver` has released the
+/// registry lock, and no producer holds the engine lock across this call.
+fn settle_refused_run(engine: &Arc<Mutex<SopEngine>>, run_id: &str) {
+    let mut guard = match engine.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    // Through the owning path: if this terminal write fails, the engine keeps
+    // the run for maintenance to settle again. No driver was admitted, so
+    // nothing else would ever make that write.
+    if let Err(e) = guard.settle_orphaned_run(
+        run_id,
+        crate::sop::engine::OrphanedRunSettlement::DrainedBeforeAdmission,
+    ) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "run_id": run_id,
+                    "error": e.to_string(),
+                })),
+            "Could not settle a SOP run whose driver was refused; it stays active and SOP \
+             maintenance retries the terminal write until it lands"
+        );
+    }
+}
+
+/// The run an action would execute steps for. Parked and terminal actions
+/// drive nothing, so they need no lease.
+fn driven_run_id(action: &SopRunAction) -> Option<&str> {
+    match action {
+        SopRunAction::ExecuteStep { run_id, .. }
+        | SopRunAction::DeterministicStep { run_id, .. } => Some(run_id),
+        _ => None,
+    }
+}
+
+/// Process-local ownership of a run's headless driver. One resumed action can
+/// be scheduled from several surfaces (HTTP approve, WS, channel, RPC); two
+/// drivers over the same run execute the same step twice and hand the engine
+/// two results for it. The lease lives in the engine and is released on drop.
+struct HeadlessDriverLease {
+    engine: Arc<Mutex<SopEngine>>,
+    run_id: String,
+    /// Set when the lease was already released under a lock the caller held.
+    /// `Drop` then does nothing: re-releasing here would free a lease a
+    /// *different* driver has since taken for the same run.
+    released: bool,
+}
+
+impl HeadlessDriverLease {
+    fn acquire(engine: &Arc<Mutex<SopEngine>>, run_id: &str) -> Option<Self> {
+        let mut guard = match engine.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.try_lease_headless_driver(run_id).then(|| Self {
+            engine: Arc::clone(engine),
+            run_id: run_id.to_string(),
+            released: false,
+        })
+    }
+}
+
+impl Drop for HeadlessDriverLease {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        let mut guard = match self.engine.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.release_headless_driver(&self.run_id);
+    }
 }
 
 /// Drive a broker-approved run from a headless approval surface.
@@ -249,13 +679,116 @@ pub fn drive_resumed_broker_action(
     config: &zeroclaw_config::schema::Config,
     engine: Arc<Mutex<SopEngine>>,
     audit: Option<Arc<SopAuditLogger>>,
+    handles: Option<&SopDriverHandles>,
     outcome: &BrokerOutcome,
 ) {
     let BrokerOutcome::Resolved(ResolveOutcome::Resumed(action)) = outcome else {
         return;
     };
 
-    spawn_headless_run_driver(config.clone(), engine, audit, action.as_ref().clone());
+    match handles {
+        // Generation-owned: the daemon's driver supervisor drains this set at
+        // reload and shutdown, so an approval-resumed driver cannot keep
+        // working under superseded configuration unobserved. An approval can
+        // resolve on a connection task that outlived its listener, so the
+        // generation may already have drained by the time this runs; admission
+        // and creation share one lock, so that case refuses the driver instead
+        // of starting one nothing will drain.
+        Some(handles) => {
+            spawn_and_register_sop_driver(
+                handles,
+                config.clone(),
+                engine,
+                audit,
+                action.as_ref().clone(),
+            );
+        }
+        // No generation supervisor on this surface (a one-shot command): the
+        // process ends with the command, so the driver cannot outlive policy.
+        None => drop(spawn_headless_run_driver(
+            config.clone(),
+            engine,
+            audit,
+            action.as_ref().clone(),
+        )),
+    }
+}
+
+/// Resolve the agent a headless `ExecuteStep` runs as, failing closed.
+///
+/// `step.agent` is already the resolved step-override-then-parent alias by the
+/// time an `ExecuteStep` exists, so `None` here means the SOP declares no
+/// owning agent at all. Headless triggers have no ambient agent turn to borrow
+/// an identity from, and borrowing an arbitrary configured agent would run an
+/// unattended procedure under that agent's provider, workspace, tool surface,
+/// and risk profile. An alias naming an unconfigured — or configured but
+/// disabled — agent fails the same way, with a message that names the SOP's own
+/// declaration rather than the generic turn-assembly error.
+fn headless_step_agent<'a>(
+    config: &zeroclaw_config::schema::Config,
+    step: &'a SopStep,
+    run_initiator: Option<&'a str>,
+) -> Result<&'a str> {
+    let alias = step
+        .agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty())
+        // A run started inside an agent turn carries that agent. The turn is
+        // gone by the time an approval resumes the step, but the identity it
+        // supplied is not arbitrary — it is the agent that started this run, and
+        // it still has to pass the configured-and-enabled checks below.
+        .or_else(|| {
+            run_initiator
+                .map(str::trim)
+                .filter(|alias| !alias.is_empty())
+        })
+        .ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "SOP step {} has no owning agent: headless execution requires `agent` on the SOP \
+                 (or on the step). Refusing to run an unattended step as an unrelated agent.",
+                step.number
+            ))
+        })?;
+    let Some(agent) = config.agents.get(alias) else {
+        anyhow::bail!(
+            "SOP step {} names agent '{alias}', which is not a configured agent",
+            step.number
+        );
+    };
+    // `enabled = false` is the operator withdrawing an agent from service.
+    // The agent lookup this alias feeds does not filter on it, so a disabled
+    // owner would otherwise keep running unattended procedures — the one class
+    // of run with nobody watching it happen.
+    if !agent.enabled {
+        anyhow::bail!(
+            "SOP step {} names agent '{alias}', which is disabled",
+            step.number
+        );
+    }
+    Ok(alias)
+}
+
+/// Build the step's tool-scope contract for the fresh `agent::run` that
+/// executes it. The engine owns the canonical `SopConfig`, so the enforcement
+/// flag and mandatory-tool list are read from it rather than re-derived.
+fn headless_step_scope(
+    engine: &Arc<Mutex<SopEngine>>,
+    run_id: &str,
+    step: &SopStep,
+) -> crate::sop::active_scope::HeadlessStepScope {
+    let config = {
+        let guard = match engine.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.config().clone()
+    };
+    crate::sop::active_scope::HeadlessStepScope {
+        run_id: run_id.to_string(),
+        step: step.clone(),
+        config,
+    }
 }
 
 async fn drive_headless_run(
@@ -263,6 +796,7 @@ async fn drive_headless_run(
     engine: Arc<Mutex<SopEngine>>,
     audit: Option<Arc<SopAuditLogger>>,
     first_action: SopRunAction,
+    mut lease: Option<HeadlessDriverLease>,
 ) {
     use crate::sop::types::SopStepStatus;
 
@@ -304,31 +838,125 @@ async fn drive_headless_run(
                         return;
                     }
                 }
-                let agent_alias = step
-                    .agent
-                    .clone()
-                    .or_else(|| config.agents.keys().min().cloned())
-                    .unwrap_or_default();
                 let started_at = crate::sop::engine::now_iso8601();
-                let session_path =
-                    std::path::PathBuf::from(format!("sop-{run_id}-step-{}", step.number));
-                let run_result = Box::pin(crate::agent::run(
-                    config.clone(),
-                    &agent_alias,
-                    Some(context),
-                    None,
-                    None,
-                    config
-                        .model_provider_for_agent(&agent_alias)
-                        .and_then(|e| e.temperature),
-                    vec![],
-                    false,
-                    Some(session_path),
-                    None,
-                    zeroclaw_api::ingress::TurnOrigin::Daemon,
-                    crate::agent::loop_::AgentRunOverrides::default(),
-                ))
-                .await;
+                // Read per action, not once per driver: the run is the durable
+                // record of who started it, and it survives the daemon
+                // generation the initiating turn belonged to.
+                let run_initiator = {
+                    let guard = match engine.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    guard
+                        .get_run(&run_id)
+                        .and_then(|run| run.initiating_agent.clone())
+                };
+                let resolved_agent = headless_step_agent(&config, &step, run_initiator.as_deref());
+                // Attribution follows execution: a step that never ran — no
+                // owner, or an owner naming an unconfigured agent — is recorded
+                // against no agent at all, so a refusal can never read as an
+                // agent having done the work.
+                let effective_agent = resolved_agent.as_ref().ok().map(|a| (*a).to_string());
+                // The audit sink the live path scopes around a delegated step.
+                // Without it a headless step records `tool_calls: []` — and an
+                // unattended run is precisely the one whose record of what it
+                // actually ran cannot be reconstructed from a conversation.
+                let call_sink = new_step_call_sink();
+                let run_result = match resolved_agent {
+                    // The step turn returns its result to THIS driver. It must
+                    // not be able to advance the run itself through the SOP
+                    // tools: a turn that does so acts on a second engine built
+                    // inside the turn, executes the successor steps there, and
+                    // hands this driver a prose summary that then fails the
+                    // step's schema. The step scope drops those tools, and the
+                    // step turn's security policy excludes them as well.
+                    //
+                    // If that policy cannot be built, the step fails here and
+                    // the turn never runs. Falling back to `agent::run`'s own
+                    // policy construction is not safe: it touches the
+                    // filesystem, so a transient error can clear on the retry
+                    // and the turn would then run without the exclusions.
+                    Ok(agent_alias) => match step_turn_security(&config, agent_alias) {
+                        Ok(policy) => {
+                            let session_path = std::path::PathBuf::from(format!(
+                                "sop-{run_id}-step-{}",
+                                step.number
+                            ));
+                            let scope = headless_step_scope(&engine, &run_id, &step);
+                            // The scope is both handed to this run and published
+                            // on the task: a tool that starts a child run
+                            // (child-agent spawning) inherits the same boundary,
+                            // so the child cannot regain tools this step denies,
+                            // including the SOP control surface the step turn
+                            // always drops. Boxed innermost. The turn future is
+                            // large, and in a debug build composing it inline
+                            // with both scope wrappers overflows the worker stack
+                            // while the value is still being built on it, before
+                            // `Box::pin` can move it to the heap.
+                            let task_scope = scope.clone();
+                            let turn = Box::pin(crate::agent::run(
+                                config.clone(),
+                                agent_alias,
+                                Some(context),
+                                None,
+                                None,
+                                config
+                                    .model_provider_for_agent(agent_alias)
+                                    .and_then(|e| e.temperature),
+                                vec![],
+                                false,
+                                Some(session_path),
+                                None,
+                                zeroclaw_api::ingress::TurnOrigin::Daemon,
+                                crate::agent::loop_::AgentRunOverrides {
+                                    security: Some(Arc::new(policy)),
+                                    sop_step_scope: Some(scope),
+                                    ..Default::default()
+                                },
+                            ));
+                            // Canonical run attribution for every provider and
+                            // tool event the step turn emits, so a run-filtered
+                            // log query (and an OTLP collector) sees what the
+                            // step actually ran, not only its lifecycle rows.
+                            zeroclaw_log::scope!(
+                                sop_run_id: run_id.as_str(),
+                                =>
+                                scope_step_call_sink(
+                                    call_sink.clone(),
+                                    crate::sop::active_scope::with_active_headless_step_scope(
+                                        task_scope, turn,
+                                    ),
+                                )
+                            )
+                            .await
+                        }
+                        Err(e) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Reject
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "run_id": run_id,
+                                    "step": step.number,
+                                    "agent": agent_alias,
+                                    "error": format!("{e:#}"),
+                                })),
+                                "SOP headless driver: step tool scope unavailable; failing the step"
+                            );
+                            Err(anyhow::Error::msg(format!(
+                                "{STEP_TURN_SCOPE_UNAVAILABLE}: {e:#}"
+                            )))
+                        }
+                    },
+                    Err(e) => Err(e),
+                };
+                // Drained for the failure arm too: a step that failed partway
+                // through still ran the calls before it, and those are the ones
+                // an investigator needs.
+                let step_calls = drain_step_calls(&call_sink);
                 let completed_at = crate::sop::engine::now_iso8601();
                 let step_result = match run_result {
                     Ok(output) => SopStepResult {
@@ -337,8 +965,8 @@ async fn drive_headless_run(
                         output,
                         started_at,
                         completed_at: Some(completed_at),
-                        effective_agent: Some(agent_alias.clone()),
-                        tool_calls: Vec::new(),
+                        effective_agent,
+                        tool_calls: step_calls,
                     },
                     Err(e) => SopStepResult {
                         step_number: step.number,
@@ -346,11 +974,12 @@ async fn drive_headless_run(
                         output: e.to_string(),
                         started_at,
                         completed_at: Some(completed_at),
-                        effective_agent: Some(agent_alias.clone()),
-                        tool_calls: Vec::new(),
+                        effective_agent,
+                        tool_calls: step_calls,
                     },
                 };
-                match advance_sop_step(&engine, &run_id, step_result.clone()) {
+                match advance_sop_step_as_driver(&engine, &run_id, step_result.clone(), &mut lease)
+                {
                     Ok((next, finished_run)) => {
                         audit_sop_step(
                             audit.as_deref(),
@@ -381,13 +1010,20 @@ async fn drive_headless_run(
             }
             SopRunAction::DeterministicStep { ref run_id, .. } => {
                 let run_id = run_id.clone();
-                let next = {
+                let (next, released) = {
                     let mut guard = match engine.lock() {
                         Ok(g) => g,
                         Err(poisoned) => poisoned.into_inner(),
                     };
-                    guard.advance_headless_deterministic_step(&run_id, action)
+                    let next = guard.advance_headless_deterministic_step(&run_id, action);
+                    let released = if matches!(&next, Ok(a) if driven_run_id(a).is_none()) {
+                        release_driver_lease(&mut guard, &mut lease)
+                    } else {
+                        None
+                    };
+                    (next, released)
                 };
+                drop(released);
                 match next {
                     Ok(next @ SopRunAction::DeterministicStep { .. }) => {
                         action = next;
@@ -497,6 +1133,64 @@ async fn drive_headless_run(
     fail_exhausted_step_budget(&engine, &run_id);
 }
 
+/// Release this driver's lease while `guard` is still held, so the release and
+/// the transition that ended the drive are one critical section.
+///
+/// Returns the now-disarmed lease for the caller to drop AFTER unlocking.
+/// `HeadlessDriverLease::drop` takes the engine lock, so dropping it here -
+/// inside the critical section - would deadlock the moment the disarm flag
+/// stopped short-circuiting that path. Handing it out keeps the lock-ordering
+/// correct by construction rather than by flag.
+#[must_use = "drop the returned lease only after the engine lock is released"]
+fn release_driver_lease(
+    guard: &mut SopEngine,
+    lease: &mut Option<HeadlessDriverLease>,
+) -> Option<HeadlessDriverLease> {
+    let mut held = lease.take()?;
+    guard.release_headless_driver(&held.run_id);
+    held.released = true;
+    Some(held)
+}
+
+/// `advance_sop_step` for a headless driver, plus release of the driver lease
+/// under the SAME engine lock when the resulting action is one this driver
+/// will not keep driving.
+///
+/// Releasing on `Drop` alone is too late. The engine parks the run inside this
+/// call and unlocks; the driver then awaits its audit write before returning.
+/// An approval arriving in that window consumes the parked action and
+/// schedules a fresh driver, which `spawn_headless_run_driver` refuses because
+/// the outgoing driver still holds the lease - leaving the run `Running` with
+/// nobody driving it. Handing the lease back inside the lock closes that
+/// window.
+fn advance_sop_step_as_driver(
+    engine: &Arc<Mutex<SopEngine>>,
+    run_id: &str,
+    result: SopStepResult,
+    lease: &mut Option<HeadlessDriverLease>,
+) -> Result<(SopRunAction, Option<SopRun>)> {
+    let mut guard = engine
+        .lock()
+        .map_err(|e| anyhow::Error::msg(format!("SOP engine lock poisoned: {e}")))?;
+    let action = guard
+        .advance_step(run_id, result)
+        .with_context(|| format!("failed to advance SOP run {run_id}"))?;
+    let finished_run = match &action {
+        SopRunAction::Completed { run_id, .. }
+        | SopRunAction::Failed { run_id, .. }
+        | SopRunAction::Cancelled { run_id, .. } => guard.get_run(run_id).cloned(),
+        _ => None,
+    };
+    let released = if driven_run_id(&action).is_none() {
+        release_driver_lease(&mut guard, lease)
+    } else {
+        None
+    };
+    drop(guard);
+    drop(released);
+    Ok((action, finished_run))
+}
+
 pub(crate) fn advance_sop_step(
     engine: &Arc<Mutex<SopEngine>>,
     run_id: &str,
@@ -530,6 +1224,29 @@ pub(crate) async fn audit_sop_step(
     let Some(audit) = audit else {
         return;
     };
+    // Emitted inside the run's scope, because canonical attribution is
+    // span-derived: an event recorded outside it carries the run id only as
+    // `attributes.run_id`. The JSONL reader bridges that legacy shape, so a
+    // run-filtered query still finds these rows — but the OTLP exporter builds
+    // its `zeroclaw.*` attributes from the canonical struct alone, so a
+    // collector would never see the step result or the terminal row under
+    // `zeroclaw.sop_run_id`. These are exactly the two events a run timeline is
+    // read by, so they carry the canonical field like the model and tool events
+    // around them already do.
+    zeroclaw_log::scope!(
+        sop_run_id: run_id,
+        =>
+        audit_sop_step_emit(audit, run_id, result, finished_run)
+    )
+    .await;
+}
+
+async fn audit_sop_step_emit(
+    audit: &SopAuditLogger,
+    run_id: &str,
+    result: &SopStepResult,
+    finished_run: Option<&SopRun>,
+) {
     if let Err(e) = audit.log_step_result(run_id, result).await {
         ::zeroclaw_log::record!(
             WARN,
@@ -585,6 +1302,7 @@ mod tests {
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }
     }
 
@@ -602,6 +1320,487 @@ mod tests {
             SopRunAction::ExecuteStep { run_id, .. } => run_id.clone(),
             other => panic!("expected ExecuteStep, got {other:?}"),
         }
+    }
+
+    /// The step result and the terminal row must carry canonical
+    /// `zeroclaw.sop_run_id`, not just `attributes.run_id`.
+    ///
+    /// The JSONL reader bridges the legacy shape, so a run-filtered query finds
+    /// these rows either way — which is exactly why the gap is easy to miss. The
+    /// OTLP exporter does not bridge: it builds its `zeroclaw.*` attributes from
+    /// the canonical struct alone, so an event emitted outside the run's scope
+    /// reaches a collector with no queryable run id at all.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn audit_events_carry_the_canonical_run_id_not_only_the_legacy_one() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let mem_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "sqlite".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn zeroclaw_memory::Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let logger = SopAuditLogger::new(memory);
+
+        let run_id = "run-canonical-attribution-0001";
+        let step = SopStepResult {
+            step_number: 7,
+            status: SopStepStatus::Completed,
+            output: "the step did its work".to_string(),
+            started_at: "2026-09-03T00:00:00Z".to_string(),
+            completed_at: Some("2026-09-03T00:00:01Z".to_string()),
+            effective_agent: Some("tester".to_string()),
+            tool_calls: Vec::new(),
+        };
+
+        audit_sop_step(Some(&logger), run_id, &step, None).await;
+
+        let mut selected = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while selected.is_none() && std::time::Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(value)
+                    if value
+                        .get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|m| m.starts_with("SOP audit: step 7 completed")) =>
+                {
+                    selected = Some(value);
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(_) => tokio::task::yield_now().await,
+            }
+        }
+
+        let event = selected.expect("the step-result event must be emitted");
+        assert_eq!(
+            event
+                .pointer("/zeroclaw/sop_run_id")
+                .and_then(serde_json::Value::as_str),
+            Some(run_id),
+            "the step result must carry canonical attribution, or OTLP consumers \
+             cannot filter it by run: {event:?}"
+        );
+    }
+
+    /// Refusing a driver is only half the boundary: the run it would have
+    /// advanced is already started and persisted.
+    ///
+    /// An approval can resolve on a connection task that outlived its listener,
+    /// so the generation may already have drained. By then
+    /// `resolve_via_broker` has written the resumed run as `Running` and it
+    /// holds an execution claim. If the refusal only declines to start a driver,
+    /// that durable row survives — an engine rebuild restores it as active and
+    /// renews the claim, and maintenance keeps renewing, so expiry never
+    /// recovers it. The run would hold an admission slot for as long as the
+    /// daemon lives with nothing able to advance it.
+    ///
+    /// This drives the real approval producer against a closed generation and
+    /// then rebuilds the engine from the same store, because removing only the
+    /// in-memory run would leave the persisted row restorable.
+    /// The failure path of settling a refused driver's run. If the terminal
+    /// write fails, no driver exists to make it again, so the run would stay
+    /// `Running` and claimed indefinitely. The engine must keep ownership of the
+    /// retry, and the next maintenance pass must land it: terminal status and
+    /// the execution claim released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_run_whose_settlement_fails_is_settled_by_maintenance() {
+        use crate::sop::store::testing::FailFirstTerminalWrite;
+
+        let store = Arc::new(FailFirstTerminalWrite::new(InMemoryRunStore::new()));
+        let sop_name = "refused-retry";
+        let mut engine = SopEngine::new(SopConfig::default()).with_store(store.clone());
+        engine.set_sops_for_test(vec![test_sop(sop_name)]);
+        let action = engine.start_run(sop_name, manual_event()).unwrap();
+        let run_id = extract_run_id(&action);
+        assert_eq!(store.claim_counts(sop_name).unwrap().0, 1);
+
+        // The generation drained before this driver could be admitted.
+        let handles = SopDriverHandles::default();
+        handles.lock().unwrap().close_and_take();
+        let engine = Arc::new(Mutex::new(engine));
+        let admitted = spawn_and_register_sop_driver(
+            &handles,
+            zeroclaw_config::schema::Config::default(),
+            Arc::clone(&engine),
+            None,
+            action,
+        );
+        assert!(!admitted, "a drained generation refuses the driver");
+        assert!(
+            store.fired(),
+            "the settlement's terminal write was the one that failed"
+        );
+
+        {
+            let guard = engine.lock().unwrap();
+            assert_eq!(
+                guard.get_run(&run_id).unwrap().status,
+                SopRunStatus::Running,
+                "the failed write leaves the run active"
+            );
+            assert!(
+                guard.has_pending_orphan_settlement(&run_id),
+                "but the engine now owns the retry, so it is not abandoned"
+            );
+        }
+        assert_eq!(store.claim_counts(sop_name).unwrap().0, 1);
+
+        let summary = engine.lock().unwrap().run_maintenance_tick();
+        assert_eq!(
+            summary.settled_orphaned_runs, 1,
+            "maintenance lands the retry"
+        );
+        let guard = engine.lock().unwrap();
+        assert!(!guard.active_runs().contains_key(&run_id));
+        assert_eq!(
+            guard.get_run(&run_id).unwrap().status,
+            SopRunStatus::Cancelled,
+            "settled through the normal terminal path"
+        );
+        assert!(!guard.has_pending_orphan_settlement(&run_id));
+        drop(guard);
+        assert_eq!(
+            store.claim_counts(sop_name).unwrap().0,
+            0,
+            "the terminal write releases the execution claim"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_driver_settles_the_run_it_would_have_advanced() {
+        let store = Arc::new(InMemoryRunStore::new());
+        let sop_name = "approval-gate";
+        let mut gated = test_sop(sop_name);
+        gated.steps[0].requires_confirmation = true;
+
+        let mut engine = SopEngine::new(SopConfig::default()).with_store(store.clone());
+        engine.set_sops_for_test(vec![gated]);
+        let parked = engine.start_run(sop_name, manual_event()).unwrap();
+        let run_id = match &parked {
+            SopRunAction::WaitApproval { run_id, .. } => run_id.clone(),
+            other => panic!("the gated step must park for approval, got {other:?}"),
+        };
+
+        let outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                crate::sop::approval::ApprovalDecision::Approve,
+                crate::sop::approval::ApprovalPrincipal::agent("tester"),
+            )
+            .expect("the approval resolves");
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::Running,
+            "the resumed run is persisted as Running before a driver is ever requested"
+        );
+        assert_eq!(
+            store.claim_counts(sop_name).unwrap().0,
+            1,
+            "and it holds an execution claim"
+        );
+
+        // The generation drains between the approval resolving and the driver
+        // being scheduled - the race this whole path exists for.
+        let handles = SopDriverHandles::default();
+        handles.lock().unwrap().close_and_take();
+        assert!(handles.lock().unwrap().is_closed());
+
+        let engine = Arc::new(Mutex::new(engine));
+        drive_resumed_broker_action(
+            &zeroclaw_config::schema::Config::default(),
+            Arc::clone(&engine),
+            None,
+            Some(&handles),
+            &outcome,
+        );
+
+        {
+            let guard = engine.lock().unwrap();
+            assert!(
+                !guard.active_runs().contains_key(&run_id),
+                "a run whose driver was refused must not stay active"
+            );
+            assert_eq!(
+                guard.get_run(&run_id).unwrap().status,
+                SopRunStatus::Cancelled,
+                "it must be settled through the terminal path, not merely dropped"
+            );
+        }
+        assert_eq!(
+            store.claim_counts(sop_name).unwrap().0,
+            0,
+            "the terminal write releases the execution claim in the same boundary"
+        );
+
+        // The half that in-memory cleanup alone would not survive.
+        let mut rebuilt = SopEngine::new(SopConfig::default()).with_store(store.clone());
+        rebuilt.set_sops_for_test(vec![test_sop(sop_name)]);
+        rebuilt.restore_runs();
+        assert!(
+            !rebuilt.active_runs().contains_key(&run_id),
+            "the rebuilt engine must not restore a settled run as active"
+        );
+        assert_eq!(
+            rebuilt.get_run(&run_id).unwrap().status,
+            SopRunStatus::Cancelled,
+            "the durable row is terminal, so a restore cannot resurrect it"
+        );
+
+        rebuilt.run_maintenance_tick();
+        assert_eq!(
+            store.claim_counts(sop_name).unwrap().0,
+            0,
+            "maintenance must not renew a claim for a run nothing will advance"
+        );
+    }
+
+    /// Two surfaces scheduling the same resumed action must not both drive it:
+    /// the second driver would execute the same step again and hand the
+    /// engine a second result for it. The lease is held for the driver's life
+    /// and released on drop, whichever way the driver exits.
+    #[test]
+    fn headless_driver_lease_refuses_a_second_driver_until_the_first_ends() {
+        let engine = Arc::new(Mutex::new(SopEngine::new(SopConfig::default())));
+        let first = HeadlessDriverLease::acquire(&engine, "run-1")
+            .expect("the first driver takes the lease");
+        assert!(
+            HeadlessDriverLease::acquire(&engine, "run-1").is_none(),
+            "a second driver for the same run is refused while the first is alive"
+        );
+        assert!(
+            HeadlessDriverLease::acquire(&engine, "run-2").is_some(),
+            "the lease is per run"
+        );
+        drop(first);
+        assert!(
+            HeadlessDriverLease::acquire(&engine, "run-1").is_some(),
+            "the lease is released when the driver ends"
+        );
+    }
+
+    /// A driver that produces an action it will not keep driving must hand the
+    /// lease back inside the engine lock, so an approval resuming the run can
+    /// take a driver immediately. The outgoing driver's `Drop` must then NOT
+    /// release the lease the next driver now holds.
+    #[test]
+    fn a_non_driving_action_hands_back_the_lease_without_clobbering_the_next_driver() {
+        let mut engine = SopEngine::new(SopConfig::default());
+        engine.set_sops_for_test(vec![test_sop("lease-handback")]);
+        let action = engine.start_run("lease-handback", manual_event()).unwrap();
+        let run_id = extract_run_id(&action);
+        let engine = Arc::new(Mutex::new(engine));
+
+        let mut lease = HeadlessDriverLease::acquire(&engine, &run_id);
+        assert!(lease.is_some(), "the driver takes the lease");
+
+        let (action, _finished) = advance_sop_step_as_driver(
+            &engine,
+            &run_id,
+            SopStepResult {
+                effective_agent: None,
+                step_number: 1,
+                status: SopStepStatus::Completed,
+                output: "ok".to_string(),
+                started_at: "2026-06-28T00:00:00Z".to_string(),
+                completed_at: Some("2026-06-28T00:00:01Z".to_string()),
+                tool_calls: Vec::new(),
+            },
+            &mut lease,
+        )
+        .unwrap();
+
+        assert!(matches!(action, SopRunAction::Completed { .. }));
+        assert!(
+            lease.is_none(),
+            "the lease is handed back with the non-driving action, not held until Drop"
+        );
+
+        // A resumed driver takes the run, and the outgoing lease (already
+        // consumed and disarmed above) cannot free it underneath them.
+        let resumed =
+            HeadlessDriverLease::acquire(&engine, &run_id).expect("a resumed driver can take it");
+        assert!(
+            HeadlessDriverLease::acquire(&engine, &run_id).is_none(),
+            "the resumed driver still owns the run"
+        );
+        drop(resumed);
+        assert!(HeadlessDriverLease::acquire(&engine, &run_id).is_some());
+    }
+
+    /// A step whose scoped tool policy cannot be built must fail without
+    /// running the turn. Running it anyway would let `agent::run` rebuild the
+    /// policy on its own, and a transient failure that clears on that retry
+    /// would run the turn with the SOP self-drive tools still exposed.
+    #[tokio::test]
+    async fn an_unbuildable_step_scope_fails_the_step_instead_of_running_unscoped() {
+        let mut sop = test_sop("scope-unavailable");
+        sop.agent = Some("owner".to_string());
+        for step in &mut sop.steps {
+            step.agent = Some("owner".to_string());
+        }
+        let mut engine = SopEngine::new(SopConfig::default());
+        engine.set_sops_for_test(vec![sop]);
+        let action = engine
+            .start_run("scope-unavailable", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&action);
+        let engine = Arc::new(Mutex::new(engine));
+
+        // The step's owning agent is configured and enabled, so it resolves,
+        // but its risk profile names no configured profile, so
+        // `SecurityPolicy::for_agent` fails and the scoped policy cannot be
+        // built. That isolates the path under test from agent resolution.
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: std::path::PathBuf::from("/tmp/zeroclaw-step-scope-unavailable-test"),
+            config_path: std::path::PathBuf::from(
+                "/tmp/zeroclaw-step-scope-unavailable-test/config.toml",
+            ),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        config.agents.insert(
+            "owner".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                risk_profile: "no-such-profile".into(),
+                ..zeroclaw_config::schema::AliasedAgentConfig::default()
+            },
+        );
+        drive_headless_run(config, Arc::clone(&engine), None, action, None).await;
+
+        let guard = engine.lock().unwrap();
+        let run = guard.get_run(&run_id).expect("run is still known");
+        let result = run
+            .step_results
+            .iter()
+            .find(|r| r.step_number == 1)
+            .expect("step 1 records a result");
+        assert_eq!(result.status, SopStepStatus::Failed);
+        assert!(
+            result.output.contains(STEP_TURN_SCOPE_UNAVAILABLE),
+            "the step must fail on the missing scope, not on a turn run without it; got: {}",
+            result.output
+        );
+    }
+
+    fn config_with_agent_profile(
+        alias: &str,
+        profile: zeroclaw_config::schema::RiskProfileConfig,
+    ) -> zeroclaw_config::schema::Config {
+        let mut cfg = zeroclaw_config::schema::Config {
+            data_dir: std::path::PathBuf::from("/tmp/zeroclaw-step-turn-security-test"),
+            config_path: std::path::PathBuf::from(
+                "/tmp/zeroclaw-step-turn-security-test/config.toml",
+            ),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        cfg.risk_profiles.insert("reviewer".into(), profile);
+        cfg.agents.insert(
+            alias.into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                risk_profile: "reviewer".into(),
+                ..zeroclaw_config::schema::AliasedAgentConfig::default()
+            },
+        );
+        cfg
+    }
+
+    /// A headless step turn must not be able to start, advance, or approve
+    /// the run it belongs to: those tools act on a second engine inside the
+    /// turn and leave the driver holding a prose result for the step. The
+    /// profile's own exclusions are kept and the three names are not
+    /// duplicated when the profile already lists one of them.
+    #[test]
+    fn step_turn_security_excludes_the_self_drive_sop_tools() {
+        let cfg = config_with_agent_profile(
+            "reviewer",
+            zeroclaw_config::schema::RiskProfileConfig {
+                excluded_tools: vec!["browser".into(), "SOP_ADVANCE".into()],
+                ..zeroclaw_config::schema::RiskProfileConfig::default()
+            },
+        );
+        let policy = step_turn_security(&cfg, "reviewer").expect("policy resolves");
+        // Assert through the consumer the runtime filter actually calls. A
+        // case-insensitive check over the vector passes even when the policy
+        // still admits the registered lowercase tool, which is the bypass
+        // this helper must not reintroduce.
+        for tool in crate::sop::active_scope::SOP_CONTROL_TOOLS {
+            assert!(
+                policy.is_tool_excluded(tool),
+                "{tool} must be excluded by the policy the step turn runs under, \
+                 got {:?}",
+                policy.excluded_tools
+            );
+        }
+        let excluded = policy.excluded_tools.clone().expect("exclusions present");
+        assert!(
+            excluded.iter().any(|e| e == "browser"),
+            "profile exclusions are kept"
+        );
+        assert_eq!(
+            excluded
+                .iter()
+                .filter(|e| e.as_str() == "sop_advance")
+                .count(),
+            1,
+            "the canonical name is added exactly once"
+        );
+        assert!(
+            excluded.iter().any(|e| e == "SOP_ADVANCE"),
+            "the profile's own spelling is left alone"
+        );
+    }
+
+    #[test]
+    fn step_turn_security_adds_exclusions_to_a_profile_that_has_none() {
+        let cfg = config_with_agent_profile(
+            "reviewer",
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        let policy = step_turn_security(&cfg, "reviewer").expect("policy resolves");
+        let mut excluded = policy.excluded_tools.expect("exclusions present");
+        excluded.sort();
+        let mut expected: Vec<String> = crate::sop::active_scope::SOP_CONTROL_TOOLS
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(excluded, expected);
+    }
+
+    #[test]
+    fn step_turn_security_fails_for_an_unknown_agent() {
+        let cfg = config_with_agent_profile(
+            "reviewer",
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        assert!(step_turn_security(&cfg, "nobody").is_err());
+    }
+
+    #[test]
+    fn only_actions_with_steps_to_execute_need_a_driver_lease() {
+        let step_action = SopRunAction::ExecuteStep {
+            run_id: "run-1".to_string(),
+            step: SopStep::default(),
+            context: String::new(),
+        };
+        assert_eq!(driven_run_id(&step_action), Some("run-1"));
+        let deterministic = SopRunAction::DeterministicStep {
+            run_id: "run-2".to_string(),
+            step: SopStep::default(),
+            input: json!({}),
+        };
+        assert_eq!(driven_run_id(&deterministic), Some("run-2"));
+        let terminal = SopRunAction::Completed {
+            run_id: "run-3".to_string(),
+            sop_name: "sop".to_string(),
+        };
+        assert_eq!(driven_run_id(&terminal), None);
     }
 
     #[tokio::test]
@@ -633,6 +1832,7 @@ mod tests {
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         };
         let store_for_engine: Arc<dyn SopRunStore> = store.clone();
         let mut engine = SopEngine::new(SopConfig::default()).with_store(store_for_engine);
@@ -906,5 +2106,112 @@ mod tests {
         assert_eq!(outer_calls[0].output, "outer");
         assert_eq!(inner_calls.len(), 1);
         assert_eq!(inner_calls[0].output, "inner");
+    }
+
+    fn config_with_agent(alias: &str, enabled: bool) -> zeroclaw_config::schema::Config {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.agents.insert(
+            alias.to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled,
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    fn owned_step(alias: Option<&str>) -> SopStep {
+        SopStep {
+            number: 1,
+            agent: alias.map(str::to_string),
+            ..SopStep::default()
+        }
+    }
+
+    /// A run started inside an agent turn borrows that agent as its owner. The
+    /// turn is gone by the time an approval resumes the step — the whole reason
+    /// the identity is recorded on the run — so the resume has to be able to use
+    /// it, or an approved step fails for want of an owner the run already knows.
+    #[test]
+    fn an_unowned_step_falls_back_to_the_runs_initiating_agent() {
+        let config = config_with_agent("ops", true);
+
+        let step = owned_step(None);
+        let resolved = headless_step_agent(&config, &step, Some("ops"))
+            .expect("the run's initiating agent owns a step that declares none");
+
+        assert_eq!(resolved, "ops");
+    }
+
+    /// The fallback supplies an identity, not an exemption: an initiator the
+    /// operator has withdrawn from service refuses exactly like a declared owner
+    /// would. Otherwise disabling an agent would stop it running new procedures
+    /// while leaving it running parked ones.
+    #[test]
+    fn an_initiating_agent_must_still_be_enabled() {
+        let config = config_with_agent("ops", false);
+
+        let err = headless_step_agent(&config, &owned_step(None), Some("ops"))
+            .expect_err("a disabled initiator must not run an unattended step");
+
+        assert!(
+            format!("{err}").contains("disabled"),
+            "the refusal must name the disabled owner: {err}"
+        );
+    }
+
+    /// Precedence: a declared owner is the author's explicit choice and a run
+    /// initiator never overrides it — the initiator here is not even configured,
+    /// so resolving it at all would be visible as an error.
+    #[test]
+    fn a_declared_owner_wins_over_the_run_initiator() {
+        let config = config_with_agent("ops", true);
+
+        let step = owned_step(Some("ops"));
+        let resolved = headless_step_agent(&config, &step, Some("unconfigured"))
+            .expect("the step's declared owner resolves");
+
+        assert_eq!(resolved, "ops");
+    }
+
+    /// An operator who disables an agent has withdrawn it from service. The
+    /// agent lookup behind this alias does not filter on `enabled`, so without
+    /// this check an unattended SOP would keep running under it.
+    #[test]
+    fn headless_step_agent_refuses_a_disabled_owner() {
+        let config = config_with_agent("ops", false);
+
+        let err = headless_step_agent(&config, &owned_step(Some("ops")), None)
+            .expect_err("a disabled owner must not run an unattended step");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("ops") && message.contains("disabled"),
+            "the refusal should name the disabled alias, got {message:?}"
+        );
+    }
+
+    #[test]
+    fn headless_step_agent_accepts_an_enabled_owner() {
+        let config = config_with_agent("ops", true);
+
+        assert_eq!(
+            headless_step_agent(&config, &owned_step(Some("ops")), None)
+                .expect("enabled owner resolves"),
+            "ops"
+        );
+    }
+
+    #[test]
+    fn headless_step_agent_refuses_missing_and_unconfigured_owners() {
+        let config = config_with_agent("ops", true);
+
+        let unowned = headless_step_agent(&config, &owned_step(None), None)
+            .expect_err("an unowned step must be refused");
+        assert!(unowned.to_string().contains("no owning agent"));
+
+        let unknown = headless_step_agent(&config, &owned_step(Some("ghost")), None)
+            .expect_err("an unconfigured owner must be refused");
+        assert!(unknown.to_string().contains("not a configured agent"));
     }
 }

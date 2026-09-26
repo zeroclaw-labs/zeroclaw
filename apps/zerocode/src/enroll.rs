@@ -18,6 +18,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+
+use crate::secure_file::{sync_dir_where_supported, write_durable};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -1111,54 +1113,6 @@ fn cache_materials(config_dir: &Path, resp: &EnrollResponse, key_pem: &str) -> R
     )?;
     mark_generation(&staged)?;
     finish_pending_publish_locked(&tls_dir)
-}
-
-/// Write `bytes` to `path` and fsync them, so the content survives power loss
-/// before anything claims it. `private` writes `0600` on Unix, with no
-/// world-readable window.
-fn write_durable(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        if private {
-            options.mode(0o600);
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        // No mode bits here; the tls directory ACL is the guard.
-        let _ = private;
-    }
-    let mut f = options
-        .open(path)
-        .with_context(|| format!("creating {}", path.display()))?;
-    f.write_all(bytes)
-        .with_context(|| format!("writing {}", path.display()))?;
-    f.sync_all()
-        .with_context(|| format!("syncing {}", path.display()))?;
-    Ok(())
-}
-
-/// fsync a directory so the entries created, renamed, or removed inside it are
-/// durable, not just the file contents. Unix opens the directory and syncs the
-/// handle. No other platform offers a portable equivalent, so this is a
-/// documented no-op there and the publication relies on the marker alone.
-fn sync_dir_where_supported(dir: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let handle = std::fs::File::open(dir)
-            .with_context(|| format!("opening {} to sync it", dir.display()))?;
-        handle
-            .sync_all()
-            .with_context(|| format!("syncing {}", dir.display()))?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
-    }
-    Ok(())
 }
 
 /// Leave `<config_dir>/tls` in the state a crash leaves after `renames` of the

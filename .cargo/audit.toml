@@ -8,9 +8,6 @@ ignore = [
     # Each entry below summarizes the corresponding rationale in deny.toml.
     # Re-evaluate both files; remove each entry once that tool's criteria are met.
     "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained; transitive dep awaiting upstream migration to rustls-pki-types
-    "RUSTSEC-2026-0173",  # proc-macro-error2 unmaintained; in cargo-deny's resolved graph via matrix-sdk dev-deps; tracking #8519
-    "RUSTSEC-2026-0247",  # bitmaps unmaintained; matrix-sdk reaches imbl directly and via eyeball-im; tracking #9899 and matrix-org/matrix-rust-sdk#6859
-    "RUSTSEC-2026-0292",  # imbl-sized-chunks double free if an element's Drop panics; the 0.2.0 fix is unreachable under the matrix-sdk 0.18 pin (imbl 6.1.0 requires ^0.1.3); same matrix-sdk -> imbl stack as RUSTSEC-2026-0247; remove once no affected version remains in Cargo.lock; tracking #9899
 
     # ── cargo-audit reads the full Cargo.lock, so it flags advisories for
     # crates that cargo-deny (graph-aware) does not pull into the resolved

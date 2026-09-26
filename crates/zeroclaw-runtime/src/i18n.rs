@@ -971,6 +971,238 @@ mod tests {
     }
 
     #[test]
+    fn plugin_egress_grant_ceremony_strings_format_in_every_locale() {
+        // The grant ceremony is the one moment an operator is told what
+        // network reach a plugin was granted, and the `{$command}` argument is
+        // the literal `zeroclaw config set plugins.entries.<zpi1_key>...`
+        // invocation they are expected to run. A catalogue that drops the key
+        // ships the raw `{key}` sentinel; one that drops the placeholder ships
+        // a command the operator cannot execute. Assert both, in every shipped
+        // catalogue.
+        let key = "zpi1_WyJ3ZWF0aGVyLXRvb2wiLCJ0b29sIiwid2VhdGhlci10b29sIl0";
+        let command = format!("zeroclaw config set plugins.entries.{key}.egress_hosts \"a.test\"");
+        /// One catalogue assertion: key, the args it is formatted with, and
+        /// the substrings the rendered value must contain.
+        type EgressStringCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
+
+        let cases: [EgressStringCase<'_>; 18] = [
+            (
+                "cli-plugin-egress-seeded",
+                &[("name", "weather-tool"), ("count", "2")],
+                &["weather-tool", "2"],
+            ),
+            (
+                "cli-plugin-egress-destination",
+                &[("host", "api.example.com")],
+                &["api.example.com"],
+            ),
+            (
+                "cli-plugin-egress-edit-command",
+                &[("command", command.as_str())],
+                &[command.as_str()],
+            ),
+            (
+                "cli-plugin-egress-declared-not-granted",
+                &[("name", "weather-tool"), ("count", "1")],
+                &["weather-tool", "1"],
+            ),
+            (
+                "cli-plugin-egress-added",
+                &[("host", "api2.example.com")],
+                &["api2.example.com"],
+            ),
+            (
+                "cli-plugin-egress-apply-command",
+                &[("command", command.as_str())],
+                &[command.as_str()],
+            ),
+            (
+                "cli-plugin-egress-granted-not-declared",
+                &[("name", "weather-tool"), ("count", "1")],
+                &["weather-tool", "1"],
+            ),
+            (
+                "cli-plugin-egress-removed",
+                &[("host", "gitea.internal.test")],
+                &["gitea.internal.test"],
+            ),
+            (
+                "cli-plugin-egress-never-extended",
+                &[("name", "weather-tool")],
+                &["weather-tool"],
+            ),
+            (
+                "cli-plugin-egress-gap",
+                &[
+                    ("name", "weather-tool"),
+                    ("hosts", "api2.example.com"),
+                    ("command", command.as_str()),
+                ],
+                &["weather-tool", "api2.example.com", command.as_str()],
+            ),
+            // The legacy-row arm of the same diagnostic. Its first line must
+            // NOT carry `{$command}`: the command only works after the rename,
+            // so the ordered steps below own it.
+            (
+                "cli-plugin-egress-gap-legacy",
+                &[("name", "weather-tool"), ("hosts", "api2.example.com")],
+                &["weather-tool", "api2.example.com"],
+            ),
+            // A catalogue that drops `{$legacy}` or `{$key}` ships a rename
+            // instruction naming neither the row to rename nor the name to
+            // give it, which is worse than no instruction at all.
+            (
+                "cli-plugin-egress-migrate-step",
+                &[
+                    ("name", "weather-tool"),
+                    ("legacy", "weather-tool"),
+                    ("key", key),
+                ],
+                &["weather-tool", key],
+            ),
+            (
+                "cli-plugin-egress-grant-step",
+                &[("command", command.as_str())],
+                &[command.as_str()],
+            ),
+            // The migrate-only arm: the authored grant already covers the
+            // declaration, so the rename alone restores reach. Like the legacy
+            // headline it must name both the row to rename and the key to give
+            // it, and (asserted below) it must never carry a grant command.
+            (
+                "cli-plugin-egress-legacy-inert",
+                &[
+                    ("name", "weather-tool"),
+                    ("legacy", "weather-tool"),
+                    ("key", key),
+                ],
+                &["weather-tool", key],
+            ),
+            // A granted entry the runtime rejects. The canonical arm carries
+            // the repair command inline; the legacy arm must not, because the
+            // command only resolves after the rename (asserted below).
+            (
+                "cli-plugin-egress-invalid-grant",
+                &[
+                    ("name", "weather-tool"),
+                    ("reason", "entry \"*.com\" wildcards a single-label suffix"),
+                    ("command", command.as_str()),
+                ],
+                &["weather-tool", "*.com", command.as_str()],
+            ),
+            (
+                "cli-plugin-egress-invalid-grant-legacy",
+                &[
+                    ("name", "weather-tool"),
+                    ("reason", "entry \"*.com\" wildcards a single-label suffix"),
+                ],
+                &["weather-tool", "*.com"],
+            ),
+            // Printed when the command repairs the hosts but a private
+            // carve-out would still be refused: it must name the row's
+            // `egress_allow_private` path so the operator can fix it by hand.
+            (
+                "cli-plugin-egress-repair-incomplete",
+                &[
+                    ("name", "weather-tool"),
+                    ("reason", "entry \"other.example.com\" is not granted"),
+                    ("key", key),
+                ],
+                &["weather-tool", key, "egress_allow_private"],
+            ),
+            // A deployment-wide refusal names its own config paths, verbatim
+            // in every catalogue, and never a row repair.
+            (
+                "cli-plugin-egress-deployment-rejected",
+                &[("reason", "invalid NAT64 prefix configuration")],
+                &[
+                    "security.nat64_prefixes",
+                    "plugins.limits.max_connections_per_instance",
+                ],
+            ),
+        ];
+
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            for (key_name, args, must_contain) in &cases {
+                let value = format_ftl_message(source, locale, key_name, args)
+                    .unwrap_or_else(|| panic!("{key_name} should format in {locale}"));
+                assert!(
+                    !value.trim().is_empty(),
+                    "{key_name} must not be empty in {locale}"
+                );
+                for needle in *must_contain {
+                    assert!(
+                        value.contains(needle),
+                        "{key_name} in {locale} must inline {needle:?}; got: {value:?}"
+                    );
+                }
+            }
+
+            // The legacy-row headline must not carry the grant command itself.
+            // That command only resolves after the rename, so a catalogue that
+            // folds it back into the headline hands the operator the failing
+            // step before the one that makes it work.
+            let headline = format_ftl_message(
+                source,
+                locale,
+                "cli-plugin-egress-gap-legacy",
+                &[("name", "weather-tool"), ("hosts", "api2.example.com")],
+            )
+            .unwrap_or_else(|| panic!("cli-plugin-egress-gap-legacy should format in {locale}"));
+            assert!(
+                !headline.contains("zeroclaw config set"),
+                "cli-plugin-egress-gap-legacy in {locale} must leave the grant \
+                 command to the ordered steps; got: {headline:?}"
+            );
+
+            // The migrate-only headline exists precisely because nothing is
+            // left to grant after the rename: a catalogue that folds a
+            // `config set` into it would hand the operator a command that
+            // replaces a list they already have right.
+            let inert = format_ftl_message(
+                source,
+                locale,
+                "cli-plugin-egress-legacy-inert",
+                &[
+                    ("name", "weather-tool"),
+                    ("legacy", "weather-tool"),
+                    ("key", key),
+                ],
+            )
+            .unwrap_or_else(|| panic!("cli-plugin-egress-legacy-inert should format in {locale}"));
+            assert!(
+                !inert.contains("zeroclaw config set"),
+                "cli-plugin-egress-legacy-inert in {locale} must not offer a grant \
+                 command; got: {inert:?}"
+            );
+
+            let invalid_legacy = format_ftl_message(
+                source,
+                locale,
+                "cli-plugin-egress-invalid-grant-legacy",
+                &[
+                    ("name", "weather-tool"),
+                    ("reason", "entry \"*.com\" wildcards a single-label suffix"),
+                ],
+            )
+            .unwrap_or_else(|| {
+                panic!("cli-plugin-egress-invalid-grant-legacy should format in {locale}")
+            });
+            assert!(
+                !invalid_legacy.contains("zeroclaw config set"),
+                "cli-plugin-egress-invalid-grant-legacy in {locale} must leave the \
+                 repair command to the ordered steps; got: {invalid_legacy:?}"
+            );
+        }
+    }
+
+    #[test]
     fn channel_approval_group_visibility_warning_is_translated_in_every_locale() {
         // This warning is what tells an operator why a stranger's reply to a
         // group approval token will bounce, so a catalogue that omits it ships
@@ -1151,6 +1383,95 @@ mod tests {
                 .unwrap_or_else(|| panic!("plugin config entry key should format in {locale}"));
             assert!(value.contains("Tool"));
             assert!(value.contains("zpi1_fixture"));
+        }
+    }
+
+    /// The `plugin info` / `plugin list --verify` load verdicts.
+    ///
+    /// These strings are the answer to "why does my plugin not show up", so a
+    /// catalogue that omits one ships the raw `{key}` sentinel in its place, and
+    /// a catalogue that copies English ships an untranslated answer. Both fail
+    /// here. Every case also pins the interpolations that must survive
+    /// translation: the plugin's identity, and the wasmtime cause chain that
+    /// carries the WIT-drift rebuild hint.
+    #[test]
+    fn plugin_load_verdict_cli_strings_are_translated_in_every_locale() {
+        const NAME: &str = "tool-fixture";
+        const VERSION: &str = "0.0.0";
+        const DESCRIPTION: &str = "a tool";
+        const ERROR: &str = "failed to instantiate: type mismatch (hint: rebuild against wit/v0)";
+
+        let row = [
+            ("name", NAME),
+            ("version", VERSION),
+            ("description", DESCRIPTION),
+        ];
+        let failed_row = [
+            ("name", NAME),
+            ("version", VERSION),
+            ("description", DESCRIPTION),
+            ("error", ERROR),
+        ];
+        /// One parity case: the Fluent key, its arguments, and the substrings
+        /// every locale's rendering must contain.
+        type ParityCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
+        let cases: [ParityCase; 7] = [
+            (
+                "cli-plugin-list-entry-loads",
+                &row,
+                &[NAME, VERSION, DESCRIPTION],
+            ),
+            (
+                "cli-plugin-list-entry-failed",
+                &failed_row,
+                &[NAME, VERSION, DESCRIPTION, ERROR],
+            ),
+            (
+                "cli-plugin-list-entry-no-component",
+                &row,
+                &[NAME, VERSION, DESCRIPTION],
+            ),
+            ("cli-plugin-info-load-ok", &[], &["WIT"]),
+            ("cli-plugin-info-load-failed", &[("error", ERROR)], &[ERROR]),
+            ("cli-plugin-info-load-not-applicable", &[], &[]),
+            (
+                "cli-plugin-info-load-failed-exit",
+                &[("name", NAME)],
+                &[NAME],
+            ),
+        ];
+
+        let english_source = include_str!("../locales/en/cli.ftl");
+        for (key, args, expected_parts) in cases {
+            let english = format_ftl_message(english_source, "en", key, args)
+                .unwrap_or_else(|| panic!("{key} should format in en"));
+            assert!(
+                !english.trim().is_empty(),
+                "{key} must not be empty in en; got {english:?}"
+            );
+
+            for (source, locale) in [
+                (include_str!("../locales/en/cli.ftl"), "en"),
+                (include_str!("../locales/es/cli.ftl"), "es"),
+                (include_str!("../locales/fr/cli.ftl"), "fr"),
+                (include_str!("../locales/ja/cli.ftl"), "ja"),
+                (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+            ] {
+                let value = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                for expected in expected_parts {
+                    assert!(
+                        value.contains(expected),
+                        "{key} in {locale} should preserve {expected:?}; got: {value:?}"
+                    );
+                }
+                if locale != "en" {
+                    assert_ne!(
+                        value, english,
+                        "{key} in {locale} is the English string verbatim, so that catalogue was never translated"
+                    );
+                }
+            }
         }
     }
 
@@ -1739,6 +2060,8 @@ mod tests {
             "cli-integrations-setup-heading",
             "cli-integrations-setup-macos-heading",
             "cli-integrations-builtin-heading",
+            "cli-integrations-chat-bind",
+            "cli-integrations-chat-enable",
         ];
         let args = [
             ("name", "definitely-not-a-real-integration"),
@@ -1759,6 +2082,53 @@ mod tests {
                     "{locale}: {key} left an unformatted placeholder: {formatted}"
                 );
             }
+
+            for (key, setup_args) in [
+                (
+                    "cli-integrations-chat-telegram-prepare",
+                    vec![("botfather", "@BotFather"), ("channel", "Telegram")],
+                ),
+                (
+                    "cli-integrations-chat-discord-prepare",
+                    vec![
+                        ("url", "https://discord.com/developers/applications"),
+                        ("intent", "MESSAGE CONTENT"),
+                    ],
+                ),
+                (
+                    "cli-integrations-chat-slack-prepare",
+                    vec![("url", "https://api.slack.com/apps")],
+                ),
+                (
+                    "cli-integrations-chat-configure",
+                    vec![("command", "zerocode"), ("channel", "Telegram")],
+                ),
+            ] {
+                let formatted = format_ftl_message(source, locale, key, &setup_args)
+                    .unwrap_or_else(|| panic!("{locale}: {key} should format"));
+                for (_, protected) in setup_args {
+                    assert!(
+                        formatted.contains(protected),
+                        "{locale}: {key} must preserve {protected:?}: {formatted}"
+                    );
+                }
+                assert!(
+                    !formatted.contains('{') && !formatted.contains('}'),
+                    "{locale}: {key} left an unformatted placeholder: {formatted}"
+                );
+            }
+
+            let enable = format_ftl_message(source, locale, "cli-integrations-chat-enable", &[])
+                .expect("channel activation guidance should format");
+            let expected = match locale {
+                "en" => "only after reviewing",
+                "es" => "solo después de revisar",
+                "fr" => "uniquement après avoir vérifié",
+                "ja" => "確認してから",
+                "zh-CN" => "确认设置和访问权限后",
+                _ => unreachable!("unlisted committed locale: {locale}"),
+            };
+            assert!(enable.contains(expected), "{locale}: {enable}");
 
             let unknown = format_ftl_message(source, locale, "cli-integrations-unknown", &args)
                 .unwrap_or_else(|| panic!("{locale}: cli-integrations-unknown should format"));

@@ -233,6 +233,53 @@ fn deny(reason: DenyReason) -> AuthOutcome {
     AuthOutcome::Denied { reason }
 }
 
+/// Build an HTTP `Authorization: Basic <b64>` header value from an OAuth client
+/// id and secret per RFC 6749 §2.3.1: each credential is
+/// `application/x-www-form-urlencoded` first, then the `id:secret` pair is
+/// base64-serialized with the standard alphabet (padded). This is what lets a
+/// credential containing `:`, `+`, a space, or other reserved bytes reach the
+/// IdP intact instead of being mangled by a raw base64 of the literal values.
+fn oauth_basic_authorization(client_id: &str, secret: &str) -> String {
+    use base64::engine::general_purpose::STANDARD;
+    let pair = format!(
+        "{}:{}",
+        form_urlencode_component(client_id),
+        form_urlencode_component(secret)
+    );
+    format!("Basic {}", STANDARD.encode(pair.as_bytes()))
+}
+
+/// `application/x-www-form-urlencoded` encoding of one component: unreserved
+/// characters (`ALPHA / DIGIT / - . _ ~`) pass through, a space becomes `+`,
+/// and every other byte becomes `%XX`. This matches the `x-www-form-urlencoded`
+/// serialization RFC 6749 §2.3.1 (via appendix B) requires for the Basic
+/// credentials.
+fn form_urlencode_component(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for &byte in input.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            b' ' => out.push('+'),
+            other => {
+                out.push('%');
+                out.push(
+                    char::from_digit((other >> 4) as u32, 16)
+                        .unwrap()
+                        .to_ascii_uppercase(),
+                );
+                out.push(
+                    char::from_digit((other & 0xf) as u32, 16)
+                        .unwrap()
+                        .to_ascii_uppercase(),
+                );
+            }
+        }
+    }
+    out
+}
+
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -558,10 +605,19 @@ impl OidcAuthProvider {
         let Some(secret) = self.config.client_secret.as_deref() else {
             return deny(DenyReason::Misconfigured);
         };
+        // RFC 6749 §2.3.1: the client identifier and secret carried in the HTTP
+        // Basic header must each be `application/x-www-form-urlencoded` BEFORE
+        // the `id:secret` pair is base64-serialized. `reqwest::basic_auth`
+        // base64s the raw values, so a client id or secret containing `:`, `+`,
+        // space, or other reserved bytes would be transmitted incorrectly and
+        // the IdP would reject an otherwise valid credential (e.g. `daemon:prod`
+        // / `s+cret` must become `daemon%3Aprod` / `s%2Bcret`). Encode each part
+        // ourselves and set the header directly.
+        let basic = oauth_basic_authorization(self.config.effective_client_id(), secret);
         let response = self
             .http
             .post(&endpoint)
-            .basic_auth(self.config.effective_client_id(), Some(secret))
+            .header(reqwest::header::AUTHORIZATION, basic)
             .form(&[("token", token), ("token_type_hint", "access_token")])
             .send()
             .await;
@@ -819,6 +875,41 @@ mod tests {
         server: MockServer,
         key: EcdsaKeyPair,
         issuer: String,
+    }
+
+    #[test]
+    fn oauth_basic_header_form_encodes_each_credential_before_base64() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+
+        // Reserved bytes in both the id and the secret: `:` and `+` must be
+        // percent-encoded per RFC 6749 §2.3.1 before the pair is base64'd, so
+        // the `:` inside the id cannot be mistaken for the id/secret delimiter
+        // and `+` is not silently turned into a space by a form decoder.
+        let header = oauth_basic_authorization("daemon:prod", "s+cret");
+        let b64 = header.strip_prefix("Basic ").expect("Basic scheme prefix");
+        let decoded = String::from_utf8(STANDARD.decode(b64).expect("valid base64")).unwrap();
+        assert_eq!(decoded, "daemon%3Aprod:s%2Bcret");
+    }
+
+    #[test]
+    fn oauth_basic_header_passes_ordinary_credentials_through() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+
+        // Control: unreserved credentials are unchanged, so the encoding does
+        // not perturb the common case.
+        let header = oauth_basic_authorization("daemon-client", "plainsecret123");
+        let b64 = header.strip_prefix("Basic ").expect("Basic scheme prefix");
+        let decoded = String::from_utf8(STANDARD.decode(b64).expect("valid base64")).unwrap();
+        assert_eq!(decoded, "daemon-client:plainsecret123");
+    }
+
+    #[test]
+    fn form_urlencode_component_maps_space_and_reserved_bytes() {
+        assert_eq!(form_urlencode_component("a b"), "a+b");
+        assert_eq!(form_urlencode_component("a:b/c?d"), "a%3Ab%2Fc%3Fd");
+        assert_eq!(form_urlencode_component("keep-._~"), "keep-._~");
     }
 
     async fn start_idp() -> TestIdp {
@@ -1170,8 +1261,21 @@ mod tests {
                         b"token=opaque-token&token_type_hint=access_token"
                     );
                 }
-                assert!(
-                    sink.received_requests().await.unwrap().is_empty(),
+                // `MockServer::start` hands out servers from wiremock's
+                // process-wide pool, and a pooled listener outlives the test
+                // that last used it. Under an in-process parallel run another
+                // test's late request can therefore land on this sink, so only
+                // a request to the redirect target itself counts as a followed
+                // redirect.
+                let followed = sink
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .filter(|request| request.url.path() == "/capture")
+                    .count();
+                assert_eq!(
+                    followed, 0,
                     "{surface} status {status} must not deliver any request to the redirect target"
                 );
             }

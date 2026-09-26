@@ -156,12 +156,18 @@ pub(crate) async fn prepare_messages_for_iteration(
         // Text-only fallback: replace every media marker with the prose
         // placeholder so no filesystem path or data URI reaches the
         // text-only provider, while surrounding text (captions, tool
-        // metadata) survives.
+        // metadata) survives. An assistant tool-call envelope is rewritten
+        // field-wise instead: signed thinking (`reasoning_content`) and
+        // tool-call signatures (`tool_calls[].extra_content`) must replay
+        // byte-for-byte, and a composite provider (the reliable wrapper)
+        // reports no vision whenever one of its fallbacks lacks it — so the
+        // primary that receives this degraded request may be the very
+        // provider that verifies those signatures.
         let stripped: Vec<ChatMessage> = history
             .iter()
             .map(|m| ChatMessage {
                 role: m.role.clone(),
-                content: multimodal::strip_media_markers(&m.content),
+                content: multimodal::strip_media_markers_model_visible(m),
             })
             .collect();
         match image_cache {
@@ -272,6 +278,88 @@ mod tests {
             "audio path leaked to the provider payload: {joined}"
         );
         assert!(joined.contains(multimodal::MEDIA_PLACEHOLDER));
+    }
+
+    /// The text-only degrade path used to map `strip_media_markers` over
+    /// every message's whole string, rewriting a marker inside an assistant
+    /// envelope's signed reasoning while keeping its signature. The rewrite
+    /// is field-wise for envelopes now, so the reasoning replays
+    /// byte-for-byte even though the provider is text-only. The envelope is
+    /// built with the production `build_native_assistant_history` builder
+    /// the adapters parse back; the `/tmp` paths are literal text only —
+    /// nothing is read from disk on the degrade path.
+    #[tokio::test]
+    async fn degrade_strips_markers_field_wise_in_assistant_envelope() {
+        let path = "/tmp/a.png";
+        let marker = format!("[{}:{}]", "IMAGE", path);
+        let reasoning =
+            format!(r#"{{"thinking":"check {marker} before answering","signature":"sig_abc"}}"#);
+        let envelope = super::super::parse_response::build_native_assistant_history(
+            &format!("saved {marker}"),
+            &[zeroclaw_api::model_provider::ToolCall {
+                id: "toolu_1".into(),
+                name: "shell".into(),
+                arguments: "{}".into(),
+                extra_content: Some(serde_json::json!({
+                    "google": {"thought_signature": "sig_gemini"}
+                })),
+            }],
+            Some(&reasoning),
+        );
+        let history = vec![
+            ChatMessage::user(format!("look {marker}")),
+            ChatMessage::assistant(envelope),
+            ChatMessage::tool("done"),
+        ];
+        let cfg = MultimodalConfig::default();
+        let prepared = prepare_messages_for_iteration(&history, &cfg, true, None)
+            .await
+            .unwrap();
+
+        let assistant_prepared = prepared
+            .messages
+            .iter()
+            .find(|m| m.role == "assistant")
+            .expect("assistant envelope survives the degrade path");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&assistant_prepared.content).expect("envelope stays valid JSON");
+        assert_eq!(
+            parsed["reasoning_content"].as_str(),
+            Some(reasoning.as_str()),
+            "signed thinking must survive the degrade path byte-for-byte"
+        );
+        assert_eq!(
+            parsed["tool_calls"],
+            serde_json::json!([{
+                "id": "toolu_1",
+                "name": "shell",
+                "arguments": "{}",
+                "extra_content": {"google": {"thought_signature": "sig_gemini"}},
+            }]),
+            "tool calls (including extra_content signatures) must round-trip unchanged"
+        );
+        let content = parsed["content"].as_str().expect("content stays a string");
+        assert!(
+            content.contains(multimodal::MEDIA_PLACEHOLDER),
+            "the envelope's content marker is replaced: {content}"
+        );
+        assert!(
+            !content.contains(path),
+            "no raw path may survive in the envelope's content: {content}"
+        );
+
+        let user_prepared = prepared
+            .messages
+            .iter()
+            .find(|m| m.role == "user")
+            .expect("user message survives the degrade path");
+        assert!(
+            user_prepared
+                .content
+                .contains(multimodal::MEDIA_PLACEHOLDER),
+            "the whole-string rule still applies to other roles: {}",
+            user_prepared.content
+        );
     }
 
     #[tokio::test]

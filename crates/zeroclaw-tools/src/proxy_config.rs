@@ -153,11 +153,32 @@ impl ProxyConfigTool {
         Ok(output)
     }
 
+    fn proxy_url_for_display(raw: &str) -> String {
+        // Environment values are not necessarily validated configuration URLs.
+        let Ok(mut url) = reqwest::Url::parse(raw) else {
+            return "[REDACTED]".into();
+        };
+        if !matches!(
+            url.scheme(),
+            "http" | "https" | "socks" | "socks5" | "socks5h"
+        ) || url.host_str().is_none()
+        {
+            return "[REDACTED]".into();
+        }
+        if url.username().is_empty() && url.password().is_none() {
+            return raw.to_owned();
+        }
+        if url.set_password(None).is_err() || url.set_username("REDACTED").is_err() {
+            return "[REDACTED]".into();
+        }
+        url.into()
+    }
+
     fn env_snapshot() -> Value {
         json!({
-            "HTTP_PROXY": std::env::var("HTTP_PROXY").ok(),
-            "HTTPS_PROXY": std::env::var("HTTPS_PROXY").ok(),
-            "ALL_PROXY": std::env::var("ALL_PROXY").ok(),
+            "HTTP_PROXY": std::env::var("HTTP_PROXY").ok().as_deref().map(Self::proxy_url_for_display),
+            "HTTPS_PROXY": std::env::var("HTTPS_PROXY").ok().as_deref().map(Self::proxy_url_for_display),
+            "ALL_PROXY": std::env::var("ALL_PROXY").ok().as_deref().map(Self::proxy_url_for_display),
             "NO_PROXY": std::env::var("NO_PROXY").ok(),
         })
     }
@@ -166,9 +187,9 @@ impl ProxyConfigTool {
         json!({
             "enabled": proxy.enabled,
             "scope": proxy.scope,
-            "http_proxy": proxy.http_proxy,
-            "https_proxy": proxy.https_proxy,
-            "all_proxy": proxy.all_proxy,
+            "http_proxy": proxy.http_proxy.as_deref().map(Self::proxy_url_for_display),
+            "https_proxy": proxy.https_proxy.as_deref().map(Self::proxy_url_for_display),
+            "all_proxy": proxy.all_proxy.as_deref().map(Self::proxy_url_for_display),
             "no_proxy": proxy.normalized_no_proxy(),
             "services": proxy.normalized_services(),
         })
@@ -543,6 +564,137 @@ mod tests {
         };
         config.save().await.unwrap();
         Arc::new(config)
+    }
+
+    #[test]
+    fn proxy_display_redacts_userinfo_and_invalid_values() {
+        for (raw, expected) in [
+            (
+                "http://fixture-user:fixture-pass@proxy.example:8080",
+                "http://REDACTED@proxy.example:8080/",
+            ),
+            (
+                "https://fixture-user@proxy.example",
+                "https://REDACTED@proxy.example/",
+            ),
+            (
+                "socks5h://:fixture-pass@proxy.example:1080",
+                "socks5h://REDACTED@proxy.example:1080",
+            ),
+            (
+                "socks5://fixture%40user:fixture%3Apass@proxy.example:1080",
+                "socks5://REDACTED@proxy.example:1080",
+            ),
+            ("http://proxy.example:8080", "http://proxy.example:8080"),
+            ("socks://[::1]:1080", "socks://[::1]:1080"),
+            ("http://fixture-user:fixture-pass@[invalid", "[REDACTED]"),
+            ("fixture-user:fixture-pass@proxy.example:8080", "[REDACTED]"),
+            (
+                "custom:fixture-user:fixture-pass@proxy.example",
+                "[REDACTED]",
+            ),
+        ] {
+            assert_eq!(ProxyConfigTool::proxy_url_for_display(raw), expected);
+        }
+        let empty = ProxyConfigTool::proxy_json(&ProxyConfig::default());
+        for key in ["http_proxy", "https_proxy", "all_proxy"] {
+            assert!(empty[key].is_null());
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_snapshots_redact_credentials_without_changing_configuration() {
+        const CHILD: &str = "ZEROCLAW_TEST_PROXY_REDACTION_CHILD";
+        const HTTP: &str = "http://fixture-user:fixture-pass@proxy.example:8080";
+        const HTTPS: &str = "https://fixture-user@proxy.example:8443";
+        const ALL: &str = "socks5h://fixture%40user:fixture%3Apass@proxy.example:1080";
+        const INVALID: &str = "http://fixture-user:fixture-pass@[invalid";
+
+        // Run real environment reads in a child without mutating the test runner's environment.
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "proxy_config::tests::proxy_snapshots_redact_credentials_without_changing_configuration",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("HTTP_PROXY", HTTP)
+                .env("HTTPS_PROXY", INVALID)
+                .env("ALL_PROXY", ALL)
+                .env("NO_PROXY", "localhost,.example")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        let tmp = TempDir::new().unwrap();
+        let tool = ProxyConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+        for args in [
+            json!({"action": "set", "scope": "zeroclaw", "http_proxy": HTTP,
+                "https_proxy": HTTPS, "all_proxy": ALL, "no_proxy": ["localhost"]}),
+            json!({"action": "get"}),
+            json!({"action": "disable", "clear_env": false}),
+        ] {
+            let is_get = args["action"] == "get";
+            let result = tool.execute(args).await.unwrap();
+            assert!(result.success, "{:?}", result.error);
+            for secret in [
+                "fixture-user",
+                "fixture-pass",
+                "fixture%40user",
+                "fixture%3Apass",
+            ] {
+                assert!(!result.output.contains(secret));
+            }
+            let output: Value = serde_json::from_str(&result.output).unwrap();
+            assert_eq!(
+                output["proxy"]["http_proxy"],
+                "http://REDACTED@proxy.example:8080/"
+            );
+            assert_eq!(
+                output["proxy"]["https_proxy"],
+                "https://REDACTED@proxy.example:8443/"
+            );
+            assert_eq!(
+                output["proxy"]["all_proxy"],
+                "socks5h://REDACTED@proxy.example:1080"
+            );
+            assert_eq!(output["proxy"]["no_proxy"], json!(["localhost"]));
+            if is_get {
+                assert_eq!(output["runtime_proxy"], output["proxy"]);
+            }
+            assert_eq!(
+                output["environment"]["HTTP_PROXY"],
+                "http://REDACTED@proxy.example:8080/"
+            );
+            assert_eq!(output["environment"]["HTTPS_PROXY"], "[REDACTED]");
+            assert_eq!(
+                output["environment"]["ALL_PROXY"],
+                "socks5h://REDACTED@proxy.example:1080"
+            );
+            assert_eq!(output["environment"]["NO_PROXY"], "localhost,.example");
+
+            for proxy in [
+                tool.load_config_without_env().unwrap().proxy,
+                runtime_proxy_config(),
+            ] {
+                assert_eq!(proxy.http_proxy.as_deref(), Some(HTTP));
+                assert_eq!(proxy.https_proxy.as_deref(), Some(HTTPS));
+                assert_eq!(proxy.all_proxy.as_deref(), Some(ALL));
+            }
+            assert_eq!(std::env::var("HTTP_PROXY").unwrap(), HTTP);
+            assert_eq!(std::env::var("HTTPS_PROXY").unwrap(), INVALID);
+            assert_eq!(std::env::var("ALL_PROXY").unwrap(), ALL);
+        }
     }
 
     #[tokio::test]

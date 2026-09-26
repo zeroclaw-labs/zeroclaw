@@ -60,6 +60,7 @@ If any intake check fails, leave one actionable checklist comment and stop. Don'
 <!-- >>> generated:review-ci-evidence-playbook by `cargo generate review-docs` - do not edit <<< -->
 - Duplicate local Cargo is not required when fresh required CI covers the same head, target, and feature set. Ask for extra validation only when it maps to a named gap in the required gate, such as macOS/Windows tests, cross-platform Clippy, desktop coverage, release target builds, stale CI beyond the [base-drift-only review case](../contributing/pr-review-protocol.md#ci-freshness-and-base-drift), or unavailable CI.
 <!-- >>> end generated:review-ci-evidence-playbook <<< -->
+- For a named Windows execution gap, use the [advisory Windows label guidance](./ci-and-actions.md#label-gated-advisory-windows-tests-windows-testsyml) to decide whether to request `ci:windows` and how to verify its result.
 - User-facing behavior changes are documented.
 - Author demonstrates understanding of behavior and blast radius (especially for AI-assisted PRs).
 - Rollback path is concrete; "revert" is not concrete.

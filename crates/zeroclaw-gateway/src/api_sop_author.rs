@@ -64,6 +64,35 @@ pub async fn handle_sop_trigger_sources(
     Json(registry).into_response()
 }
 
+/// `GET /api/sops/decision-models`: the `[decision_models]` aliases an SOP's
+/// `[decision] model` can select, sorted by alias. Never includes the API key.
+pub async fn handle_sop_decision_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let mut models: Vec<_> = {
+        let config = state.config.read();
+        config
+            .decision_models
+            .iter()
+            .filter_map(|(alias, m)| {
+                let (base_url, model) = m.endpoint()?;
+                Some(serde_json::json!({
+                    "alias": alias,
+                    "provider": m.provider,
+                    "model": model,
+                    "base_url": base_url,
+                }))
+            })
+            .collect()
+    };
+    models.sort_by(|a, b| a["alias"].as_str().cmp(&b["alias"].as_str()));
+    Json(serde_json::json!({ "models": models })).into_response()
+}
+
 /// Body for `POST /api/tools/param-options`: resolve selectable values
 /// for a domain-typed tool parameter. `args` carries sibling arguments
 /// already chosen so cascading domains (e.g. peer targets narrowing on
@@ -153,6 +182,10 @@ pub async fn handle_sop_graph(
 pub struct SopRunBody {
     #[serde(default)]
     pub payload: Option<String>,
+    /// Optional semantic work-item key shared with another producer, such as a
+    /// Git-channel event. Matching keys coalesce only while the first run is active.
+    #[serde(default)]
+    pub dedup_key: Option<String>,
 }
 
 /// Fire a Manual run for the named SOP and return its `run_id`.
@@ -197,12 +230,55 @@ pub async fn handle_sop_run(
             .into_response();
     };
 
+    // A dashboard run emits a Manual event but has no agent turn behind it: the
+    // driver below executes the step, so an unowned procedure would start, burn
+    // a run id, and fail its first step. Refuse before dispatch, on the same
+    // ownership rule the driver and the authoring gate apply.
+    let ownership_refusal = match engine.lock() {
+        Ok(guard) => guard
+            .get_sop(&name)
+            .and_then(zeroclaw_runtime::sop::headless_ownership_refusal),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "SOP engine lock poisoned" })),
+            )
+                .into_response();
+        }
+    };
+    if let Some(refusal) = ownership_refusal {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": refusal })),
+        )
+            .into_response();
+    }
+
     let payload = body
         .payload
         .as_deref()
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .map(str::to_string);
+    let dedup_key = body
+        .dedup_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty());
+    if dedup_key
+        .is_some_and(|key| key.len() > zeroclaw_runtime::sop::dispatch::MAX_ACTIVE_DEDUP_KEY_BYTES)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "dedup_key exceeds {} bytes",
+                    zeroclaw_runtime::sop::dispatch::MAX_ACTIVE_DEDUP_KEY_BYTES
+                )
+            })),
+        )
+            .into_response();
+    }
 
     let event = zeroclaw_runtime::sop::SopEvent {
         source: zeroclaw_runtime::sop::SopTriggerSource::Manual,
@@ -211,8 +287,14 @@ pub async fn handle_sop_run(
         timestamp: zeroclaw_runtime::sop::engine::now_iso8601(),
     };
 
-    let results =
-        zeroclaw_runtime::sop::dispatch::dispatch_sop_event_to(engine, audit, event, &name).await;
+    let results = if let Some(dedup_key) = dedup_key {
+        zeroclaw_runtime::sop::dispatch::dispatch_sop_event_to_deduplicated(
+            engine, audit, event, &name, dedup_key,
+        )
+        .await
+    } else {
+        zeroclaw_runtime::sop::dispatch::dispatch_sop_event_to(engine, audit, event, &name).await
+    };
     zeroclaw_runtime::sop::dispatch::process_headless_results(&results);
 
     for result in &results {
@@ -225,12 +307,30 @@ pub async fn handle_sop_run(
                 );
                 if needs_driver {
                     let config = state.config.read().clone();
-                    zeroclaw_runtime::sop::spawn_headless_run_driver(
-                        config,
-                        std::sync::Arc::clone(engine),
-                        Some(std::sync::Arc::clone(audit)),
-                        action.as_ref().clone(),
-                    );
+                    // A dashboard run outlives the request that started it, but
+                    // it does not outlive the daemon generation whose config and
+                    // engine it captured: it is admitted into that generation's
+                    // set like every other surface, so one reload drains all of
+                    // them, and a generation that has already drained refuses it
+                    // before it starts. Only a caller with no generation to
+                    // belong to (a standalone gateway) detaches.
+                    match state.sop_driver_handles.as_ref() {
+                        Some(handles) => {
+                            zeroclaw_runtime::sop::spawn_and_register_sop_driver(
+                                handles,
+                                config,
+                                std::sync::Arc::clone(engine),
+                                Some(std::sync::Arc::clone(audit)),
+                                action.as_ref().clone(),
+                            );
+                        }
+                        None => drop(zeroclaw_runtime::sop::spawn_headless_run_driver(
+                            config,
+                            std::sync::Arc::clone(engine),
+                            Some(std::sync::Arc::clone(audit)),
+                            action.as_ref().clone(),
+                        )),
+                    }
                 }
                 return Json(serde_json::json!({ "run_id": run_id })).into_response();
             }
@@ -573,6 +673,7 @@ pub async fn handle_sop_decide(
             &config,
             std::sync::Arc::clone(engine),
             state.sop_audit.clone(),
+            state.sop_driver_handles.as_ref(),
             &outcome,
         );
     }
@@ -840,13 +941,52 @@ pub async fn handle_sop_save(
     }
     sop.name = name;
     let (dir, _mode) = sops_dir_and_mode(&state);
-    match zeroclaw_runtime::sop::save_sop(&dir, &sop) {
+    // `PUT` edits the SOP named in its URL. If that SOP has been renamed or
+    // deleted since the client loaded it, refuse instead of recreating it
+    // under the retired name; creating a SOP is `POST /api/sops`.
+    match zeroclaw_runtime::sop::save_existing_sop_typed(&dir, &sop) {
         Ok(()) => Json(serde_json::json!({ "saved": sop.name })).into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Err(e) => {
+            let code = match e {
+                zeroclaw_runtime::sop::SopAuthorError::NotFound(_) => StatusCode::NOT_FOUND,
+                zeroclaw_runtime::sop::SopAuthorError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            (code, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
+        }
+    }
+}
+
+/// Body for `POST /api/sops/{name}/rename`: the name to move the SOP to.
+#[derive(serde::Deserialize)]
+pub struct SopRenameBody {
+    pub to: String,
+}
+
+/// Move a SOP to a new name. `PUT /api/sops/{name}` can only ever overwrite
+/// the SOP named in its own URL, so a name change is its own collision-checked
+/// operation rather than a save with a different name in the body.
+pub async fn handle_sop_rename(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(body): Json<SopRenameBody>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let (dir, mode) = sops_dir_and_mode(&state);
+    match zeroclaw_runtime::sop::rename_sop_typed(&dir, &name, &body.to, mode) {
+        Ok(()) => Json(serde_json::json!({ "renamed": body.to, "from": name })).into_response(),
+        Err(e) => {
+            let code = match e {
+                zeroclaw_runtime::sop::SopAuthorError::NotFound(_) => StatusCode::NOT_FOUND,
+                zeroclaw_runtime::sop::SopAuthorError::AlreadyExists(_) => StatusCode::CONFLICT,
+                zeroclaw_runtime::sop::SopAuthorError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                zeroclaw_runtime::sop::SopAuthorError::Other(_) => StatusCode::BAD_REQUEST,
+            };
+            (code, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
+        }
     }
 }
 
@@ -987,7 +1127,147 @@ mod tests {
             agent: None,
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
+            decision: None,
         }
+    }
+
+    /// A Manual SOP whose one `execute` step resolves an owner only when
+    /// `owner` is set. `sop_execute` would run it under the calling agent; the
+    /// dashboard has no such agent.
+    fn manual_execute_sop(owner: Option<&str>) -> Sop {
+        Sop {
+            name: "nightly".into(),
+            description: "t".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Auto,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "collect".into(),
+                kind: SopStepKind::Execute,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            agent: owner.map(str::to_string),
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            decision: None,
+        }
+    }
+
+    fn manual_run_state(sop: Sop) -> (tempfile::TempDir, AppState) {
+        let tmp = tempfile::tempdir().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        zeroclaw_runtime::sop::save_sop(&sops_dir, &sop).unwrap();
+
+        let mut engine = SopEngine::new(SopConfig::default());
+        engine.set_sops_for_test(vec![sop]);
+
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        config.sop.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
+        let mut state = crate::api::test_state(config);
+        state.sop_engine = Some(Arc::new(Mutex::new(engine)));
+        state.sop_audit = Some(Arc::new(zeroclaw_runtime::sop::SopAuditLogger::new(
+            Arc::new(zeroclaw_memory::NoneMemory::new("none")),
+        )));
+        (tmp, state)
+    }
+
+    /// A dashboard run drives the SOP through the headless driver, which has no
+    /// agent turn to inherit an owner from. Starting an unowned procedure here
+    /// would burn a run id and fail its first step, so the surface refuses it up
+    /// front — the authoring gate lets the SOP save because `sop_execute` can
+    /// still run it under the calling agent.
+    #[tokio::test]
+    async fn manual_run_refuses_an_unowned_procedure_before_starting_it() {
+        let (_tmp, state) = manual_run_state(manual_execute_sop(None));
+
+        let resp = handle_sop_run(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("nightly".to_string()),
+            Json(SopRunBody {
+                payload: None,
+                dedup_key: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a dashboard-started run with no owning agent must be refused"
+        );
+        assert!(
+            state
+                .sop_engine
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .active_runs()
+                .is_empty(),
+            "the refusal must land before a run is started"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_run_starts_an_owned_procedure() {
+        let (_tmp, state) = manual_run_state(manual_execute_sop(Some("ops")));
+
+        let resp = handle_sop_run(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("nightly".to_string()),
+            Json(SopRunBody {
+                payload: None,
+                dedup_key: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "an owned procedure must still start from the dashboard"
+        );
+    }
+
+    /// A dashboard run outlives the request that started it, but not the daemon
+    /// generation whose config and engine its driver captured. Detaching the
+    /// handle — the earlier behaviour — left that driver working across a reload
+    /// that superseded its configuration, with nothing left to drain or observe
+    /// it. It registers with the generation's set like every other surface.
+    #[tokio::test]
+    async fn manual_run_registers_its_driver_with_the_generation_set() {
+        let (_tmp, mut state) = manual_run_state(manual_execute_sop(Some("ops")));
+        let handles = zeroclaw_runtime::sop::SopDriverHandles::default();
+        state.sop_driver_handles = Some(Arc::clone(&handles));
+
+        let resp = handle_sop_run(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("nightly".to_string()),
+            Json(SopRunBody {
+                payload: None,
+                dedup_key: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            handles.lock().unwrap().len(),
+            1,
+            "the dashboard-started driver must join the generation-owned set rather than detach"
+        );
     }
 
     fn authoring_checkpoint_sop(name: &str) -> Sop {
@@ -1011,7 +1291,154 @@ mod tests {
             agent: None,
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
+            decision: None,
         }
+    }
+
+    fn authoring_rename_state(
+        token: &str,
+        names: &[&str],
+    ) -> (tempfile::TempDir, std::path::PathBuf, AppState) {
+        let tmp = tempfile::tempdir().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        for name in names {
+            zeroclaw_runtime::sop::save_sop(&sops_dir, &authoring_checkpoint_sop(name)).unwrap();
+        }
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        config.sop.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
+        let mut state = crate::api::test_state(config);
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[token.to_string()],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
+        (tmp, sops_dir, state)
+    }
+
+    #[tokio::test]
+    async fn authoring_rename_moves_the_sop_and_maps_failures_to_status_codes() {
+        let token = "author-token";
+        let (_tmp, sops_dir, state) =
+            authoring_rename_state(token, &["deploy-old", "deploy-taken"]);
+
+        let resp = handle_sop_rename(
+            State(state.clone()),
+            bearer(token),
+            Path("deploy-old".to_string()),
+            Json(SopRenameBody {
+                to: "deploy-new".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            !sops_dir.join("deploy-old").exists(),
+            "the SOP moves rather than being copied"
+        );
+        assert!(sops_dir.join("deploy-new").exists());
+
+        let resp = handle_sop_rename(
+            State(state.clone()),
+            bearer(token),
+            Path("deploy-new".to_string()),
+            Json(SopRenameBody {
+                to: "deploy-taken".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "a name another SOP owns is a conflict, not a merge"
+        );
+        assert!(sops_dir.join("deploy-new").exists());
+        assert!(sops_dir.join("deploy-taken").exists());
+
+        let resp = handle_sop_rename(
+            State(state.clone()),
+            bearer(token),
+            Path("deploy-missing".to_string()),
+            Json(SopRenameBody {
+                to: "deploy-anything".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let resp = handle_sop_rename(
+            State(state),
+            bearer(token),
+            Path("deploy-new".to_string()),
+            Json(SopRenameBody {
+                to: "../escaped".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a rename target that escapes the SOP root is rejected"
+        );
+        assert!(!sops_dir.parent().unwrap().join("escaped").exists());
+    }
+
+    /// `PUT /api/sops/{name}` edits the SOP named in its URL. After a rename,
+    /// a client still holding the old name must get a not-found, and the
+    /// retired name must not be recreated.
+    #[tokio::test]
+    async fn authoring_save_after_rename_does_not_recreate_the_retired_sop() {
+        let token = "author-token";
+        let (_tmp, sops_dir, state) = authoring_rename_state(token, &["deploy-before"]);
+
+        let resp = handle_sop_rename(
+            State(state.clone()),
+            bearer(token),
+            Path("deploy-before".to_string()),
+            Json(SopRenameBody {
+                to: "deploy-after".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = handle_sop_save(
+            State(state),
+            bearer(token),
+            Path("deploy-before".to_string()),
+            Json(authoring_checkpoint_sop("deploy-before")),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a stale edit of a renamed SOP is not found, not a silent re-create"
+        );
+        assert!(!sops_dir.join("deploy-before").exists());
+        assert!(sops_dir.join("deploy-after").exists());
+    }
+
+    #[tokio::test]
+    async fn authoring_rename_requires_auth() {
+        let (_tmp, sops_dir, state) = authoring_rename_state("author-token", &["deploy-old"]);
+
+        let resp = handle_sop_rename(
+            State(state),
+            HeaderMap::new(),
+            Path("deploy-old".to_string()),
+            Json(SopRenameBody {
+                to: "deploy-new".to_string(),
+            }),
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::OK);
+        assert!(
+            sops_dir.join("deploy-old").exists(),
+            "an unauthenticated rename must not touch the SOP root"
+        );
+        assert!(!sops_dir.join("deploy-new").exists());
     }
 
     fn authoring_state_with_policied_gate(
@@ -1302,6 +1729,7 @@ mod tests {
             agent: None,
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
+            decision: None,
         }
     }
 

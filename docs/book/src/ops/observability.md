@@ -1,6 +1,6 @@
 # Logs & observability
 
-Every event ZeroClaw emits flows through one crate: `zeroclaw-log`. The crate owns the on-disk JSONL schema, the in-process broadcast stream the dashboard reads, the optional bridge to the typed `Observer` (Prometheus / OTel), and the macros (`record!`, `scope!`, `spawn!`) that subsystems call.
+Every event ZeroClaw emits flows through one crate: `zeroclaw-log`. The crate owns the on-disk JSONL schema, the in-process broadcast stream the dashboard reads, the optional typed `Observer` bridge, the native OTLP log-export bridge, and the macros (`record!`, `scope!`, `spawn!`) that subsystems call.
 
 This page covers what an operator needs: configuration, where the log lives,
 the shape of the events, and how to query them.
@@ -18,9 +18,9 @@ install produces a 200-event rolling JSONL at
 `~/.zeroclaw/data/state/runtime-trace.jsonl`, and the dashboard's Logs page
 works without further configuration.
 
-`log_persistence = "none"` disables persistence entirely but does not gate the broadcast stream used by dashboard SSE. The optional typed `Observer` bridge is also independent of persistence, but it receives canonical log events only when explicitly bound; the current production bootstrap does not install that binding.
+`log_persistence = "none"` disables persistence entirely but does not gate the broadcast stream used by dashboard SSE or native OTLP export. The optional typed `Observer` bridge is also independent of persistence, but it receives canonical log events only when explicitly bound; the current production bootstrap does not install that binding.
 
-Persistence is best-effort rather than a transactional audit guarantee. The Observer bridge, when bound, and broadcast delivery happen before the event is offered to a bounded background-writer queue. A full queue or worker write failure can leave an event out of JSONL. Periodic sync covers the current active file; daily rotation before a new UTC day's first append and size rotation after a threshold-crossing append can rename the active file without first syncing it, so the cadence does not bound durability for a just-rotated archive. See [Logging architecture](../architecture/logging.md#delivery-surfaces-have-different-guarantees) for the separate delivery contracts.
+Persistence is best-effort rather than a transactional audit guarantee. The Observer bridge, native OTLP queue, and broadcast delivery happen before the event is offered to a bounded background-writer queue. A full queue or worker write failure can leave an event out of JSONL. Periodic sync covers the current active file; daily rotation before a new UTC day's first append and size rotation after a threshold-crossing append can rename the active file without first syncing it, so the cadence does not bound durability for a just-rotated archive. See [Logging architecture](../architecture/logging.md#delivery-surfaces-have-different-guarantees) for the separate delivery contracts.
 
 ### Archive rotation (`log_persistence = "rotating"`)
 
@@ -57,6 +57,59 @@ Daily rotation keys off the UTC calendar, so its boundary may not line up with
 local midnight in other time zones. These keys are ignored unless
 `log_persistence = "rotating"`, and the `none`, `rolling`, and `full` modes are
 unchanged.
+
+### Native OTLP logs (`observability-otel`)
+
+The opt-in `observability-otel` feature exports traces, metrics, and logs through
+the official OpenTelemetry SDK. Logs use OTLP/HTTP with protobuf encoding and
+are batch-posted to `<otel_endpoint>/v1/logs`; traces and metrics keep their
+standard `/v1/traces` and `/v1/metrics` endpoints. The feature remains outside
+default builds because of its larger SDK and HTTP-client footprint.
+
+```toml
+[observability]
+backend = "otel"
+otel_endpoint = "http://localhost:4318"
+otel_service_name = "zeroclaw"
+
+# Local/offline inspection remains available at the same time.
+log_persistence = "rolling"
+
+# Optional vendor or collector headers.
+[observability.otel_headers]
+Authorization = "Bearer <collector-token>"
+```
+
+Build with `--features observability-otel`. The endpoint can be an OpenTelemetry
+Collector, Grafana Alloy, or any vendor endpoint that accepts OTLP logs over
+HTTP/protobuf. Header values are secret config fields and never appear in the
+exported records.
+
+Each canonical `LogEvent` maps into the stable OpenTelemetry Logs Data Model:
+
+| ZeroClaw field | OpenTelemetry destination |
+| --- | --- |
+| `@timestamp` | LogRecord `Timestamp`; export time becomes `ObservedTimestamp` |
+| `severity_number`, `severity_text` | LogRecord normalized severity fields |
+| `message` | LogRecord `Body` |
+| configured service name + crate version | Resource `service.name`, `service.version` |
+| valid 16-byte trace + 8-byte span identifiers | LogRecord `TraceId`, `SpanId` |
+| `event.*` | ECS-compatible LogRecord attributes |
+| `_file`, `_line` | `code.file.path`, `code.line.number` |
+| model/provider/token fields | `gen_ai.*` semantic attributes |
+| tool identity | `tool.name` |
+| `zeroclaw.*` attribution | namespaced LogRecord attributes, including `zeroclaw.sop_run_id` |
+
+Application correlation strings that are not valid OTel trace/span identifiers
+remain searchable as `zeroclaw.trace_id` / `zeroclaw.span_id` attributes rather
+than being coerced into invented trace context. Nested JSON values map to OTel
+`AnyValue` maps and lists. Broadcast-only ephemeral attributes, including pairing
+codes, are never presented to the exporter.
+
+The exporter is additive. JSONL, dashboard SSE, `/api/logs`, CLI, and ZeroCode
+keep their existing schema and continue working if the collector is unavailable.
+Exporter replacement or shutdown force-flushes the SDK batch queue; runtime
+emission itself only queues and does not perform network I/O on the caller.
 
 ### GenAI span attributes (`observability-otel`)
 
@@ -140,9 +193,38 @@ turn.
 
 | Value | What is captured |
 | --- | --- |
-| `off` (default) | Only `messages_count`. No message content is recorded; existing behavior. |
+| `off` (default) | No message content is recorded. The event still carries `messages_count` plus the always-on prefix fingerprints described below (`system_chars`, `tools_count`, and when present `system_sha256`, `tools_sha256`); they are digests, not content, but a trace reader can still test them for equality. |
 | `redacted` | Full message history (role + content), credential-scanned with the same `scrub_credentials` pass used for `raw_response` and tool I/O, then truncated at `log_tool_io_truncate_bytes`. Truncation is flagged with `request_messages_truncated` and `request_messages_original_bytes`. |
 | `full` | Same credential scrubbing as `redacted`, but untruncated (replay fidelity, mirroring `raw_response`). |
+
+Every `llm_request` event also carries prefix fingerprints of the runtime's
+request inputs, whatever the payload policy: `system_chars` and `tools_count`
+are always present; `system_sha256` (the first 16 hex chars of a SHA-256 over
+the contiguous leading `system` messages, serialized as a JSON array of their
+contents, present only when the first message has the `system` role) and
+`tools_sha256` (the same over the native tool specs serialized as a JSON
+array, present only when tool specs are attached, so a reordered tool set
+fingerprints differently). They describe what the runtime
+handed the provider adapter, one row per logical request; provider-side
+transforms (schema cleaning, cache-control placement, an OAuth system prefix,
+system-message merging on compatible wires, a second leading system message
+that the Anthropic adapter drops, retries inside the adapter) are outside the
+hashed bytes. Read a change as a diagnostic hint, not a cache
+verdict: a changed `system_sha256` means one of the leading system messages
+changed, or one was inserted or removed, for example after an included
+workspace file changed, a before-call hook edited or added one, or the tool
+framing switched between native and text protocol;
+a changed `tools_sha256` means the runtime tool-spec serialization changed,
+which includes metadata fields the wire does not carry. In text-protocol mode
+the tool instructions live inside the system text, so `tools_count` is 0 and
+`tools_sha256` is absent while a tool-set change shows up under
+`system_sha256`. Confirm an actual cache hit or miss from the provider's
+reported cache usage. The fingerprints are counts and unsalted truncated
+hashes, not content: they reveal whether an input changed and let a known
+candidate text be tested for equality, but persist no message text. Anyone
+who can read the trace can test a known candidate prompt or tool set for
+equality, so treat trace files with the same access controls as the opt-in
+payload capture that sits beside them.
 
 Both `redacted` and `full` always run credential scrubbing; the only difference
 between them is truncation. The capture reuses the existing
@@ -239,6 +321,9 @@ curl "$ZEROCLAW_GATEWAY/api/logs?channel=discord.glados"
 
 # A single agent turn:
 curl "$ZEROCLAW_GATEWAY/api/logs?trace_id=<value-from-a-prior-event>"
+
+# Every retained event attributed to one SOP run (across its step turns):
+curl "$ZEROCLAW_GATEWAY/api/logs?sop_run_id=<run-id>"
 ```
 
 </div>
@@ -261,6 +346,8 @@ Restart from the newest page after changing filters. Treat `at_end: true` as the
 
 A cursor issued by an older daemon, which named a segment by filename without an anchor, is still accepted. That form cannot say whether it means a rotated archive or the active file, so the reader tries the archives first, where a name is never reassigned, and falls back to the active file.
 
+The log response includes `persistence_enabled: boolean`, which distinguishes
+"no matching events" from a daemon where runtime-trace persistence is disabled.
 The `/api/status` response includes `daemon_started_at: string` (RFC
 3339), so a dashboard can default to "since daemon start" without an
 extra round-trip.
@@ -304,8 +391,20 @@ scrape_configs:
 
 ### OpenTelemetry Collector
 
-The `filelog` receiver maps the schema directly. Export to any OTel
-sink afterward (Tempo, Honeycomb, Datadog, etc.):
+With an `observability-otel` build, prefer the native OTLP receiver; no parsing
+or field transform is needed:
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 127.0.0.1:4318
+```
+
+Point `observability.otel_endpoint` at that listener. The existing `filelog`
+receiver remains a useful fallback for default builds, backfilling retained
+JSONL, or running a separate file shipper:
 
 ```yaml
 receivers:
@@ -383,6 +482,10 @@ volume governor for genuine errors.
   migration.
 - `crates/zeroclaw-log/src/observer_bridge.rs`: typed `Observer`
   projection for Prometheus / OTel consumers.
+- `crates/zeroclaw-log/src/export_bridge.rs`: nonblocking canonical-event
+  bridge used by the native OTLP log exporter.
+- `crates/zeroclaw-runtime/src/observability/otel_logs.rs`: OTel Logs Data
+  Model mapping and OTLP/HTTP protobuf exporter.
 - `crates/zeroclaw-gateway/src/api_logs.rs`: the HTTP adapter.
 
 Touch the source before you trust the prose on this page.

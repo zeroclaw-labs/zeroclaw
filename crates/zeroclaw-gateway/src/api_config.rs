@@ -2748,6 +2748,7 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
         }
     }
 
@@ -2767,6 +2768,43 @@ mod tests {
     // tests below fall through into real persistence (`persist_and_swap` ->
     // `save_dirty`), and a bare `Config::default()` would write the developer's
     // live `~/.zeroclaw/config.toml`.
+
+    #[tokio::test]
+    async fn prop_get_surfaces_disabled_audit_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.security.audit.enabled = false;
+        let state = test_state(config);
+
+        let (status, json) = response_json(
+            handle_prop_get(
+                State(state),
+                HeaderMap::new(),
+                Query(PropQuery {
+                    path: "security.audit.enabled".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["value"], "false");
+        let warning = json["warnings"]
+            .as_array()
+            .expect("warnings is an array")
+            .iter()
+            .find(|warning| warning["code"] == "security_audit_disabled_drops_certificate_record")
+            .expect("gateway response includes the disabled-audit warning");
+        assert_eq!(warning["path"], "security.audit.enabled");
+        assert!(
+            warning["message"]
+                .as_str()
+                .expect("warning message is a string")
+                .contains("Command execution is not audited"),
+            "the structured message must scope the gap to command execution"
+        );
+    }
 
     #[tokio::test]
     async fn prop_put_does_not_materialize_resource_keyed_rate_alias() {

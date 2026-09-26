@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::TurnEvent;
-use zeroclaw_config::schema::{MultimodalConfig, PacingConfig};
+use zeroclaw_config::schema::{MultimodalConfig, PacingConfig, ResolvedContextLimits};
 use zeroclaw_providers::{ChatMessage, ModelProvider};
 use zeroclaw_tool_call_parser::{strip_think_tags, strip_trailing_terminal_markers};
 
@@ -59,7 +59,7 @@ pub(crate) async fn finish_after_max_iterations(
     knobs: &LoopKnobs,
     event_tx: Option<&Sender<TurnEvent>>,
     mut new_messages_out: Option<&mut Vec<ChatMessage>>,
-    context_token_budget: usize,
+    context_limits: ResolvedContextLimits,
     crumb_present: &mut bool,
     token_counter: super::DispatchTokenCounter,
     observer: &dyn crate::observability::Observer,
@@ -129,6 +129,7 @@ pub(crate) async fn finish_after_max_iterations(
     // request failure.
     let degrade_strip_images = !model_provider.capabilities_for_model(model).vision
         && zeroclaw_providers::multimodal::count_image_markers(history) > 0;
+    let trim_budget = super::dispatch_trim_budget(context_limits);
     let mut tokens_before = None;
     let mut dropped_messages = 0;
     let mut dropped_turns = 0;
@@ -152,7 +153,7 @@ pub(crate) async fn finish_after_max_iterations(
             history,
             crumb_present,
             tokens,
-            context_token_budget,
+            trim_budget,
         );
         dropped_messages += trim.dropped_messages;
         if trim.outcome == super::PreDispatchOutcome::Trimmed {
@@ -164,12 +165,17 @@ pub(crate) async fn finish_after_max_iterations(
             (provider_name, model),
             &trim,
             dropped_turns,
-            context_token_budget,
+            trim_budget,
             before,
             tokens,
             token_counter.source(),
         );
-        let floor = trim.outcome == super::PreDispatchOutcome::Floor;
+        let floor = tokens > context_limits.model_context_window as u64;
+        let event_budget = if floor {
+            context_limits.model_context_window
+        } else {
+            trim_budget
+        };
         if dropped_messages > 0 || floor {
             let source = token_counter.source();
             if let Some(tx) = event_tx {
@@ -178,7 +184,7 @@ pub(crate) async fn finish_after_max_iterations(
                         dropped_messages,
                         kept_turns: trim.kept_turns,
                         reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
-                        token_budget: Some(context_token_budget as u64),
+                        token_budget: Some(event_budget as u64),
                         tokens_before: Some(before),
                         tokens_after: Some(tokens),
                         tokens_before_source: Some(source),
@@ -195,7 +201,7 @@ pub(crate) async fn finish_after_max_iterations(
                     channel: None,
                     agent_alias: None,
                     turn_id: None,
-                    token_budget: Some(context_token_budget as u64),
+                    token_budget: Some(event_budget as u64),
                     tokens_before: Some(before),
                     tokens_after: Some(tokens),
                     tokens_before_source: Some(source),
@@ -205,9 +211,12 @@ pub(crate) async fn finish_after_max_iterations(
             );
         }
         if floor {
-            return Err(anyhow::Error::msg(crate::i18n::get_required_cli_string(
-                "turn-context-budget-floor-error",
-            )));
+            return Err(super::context_window_exceeded_error(
+                (provider_name, model),
+                context_limits,
+                tokens,
+                token_counter.source(),
+            ));
         }
         break messages;
     };
@@ -392,7 +401,9 @@ mod graceful_summary_metering_tests {
     use zeroclaw_api::model_provider::{
         ChatRequest, ChatResponse, ProviderCapabilities, SemanticEmptyTerminalCompletion,
     };
-    use zeroclaw_config::schema::{CostConfig, MultimodalConfig, PacingConfig};
+    use zeroclaw_config::schema::{
+        CostConfig, MultimodalConfig, PacingConfig, ResolvedContextLimits,
+    };
     use zeroclaw_providers::traits::TokenUsage;
     use zeroclaw_providers::{ChatMessage, ModelProvider};
 
@@ -471,7 +482,7 @@ mod graceful_summary_metering_tests {
             &knobs,
             event_tx,
             None,
-            0,
+            ResolvedContextLimits::legacy_fallback(0),
             &mut false,
             super::super::DispatchTokenCounter::default(),
             &crate::observability::NoopObserver,
@@ -720,68 +731,74 @@ mod graceful_summary_metering_tests {
 
     #[tokio::test]
     async fn graceful_summary_prompt_can_make_the_latest_turn_unsatisfiable() {
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let provider = CapturingProvider {
-            seen: Arc::clone(&seen),
-            vision: false,
-        };
-        let mut history = vec![
-            ChatMessage::user("current question"),
-            ChatMessage::assistant("work completed"),
-        ];
-        // The real turn fits exactly; only the synthetic prompt can exceed it.
-        let budget = crate::agent::history::estimate_history_tokens(&history);
-        let mut crumb_present = false;
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let error = finish_after_max_iterations(
-            &provider,
-            &mut history,
-            "custom",
-            "test-model",
-            "test-model",
-            None,
-            &MultimodalConfig::default(),
-            &[],
-            &PacingConfig::default(),
-            None,
-            1,
-            String::new(),
-            "summary-prompt-floor",
-            &LoopKnobs::default(),
-            Some(&tx),
-            None,
-            budget,
-            &mut crumb_present,
-            super::super::DispatchTokenCounter::default(),
-            &crate::observability::NoopObserver,
-        )
-        .await
-        .expect_err("summary prompt must be included in the floor decision");
-        assert!(
-            error
-                .to_string()
-                .contains(&crate::i18n::get_required_cli_string(
-                    "turn-context-budget-floor-error",
-                ))
-        );
-        assert!(
-            seen.lock().unwrap().is_empty(),
-            "no oversized summary dispatch"
-        );
-        assert_eq!(history.len(), 2);
-        assert_eq!(history[0].content, "current question");
-        assert_eq!(history[1].content, "work completed");
-        assert!(!crumb_present);
-        let TurnEvent::HistoryTrimmed {
-            tokens_after,
-            unsatisfiable_floor,
-            ..
-        } = rx.try_recv().unwrap()
-        else {
-            panic!("expected summary floor event");
-        };
-        assert_eq!(unsatisfiable_floor, Some(true));
-        assert!(tokens_after.unwrap() > budget as u64);
+        for disable_soft_budget in [false, true] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let provider = CapturingProvider {
+                seen: Arc::clone(&seen),
+                vision: false,
+            };
+            let mut history = vec![
+                ChatMessage::user("current question"),
+                ChatMessage::assistant("work completed"),
+            ];
+            // The real turn fits exactly; only the synthetic prompt can exceed it.
+            let budget = crate::agent::history::estimate_history_tokens(&history);
+            let mut crumb_present = false;
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let error = finish_after_max_iterations(
+                &provider,
+                &mut history,
+                "custom",
+                "test-model",
+                "test-model",
+                None,
+                &MultimodalConfig::default(),
+                &[],
+                &PacingConfig::default(),
+                None,
+                1,
+                String::new(),
+                "summary-prompt-floor",
+                &LoopKnobs::default(),
+                Some(&tx),
+                None,
+                ResolvedContextLimits {
+                    model_context_window: budget,
+                    ..ResolvedContextLimits::legacy_fallback(if disable_soft_budget {
+                        0
+                    } else {
+                        budget
+                    })
+                },
+                &mut crumb_present,
+                super::super::DispatchTokenCounter::default(),
+                &crate::observability::NoopObserver,
+            )
+            .await
+            .expect_err("summary prompt must be included in the floor decision");
+            let exceeded = super::super::context_window_exceeded_from_error(&error)
+                .expect("summary capacity rejection must retain its typed cause");
+            assert_eq!(exceeded.model_context_window, budget);
+            assert!(exceeded.estimated_tokens > budget);
+            assert!(
+                seen.lock().unwrap().is_empty(),
+                "no oversized summary dispatch"
+            );
+            assert_eq!(history.len(), 2);
+            assert_eq!(history[0].content, "current question");
+            assert_eq!(history[1].content, "work completed");
+            assert!(!crumb_present);
+            let TurnEvent::HistoryTrimmed {
+                tokens_after,
+                unsatisfiable_floor,
+                ..
+            } = rx.try_recv().unwrap()
+            else {
+                panic!("expected summary floor event");
+            };
+            assert_eq!(unsatisfiable_floor, Some(true));
+            assert!(tokens_after.unwrap() > budget as u64);
+        }
     }
 
     // The graceful-summary path now prepares the accumulated history through
@@ -830,7 +847,7 @@ mod graceful_summary_metering_tests {
             &knobs,
             None,
             None,
-            0,
+            ResolvedContextLimits::legacy_fallback(0),
             &mut false,
             super::super::DispatchTokenCounter::default(),
             &crate::observability::NoopObserver,
@@ -902,7 +919,7 @@ mod graceful_summary_metering_tests {
             &knobs,
             None,
             None,
-            0,
+            ResolvedContextLimits::legacy_fallback(0),
             &mut false,
             super::super::DispatchTokenCounter::default(),
             &crate::observability::NoopObserver,
@@ -978,7 +995,7 @@ mod graceful_summary_metering_tests {
             &knobs,
             None,
             None,
-            0,
+            ResolvedContextLimits::legacy_fallback(0),
             &mut false,
             super::super::DispatchTokenCounter::default(),
             &crate::observability::NoopObserver,
@@ -1000,6 +1017,166 @@ mod graceful_summary_metering_tests {
             captured.matches(&inline_marker).count(),
             2,
             "both images must arrive as the same byte-identical inline marker: {captured}"
+        );
+    }
+
+    // The graceful summary replays history through the metered one-shot seam,
+    // whose sanitizers used to rewrite each message as a whole string — so a
+    // marker inside an assistant envelope's signed thinking text was replaced
+    // while its signature stayed, which Anthropic rejects on replay. The
+    // envelope (signed thinking included) must reach the provider
+    // byte-for-byte, so the assistant entry is built with the production
+    // `build_native_assistant_history` builder the adapters parse back.
+    #[tokio::test]
+    async fn graceful_summary_replays_signed_thinking_unmodified() {
+        let marker = format!("[{}:{}]", "IMAGE", "/tmp/shot.png");
+        let reasoning =
+            format!(r#"{{"thinking":"check {marker} before answering","signature":"sig_replay"}}"#);
+        let assistant_content = super::super::parse_response::build_native_assistant_history(
+            "",
+            &[zeroclaw_api::model_provider::ToolCall {
+                id: "toolu_think".into(),
+                name: "shell".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }],
+            Some(&reasoning),
+        );
+        let mut history = vec![
+            ChatMessage::user("run the tool"),
+            ChatMessage::assistant(assistant_content.clone()),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "content": "done",
+                    "tool_call_id": "toolu_think",
+                })
+                .to_string(),
+            ),
+        ];
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            seen: Arc::clone(&seen),
+            vision: true,
+        };
+        let pacing = PacingConfig::default();
+        let knobs = LoopKnobs::default();
+        let multimodal_config = MultimodalConfig::default();
+
+        let out = finish_after_max_iterations(
+            &provider,
+            &mut history,
+            "custom",
+            "test-model",
+            "test-model",
+            None,
+            &multimodal_config,
+            &[],
+            &pacing,
+            None,
+            2,
+            String::new(),
+            "trace-req-signed-thinking",
+            &knobs,
+            None,
+            None,
+            ResolvedContextLimits::legacy_fallback(0),
+            &mut false,
+            super::super::DispatchTokenCounter::default(),
+            &crate::observability::NoopObserver,
+        )
+        .await
+        .expect("graceful summary should succeed");
+
+        assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
+        let captured = seen.lock().unwrap().join("\n");
+        assert!(
+            captured.contains(&assistant_content),
+            "the assistant envelope (signed thinking included) must reach the provider byte-for-byte: {captured}"
+        );
+        assert!(
+            !captured.contains(zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER),
+            "nothing in this history is a deliverable marker outside the thinking, so a placeholder anywhere means the reasoning was touched: {captured}"
+        );
+    }
+
+    // Degrade twin of the signed-thinking replay: `vision: false` is what a
+    // reliable wrapper reports whenever any fallback lacks vision — even
+    // when the primary that receives the request verifies thinking
+    // signatures — so the summary's text-only degrade path must keep the
+    // envelope byte-identical too, not just the one-shot seam. The history
+    // carries a path-form marker in the user turn so the summary actually
+    // takes the degrade branch; the placeholder in the captured request is
+    // the probe that it ran.
+    #[tokio::test]
+    async fn graceful_summary_degrade_replays_signed_thinking_unmodified() {
+        let user_marker = format!("[{}:{}]", "IMAGE", "/tmp/degrade.png");
+        let marker = format!("[{}:{}]", "IMAGE", "/tmp/shot.png");
+        let reasoning =
+            format!(r#"{{"thinking":"check {marker} before answering","signature":"sig_replay"}}"#);
+        let assistant_content = super::super::parse_response::build_native_assistant_history(
+            "",
+            &[zeroclaw_api::model_provider::ToolCall {
+                id: "toolu_think".into(),
+                name: "shell".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }],
+            Some(&reasoning),
+        );
+        let mut history = vec![
+            ChatMessage::user(format!("run the tool on {user_marker}")),
+            ChatMessage::assistant(assistant_content.clone()),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "content": "done",
+                    "tool_call_id": "toolu_think",
+                })
+                .to_string(),
+            ),
+        ];
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            seen: Arc::clone(&seen),
+            vision: false,
+        };
+        let pacing = PacingConfig::default();
+        let knobs = LoopKnobs::default();
+        let multimodal_config = MultimodalConfig::default();
+
+        let out = finish_after_max_iterations(
+            &provider,
+            &mut history,
+            "custom",
+            "test-model",
+            "test-model",
+            None,
+            &multimodal_config,
+            &[],
+            &pacing,
+            None,
+            2,
+            String::new(),
+            "trace-req-signed-thinking-degrade",
+            &knobs,
+            None,
+            None,
+            ResolvedContextLimits::legacy_fallback(0),
+            &mut false,
+            super::super::DispatchTokenCounter::default(),
+            &crate::observability::NoopObserver,
+        )
+        .await
+        .expect("graceful summary should succeed");
+
+        assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
+        let captured = seen.lock().unwrap().join("\n");
+        assert!(
+            captured.contains(&assistant_content),
+            "the assistant envelope (signed thinking included) must survive the degrade path byte-for-byte: {captured}"
+        );
+        assert!(
+            captured.contains(zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER),
+            "the user-turn marker must be replaced, proving the degrade branch ran: {captured}"
         );
     }
 

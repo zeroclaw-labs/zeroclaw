@@ -105,34 +105,44 @@ pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
     // <name>` keeps producing actionable output. The Chat-category catch-all
     // points operators at the per-channel config keys.
     match entry.name.as_str() {
-        "Telegram" => {
+        "Telegram" | "Discord" | "Slack" => {
             println!(
                 "  {}:",
                 get_required_cli_string("cli-integrations-setup-heading")
             );
-            println!("    1. Message @BotFather on Telegram");
-            println!("    2. Create a bot and copy the token");
-            println!("    3. Run: zeroclaw config set channels.telegram.default.bot_token <token>");
-            println!("    4. Start: zeroclaw channel start");
-        }
-        "Discord" => {
+            let preparation = match entry.name.as_str() {
+                "Telegram" => get_required_cli_string_with_args(
+                    "cli-integrations-chat-telegram-prepare",
+                    &[("botfather", "@BotFather"), ("channel", "Telegram")],
+                ),
+                "Discord" => get_required_cli_string_with_args(
+                    "cli-integrations-chat-discord-prepare",
+                    &[
+                        ("url", "https://discord.com/developers/applications"),
+                        ("intent", "MESSAGE CONTENT"),
+                    ],
+                ),
+                _ => get_required_cli_string_with_args(
+                    "cli-integrations-chat-slack-prepare",
+                    &[("url", "https://api.slack.com/apps")],
+                ),
+            };
+            println!("    1. {preparation}");
             println!(
-                "  {}:",
-                get_required_cli_string("cli-integrations-setup-heading")
+                "    2. {}",
+                get_required_cli_string_with_args(
+                    "cli-integrations-chat-configure",
+                    &[("command", "zerocode"), ("channel", &entry.name)],
+                )
             );
-            println!("    1. Go to https://discord.com/developers/applications");
-            println!("    2. Create app → Bot → Copy token");
-            println!("    3. Enable MESSAGE CONTENT intent");
-            println!("    4. Run: zeroclaw config set channels.discord.default.bot-token <token>");
-        }
-        "Slack" => {
             println!(
-                "  {}:",
-                get_required_cli_string("cli-integrations-setup-heading")
+                "    3. {}",
+                get_required_cli_string("cli-integrations-chat-bind")
             );
-            println!("    1. Go to https://api.slack.com/apps");
-            println!("    2. Create app → Bot Token Scopes → Install");
-            println!("    3. Run: zeroclaw config set channels.slack.default.bot-token <token>");
+            println!(
+                "    4. {}",
+                get_required_cli_string("cli-integrations-chat-enable")
+            );
         }
         "iMessage" => {
             println!(

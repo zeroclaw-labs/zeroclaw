@@ -471,6 +471,7 @@ Two operational constraints worth repeating from the
 
 | Symptom | Likely cause |
 |---|---|
+| `zeroclaw plugin install` fails with `does not load against this host` | The component was built against a WIT that differs from this host's `wit/v0` (a stale `configure` signature, a capability flag the host does not share), or for the wrong target (a core module or `wasm32-wasip1`). The install-time load check is the same instantiation the daemon runs at startup, so nothing was installed. Rebuild against the shipped WIT and reinstall; `--no-verify` installs it anyway, and the daemon will then skip it at startup with the same diagnostic. |
 | Plugin missing from `zeroclaw plugin list` | Plugin system disabled; malformed manifest; `wasm_path` file missing; signature policy rejected it. The startup log carries the specific skip warning. |
 | Present in `zeroclaw plugin list` but the tool never loads | `plugins.auto_discover` is `false` (the default). Auto-discovered tool and skill capabilities load only when `plugins.auto_discover = true`; `plugins.enabled = true` alone activates only explicitly-declared channels. Run `zeroclaw config set plugins.auto_discover true`. |
 | Tool rejected during registration | Config validation or the metadata probe failed. Check the log for the specific error; a probe failure usually means the component was built against mismatched WIT. |

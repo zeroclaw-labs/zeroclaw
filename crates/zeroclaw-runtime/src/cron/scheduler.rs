@@ -792,6 +792,11 @@ async fn execute_and_persist_job(
     (job.id.clone(), success, output)
 }
 
+fn agent_job_error_message(error: &anyhow::Error) -> String {
+    crate::agent::terminal_completion_error_message(error, None)
+        .unwrap_or_else(|| crate::i18n::get_required_cli_string("cron-agent-job-failed"))
+}
+
 async fn run_agent_job(
     config: &Config,
     security: &SecurityPolicy,
@@ -861,6 +866,9 @@ async fn run_agent_job(
         // `agent::run` is the correct choice. The daemon heartbeat
         // worker is the only `mcp_registry` supplier.
         mcp_registry: None,
+        // A `[[cron]]` job runs a prompt, not a SOP step. SOP cron triggers
+        // are a separate surface driven by the SOP maintenance tick.
+        sop_step_scope: None,
     };
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
@@ -897,6 +905,27 @@ async fn run_agent_job(
             },
         ),
         Err(e) => {
+            let mut error_attributes = ::serde_json::json!({
+                "job_id": job.id,
+                "agent_alias": agent_alias,
+            });
+            if let Some(exceeded) = crate::agent::context_window_exceeded_from_error(&e) {
+                error_attributes["error_kind"] = "context_window_exceeded".into();
+                error_attributes["estimated_tokens"] = exceeded.estimated_tokens.into();
+                error_attributes["model_context_window"] = exceeded.model_context_window.into();
+                error_attributes["provider_attempted"] = false.into();
+            } else {
+                error_attributes["error_kind"] = "agent_error".into();
+                error_attributes["error_bytes"] = e.to_string().len().into();
+            }
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Cron)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(error_attributes),
+                "cron_agent_job_failed"
+            );
             if matches!(job.session_target, SessionTarget::Isolated) {
                 let mem_session_key = zeroclaw_api::session_keys::sanitize_session_key(&format!(
                     "cli:{}",
@@ -914,7 +943,7 @@ async fn run_agent_job(
                     let _ = mem.purge_session(&mem_session_key).await;
                 }
             }
-            (false, format!("agent job failed: {e}"))
+            (false, agent_job_error_message(&e))
         }
     }
 }
@@ -2173,6 +2202,36 @@ mod tests {
         assert!(output.contains("always_missing_for_retry_test"));
     }
 
+    #[test]
+    fn agent_job_error_message_preserves_terminal_causes_and_safe_messages() {
+        let context = anyhow::Error::new(crate::agent::ContextWindowExceeded {
+            estimated_tokens: 65_537,
+            model_context_window: 65_536,
+        })
+        .context("maximum context length; https://private.invalid/?key=secret");
+        let provider =
+            anyhow::Error::new(zeroclaw_providers::ReliableProviderTerminalFailure::new(
+                zeroclaw_providers::ReliableProviderTerminalFailureKind::ProviderServer,
+                None,
+                "private provider response".to_string(),
+            ));
+        let semantic =
+            anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion);
+        let unknown = anyhow::Error::msg("private prompt; https://private.invalid/?key=secret");
+
+        for (error, key) in [
+            (&context, "turn-context-window-exceeded-error"),
+            (&provider, "cli-agent-error-provider-server"),
+            (&semantic, "cli-agent-error-invalid-semantic-completion"),
+            (&unknown, "cron-agent-job-failed"),
+        ] {
+            let output = agent_job_error_message(error);
+            assert_eq!(output, crate::i18n::get_required_cli_string(key));
+            assert!(!output.contains("private") && !output.contains("secret"));
+            assert!(!output.contains("agent job failed:"));
+        }
+    }
+
     #[tokio::test]
     async fn run_agent_job_returns_error_without_provider_key() {
         let tmp = TempDir::new().unwrap();
@@ -2185,7 +2244,114 @@ mod tests {
         let (success, output) =
             Box::pin(run_agent_job(&config, &security, "test-agent", &job)).await;
         assert!(!success);
-        assert!(output.contains("agent job failed:"));
+        assert!(!output.trim().is_empty());
+        assert!(!output.contains("agent job failed:"));
+        assert!(!output.contains("All model providers/models failed"));
+    }
+
+    #[tokio::test]
+    async fn cron_context_window_failure_delivers_safe_text_without_provider_dispatch() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use zeroclaw_config::schema::{ModelProviderConfig, OllamaModelProviderConfig};
+
+        // DELIVERY_FN is process-global and other suites install their own
+        // handlers; isolate this recorder without changing production state.
+        const CHILD_ENV: &str = "ZEROCLAW_CRON_CONTEXT_DELIVERY_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .arg("cron::scheduler::tests::cron_context_window_failure_delivers_safe_text_without_provider_dispatch")
+                .arg("--exact")
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, "1")
+                .status()
+                .await
+                .unwrap();
+            assert!(
+                status.success(),
+                "isolated cron delivery test failed: {status}"
+            );
+            return;
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_route = calls.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                calls_for_route.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"role": "assistant", "content": "unexpected dispatch"}, "finish_reason": "stop"}],
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        register_recording_delivery_fn();
+        let delivered_before = CONTEXT_FAILURES_DELIVERED.load(Ordering::SeqCst);
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.memory.backend = "none".to_string();
+        config.providers.models.ollama.insert(
+            "capacity".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("capacity-model".to_string()),
+                    context_window: Some(64),
+                    uri: Some(format!("http://{address}")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.get_mut(TEST_AGENT).unwrap().model_provider = "ollama.capacity".into();
+        config
+            .runtime_profiles
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .max_context_tokens = Some(0);
+        let security = test_security(&config);
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("private-context-prompt ".repeat(256));
+        job.allowed_tools = Some(vec![]);
+        job.uses_memory = false;
+        job.delivery = DeliveryConfig {
+            mode: "announce".to_string(),
+            channel: Some(CONTEXT_FAILURE_CHANNEL.to_string()),
+            to: Some("test-target".to_string()),
+            ..Default::default()
+        };
+
+        let (success, output) = Box::pin(run_agent_job(&config, &security, TEST_AGENT, &job)).await;
+        assert!(!success);
+        let expected = crate::i18n::get_required_cli_string("turn-context-window-exceeded-error");
+        assert_eq!(output, expected);
+        for context in [
+            CronDeliveryContext::Scheduled,
+            CronDeliveryContext::ToolManual,
+            CronDeliveryContext::GatewayManual,
+            CronDeliveryContext::RpcManual,
+        ] {
+            let outcome =
+                deliver_and_classify_run_result(&config, &job, success, output.clone(), context)
+                    .await;
+            assert!(!outcome.success);
+            assert_eq!(outcome.status, "error");
+            assert_eq!(outcome.output, expected);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            CONTEXT_FAILURES_DELIVERED.load(Ordering::SeqCst) - delivered_before,
+            4
+        );
+        server.abort();
     }
 
     #[tokio::test]
@@ -2874,6 +3040,9 @@ mod tests {
     }
 
     static DELIVERED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static CONTEXT_FAILURES_DELIVERED: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    const CONTEXT_FAILURE_CHANNEL: &str = "context-failure-delivery";
 
     /// Channel name the recorder counts. Used only by the suppression test.
     const COUNT_CHANNEL: &str = "count-delivery";
@@ -2883,13 +3052,20 @@ mod tests {
         // so repeated calls across tests are safe and the first writer wins. The
         // handler honours the `fail-delivery` failure contract used by the
         // delivery-classification tests so it composes regardless of order.
-        register_delivery_fn(Box::new(|_config, channel, _target, _thread, _output| {
+        register_delivery_fn(Box::new(|_config, channel, _target, _thread, output| {
             Box::pin(async move {
                 if channel == "fail-delivery" {
                     anyhow::bail!("synthetic delivery failure");
                 }
                 if channel == COUNT_CHANNEL {
                     DELIVERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                if channel == CONTEXT_FAILURE_CHANNEL {
+                    assert_eq!(
+                        output,
+                        crate::i18n::get_required_cli_string("turn-context-window-exceeded-error")
+                    );
+                    CONTEXT_FAILURES_DELIVERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
                 Ok(())
             })
@@ -2994,8 +3170,12 @@ mod tests {
         let workspace = std::env::temp_dir();
         let cmd = build_configured_shell_command(&config, "echo cron-test", &workspace).unwrap();
         let debug = format!("{cmd:?}");
+        let expected = zeroclaw_config::platform::native::default_shell();
         assert!(debug.contains("echo cron-test"));
-        assert!(debug.contains("\"sh\""), "should use sh: {debug}");
+        assert!(
+            debug.contains(&format!("\"{expected}\"")),
+            "should use platform default {expected:?}: {debug}"
+        );
         // Must NOT use login shell (-l) — login shells load full profile
         // and are slow/unpredictable for cron jobs.
         assert!(

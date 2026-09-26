@@ -113,14 +113,16 @@ impl Attributable for WasmChannel {
     }
 }
 
-fn build_linker(http: bool) -> Result<Linker<PluginState>> {
+fn build_linker(imports: crate::component::OptionalImports) -> Result<Linker<PluginState>> {
     let mut linker = Linker::new(engine());
     crate::component::add_wasi(&mut linker)?;
-    if http {
+    if imports.http {
         crate::component::add_wasi_http(&mut linker)?;
     }
     let mut options = crate::component::bindings::channel::LinkOptions::default();
     options.plugins_wit_v0(true);
+    options.plugins_wit_v0_sockets(imports.sockets);
+    options.plugins_wit_v0_websocket(imports.websocket);
     wt(
         ChannelPlugin::add_to_linker::<_, wasmtime::component::HasSelf<_>>(
             &mut linker,
@@ -288,6 +290,47 @@ impl WasmChannel {
     }
 }
 
+/// Verify a channel component instantiates against this host's `channel-plugin`
+/// world, then discard it. This is the install-time load-check: it runs the
+/// same import/export type-check the daemon runs at startup — the point where a
+/// plugin built against a drifted or wrong WIT ABI actually fails — but stops
+/// **before** `configure()` and every other guest export. `configure()` reads
+/// operator config that need not exist at install time, so running it would
+/// turn "not configured yet" into a spurious load failure; the ABI mismatch we
+/// want to catch surfaces at `instantiate_async` regardless.
+///
+/// The store is built exactly as production channel instantiation builds it
+/// (via [`new_channel_store`]): `wasi:http` is linked for an
+/// `HttpClient`-granted scope, so a channel importing it instantiates as it
+/// would at startup, but with no egress authority every destination is denied,
+/// so the load check itself never reaches the network.
+pub async fn verify_channel_loads(
+    component: &AdmittedComponent,
+    scope: &crate::instance::PluginInstanceScope,
+    services: &PluginHostServices,
+    limits: crate::component::PluginLimits,
+) -> Result<()> {
+    scope.require_capability(crate::PluginCapability::Channel)?;
+    let component = load_component(component)?;
+    let mut store = new_channel_store(
+        scope.clone(),
+        services.clone(),
+        limits,
+        InboundQueue::default(),
+        None,
+    );
+    let imports = crate::component::OptionalImports::for_store(store.data());
+    let linker = build_linker(imports)?;
+    crate::component::ensure_imports_coherent(&store, imports)?;
+    call_store!(store, async |store: &mut Store<PluginState>| {
+        wt_instantiate(
+            ChannelPlugin::instantiate_async(store, &component, &linker).await,
+            "failed to instantiate channel plugin",
+        )
+        .map(|_bindings| ())
+    })
+}
+
 impl ChannelInstanceFactory {
     async fn instantiate(
         &self,
@@ -310,9 +353,9 @@ impl ChannelInstanceFactory {
             inbound,
             self.egress.clone(),
         );
-        let http = store.data().http_enabled();
-        let linker = build_linker(http)?;
-        crate::component::ensure_http_coherent(&store, http)?;
+        let imports = crate::component::OptionalImports::for_store(store.data());
+        let linker = build_linker(imports)?;
+        crate::component::ensure_imports_coherent(&store, imports)?;
         let bindings = call_store!(store, async |store: &mut Store<PluginState>| {
             wt_instantiate(
                 ChannelPlugin::instantiate_async(store, self.component.as_ref(), &linker).await,
@@ -1427,7 +1470,7 @@ mod tests {
     async fn channel_validates_config_before_loading_guest_code() {
         let scope = crate::instance::test_scope(PluginCapability::Channel, "main", []);
         let endpoint = PluginChannelEndpoint::new(scope, "plugin").unwrap();
-        let services = PluginHostServices::new(PluginConfigResolver::new(|_| {
+        let services = crate::services::test_services(PluginConfigResolver::new(|_| {
             Err(crate::error::PluginError::InvalidConfig(
                 "invalid-before-load".to_string(),
             ))

@@ -188,6 +188,10 @@ pub struct ArcToolRef(pub Arc<dyn Tool>);
 
 #[async_trait]
 impl Tool for ArcToolRef {
+    fn requires_unrestricted_principal(&self) -> bool {
+        self.0.requires_unrestricted_principal()
+    }
+
     fn name(&self) -> &str {
         self.0.name()
     }
@@ -270,6 +274,10 @@ impl ::zeroclaw_api::attribution::Attributable for ArcDelegatingTool {
 
 #[async_trait]
 impl Tool for ArcDelegatingTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        self.inner.requires_unrestricted_principal()
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -756,13 +764,64 @@ fn plugin_egress_policy(
     config: &Config,
     instance_key: &str,
 ) -> Result<zeroclaw_plugins::egress::EgressPolicy, zeroclaw_plugins::egress::EgressError> {
+    use zeroclaw_plugins::egress::{
+        EgressError, EgressPolicy, TlsClientIdentity, TlsProfile, TlsProfileName,
+    };
     let (hosts, allow_private) = config.plugins.entry_egress(instance_key);
-    zeroclaw_plugins::egress::EgressPolicy::new(
+    let profiles = config
+        .plugins
+        .entry_tls_profiles(instance_key)
+        .into_iter()
+        .map(|profile| {
+            let secret = |field: &str, name: Option<String>| {
+                name.map(|name| {
+                    zeroclaw_api::plugin_key::SecretPropertyRef::parse(name).map_err(|_| {
+                        EgressError::InvalidTlsProfile {
+                            profile: profile.name.clone(),
+                            reason: format!("{field} is not a portable secret property"),
+                        }
+                    })
+                })
+                .transpose()
+            };
+            let custom_ca = secret("custom_ca_secret", profile.custom_ca_secret.clone())?;
+            let certificate = secret(
+                "client_certificate_secret",
+                profile.client_certificate_secret.clone(),
+            )?;
+            let private_key = secret(
+                "client_private_key_secret",
+                profile.client_private_key_secret.clone(),
+            )?;
+            let identity = match (certificate, private_key) {
+                (Some(certificate), Some(private_key)) => {
+                    Some(TlsClientIdentity::new(certificate, private_key))
+                }
+                (None, None) => None,
+                _ => {
+                    return Err(EgressError::InvalidTlsProfile {
+                        profile: profile.name.clone(),
+                        reason: "client certificate and private key must be set together"
+                            .to_string(),
+                    });
+                }
+            };
+            TlsProfile::new(
+                TlsProfileName::new(profile.name.clone())?,
+                &profile.hosts,
+                profile.system_roots,
+                custom_ca,
+                identity,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    EgressPolicy::new(
         &hosts,
         &allow_private,
         &config.security.nat64_prefixes,
         config.plugins.limits.max_connections_per_instance,
-    )
+    )?
+    .with_tls_profiles(profiles)
 }
 
 /// The one host-owned egress authority shared by every plugin instance in a
@@ -803,6 +862,34 @@ pub(crate) fn plugin_egress_service(
     )
 }
 
+/// The secret properties an instance's TLS profiles reference.
+///
+/// That material (a CA bundle, a client certificate and its private key) is
+/// read by the host when it builds a TLS connection. Resolved config marks it
+/// host-only so the guest's `secrets` import cannot return it. A reference that
+/// is not a portable property name is skipped here: the egress policy rejects
+/// the profile, and no secret by that name can be resolved.
+#[cfg(feature = "plugins-wasm")]
+fn plugin_tls_secret_properties(
+    config: &Config,
+    instance_key: &str,
+) -> Vec<zeroclaw_api::plugin_key::SecretPropertyRef> {
+    config
+        .plugins
+        .entry_tls_profiles(instance_key)
+        .into_iter()
+        .flat_map(|profile| {
+            [
+                profile.custom_ca_secret,
+                profile.client_certificate_secret,
+                profile.client_private_key_secret,
+            ]
+        })
+        .flatten()
+        .filter_map(|name| zeroclaw_api::plugin_key::SecretPropertyRef::parse(name).ok())
+        .collect()
+}
+
 #[cfg(feature = "plugins-wasm")]
 fn plugin_config_values(
     config: &Config,
@@ -826,6 +913,12 @@ pub(crate) fn plugin_host_services(
     config: Arc<Config>,
     live_config: Option<Arc<parking_lot::RwLock<Config>>>,
 ) -> zeroclaw_plugins::services::PluginHostServices {
+    let data_dir = config.data_dir.clone();
+    let config_dir = config
+        .config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
     // A live daemon handle and a fallback snapshot are mutually exclusive in
     // the long-lived service, so the resolver never retains two config sources.
     let fallback_config = live_config.is_none().then_some(config);
@@ -835,12 +928,17 @@ pub(crate) fn plugin_host_services(
         let manifest = host
             .manifest(package)
             .ok_or_else(|| zeroclaw_plugins::error::PluginError::NotFound(package.to_string()))?;
-        if let Some(live_config) = &live_config {
+        // Filled from the same config view the values come from, so the
+        // reserved set and the secrets it withholds share one revision.
+        let mut host_only = Vec::new();
+        let resolved = if let Some(live_config) = &live_config {
             zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
                 // Transient per-call view: schema/grant checks happen before
                 // this access, and the global lock is released before guest
                 // setup.
-                plugin_config_values(&live_config.read(), &config_entry_key, package)
+                let config = live_config.read();
+                host_only = plugin_tls_secret_properties(&config, &config_entry_key);
+                plugin_config_values(&config, &config_entry_key, package)
             })
         } else {
             let config = fallback_config.as_ref().ok_or_else(|| {
@@ -849,11 +947,16 @@ pub(crate) fn plugin_host_services(
                 )
             })?;
             zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
+                host_only = plugin_tls_secret_properties(config, &config_entry_key);
                 plugin_config_values(config, &config_entry_key, package)
             })
-        }
+        };
+        resolved.map(|resolved| resolved.reserve_for_host(host_only))
     });
-    zeroclaw_plugins::services::PluginHostServices::new(config)
+    let state = zeroclaw_plugins::services::PluginStateService::new(
+        crate::plugin_state::PluginStateStore::new(&data_dir, &config_dir),
+    );
+    zeroclaw_plugins::services::PluginHostServices::new(config, state)
 }
 
 /// Stack reserved for the dedicated registry-builder thread. The registry
@@ -1899,7 +2002,9 @@ fn all_tools_with_runtime_on_thread(
         tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(sop_engine))));
         if let Some(ref sop_audit) = sop_audit {
             tool_arcs.push(Arc::new(
-                SopExecuteTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
+                SopExecuteTool::new(Arc::clone(sop_engine))
+                    .with_audit(Arc::clone(sop_audit))
+                    .with_initiator(agent_alias),
             ));
             tool_arcs.push(Arc::new(
                 SopAdvanceTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
@@ -1910,7 +2015,9 @@ fn all_tools_with_runtime_on_thread(
                     .with_audit(Arc::clone(sop_audit)),
             ));
         } else {
-            tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(sop_engine))));
+            tool_arcs.push(Arc::new(
+                SopExecuteTool::new(Arc::clone(sop_engine)).with_initiator(agent_alias),
+            ));
             tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(sop_engine))));
             tool_arcs.push(Arc::new(
                 SopApproveTool::new(Arc::clone(sop_engine)).with_agent_alias(agent_alias),
@@ -2187,19 +2294,7 @@ fn all_tools_with_runtime_on_thread(
                     if root_config.pipeline.enabled {
                         registered_names.insert(PipelineTool::NAME.to_string());
                     }
-                    let plugin_limits = zeroclaw_plugins::component::PluginLimits {
-                        call_fuel: config.plugins.limits.call_fuel,
-                        max_memory_bytes: config
-                            .plugins
-                            .limits
-                            .max_memory_mb
-                            .saturating_mul(1024 * 1024),
-                        max_table_elements: config.plugins.limits.max_table_elements,
-                        max_instances: config.plugins.limits.max_instances,
-                        call_timeout: std::time::Duration::from_millis(
-                            config.plugins.limits.call_timeout_ms,
-                        ),
-                    };
+                    let plugin_limits = crate::plugin_runtime::plugin_limits(&config);
                     let egress_service =
                         plugin_egress_service(Arc::clone(&config), live_config.clone());
                     register_plugin_tools(
@@ -2712,6 +2807,7 @@ const = true
             config: HashMap::from([("enabled".to_string(), enabled.to_string())]),
             egress_hosts: Vec::new(),
             egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
         };
         let mut snapshot = Config::default();
         snapshot.plugins.entries = vec![
@@ -2805,6 +2901,7 @@ permissions = ["http_client"]
             config: HashMap::new(),
             egress_hosts: vec!["api.example.com".to_string()],
             egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
         };
         let request = || {
             zeroclaw_plugins::egress::EgressRequest::new(
@@ -2847,6 +2944,60 @@ permissions = ["http_client"]
             ),
             "a raw package or binding entry must not bypass the canonical key"
         );
+
+        // The same row carries the instance's TLS profiles into policy, read at
+        // use time like the grant itself.
+        let profile = |hosts: &[&str]| zeroclaw_config::schema::PluginTlsProfileConfig {
+            name: "corp".to_string(),
+            hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
+            system_roots: true,
+            custom_ca_secret: Some("corp_ca".to_string()),
+            client_certificate_secret: None,
+            client_private_key_secret: None,
+        };
+        let mut with_profile = Config::default();
+        let mut row = entry(&instance_key);
+        row.tls_profiles = vec![profile(&["api.example.com"])];
+        with_profile.plugins.entries = vec![row];
+        let authorized = plugin_egress_service(Arc::new(with_profile), None)
+            .authorize_addresses(request().with_tls_profile("corp").unwrap(), addresses)
+            .expect("a configured profile for a granted host must authorize");
+        assert_eq!(
+            authorized
+                .tls_profile()
+                .and_then(|profile| profile.custom_ca())
+                .map(|secret| secret.as_str()),
+            Some("corp_ca")
+        );
+
+        // The same profile's material is reserved for the host, so the guest's
+        // `secrets` import cannot return it.
+        let mut with_identity = Config::default();
+        let mut row = entry(&instance_key);
+        row.tls_profiles = vec![zeroclaw_config::schema::PluginTlsProfileConfig {
+            client_certificate_secret: Some("client_cert".to_string()),
+            client_private_key_secret: Some("client_key".to_string()),
+            ..profile(&["api.example.com"])
+        }];
+        with_identity.plugins.entries = vec![row];
+        let reserved = plugin_tls_secret_properties(&with_identity, &instance_key);
+        assert_eq!(
+            reserved.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+            ["corp_ca", "client_cert", "client_key"]
+        );
+        assert!(plugin_tls_secret_properties(&Config::default(), &instance_key).is_empty());
+
+        // A profile that names an ungranted host fails the whole policy
+        // closed, even if it slipped past load-time validation.
+        let mut widened = Config::default();
+        let mut row = entry(&instance_key);
+        row.tls_profiles = vec![profile(&["other.example.com"])];
+        widened.plugins.entries = vec![row];
+        assert!(matches!(
+            plugin_egress_service(Arc::new(widened), None)
+                .authorize_addresses(request(), addresses),
+            Err(zeroclaw_plugins::egress::EgressError::TlsProfileHostNotGranted { .. })
+        ));
     }
 
     #[test]
@@ -2986,7 +3137,13 @@ permissions = ["http_client"]
         reserved: &[&str],
     ) -> Vec<String> {
         let (resolver, probed) = recording_resolver(host);
-        let services = zeroclaw_plugins::services::PluginHostServices::new(resolver);
+        let state_dir = tempfile::tempdir().expect("plugin state dir");
+        let services = zeroclaw_plugins::services::PluginHostServices::new(
+            resolver,
+            zeroclaw_plugins::services::PluginStateService::new(
+                crate::plugin_state::PluginStateStore::new(state_dir.path(), state_dir.path()),
+            ),
+        );
         let mut registered_names: std::collections::HashSet<String> =
             reserved.iter().map(|name| (*name).to_string()).collect();
         let mut tool_arcs: Vec<Arc<dyn Tool>> = Vec::new();
@@ -4006,6 +4163,7 @@ permissions = ["http_client"]
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }]);
         let action = engine
             .start_run(

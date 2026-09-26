@@ -316,7 +316,7 @@ mod tests {
             assert!(defaults.contains(&Chord::with(KeyCode::Backspace, KeyModifiers::ALT)));
             assert_eq!(
                 action_key_labels(InputBarAction::DeletePreviousWord).len(),
-                2
+                if cfg!(target_os = "macos") { 3 } else { 2 }
             );
         });
     }
@@ -528,7 +528,7 @@ mod tests {
             );
             assert_eq!(
                 action_key_labels(InputBarAction::DeletePreviousWord).len(),
-                2
+                if cfg!(target_os = "macos") { 3 } else { 2 }
             );
         });
     }

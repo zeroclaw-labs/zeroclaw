@@ -10,7 +10,7 @@ use crate::schema::{RuntimeConfig, RuntimeKind};
 pub fn create_runtime(config: &RuntimeConfig) -> anyhow::Result<Box<dyn RuntimeAdapter>> {
     match config.kind {
         RuntimeKind::Native => {
-            let shell = config.shell.clone().unwrap_or_else(|| "sh".into());
+            let shell = config.shell.clone().unwrap_or_else(native::default_shell);
             #[cfg(unix)]
             validate_shell(&shell)?;
             #[cfg(windows)]
@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     #[cfg(not(target_os = "windows"))]
-    fn factory_native_default_shell_is_sh() {
+    fn factory_native_default_shell_uses_platform_resolver() {
         let cfg = RuntimeConfig {
             kind: RuntimeKind::Native,
             shell: None,
@@ -185,9 +185,10 @@ mod tests {
             .build_shell_command("echo hi", &std::env::temp_dir())
             .unwrap();
         let debug = format!("{cmd:?}");
+        let expected = native::default_shell();
         assert!(
-            debug.contains("\"sh\""),
-            "default shell should be 'sh', got: {debug}"
+            debug.contains(&format!("\"{expected}\"")),
+            "default shell should be {expected:?}, got: {debug}"
         );
     }
 

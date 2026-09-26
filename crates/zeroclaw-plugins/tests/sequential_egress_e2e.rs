@@ -34,7 +34,7 @@ use zeroclaw_plugins::instance::PluginInstanceScope;
 use zeroclaw_plugins::services::PluginHostServices;
 use zeroclaw_plugins::{PluginCapability, PluginManifest, PluginPermission};
 
-use support::admit_fixture;
+use support::{admit_fixture, state_service};
 
 // ── fixture provisioning ──────────────────────────────────────────
 
@@ -144,9 +144,10 @@ async fn probe(
 
     let services = {
         let manifest = manifest.clone();
-        PluginHostServices::new(PluginConfigResolver::new(move |scope| {
-            resolve_plugin_config(&manifest, scope, None)
-        }))
+        PluginHostServices::new(
+            PluginConfigResolver::new(move |scope| resolve_plugin_config(&manifest, scope, None)),
+            state_service(),
+        )
     };
 
     let mut plugin = zeroclaw_plugins::runtime::create_plugin_with_egress(

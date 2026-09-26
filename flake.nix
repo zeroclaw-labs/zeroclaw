@@ -45,10 +45,12 @@
           inherit nixpkgs system;
         };
         # >>> generated:flake-packages by `cargo generate installers` - do not edit <<<
-        # Default feature set: canonical lean Dist.
-        # Override with `packages.zeroclaw.override { features = [ ... ]; }`.
+        # Default feature sets: zeroclaw uses canonical lean Dist,
+        # zerocode uses its own package features (currently empty).
+        # Override per-package, e.g. `packages.zeroclaw.override { features = [ ... ]; }`.
         zeroclawDefaultFeatures = [ "acp-bridge" "agent-runtime" "channel-acp-server" "channel-discord" "channel-email" "channel-filesystem" "channel-git" "channel-lark" "channel-matrix" "channel-telegram" "channel-webhook" "gateway" "observability-prometheus" "schema-export" "whatsapp-web" ];
-        buildZeroclaw = { pname, cargoPkg, features ? zeroclawDefaultFeatures }:
+        zerocodeDefaultFeatures = [  ];
+        buildZeroclaw = { pname, cargoPkg, features }:
           (pkgs.makeRustPlatform {
             cargo = rustToolchain;
             rustc = rustToolchain;
@@ -68,10 +70,16 @@
             buildInputs = [ pkgs.stdenv.cc.cc ];
           };
         # >>> end generated:flake-packages <<<
+        webPkgs = pkgs.callPackage ./nix/web.nix { inherit rustToolchain; };
       in {
-        packages.zeroclaw = buildZeroclaw { pname = "zeroclaw"; cargoPkg = "zeroclaw"; };
-        packages.zerocode = buildZeroclaw { pname = "zerocode"; cargoPkg = "zerocode"; };
-        packages.default = buildZeroclaw { pname = "zeroclaw"; cargoPkg = "zeroclaw"; };
+        packages.zeroclaw = buildZeroclaw { pname = "zeroclaw"; cargoPkg = "zeroclaw"; features = zeroclawDefaultFeatures; };
+        packages.zerocode = buildZeroclaw { pname = "zerocode"; cargoPkg = "zerocode"; features = zerocodeDefaultFeatures; };
+        packages.default = buildZeroclaw { pname = "zeroclaw"; cargoPkg = "zeroclaw"; features = zeroclawDefaultFeatures; };
+        # Web dashboard bundle (see nix/web.nix). Kept outside the
+        # `generated:flake-packages` block so `cargo generate installers`
+        # does not clobber it.
+        packages.zeroclaw-web = webPkgs.zeroclawWeb;
+        packages.zeroclaw-openapi-spec = webPkgs.openapiSpec;
         checks = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           nixos-module-eval = pkgs.writeText "zeroclaw-nixos-module-eval" (
             builtins.toJSON nixosModuleEvalTests
