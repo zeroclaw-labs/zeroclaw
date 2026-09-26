@@ -2340,6 +2340,9 @@ pub async fn run(
                     (vec![ChatMessage::system(&system_prompt)], false)
                 };
 
+            // The shipped REPL reads stdin directly instead of going through
+            // `CliChannel::listen`, so it must own the terminal erase guard.
+            let _utf8_erase_guard = crate::cli_input::ensure_terminal_utf8_erase();
             loop {
                 print!("> ");
                 let _ = std::io::stdout().flush();
