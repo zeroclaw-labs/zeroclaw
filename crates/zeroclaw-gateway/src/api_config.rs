@@ -49,36 +49,10 @@ pub struct PropPutBody {
 /// One JSON Patch operation. Supports `add`, `remove`, `replace`, `test`, and
 /// ZeroClaw's `comment` extension. Every operation requires `path`; `add`,
 /// `replace`, and `test` require `value`, while `comment` requires `comment`.
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct PatchOp {
-    pub op: String,
-    pub path: String,
-    #[serde(default)]
-    pub value: Option<serde_json::Value>,
-    #[serde(default)]
-    pub comment: Option<String>,
-}
-
-/// Single result entry in a successful PATCH response, one per applied op.
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct PatchOpResult {
-    pub op: String,
-    pub path: String,
-    /// The resulting value at the target path after the op applied.
-    /// `None` for secret paths (per the secrets-handling boundary), and for
-    /// `remove` ops where the field was reset to its default.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub value: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub populated: Option<bool>,
-    /// Comment that was applied alongside this op (if any). Echoed so
-    /// clients can confirm the comment was actually written to disk
-    /// without having to round-trip through `GET` and parse the TOML.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub comment: Option<String>,
-}
+///
+/// Defined in `zeroclaw_config::patch` so the gateway, the CLI and the
+/// agent-facing tool all speak one shape and produce one error envelope.
+pub use zeroclaw_config::patch::{PatchOp, PatchOpResult};
 
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -102,65 +76,6 @@ pub async fn handle_config_get(State(state): State<AppState>, headers: HeaderMap
     let mut cfg = state.config.read().clone();
     cfg.mask_secrets();
     Json(cfg).into_response()
-}
-
-fn parse_patch_ops(value: serde_json::Value) -> Result<Vec<PatchOp>, ConfigApiError> {
-    let ops = value.as_array().ok_or_else(|| {
-        ConfigApiError::new(
-            ConfigApiCode::ValueTypeMismatch,
-            "JSON Patch body must be a JSON array of operations",
-        )
-    })?;
-
-    let mut parsed = Vec::with_capacity(ops.len());
-    for (idx, op) in ops.iter().enumerate() {
-        let object = op.as_object().ok_or_else(|| {
-            ConfigApiError::new(
-                ConfigApiCode::ValueTypeMismatch,
-                format!("JSON Patch op[{idx}] must be an object"),
-            )
-            .with_op_index(idx)
-        })?;
-        let op_name = object.get("op").and_then(|v| v.as_str()).ok_or_else(|| {
-            ConfigApiError::new(
-                ConfigApiCode::ValueTypeMismatch,
-                format!("JSON Patch op[{idx}] requires string `op` field"),
-            )
-            .with_op_index(idx)
-        })?;
-        let path = object.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
-            ConfigApiError::new(
-                ConfigApiCode::ValueTypeMismatch,
-                format!("JSON Patch op[{idx}] requires string `path` field"),
-            )
-            .with_op_index(idx)
-        })?;
-        let comment = match object.get("comment") {
-            Some(value) => Some(
-                value
-                    .as_str()
-                    .ok_or_else(|| {
-                        ConfigApiError::new(
-                            ConfigApiCode::ValueTypeMismatch,
-                            format!("JSON Patch op[{idx}] `comment` field must be a string"),
-                        )
-                        .with_path(json_pointer_to_dotted(path))
-                        .with_op_index(idx)
-                    })?
-                    .to_string(),
-            ),
-            None => None,
-        };
-
-        parsed.push(PatchOp {
-            op: op_name.to_string(),
-            path: path.to_string(),
-            value: object.get("value").cloned(),
-            comment,
-        });
-    }
-
-    Ok(parsed)
 }
 
 /// Response for a non-secret GET / PUT / DELETE.
@@ -292,18 +207,6 @@ fn error_response(err: ConfigApiError) -> Response {
     (status, axum::Json(err)).into_response()
 }
 
-/// Wrap an `anyhow::Error` from `Config::set_prop` / `get_prop` into a
-/// `ConfigApiError`. Path-not-found errors get the specific code; everything
-/// else falls through to ValidationFailed.
-fn map_prop_error(err: anyhow::Error, path: &str) -> ConfigApiError {
-    let msg = err.to_string();
-    if msg.starts_with("Unknown property") {
-        ConfigApiError::path_not_found(path)
-    } else {
-        ConfigApiError::from_validation(err).with_path(path)
-    }
-}
-
 // ── Helpers ─────────────────────────────────────────────────────────
 
 // Typed-value coercion lives in `zeroclaw_config::typed_value` — both the
@@ -312,39 +215,15 @@ fn map_prop_error(err: anyhow::Error, path: &str) -> ConfigApiError {
 // against the declared PropKind" contract.
 use zeroclaw_config::typed_value::coerce_for_set_prop as json_to_setprop_string;
 
+// Patch parsing/apply and the prop-metadata helpers live in
+// `zeroclaw_config::patch` so the gateway, the CLI and the agent-facing
+// `config_patch` tool share one implementation and one error envelope.
+use zeroclaw_config::patch::{
+    apply_patch_ops, json_pointer_to_dotted, lookup_prop_field, map_prop_error, parse_patch_ops,
+};
+
 /// Look up the prop_field metadata for a path. Used by the per-prop GET / PUT
 /// handlers to decide whether the field is a secret.
-fn lookup_prop_field(
-    config: &zeroclaw_config::schema::Config,
-    path: &str,
-) -> Option<zeroclaw_config::traits::PropFieldInfo> {
-    config
-        .prop_fields()
-        .into_iter()
-        .find(|info| info.name == path)
-        .or_else(|| {
-            zeroclaw_config::schema::Config::prop_is_secret(path).then(|| {
-                zeroclaw_config::traits::PropFieldInfo {
-                    name: path.to_string(),
-                    category: "Secrets",
-                    display_value: zeroclaw_config::traits::UNSET_DISPLAY.to_string(),
-                    type_hint: "String",
-                    kind: zeroclaw_config::traits::PropKind::String,
-                    is_secret: true,
-                    enum_variants: None,
-                    description: "",
-                    derived_from_secret: false,
-                    credential_class: Some(
-                        zeroclaw_config::traits::CredentialSurfaceClass::EncryptedSecret,
-                    ),
-                    tab: zeroclaw_config::traits::ConfigTab::None,
-                    alias_source: None,
-                    multiline: false,
-                }
-            })
-        })
-}
-
 fn scoped_validate(
     working: &zeroclaw_config::schema::Config,
 ) -> Result<Vec<zeroclaw_config::validation_warnings::ValidationWarning>, ConfigApiError> {
@@ -402,16 +281,12 @@ pub(crate) async fn persist_and_swap(
     );
     let config_path = new_config.config_path.clone();
 
-    // Snapshot pre-write disk state (used for revert on save failure). Only
-    // NotFound means the file was absent. Any other read failure must stop
-    // before the save because treating an unreadable file as absent would
-    // let the rollback path delete an existing canonical config.
-    let snapshot = read_config_snapshot(&config_path).await?;
+    // Keep the unreadable-file admission check. Persistence itself owns
+    // rollback while holding the canonical disk lock; restoring an earlier
+    // transport snapshot here could clobber a concurrent agent/RPC write.
+    verify_readable_config(&config_path).await?;
 
     if let Err(e) = new_config.save_dirty().await {
-        if let Some(prev) = snapshot {
-            let _ = tokio::fs::write(&config_path, prev).await;
-        }
         // When the path was absent, the atomic writer either leaves it absent
         // on failure or reports a visible rename as success. Do not remove a
         // path here: an external writer may have created it after admission.
@@ -428,12 +303,10 @@ pub(crate) async fn persist_and_swap(
     Ok(())
 }
 
-async fn read_config_snapshot(
-    config_path: &std::path::Path,
-) -> Result<Option<Vec<u8>>, ConfigApiError> {
+async fn verify_readable_config(config_path: &std::path::Path) -> Result<(), ConfigApiError> {
     match tokio::fs::read(config_path).await {
-        Ok(contents) => Ok(Some(contents)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(ConfigApiError::new(
             ConfigApiCode::ReloadFailed,
             format!("failed to snapshot existing config before save: {error}"),
@@ -441,25 +314,7 @@ async fn read_config_snapshot(
     }
 }
 
-/// Reject masked or empty values from writes to secret-bearing properties.
-/// Dashboard surfaces may send the masked display sentinel when no real edit
-/// was made; accepting it would replace the live secret with that sentinel.
-fn reject_masked_secret_value(
-    path: &str,
-    is_sensitive: bool,
-    value: &str,
-) -> Result<(), ConfigApiError> {
-    if is_sensitive
-        && (value == zeroclaw_config::traits::MASKED_SECRET || value == "****" || value.is_empty())
-    {
-        return Err(ConfigApiError::new(
-            ConfigApiCode::ValidationFailed,
-            format!("Refusing to overwrite secret `{path}` with a masked or empty value"),
-        )
-        .with_path(path));
-    }
-    Ok(())
-}
+use zeroclaw_config::patch::reject_masked_secret_value;
 
 /// `POST /api/channels/bind` request body. The GUI/HTTP equivalent of
 /// `zeroclaw channel bind-<type> <identity> --alias <alias>`: authorize an
@@ -2029,190 +1884,10 @@ pub async fn handle_patch(
     }
 
     let mut working = working;
-    let mut results = Vec::with_capacity(ops.len());
-
-    for (idx, op) in ops.iter().enumerate() {
-        let path = json_pointer_to_dotted(&op.path);
-        if matches!(op.op.as_str(), "add" | "replace") && working.ensure_map_key_for_path(&path) {
-            // Refused to vivify the reserved `default` agent: surface the same
-            // reserved error the explicit create surfaces do, not a generic 404.
-            return error_response(
-                ConfigApiError::new(
-                    ConfigApiCode::ValidationFailed,
-                    "alias `default` is reserved and cannot be created",
-                )
-                .with_path(&path)
-                .with_op_index(idx),
-            );
-        }
-        let info = lookup_prop_field(&working, &path);
-        let is_sensitive = info
-            .as_ref()
-            .map(|i| i.is_secret || i.derived_from_secret)
-            .unwrap_or(false);
-
-        match op.op.as_str() {
-            "test" => {
-                // Secret values can't leave the server, so a differential
-                // test response would be the only signal — ban the op.
-                if is_sensitive {
-                    return error_response(
-                        ConfigApiError::secret_test_forbidden(&path).with_op_index(idx),
-                    );
-                }
-                let want = match op.value.as_ref() {
-                    Some(v) => v.clone(),
-                    None => {
-                        return error_response(
-                            ConfigApiError::new(
-                                ConfigApiCode::ValueTypeMismatch,
-                                "JSON Patch `test` op requires `value` field",
-                            )
-                            .with_path(&path)
-                            .with_op_index(idx),
-                        );
-                    }
-                };
-                let actual_str = match working.get_prop(&path) {
-                    Ok(v) => v,
-                    Err(e) => return error_response(map_prop_error(e, &path).with_op_index(idx)),
-                };
-                let want_str = match json_to_setprop_string(&want, info.as_ref().map(|i| i.kind)) {
-                    Ok(s) => s,
-                    Err(e) => return error_response(e.with_path(&path).with_op_index(idx)),
-                };
-                if actual_str != want_str {
-                    return error_response(
-                        ConfigApiError::new(
-                            ConfigApiCode::ValidationFailed,
-                            format!("`test` op failed: expected {want_str:?}, got {actual_str:?}"),
-                        )
-                        .with_path(&path)
-                        .with_op_index(idx),
-                    );
-                }
-                results.push(PatchOpResult {
-                    op: op.op.clone(),
-                    path,
-                    value: Some(serde_json::Value::String(actual_str)),
-                    populated: None,
-                    comment: None, // `test` ops don't write
-                });
-            }
-            "add" | "replace" => {
-                let value = match op.value.as_ref() {
-                    Some(v) => v.clone(),
-                    None => {
-                        return error_response(
-                            ConfigApiError::new(
-                                ConfigApiCode::ValueTypeMismatch,
-                                format!("JSON Patch `{}` op requires `value` field", op.op),
-                            )
-                            .with_path(&path)
-                            .with_op_index(idx),
-                        );
-                    }
-                };
-                let value_str = match json_to_setprop_string(&value, info.as_ref().map(|i| i.kind))
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        return error_response(e.with_path(&path).with_op_index(idx));
-                    }
-                };
-                if let Err(e) = reject_masked_secret_value(&path, is_sensitive, &value_str) {
-                    return error_response(e.with_op_index(idx));
-                }
-                if let Err(e) = working.set_prop_persistent(&path, &value_str) {
-                    return error_response(map_prop_error(e, &path).with_op_index(idx));
-                }
-                if is_sensitive {
-                    results.push(PatchOpResult {
-                        op: op.op.clone(),
-                        path,
-                        value: None,
-                        populated: Some(!value_str.is_empty()),
-                        comment: op.comment.clone(),
-                    });
-                } else {
-                    results.push(PatchOpResult {
-                        op: op.op.clone(),
-                        path,
-                        value: Some(serde_json::Value::String(value_str)),
-                        populated: None,
-                        comment: op.comment.clone(),
-                    });
-                }
-            }
-            "remove" => {
-                if let Err(e) = working.set_prop_persistent(&path, "") {
-                    return error_response(map_prop_error(e, &path).with_op_index(idx));
-                }
-                if is_sensitive {
-                    results.push(PatchOpResult {
-                        op: op.op.clone(),
-                        path,
-                        value: None,
-                        populated: Some(false),
-                        comment: op.comment.clone(),
-                    });
-                } else {
-                    results.push(PatchOpResult {
-                        op: op.op.clone(),
-                        path,
-                        value: Some(serde_json::Value::Null),
-                        populated: None,
-                        comment: op.comment.clone(),
-                    });
-                }
-            }
-            "comment" => {
-                // Comment-only update: record the (path, comment) pair
-                // for `apply_comments` after the patch commits, but
-                // skip `set_prop` entirely. Lets the operator annotate
-                // a secret without rotating its ciphertext.
-                if info.is_none() {
-                    return error_response(
-                        ConfigApiError::path_not_found(&path).with_op_index(idx),
-                    );
-                }
-                let Some(comment) = op.comment.clone() else {
-                    return error_response(
-                        ConfigApiError::new(
-                            ConfigApiCode::ValueTypeMismatch,
-                            "JSON Patch `comment` op requires `comment` field",
-                        )
-                        .with_path(&path)
-                        .with_op_index(idx),
-                    );
-                };
-                results.push(PatchOpResult {
-                    op: op.op.clone(),
-                    path,
-                    value: None,
-                    populated: None,
-                    comment: Some(comment),
-                });
-            }
-            "move" | "copy" => {
-                return error_response(
-                    ConfigApiError::op_not_supported(&op.op)
-                        .with_path(&path)
-                        .with_op_index(idx),
-                );
-            }
-            other => {
-                return error_response(
-                    ConfigApiError::new(
-                        ConfigApiCode::OpNotSupported,
-                        format!("unknown JSON Patch operation `{other}`"),
-                    )
-                    .with_path(&path)
-                    .with_op_index(idx),
-                );
-            }
-        }
-    }
+    let results = match apply_patch_ops(&mut working, &ops) {
+        Ok(results) => results,
+        Err(e) => return error_response(e),
+    };
 
     // Per-PATCH validation is scoped to the dirty paths. See
     // `scoped_validate` for the contract.
@@ -2261,14 +1936,6 @@ pub async fn handle_patch(
         warnings,
     })
     .into_response()
-}
-
-fn json_pointer_to_dotted(path: &str) -> String {
-    if path.starts_with('/') {
-        path.trim_start_matches('/').replace('/', ".")
-    } else {
-        path.to_string()
-    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -2347,6 +2014,16 @@ pub async fn handle_migrate(State(state): State<AppState>, headers: HeaderMap) -
     let (config_path, data_dir) = {
         let live = state.config.read();
         (live.config_path.clone(), live.data_dir.clone())
+    };
+
+    let _disk_guard = match zeroclaw_config::write_lock::acquire(&config_path).await {
+        Ok(guard) => guard,
+        Err(error) => {
+            return error_response(ConfigApiError::new(
+                ConfigApiCode::InternalError,
+                format!("failed to acquire config write lock: {error}"),
+            ));
+        }
     };
 
     let raw = match tokio::fs::read_to_string(&config_path).await {
@@ -3094,6 +2771,115 @@ mod tests {
         assert!(
             live.channels.telegram.contains_key("newbot"),
             "handle_prop_put's own change must also land"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_agent_and_gateway_patches_preserve_the_gateway_write() {
+        use zeroclaw_api::tool::{APPROVAL_EXECUTION_BINDING_ARG, Tool};
+        use zeroclaw_runtime::tools::config_patch::ConfigPatchTool;
+        let dir = tempfile::tempdir().unwrap();
+        let config = temp_config(&dir);
+        config.save().await.unwrap();
+        let path = config.config_path.clone();
+        let tool = ConfigPatchTool::new(
+            path.clone(),
+            Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+        );
+        let mut args = serde_json::json!({"ops":[{"op":"replace","path":"/gateway/host","value":"127.0.0.2"}]});
+        args[APPROVAL_EXECUTION_BINDING_ARG] = tool
+            .approval_summary_for_call(&args)
+            .unwrap()
+            .execution_binding
+            .unwrap();
+        let state = test_state(config);
+        let (agent, http) = tokio::join!(
+            tool.execute(args),
+            handle_patch(
+                State(state),
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([
+                    {"op":"replace","path":"/gateway/port","value":4343}
+                ]))
+            ),
+        );
+        let agent = agent.unwrap();
+        let (status, body) = response_json(http).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let saved: zeroclaw_config::schema::Config =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved.gateway.port, 4343,
+            "agent writer must not clobber gateway persistence"
+        );
+        if agent.success {
+            assert_eq!(saved.gateway.host, "127.0.0.2");
+        } else {
+            assert!(agent.error.unwrap().contains("changed"));
+        }
+    }
+
+    /// The clobber direction, forced rather than raced: the agent's approved
+    /// patch lands first, then a gateway PATCH to a different field. The
+    /// gateway's live snapshot never saw the agent's write, so this pins that
+    /// gateway persistence re-reads the file and applies only its own change
+    /// instead of writing that stale snapshot back over the agent's.
+    #[tokio::test]
+    async fn gateway_patch_after_an_agent_patch_preserves_both_writes() {
+        use zeroclaw_api::tool::{APPROVAL_EXECUTION_BINDING_ARG, Tool};
+        use zeroclaw_runtime::tools::config_patch::ConfigPatchTool;
+        let dir = tempfile::tempdir().unwrap();
+        let config = temp_config(&dir);
+        config.save().await.unwrap();
+        let path = config.config_path.clone();
+        let original: zeroclaw_config::schema::Config =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_ne!(
+            original.gateway.host, "127.0.0.2",
+            "fixture must change the host"
+        );
+        assert_ne!(original.gateway.port, 4343, "fixture must change the port");
+        let state = test_state(config);
+        let tool = ConfigPatchTool::new(
+            path.clone(),
+            Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+        );
+        let mut args = serde_json::json!({"ops":[{"op":"replace","path":"/gateway/host","value":"127.0.0.2"}]});
+        args[APPROVAL_EXECUTION_BINDING_ARG] = tool
+            .approval_summary_for_call(&args)
+            .unwrap()
+            .execution_binding
+            .unwrap();
+
+        let agent = tool.execute(args).await.unwrap();
+        assert!(
+            agent.success,
+            "agent patch must land first: {:?}",
+            agent.error
+        );
+
+        let (status, body) = response_json(
+            handle_patch(
+                State(state),
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([
+                    {"op":"replace","path":"/gateway/port","value":4343}
+                ])),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let saved: zeroclaw_config::schema::Config =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved.gateway.host, "127.0.0.2",
+            "the later gateway write must not revert the agent's change"
+        );
+        assert_eq!(
+            saved.gateway.port, 4343,
+            "the gateway's own change must land"
         );
     }
 

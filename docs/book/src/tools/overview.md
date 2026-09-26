@@ -62,6 +62,7 @@ Always registered alongside the built-ins:
 
 | Tool | Notes |
 |---|---|
+| `config_patch` | Apply validated JSON Patch operations to `config.toml`. Writes are disk-only until reload or restart. See [Config authoring](#config-authoring) for its approval rules. |
 | `cron_*` | Manage scheduled jobs: `cron_add`, `cron_list`, `cron_remove`, `cron_update`, `cron_run`, `cron_runs` |
 | `schedule` | Shell-only one-shot/recurring scheduling |
 | `memory_forget`, `memory_export`, `memory_purge` | Long-term memory management |
@@ -128,6 +129,37 @@ The schema has no per-channel `tools_allow` / `tools_deny` field. Tool gating li
 - The MCP exception is scoped to the **risk profile**'s `allowed_tools` only. Caller-supplied per-run allow-lists (cron job `allowed_tools`, narrowed delegate invocations, etc.) are still treated as strict explicit-list intersections. A job that narrows itself to `allowed_tools = ["cron_add"]` will not surface runtime-discovered MCP wrappers it did not name, even when the agent's risk profile would auto-admit them.
 
 If you need finer-grained gating under Full autonomy, put sensitive tools in the per-profile `always_ask` list: they still prompt (or fail closed) even when `level = "full"`. Dropping the profile to `read_only` or `supervised` is only required when you want the whole risk-tier matrix, not when you need a handful of exceptions.
+
+### Config authoring
+
+`config_patch` gives an agent a typed config-writing path without exposing raw
+file writes. Before an approval, the host renders the proposed operations and
+their resolved-policy effects; secret values are redacted. A successful call
+writes `config.toml`, but the running daemon keeps its current configuration
+until the operator reloads or restarts it. See [Config lifecycle](../architecture/config-lifecycle.md#saved-vs-applied).
+
+The built-in risk presets treat this capability deliberately:
+
+- `locked_down` excludes it.
+- `balanced` pins it in `always_ask`. Only the local terminal or an authenticated
+  paired client is an operator approval surface; chat channels cannot approve it.
+- `yolo` and custom auto-approve rules still require an operator decision for
+  every `config_patch` call. Session-level “always approve” cannot bypass this
+  tool's structural operator boundary.
+
+Read-only operation policy still refuses writes. Approved calls carry a
+host-authenticated binding to the exact operations and on-disk source bytes.
+A concurrent edit invalidates the preview and requires a new approval.
+Values and comments are committed together; a failed annotation never reports
+that the complete patch was saved. Config writers share an in-process disk lock.
+Edits by other processes are detected by a final byte comparison, but external
+editors do not participate in that lock.
+
+Nested execution surfaces cannot grant operator approval. Bounded and
+independent agentic delegates therefore do not receive operator-only tools, and
+`execute_pipeline` refuses to admit them as child steps even when
+`pipeline.allowed_tools` names them explicitly. The same rule applies to skill
+aliases and other wrappers around an operator-only target.
 
 See [Autonomy levels](../security/autonomy.md) for the full set of per-profile fields.
 

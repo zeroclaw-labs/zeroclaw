@@ -12,6 +12,7 @@ pub async fn apply_comments(
     if annotations.is_empty() {
         return Ok(());
     }
+    let _write_guard = crate::write_lock::acquire(config_path).await?;
     let raw = tokio::fs::read_to_string(config_path).await?;
     let mut doc: toml_edit::DocumentMut = match raw.parse() {
         Ok(d) => d,
@@ -26,11 +27,11 @@ pub async fn apply_comments(
 /// Walk to the leaf key for `dotted` and decorate it with `# {comment}\n`,
 /// preserving any non-comment whitespace already in the prefix. Empty comment
 /// strips comment lines from the existing prefix while leaving blank lines.
-pub fn decorate_key(root: &mut toml_edit::Table, dotted: &str, comment: &str) {
+pub fn decorate_key(root: &mut toml_edit::Table, dotted: &str, comment: &str) -> bool {
     let segments: Vec<&str> = dotted.split('.').collect();
     let (last, rest) = match segments.split_last() {
         Some(s) => s,
-        None => return,
+        None => return false,
     };
     fn walk<'a>(
         table: &'a mut toml_edit::Table,
@@ -44,12 +45,15 @@ pub fn decorate_key(root: &mut toml_edit::Table, dotted: &str, comment: &str) {
     }
     let table = match walk(root, rest) {
         Some(t) => t,
-        None => return,
+        None => return false,
     };
     if let Some(mut key) = table.key_mut(last) {
         let decor = key.leaf_decor_mut();
         let new_prefix = build_comment_prefix(decor.prefix(), comment);
         decor.set_prefix(new_prefix);
+        true
+    } else {
+        false
     }
 }
 

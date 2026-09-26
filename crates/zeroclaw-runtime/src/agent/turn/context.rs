@@ -50,6 +50,20 @@ pub(crate) struct TurnCtx<'a> {
     /// AcceptedRoute, the AcceptedRoute tuple is the authoritative identity
     /// and this field is ignored.
     pub(crate) serving_model: Option<String>,
+    /// The turn's tool registry, so the approval gate can ask a tool for a
+    /// host-computed prompt (`Tool::approval_summary`) before asking the
+    /// operator. Read-only here; execution stays with the dispatcher.
+    pub(crate) tools: &'a [Box<dyn zeroclaw_api::tool::Tool>],
+}
+
+impl TurnCtx<'_> {
+    /// Look up a registry tool by name, for approval-time introspection.
+    pub(crate) fn tool_by_name(&self, name: &str) -> Option<&dyn zeroclaw_api::tool::Tool> {
+        self.tools
+            .iter()
+            .find(|t| t.name() == name)
+            .map(AsRef::as_ref)
+    }
 }
 
 /// Lightweight metadata for turn-level event emission.
@@ -101,6 +115,11 @@ impl<'a> TurnCtx<'a> {
             parent_agent_alias: self.parent_agent_alias,
             serving_provider_name: Some(provider_name.to_string()),
             serving_model: Some(model.to_string()),
+            // The routed view is what the tool phase receives, and the registry
+            // is what the approval gate and argument redaction resolve tools
+            // against: an empty slice here would silently drop operator-only
+            // gating and secret redaction on every routed turn.
+            tools: self.tools,
         }
     }
 

@@ -577,6 +577,7 @@ mod argument_preservation_tests {
             agent_alias: None,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
             turn_id: "argument-preservation",
+            tools: &[],
             serving_provider_name: None,
             serving_model: None,
         };
@@ -826,6 +827,7 @@ mod cost_usd_regression_tests {
             turn_id: "turn-cost-regression",
             serving_provider_name: None,
             serving_model: None,
+            tools: &[],
         };
 
         let specs = IterationToolSpecs {
@@ -971,6 +973,7 @@ mod cost_usd_regression_tests {
             turn_id: "malformed-protocol-usage",
             serving_provider_name: None,
             serving_model: None,
+            tools: &[],
         };
         let specs = IterationToolSpecs {
             tool_specs: vec![crate::tools::ToolSpec::new(

@@ -105,6 +105,35 @@ pub fn scrub_credentials_value(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// Log-safe string form of a tool call's `args`, for audit logs, observer
+/// events, and the approval WARN record. When the tool declares a
+/// source-level redaction ([`Tool::redact_args_for_log`]) — because its raw
+/// arguments carry secret values the generic scrubber cannot recognize — that
+/// redacted form is used; otherwise the existing generic string scrub applies.
+/// The generic scrubber still runs over the redacted form as defense in depth.
+pub fn loggable_args_string(
+    tool: Option<&dyn zeroclaw_api::tool::Tool>,
+    args: &serde_json::Value,
+) -> String {
+    match tool.and_then(|t| t.redact_args_for_log(args)) {
+        Some(redacted) => scrub_credentials(&redacted.to_string()),
+        None => scrub_credentials(&args.to_string()),
+    }
+}
+
+/// Log-safe JSON form of a tool call's `args`, for structured log attributes
+/// and client-facing `TurnEvent::ToolCall` frames. When the tool redacts its
+/// own arguments the redacted value is returned unchanged; otherwise the
+/// arguments pass through untouched, preserving prior behavior for every tool
+/// that does not opt in.
+pub fn loggable_args_value(
+    tool: Option<&dyn zeroclaw_api::tool::Tool>,
+    args: &serde_json::Value,
+) -> serde_json::Value {
+    tool.and_then(|t| t.redact_args_for_log(args))
+        .unwrap_or_else(|| args.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{is_credential_key, scrub_credentials, scrub_credentials_value};

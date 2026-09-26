@@ -976,10 +976,9 @@ impl DelegateTool {
             activated_handle,
             ..
         } = assembled;
-        // Strip the delegate tool from the ALREADY-sealed registry via the
-        // `retain` mutator - no unseal/reseal round-trip through a raw `Vec`.
-        // Same set removed as before (`tool.name() != Self::NAME`).
-        registry.retain(|tool| tool.name() != Self::NAME);
+        // Nested turns cannot acquire an operator-only capability, regardless
+        // of the target profile's standing auto-approval rules.
+        registry.retain(|tool| tool.name() != Self::NAME && !tool.approval_requires_operator());
         Ok(IndependentTargetTools {
             tools: registry,
             deferred_section,
@@ -3672,6 +3671,8 @@ impl DelegateTool {
                         .filter(|tool| tool.name() != Self::NAME)
                         .filter(|tool| self.security.is_tool_allowed(tool.name()))
                         .filter(|tool| Self::delegate_admits_with_mcp(&tool_policy, tool.name()))
+                        // Nested turns cannot obtain operator approval.
+                        .filter(|tool| !tool.approval_requires_operator())
                         .cloned()
                         .collect()
                 };
@@ -4045,6 +4046,28 @@ impl Tool for ToolArcRef {
 
     fn param_domains(&self) -> Vec<(&'static str, ::zeroclaw_api::tool::OptionDomain)> {
         self.inner.param_domains()
+    }
+
+    fn approval_requires_operator(&self) -> bool {
+        self.inner.approval_requires_operator()
+    }
+
+    fn requires_host_approval_summary(&self) -> bool {
+        self.inner.requires_host_approval_summary()
+    }
+
+    fn redact_args_for_log(&self, args: &serde_json::Value) -> Option<serde_json::Value> {
+        self.inner.redact_args_for_log(args)
+    }
+    fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {
+        self.inner.approval_summary(args)
+    }
+
+    fn approval_summary_for_call(
+        &self,
+        args: &serde_json::Value,
+    ) -> Option<zeroclaw_api::tool::ToolApprovalSummary> {
+        self.inner.approval_summary_for_call(args)
     }
 
     // Forward `spec()` so inner overrides keep their `Arc`-shared parameter
@@ -13719,6 +13742,139 @@ command = "rm independent-delegate-marker"
         );
     }
 
+    #[tokio::test]
+    async fn independent_delegate_excludes_direct_and_pipeline_config_patch_routes() {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.pipeline.enabled = true;
+        config.pipeline.allowed_tools = vec!["config_patch".to_string()];
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "target".to_string(),
+            RiskProfileConfig {
+                allowed_tools: Vec::new(),
+                always_ask: Vec::new(),
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                model_provider: "ollama.caller".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Independent,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "target".into(),
+                runtime_profile: "agentic".into(),
+                model_provider: "ollama.target".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.save().await.expect("save valid config fixture");
+        let config_path = config.config_path.clone();
+        let before = std::fs::read(&config_path).expect("read config before pipeline attempt");
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_runtime(Arc::new(DelegateTestRuntime))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+        let target_policy = tool
+            .policy_for_target("target")
+            .expect("independent target policy resolves");
+
+        let tools = tool
+            .independent_agentic_tools_for_target("target", target_policy)
+            .await
+            .expect("target-owned registry builds")
+            .tools;
+        let tool_names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
+
+        assert!(
+            tool_names.contains(&"shell"),
+            "an empty target allowlist must still expose ordinary target tools"
+        );
+        assert!(
+            !tool_names.contains(&"config_patch"),
+            "the real operator-only ConfigPatchTool must not enter an approval-free independent loop"
+        );
+        assert!(
+            tool_names.contains(&"execute_pipeline"),
+            "the regression must exercise the independent delegate's real pipeline route"
+        );
+
+        let pipeline = tools
+            .iter()
+            .find(|tool| tool.name() == "execute_pipeline")
+            .expect("pipeline is present");
+        let result = pipeline
+            .execute(serde_json::json!({
+                "steps": [{
+                    "tool": "config_patch",
+                    "args": {
+                        "ops": [{
+                            "op": "replace",
+                            "path": "/gateway/host",
+                            "value": "127.0.0.2"
+                        }]
+                    }
+                }]
+            }))
+            .await
+            .expect("pipeline returns a tool result");
+        assert!(
+            !result.success,
+            "the pipeline must reject its operator-only config_patch child"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Unknown tool 'config_patch'")),
+            "pipeline refusal should identify the unavailable child: {:?}",
+            result.error
+        );
+        assert_eq!(
+            std::fs::read(&config_path).expect("read config after pipeline attempt"),
+            before,
+            "an independent delegate pipeline attempt must leave config.toml byte-identical"
+        );
+    }
+
     fn fallback_delegate_config(
         primary_uri: String,
         backup_uri: String,
@@ -14689,6 +14845,53 @@ command = "rm independent-delegate-marker"
     }
 
     #[tokio::test]
+    async fn bounded_delegate_excludes_config_patch_without_an_operator_surface() {
+        let tmp = TempDir::new().unwrap();
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec!["config_patch".to_string()]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(
+                crate::tools::config_patch::ConfigPatchTool::new(
+                    tmp.path().join("config.toml"),
+                    test_security(),
+                ),
+            )])));
+
+        let model_provider = ToolListInspector {
+            forbidden_names: vec!["config_patch".to_string()],
+        };
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &model_provider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "expected success, got error: {:?}",
+            result.error
+        );
+        assert!(
+            result.output.contains("done"),
+            "config_patch must not be advertised to a bounded delegate: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("forbidden_tool_seen"),
+            "an operator-only config_patch reached a bounded delegate with no approval surface: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
     async fn delegate_parent_none_unrestricted_passes_target_policy() {
         let config = agentic_agent_config();
         let parent_security = Arc::new(SecurityPolicy {
@@ -14873,6 +15076,14 @@ mod tool_arc_ref_spec_tests {
             }
         }
 
+        fn approval_requires_operator(&self) -> bool {
+            true
+        }
+
+        fn approval_summary(&self, _args: &serde_json::Value) -> Option<String> {
+            Some("computed by the host".to_string())
+        }
+
         async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
             Ok(ToolResult {
                 success: true,
@@ -14897,6 +15108,15 @@ mod tool_arc_ref_spec_tests {
             Arc::ptr_eq(&wrapped.spec().parameters, &inner_params),
             "ToolArcRef must forward spec() so the inner Arc-shared schema \
              survives; the trait default deep-clones it every call"
+        );
+        assert!(
+            wrapped.approval_requires_operator(),
+            "ToolArcRef must preserve the inner tool's operator-only marker"
+        );
+        assert_eq!(
+            wrapped.approval_summary(&serde_json::json!({})).as_deref(),
+            Some("computed by the host"),
+            "ToolArcRef must preserve host-computed approval text"
         );
     }
 

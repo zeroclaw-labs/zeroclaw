@@ -174,6 +174,7 @@ If the target agent's `[runtime_profiles.<target>].agentic = true`, `delegate` b
 2. A non-empty `allowed_tools` list keeps only exact matching tool names.
 3. `[risk_profiles.<target_profile>].excluded_tools` always subtracts from the result.
 4. `delegate` is removed from the child registry unless bounded sub-delegation is granted: a bounded target whose risk profile sets `delegation_policy mode = "allow"` (and whose caller-side gates admit the tool) receives a target-bound, delegate-only instance that additionally refuses delegation when the target's profile would prompt for it; independent child registries always drop it.
+5. Tools whose approval requires an operator surface are removed because the nested loop has no operator approval surface. `execute_pipeline` also removes operator-only child tools, so a pipeline allowlist cannot restore the capability indirectly.
 
 This policy lives on the target, not the caller. Same-profile peers use the shared risk profile. Explicit cross-profile delegates use the target's risk profile after the reachability and delegation-policy gates. Bounded agentic delegates receive only the caller-capped tool registry intersected with the target's tool policy; independent agentic delegates receive the target-owned tool registry. A missing target risk profile refuses before the sub-loop starts. A configured profile that leaves zero executable child tools still permits a normal model turn with no tools.
 

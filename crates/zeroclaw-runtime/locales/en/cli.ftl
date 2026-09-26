@@ -862,6 +862,7 @@ cli-desktop-blurb2 = connects to the same gateway as the CLI.
 cli-config-all-configured = All sections already configured.
 cli-config-schema-current = Config already at current schema version.
 cli-config-applied-ops = Applied {$count} operation(s):
+cli-config-patch-comment-write-failed = warning: failed to write op comments to config.toml: {$error}
 cli-plugins-none = No plugins installed.
 cli-plugins-installed = Installed plugins:
 cli-plugin-catalog-heading = Plugins:
@@ -1381,6 +1382,10 @@ channel-approval-opt-allow-always = Always allow
 channel-approval-opt-reject = Reject
 channel-approval-opt-reject-with-edit = Reject with edit
 tool-git-operations-error-docker-runtime-write-unsupported = Git write commands are unavailable with the Docker runtime because they cannot be confined to its container.
+
+cli-config-patch-unsupported-fields = Config patch contains unsupported fields.
+cli-config-patch-not-saved = Config patch was not saved: { $error }
+cli-operator-tool-approval-required = Operator-only tool requires an interactive operator approval surface.
 
 # ── RPC inbound authentication ──
 rpc-auth-required-token = Authentication required: present auth_token in initialize, or connect from a mapped local uid

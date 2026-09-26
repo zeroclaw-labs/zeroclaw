@@ -645,6 +645,10 @@ async fn handle_socket(
         approval_event_tx.clone(),
         pending_approvals.clone(),
         Duration::from_secs(WS_APPROVAL_TIMEOUT_SECS),
+        // Only a paired-token-authenticated connection counts as an operator
+        // surface. `auth_subject` is `None` when pairing is disabled, where
+        // the socket is unauthenticated and must not approve operator-only tools.
+        auth_subject.clone(),
     ));
     agent
         .channel_handles()
@@ -2707,6 +2711,180 @@ data: {\"type\":\"message_stop\"}\n\n",
     }
 
     #[test]
+    fn anonymous_websocket_cannot_approve_config_patch() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(anonymous_websocket_cannot_approve_config_patch_inner());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn anonymous_websocket_cannot_approve_config_patch_inner() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let requests = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&requests);
+        let mock_app = Router::new().route("/v1/messages", post(move |Json(request): Json<serde_json::Value>| {
+            let calls = Arc::clone(&calls);
+            async move {
+                let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                if first {
+                    assert!(request["tools"].as_array().unwrap().iter().any(|t| t["name"] == "config_patch"));
+                }
+                let block = if first {
+                    serde_json::json!({"type":"tool_use", "id":"patch-call", "name":"config_patch", "input":{}})
+                } else {
+                    serde_json::json!({"type":"text", "text":""})
+                };
+                let delta = if first {
+                    serde_json::json!({"type":"input_json_delta", "partial_json":serde_json::json!({
+                        "ops":[{"op":"replace","path":"/gateway/host","value":"127.0.0.2"}]
+                    }).to_string()})
+                } else { serde_json::json!({"type":"text_delta", "text":"finished"}) };
+                let events = [
+                    serde_json::json!({"type":"message_start", "message":{"id":"msg-test","type":"message","role":"assistant","model":"claude-test","usage":{"input_tokens":1}}}),
+                    serde_json::json!({"type":"content_block_start","index":0,"content_block":block}),
+                    serde_json::json!({"type":"content_block_delta","index":0,"delta":delta}),
+                    serde_json::json!({"type":"content_block_stop","index":0}),
+                    serde_json::json!({"type":"message_delta","delta":{"stop_reason":if first {"tool_use"} else {"end_turn"}},"usage":{"output_tokens":1}}),
+                    serde_json::json!({"type":"message_stop"}),
+                ];
+                let body = events.iter().map(|e| format!("event: {}\ndata: {e}\n\n",e["type"].as_str().unwrap())).collect::<String>();
+                ([(header::CONTENT_TYPE,"text/event-stream")],body)
+            }
+        }));
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        let mock_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(mock_listener, mock_app).await.unwrap();
+        });
+        let tmp = tempfile::tempdir().expect("temporary gateway workspace");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("gateway workspace");
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: workspace.clone(),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.reliability.provider_retries = 0;
+        config.providers.models.anthropic.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::AnthropicModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    api_key: Some("test-key".to_string()),
+                    uri: Some(format!("http://{mock_addr}")),
+                    model: Some("claude-test".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig {
+                auto_approve: vec!["config_patch".into()],
+                ..Default::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig::default(),
+        );
+        config.agents.insert(
+            "web".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "anthropic.fixture".into(),
+                risk_profile: "fixture".into(),
+                runtime_profile: "fixture".into(),
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(workspace),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.gateway.require_pairing = false;
+        config.save().await.expect("save fixture config");
+        let config_path = config.config_path.clone();
+        let before = std::fs::read(&config_path).expect("config before WS turn");
+        let state = crate::api::tests::test_state(config);
+        assert!(!state.pairing.require_pairing());
+        let app = Router::new()
+            .route("/ws/chat", get(handle_ws_chat))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (mut socket, _) = connect_async(format!(
+            // This URL connects only to the test's loopback listener.
+            "ws://{address}/ws/chat?agent=web" // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
+        ))
+        .await
+        .unwrap();
+        socket.next().await.unwrap().unwrap();
+        socket
+            .send(ClientMessage::Text(r#"{"type":"connect"}"#.into()))
+            .await
+            .unwrap();
+        socket.next().await.unwrap().unwrap();
+        socket
+            .send(ClientMessage::Text(
+                r#"{"type":"message","content":"patch config"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        let mut saw_denial = false;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let frame = socket.next().await.unwrap().unwrap();
+                if let ClientMessage::Text(text) = frame {
+                    let event: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    assert_ne!(
+                        event["type"], "approval_request",
+                        "anonymous socket received an operator prompt: {event}"
+                    );
+                    assert_ne!(
+                        event["type"], "error",
+                        "turn failed before the approval boundary: {event}"
+                    );
+                    if event["type"] == "tool_result" && event["name"] == "config_patch" {
+                        assert!(
+                            event["output"]
+                                .as_str()
+                                .unwrap()
+                                .contains("operator approval"),
+                            "{event}"
+                        );
+                        saw_denial = true;
+                    }
+                    if event["type"] == "done" {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("WebSocket turn must finish");
+        assert!(
+            saw_denial,
+            "real config_patch call must reach operator denial"
+        );
+        assert!(requests.load(Ordering::SeqCst) >= 2);
+        assert_eq!(std::fs::read(&config_path).unwrap(), before);
+        server.abort();
+        mock_server.abort();
+    }
+
+    #[test]
     fn websocket_connect_persists_a_restore_time_trim_before_going_live() {
         // Same contract as the ACP/RPC restore-persistence regressions: an
         // over-cap restored transcript trims in memory as soon as the socket
@@ -3703,6 +3881,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             tx,
             pending,
             Duration::from_secs(WS_APPROVAL_TIMEOUT_SECS),
+            Some("paired-test-subject".into()),
         ));
 
         let handle: zeroclaw_runtime::tools::PerToolChannelHandle =
