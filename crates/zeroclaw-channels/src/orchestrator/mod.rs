@@ -13134,12 +13134,63 @@ fn build_channel_by_id(
     }
 }
 
+/// Optional envelope fields for a one-off `channel send`. `cc` and `bcc` are
+/// email-only and rejected for any other channel rather than silently dropped;
+/// `subject` is a pre-existing cross-channel field.
+#[derive(Debug, Default, Clone)]
+pub struct ChannelSendEnvelope {
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    pub subject: Option<String>,
+}
+
+impl ChannelSendEnvelope {
+    /// Whether any email-only recipient field was supplied.
+    fn has_email_recipients(&self) -> bool {
+        !self.cc.is_empty() || !self.bcc.is_empty()
+    }
+}
+
+/// Reject email-only recipient fields aimed at a channel that addresses a
+/// single peer. Failing loudly matters here: a silently ignored `--cc` is
+/// indistinguishable from a delivered one, so the operator would believe a
+/// participant was included when they were never addressed.
+fn check_envelope_supported(
+    channel_name: &str,
+    channel_id: &str,
+    envelope: &ChannelSendEnvelope,
+) -> Result<()> {
+    if envelope.has_email_recipients() && channel_name != "email" {
+        anyhow::bail!(
+            "--cc/--bcc are email-only; channel '{channel_id}' addresses a single recipient"
+        );
+    }
+    Ok(())
+}
+
+/// The announcement dispatcher builds its own `SendMessage` from the body
+/// alone, so a one-off send that falls through to it has nowhere to put
+/// envelope fields. Refusing them keeps the guarantee above: an operator who
+/// passed `--cc` or `--subject` is told it did not apply instead of being told
+/// the message was sent.
+fn check_envelope_dispatchable(channel_id: &str, envelope: &ChannelSendEnvelope) -> Result<()> {
+    if envelope.has_email_recipients() || envelope.subject.is_some() {
+        anyhow::bail!(
+            "--cc/--bcc/--subject are not supported for '{channel_id}': aliased ids the one-off \
+             builder does not resolve are delivered through the announcement dispatcher, \
+             which carries only the message body"
+        );
+    }
+    Ok(())
+}
+
 /// Send a one-off message to a configured channel.
 pub async fn send_channel_message(
     config: &Config,
     channel_id: &str,
     recipient: &str,
     message: &str,
+    envelope: ChannelSendEnvelope,
 ) -> Result<()> {
     // Wrap into the canonical shared handle for the builder; this is a
     // one-shot path so the snapshot is dropped immediately after send.
@@ -13154,6 +13205,7 @@ pub async fn send_channel_message(
         Err(err)
             if channel_id.contains('.') && err.downcast_ref::<UnknownChannelId>().is_some() =>
         {
+            check_envelope_dispatchable(channel_id, &envelope)?;
             deliver_announcement(config, channel_id, recipient, None, message)
                 .await
                 .with_context(|| format!("Failed to send message via {channel_id}"))?;
@@ -13162,7 +13214,13 @@ pub async fn send_channel_message(
         }
         Err(err) => return Err(err),
     };
-    let msg = SendMessage::new(message, recipient);
+    check_envelope_supported(channel.name(), channel_id, &envelope)?;
+    let mut msg = SendMessage::new(message, recipient)
+        .cc(envelope.cc)
+        .bcc(envelope.bcc);
+    if let Some(subject) = envelope.subject {
+        msg = msg.subject(subject);
+    }
     channel
         .send(&msg)
         .await
@@ -48001,6 +48059,69 @@ This is an example JSON object for profile settings."#;
     }
 
     #[test]
+    fn email_only_envelope_fields_are_rejected_for_single_recipient_channels() {
+        let envelope = ChannelSendEnvelope {
+            cc: vec!["bob@example.invalid".to_string()],
+            ..Default::default()
+        };
+
+        let err = check_envelope_supported("telegram", "telegram", &envelope)
+            .expect_err("a Cc aimed at Telegram must not be silently dropped");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("email-only") && msg.contains("telegram"),
+            "error must name the unsupported flag and channel, got: {msg}"
+        );
+
+        check_envelope_supported("email", "email.work", &envelope)
+            .expect("email accepts Cc recipients");
+    }
+
+    #[test]
+    fn envelope_fields_are_rejected_on_the_announcement_fallback() {
+        // `deliver_announcement` builds its own message from the body alone, so
+        // any envelope field reaching that route would be silently dropped.
+        for envelope in [
+            ChannelSendEnvelope {
+                cc: vec!["bob@example.invalid".to_string()],
+                ..Default::default()
+            },
+            ChannelSendEnvelope {
+                bcc: vec!["bob@example.invalid".to_string()],
+                ..Default::default()
+            },
+            ChannelSendEnvelope {
+                subject: Some("Status".to_string()),
+                ..Default::default()
+            },
+        ] {
+            let err = check_envelope_dispatchable("email.work", &envelope)
+                .expect_err("envelope fields must not be dropped on the dispatcher route");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("not supported") && msg.contains("email.work"),
+                "error must name the limitation and channel, got: {msg}"
+            );
+        }
+
+        check_envelope_dispatchable("email.work", &ChannelSendEnvelope::default())
+            .expect("an empty envelope keeps the dispatcher route open");
+    }
+
+    #[test]
+    fn subject_only_envelope_stays_allowed_on_every_channel() {
+        // `subject` predates this change and is a cross-channel field, so it
+        // must not start failing for non-email channels.
+        let envelope = ChannelSendEnvelope {
+            subject: Some("Status".to_string()),
+            ..Default::default()
+        };
+
+        check_envelope_supported("telegram", "telegram", &envelope)
+            .expect("subject alone must not trip the email-only guard");
+    }
+
+    #[test]
     fn build_channel_by_id_unknown_channel_returns_error() {
         let config = Config::default();
         let config_arc = Arc::new(RwLock::new(config));
@@ -52673,9 +52794,15 @@ Done."#;
     async fn one_off_send_resolves_dotted_discord_alias() {
         let config = zeroclaw_config::schema::Config::default();
 
-        let err = send_channel_message(&config, "discord.governance", "123456789", "test message")
-            .await
-            .expect_err("unconfigured alias should fail after dotted ref resolution");
+        let err = send_channel_message(
+            &config,
+            "discord.governance",
+            "123456789",
+            "test message",
+            ChannelSendEnvelope::default(),
+        )
+        .await
+        .expect_err("unconfigured alias should fail after dotted ref resolution");
         let message = format!("{err:#}");
         assert!(
             message.contains("[channels.discord.governance] not configured"),
@@ -52692,9 +52819,15 @@ Done."#;
         // It must reach the QQ arm rather than the dispatcher's reject path.
         let config = zeroclaw_config::schema::Config::default();
 
-        let err = send_channel_message(&config, "qq.qq", "user:OPENID", "test message")
-            .await
-            .expect_err("unconfigured alias should fail after dotted ref resolution");
+        let err = send_channel_message(
+            &config,
+            "qq.qq",
+            "user:OPENID",
+            "test message",
+            ChannelSendEnvelope::default(),
+        )
+        .await
+        .expect_err("unconfigured alias should fail after dotted ref resolution");
         let message = format!("{err:#}");
         assert!(
             message.contains("[channels.qq.qq] not configured"),
@@ -52715,9 +52848,15 @@ Done."#;
         // builder's own alias lookup rather than the dispatcher's reject path.
         let config = zeroclaw_config::schema::Config::default();
 
-        let err = send_channel_message(&config, "linq.governance", "+15550100", "test message")
-            .await
-            .expect_err("unconfigured alias should fail at the builder's linq arm");
+        let err = send_channel_message(
+            &config,
+            "linq.governance",
+            "+15550100",
+            "test message",
+            ChannelSendEnvelope::default(),
+        )
+        .await
+        .expect_err("unconfigured alias should fail at the builder's linq arm");
         let message = format!("{err:#}");
         assert!(
             message.contains("Linq alias 'governance' not configured"),

@@ -89,6 +89,12 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
             message,
             channel_id,
             recipient,
-        } => send_channel_message(config, &channel_id, &recipient, &message).await,
+            cc,
+            bcc,
+            subject,
+        } => {
+            let envelope = ChannelSendEnvelope { cc, bcc, subject };
+            send_channel_message(config, &channel_id, &recipient, &message, envelope).await
+        }
     }
 }
