@@ -1470,10 +1470,18 @@ pub enum SessionUpdateEvent {
     /// full context window (provider `context_window`), exposed distinctly so a
     /// client can render capacity and budget separately. Any may be absent when
     /// the provider doesn't report usage or the value can't be resolved.
+    ///
+    /// `input_tokens_source` states where `input_tokens` came from. It is
+    /// `provider` for a provider-reported count and `estimate` when the
+    /// provider omitted usage and the runtime substituted a local estimate so
+    /// the meter still has a numerator. Clients should render an estimated
+    /// value as approximate. It is absent when `input_tokens` is absent.
     ContextUsage {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_tokens_source: Option<zeroclaw_api::agent::TokenCountSource>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_context_tokens: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

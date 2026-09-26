@@ -919,6 +919,9 @@ async fn emit_rejected_attempt_usage(
                     provider_ref: billable.attempt.provider_ref().to_string(),
                     model: billable.attempt.model().to_string(),
                     accepted: false,
+                    // Rejected billing telemetry never feeds the context
+                    // meter, so it carries no display estimate.
+                    estimated_input_tokens: None,
                 })
                 .await;
         }

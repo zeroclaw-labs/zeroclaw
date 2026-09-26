@@ -3864,6 +3864,7 @@ mod tests {
             provider_ref: "stub".into(),
             model: "stub-model".into(),
             accepted: true,
+            estimated_input_tokens: None,
         };
 
         assert!(notification_for_turn_event("session", &event).is_none());
@@ -3903,6 +3904,70 @@ mod tests {
             store.load_session(session_id).unwrap().unwrap().token_count,
             1000,
             "rejected usage is billing-only"
+        );
+    }
+
+    /// Boundary (persistence): a display estimate must never become a durable
+    /// session token count. The ACP drain extracts `input_tokens` from the
+    /// event — never `estimated_input_tokens` — so an accepted usage-less
+    /// response clears the stale count instead of persisting the estimate.
+    #[tokio::test]
+    async fn estimated_usage_is_never_persisted_as_a_session_token_count() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let session_id = "sess-acp-estimate-not-persisted";
+        store
+            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .unwrap();
+
+        // Establish a real measured count first.
+        persist_acp_usage_snapshot_ordered(&store, session_id, Some(1000), true).await;
+        assert_eq!(
+            store.load_session(session_id).unwrap().unwrap().token_count,
+            1000
+        );
+
+        // An accepted response where the provider reported nothing, but the
+        // runtime formed a display estimate.
+        let event = TurnEvent::Usage {
+            input_tokens: None,
+            cached_input_tokens: None,
+            output_tokens: None,
+            cost_usd: None,
+            context_token_budget: Some(180_000),
+            model_context_window: Some(200_000),
+            provider_ref: "llamacpp.default".into(),
+            model: "local-model".into(),
+            accepted: true,
+            estimated_input_tokens: Some(4_200),
+        };
+
+        // Mirror the drain's extraction: persistence reads the measured field.
+        let TurnEvent::Usage {
+            input_tokens,
+            accepted,
+            estimated_input_tokens,
+            ..
+        } = &event
+        else {
+            panic!("fixture must be a Usage event");
+        };
+        assert_eq!(
+            *estimated_input_tokens,
+            Some(4_200),
+            "fixture must carry an estimate"
+        );
+        assert_eq!(
+            *input_tokens, None,
+            "the measured field must stay absent so persistence cannot store an estimate"
+        );
+        persist_acp_usage_snapshot_ordered(&store, session_id, *input_tokens, *accepted).await;
+
+        assert_eq!(
+            store.load_session(session_id).unwrap().unwrap().token_count,
+            0,
+            "estimate must clear the stale measured count, never be persisted as one"
         );
     }
 

@@ -1480,6 +1480,13 @@ impl UsageFold {
             provider_ref,
             model: served_model,
             accepted,
+            // Deliberately ignored. This fold is the billing/accounting
+            // ledger: totals, the per-(provider, model) breakdown, and the
+            // accepted-serving snapshot must all describe provider-measured
+            // usage only. The display estimate is a context-meter concern and
+            // is carried to clients on the RPC `context_usage` surface, which
+            // labels it via `input_tokens_source`.
+            estimated_input_tokens: _,
         } = event
         else {
             return;
@@ -5081,6 +5088,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             provider_ref: provider_ref.to_string(),
             model: model.to_string(),
             accepted,
+            estimated_input_tokens: None,
         }
     }
 

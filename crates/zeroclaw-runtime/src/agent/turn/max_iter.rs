@@ -35,6 +35,10 @@ async fn emit_summary_attempt_usage(
                     provider_ref: summary.provider_ref.clone(),
                     model: summary.model.clone(),
                     accepted: summary.accepted,
+                    // Billing projection of already-settled attempts. The
+                    // display estimate belongs only to the live accepted
+                    // response emitted by `record_accepted_chat_response`.
+                    estimated_input_tokens: None,
                 })
                 .await;
         }

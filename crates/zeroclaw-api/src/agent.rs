@@ -190,6 +190,30 @@ pub enum TurnEvent {
         /// attempts are billing-only telemetry; they do not update the accepted
         /// context snapshot (ACP session token count, context-meter ceiling).
         accepted: bool,
+        /// Locally estimated prompt size, published **only** when the provider
+        /// omitted `input_tokens`. Local OpenAI-compatible servers (llama.cpp
+        /// and similar) routinely omit `usage`, which leaves a context meter
+        /// with a budget but no numerator.
+        ///
+        /// This is **not** measured usage and carries a different contract
+        /// from every other field on this event:
+        ///
+        /// - It must never be billed, summed into provider usage totals, or
+        ///   persisted as a provider token count.
+        ///   Accounting and persistence consumers read `input_tokens`, which
+        ///   stays `None` exactly when the provider reported nothing.
+        /// - A consumer rendering a context meter may use it as a display
+        ///   numerator, and must label it as an estimate
+        ///   (`TokenCountSource::Estimated`) rather than provider-reported.
+        /// - It is a lower bound: the history heuristic does not price
+        ///   separately supplied native tool schemas, so a tool-heavy request
+        ///   estimates low. That is acceptable for a labelled display value
+        ///   and is not acceptable for accounting — another reason it is kept
+        ///   off `input_tokens`.
+        ///
+        /// `None` means either the provider reported a real count (use
+        /// `input_tokens`) or no estimate could be formed.
+        estimated_input_tokens: Option<u64>,
     },
 }
 
