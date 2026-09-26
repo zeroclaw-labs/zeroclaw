@@ -21,7 +21,6 @@ zeroclaw-providers.workspace = true
 zeroclaw-channels = { workspace = true, default-features = false, features = ["channel-acp-server"] }
 zeroclaw-runtime.workspace = true
 zeroclaw-tools.workspace = true
-zeroclaw-hardware.workspace = true
 zeroclaw-plugins = { workspace = true, optional = true }
 
 # HTTP server

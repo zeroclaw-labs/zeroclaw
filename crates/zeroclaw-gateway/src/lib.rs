@@ -33,7 +33,6 @@ pub mod api_webauthn;
 pub mod api_webhook;
 pub mod auth_rate_limit;
 pub mod canvas;
-pub mod hardware_context;
 pub mod node_tool;
 pub mod nodes;
 pub mod openapi;
@@ -4486,6 +4485,14 @@ async fn process_nextcloud_talk_webhook(
 #[cfg(feature = "channel-email")]
 const GMAIL_WEBHOOK_MAX_BODY: usize = 1024 * 1024;
 
+/// Compare the presented Gmail push bearer against the configured secret in
+/// constant time, so a wrong token's rejection latency does not reveal how
+/// many leading bytes matched.
+#[cfg(feature = "channel-email")]
+fn gmail_bearer_matches(provided: &str, secret: &str) -> bool {
+    zeroclaw_config::pairing::constant_time_eq(provided, secret)
+}
+
 /// POST /webhook/gmail — incoming Gmail Pub/Sub push notification
 #[cfg(feature = "channel-email")]
 async fn handle_gmail_push_webhook(
@@ -4517,7 +4524,7 @@ async fn handle_gmail_push_webhook(
             .and_then(|auth| auth.strip_prefix("Bearer "))
             .unwrap_or("");
 
-        if provided != secret {
+        if !gmail_bearer_matches(provided, &secret) {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -12621,5 +12628,30 @@ mod accept_error_tests {
         assert!(!is_recoverable_accept_error(&Error::from(
             ErrorKind::InvalidInput
         )));
+    }
+}
+
+#[cfg(all(test, feature = "channel-email"))]
+mod gmail_bearer_tests {
+    use super::gmail_bearer_matches;
+
+    #[test]
+    fn matching_bearer_is_accepted() {
+        assert!(gmail_bearer_matches("s3cret-token", "s3cret-token"));
+    }
+
+    #[test]
+    fn prefix_and_same_length_mismatches_are_rejected() {
+        // A correct prefix must fail exactly like an equal-length mismatch:
+        // the compare runs over the longer input regardless of where the
+        // first differing byte is, so neither shape leaks progress.
+        assert!(!gmail_bearer_matches("s3cret", "s3cret-token"));
+        assert!(!gmail_bearer_matches("s3cret-tokeN", "s3cret-token"));
+        assert!(!gmail_bearer_matches("s3cret-token-longer", "s3cret-token"));
+    }
+
+    #[test]
+    fn missing_bearer_never_matches_a_configured_secret() {
+        assert!(!gmail_bearer_matches("", "s3cret-token"));
     }
 }

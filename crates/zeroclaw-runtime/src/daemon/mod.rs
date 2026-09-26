@@ -1459,7 +1459,29 @@ where
 
             crate::health::bump_component_restart(name);
             crate::util::release_freed_heap();
-            tokio::time::sleep(Duration::from_secs(backoff)).await;
+            // The backoff sleep must yield to cancellation: a daemon shutting
+            // down or reloading while a component is in its retry window would
+            // otherwise wait out the whole window before the supervisor exits.
+            tokio::select! {
+                () = cancel.cancelled() => {
+                    crate::health::mark_component_ok(name);
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_attrs(::serde_json::json!({
+                                "name": name,
+                                "backoff_secs": backoff,
+                            })),
+                        &format!(
+                            "Daemon component '{name}' cancelled during restart backoff; \
+                             supervisor exiting"
+                        )
+                    );
+                    return;
+                }
+                () = tokio::time::sleep(Duration::from_secs(backoff)) => {}
+            }
             // Double backoff AFTER sleeping so first error uses initial_backoff
             backoff = backoff.saturating_mul(2).min(max_backoff);
         }
@@ -3304,6 +3326,60 @@ mod tests {
             component["restart_count"].as_u64().unwrap_or(0),
             0,
             "cooperative shutdown must not trigger a restart; got snapshot: {component}"
+        );
+    }
+
+    /// A cancellation that arrives while the supervisor is sleeping out a
+    /// restart backoff must end the supervisor during that sleep, without a
+    /// further component run and without waiting out the backoff window.
+    #[tokio::test]
+    async fn supervisor_exits_during_backoff_when_cancel_fires() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_inner = Arc::clone(&calls);
+        // A 60 s initial backoff: if the sleep ignored the token, the join
+        // below could not complete within its 1 s budget.
+        let handle = spawn_component_supervisor(
+            "daemon-test-cancel-in-backoff",
+            60,
+            60,
+            cancel.clone(),
+            move || {
+                let calls = Arc::clone(&calls_inner);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    anyhow::bail!("boom")
+                }
+            },
+        );
+
+        // Let the component fail once so the supervisor is parked in its
+        // backoff sleep.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        cancel.cancel();
+
+        let join = tokio::time::timeout(Duration::from_secs(1), handle).await;
+        assert!(
+            join.is_ok(),
+            "supervisor must exit during the backoff sleep once cancelled; got: {join:?}"
+        );
+        let _ = join.unwrap();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a cancelled supervisor must not run the component again"
+        );
+        let snapshot = crate::health::snapshot_json();
+        let component = &snapshot["components"]["daemon-test-cancel-in-backoff"];
+        assert_eq!(
+            component["status"], "ok",
+            "a cancellation during backoff is a cooperative shutdown, not an error; got: {component}"
         );
     }
 
