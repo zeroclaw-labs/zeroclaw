@@ -26,3 +26,6 @@ mod publish_contract;
 
 #[path = "architecture/ci_runner_labels.rs"]
 mod ci_runner_labels;
+
+#[path = "architecture/stream_error_terminal.rs"]
+mod stream_error_terminal;

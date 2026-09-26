@@ -717,6 +717,11 @@ pub struct ModelProviderRuntimeOptions {
     /// When `Some(false)`, strip assistant reasoning fields from outbound
     /// history replay. `None` honours provider default.
     pub replay_assistant_reasoning: Option<bool>,
+    /// Forward Anthropic extended thinking through OpenAI-compatible
+    /// providers: inject the runtime thinking params as an Anthropic-shaped
+    /// `thinking` request object and normalize gateway thinking responses
+    /// for replay. Propagated from `ModelProviderConfig::thinking_passthrough`.
+    pub thinking_passthrough: bool,
     /// Forward Anthropic prompt caching through OpenAI-compatible providers:
     /// inject `cache_control` breakpoints (system prompt; rolling last
     /// message) into request bodies and capture gateway-reported cache
@@ -782,6 +787,7 @@ impl Default for ModelProviderRuntimeOptions {
             merge_system_into_user: false,
             provider_extra: None,
             replay_assistant_reasoning: None,
+            thinking_passthrough: false,
             cache_passthrough: false,
             cache_ttl: None,
             native_tools: None,
@@ -850,6 +856,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         merge_system_into_user,
         provider_extra: entry.and_then(|e| e.provider_extra.clone()),
         replay_assistant_reasoning: entry.and_then(|e| e.replay_assistant_reasoning),
+        thinking_passthrough: entry.is_some_and(|e| e.thinking_passthrough),
         cache_passthrough: entry.is_some_and(|e| e.cache_passthrough),
         cache_ttl: entry.and_then(|e| e.cache_ttl),
         native_tools: entry.and_then(|e| e.native_tools),

@@ -970,6 +970,18 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_assistant_reasoning: Option<bool>,
+    /// Forward Anthropic extended thinking through this OpenAI-compatible
+    /// provider. When true and the runtime requests native thinking, request
+    /// bodies gain an Anthropic-shaped `thinking` object
+    /// (`{"type":"enabled","budget_tokens":N}`), and gateway thinking
+    /// responses are normalized into replayable signed blocks. Only
+    /// gateways that translate between OpenAI Chat Completions and the
+    /// Anthropic API support this (e.g. LiteLLM); a non-translating upstream
+    /// rejects the injected object with HTTP 400. Default `false`: request
+    /// bodies and response handling are unchanged.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub thinking_passthrough: bool,
     /// Forward Anthropic prompt caching through this OpenAI-compatible
     /// provider. When true, request bodies on the structured paths (agent
     /// turns, tool calls, structured streaming) gain an Anthropic-shaped

@@ -79,6 +79,12 @@ pub struct OpenAiCompatibleModelProvider {
     /// `cache_passthrough`. One TTL per request by design. Inert without
     /// passthrough: no markers are placed, so nothing carries a TTL.
     cache_ttl: Option<CacheTtl>,
+    /// When true, forward runtime-supplied native thinking params as an
+    /// Anthropic-shaped `thinking` object in request bodies and normalize
+    /// gateway thinking responses for replay. Requires a gateway that
+    /// translates between OpenAI Chat Completions and the Anthropic API;
+    /// a non-translating upstream rejects the injected object with HTTP 400.
+    thinking_passthrough: bool,
     /// Custom API path suffix (e.g. "/v2/generate").
     /// When set, overrides the default `/chat/completions` path detection.
     api_path: Option<String>,
@@ -500,6 +506,9 @@ pub struct OpenAiCompatibleBuilder {
     /// Set by [`OpenAiCompatibleBuilder::with_cache_ttl`]. Default `None`:
     /// breakpoints keep the 5-minute API default.
     cache_ttl: Option<CacheTtl>,
+    /// Set to `true` by [`OpenAiCompatibleBuilder::with_thinking_passthrough`].
+    /// Default `false` leaves requests and response handling unchanged.
+    thinking_passthrough: bool,
     api_path: Option<String>,
     max_tokens: Option<u32>,
     models_dev_key: Option<String>,
@@ -670,6 +679,17 @@ impl OpenAiCompatibleBuilder {
         self
     }
 
+    /// Forward Anthropic extended thinking through this provider: inject the
+    /// runtime thinking params as an Anthropic-shaped `thinking` request
+    /// object and normalize gateway thinking responses for replay. Only
+    /// meaningful for gateways that translate between OpenAI Chat
+    /// Completions and the Anthropic API (e.g. LiteLLM); a non-translating
+    /// upstream rejects the injected object with HTTP 400. Off by default.
+    pub fn with_thinking_passthrough(mut self) -> Self {
+        self.thinking_passthrough = true;
+        self
+    }
+
     /// Set a custom API path suffix for this model_provider.
     pub fn api_path(mut self, api_path: Option<String>) -> Self {
         self.api_path = api_path;
@@ -808,6 +828,7 @@ impl OpenAiCompatibleBuilder {
             replay_assistant_reasoning: self.replay_assistant_reasoning_override.unwrap_or(true),
             cache_passthrough: self.cache_passthrough,
             cache_ttl: self.cache_ttl,
+            thinking_passthrough: self.thinking_passthrough,
             api_path: self.api_path,
             max_tokens: self.max_tokens,
             models_dev_key: self.models_dev_key,
@@ -851,6 +872,7 @@ impl OpenAiCompatibleModelProvider {
             replay_assistant_reasoning_override: None,
             cache_passthrough: false,
             cache_ttl: None,
+            thinking_passthrough: false,
             api_path: None,
             max_tokens: None,
             models_dev_key: None,
@@ -1299,13 +1321,45 @@ impl OpenAiCompatibleModelProvider {
             .or_else(|| value.get("reasoning").and_then(serde_json::Value::as_str))
     }
 
-    fn assistant_reasoning_pair_for_replay(
-        &self,
-        value: &serde_json::Value,
-    ) -> (Option<String>, Option<String>) {
+    /// Replay payload for an outbound assistant history message.
+    ///
+    /// Flag off: today's behavior — the stored reasoning strings replay
+    /// verbatim. Flag on: history reasoning is expected as newline-delimited
+    /// signed-JSON envelope lines (the capture format); signed lines
+    /// reconstruct a `thinking_blocks` array and suppress the string fields.
+    /// Unsigned or malformed history sends nothing — blocks are never
+    /// fabricated, and a bare reasoning string is exactly what translating
+    /// gateways reject. `replay_assistant_reasoning = false` still wins:
+    /// nothing at all.
+    fn assistant_thinking_replay(&self, value: &serde_json::Value) -> AssistantThinkingReplay {
         if !self.replay_assistant_reasoning {
-            return (None, None);
+            return AssistantThinkingReplay::none();
         }
+        if !self.thinking_passthrough {
+            let (reasoning_content, reasoning) = Self::assistant_reasoning_pair(value);
+            return AssistantThinkingReplay {
+                reasoning_content,
+                reasoning,
+                thinking_blocks: None,
+            };
+        }
+        let Some(reasoning) = Self::assistant_reasoning_value(value) else {
+            return AssistantThinkingReplay::none();
+        };
+        match Self::reasoning_lines_to_thinking_blocks(reasoning) {
+            Some(blocks) => AssistantThinkingReplay {
+                reasoning_content: None,
+                reasoning: None,
+                thinking_blocks: Some(blocks),
+            },
+            // Unsigned/malformed: documented no-op.
+            None => AssistantThinkingReplay::none(),
+        }
+    }
+
+    /// Field-level reasoning pair, ignoring the replay gate. Shared by the
+    /// flag-off branch of [`Self::assistant_thinking_replay`].
+    fn assistant_reasoning_pair(value: &serde_json::Value) -> (Option<String>, Option<String>) {
         let reasoning_content = value
             .get("reasoning_content")
             .and_then(serde_json::Value::as_str)
@@ -1316,6 +1370,347 @@ impl OpenAiCompatibleModelProvider {
             .map(ToString::to_string);
         (reasoning_content, reasoning)
     }
+
+    /// Signed-block replay for the history fallback builder. Mirrors the
+    /// native request converter's assistant handling: when the stored
+    /// content is the runtime's reasoning envelope (a JSON object carrying
+    /// `reasoning_content`), run the same validated reconstruction and
+    /// attach the resulting `thinking_blocks`. Gated by the same provider
+    /// flags as the converter, so flag-off history produces no field.
+    fn fallback_thinking_replay(&self, message: &ChatMessage) -> Option<Vec<serde_json::Value>> {
+        if !self.thinking_passthrough || !self.replay_assistant_reasoning {
+            return None;
+        }
+        if message.role != "assistant" {
+            return None;
+        }
+        let value = serde_json::from_str::<serde_json::Value>(&message.content).ok()?;
+        self.assistant_thinking_replay(&value).thinking_blocks
+    }
+
+    /// Reconstruct `thinking_blocks` from newline-delimited signed-JSON
+    /// envelope lines. Replay whitelist mirrors capture: signed `thinking`
+    /// envelopes and well-formed `redacted_thinking` lines (opaque `data`
+    /// replayed verbatim, signature-less by design) are forwarded; well-formed
+    /// lines of any other type are skipped, not forwarded. Lines that fail to
+    /// parse and thinking lines without a signature void the whole replay:
+    /// Anthropic rejects unsigned thinking blocks on input, and the caller
+    /// sends nothing rather than fabricating or forwarding a partial
+    /// sequence. Mirrors the native Anthropic provider's replay parsing
+    /// (`crates/zeroclaw-providers/src/anthropic.rs`) — duplicate-with-comment
+    /// per the passthrough spec boundary.
+    fn reasoning_lines_to_thinking_blocks(reasoning: &str) -> Option<Vec<serde_json::Value>> {
+        let mut blocks = Vec::new();
+        for line in reasoning.split('\n') {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let parsed: serde_json::Value = serde_json::from_str(line).ok()?;
+            let block_type = parsed
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("thinking");
+            if block_type == "redacted_thinking" {
+                let has_data = parsed
+                    .get("data")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|data| !data.is_empty());
+                if has_data {
+                    blocks.push(parsed);
+                }
+                continue;
+            }
+            if block_type != "thinking" {
+                continue;
+            }
+            let thinking = parsed.get("thinking").and_then(serde_json::Value::as_str)?;
+            let signature = parsed
+                .get("signature")
+                .and_then(serde_json::Value::as_str)
+                .filter(|signature| !signature.is_empty())?;
+            blocks.push(serde_json::json!({
+                "type": "thinking",
+                "thinking": thinking,
+                "signature": signature,
+            }));
+        }
+        (!blocks.is_empty()).then_some(blocks)
+    }
+
+    /// Anthropic-shaped `thinking` request object for the given model and
+    /// runtime params, when [`Self::thinking_passthrough`] is on and the
+    /// runtime supplied native thinking params.
+    ///
+    /// Style resolution is shared with the native Anthropic provider via
+    /// `crate::anthropic::anthropic_thinking_style` (same crate, free
+    /// function): budget models get the fixed-budget `enabled` shape,
+    /// adaptive-only models (Opus 4.7, the whole Fable 5 family) get
+    /// `{"type":"adaptive"}` with no `budget_tokens`, matching the native
+    /// `NativeThinkingConfig` serialization. `params.display` rides on both
+    /// shapes as the snake_case `display` key when present, exactly as the
+    /// native provider emits it. Gateway model IDs may carry routing
+    /// prefixes; the resolver's substring matching handles them.
+    /// History-path chat with optional thinking rethreading. Fallback paths
+    /// that rebuild a tool request as prompt-guided text pass the original
+    /// `request.thinking` so the rebuilt body keeps the same injection the
+    /// primary path would have sent. Returns the parsed gateway message
+    /// plus its usage; projecting that into legacy text is the caller's
+    /// choice (`legacy_history_text` for the `String`-returning path).
+    async fn chat_with_history_inner(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: Option<f64>,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+    ) -> anyhow::Result<(
+        ResponseMessage,
+        Option<zeroclaw_api::model_provider::TokenUsage>,
+    )> {
+        let credential = self.resolve_credential().await?;
+
+        let normalized = self.normalize_messages_for_upstream(messages).await?;
+        let merge = self.effective_merge_system(model);
+        let (effective_messages, _system_merged) =
+            Self::flatten_system_messages(&normalized, merge);
+        // Strip native tool constructs for non-native-tool model_providers.
+        let effective_messages = self.strip_native_tool_messages(&effective_messages);
+        let api_messages: Vec<Message> = effective_messages
+            .iter()
+            .map(|m| Message {
+                role: m.role.clone(),
+                content: self.message_content_for_role(&m.role, &m.content, !merge, false),
+                thinking_blocks: self.fallback_thinking_replay(m),
+            })
+            .collect();
+
+        let shape = self.resolve_request_shape(model, thinking, temperature, self.max_tokens);
+        let request = ApiChatRequest {
+            model: model.to_string(),
+            messages: api_messages,
+            temperature: shape.temperature,
+            stream: Some(false),
+            stream_options: None,
+            reasoning_effort: self.reasoning_effort_for_model(model),
+            tool_stream: None,
+            tools: None,
+            tool_choice: None,
+            max_tokens: shape.max_tokens,
+            extra_body: shape.extra_body,
+        };
+        // No cache breakpoints here, deliberately: the `String`-returning
+        // `chat_with_history` wrapper drops response usage, so a premium
+        // cache write it triggered could never be accounted for. The
+        // structured schema-fallback re-entry in `chat` does surface usage,
+        // but the rule still holds: this shared request builder exists for
+        // the text-only contract, whose wrapper cannot account a cache
+        // write. The cache flag is honored on the structured paths (`chat`,
+        // `chat_with_tools`, `stream_chat`), which capture usage; the
+        // provider docs describe this usage-capture boundary.
+
+        let url = self.chat_completions_url();
+        let response = match self
+            .apply_opencode_session_header(self.apply_auth_header(
+                self.http_client().post(&url).json(&request),
+                credential.as_deref(),
+            )?)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(chat_error) => return Err(chat_error.into()),
+        };
+
+        if !response.status().is_success() {
+            return Err(super::api_error(&self.name, response).await);
+        }
+
+        let body = response.text().await?;
+        let chat_response = parse_chat_response_body(&self.name, &body)?;
+        let usage = chat_response.usage.map(UsageInfo::into_provider_usage);
+
+        chat_response
+            .choices
+            .into_iter()
+            .next()
+            .map(|choice| (choice.message, usage))
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"model_provider": &self.name})),
+                    "compatible: empty choices in response"
+                );
+                anyhow::Error::msg(format!("No response from {}", self.name))
+            })
+    }
+
+    fn thinking_request_object(
+        &self,
+        model: &str,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+    ) -> Option<serde_json::Value> {
+        if !self.thinking_passthrough {
+            return None;
+        }
+        let params = thinking?;
+        let mut object = match crate::anthropic::anthropic_thinking_style(model) {
+            crate::anthropic::AnthropicThinkingStyle::Adaptive => {
+                serde_json::json!({"type": "adaptive"})
+            }
+            crate::anthropic::AnthropicThinkingStyle::Budget => serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": params.budget_tokens
+            }),
+        };
+        if let Some(display) = params.display {
+            object["display"] = serde_json::json!(display.as_str());
+        }
+        Some(serde_json::json!({ "thinking": object }))
+    }
+
+    /// Effective `extra_body` for a request body: the injected `thinking`
+    /// object (when any) merged under the configured `extra_body`, whose
+    /// explicit keys always win. With the flag off or no params supplied,
+    /// this is exactly the configured `extra_body` (byte-identical default).
+    fn request_extra_body(
+        &self,
+        model: &str,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+    ) -> Option<serde_json::Value> {
+        let Some(mut merged) = self.thinking_request_object(model, thinking) else {
+            return self.extra_body.clone();
+        };
+        match self.extra_body.as_ref() {
+            None => Some(merged),
+            Some(extra) if extra.is_object() => {
+                if let (Some(base), Some(over)) = (merged.as_object_mut(), extra.as_object()) {
+                    base.extend(over.clone());
+                }
+                Some(merged)
+            }
+            // Non-object `extra_body` cannot be key-merged; the explicit
+            // config value wins outright (preserving its existing behavior).
+            Some(extra) => Some(extra.clone()),
+        }
+    }
+
+    /// Effective request shape for a body that may carry thinking
+    /// passthrough: the merged `extra_body` plus the normalized temperature
+    /// and output limit, resolved together so the three fields can never
+    /// disagree about which `thinking` object is being sent. Normalization
+    /// follows the `thinking` object that will actually be serialized —
+    /// the injected one, or the operator's explicit
+    /// `provider_extra.thinking` override when that key wins the merge —
+    /// so an `enabled` or `adaptive` effective object forces temperature
+    /// 1.0 (Anthropic rejects extended thinking combined with a modified
+    /// temperature) and an `enabled` object with an integer
+    /// `budget_tokens` raises `max_tokens` above that effective budget
+    /// (the API requires the limit to strictly exceed the budget), while
+    /// any other effective shape keeps the caller's values. With the flag
+    /// off or no params supplied nothing is injected and nothing is
+    /// normalized, keeping flag-off requests byte-identical; an operator's
+    /// configured `extra_body` carrying its own `thinking` key with the
+    /// flag off is that explicit request and is left alone.
+    fn resolve_request_shape(
+        &self,
+        model: &str,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+        temperature: Option<f64>,
+        max_tokens: Option<u32>,
+    ) -> EffectiveRequestShape {
+        let extra_body = self.request_extra_body(model, thinking);
+        if self.thinking_request_object(model, thinking).is_none() {
+            return EffectiveRequestShape {
+                extra_body,
+                temperature,
+                max_tokens,
+            };
+        }
+        // The `thinking` object that will actually be serialized: the
+        // injected one, or the operator's explicit override when the
+        // configured `extra_body` key wins the merge.
+        let effective_thinking = extra_body.as_ref().and_then(|body| body.get("thinking"));
+        let thinking_type = effective_thinking
+            .and_then(|object| object.get("type"))
+            .and_then(serde_json::Value::as_str);
+        if !matches!(thinking_type, Some("enabled") | Some("adaptive")) {
+            // `off` or any other explicit shape (including a non-object
+            // `extra_body` that replaced the merge): the operator pinned a
+            // non-thinking request, so their temperature and limit stand.
+            return EffectiveRequestShape {
+                extra_body,
+                temperature,
+                max_tokens,
+            };
+        }
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"model": model})),
+            "Passthrough extended thinking enabled; forcing temperature=1.0"
+        );
+        if thinking_type == Some("adaptive") {
+            // Adaptive thinking carries no budget; the configured limit
+            // stands.
+            return EffectiveRequestShape {
+                extra_body,
+                temperature: Some(1.0),
+                max_tokens,
+            };
+        }
+        // The API requires max_tokens > budget_tokens (strictly greater),
+        // measured against the budget actually being sent.
+        let min_required = effective_thinking
+            .and_then(|object| object.get("budget_tokens"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|budget| u32::try_from(budget).ok())
+            .and_then(|budget| budget.checked_add(1));
+        let max_tokens = match min_required {
+            Some(min_required) => {
+                let raised = max_tokens.max(Some(min_required));
+                if raised != max_tokens {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"model": model})),
+                        "Passthrough thinking budget meets or exceeds configured max_tokens; raising output limit"
+                    );
+                }
+                raised
+            }
+            None => {
+                // The effective object carries no integer budget (an
+                // override asked for a shape whose limit relation cannot
+                // be validated here); leave the configured limit alone and
+                // let the gateway report an invalid shape.
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"model": model})),
+                    "Passthrough thinking object carries no integer budget_tokens; leaving max_tokens unchanged"
+                );
+                max_tokens
+            }
+        };
+        EffectiveRequestShape {
+            extra_body,
+            temperature: Some(1.0),
+            max_tokens,
+        }
+    }
+}
+
+/// Resolved request-shape fields for a body that may carry thinking
+/// passthrough: the merged `extra_body` plus the normalized temperature
+/// and output limit, produced together by
+/// [`OpenAiCompatibleModelProvider::resolve_request_shape`] so the three
+/// fields cannot disagree about which `thinking` object is being sent.
+#[derive(Debug)]
+struct EffectiveRequestShape {
+    extra_body: Option<serde_json::Value>,
+    temperature: Option<f64>,
+    max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1359,6 +1754,16 @@ struct StreamOptionsBody {
 struct Message {
     role: String,
     content: MessageContent,
+    /// Anthropic `thinking_blocks` replay on assistant turns, populated only
+    /// when the passthrough flag is on and the stored content is a runtime
+    /// reasoning envelope with validated signed blocks: the same
+    /// reconstruction the native request converter performs. Absent
+    /// otherwise, keeping flag-off fallback requests byte-identical. This is
+    /// what keeps the second schema-fallback turn's signed trajectory
+    /// intact: the two-field fallback builder must replay what the primary
+    /// converter would have replayed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_blocks: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1670,6 +2075,12 @@ struct ResponseMessage {
     content: Option<String>,
     reasoning_content: Option<String>,
     tool_calls: Option<Vec<ToolCall>>,
+    /// Raw gateway `thinking_blocks` array, preserved so
+    /// [`OpenAiCompatibleModelProvider::parse_native_response`] can
+    /// normalize it behind the `thinking_passthrough` flag. Never
+    /// serialized.
+    #[serde(skip_serializing)]
+    thinking_blocks: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1682,6 +2093,10 @@ struct RawResponseMessage {
     reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ToolCall>>,
+    /// Anthropic thinking blocks forwarded by translating gateways
+    /// (e.g. `thinking_blocks` on LiteLLM / passthrough responses).
+    #[serde(default)]
+    thinking_blocks: Option<Vec<serde_json::Value>>,
 }
 
 impl From<RawResponseMessage> for ResponseMessage {
@@ -1693,6 +2108,7 @@ impl From<RawResponseMessage> for ResponseMessage {
             content: openai_assistant_content_plaintext(raw.content),
             reasoning_content,
             tool_calls: raw.tool_calls,
+            thinking_blocks: raw.thinking_blocks,
         }
     }
 }
@@ -1724,6 +2140,22 @@ impl ResponseMessage {
 
     fn effective_content_optional(&self) -> Option<String> {
         self.content.as_ref().cloned().filter(|c| !c.is_empty())
+    }
+}
+
+/// Text-only history contract, carried over from the pre-structured-path
+/// behavior: callers that parse tool calls back out of text depend on the
+/// JSON shape, so a message with non-empty `tool_calls` serializes the
+/// whole gateway message; every other shape reduces to visible content.
+fn legacy_history_text(message: &ResponseMessage) -> String {
+    if message
+        .tool_calls
+        .as_ref()
+        .is_some_and(|t: &Vec<_>| !t.is_empty())
+    {
+        serde_json::to_string(message).unwrap_or_else(|_| message.effective_content())
+    } else {
+        message.effective_content()
     }
 }
 
@@ -1858,6 +2290,24 @@ fn ensure_reasoning_effort_none(payload: &mut serde_json::Value) -> bool {
     true
 }
 
+/// Replay fields for an outbound assistant history message — see
+/// [`OpenAiCompatibleModelProvider::assistant_thinking_replay`].
+struct AssistantThinkingReplay {
+    reasoning_content: Option<String>,
+    reasoning: Option<String>,
+    thinking_blocks: Option<Vec<serde_json::Value>>,
+}
+
+impl AssistantThinkingReplay {
+    fn none() -> Self {
+        Self {
+            reasoning_content: None,
+            reasoning: None,
+            thinking_blocks: None,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct NativeMessage {
     role: String,
@@ -1873,6 +2323,11 @@ struct NativeMessage {
     reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "reasoning")]
     reasoning: Option<String>,
+    /// Reconstructed Anthropic thinking blocks for assistant history replay
+    /// under `thinking_passthrough` (signed envelope lines only). Never
+    /// populated alongside the string reasoning fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_blocks: Option<Vec<serde_json::Value>>,
     /// Tool name for `role: "tool"` messages. Groq native tool calling
     /// requires this field on every tool-result message; omitting it causes
     /// HTTP 400 "Tools should have a name!"./
@@ -2637,6 +3092,7 @@ impl OpenAiCompatibleModelProvider {
         temperature: Option<f64>,
         allow_user_image_parts: bool,
         system_merged: bool,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
     ) -> NativeChatRequest {
         let has_tool_entries = tools.as_ref().is_some_and(|tools| !tools.is_empty());
         let tool_choice = has_tool_entries.then(|| "auto".to_string());
@@ -2645,10 +3101,11 @@ impl OpenAiCompatibleModelProvider {
         let carrier = Self::merged_system_carrier_index(&messages, system_merged);
         self.apply_cache_breakpoints(&mut messages, carrier);
 
+        let shape = self.resolve_request_shape(model, thinking, temperature, self.max_tokens);
         NativeChatRequest {
             model: model.to_string(),
             messages,
-            temperature,
+            temperature: shape.temperature,
             stream: Some(false),
             // Non-streaming path; `usage` is on the final response body, not
             // gated on `stream_options.include_usage`.
@@ -2657,8 +3114,8 @@ impl OpenAiCompatibleModelProvider {
             tool_stream: self.tool_stream_for_tools(has_tool_entries),
             tools,
             tool_choice,
-            max_tokens: self.max_tokens,
-            extra_body: self.extra_body.clone(),
+            max_tokens: shape.max_tokens,
+            extra_body: shape.extra_body,
         }
     }
 
@@ -2670,24 +3127,45 @@ impl OpenAiCompatibleModelProvider {
         temperature: Option<f64>,
         allow_user_image_parts: bool,
         system_merged: bool,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
     ) -> NativeChatRequest<&'a [serde_json::Value]> {
         let has_tool_entries = tools.is_some_and(|tools| !tools.is_empty());
         let mut messages =
             self.convert_messages_for_native(effective_messages, allow_user_image_parts);
         let carrier = Self::merged_system_carrier_index(&messages, system_merged);
         self.apply_cache_breakpoints(&mut messages, carrier);
+        let shape = self.resolve_request_shape(model, thinking, temperature, self.max_tokens);
         NativeChatRequest {
             model: model.to_string(),
             messages,
-            temperature,
+            temperature: shape.temperature,
             stream: Some(false),
             stream_options: None,
             reasoning_effort: self.reasoning_effort_for_model(model),
             tool_stream: self.tool_stream_for_tools(has_tool_entries),
             tools,
             tool_choice: has_tool_entries.then(|| "auto".to_string()),
-            max_tokens: self.max_tokens,
-            extra_body: self.extra_body.clone(),
+            max_tokens: shape.max_tokens,
+            extra_body: shape.extra_body,
+        }
+    }
+
+    /// Thinking params for a STREAMING request body. Passthrough never
+    /// attaches thinking to the streamed wire: gateway SSE thinking frames
+    /// are unverified territory (the live probe was non-streaming), and a
+    /// streamed response cannot feed signed capture. This is defense in
+    /// depth for a wrapper that streams this leaf despite the
+    /// [`ModelProvider::supports_streaming`] disclaimer: such a request
+    /// behaves like thinking-off for that turn instead of producing an
+    /// uncapturable trajectory. Flag off keeps legacy streaming untouched.
+    fn streaming_thinking_params(
+        &self,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+    ) -> Option<zeroclaw_api::model_provider::NativeThinkingParams> {
+        if self.thinking_passthrough {
+            None
+        } else {
+            thinking
         }
     }
 
@@ -2702,6 +3180,7 @@ impl OpenAiCompatibleModelProvider {
         options_enabled: bool,
         merge: bool,
         system_merged: bool,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
     ) -> NativeChatRequest {
         // Guard on the converted tools being non-empty (not just the raw
         // input being non-empty): convert_tool_specs_for_model can sanitize
@@ -2714,10 +3193,28 @@ impl OpenAiCompatibleModelProvider {
         let mut messages = self.convert_messages_for_native(effective_messages, !merge);
         let carrier = Self::merged_system_carrier_index(&messages, system_merged);
         self.apply_cache_breakpoints(&mut messages, carrier);
+        // Streamed requests are thinking-off under passthrough (see
+        // streaming_thinking_params). History replay blocks require the
+        // request thinking object, so strip them here: a hypothetical
+        // wrapper streaming this leaf gets a thinking-off request, not a
+        // blocks-without-thinking-object 400. Stripping after the cache
+        // breakpoints are placed keeps both features composing on one
+        // converted message list.
+        if self.thinking_passthrough {
+            for message in &mut messages {
+                message.thinking_blocks = None;
+            }
+        }
+        let shape = self.resolve_request_shape(
+            model,
+            self.streaming_thinking_params(thinking),
+            temperature,
+            self.max_tokens,
+        );
         NativeChatRequest {
             model: model.to_string(),
             messages,
-            temperature,
+            temperature: shape.temperature,
             reasoning_effort: self.reasoning_effort_for_model(model),
             tool_stream: if options_enabled {
                 self.tool_stream_for_tools(true)
@@ -2733,8 +3230,8 @@ impl OpenAiCompatibleModelProvider {
             }),
             tools,
             tool_choice,
-            max_tokens: self.max_tokens,
-            extra_body: self.extra_body.clone(),
+            max_tokens: shape.max_tokens,
+            extra_body: shape.extra_body,
         }
     }
 
@@ -2933,16 +3430,16 @@ impl OpenAiCompatibleModelProvider {
                                 .then(|| MessageContent::Text(String::new()))
                         });
 
-                    let (reasoning_content, reasoning) =
-                        self.assistant_reasoning_pair_for_replay(&value);
+                    let replay = self.assistant_thinking_replay(&value);
 
                     return NativeMessage {
                         role: "assistant".to_string(),
                         content,
                         tool_call_id: None,
                         tool_calls: Some(tool_calls),
-                        reasoning_content,
-                        reasoning,
+                        reasoning_content: replay.reasoning_content,
+                        reasoning: replay.reasoning,
+                        thinking_blocks: replay.thinking_blocks,
                         name: None,
                     };
                 }
@@ -2961,16 +3458,16 @@ impl OpenAiCompatibleModelProvider {
                         .and_then(serde_json::Value::as_str)
                         .map(|value| MessageContent::Text(value.to_string()));
 
-                    let (reasoning_content, reasoning) =
-                        self.assistant_reasoning_pair_for_replay(&value);
+                    let replay = self.assistant_thinking_replay(&value);
 
                     return NativeMessage {
                         role: "assistant".to_string(),
                         content,
                         tool_call_id: None,
                         tool_calls: None,
-                        reasoning_content,
-                        reasoning,
+                        reasoning_content: replay.reasoning_content,
+                        reasoning: replay.reasoning,
+                        thinking_blocks: replay.thinking_blocks,
                         name: None,
                     };
                 }
@@ -3041,6 +3538,7 @@ impl OpenAiCompatibleModelProvider {
                         tool_calls: None,
                         reasoning_content: None,
                         reasoning: None,
+                        thinking_blocks: None,
                         name: tool_name,
                     };
                 }
@@ -3057,6 +3555,7 @@ impl OpenAiCompatibleModelProvider {
                     tool_calls: None,
                     reasoning_content: None,
                     reasoning: None,
+                    thinking_blocks: None,
                     name: None,
                 }
             })
@@ -3180,7 +3679,7 @@ impl OpenAiCompatibleModelProvider {
 
     fn parse_native_response(&self, message: ResponseMessage) -> ProviderChatResponse {
         let text = message.effective_content_optional();
-        let reasoning_content = message.reasoning_content.clone();
+        let reasoning_content = self.capture_reasoning_content(&message);
         let mut used_tool_call_ids = std::collections::HashSet::new();
         let tool_calls = message
             .tool_calls
@@ -3205,6 +3704,87 @@ impl OpenAiCompatibleModelProvider {
             usage: None,
             reasoning_content,
         }
+    }
+
+    /// Flag-gated reasoning capture for a parsed gateway message.
+    ///
+    /// Flag off: today's behavior exactly — the `reasoning_content` string is
+    /// passed through untouched (DeepSeek/GLM/Qwen flows).
+    ///
+    /// Flag on: normalize into the newline-delimited signed-JSON line format
+    /// the native Anthropic provider uses for `reasoning_content` (one
+    /// `{"thinking":..,"signature":..}` line per block). A `thinking_blocks`
+    /// array (signed) wins over a plain reasoning string; a bare string is
+    /// wrapped as a single unsigned line (`signature: ""`), matching how the
+    /// native provider emits signature-less blocks.
+    fn capture_reasoning_content(&self, message: &ResponseMessage) -> Option<String> {
+        if !self.thinking_passthrough {
+            return message.reasoning_content.clone();
+        }
+        if let Some(blocks) = &message.thinking_blocks
+            && let Some(lines) = Self::thinking_blocks_to_reasoning_lines(blocks)
+        {
+            return Some(lines);
+        }
+        message.reasoning_content.as_ref().map(|reasoning| {
+            serde_json::json!({"thinking": reasoning, "signature": ""}).to_string()
+        })
+    }
+
+    /// Convert gateway `thinking_blocks` (Anthropic content-block style) into
+    /// the native signed-JSON line format. Blocks with neither thinking text
+    /// nor a signature are skipped. Returns `None` when no block survives, so
+    /// the caller falls back to the plain reasoning string.
+    ///
+    /// Deliberately mirrors the native Anthropic provider's block emission
+    /// (`crates/zeroclaw-providers/src/anthropic.rs`): same line shape, same
+    /// signature-or-text inclusion rule. Duplicate-with-comment, not a shared
+    /// helper, per the passthrough spec boundary (mirrors the native provider).
+    ///
+    /// Block-type whitelist: only `thinking` and `redacted_thinking` are
+    /// captured. `redacted_thinking` is preserved verbatim (it must replay
+    /// unchanged and carries no signature by design) but only when its
+    /// required opaque `data` field is a non-empty string. Every other type
+    /// is skipped, not stored: accepting gateway-controlled JSON blocks of
+    /// unknown shape into replay history would be an unvalidated
+    /// network-to-request channel. Skipping keeps a novel-but-harmless block
+    /// type from bricking the turn.
+    fn thinking_blocks_to_reasoning_lines(blocks: &[serde_json::Value]) -> Option<String> {
+        let mut lines: Vec<String> = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            let block_type = block
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("thinking");
+            if block_type == "redacted_thinking" {
+                let has_data = block
+                    .get("data")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|data| !data.is_empty());
+                if has_data {
+                    lines.push(block.to_string());
+                }
+                continue;
+            }
+            if block_type != "thinking" {
+                continue;
+            }
+            let thinking = block
+                .get("thinking")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let signature = block
+                .get("signature")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if thinking.is_empty() && signature.is_empty() {
+                continue;
+            }
+            lines.push(
+                serde_json::json!({"thinking": thinking, "signature": signature}).to_string(),
+            );
+        }
+        (!lines.is_empty()).then(|| lines.join("\n"))
     }
 
     fn is_native_tool_schema_unsupported(status: reqwest::StatusCode, error: &str) -> bool {
@@ -3491,17 +4071,20 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             messages.push(Message {
                 role: "user".to_string(),
                 content: Self::to_message_content("user", &content, !merge),
+                thinking_blocks: None,
             });
         } else {
             if let Some(sys) = system_prompt {
                 messages.push(Message {
                     role: "system".to_string(),
                     content: MessageContent::Text(sys.to_string()),
+                    thinking_blocks: None,
                 });
             }
             messages.push(Message {
                 role: "user".to_string(),
                 content: Self::to_message_content("user", &normalized_message, true),
+                thinking_blocks: None,
             });
         }
 
@@ -3587,90 +4170,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let credential = self.resolve_credential().await?;
-
-        let normalized = self.normalize_messages_for_upstream(messages).await?;
-        let merge = self.effective_merge_system(model);
-        let (effective_messages, _system_merged) =
-            Self::flatten_system_messages(&normalized, merge);
-        // Strip native tool constructs for non-native-tool model_providers.
-        let effective_messages = self.strip_native_tool_messages(&effective_messages);
-        let api_messages: Vec<Message> = effective_messages
-            .iter()
-            .map(|m| Message {
-                role: m.role.clone(),
-                content: self.message_content_for_role(&m.role, &m.content, !merge, false),
-            })
-            .collect();
-
-        let request = ApiChatRequest {
-            model: model.to_string(),
-            messages: api_messages,
-            temperature,
-            stream: Some(false),
-            stream_options: None,
-            reasoning_effort: self.reasoning_effort_for_model(model),
-            tool_stream: None,
-            tools: None,
-            tool_choice: None,
-            max_tokens: self.max_tokens,
-            extra_body: self.extra_body.clone(),
-        };
-        // No cache breakpoints here, deliberately: this text-only helper
-        // never surfaces response usage to dispatch accounting, so a
-        // premium cache write it triggered could never be accounted for
-        // (fallback re-entries through this path return `usage: None`).
-        // The flag is honored on the structured paths (`chat`,
-        // `chat_with_tools`, `stream_chat`), which capture usage; the
-        // provider docs describe this usage-capture boundary.
-
-        let url = self.chat_completions_url();
-        let response = match self
-            .apply_opencode_session_header(self.apply_auth_header(
-                self.http_client().post(&url).json(&request),
-                credential.as_deref(),
-            )?)
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(chat_error) => return Err(chat_error.into()),
-        };
-
-        if !response.status().is_success() {
-            return Err(super::api_error(&self.name, response).await);
-        }
-
-        let body = response.text().await?;
-        let chat_response = parse_chat_response_body(&self.name, &body)?;
-
-        chat_response
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| {
-                if c.message.tool_calls.is_some()
-                    && c.message
-                        .tool_calls
-                        .as_ref()
-                        .is_some_and(|t: &Vec<_>| !t.is_empty())
-                {
-                    serde_json::to_string(&c.message)
-                        .unwrap_or_else(|_| c.message.effective_content())
-                } else {
-                    c.message.effective_content()
-                }
-            })
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"model_provider": &self.name})),
-                    "compatible: empty choices in response"
-                );
-                anyhow::Error::msg(format!("No response from {}", self.name))
-            })
+        let (message, _usage) = self
+            .chat_with_history_inner(messages, model, temperature, None)
+            .await?;
+        Ok(legacy_history_text(&message))
     }
 
     async fn chat_with_tools(
@@ -3697,6 +4200,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             temperature,
             !merge,
             system_merged,
+            // Legacy entry point: carries no `ChatRequest`, so no runtime
+            // thinking params are available to forward.
+            None,
         );
         let mut payload = serde_json::to_value(request)?;
         let tools_count = payload
@@ -3814,6 +4320,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             temperature,
             !merge,
             system_merged,
+            request.thinking,
         );
         let mut payload = serde_json::to_value(native_request)?;
         let tools_count = payload
@@ -3893,15 +4400,17 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             if Self::is_native_tool_schema_unsupported(status, &sanitized) {
                 let fallback_messages =
                     Self::with_prompt_guided_tool_instructions(request.messages, request.tools);
-                let text = self
-                    .chat_with_history(&fallback_messages, model, temperature)
+                let (message, usage) = self
+                    .chat_with_history_inner(
+                        &fallback_messages,
+                        model,
+                        temperature,
+                        request.thinking,
+                    )
                     .await?;
-                return Ok(ProviderChatResponse {
-                    text: Some(text),
-                    tool_calls: vec![],
-                    usage: None,
-                    reasoning_content: None,
-                });
+                let mut response = self.parse_native_response(message);
+                response.usage = usage;
+                return Ok(response);
             }
 
             anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
@@ -3936,7 +4445,14 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
     }
 
     fn supports_streaming(&self) -> bool {
-        true
+        // Passthrough pins requests to the non-streaming wire: gateway SSE
+        // thinking frames are unverified territory (the live probe was
+        // non-streaming), and streamed reasoning would reach history
+        // unsigned, breaking signed block replay on the next tool-loop
+        // iteration. The flag is opt-in, so trading streaming for a correct
+        // signed trajectory is the honest default until wire-first
+        // streaming support lands.
+        !self.thinking_passthrough
     }
 
     fn supports_streaming_tool_events(&self) -> bool {
@@ -3963,6 +4479,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let messages_owned: Vec<ChatMessage> = request.messages.to_vec();
         let tools_owned: Option<Vec<zeroclaw_api::tool::ToolSpec>> =
             request.tools.map(<[zeroclaw_api::tool::ToolSpec]>::to_vec);
+        // `NativeThinkingParams` is `Copy`; captured for both streaming
+        // request branches (tool and tool-less) below.
+        let thinking_owned = request.thinking;
         let model = model.to_string();
         let count_tokens = options.count_tokens;
         let options_enabled = options.enabled;
@@ -4005,6 +4524,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     options_enabled,
                     merge,
                     system_merged,
+                    thinking_owned,
                 ))
             } else {
                 let mut messages: Vec<Message> = effective_messages
@@ -4016,16 +4536,28 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                             &message.content,
                             !merge,
                             false,
+                            // Streamed requests are thinking-off under
+                            // passthrough (see streaming_thinking_params):
+                            // history replay blocks require the request
+                            // thinking object, so they never ride the
+                            // streamed wire.
                         ),
+                        thinking_blocks: None,
                     })
                     .collect();
                 let carrier = Self::merged_system_carrier_index(&messages, system_merged);
                 provider.apply_cache_breakpoints(&mut messages, carrier);
 
+                let shape = provider.resolve_request_shape(
+                    &model,
+                    provider.streaming_thinking_params(thinking_owned),
+                    temperature,
+                    provider.max_tokens,
+                );
                 serde_json::to_value(ApiChatRequest {
                     model: model.clone(),
                     messages,
-                    temperature,
+                    temperature: shape.temperature,
                     reasoning_effort: reasoning_effort.clone(),
                     tool_stream: if options_enabled {
                         provider.tool_stream_for_tools(false)
@@ -4038,8 +4570,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     }),
                     tools: None,
                     tool_choice: None,
-                    max_tokens: provider.max_tokens,
-                    extra_body: provider.extra_body.clone(),
+                    max_tokens: shape.max_tokens,
+                    extra_body: shape.extra_body,
                 })
             };
 
@@ -4230,17 +4762,20 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 messages.push(Message {
                     role: "user".to_string(),
                     content: Self::to_message_content("user", &content, !merge),
+                    thinking_blocks: None,
                 });
             } else {
                 if let Some(sys) = system_prompt_owned {
                     messages.push(Message {
                         role: "system".to_string(),
                         content: MessageContent::Text(sys),
+                        thinking_blocks: None,
                     });
                 }
                 messages.push(Message {
                     role: "user".to_string(),
                     content: Self::to_message_content("user", &normalized_message_content, !merge),
+                    thinking_blocks: None,
                 });
             }
 
@@ -4390,6 +4925,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 .map(|m| Message {
                     role: m.role.clone(),
                     content: provider.message_content_for_role(&m.role, &m.content, !merge, false),
+                    thinking_blocks: None,
                 })
                 .collect();
 
@@ -5373,14 +5909,17 @@ mod tests {
             Message {
                 role: "system".to_string(),
                 content: MessageContent::Text("you are brief".to_string()),
+                thinking_blocks: None,
             },
             Message {
                 role: "user".to_string(),
                 content: MessageContent::Text("hi".to_string()),
+                thinking_blocks: None,
             },
             Message {
                 role: "assistant".to_string(),
                 content: MessageContent::Text("hello".to_string()),
+                thinking_blocks: None,
             },
             Message {
                 role: "user".to_string(),
@@ -5389,10 +5928,12 @@ mod tests {
                         url: "data:image/png;base64,abcd".to_string(),
                     },
                 }]),
+                thinking_blocks: None,
             },
             Message {
                 role: "system".to_string(),
                 content: MessageContent::Text("extra".to_string()),
+                thinking_blocks: None,
             },
         ];
         provider.apply_cache_breakpoints(&mut messages, None);
@@ -5803,6 +6344,7 @@ mod tests {
             true,
             false,
             false,
+            None,
         ))
         .unwrap();
 
@@ -5835,6 +6377,7 @@ mod tests {
             true,
             false,
             false,
+            None,
         ))
         .unwrap();
         assert!(
@@ -5892,6 +6435,1600 @@ mod tests {
     // "When using `tool_choice`, `tools` must be set."). The request builders
     // must omit `tool_choice` whenever the converted tool list is empty.
     #[test]
+    fn thinking_passthrough_flag_off_never_injects_thinking() {
+        // Flag off = today's behavior exactly, regardless of runtime params.
+        // Byte-identical guarantee, asserted two ways: the request payload
+        // carries no `thinking` key (and is identical with params present or
+        // absent), and the extra_body seam returns the configured extra_body
+        // value unchanged.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let messages = vec![ChatMessage::user("hello")];
+
+        let p = make_model_provider("gateway", "http://localhost:8000/v1", None);
+        let with_params = serde_json::to_value(p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            None,
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        let without_params = serde_json::to_value(p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            None,
+            false,
+            false,
+            None,
+        ))
+        .unwrap();
+        assert!(
+            with_params.get("thinking").is_none(),
+            "flag-off request must never gain a thinking key; got: {with_params}"
+        );
+        assert_eq!(
+            with_params, without_params,
+            "flag-off requests must be byte-identical whether params are present or not"
+        );
+
+        let extra = serde_json::json!({"top_k": 5});
+        let p_with_extra = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .extra_body(extra.clone())
+            .build();
+        assert_eq!(
+            p_with_extra.request_extra_body("test-model", Some(params)),
+            Some(extra),
+            "flag-off extra_body seam must return the configured extra_body unchanged"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_injects_enabled_budget_shape() {
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            None,
+            false,
+            false,
+            Some(params),
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 8_192}),
+            "passthrough must inject the Anthropic enabled-budget thinking shape"
+        );
+
+        // Streaming builder mirrors the non-streaming injection... except it
+        // must NOT: passthrough never attaches thinking to the streamed wire
+        // (unverified SSE frames, no signed capture on streamed responses).
+        // The streamed body behaves like thinking-off for that turn.
+        let streaming = serde_json::to_value(p.build_streaming_native_tool_request(
+            "test-model",
+            &messages,
+            Some(vec![]),
+            None,
+            true,
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert!(
+            streaming.get("thinking").is_none(),
+            "streamed requests under passthrough must never carry the thinking object: {streaming}"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_streaming_builder_drops_thinking_display_variants_too() {
+        // Defense in depth: every display variant is equally withheld from
+        // the streamed wire under passthrough.
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: Some(zeroclaw_api::model_provider::ThinkingDisplay::Summarized),
+        };
+
+        let with_tools = serde_json::to_value(p.build_streaming_native_tool_request(
+            "test-model",
+            &messages,
+            Some(vec![]),
+            None,
+            true,
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert!(with_tools.get("thinking").is_none());
+
+        let flag_off = make_model_provider("gateway", "http://localhost:8000/v1", None);
+        let legacy = serde_json::to_value(flag_off.build_streaming_native_tool_request(
+            "test-model",
+            &messages,
+            Some(vec![]),
+            None,
+            true,
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert!(
+            legacy.get("thinking").is_none(),
+            "flag-off streaming never injected thinking and must stay that way"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_adaptive_model_sends_adaptive_shape_without_budget() {
+        // Adaptive-only models reject the fixed-budget shape with HTTP 400;
+        // the injected object must switch to the bare adaptive shape.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+
+        let resolved = p
+            .request_extra_body("claude-opus-4-7", Some(params))
+            .unwrap();
+        assert_eq!(
+            resolved["thinking"],
+            serde_json::json!({"type": "adaptive"}),
+            "adaptive-only models must receive the adaptive shape"
+        );
+        assert!(
+            resolved["thinking"].get("budget_tokens").is_none(),
+            "adaptive shape must not carry a budget_tokens key"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_budget_model_shape_unchanged_by_style_share() {
+        // A budget model keeps the enabled shape exactly, with no display
+        // key when params.display is None.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+
+        let resolved = p.request_extra_body("test-model", Some(params)).unwrap();
+        assert_eq!(
+            resolved["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 8_192}),
+            "budget models must keep the enabled shape; display None must omit the key"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_display_includes_snake_case_value_on_both_styles() {
+        // params.display rides on both shapes, serialized snake_case like
+        // the native provider's NativeThinkingConfig.
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+
+        let updates = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: Some(zeroclaw_api::model_provider::ThinkingDisplay::Updates),
+        };
+        let budget = p.request_extra_body("test-model", Some(updates)).unwrap();
+        assert_eq!(
+            budget["thinking"],
+            serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": 8_192,
+                "display": "updates"
+            }),
+            "display Some must emit the snake_case value on the budget shape"
+        );
+
+        let adaptive = p
+            .request_extra_body("claude-opus-4-7", Some(updates))
+            .unwrap();
+        assert_eq!(
+            adaptive["thinking"],
+            serde_json::json!({"type": "adaptive", "display": "updates"}),
+            "display Some must emit the snake_case value on the adaptive shape"
+        );
+
+        let omitted = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: Some(zeroclaw_api::model_provider::ThinkingDisplay::Omitted),
+        };
+        let omitted_body = p.request_extra_body("test-model", Some(omitted)).unwrap();
+        assert_eq!(
+            omitted_body["thinking"]["display"],
+            serde_json::json!("omitted"),
+            "each display variant must serialize to its snake_case name"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_prefixed_adaptive_model_id_resolves_adaptive() {
+        // Gateway routing prefixes model IDs; the shared style resolver
+        // matches on substrings, so a prefixed adaptive-only ID must still
+        // resolve to the adaptive shape (live gateways emit IDs like
+        // "claude-group/claude-fable-5").
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+
+        for model in [
+            "claude-group/claude-opus-4-7",
+            "team-alias/claude-fable-5-1",
+        ] {
+            let resolved = p.request_extra_body(model, Some(params)).unwrap();
+            assert_eq!(
+                resolved["thinking"],
+                serde_json::json!({"type": "adaptive"}),
+                "prefixed adaptive-only ID {model} must resolve to the adaptive shape"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_passthrough_adaptive_shape_flows_through_request_builder() {
+        // End to end through the non-streaming builder: an adaptive-only
+        // gateway model gets the adaptive thinking object at the top level.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: Some(zeroclaw_api::model_provider::ThinkingDisplay::Summarized),
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "claude-group/claude-fable-5-1",
+            None,
+            false,
+            false,
+            Some(params),
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value["thinking"],
+            serde_json::json!({"type": "adaptive", "display": "summarized"}),
+            "the request builder must carry the adaptive plus display shape to the wire"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_without_params_sends_no_thinking() {
+        // Flag on but the runtime supplied no native thinking params: nothing
+        // to forward, request must stay free of a thinking key.
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            None,
+            false,
+            false,
+            None,
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert!(
+            value.get("thinking").is_none(),
+            "params-None request must not carry a thinking key; got: {value}"
+        );
+        assert!(p.request_extra_body("test-model", None).is_none());
+    }
+
+    #[test]
+    fn thinking_passthrough_extra_body_keys_win_over_injected_thinking() {
+        // Explicit operator `extra_body` always wins: an extra_body `thinking`
+        // key must fully shadow the injected object.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .extra_body(serde_json::json!({"thinking": {"type": "off"}}))
+            .build();
+
+        let resolved = p.request_extra_body("test-model", Some(params)).unwrap();
+        assert_eq!(
+            resolved["thinking"],
+            serde_json::json!({"type": "off"}),
+            "explicit extra_body thinking key must win over the injected object"
+        );
+        assert!(
+            resolved.get("budget_tokens").is_none(),
+            "injected budget_tokens must not leak to the top level"
+        );
+    }
+
+    #[tokio::test]
+    async fn thinking_passthrough_explicit_enabled_override_raises_limit_above_its_budget() {
+        // An explicit `provider_extra` thinking key wins over the injected
+        // object, so normalization must follow the object that is actually
+        // serialized: an `enabled` override with its own budget raises
+        // `max_tokens` above THAT budget (the runtime budget is not the one
+        // on the wire) and still forces temperature 1.0.
+        use axum::Json;
+        use axum::Router;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let bodies_for_route = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let bodies = Arc::clone(&bodies_for_route);
+                async move {
+                    bodies.lock().unwrap().push(body);
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}]
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base_url = format!("http://{addr}");
+        let messages = vec![ChatMessage::user("hello")];
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url(&base_url)
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .extra_body(serde_json::json!({
+                "thinking": {"type": "enabled", "budget_tokens": 16_384}
+            }))
+            .max_tokens(Some(10_000))
+            .build();
+        p.chat_with_history_inner(&messages, "test-model", Some(0.7), Some(params))
+            .await
+            .unwrap();
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1, "one captured body per request");
+        assert_eq!(
+            bodies[0]["thinking"]["budget_tokens"],
+            serde_json::json!(16_384),
+            "explicit extra_body thinking budget must win over the injected one"
+        );
+        assert_eq!(
+            bodies[0]["max_tokens"],
+            serde_json::json!(16_385),
+            "max_tokens must be raised above the effective (override) budget; got max_tokens = {}",
+            bodies[0]["max_tokens"]
+        );
+        assert_eq!(
+            bodies[0]["temperature"],
+            serde_json::json!(1.0),
+            "an effective enabled thinking object still forces temperature 1.0"
+        );
+        drop(bodies);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn thinking_passthrough_explicit_off_override_keeps_temperature_and_limit() {
+        // The `off` override is the object actually serialized, so the
+        // request is not thinking-enabled: the caller's temperature and
+        // limit stand instead of the injected-shape normalization.
+        use axum::Json;
+        use axum::Router;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let bodies_for_route = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let bodies = Arc::clone(&bodies_for_route);
+                async move {
+                    bodies.lock().unwrap().push(body);
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}]
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base_url = format!("http://{addr}");
+        let messages = vec![ChatMessage::user("hello")];
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url(&base_url)
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .extra_body(serde_json::json!({"thinking": {"type": "off"}}))
+            .max_tokens(Some(10_000))
+            .build();
+        p.chat_with_history_inner(&messages, "test-model", Some(0.7), Some(params))
+            .await
+            .unwrap();
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1, "one captured body per request");
+        assert_eq!(
+            bodies[0]["thinking"],
+            serde_json::json!({"type": "off"}),
+            "explicit extra_body thinking key must win over the injected object"
+        );
+        assert_eq!(
+            bodies[0]["temperature"],
+            serde_json::json!(0.7),
+            "an effective off thinking object must keep the caller's temperature"
+        );
+        assert_eq!(
+            bodies[0]["max_tokens"],
+            serde_json::json!(10_000),
+            "an effective off thinking object must keep the configured limit"
+        );
+        drop(bodies);
+        server.abort();
+    }
+
+    #[test]
+    fn thinking_passthrough_override_shapes_flow_through_native_tool_builder() {
+        // The typed native-tools path resolves from the same effective
+        // object as the shared builder: an `off` override keeps the
+        // caller's values, an `enabled` override raises the limit above
+        // its own budget and still forces temperature 1.0.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let messages = vec![ChatMessage::user("hello")];
+
+        let off = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .extra_body(serde_json::json!({"thinking": {"type": "off"}}))
+            .max_tokens(Some(10_000))
+            .build();
+        let off_body = serde_json::to_value(off.build_native_tool_chat_request(
+            &messages,
+            Some(vec![NativeToolSpec {
+                kind: "function".to_string(),
+                extra: serde_json::Map::new(),
+                function: NativeToolFunctionSpec {
+                    extra: serde_json::Map::new(),
+                    name: "get_weather".to_string(),
+                    description: String::new(),
+                    parameters: std::sync::Arc::new(serde_json::json!({})),
+                },
+            }]),
+            "test-model",
+            Some(0.7),
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            off_body["thinking"],
+            serde_json::json!({"type": "off"}),
+            "explicit off override must win on the typed path; got: {off_body}"
+        );
+        assert_eq!(
+            off_body["temperature"],
+            serde_json::json!(0.7),
+            "effective off object keeps the caller's temperature on the typed path"
+        );
+        assert_eq!(
+            off_body["max_tokens"],
+            serde_json::json!(10_000),
+            "effective off object keeps the configured limit on the typed path"
+        );
+
+        let enabled = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .extra_body(serde_json::json!({
+                "thinking": {"type": "enabled", "budget_tokens": 16_384}
+            }))
+            .max_tokens(Some(10_000))
+            .build();
+        let enabled_body = serde_json::to_value(enabled.build_native_tool_chat_request(
+            &messages,
+            Some(vec![NativeToolSpec {
+                kind: "function".to_string(),
+                extra: serde_json::Map::new(),
+                function: NativeToolFunctionSpec {
+                    extra: serde_json::Map::new(),
+                    name: "get_weather".to_string(),
+                    description: String::new(),
+                    parameters: std::sync::Arc::new(serde_json::json!({})),
+                },
+            }]),
+            "test-model",
+            Some(0.7),
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            enabled_body["thinking"]["budget_tokens"],
+            serde_json::json!(16_384),
+            "explicit enabled override budget must win on the typed path; got: {enabled_body}"
+        );
+        assert_eq!(
+            enabled_body["max_tokens"],
+            serde_json::json!(16_385),
+            "typed path must raise the limit above the effective override budget; got: {enabled_body}"
+        );
+        assert_eq!(
+            enabled_body["temperature"],
+            serde_json::json!(1.0),
+            "effective enabled object still forces temperature 1.0 on the typed path"
+        );
+    }
+
+    #[tokio::test]
+    async fn thinking_passthrough_prompt_guided_fallback_never_injects_or_normalizes() {
+        // Streaming sites pass streaming_thinking_params, which is None
+        // whenever passthrough is on: the tool-less streaming fallback can
+        // never inject the thinking object, so it never normalizes either.
+        // Without an override the body carries no `thinking` key at all;
+        // an operator's explicit override rides along as their own request
+        // with the caller's temperature and limit untouched.
+        use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
+        use futures_util::StreamExt as _;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let bodies_for_route = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let bodies = Arc::clone(&bodies_for_route);
+                async move {
+                    let streaming =
+                        body.get("stream").and_then(serde_json::Value::as_bool) == Some(true);
+                    bodies.lock().unwrap().push(body);
+                    if streaming {
+                        return (
+                            StatusCode::OK,
+                            [("content-type", "text/event-stream")],
+                            concat!(
+                                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                                "data: [DONE]\n\n"
+                            ),
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base_url = format!("http://{addr}");
+        let messages = vec![ChatMessage::user("hello")];
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+
+        let plain = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url(&base_url)
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .max_tokens(Some(10_000))
+            .build();
+        let events = plain
+            .stream_chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: Some(params),
+                },
+                "test-model",
+                Some(0.75),
+                StreamOptions {
+                    enabled: true,
+                    count_tokens: false,
+                },
+            )
+            .collect::<Vec<_>>()
+            .await;
+        assert!(
+            events.iter().all(Result::is_ok),
+            "fallback stream must succeed: {events:?}"
+        );
+
+        let override_provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url(&base_url)
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .extra_body(serde_json::json!({
+                "thinking": {"type": "enabled", "budget_tokens": 16_384}
+            }))
+            .max_tokens(Some(10_000))
+            .build();
+        let events = override_provider
+            .stream_chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: Some(params),
+                },
+                "test-model",
+                Some(0.7),
+                StreamOptions {
+                    enabled: true,
+                    count_tokens: false,
+                },
+            )
+            .collect::<Vec<_>>()
+            .await;
+        assert!(
+            events.iter().all(Result::is_ok),
+            "override fallback stream must succeed: {events:?}"
+        );
+
+        server.abort();
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "one captured body per stream");
+        assert!(
+            bodies[0].get("thinking").is_none(),
+            "passthrough streaming fallback must not inject a thinking object; got: {}",
+            bodies[0]
+        );
+        assert_eq!(
+            bodies[0]["temperature"],
+            serde_json::json!(0.75),
+            "no injection means no temperature forcing on the fallback body"
+        );
+        assert_eq!(
+            bodies[0]["max_tokens"],
+            serde_json::json!(10_000),
+            "no injection means no limit raising on the fallback body"
+        );
+        assert_eq!(
+            bodies[1]["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 16_384}),
+            "an explicit override rides the fallback body as the operator's own request"
+        );
+        assert_eq!(
+            bodies[1]["temperature"],
+            serde_json::json!(0.7),
+            "the fallback never normalizes, even with an enabled override configured"
+        );
+        assert_eq!(
+            bodies[1]["max_tokens"],
+            serde_json::json!(10_000),
+            "the fallback never raises the limit, even with an enabled override configured"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_merges_alongside_unrelated_extra_body_keys() {
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 4_096,
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .extra_body(serde_json::json!({"top_k": 5}))
+            .build();
+
+        let resolved = p.request_extra_body("test-model", Some(params)).unwrap();
+        assert_eq!(
+            resolved["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 4_096}),
+            "injected thinking object must ride alongside unrelated extra_body keys"
+        );
+        assert_eq!(resolved["top_k"], serde_json::json!(5));
+    }
+
+    #[test]
+    fn thinking_passthrough_non_object_extra_body_wins_outright() {
+        // A non-object extra_body cannot be key-merged; the explicit config
+        // value wins outright. (Serializing it would fail at the existing
+        // serde(flatten) boundary — unchanged pre-existing behavior — so
+        // this pins the seam, not the wire.)
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .extra_body(serde_json::json!("scalar"))
+            .build();
+
+        assert_eq!(
+            p.request_extra_body("test-model", Some(params)),
+            Some(serde_json::json!("scalar")),
+            "non-object extra_body must win outright over the injected thinking object"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_forces_temperature_in_native_tool_builder() {
+        // Anthropic rejects extended thinking combined with a modified
+        // temperature: whenever the builder injects the thinking object, the
+        // caller's temperature must be replaced with 1.0 (the native
+        // provider's rule). Flag off and params-None keep the caller's
+        // value, leaving those bodies byte-identical.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let messages = vec![ChatMessage::user("hello")];
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value["temperature"],
+            serde_json::json!(1.0),
+            "injected thinking requires temperature 1.0; got: {value}"
+        );
+        assert_eq!(
+            value["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 8_192}),
+            "the forcing must ride on an actually injected thinking object"
+        );
+
+        let flag_off = make_model_provider("gateway", "http://localhost:8000/v1", None);
+        let legacy = serde_json::to_value(flag_off.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            legacy["temperature"],
+            serde_json::json!(0.75),
+            "flag-off request must keep the caller's temperature"
+        );
+        assert!(
+            legacy.get("thinking").is_none(),
+            "flag-off request must inject nothing; got: {legacy}"
+        );
+
+        let no_params = serde_json::to_value(p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            no_params["temperature"],
+            serde_json::json!(0.75),
+            "params-None request under passthrough must keep the caller's temperature"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_forces_temperature_in_raw_tool_builder() {
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let messages = vec![ChatMessage::user("hello")];
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+
+        let req = p.build_raw_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value["temperature"],
+            serde_json::json!(1.0),
+            "raw tool builder must force temperature 1.0 when thinking is injected"
+        );
+        assert!(value.get("thinking").is_some());
+
+        let flag_off = make_model_provider("gateway", "http://localhost:8000/v1", None);
+        let legacy = serde_json::to_value(flag_off.build_raw_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            legacy["temperature"],
+            serde_json::json!(0.75),
+            "flag-off raw tool request must keep the caller's temperature"
+        );
+        assert!(legacy.get("thinking").is_none());
+
+        let no_params = serde_json::to_value(p.build_raw_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            no_params["temperature"],
+            serde_json::json!(0.75),
+            "params-None raw tool request must keep the caller's temperature"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_forces_temperature_for_adaptive_style() {
+        // The forcing rule is style-independent, matching the native
+        // provider: an adaptive-only gateway model with thinking params also
+        // gets temperature 1.0.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "claude-group/claude-fable-5-1",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value["temperature"],
+            serde_json::json!(1.0),
+            "adaptive-style thinking must force temperature 1.0 too"
+        );
+        assert_eq!(
+            value["thinking"],
+            serde_json::json!({"type": "adaptive"}),
+            "the adaptive shape must still be the injected object"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_keeps_temperature_on_streaming_builder() {
+        // Passthrough never attaches thinking to the streamed wire
+        // (streaming_thinking_params): the temperature resolves from the
+        // same params the builder actually injects, so the streamed body
+        // behaves like thinking-off for the temperature as well: the
+        // caller's value is kept, nothing is forced. Flag off is the same
+        // byte-identical legacy body.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let messages = vec![ChatMessage::user("hello")];
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+
+        let streamed = serde_json::to_value(p.build_streaming_native_tool_request(
+            "test-model",
+            &messages,
+            Some(vec![]),
+            Some(0.75),
+            true,
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            streamed["temperature"],
+            serde_json::json!(0.75),
+            "streamed requests under passthrough carry no thinking object, so the caller's temperature is kept"
+        );
+        assert!(
+            streamed.get("thinking").is_none(),
+            "streamed request must inject nothing; got: {streamed}"
+        );
+
+        let flag_off = make_model_provider("gateway", "http://localhost:8000/v1", None);
+        let legacy = serde_json::to_value(flag_off.build_streaming_native_tool_request(
+            "test-model",
+            &messages,
+            Some(vec![]),
+            Some(0.75),
+            true,
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            legacy["temperature"],
+            serde_json::json!(0.75),
+            "flag-off streamed request must keep the caller's temperature"
+        );
+        assert!(legacy.get("thinking").is_none());
+    }
+
+    #[tokio::test]
+    async fn thinking_passthrough_forces_temperature_on_history_fallback() {
+        // The prompt-guided fallback rebuilds the request through
+        // chat_with_history_inner with the runtime's thinking params: the
+        // rebuilt body must carry the same temperature forcing as the
+        // primary path.
+        use axum::Json;
+        use axum::Router;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let bodies_for_route = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let bodies = Arc::clone(&bodies_for_route);
+                async move {
+                    bodies.lock().unwrap().push(body);
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}]
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base_url = format!("http://{addr}");
+        let messages = vec![ChatMessage::user("hello")];
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url(&base_url)
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        p.chat_with_history_inner(&messages, "test-model", Some(0.75), Some(params))
+            .await
+            .unwrap();
+
+        let flag_off = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url(&base_url)
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .build();
+        flag_off
+            .chat_with_history_inner(&messages, "test-model", Some(0.75), Some(params))
+            .await
+            .unwrap();
+
+        p.chat_with_history_inner(&messages, "test-model", Some(0.75), None)
+            .await
+            .unwrap();
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 3, "one captured body per request");
+        assert_eq!(
+            bodies[0]["temperature"],
+            serde_json::json!(1.0),
+            "fallback request with injected thinking must carry temperature 1.0"
+        );
+        assert!(bodies[0].get("thinking").is_some());
+        assert_eq!(
+            bodies[1]["temperature"],
+            serde_json::json!(0.75),
+            "flag-off fallback request must keep the caller's temperature"
+        );
+        assert!(bodies[1].get("thinking").is_none());
+        assert_eq!(
+            bodies[2]["temperature"],
+            serde_json::json!(0.75),
+            "params-None fallback request must keep the caller's temperature"
+        );
+        drop(bodies);
+        server.abort();
+    }
+
+    #[test]
+    fn thinking_passthrough_raises_max_tokens_in_native_tool_builder() {
+        // Anthropic rejects a fixed-budget thinking request whose output
+        // limit does not strictly exceed the budget: whenever the builder
+        // injects the thinking object, the configured limit is raised to
+        // budget_tokens + 1 (the native provider's rule). Flag off and
+        // params-None keep the configured limit, leaving those bodies
+        // byte-identical.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let messages = vec![ChatMessage::user("hello")];
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .max_tokens(Some(4_096))
+            .build();
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value["max_tokens"],
+            serde_json::json!(8_193),
+            "injected thinking requires max_tokens above the budget; got: {value}"
+        );
+        assert_eq!(
+            value["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 8_192}),
+            "the raising must ride on an actually injected thinking object"
+        );
+
+        let flag_off = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .max_tokens(Some(4_096))
+            .build();
+        let legacy = serde_json::to_value(flag_off.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            legacy["max_tokens"],
+            serde_json::json!(4_096),
+            "flag-off request must keep the configured max_tokens"
+        );
+        assert!(
+            legacy.get("thinking").is_none(),
+            "flag-off request must inject nothing; got: {legacy}"
+        );
+
+        let no_params = serde_json::to_value(p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            no_params["max_tokens"],
+            serde_json::json!(4_096),
+            "params-None request under passthrough must keep the configured max_tokens"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_raises_max_tokens_in_raw_tool_builder() {
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let messages = vec![ChatMessage::user("hello")];
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .max_tokens(Some(4_096))
+            .build();
+
+        let req = p.build_raw_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value["max_tokens"],
+            serde_json::json!(8_193),
+            "raw tool builder must raise max_tokens when thinking is injected"
+        );
+        assert!(value.get("thinking").is_some());
+
+        let flag_off = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .max_tokens(Some(4_096))
+            .build();
+        let legacy = serde_json::to_value(flag_off.build_raw_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            legacy["max_tokens"],
+            serde_json::json!(4_096),
+            "flag-off raw tool request must keep the configured max_tokens"
+        );
+        assert!(legacy.get("thinking").is_none());
+
+        let no_params = serde_json::to_value(p.build_raw_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            no_params["max_tokens"],
+            serde_json::json!(4_096),
+            "params-None raw tool request must keep the configured max_tokens"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_keeps_max_tokens_when_configured_above_budget() {
+        // The native rule raises only when needed: a configured limit
+        // already above the budget is sent unchanged, and an unset limit
+        // resolves to the minimum the budget requires.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let messages = vec![ChatMessage::user("hello")];
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .max_tokens(Some(16_384))
+            .build();
+        let value = serde_json::to_value(p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            value["max_tokens"],
+            serde_json::json!(16_384),
+            "configured limit above the budget must be kept"
+        );
+        assert!(value.get("thinking").is_some());
+
+        let unset = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let value = serde_json::to_value(unset.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            value["max_tokens"],
+            serde_json::json!(8_193),
+            "unset limit must resolve to the budget minimum"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_keeps_max_tokens_for_adaptive_style() {
+        // The raising rule is budget-only, matching the native provider:
+        // adaptive-style thinking carries no budget, so the configured
+        // limit is unconstrained.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .max_tokens(Some(4_096))
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "claude-group/claude-fable-5-1",
+            Some(0.75),
+            false,
+            false,
+            Some(params),
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value["max_tokens"],
+            serde_json::json!(4_096),
+            "adaptive-style thinking must keep the configured max_tokens"
+        );
+        assert_eq!(
+            value["thinking"],
+            serde_json::json!({"type": "adaptive"}),
+            "the adaptive shape must still be the injected object"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_keeps_max_tokens_on_streaming_builder() {
+        // Passthrough never attaches thinking to the streamed wire
+        // (streaming_thinking_params): the limit resolves from the same
+        // params the builder actually injects, so the streamed body
+        // behaves like thinking-off for the limit as well: the configured
+        // value is kept, nothing is raised. Flag off is the same
+        // byte-identical legacy body.
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let messages = vec![ChatMessage::user("hello")];
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .max_tokens(Some(4_096))
+            .build();
+
+        let streamed = serde_json::to_value(p.build_streaming_native_tool_request(
+            "test-model",
+            &messages,
+            Some(vec![]),
+            Some(0.75),
+            true,
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            streamed["max_tokens"],
+            serde_json::json!(4_096),
+            "streamed requests under passthrough carry no thinking object, so the configured max_tokens is kept"
+        );
+        assert!(
+            streamed.get("thinking").is_none(),
+            "streamed request must inject nothing; got: {streamed}"
+        );
+
+        let flag_off = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("http://localhost:8000/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .max_tokens(Some(4_096))
+            .build();
+        let legacy = serde_json::to_value(flag_off.build_streaming_native_tool_request(
+            "test-model",
+            &messages,
+            Some(vec![]),
+            Some(0.75),
+            true,
+            false,
+            false,
+            Some(params),
+        ))
+        .unwrap();
+        assert_eq!(
+            legacy["max_tokens"],
+            serde_json::json!(4_096),
+            "flag-off streamed request must keep the configured max_tokens"
+        );
+        assert!(legacy.get("thinking").is_none());
+    }
+
+    #[tokio::test]
+    async fn thinking_passthrough_raises_max_tokens_on_history_fallback() {
+        // The prompt-guided fallback rebuilds the request through
+        // chat_with_history_inner with the runtime's thinking params: the
+        // rebuilt body must carry the same budget-safe limit as the
+        // primary path.
+        use axum::Json;
+        use axum::Router;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let bodies_for_route = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let bodies = Arc::clone(&bodies_for_route);
+                async move {
+                    bodies.lock().unwrap().push(body);
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}]
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base_url = format!("http://{addr}");
+        let messages = vec![ChatMessage::user("hello")];
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+
+        let p = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url(&base_url)
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .max_tokens(Some(4_096))
+            .build();
+        p.chat_with_history_inner(&messages, "test-model", Some(0.75), Some(params))
+            .await
+            .unwrap();
+
+        let flag_off = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url(&base_url)
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .max_tokens(Some(4_096))
+            .build();
+        flag_off
+            .chat_with_history_inner(&messages, "test-model", Some(0.75), Some(params))
+            .await
+            .unwrap();
+
+        p.chat_with_history_inner(&messages, "test-model", Some(0.75), None)
+            .await
+            .unwrap();
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 3, "one captured body per request");
+        assert_eq!(
+            bodies[0]["max_tokens"],
+            serde_json::json!(8_193),
+            "fallback request with injected thinking must carry a budget-safe limit"
+        );
+        assert!(bodies[0].get("thinking").is_some());
+        assert_eq!(
+            bodies[1]["max_tokens"],
+            serde_json::json!(4_096),
+            "flag-off fallback request must keep the configured max_tokens"
+        );
+        assert!(bodies[1].get("thinking").is_none());
+        assert_eq!(
+            bodies[2]["max_tokens"],
+            serde_json::json!(4_096),
+            "params-None fallback request must keep the configured max_tokens"
+        );
+        drop(bodies);
+        server.abort();
+    }
+
+    #[test]
     fn build_native_tool_chat_request_omits_tool_choice_when_no_tools() {
         let p = make_model_provider("vllm", "http://localhost:8000/v1", None);
         let messages = vec![ChatMessage::user("hello")];
@@ -5902,8 +8039,15 @@ mod tests {
         // directly.
 
         // None tools → no tool_choice key.
-        let req =
-            p.build_native_tool_chat_request(&messages, None, "test-model", None, false, false);
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            None,
+            "test-model",
+            None,
+            false,
+            false,
+            None,
+        );
         let value = serde_json::to_value(&req).unwrap();
         assert!(
             value.get("tool_choice").is_none(),
@@ -5918,6 +8062,7 @@ mod tests {
             None,
             false,
             false,
+            None,
         );
         let value_empty = serde_json::to_value(&req_empty).unwrap();
         assert!(
@@ -5947,6 +8092,7 @@ mod tests {
             None,
             false,
             false,
+            None,
         );
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
@@ -5980,8 +8126,15 @@ mod tests {
             },
         }];
 
-        let req =
-            p.build_native_tool_chat_request(&messages, Some(tools), "gpt-5", None, false, false);
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            Some(tools),
+            "gpt-5",
+            None,
+            false,
+            false,
+            None,
+        );
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
             value
@@ -6006,7 +8159,8 @@ mod tests {
             .build();
         let messages = vec![ChatMessage::user("hello")];
 
-        let req = p.build_native_tool_chat_request(&messages, None, "gpt-5", None, false, false);
+        let req =
+            p.build_native_tool_chat_request(&messages, None, "gpt-5", None, false, false, None);
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
             value
@@ -6260,6 +8414,591 @@ mod tests {
             Some("high")
         );
         assert!(bodies[0].get("tools").is_some());
+        server.abort();
+    }
+
+    /// Spawn a mock endpoint that rejects any request carrying `tools` with a
+    /// schema-unsupported error and accepts the tool-less fallback. Returns
+    /// the bound address, the recorded bodies, and the server handle.
+    fn spawn_schema_rejecting_endpoint() -> impl std::future::Future<
+        Output = (
+            std::net::SocketAddr,
+            std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+            ::tokio::task::JoinHandle<()>,
+        ),
+    > {
+        use axum::Json;
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        async move {
+            let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+            let bodies_for_route = Arc::clone(&bodies);
+            let app = Router::new().route(
+                "/chat/completions",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let bodies = Arc::clone(&bodies_for_route);
+                    async move {
+                        let rejects = body.get("tools").is_some();
+                        bodies.lock().unwrap().push(body);
+                        if rejects {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": {
+                                        "message": "unknown parameter: tools",
+                                    }
+                                })),
+                            )
+                                .into_response();
+                        }
+                        Json(serde_json::json!({
+                            "choices": [{
+                                "message": {
+                                    "content": "ok",
+                                    "thinking_blocks": [
+                                        {
+                                            "type": "thinking",
+                                            "thinking": "guided fallback thought",
+                                            "signature": "sig_fb"
+                                        }
+                                    ]
+                                }
+                            }]
+                        }))
+                        .into_response()
+                    }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.expect("serve schema test");
+            });
+            (addr, bodies, server)
+        }
+    }
+
+    /// Schema-rejecting endpoint whose tool-less fallback responses carry
+    /// signed thinking blocks, so the first fallback turn produces captured
+    /// reasoning for the second turn's history.
+    fn spawn_schema_rejecting_endpoint_with_signed_fallback() -> impl std::future::Future<
+        Output = (
+            std::net::SocketAddr,
+            std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+            ::tokio::task::JoinHandle<()>,
+        ),
+    > {
+        use axum::Json;
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        async move {
+            let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+            let bodies_for_route = Arc::clone(&bodies);
+            let app = Router::new().route(
+                "/chat/completions",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let bodies = Arc::clone(&bodies_for_route);
+                    async move {
+                        let rejects = body.get("tools").is_some();
+                        bodies.lock().unwrap().push(body);
+                        if rejects {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": { "message": "unknown parameter: tools" }
+                                })),
+                            )
+                                .into_response();
+                        }
+                        Json(serde_json::json!({
+                            "choices": [{
+                                "message": {
+                                    "content": "ok",
+                                    "thinking_blocks": [
+                                        {"type": "thinking", "thinking": "visible", "signature": "sig1"},
+                                        {"type": "thinking", "thinking": "", "signature": "sig-only"},
+                                        {"type": "redacted_thinking", "data": "ErUBCkEIRAP...opaque"}
+                                    ]
+                                }
+                            }]
+                        }))
+                        .into_response()
+                    }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("serve signed fallback test");
+            });
+            (addr, bodies, server)
+        }
+    }
+
+    /// Schema-rejecting endpoint whose tool-less fallback reply carries a
+    /// native tool call beside visible content, signed thinking, and usage:
+    /// the prompt-guided fallback retry is not limited to text-only replies.
+    fn spawn_schema_rejecting_endpoint_with_tool_call_fallback() -> impl std::future::Future<
+        Output = (
+            std::net::SocketAddr,
+            std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+            ::tokio::task::JoinHandle<()>,
+        ),
+    > {
+        use axum::Json;
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        async move {
+            let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+            let bodies_for_route = Arc::clone(&bodies);
+            let app = Router::new().route(
+                "/chat/completions",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let bodies = Arc::clone(&bodies_for_route);
+                    async move {
+                        let rejects = body.get("tools").is_some();
+                        bodies.lock().unwrap().push(body);
+                        if rejects {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": { "message": "unknown parameter: tools" }
+                                })),
+                            )
+                                .into_response();
+                        }
+                        Json(serde_json::json!({
+                            "choices": [{
+                                "message": {
+                                    "content": "ok",
+                                    "tool_calls": [{
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "get_weather",
+                                            "arguments": "{\"city\":\"SF\"}"
+                                        }
+                                    }],
+                                    "thinking_blocks": [
+                                        {"type": "thinking", "thinking": "fallback thought", "signature": "sig_norm"}
+                                    ]
+                                }
+                            }],
+                            "usage": {"prompt_tokens": 12, "completion_tokens": 34}
+                        }))
+                        .into_response()
+                    }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("serve tool-call fallback test");
+            });
+            (addr, bodies, server)
+        }
+    }
+
+    #[tokio::test]
+    async fn second_schema_fallback_replays_signed_history() {
+        let (addr, bodies, server) = spawn_schema_rejecting_endpoint_with_signed_fallback().await;
+
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url(&format!("http://{addr}"))
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "get_weather",
+            "Get weather",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+        let thinking = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+
+        // Turn 1: schema rejected, prompt-guided fallback succeeds and its
+        // response carries signed thinking blocks, which capture converts
+        // into replay lines.
+        let turn_one = vec![ChatMessage::user("What is the weather in SF?")];
+        let response = provider
+            .chat(
+                crate::traits::ChatRequest {
+                    messages: &turn_one,
+                    tools: Some(&tools),
+                    thinking: Some(thinking),
+                },
+                "test-model",
+                None,
+            )
+            .await
+            .unwrap();
+        let captured = response
+            .reasoning_content
+            .expect("fallback thinking captured");
+        let captured_lines: Vec<&str> = captured.split('\n').collect();
+        assert_eq!(captured_lines.len(), 3, "signed, signature-only, redacted");
+
+        // Turn 2: history carries the runtime-persisted reasoning envelope;
+        // the gateway rejects the schema again, so this request also goes
+        // through the fallback history builder.
+        let envelope = serde_json::json!({
+            "content": "ok",
+            "reasoning_content": captured,
+        });
+        let turn_two = vec![
+            ChatMessage::user("What is the weather in SF?"),
+            ChatMessage::assistant(envelope.to_string()),
+            ChatMessage::user("And the forecast for tomorrow?"),
+        ];
+        provider
+            .chat(
+                crate::traits::ChatRequest {
+                    messages: &turn_two,
+                    tools: Some(&tools),
+                    thinking: Some(thinking),
+                },
+                "test-model",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let bodies = bodies.lock().unwrap();
+        // Each chat call records its rejected primary request plus its
+        // fallback request: [primary-1, fallback-1, primary-2, fallback-2].
+        assert_eq!(bodies.len(), 4, "two calls, primary plus fallback each");
+        assert!(
+            bodies[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|message| message.get("thinking_blocks").is_none()),
+            "turn-1 history carries no reasoning yet"
+        );
+
+        let assistant = bodies[3]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .expect("assistant turn in second request");
+        assert_eq!(
+            assistant["thinking_blocks"],
+            serde_json::json!([
+                {"type": "thinking", "thinking": "visible", "signature": "sig1"},
+                {"type": "thinking", "thinking": "", "signature": "sig-only"},
+                {"type": "redacted_thinking", "data": "ErUBCkEIRAP...opaque"}
+            ]),
+            "the second fallback request must replay the exact signed blocks"
+        );
+        assert_eq!(
+            bodies[3]["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 8_192}),
+            "fallback request keeps the thinking request object"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fallback_history_replay_is_flag_gated() {
+        let (addr, bodies, server) = spawn_schema_rejecting_endpoint_with_signed_fallback().await;
+
+        // Same envelope history, flag OFF: the fallback wire must stay
+        // byte-identical to the pre-passthrough behavior, so the assistant
+        // message carries no thinking_blocks field at all.
+        let provider = make_model_provider("test", &format!("http://{addr}"), None);
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "get_weather",
+            "Get weather",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+        let messages = vec![
+            ChatMessage::user("What is the weather in SF?"),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "ok",
+                    "reasoning_content": "{\"thinking\":\"visible\",\"signature\":\"sig1\"}"
+                })
+                .to_string(),
+            ),
+            ChatMessage::user("And the forecast?"),
+        ];
+
+        provider
+            .chat(
+                crate::traits::ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "primary plus fallback");
+        let assistant = bodies[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .expect("assistant turn");
+        assert!(
+            assistant.get("thinking_blocks").is_none(),
+            "flag-off fallback wire must not grow a thinking_blocks field"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn schema_fallback_rethreads_thinking_params() {
+        let (addr, bodies, server) = spawn_schema_rejecting_endpoint().await;
+
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url(&format!("http://{addr}"))
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "get_weather",
+            "Get weather",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+        let thinking = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+
+        let response = provider
+            .chat(
+                crate::traits::ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: Some(thinking),
+                },
+                "test-model",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.text.as_deref(), Some("ok"));
+        let captured: serde_json::Value = serde_json::from_str(
+            response
+                .reasoning_content
+                .as_deref()
+                .expect("fallback response must capture the returned signed thinking"),
+        )
+        .unwrap();
+        assert_eq!(
+            captured,
+            serde_json::json!({
+                "thinking": "guided fallback thought",
+                "signature": "sig_fb"
+            }),
+            "fallback response must capture the returned signed thinking, not drop it"
+        );
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "schema fallback must be a single retry");
+        assert_eq!(
+            bodies[0]["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 8_192}),
+            "primary request carries the injected thinking object"
+        );
+        assert!(bodies[0].get("tools").is_some());
+        assert!(
+            bodies[1].get("tools").is_none(),
+            "fallback rebuild drops the tools parameter"
+        );
+        assert_eq!(
+            bodies[1]["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 8_192}),
+            "fallback rebuild must rethread the same thinking injection"
+        );
+        drop(bodies);
+        server.abort();
+
+        // Two-turn regression: the captured fallback thinking must replay on
+        // the next tool-loop iteration. Simulate turn 2 by appending the
+        // assistant turn (as the runtime persists it) and converting.
+        let assistant_content = serde_json::json!({
+            "content": "ok",
+            "reasoning_content": response.reasoning_content,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "name": "get_weather",
+                    "arguments": "{\"city\": \"SF\"}",
+                }
+            ],
+        });
+        let history = vec![
+            ChatMessage::user("hello"),
+            ChatMessage::assistant(assistant_content.to_string()),
+            ChatMessage::tool(r#"{"tool_call_id": "call_1", "content": "72F"}"#.to_string()),
+        ];
+        let native = provider.convert_messages_for_native(&history, false);
+        assert_eq!(
+            native[1].thinking_blocks,
+            Some(vec![serde_json::json!({
+                "type": "thinking",
+                "thinking": "guided fallback thought",
+                "signature": "sig_fb"
+            })]),
+            "turn-2 outbound must replay the exact signed blocks captured on the fallback turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_fallback_returns_normalized_text_beside_native_tool_calls() {
+        let (addr, bodies, server) =
+            spawn_schema_rejecting_endpoint_with_tool_call_fallback().await;
+
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url(&format!("http://{addr}"))
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "get_weather",
+            "Get weather",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+        let thinking = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 8_192,
+            display: None,
+        };
+        let messages = vec![ChatMessage::user("What is the weather in SF?")];
+
+        let response = provider
+            .chat(
+                crate::traits::ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: Some(thinking),
+                },
+                "test-model",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.text.as_deref(),
+            Some("ok"),
+            "fallback text must stay the normalized content, not the legacy JSON projection"
+        );
+        assert!(
+            !response
+                .text
+                .as_deref()
+                .unwrap_or_default()
+                .contains("tool_calls"),
+            "visible narration must not carry the serialized message JSON"
+        );
+        assert_eq!(
+            response.tool_calls.len(),
+            1,
+            "the native call must surface structurally"
+        );
+        assert_eq!(response.tool_calls[0].name, "get_weather");
+        assert_eq!(response.tool_calls[0].arguments, "{\"city\":\"SF\"}");
+        let captured: serde_json::Value = serde_json::from_str(
+            response
+                .reasoning_content
+                .as_deref()
+                .expect("fallback response must capture the returned signed thinking"),
+        )
+        .unwrap();
+        assert_eq!(
+            captured,
+            serde_json::json!({
+                "thinking": "fallback thought",
+                "signature": "sig_norm"
+            }),
+            "fallback response must capture the returned signed thinking"
+        );
+        let usage = response.usage.expect("fallback response surfaces usage");
+        assert_eq!(usage.input_tokens, Some(12));
+        assert_eq!(usage.output_tokens, Some(34));
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "schema fallback must be a single retry");
+        drop(bodies);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn chat_with_history_keeps_legacy_json_text_for_tool_call_responses() {
+        let reply = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_legacy",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": "{\"city\":\"SF\"}"
+                        }
+                    }]
+                }
+            }]
+        });
+        let (provider, _captured, server) = mock_non_streaming_response(reply.clone()).await;
+        let messages = vec![ChatMessage::user("What is the weather in SF?")];
+
+        let text = provider
+            .chat_with_history(&messages, "test-model", None)
+            .await
+            .expect("chat history should succeed");
+
+        let parsed: serde_json::Value = serde_json::from_str(&text)
+            .expect("tool-call replies keep the serialized-message JSON text contract");
+        assert_eq!(
+            parsed["tool_calls"][0]["function"]["name"],
+            serde_json::json!("get_weather"),
+            "legacy text names the called function"
+        );
+        let message: ResponseMessage =
+            serde_json::from_value(reply["choices"][0]["message"].clone())
+                .expect("reply message parses as the gateway message shape");
+        assert_eq!(
+            text,
+            serde_json::to_string(&message).expect("gateway message serializes"),
+            "legacy text is exactly the serialized gateway message"
+        );
+
         server.abort();
     }
 
@@ -6982,6 +9721,7 @@ mod tests {
                 tool_calls: None,
                 reasoning_content: None,
                 reasoning: None,
+                thinking_blocks: None,
                 name: None,
             }],
             temperature: Some(0.7),
@@ -7129,10 +9869,12 @@ mod tests {
                 Message {
                     role: "system".to_string(),
                     content: MessageContent::Text("You are ZeroClaw".to_string()),
+                    thinking_blocks: None,
                 },
                 Message {
                     role: "user".to_string(),
                     content: MessageContent::Text("hello".to_string()),
+                    thinking_blocks: None,
                 },
             ],
             temperature: Some(0.4),
@@ -8048,6 +10790,7 @@ mod tests {
                 extra_content: None,
             }]),
             reasoning_content: None,
+            thinking_blocks: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -8074,6 +10817,7 @@ mod tests {
                 extra_content: None,
             }]),
             reasoning_content: None,
+            thinking_blocks: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -8162,6 +10906,7 @@ mod tests {
                 extra_content: None,
             }]),
             reasoning_content: None,
+            thinking_blocks: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -8189,6 +10934,7 @@ mod tests {
                 extra_content: None,
             }]),
             reasoning_content: None,
+            thinking_blocks: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -8216,6 +10962,7 @@ mod tests {
                 extra_content: None,
             }]),
             reasoning_content: None,
+            thinking_blocks: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -8257,6 +11004,7 @@ mod tests {
                 },
             ]),
             reasoning_content: None,
+            thinking_blocks: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -8822,6 +11570,7 @@ mod tests {
             tool_calls: None,
             reasoning_content: None,
             reasoning: None,
+            thinking_blocks: None,
             name: Some("shell".to_string()),
         };
         let json = serde_json::to_string(&tool_with_name).unwrap();
@@ -8837,6 +11586,7 @@ mod tests {
             tool_calls: None,
             reasoning_content: None,
             reasoning: None,
+            thinking_blocks: None,
             name: None,
         };
         let json = serde_json::to_string(&tool_without_name).unwrap();
@@ -8852,6 +11602,7 @@ mod tests {
             tool_calls: None,
             reasoning_content: None,
             reasoning: None,
+            thinking_blocks: None,
             name: None,
         };
         let json = serde_json::to_string(&assistant_msg).unwrap();
@@ -9573,6 +12324,7 @@ mod tests {
             messages: vec![Message {
                 role: "user".to_string(),
                 content: MessageContent::Text("What is the weather?".to_string()),
+                thinking_blocks: None,
             }],
             temperature: Some(0.7),
             stream: Some(false),
@@ -9598,6 +12350,7 @@ mod tests {
             messages: vec![Message {
                 role: "user".to_string(),
                 content: MessageContent::Text("List /tmp".to_string()),
+                thinking_blocks: None,
             }],
             temperature: Some(0.7),
             stream: Some(false),
@@ -9634,6 +12387,7 @@ mod tests {
             messages: vec![Message {
                 role: "user".to_string(),
                 content: MessageContent::Text("List /tmp".to_string()),
+                thinking_blocks: None,
             }],
             temperature: Some(0.7),
             stream: Some(false),
@@ -9817,6 +12571,7 @@ mod tests {
             Some(0.7),
             true,
             false,
+            None,
         );
         let value = serde_json::to_value(&request).unwrap();
         let first_message = &value["messages"][0];
@@ -10608,15 +13363,15 @@ mod tests {
     /// `extra_body` (the same surface the thinking-passthrough feature
     /// uses), and it must ride alongside the cache breakpoints in one
     /// request: neither injection disturbs the other. This proves generic
-    /// flattened-body coexistence on the structured path; full proof that
-    /// the two operator flags compose awaits the thinking-passthrough
-    /// provider flag landing in this tree.
+    /// flattened-body coexistence on the structured path; the flag-side
+    /// composition proof lives in
+    /// `cache_and_thinking_passthrough_flags_compose_in_one_request` below.
     #[tokio::test]
     async fn cache_breakpoints_coexist_with_thinking_object_in_one_request() {
         let (provider, captured, server) = mock_streaming_cache_capture(true).await;
         // Builder-level extra_body mirrors what provider_extra supplies for
-        // thinking-capable gateways; swap in the flag-side equivalent when
-        // the thinking-passthrough provider flag lands in this tree.
+        // thinking-capable gateways; the flag-side equivalent is proven by
+        // cache_and_thinking_passthrough_flags_compose_in_one_request below.
         let provider = OpenAiCompatibleModelProvider {
             extra_body: Some(serde_json::json!({
                 "thinking": {"type": "enabled", "budget_tokens": 2048},
@@ -10658,6 +13413,73 @@ mod tests {
             requests[0]["messages"][3]["content"][0]["cache_control"],
             serde_json::json!({"type": "ephemeral"}),
             "rolling cache breakpoint present alongside the thinking object"
+        );
+    }
+
+    /// Flag composition, the real thing: both operator flags on one
+    /// provider, runtime thinking params supplied by the caller, and the
+    /// cache breakpoints still landing beside the injected thinking object
+    /// in a single request. Where the sibling test above proves flattened
+    /// extra_body coexistence, this one exercises the flags themselves
+    /// (flag-gated injection plus the forced temperature and budget-safe
+    /// output limit that come with it).
+    #[tokio::test]
+    async fn cache_and_thinking_passthrough_flags_compose_in_one_request() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let provider = OpenAiCompatibleModelProvider {
+            thinking_passthrough: true,
+            ..provider
+        };
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user("bye"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
+                        budget_tokens: 2048,
+                        display: None,
+                    }),
+                },
+                "test-model",
+                Some(0.7),
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("two-flag request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 2048}),
+            "the flag-injected thinking object rides at the top level"
+        );
+        assert_eq!(
+            requests[0]["temperature"],
+            serde_json::json!(1.0),
+            "thinking injection forces temperature 1.0 on the combined request"
+        );
+        assert_eq!(
+            requests[0]["messages"][0]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"}),
+            "system cache breakpoint present alongside flag-injected thinking"
+        );
+        assert_eq!(
+            requests[0]["messages"][3]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"}),
+            "rolling cache breakpoint present alongside flag-injected thinking"
+        );
+        let max_tokens = requests[0]["max_tokens"]
+            .as_u64()
+            .expect("budget-safe output limit is set");
+        assert!(
+            max_tokens > 2048,
+            "output limit must strictly exceed the thinking budget, got {max_tokens}"
         );
     }
 
@@ -10984,6 +13806,7 @@ mod tests {
                 parameters: None,
                 extra_content: None,
             }]),
+            thinking_blocks: None,
         };
 
         let parsed = provider.parse_native_response(message);
@@ -10999,11 +13822,709 @@ mod tests {
             content: Some("hello".to_string()),
             reasoning_content: None,
             tool_calls: None,
+            thinking_blocks: None,
         };
 
         let parsed = provider.parse_native_response(message);
         assert!(parsed.reasoning_content.is_none());
         assert_eq!(parsed.text.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn thinking_passthrough_off_keeps_reasoning_content_raw() {
+        // Flag off = today's behavior: `reasoning_content` passes through
+        // untouched and gateway `thinking_blocks` are ignored entirely.
+        let provider = make_model_provider("test", "https://example.com", None);
+        let message = ResponseMessage {
+            content: None,
+            reasoning_content: Some("raw chain of thought".to_string()),
+            tool_calls: None,
+            thinking_blocks: Some(vec![serde_json::json!({
+                "type": "thinking",
+                "thinking": "signed thought",
+                "signature": "sig"
+            })]),
+        };
+
+        let parsed = provider.parse_native_response(message);
+        assert_eq!(
+            parsed.reasoning_content.as_deref(),
+            Some("raw chain of thought"),
+            "flag-off capture must not normalize or wrap the reasoning string"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_capture_normalizes_thinking_blocks_to_signed_lines() {
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let message = ResponseMessage {
+            content: None,
+            reasoning_content: None,
+            tool_calls: None,
+            thinking_blocks: Some(vec![
+                serde_json::json!({"type": "thinking", "thinking": "first", "signature": "sig1"}),
+                serde_json::json!({"type": "thinking", "thinking": "second", "signature": "sig2"}),
+            ]),
+        };
+
+        let parsed = provider.parse_native_response(message);
+        let reasoning = parsed
+            .reasoning_content
+            .expect("blocks must normalize to lines");
+        let lines: Vec<serde_json::Value> = reasoning
+            .split('\n')
+            .map(|line| serde_json::from_str(line).expect("each line must be valid JSON"))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                serde_json::json!({"thinking": "first", "signature": "sig1"}),
+                serde_json::json!({"thinking": "second", "signature": "sig2"}),
+            ],
+            "capture must emit one signed-JSON line per thinking block, matching the \
+             native provider's reasoning_content format"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_capture_wraps_bare_reasoning_string_as_unsigned_line() {
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let message = ResponseMessage {
+            content: None,
+            reasoning_content: Some("plain reasoning".to_string()),
+            tool_calls: None,
+            thinking_blocks: None,
+        };
+
+        let parsed = provider.parse_native_response(message);
+        let reasoning = parsed.reasoning_content.expect("string must be captured");
+        let line: serde_json::Value =
+            serde_json::from_str(&reasoning).expect("captured string must be a JSON line");
+        assert_eq!(
+            line,
+            serde_json::json!({"thinking": "plain reasoning", "signature": ""}),
+            "bare reasoning strings normalize to an unsigned envelope line"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_capture_signed_blocks_win_over_plain_string() {
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let message = ResponseMessage {
+            content: None,
+            reasoning_content: Some("unsigned duplicate".to_string()),
+            tool_calls: None,
+            thinking_blocks: Some(vec![serde_json::json!({
+                "thinking": "signed", "signature": "sig"
+            })]),
+        };
+
+        let parsed = provider.parse_native_response(message);
+        let reasoning = parsed
+            .reasoning_content
+            .expect("capture must produce lines");
+        let line: serde_json::Value = serde_json::from_str(&reasoning).unwrap();
+        assert_eq!(
+            line,
+            serde_json::json!({"thinking": "signed", "signature": "sig"}),
+            "signed thinking_blocks are the authoritative capture source"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_capture_skips_empty_blocks_and_falls_back_to_string() {
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let message = ResponseMessage {
+            content: None,
+            reasoning_content: Some("fallback thought".to_string()),
+            tool_calls: None,
+            thinking_blocks: Some(vec![
+                serde_json::json!({"type": "thinking", "thinking": "", "signature": ""}),
+                serde_json::json!({"thinking": "", "signature": ""}),
+            ]),
+        };
+
+        let parsed = provider.parse_native_response(message);
+        let reasoning = parsed.reasoning_content.expect("fallback capture");
+        let line: serde_json::Value = serde_json::from_str(&reasoning).unwrap();
+        assert_eq!(
+            line,
+            serde_json::json!({"thinking": "fallback thought", "signature": ""}),
+            "blocks with neither text nor signature are skipped; bare string is the fallback"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_replay_reconstructs_signed_blocks() {
+        // Flag on + signed envelope history (2a capture format) -> outbound
+        // thinking_blocks; string fields suppressed.
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let signed = r#"{"content": "answer", "reasoning_content": "{\"thinking\":\"thought one\",\"signature\":\"sig1\"}\n{\"thinking\":\"thought two\",\"signature\":\"sig2\"}", "tool_calls": []}"#;
+        let messages = vec![ChatMessage::assistant(signed.to_string())];
+
+        let native = provider.convert_messages_for_native(&messages, false);
+        assert_eq!(native.len(), 1);
+        let message = &native[0];
+        assert_eq!(
+            message.reasoning_content, None,
+            "signed replay must suppress the reasoning_content string"
+        );
+        assert_eq!(message.reasoning, None);
+        let blocks = message
+            .thinking_blocks
+            .as_ref()
+            .expect("signed history must reconstruct thinking_blocks");
+        assert_eq!(
+            blocks,
+            &vec![
+                serde_json::json!({"type": "thinking", "thinking": "thought one", "signature": "sig1"}),
+                serde_json::json!({"type": "thinking", "thinking": "thought two", "signature": "sig2"}),
+            ],
+            "reconstructed blocks must be Anthropic content-block shaped"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_replay_signature_only_history_round_trips_probe_shape() {
+        // Live-probe fixture (slice 2b): 2a captures a signature-only block;
+        // replay must reconstruct exactly what the gateway sent.
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let signature_only = r#"{"content": "answer", "reasoning_content": "{\"thinking\":\"\",\"signature\":\"CAISkQIKjwEIERgCKkD/bXd1ajb4AEMrh8seIyvE22xRnQ==\"}", "tool_calls": []}"#;
+        let messages = vec![ChatMessage::assistant(signature_only.to_string())];
+
+        let native = provider.convert_messages_for_native(&messages, false);
+        let blocks = native[0]
+            .thinking_blocks
+            .as_ref()
+            .expect("signature-only history must reconstruct thinking_blocks");
+        assert_eq!(
+            blocks,
+            &vec![serde_json::json!({
+                "type": "thinking",
+                "thinking": "",
+                "signature": "CAISkQIKjwEIERgCKkD/bXd1ajb4AEMrh8seIyvE22xRnQ=="
+            })],
+            "signature-only capture must round-trip to the observed gateway block shape"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_replay_unsigned_history_is_noop() {
+        // Unsigned envelope (signature "") and plain unparseable text both
+        // send nothing: blocks are never fabricated, and a bare string is
+        // exactly what translating gateways reject.
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let messages = vec![
+            ChatMessage::assistant(
+                r#"{"content": "a", "reasoning_content": "{\"thinking\":\"t\",\"signature\":\"\"}"}"#
+                    .to_string(),
+            ),
+            ChatMessage::assistant(
+                r#"{"content": "b", "reasoning_content": "plain streamed reasoning"}"#.to_string(),
+            ),
+        ];
+
+        let native = provider.convert_messages_for_native(&messages, false);
+        assert_eq!(native.len(), 2);
+        for message in &native {
+            assert_eq!(
+                message.reasoning_content, None,
+                "unsigned history replays nothing"
+            );
+            assert_eq!(message.reasoning, None);
+            assert!(message.thinking_blocks.is_none(), "no fabricated blocks");
+        }
+    }
+
+    #[test]
+    fn thinking_passthrough_replay_mixed_lines_noop_entirely() {
+        // All-or-nothing: one unsigned line in signed history voids the
+        // replay rather than sending a partial block sequence.
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let mixed = r#"{"content": "answer", "reasoning_content": "{\"thinking\":\"signed\",\"signature\":\"sig\"}\n{\"thinking\":\"unsigned\",\"signature\":\"\"}", "tool_calls": []}"#;
+        let messages = vec![ChatMessage::assistant(mixed.to_string())];
+
+        let native = provider.convert_messages_for_native(&messages, false);
+        assert!(native[0].thinking_blocks.is_none());
+        assert_eq!(native[0].reasoning_content, None);
+    }
+
+    #[test]
+    fn thinking_passthrough_replay_flag_off_replays_strings_verbatim() {
+        // Flag off = today's behavior: strings replay, no blocks field.
+        let provider = make_model_provider("gateway", "https://example.com", None);
+        let signed = r#"{"content": "answer", "reasoning_content": "{\"thinking\":\"t\",\"signature\":\"sig\"}", "tool_calls": []}"#;
+        let messages = vec![ChatMessage::assistant(signed.to_string())];
+
+        let native = provider.convert_messages_for_native(&messages, false);
+        assert_eq!(
+            native[0].reasoning_content.as_deref(),
+            Some(r#"{"thinking":"t","signature":"sig"}"#),
+            "flag-off replay must pass the stored string through untouched"
+        );
+        assert!(native[0].thinking_blocks.is_none());
+    }
+
+    #[test]
+    fn thinking_passthrough_replay_replay_override_wins_over_flag() {
+        // replay_assistant_reasoning = false wins under thinking_passthrough:
+        // providers that reject reasoning input still get nothing.
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .without_assistant_reasoning_replay()
+            .build();
+        let signed = r#"{"content": "answer", "reasoning_content": "{\"thinking\":\"t\",\"signature\":\"sig\"}", "tool_calls": []}"#;
+        let messages = vec![ChatMessage::assistant(signed.to_string())];
+
+        let native = provider.convert_messages_for_native(&messages, false);
+        assert_eq!(native[0].reasoning_content, None);
+        assert_eq!(native[0].reasoning, None);
+        assert!(native[0].thinking_blocks.is_none());
+    }
+
+    #[test]
+    fn thinking_passthrough_replay_blocks_serialize_top_level() {
+        // The reconstructed blocks serialize as a top-level assistant
+        // message field for the gateway to translate.
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let signed = r#"{"content": "answer", "reasoning_content": "{\"thinking\":\"t\",\"signature\":\"sig\"}", "tool_calls": []}"#;
+        let messages = vec![ChatMessage::assistant(signed.to_string())];
+
+        let native = provider.convert_messages_for_native(&messages, false);
+        let value = serde_json::to_value(&native[0]).unwrap();
+        assert_eq!(
+            value["thinking_blocks"],
+            serde_json::json!([{"type": "thinking", "thinking": "t", "signature": "sig"}]),
+            "thinking_blocks must serialize at the assistant message top level"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_disables_streaming_capability() {
+        // Passthrough pins requests to the non-streaming wire: gateway SSE
+        // thinking frames are unverified, and streamed reasoning would reach
+        // history unsigned and break signed replay. Flag off keeps streaming.
+        let with_flag = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let without_flag = make_model_provider("gateway", "https://example.com", None);
+
+        assert!(
+            !with_flag.supports_streaming(),
+            "passthrough must report the provider as non-streaming"
+        );
+        assert!(without_flag.supports_streaming());
+    }
+
+    #[test]
+    fn thinking_passthrough_capture_preserves_redacted_blocks_verbatim() {
+        // redacted_thinking carries an opaque data field and no signature;
+        // the empty-empty skip must never swallow it. Non-thinking blocks
+        // are stored as raw JSON lines.
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let redacted = serde_json::json!({
+            "type": "redacted_thinking",
+            "data": "ErUBCkEIRAP...opaque"
+        });
+        let message = ResponseMessage {
+            content: Some("answer".to_string()),
+            reasoning_content: None,
+            tool_calls: None,
+            thinking_blocks: Some(vec![
+                serde_json::json!({
+                    "type": "thinking",
+                    "thinking": "visible thought",
+                    "signature": "sig1"
+                }),
+                redacted.clone(),
+            ]),
+        };
+
+        let parsed = provider.parse_native_response(message);
+        let reasoning = parsed
+            .reasoning_content
+            .expect("both blocks must be captured");
+        let lines: Vec<serde_json::Value> = reasoning
+            .split('\n')
+            .map(serde_json::from_str)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(lines.len(), 2, "thinking and redacted lines both captured");
+        assert_eq!(
+            lines[0],
+            serde_json::json!({"thinking": "visible thought", "signature": "sig1"}),
+        );
+        assert_eq!(
+            lines[1], redacted,
+            "redacted_thinking must be stored verbatim, data field intact"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_redacted_blocks_round_trip_verbatim() {
+        // Full circle: gateway blocks -> capture lines -> replay blocks, with
+        // the redacted block byte-identical and the thinking block canonical.
+        let redacted = serde_json::json!({
+            "type": "redacted_thinking",
+            "data": "ErUBCkEIRAP...opaque"
+        });
+        let thinking = serde_json::json!({
+            "type": "thinking",
+            "thinking": "visible thought",
+            "signature": "sig1"
+        });
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+
+        let message = ResponseMessage {
+            content: Some("answer".to_string()),
+            reasoning_content: None,
+            tool_calls: None,
+            thinking_blocks: Some(vec![thinking.clone(), redacted.clone()]),
+        };
+        let reasoning = provider
+            .parse_native_response(message)
+            .reasoning_content
+            .expect("capture must produce replay lines");
+
+        let blocks = OpenAiCompatibleModelProvider::reasoning_lines_to_thinking_blocks(&reasoning)
+            .expect("signed thinking plus redacted lines must reconstruct");
+        assert_eq!(
+            blocks,
+            vec![thinking, redacted],
+            "replay must emit the thinking block canonical and the redacted block verbatim"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_capture_skips_hostile_block_types() {
+        // Whitelist enforcement: only thinking and redacted_thinking are
+        // captured. A gateway-controlled text/tool_use/unknown-typed block
+        // must not become stored replay material.
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let message = ResponseMessage {
+            content: Some("answer".to_string()),
+            reasoning_content: None,
+            tool_calls: None,
+            thinking_blocks: Some(vec![
+                serde_json::json!({"type": "text", "text": "hostile text block"}),
+                serde_json::json!({
+                    "type": "tool_use",
+                    "id": "call_x",
+                    "name": "get_weather",
+                    "input": {"city": "SF"}
+                }),
+                serde_json::json!({"type": "totally_novel", "payload": "???"}),
+                serde_json::json!({
+                    "type": "thinking",
+                    "thinking": "real thought",
+                    "signature": "sig1"
+                }),
+            ]),
+        };
+
+        let parsed = provider.parse_native_response(message);
+        let reasoning = parsed
+            .reasoning_content
+            .expect("the thinking block must be captured");
+        let lines: Vec<&str> = reasoning.split('\n').collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "hostile block types must not reach replay history"
+        );
+        assert!(lines[0].contains("real thought"));
+        assert!(!lines[0].contains("hostile"));
+        assert!(!lines[0].contains("tool_use"));
+        assert!(!lines[0].contains("totally_novel"));
+    }
+
+    #[test]
+    fn thinking_passthrough_capture_rejects_malformed_redacted_blocks() {
+        // redacted_thinking without a non-empty data field fails validation
+        // and is skipped, not stored verbatim.
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let message = ResponseMessage {
+            content: Some("answer".to_string()),
+            reasoning_content: None,
+            tool_calls: None,
+            thinking_blocks: Some(vec![
+                serde_json::json!({"type": "redacted_thinking"}),
+                serde_json::json!({"type": "redacted_thinking", "data": ""}),
+                serde_json::json!({"type": "redacted_thinking", "data": "ErUBCkEIRAP"}),
+            ]),
+        };
+
+        let parsed = provider.parse_native_response(message);
+        let reasoning = parsed
+            .reasoning_content
+            .expect("the well-formed block must be captured");
+        let lines: Vec<&str> = reasoning.split('\n').collect();
+        assert_eq!(lines.len(), 1, "only the validated redacted block survives");
+        assert!(lines[0].contains("ErUBCkEIRAP"));
+    }
+
+    #[test]
+    fn thinking_passthrough_replay_does_not_forward_hostile_lines() {
+        // History written before the whitelist (or tampered) must not forward
+        // unknown-typed blocks into outbound thinking_blocks. Well-formed
+        // siblings still replay.
+        let reasoning = format!(
+            "{}\n{}\n{}",
+            r#"{"type":"text","text":"hostile"}"#,
+            r#"{"type":"tool_use","id":"call_x","name":"f","input":{}}"#,
+            r#"{"type":"thinking","thinking":"real","signature":"sig1"}"#
+        );
+
+        let blocks = OpenAiCompatibleModelProvider::reasoning_lines_to_thinking_blocks(&reasoning)
+            .expect("a valid signed line exists");
+        assert_eq!(
+            blocks,
+            vec![serde_json::json!({
+                "type": "thinking",
+                "thinking": "real",
+                "signature": "sig1"
+            })],
+            "hostile typed lines must be skipped, valid thinking forwarded"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_replay_skips_malformed_redacted_lines() {
+        // A redacted line without data cannot come from fixed capture; it
+        // must not forward. Signed thinking siblings still replay.
+        let reasoning = format!(
+            "{}\n{}",
+            r#"{"type":"redacted_thinking"}"#,
+            r#"{"type":"thinking","thinking":"t","signature":"sig"}"#
+        );
+
+        let blocks = OpenAiCompatibleModelProvider::reasoning_lines_to_thinking_blocks(&reasoning)
+            .expect("a valid signed line exists");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], serde_json::json!("thinking"));
+    }
+
+    #[tokio::test]
+    async fn thinking_passthrough_tool_loop_replays_signed_blocks_on_turn_two() {
+        // Two-turn regression: a tool-call turn whose response carried signed
+        // thinking must produce a turn-2 outbound request replaying those
+        // exact blocks (non-streaming; the flag pins the loop to this path).
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let envelope = r#"{"thinking":"checked the weather","signature":"sig1"}"#;
+        let assistant_content = serde_json::json!({
+            "content": null,
+            "reasoning_content": envelope,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "name": "get_weather",
+                    "arguments": "{\"city\": \"SF\"}",
+                }
+            ],
+        });
+        let history = vec![
+            ChatMessage::user("What is the weather in SF?"),
+            ChatMessage::assistant(assistant_content.to_string()),
+            ChatMessage::tool(
+                r#"{"tool_call_id": "call_1", "content": "72F and sunny"}"#.to_string(),
+            ),
+        ];
+
+        let native = provider.convert_messages_for_native(&history, false);
+        assert_eq!(native.len(), 3, "all three turns convert");
+        let assistant = &native[1];
+        assert_eq!(
+            assistant.reasoning_content, None,
+            "signed replay suppresses the string fields"
+        );
+        assert_eq!(
+            assistant.thinking_blocks,
+            Some(vec![serde_json::json!({
+                "type": "thinking",
+                "thinking": "checked the weather",
+                "signature": "sig1"
+            })]),
+            "turn-2 outbound must replay the exact signed blocks from turn 1"
+        );
+        assert!(assistant.tool_calls.is_some(), "tool calls stay intact");
+        let tool_result = &native[2];
+        assert_eq!(tool_result.role, "tool");
+        assert!(tool_result.thinking_blocks.is_none());
+    }
+
+    #[test]
+    fn thinking_passthrough_capture_signature_only_block_survives() {
+        // Live-probe fixture (slice 2b, .worktree/probe-truefoundry-2026-09-03.md):
+        // TrueFoundry returns thinking blocks with EMPTY text but a valid
+        // signature. These must survive capture — a text-only gate would drop
+        // them and break replay (the same bug previously fixed for the native
+        // provider's signature-only blocks).
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let message = ResponseMessage {
+            content: Some("answer".to_string()),
+            reasoning_content: None,
+            tool_calls: None,
+            thinking_blocks: Some(vec![serde_json::json!({
+                "type": "thinking",
+                "thinking": "",
+                "signature": "CAISkQIKjwEIERgCKkD/bXd1ajb4AEMrh8seIyvE22xRnQ=="
+            })]),
+        };
+
+        let parsed = provider.parse_native_response(message);
+        let reasoning = parsed
+            .reasoning_content
+            .expect("signature-only block must be captured");
+        let line: serde_json::Value = serde_json::from_str(&reasoning).unwrap();
+        assert_eq!(
+            line,
+            serde_json::json!({
+                "thinking": "",
+                "signature": "CAISkQIKjwEIERgCKkD/bXd1ajb4AEMrh8seIyvE22xRnQ=="
+            }),
+            "signature-only blocks (empty thinking text) must survive capture intact"
+        );
+    }
+
+    #[test]
+    fn thinking_passthrough_capture_parses_gateway_thinking_blocks_json() {
+        // End-to-end through the response envelope: a gateway response whose
+        // message carries `thinking_blocks` deserializes into the raw field
+        // that capture normalization reads.
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("gateway")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .with_thinking_passthrough()
+            .build();
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "answer",
+                    "reasoning_content": "plain text",
+                    "thinking_blocks": [
+                        {"type": "thinking", "thinking": "block thought", "signature": "sig9"}
+                    ]
+                }
+            }]
+        });
+        let response =
+            parse_chat_response_body("gateway", &body.to_string()).expect("payload parses");
+        let parsed = provider.parse_native_response(
+            response
+                .choices
+                .into_iter()
+                .next()
+                .expect("one choice")
+                .message,
+        );
+        let reasoning = parsed.reasoning_content.expect("capture from gateway JSON");
+        let line: serde_json::Value = serde_json::from_str(&reasoning).unwrap();
+        assert_eq!(
+            line,
+            serde_json::json!({"thinking": "block thought", "signature": "sig9"}),
+            "gateway thinking_blocks must reach capture and win over the plain string"
+        );
     }
 
     #[test]
@@ -11079,6 +14600,7 @@ mod tests {
             None,
             true,
             false,
+            None,
         );
         let default_message = &default_request.messages[0];
         assert_eq!(default_message.role, "assistant");
@@ -11115,6 +14637,7 @@ mod tests {
             None,
             true,
             false,
+            None,
         );
         let groq_message = &groq_request.messages[0];
         assert_eq!(groq_message.role, "assistant");
@@ -11322,6 +14845,7 @@ mod tests {
             tool_calls: None,
             reasoning_content: None,
             reasoning: None,
+            thinking_blocks: None,
             name: None,
         };
         let json = serde_json::to_string(&msg_without).unwrap();
@@ -11337,6 +14861,7 @@ mod tests {
             tool_calls: None,
             reasoning_content: Some("thinking...".to_string()),
             reasoning: None,
+            thinking_blocks: None,
             name: None,
         };
         let json = serde_json::to_string(&msg_with).unwrap();
@@ -12106,6 +15631,7 @@ mod tests {
             messages: vec![Message {
                 role: "user".to_string(),
                 content: MessageContent::Text("hi".to_string()),
+                thinking_blocks: None,
             }],
             temperature,
             stream: None,
