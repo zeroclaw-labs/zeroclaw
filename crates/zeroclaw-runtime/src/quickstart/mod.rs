@@ -1,5 +1,7 @@
 //! Quickstart apply path.
 
+pub mod liveness;
+
 use serde::{Deserialize, Serialize};
 
 use zeroclaw_config::helpers::kebab_to_snake;
@@ -40,6 +42,10 @@ impl Surface {
 struct RunCtx {
     run_id: String,
     surface: Surface,
+    /// Staging for the pre-persist liveness probe. The probe needs only the
+    /// staged provider entry, so it skips every step that writes to disk or
+    /// makes a network call of its own.
+    probe_only: bool,
 }
 
 impl RunCtx {
@@ -50,7 +56,18 @@ impl RunCtx {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| format!("{:x}{:x}", d.as_secs(), d.subsec_nanos()))
             .unwrap_or_else(|_| format!("{:x}", std::process::id()));
-        Self { run_id, surface }
+        Self {
+            run_id,
+            surface,
+            probe_only: false,
+        }
+    }
+
+    fn for_probe(surface: Surface) -> Self {
+        Self {
+            probe_only: true,
+            ..Self::new(surface)
+        }
     }
 
     fn base_attrs(&self) -> serde_json::Value {
@@ -1301,14 +1318,15 @@ fn apply_model_provider(
                     .and_then(|v| if v.is_empty() { None } else { Some(v.clone()) }),
                 ..Default::default()
             };
-            if tokio::runtime::Handle::try_current()
-                .map(|h| {
-                    matches!(
-                        h.runtime_flavor(),
-                        tokio::runtime::RuntimeFlavor::MultiThread
-                    )
-                })
-                .unwrap_or(false)
+            if !ctx.is_some_and(|ctx| ctx.probe_only)
+                && tokio::runtime::Handle::try_current()
+                    .map(|h| {
+                        matches!(
+                            h.runtime_flavor(),
+                            tokio::runtime::RuntimeFlavor::MultiThread
+                        )
+                    })
+                    .unwrap_or(false)
                 && let Some(ctx) = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(fetch_quickstart_context_window(
                         provider_type,
@@ -1979,7 +1997,7 @@ fn apply_personality_files(
     errors: &mut Vec<QuickstartError>,
     ctx: Option<&RunCtx>,
 ) {
-    if files.is_empty() {
+    if files.is_empty() || ctx.is_some_and(|ctx| ctx.probe_only) {
         return;
     }
     let workspace = config.agent_workspace_dir(agent_alias);
@@ -2419,6 +2437,59 @@ mod tests {
                 .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn probe_staging_writes_nothing_to_disk() {
+        // The liveness probe stages a submission only to reach its provider
+        // entry. Personality files would create the agent workspace and stage
+        // tempfiles there, so probe-only staging must skip them entirely.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = Config {
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        let mut submission = fresh_submission("probe_bot");
+        submission.agent.personality_files =
+            vec![zeroclaw_config::presets::QuickstartPersonalityFile {
+                filename: "SOUL.md".into(),
+                content: "Be kind.".into(),
+            }];
+        let workspace = cfg.agent_workspace_dir("probe_bot");
+
+        let ctx = RunCtx::for_probe(Surface::Test);
+        let mut staged = Vec::new();
+        let mut errors = Vec::new();
+        let applied = apply_into(&mut cfg, &submission, &mut staged, &mut errors, Some(&ctx));
+
+        assert!(errors.is_empty(), "probe staging failed: {errors:?}");
+        assert!(applied.is_some(), "probe staging produced no agent");
+        assert!(staged.is_empty(), "probe staging staged personality files");
+        assert!(
+            !workspace.exists(),
+            "probe staging created the agent workspace at {}",
+            workspace.display()
+        );
+
+        // Control: ordinary staging of the same submission does create the
+        // workspace, so the assertion above cannot pass vacuously.
+        let mut cfg = Config {
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        let ctx = RunCtx::new(Surface::Test);
+        let mut staged = Vec::new();
+        let mut errors = Vec::new();
+        apply_into(&mut cfg, &submission, &mut staged, &mut errors, Some(&ctx));
+        assert!(errors.is_empty(), "control staging failed: {errors:?}");
+        assert!(
+            !staged.is_empty(),
+            "control staging staged no personality file"
+        );
+        assert!(
+            workspace.exists(),
+            "control staging did not create the workspace"
+        );
     }
 
     fn apply_fresh_provider(
