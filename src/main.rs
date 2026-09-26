@@ -149,6 +149,28 @@ fn ta(key: &str, args: &[(&str, &str)], fallback: impl Into<String>) -> String {
     }
 }
 
+/// Print the relay frontdoor enrollment link for a freshly minted pairing code,
+/// plus a terminal QR of it when stdout is an interactive terminal (under a
+/// service manager stdout lands in the journal, where a QR block is noise).
+/// Console only: the link carries the one-time code, so it is never logged.
+#[cfg(feature = "agent-runtime")]
+fn print_enroll_frontdoor_hint(profile: &zeroclaw_runtime::enroll::RelayProfile, code: &str) {
+    use std::io::IsTerminal;
+    let stdout = std::io::stdout();
+    let render_qr = stdout.is_terminal();
+    let mut out = stdout.lock();
+    let _ = zeroclaw_runtime::enroll::write_frontdoor_hint(
+        &mut out,
+        profile,
+        code,
+        render_qr,
+        |link| zeroclaw_runtime::enroll::FrontdoorHintText {
+            header: t("cli-enroll-frontdoor-header", "browser enrollment link"),
+            link_line: ta("cli-enroll-frontdoor-link", &[("link", link)], "link"),
+        },
+    );
+}
+
 /// Interactive secret prompt with pre-submit feedback.
 ///
 /// The value stays hidden, but the prompt shows a bounded mask once the input
@@ -7629,6 +7651,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                 ta("cli-enroll-pairing-code", &[("code", &code)], "code")
                             );
                             println!("{}", ta("cli-enroll-sas", &[("sas", &sas)], "SAS"));
+                            print_enroll_frontdoor_hint(&relay_profile, &code);
                             println!();
                         }
 
@@ -8372,6 +8395,9 @@ Add pricing to the active provider profile or supply a catalog entry."
                     "{}",
                     ta("cli-enroll-sas", &[("sas", &generated.sas)], "SAS")
                 );
+                let relay_profile =
+                    zeroclaw_runtime::enroll::relay_profile(&config.data_dir, &config.relay);
+                print_enroll_frontdoor_hint(&relay_profile, &generated.pairing_code);
                 Ok(())
             }
             SecurityCommands::RelayRotateNodeId => {

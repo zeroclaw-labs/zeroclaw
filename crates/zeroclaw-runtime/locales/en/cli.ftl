@@ -1274,6 +1274,8 @@ cli-enroll-confirm-sas-line-1 = this one-time pairing code and confirm the short
 cli-enroll-confirm-sas-line-2 = matches on both ends before trusting the daemon:
 cli-enroll-pairing-code = {"    "}pairing code : {$code}
 cli-enroll-sas = {"    "}SAS          : {$sas}
+cli-enroll-frontdoor-header = Or enroll a phone in its browser through the relay (if the relay serves the enrollment page) - scan or open:
+cli-enroll-frontdoor-link = {"    "}link         : {$link}
 
 # ── Context window (doctor update-context-windows, agent interactive) ──
 cli-delegate-error-invalid-semantic-completion = Agent '{$agent_name}' failed: model provider returned an invalid semantic completion.

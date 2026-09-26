@@ -1249,6 +1249,36 @@ mod tests {
     }
 
     #[test]
+    fn enroll_frontdoor_link_strings_format_in_all_locales() {
+        let link = "https://relay.example:9443/?node=abc&code=Xy7Kq2Lm9Pz4";
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            let header = format_ftl_message(source, locale, "cli-enroll-frontdoor-header", &[])
+                .unwrap_or_else(|| panic!("frontdoor header should format in {locale}"));
+            assert!(
+                !header.trim().is_empty(),
+                "empty frontdoor header in {locale}"
+            );
+            let line = format_ftl_message(
+                source,
+                locale,
+                "cli-enroll-frontdoor-link",
+                &[("link", link)],
+            )
+            .unwrap_or_else(|| panic!("frontdoor link line should format in {locale}"));
+            assert!(
+                line.contains(link),
+                "the link must survive formatting verbatim in {locale}: {line:?}"
+            );
+        }
+    }
+
+    #[test]
     fn daemon_startup_cli_strings_format_in_all_locales() {
         let url = "http://127.0.0.1:42617";
         let path = "/tmp/zeroclaw-test/daemon.sock";

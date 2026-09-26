@@ -487,6 +487,16 @@ successful enrollment and expires ten minutes after it is minted, so the stored
 link is spent or dead. Treat a link that carries an unused code like the code
 itself, and prefer enrolling promptly after minting.
 
+When `[relay]` is enabled, the daemon builds this link for you. Next to the
+pairing code and SAS on the operator console (the startup banner and
+`zeroclaw security enroll-paircode --new`) it prints
+`https://<relay>/?node=<node-id>&code=<pairing-code>`, derived from
+`[relay].url` and the node id, and, when stdout is an interactive terminal, a
+QR code of the same link for a phone to scan. The link only works if the relay
+has `[frontdoor]` enabled. It goes to the console only, never to the structured
+log; under a service manager the console is the journal, which already receives
+the pairing code itself.
+
 ---
 
 ## Configuration reference
