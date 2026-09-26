@@ -7,12 +7,14 @@ use crate::approval::ApprovalManager;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
 use crate::security::SecurityPolicy;
+use crate::security::ingress::{IngressPolicy, steering_policy};
 use crate::sop::{SopAuditLogger, SopEngine};
 use crate::tools::{self, Tool};
 use anyhow::{Context, Result};
 use chrono::{Datelike, Timelike};
 use std::path::Path;
 use std::sync::Arc;
+use zeroclaw_api::ingress::IngressDecision;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
 #[cfg(test)]
@@ -22,6 +24,7 @@ use zeroclaw_providers::{
 };
 
 // Re-export TurnEvent from zeroclaw-types for backwards compatibility.
+pub use crate::security::ingress::SteeringMessage;
 pub use zeroclaw_api::agent::TurnEvent;
 
 /// The turn engine's single per-call limits authority. Aliased from the turn
@@ -347,6 +350,30 @@ async fn forward_history_trim_notice(
 ) {
     if let Some(notice) = notice {
         let _ = event_tx.send(notice.into_turn_event()).await;
+    }
+}
+
+enum SteeringReceiver<'a> {
+    Legacy(&'a mut tokio::sync::mpsc::Receiver<String>),
+    Provenance(&'a mut tokio::sync::mpsc::Receiver<SteeringMessage>),
+}
+
+impl SteeringReceiver<'_> {
+    fn drain(&mut self) -> Vec<SteeringMessage> {
+        let mut messages = Vec::new();
+        match self {
+            Self::Legacy(rx) => {
+                while let Ok(content) = rx.try_recv() {
+                    messages.push(SteeringMessage::unknown(content));
+                }
+            }
+            Self::Provenance(rx) => {
+                while let Ok(message) = rx.try_recv() {
+                    messages.push(message);
+                }
+            }
+        }
+        messages
     }
 }
 
@@ -3648,7 +3675,39 @@ impl Agent {
         user_message: &str,
         event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
         cancel_token: Option<tokio_util::sync::CancellationToken>,
-        mut steering_rx: Option<&mut tokio::sync::mpsc::Receiver<String>>,
+        steering_rx: Option<&mut tokio::sync::mpsc::Receiver<String>>,
+    ) -> std::result::Result<StreamedTurnSuccess, StreamedTurnError> {
+        self.turn_streamed_with_steering_source(
+            user_message,
+            event_tx,
+            cancel_token,
+            steering_rx.map(SteeringReceiver::Legacy),
+        )
+        .await
+    }
+
+    pub async fn turn_streamed_with_steering_provenance_state(
+        &mut self,
+        user_message: &str,
+        event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
+        cancel_token: Option<tokio_util::sync::CancellationToken>,
+        steering_rx: Option<&mut tokio::sync::mpsc::Receiver<SteeringMessage>>,
+    ) -> std::result::Result<StreamedTurnSuccess, StreamedTurnError> {
+        self.turn_streamed_with_steering_source(
+            user_message,
+            event_tx,
+            cancel_token,
+            steering_rx.map(SteeringReceiver::Provenance),
+        )
+        .await
+    }
+
+    async fn turn_streamed_with_steering_source(
+        &mut self,
+        user_message: &str,
+        event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
+        cancel_token: Option<tokio_util::sync::CancellationToken>,
+        mut steering_rx: Option<SteeringReceiver<'_>>,
     ) -> std::result::Result<StreamedTurnSuccess, StreamedTurnError> {
         // See `Agent::turn` for the rationale. Same guard: blank input would
         // push a timestamp-only user message into history and the model would
@@ -3864,6 +3923,7 @@ impl Agent {
         // wins.
         let served_route_sink: crate::agent::loop_::ServedRouteSink =
             std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut pending_admitted_steering = Vec::new();
         for round in 0..self.config.resolved.max_tool_iterations {
             // Early exit if the caller cancelled this turn (e.g. user abort)
             if cancel_token
@@ -3890,19 +3950,46 @@ impl Agent {
             } else {
                 Vec::new()
             };
-
+            let ingress_policy_cfg = IngressPolicy::default();
             // Steering drain: each accepted mid-turn message becomes its own
             // enriched user turn in both transcripts before the next round.
-            for steering_message in crate::agent::loop_::drain_steering_messages(&mut steering_rx) {
-                // Mirror the enrichment logic from append_streamed_user_message_to_history
-                // but route through round_added instead of self.history/new_msgs.
+            let mut steering_messages: Vec<_> = std::mem::take(&mut pending_admitted_steering)
+                .into_iter()
+                .map(|message| (message, true))
+                .collect();
+            steering_messages.extend(
+                steering_rx
+                    .as_mut()
+                    .map(SteeringReceiver::drain)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|message| (message, false)),
+            );
+            for (steering_message, already_admitted) in steering_messages {
+                if !already_admitted {
+                    match steering_policy(
+                        steering_message.content(),
+                        steering_message.ingress(),
+                        &ingress_policy_cfg,
+                    ) {
+                        IngressDecision::Loop | IngressDecision::Annotate { .. } => {}
+                        IngressDecision::Gate { .. } => {
+                            // SOP diversion is not wired yet; preserve Loop behavior.
+                        }
+                        IngressDecision::Drop { .. } => continue,
+                    }
+                }
+
+                // Mirror the enrichment logic from
+                // append_streamed_user_message_to_history, but route through
+                // round_added instead of self.history/new_msgs.
                 if self.auto_save {
                     let store_start = std::time::Instant::now();
                     let store_result = self
                         .memory
                         .store(
                             "user_msg",
-                            &steering_message,
+                            steering_message.content(),
                             MemoryCategory::Conversation,
                             self.memory_session_id.as_deref(),
                         )
@@ -3917,14 +4004,22 @@ impl Agent {
                         turn_id: Some(turn_id.clone()),
                     });
                 }
-                let enriched = self.enrich_user_message(&steering_message);
+                let enriched = self.enrich_user_message(steering_message.content());
                 round_added.push(ChatMessage::user(enriched));
             }
+            let initial_ingress_subject = if round == 0 {
+                crate::agent::turn::InitialIngressSubject::Original {
+                    text: user_message.to_string(),
+                    ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
+                }
+            } else {
+                crate::agent::turn::InitialIngressSubject::AlreadyAdmitted
+            };
             let round_loop = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 Some(cost_context.clone()),
                 crate::agent::tool_receipts::scope_receipts(
                     receipt_scope.clone(),
-                    Box::pin(crate::agent::loop_::run_tool_call_loop(
+                    Box::pin(crate::agent::turn::run_tool_call_loop_with_initial_ingress(
                         crate::agent::loop_::ToolLoop {
                             exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                                 crate::agent::loop_::ResolvedModelAccess {
@@ -4024,15 +4119,16 @@ impl Agent {
                                 .and_then(|c| c.config.as_deref())
                                 .map(|config| crate::agent::turn::SopStepReassembly { config }),
                         },
+                        initial_ingress_subject,
                     )),
                 ),
             );
+            let round_loop = Box::pin(round_loop);
             // Scope the provider-fallback task-local around the round so the
             // resilient wrapper's requested-vs-served record is visible here,
             // then read it immediately. Box before adding the prompt scope so
             // the nested task-locals do not capture the full round future on
             // the worker stack in debug builds.
-            let round_loop = Box::pin(round_loop);
             let (loop_result, round_fallback, round_context_truncated, round_safeguard) =
                 zeroclaw_providers::scope_safeguard_fallback(async {
                     let (result, fallback, context_truncated) =
@@ -4139,9 +4235,27 @@ impl Agent {
                     let notice = self.trim_history(Some(&turn_id));
                     forward_history_trim_notice(&event_tx, notice).await;
 
-                    let has_more_steering =
-                        steering_rx.as_deref_mut().is_some_and(|rx| !rx.is_empty());
-                    if has_more_steering {
+                    for message in steering_rx
+                        .as_mut()
+                        .map(SteeringReceiver::drain)
+                        .unwrap_or_default()
+                    {
+                        match steering_policy(
+                            message.content(),
+                            message.ingress(),
+                            &ingress_policy_cfg,
+                        ) {
+                            IngressDecision::Loop | IngressDecision::Annotate { .. } => {
+                                pending_admitted_steering.push(message);
+                            }
+                            IngressDecision::Gate { .. } => {
+                                // SOP diversion is not wired yet; preserve Loop behavior.
+                                pending_admitted_steering.push(message);
+                            }
+                            IngressDecision::Drop { .. } => {}
+                        }
+                    }
+                    if !pending_admitted_steering.is_empty() {
                         continue;
                     }
 
@@ -4439,6 +4553,65 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use zeroclaw_api::observability_traits::ObserverMetric;
+
+    fn steering_context(
+        message_id: &str,
+        sender: &str,
+        transport: zeroclaw_api::ingress::Transport,
+    ) -> zeroclaw_api::ingress::IngressContext {
+        zeroclaw_api::ingress::IngressContext {
+            message_id: Some(message_id.to_string()),
+            source_class: zeroclaw_api::ingress::SourceClass::External,
+            sender: Some(sender.to_string()),
+            transport,
+            trust: zeroclaw_api::ingress::TrustClass::Untrusted,
+            origin: zeroclaw_api::ingress::TurnOrigin::Interactive,
+        }
+    }
+
+    #[test]
+    fn steering_receiver_preserves_each_known_injection_context() {
+        let first_context =
+            steering_context("rpc-1", "actor-a", zeroclaw_api::ingress::Transport::Rpc);
+        let second_context = steering_context(
+            "gateway-2",
+            "actor-b",
+            zeroclaw_api::ingress::Transport::Gateway,
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+        sender
+            .try_send(SteeringMessage::known(
+                "first".to_string(),
+                first_context.clone(),
+            ))
+            .unwrap();
+        sender
+            .try_send(SteeringMessage::known(
+                "second".to_string(),
+                second_context.clone(),
+            ))
+            .unwrap();
+
+        let mut source = SteeringReceiver::Provenance(&mut receiver);
+        let messages = source.drain();
+
+        assert_eq!(messages[0].content(), "first");
+        assert_eq!(messages[0].ingress(), Some(&first_context));
+        assert_eq!(messages[1].content(), "second");
+        assert_eq!(messages[1].ingress(), Some(&second_context));
+    }
+
+    #[test]
+    fn legacy_steering_receiver_marks_provenance_unknown() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        sender.try_send("legacy".to_string()).unwrap();
+
+        let mut source = SteeringReceiver::Legacy(&mut receiver);
+        let messages = source.drain();
+
+        assert_eq!(messages[0].content(), "legacy");
+        assert!(messages[0].ingress().is_none());
+    }
 
     #[test]
     fn build_session_model_provider_rejects_undotted_ref() {
@@ -12777,6 +12950,242 @@ mod tests {
         assert!(
             key.is_none(),
             "multimodal prompt with [IMAGE:] marker must skip response cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_steering_admission_keeps_per_injection_context() {
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer = Arc::new(CapturingObserver::default());
+        let model_provider = Box::new(StreamingSteeringModelProvider {
+            seen_messages: Arc::new(Mutex::new(Vec::new())),
+            call_count: AtomicUsize::new(0),
+            fail_on_call: None,
+            fail_chat_on_call: None,
+            fail_after_delta_on_call: None,
+            delay_chat_on_call: None,
+        });
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(mem)
+            .observer(observer.clone())
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .auto_save(true)
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let first_context =
+            steering_context("rpc-1", "actor-a", zeroclaw_api::ingress::Transport::Rpc);
+        let second_context = steering_context(
+            "gateway-2",
+            "actor-b",
+            zeroclaw_api::ingress::Transport::Gateway,
+        );
+        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel(4);
+        steering_tx
+            .send(SteeringMessage::known(
+                "accepted-a".to_string(),
+                first_context.clone(),
+            ))
+            .await
+            .expect("first steering message should enqueue");
+        steering_tx
+            .send(SteeringMessage::known(
+                "drop-me".to_string(),
+                second_context.clone(),
+            ))
+            .await
+            .expect("second steering message should enqueue");
+        steering_tx
+            .send(SteeringMessage::unknown("legacy".to_string()))
+            .await
+            .expect("legacy steering message should enqueue");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let outcome = crate::security::ingress::with_test_policy_probe(
+            observations.clone(),
+            Some("drop-me".to_string()),
+            agent.turn_streamed_with_steering_provenance_state(
+                "original",
+                event_tx,
+                None,
+                Some(&mut steering_rx),
+            ),
+        )
+        .await
+        .expect("steered turn should succeed");
+
+        let observations = observations.lock().clone();
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| observation.text.as_str())
+                .collect::<Vec<_>>(),
+            ["accepted-a", "drop-me", "legacy", "original"],
+            "the wrapper must admit each injection, then the loop must admit only the original user"
+        );
+        assert_eq!(observations[0].ingress, Some(first_context));
+        assert_eq!(observations[1].ingress, Some(second_context));
+        assert!(observations[2].ingress.is_none());
+        assert_eq!(
+            observations[3].ingress,
+            Some(zeroclaw_api::ingress::IngressContext::agent_direct())
+        );
+
+        let user_messages: Vec<_> = outcome
+            .new_messages
+            .iter()
+            .filter_map(|message| match message {
+                ConversationMessage::Chat(message) if message.role == "user" => {
+                    Some(message.content.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            user_messages
+                .iter()
+                .any(|content| content.contains("original"))
+        );
+        assert!(
+            user_messages
+                .iter()
+                .any(|content| content.contains("accepted-a"))
+        );
+        assert!(
+            user_messages
+                .iter()
+                .any(|content| content.contains("legacy"))
+        );
+        assert!(
+            user_messages
+                .iter()
+                .all(|content| !content.contains("drop-me")),
+            "a dropped injection must not reach transcript history"
+        );
+
+        let memory_stores = observer
+            .events
+            .lock()
+            .iter()
+            .filter(|event| matches!(event, ObserverEvent::MemoryStore { .. }))
+            .count();
+        assert_eq!(
+            memory_stores, 3,
+            "only the original and two admitted injections should reach auto-save"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_steering_drop_only_after_round_does_not_replay_model() {
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let seen_messages = Arc::new(Mutex::new(Vec::new()));
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let model_provider = Box::new(StreamingSteeringModelProvider {
+            seen_messages: seen_messages.clone(),
+            call_count: AtomicUsize::new(0),
+            fail_on_call: None,
+            fail_chat_on_call: None,
+            fail_after_delta_on_call: None,
+            delay_chat_on_call: None,
+        });
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+        agent.config.resolved.max_tool_iterations = 1;
+
+        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel(4);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let probe_observations = observations.clone();
+        let handle = zeroclaw_spawn::spawn!(async move {
+            crate::security::ingress::with_test_policy_probe(
+                probe_observations,
+                Some("drop-late".to_string()),
+                agent.turn_streamed_with_steering_provenance_state(
+                    "original",
+                    event_tx,
+                    None,
+                    Some(&mut steering_rx),
+                ),
+            )
+            .await
+        });
+
+        loop {
+            match event_rx.recv().await.expect("turn event should arrive") {
+                TurnEvent::Chunk { delta } if delta == "draft" => {
+                    steering_tx
+                        .send(SteeringMessage::unknown("drop-late".to_string()))
+                        .await
+                        .expect("late steering message should enqueue");
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        let outcome = handle
+            .await
+            .expect("turn task should finish")
+            .expect("steered turn should succeed");
+        assert_eq!(outcome.response, "draft");
+        assert_eq!(
+            seen_messages.lock().len(),
+            1,
+            "a late injection dropped at the wrapper must not trigger another model request"
+        );
+
+        let observations = observations.lock().clone();
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| observation.text.as_str())
+                .collect::<Vec<_>>(),
+            ["original", "drop-late"]
+        );
+        let user_messages: Vec<_> = outcome
+            .new_messages
+            .iter()
+            .filter_map(|message| match message {
+                ConversationMessage::Chat(message) if message.role == "user" => {
+                    Some(message.content.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            user_messages
+                .iter()
+                .all(|content| !content.contains("drop-late")),
+            "a late dropped injection must not reach transcript history"
         );
     }
 

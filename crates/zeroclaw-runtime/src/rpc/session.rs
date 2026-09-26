@@ -1,6 +1,6 @@
 //! RPC session state.
 
-use crate::agent::agent::{Agent, TurnEvent};
+use crate::agent::agent::{Agent, SteeringMessage, TurnEvent};
 use crate::agent::dispatcher::ToolDispatcher;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -44,6 +44,9 @@ pub enum CancelCause {
     ClientRpc,
     /// Explicit `session/kill` from the dashboard or admin RPC.
     AdminKill,
+    /// `session/abort` from an operator connection that need not own the
+    /// session's client.
+    OperatorAbort,
     /// The session was explicitly removed/torn down while a turn was live.
     SessionRemoved,
     /// The RPC connection generation that accepted the turn was closed.
@@ -57,10 +60,21 @@ impl CancelCause {
         match self {
             CancelCause::ClientRpc => "client_rpc",
             CancelCause::AdminKill => "admin_kill",
+            CancelCause::OperatorAbort => "operator_abort",
             CancelCause::SessionRemoved => "session_removed",
             CancelCause::ConnectionClosed => "connection_closed",
         }
     }
+}
+
+/// Result of [`SessionStore::steer_session`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteerOutcome {
+    Accepted,
+    /// The running turn's steering queue is full.
+    QueueFull,
+    /// No turn is running, or it stopped accepting steering.
+    NoActiveTurn,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -230,6 +244,10 @@ pub struct SessionStore {
     cancel_tokens: std::sync::Mutex<HashMap<String, (u64, tokio_util::sync::CancellationToken)>>,
     cancel_generation: std::sync::atomic::AtomicU64,
     cancel_causes: std::sync::Mutex<HashMap<String, CancelCause>>,
+    /// Steering sender of each session's running turn, keyed by the same
+    /// generation as its cancel token so the turn's exit removes exactly its
+    /// own entry.
+    steering: std::sync::Mutex<HashMap<String, (u64, tokio::sync::mpsc::Sender<SteeringMessage>)>>,
     max_sessions: usize,
     pub session_queue: Arc<SessionActorQueue>,
     /// Monotonic counter incremented on every `insert` that installs or
@@ -267,6 +285,12 @@ pub(crate) struct CancelTokenRegistration<'a> {
 }
 
 impl CancelTokenRegistration<'_> {
+    /// Generation of the registered token, shared by the turn's steering
+    /// registration.
+    pub(crate) fn generation(&self) -> Option<u64> {
+        self.generation
+    }
+
     /// Drain the turn's cancellation attribution before unregistering the
     /// token. `remove_cancel_token` intentionally clears any leftover cause.
     pub(crate) fn finish(mut self) -> Option<CancelCause> {
@@ -295,6 +319,7 @@ impl SessionStore {
             cancel_tokens: std::sync::Mutex::new(HashMap::new()),
             cancel_generation: std::sync::atomic::AtomicU64::new(0),
             cancel_causes: std::sync::Mutex::new(HashMap::new()),
+            steering: std::sync::Mutex::new(HashMap::new()),
             max_sessions,
             session_queue,
             session_generation: std::sync::atomic::AtomicU64::new(0),
@@ -1320,6 +1345,12 @@ impl SessionStore {
                 _ => return,
             }
         }
+        {
+            let mut steering = self.steering.lock().unwrap_or_else(|e| e.into_inner());
+            if steering.get(id).is_some_and(|(g, _)| *g == generation) {
+                steering.remove(id);
+            }
+        }
         self.cancel_causes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1328,6 +1359,12 @@ impl SessionStore {
 
     pub fn cancel_session(&self, id: &str) -> bool {
         self.signal_cancellation(id, CancelCause::ClientRpc)
+    }
+
+    /// Interrupt the session's running turn on an operator's behalf. Unlike
+    /// [`Self::cancel_session`] it is not tied to the owning client.
+    pub fn abort_session(&self, id: &str) -> bool {
+        self.signal_cancellation(id, CancelCause::OperatorAbort)
     }
 
     /// Signal an in-flight turn before a close/delete handler waits for the
@@ -1353,6 +1390,46 @@ impl SessionStore {
                 true
             })
             .unwrap_or(false)
+    }
+
+    /// Accept steering for the turn registered under `generation`. Removed
+    /// with that generation's cancel token.
+    pub(crate) fn register_steering(
+        &self,
+        id: &str,
+        generation: u64,
+        sender: tokio::sync::mpsc::Sender<SteeringMessage>,
+    ) {
+        self.steering
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string(), (generation, sender));
+    }
+
+    /// Queue a steering message for the session's running turn.
+    pub fn steer_session(&self, id: &str, content: String) -> SteerOutcome {
+        self.steer_session_with_provenance(id, SteeringMessage::unknown(content))
+    }
+
+    pub(crate) fn steer_session_with_provenance(
+        &self,
+        id: &str,
+        message: SteeringMessage,
+    ) -> SteerOutcome {
+        let sender = self
+            .steering
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .map(|(_, sender)| sender.clone());
+        let Some(sender) = sender else {
+            return SteerOutcome::NoActiveTurn;
+        };
+        match sender.try_send(message) {
+            Ok(()) => SteerOutcome::Accepted,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => SteerOutcome::QueueFull,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => SteerOutcome::NoActiveTurn,
+        }
     }
 
     /// Returns true if a cancel token is registered — i.e. a turn is in flight.
