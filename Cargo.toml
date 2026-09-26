@@ -36,7 +36,7 @@ zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.8.5" }
 zerocode = { path = "apps/zerocode", version = "0.8.5" }
 directories = "6.0"
 sys-locale = "0.3"
-hmac = "0.12"
+hmac = "0.13"
 zeroize = "1.8"
 
 [package]
