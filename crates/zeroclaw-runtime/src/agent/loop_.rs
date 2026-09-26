@@ -1,3 +1,4 @@
+use crate::agent::execution_tree_budget::ExecutionTreeBudget;
 use crate::approval::ApprovalManager;
 
 /// Format token count with thousands separators.
@@ -963,6 +964,15 @@ async fn agent_turn_with_sop_reassembly(
     sop_reassembly: Option<SopStepReassembly<'_>>,
 ) -> Result<String> {
     let turn_id = turn_id.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_string);
+    let shared_budget = ExecutionTreeBudget::current()
+        .map(|budget| budget.child())
+        .or_else(|| {
+            config.zip(agent_alias).and_then(|(config, alias)| {
+                ExecutionTreeBudget::from_limit(
+                    config.effective_max_execution_tree_iterations(alias),
+                )
+            })
+        });
     #[cfg(test)]
     if let Some(hook) = AGENT_TURN_SOP_REASSEMBLY_TEST_HOOK
         .lock()
@@ -1045,7 +1055,7 @@ async fn agent_turn_with_sop_reassembly(
         channel_reply_target,
         cancellation_token: None,
         on_delta: None,
-        shared_budget: None, // no shared budget for agent_turn callers
+        shared_budget,
         channel,
         collected_receipts: None,
         event_tx: None,
@@ -2021,6 +2031,11 @@ pub async fn run(
                 ChatMessage::system(&system_prompt),
                 ChatMessage::user(&enriched),
             ];
+            let execution_tree_budget = ExecutionTreeBudget::current()
+                .map(|budget| budget.child())
+                .or_else(|| {
+                    ExecutionTreeBudget::from_limit(agent.resolved.max_execution_tree_iterations)
+                });
             // One-shot transcript: no prior trim ran, so no crumb exists.
             let mut history_has_trim_breadcrumb = false;
 
@@ -2116,7 +2131,7 @@ pub async fn run(
                                 channel_reply_target: None,
                                 cancellation_token: None,
                                 on_delta: None,
-                                shared_budget: None,
+                                shared_budget: execution_tree_budget.clone(),
                                 channel: None,
                                 collected_receipts: None,
                                 event_tx: None,
@@ -2576,6 +2591,13 @@ pub async fn run(
                 };
 
                 history.push(ChatMessage::user(&enriched));
+                let execution_tree_budget = ExecutionTreeBudget::current()
+                    .map(|budget| budget.child())
+                    .or_else(|| {
+                        ExecutionTreeBudget::from_limit(
+                            agent.resolved.max_execution_tree_iterations,
+                        )
+                    });
 
                 // Set up streaming channel so tool progress and response
                 // content are printed progressively instead of buffered.
@@ -2712,7 +2734,7 @@ pub async fn run(
                                     channel_reply_target: None,
                                     cancellation_token: Some(cancel_token.clone()),
                                     on_delta: Some(delta_tx.clone()),
-                                    shared_budget: None,
+                                    shared_budget: execution_tree_budget.clone(),
                                     channel: None,
                                     collected_receipts: None,
                                     event_tx: None,
@@ -19412,7 +19434,7 @@ Let me check the result."#;
         }
         assert_eq!(
             hook_calls.load(Ordering::SeqCst),
-            if summary { 1 } else { 2 },
+            2,
             "one hook per preparation"
         );
         let captured = requests.lock().unwrap();
@@ -19476,12 +19498,13 @@ Let me check the result."#;
             }
             if summary {
                 assert_eq!(next.schema_tokens, 0, "the summary is tools-free");
+                let mut tail = next.messages.iter().rev();
+                assert_eq!(tail.next().unwrap().content, "hook suffix");
                 assert!(
-                    next.messages
-                        .last()
+                    tail.next()
                         .unwrap()
                         .content
-                        .starts_with("You have reached")
+                        .starts_with("Agent exceeded maximum tool iterations")
                 );
                 assert!(
                     next.messages
@@ -19506,9 +19529,9 @@ Let me check the result."#;
                     .any(|m| m.content.contains(&"r".repeat(4000)))
             );
             assert!(
-                !history
-                    .iter()
-                    .any(|m| m.content.starts_with("You have reached")),
+                !history.iter().any(|m| m
+                    .content
+                    .starts_with("Agent exceeded maximum tool iterations")),
                 "failed summary must not append a synthetic user turn"
             );
         }

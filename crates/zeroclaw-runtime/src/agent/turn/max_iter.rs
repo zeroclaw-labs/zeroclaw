@@ -11,9 +11,26 @@ use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::TurnEvent;
-use zeroclaw_config::schema::{MultimodalConfig, PacingConfig, ResolvedContextLimits};
+use zeroclaw_config::schema::{Config, MultimodalConfig, PacingConfig, ResolvedContextLimits};
 use zeroclaw_providers::{ChatMessage, ModelProvider};
 use zeroclaw_tool_call_parser::{strip_think_tags, strip_trailing_terminal_markers};
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CompletionLimit {
+    LocalIterations(usize),
+    ExecutionTree,
+}
+
+impl CompletionLimit {
+    fn explanation(self) -> String {
+        match self {
+            Self::LocalIterations(limit) => {
+                format!("Agent exceeded maximum tool iterations ({limit})")
+            }
+            Self::ExecutionTree => "Agent exhausted the execution-tree iteration budget".into(),
+        }
+    }
+}
 
 /// Project a finished summary call's settled attempts as `TurnEvent::Usage`
 /// so the gateway ledger includes the final-summary billed work. Mirrors
@@ -50,21 +67,25 @@ pub(crate) async fn finish_after_max_iterations(
     model: &str,
     dispatch_model: &str,
     temperature: Option<f64>,
-    multimodal_config: &MultimodalConfig,
     pacing: &PacingConfig,
     cancellation_token: Option<&CancellationToken>,
-    max_iterations: usize,
+    limit: CompletionLimit,
     mut accumulated_display_text: String,
     turn_id: &str,
     knobs: &LoopKnobs,
     event_tx: Option<&Sender<TurnEvent>>,
     on_delta: Option<&Sender<StreamDelta>>,
     mut new_messages_out: Option<&mut Vec<ChatMessage>>,
-    context_limits: ResolvedContextLimits,
+    config: Option<&Config>,
+    multimodal_config: &MultimodalConfig,
+    hooks: Option<&crate::hooks::HookRunner>,
+    mut image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
+    context_limits_for_route: impl Fn(&str, &str) -> ResolvedContextLimits + Send + Sync,
     crumb_present: &mut bool,
-    token_counter: super::DispatchTokenCounter,
+    reported_usage: Option<super::ReportedRequestUsage>,
     observer: &dyn crate::observability::Observer,
 ) -> Result<String> {
+    let exhaustion = limit.explanation();
     ::zeroclaw_log::record!(
         WARN,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -72,7 +93,7 @@ pub(crate) async fn finish_after_max_iterations(
             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
             .with_attrs(::serde_json::json!({
                 "model": model,
-                "max_iterations": max_iterations,
+                "limit": format!("{limit:?}"),
                 "trace_id": turn_id,
             })),
         "tool_loop_exhausted"
@@ -81,7 +102,7 @@ pub(crate) async fn finish_after_max_iterations(
     // ErrorAtCap callers (embedders driving Agent::turn) treat the cap as a
     // control signal: bail instead of spending another LLM call on a summary.
     if knobs.max_iteration_behavior == MaxIterationBehavior::ErrorAtCap {
-        anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+        anyhow::bail!("{exhaustion}")
     }
 
     // Graceful shutdown: ask the LLM for a final summary without tools
@@ -90,8 +111,8 @@ pub(crate) async fn finish_after_max_iterations(
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
             .with_category(::zeroclaw_log::EventCategory::Agent)
             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-            .with_attrs(::serde_json::json!({"max_iterations": max_iterations})),
-        "Max iterations reached, requesting final summary"
+            .with_attrs(::serde_json::json!({"limit": format!("{limit:?}")})),
+        "Iteration allowance exhausted, requesting final summary"
     );
     let tool_calls_stripped =
         crate::agent::history_pruner::strip_orphaned_tool_calls_from_assistants(history);
@@ -110,117 +131,31 @@ pub(crate) async fn finish_after_max_iterations(
         );
     }
 
-    let summary_prompt = ChatMessage::user(
-        "You have reached the maximum number of tool iterations. \
-         Please provide your best answer based on the work completed so far. \
-         Summarize what you accomplished and what remains to be done."
-            .to_string(),
-    );
-    let summary_prompt_mirror = summary_prompt.clone();
-
-    // The summary may see the turn's images, so the accumulated history goes
-    // through the same multimodal normalizer an in-loop request does (size,
-    // MIME and image-cap limits all apply) instead of being sent verbatim.
-    // Preparing before the summary prompt is appended keeps the trailing
-    // tool results the latest tool-result run, so their markers normalize
-    // exactly as an in-loop dispatch would. A provider that cannot see
-    // images degrades to text-only exactly like the in-loop rule, minus the
-    // vision-fallback resolution: handing validated inline images to a
-    // provider that rejects them would turn the graceful exit into a hard
-    // request failure.
-    let degrade_strip_images = !model_provider.capabilities_for_model(model).vision
-        && zeroclaw_providers::multimodal::count_image_markers(history) > 0;
-    let trim_budget = super::dispatch_trim_budget(context_limits);
-    let mut tokens_before = None;
-    let mut dropped_messages = 0;
-    let mut dropped_turns = 0;
-    let request_messages = loop {
-        let mut messages = super::prepare_messages_for_iteration(
-            history,
-            multimodal_config,
-            degrade_strip_images,
-            None,
-        )
-        .await?
-        .messages;
-        // Count the summary prompt, but keep it out of durable history until
-        // the request fits: it must not make the newest real turn droppable.
-        messages.push(summary_prompt_mirror.clone());
-        let tokens = token_counter.count(crate::agent::history::estimate_history_tokens(&messages));
-        let before = *tokens_before.get_or_insert(tokens);
-        let mut trim = super::surface_oversized_dispatch_if_needed(
-            history,
-            crumb_present,
-            tokens,
-            trim_budget,
-        );
-        dropped_messages += trim.dropped_messages;
-        if trim.outcome == super::PreDispatchOutcome::Trimmed {
-            dropped_turns += 1;
-            continue;
-        }
-        trim.dropped_messages = dropped_messages;
-        super::record_dispatch_trim(
-            (provider_name, model),
-            &trim,
-            dropped_turns,
-            trim_budget,
-            before,
-            tokens,
-            token_counter.source(),
-        );
-        let floor = tokens > context_limits.model_context_window as u64;
-        let event_budget = if floor {
-            context_limits.model_context_window
-        } else {
-            trim_budget
-        };
-        if dropped_messages > 0 || floor {
-            let source = token_counter.source();
-            if let Some(tx) = event_tx {
-                let _ = tx
-                    .send(TurnEvent::HistoryTrimmed {
-                        dropped_messages,
-                        dropped_turns,
-                        kept_turns: trim.kept_turns,
-                        reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
-                        token_budget: Some(event_budget as u64),
-                        tokens_before: Some(before),
-                        tokens_after: Some(tokens),
-                        tokens_before_source: Some(source),
-                        tokens_after_source: Some(source),
-                        unsatisfiable_floor: floor.then_some(true),
-                    })
-                    .await;
-            }
-            observer.record_event(
-                &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
-                    dropped_messages,
-                    kept_turns: trim.kept_turns,
-                    reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
-                    channel: None,
-                    agent_alias: None,
-                    turn_id: None,
-                    token_budget: Some(event_budget as u64),
-                    tokens_before: Some(before),
-                    tokens_after: Some(tokens),
-                    tokens_before_source: Some(source),
-                    tokens_after_source: Some(source),
-                    unsatisfiable_floor: floor.then_some(true),
-                },
-            );
-        }
-        if floor {
-            return Err(super::context_window_exceeded_error(
-                (provider_name, model),
-                context_limits,
-                tokens,
-                token_counter.source(),
-            ));
-        }
-        break messages;
+    // Resolve against the real latest user turn, before the synthetic summary
+    // prompt could hide a fresh image from the vision-capability policy.
+    let (vision_provider, degrade_strip_images) = super::vision_route::resolve_vision_provider(
+        config,
+        model_provider,
+        history,
+        multimodal_config,
+        provider_name,
+        model,
+        dispatch_model,
+    )?;
+    let (model_provider, provider_name, model, dispatch_model) = match vision_provider.as_ref() {
+        Some(route) => (
+            route.provider.as_ref(),
+            route.provider_name.as_str(),
+            route.model.as_str(),
+            route.model.as_str(),
+        ),
+        None => (model_provider, provider_name, model, dispatch_model),
     };
-    history.push(summary_prompt);
+    let summary_prompt = ChatMessage::user(format!(
+        "{exhaustion}. Please provide your best answer based on the work completed so far. \
+         Summarize what you accomplished and what remains to be done."
+    ));
+    let summary_prompt_mirror = summary_prompt.clone();
 
     enum SummaryCall {
         Cancelled,
@@ -233,27 +168,171 @@ pub(crate) async fn finish_after_max_iterations(
     // match arms below can read it after the future completes.
     let mut summary_attempts = Vec::new();
     let summary_call = {
-        let summary_request = zeroclaw_providers::ChatRequest {
-            messages: &request_messages,
-            tools: None, // No tools — force a text response
-            thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                .try_with(Clone::clone)
-                .ok()
-                .flatten(),
+        // Preparation and hooks belong to the same timeout/cancellation scope
+        // as dispatch; only a successful summary persists the prompt.
+        let summary_future = async {
+            // Exclude the synthetic prompt so trailing tool-result images
+            // remain in the latest run and receive normal image validation.
+            let mut messages = super::vision_route::prepare_messages_for_iteration(
+                history,
+                multimodal_config,
+                degrade_strip_images,
+                image_cache.as_deref_mut(),
+            )
+            .await?
+            .messages;
+            messages.push(summary_prompt_mirror.clone());
+            let pre_hook_messages = messages.clone();
+            let mut selected_model = model.to_string();
+            if let Some(hooks) = hooks.filter(|hooks| !hooks.is_empty())
+                && let crate::hooks::HookResult::Cancel(reason) = hooks
+                    .run_before_llm_call(&mut messages, &mut selected_model)
+                    .await
+            {
+                anyhow::bail!("LLM call cancelled by hook: {reason}");
+            }
+            let context_limits = context_limits_for_route(provider_name, &selected_model);
+            let trim_budget = super::dispatch_trim_budget(context_limits);
+            let token_counter = super::DispatchTokenCounter::for_route(
+                reported_usage,
+                provider_name,
+                &selected_model,
+            );
+            let suffix_only = messages.len() >= pre_hook_messages.len()
+                && messages
+                    .iter()
+                    .zip(&pre_hook_messages)
+                    .all(|(a, b)| a.role == b.role && a.content == b.content);
+            let hook_suffix = if suffix_only {
+                messages[pre_hook_messages.len()..].to_vec()
+            } else {
+                Vec::new()
+            };
+            let tokens_before =
+                token_counter.count(crate::agent::history::estimate_history_tokens(&messages));
+            let mut dropped_messages = 0;
+            let mut dropped_turns = 0;
+            loop {
+                let tokens =
+                    token_counter.count(crate::agent::history::estimate_history_tokens(&messages));
+                let mut trim = super::surface_oversized_dispatch_if_needed(
+                    history,
+                    crumb_present,
+                    tokens,
+                    trim_budget,
+                );
+                dropped_messages += trim.dropped_messages;
+                if trim.outcome == super::PreDispatchOutcome::Trimmed {
+                    // Rebuild only an unchanged prefix plus a transient suffix.
+                    // Arbitrary hook rewrites cannot be replayed without invoking the hook twice.
+                    if !suffix_only {
+                        anyhow::bail!(crate::i18n::get_required_cli_string(
+                            "turn-context-hook-mutation-unsafe-error",
+                        ));
+                    }
+                    dropped_turns += 1;
+                    messages = super::vision_route::prepare_messages_for_iteration(
+                        history,
+                        multimodal_config,
+                        degrade_strip_images,
+                        image_cache.as_deref_mut(),
+                    )
+                    .await?
+                    .messages;
+                    messages.push(summary_prompt_mirror.clone());
+                    messages.extend(hook_suffix.iter().cloned());
+                    continue;
+                }
+                trim.dropped_messages = dropped_messages;
+                super::record_dispatch_trim(
+                    (provider_name, &selected_model),
+                    &trim,
+                    dropped_turns,
+                    trim_budget,
+                    tokens_before,
+                    tokens,
+                    token_counter.source(),
+                );
+                let floor = tokens > context_limits.model_context_window as u64;
+                let event_budget = if floor {
+                    context_limits.model_context_window
+                } else {
+                    trim_budget
+                };
+                if dropped_messages > 0 || floor {
+                    let source = token_counter.source();
+                    let reason = crate::i18n::get_required_cli_string("history-trim-reason-budget");
+                    if let Some(tx) = event_tx {
+                        let _ = tx
+                            .send(TurnEvent::HistoryTrimmed {
+                                dropped_messages,
+                                dropped_turns,
+                                kept_turns: trim.kept_turns,
+                                reason: reason.clone(),
+                                token_budget: Some(event_budget as u64),
+                                tokens_before: Some(tokens_before),
+                                tokens_after: Some(tokens),
+                                tokens_before_source: Some(source),
+                                tokens_after_source: Some(source),
+                                unsatisfiable_floor: floor.then_some(true),
+                            })
+                            .await;
+                    }
+                    observer.record_event(
+                        &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
+                            dropped_messages,
+                            kept_turns: trim.kept_turns,
+                            reason,
+                            channel: None,
+                            agent_alias: None,
+                            turn_id: None,
+                            token_budget: Some(event_budget as u64),
+                            tokens_before: Some(tokens_before),
+                            tokens_after: Some(tokens),
+                            tokens_before_source: Some(source),
+                            tokens_after_source: Some(source),
+                            unsatisfiable_floor: floor.then_some(true),
+                        },
+                    );
+                }
+                if floor {
+                    return Err(super::context_window_exceeded_error(
+                        (provider_name, &selected_model),
+                        context_limits,
+                        tokens,
+                        token_counter.source(),
+                    ));
+                }
+                break;
+            }
+            let summary_request = zeroclaw_providers::ChatRequest {
+                messages: &messages,
+                tools: None, // No tools — force a text response
+                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten(),
+            };
+            let access = crate::agent::turn::execution::ResolvedModelAccess {
+                model_provider,
+                provider_name,
+                model: &selected_model,
+                dispatch_model: if selected_model == model {
+                    dispatch_model
+                } else {
+                    &selected_model
+                },
+                temperature,
+            };
+            // Route the graceful-summary call through the metered provider seam. This
+            // was the one tool-loop provider call that skipped the budget check and
+            // recorded no cost; through the seam it now fails closed when the turn's
+            // budget is exhausted and its token usage is charged like any in-loop
+            // call. Metering is a no-op when the turn is unscoped.
+            access
+                .run_model_query(summary_request, &mut summary_attempts)
+                .await
         };
-        let access = crate::agent::turn::execution::ResolvedModelAccess {
-            model_provider,
-            provider_name,
-            model,
-            dispatch_model,
-            temperature,
-        };
-        // Route the graceful-summary call through the metered provider seam. This
-        // was the one tool-loop provider call that skipped the budget check and
-        // recorded no cost; through the seam it now fails closed when the turn's
-        // budget is exhausted and its token usage is charged like any in-loop
-        // call. Metering is a no-op when the turn is unscoped.
-        let summary_future = access.run_model_query(summary_request, &mut summary_attempts);
         match pacing.step_timeout_secs {
             Some(step_secs) if step_secs > 0 => {
                 let step_timeout = Duration::from_secs(step_secs);
@@ -287,11 +366,9 @@ pub(crate) async fn finish_after_max_iterations(
 
     let resp = match summary_call {
         SummaryCall::Cancelled => {
-            history.pop();
             return Err(ToolLoopCancelled.into());
         }
         SummaryCall::TimedOut(step_secs) => {
-            history.pop();
             anyhow::bail!("Final summary LLM call timed out after {step_secs}s (step_timeout_secs)")
         }
         SummaryCall::Done(Err(e)) => {
@@ -303,17 +380,14 @@ pub(crate) async fn finish_after_max_iterations(
                     .with_attrs(::serde_json::json!({
                         "model": model,
                         "provider": provider_name,
-                        "max_iterations": max_iterations,
+                        "limit": format!("{limit:?}"),
                         "trace_id": turn_id,
                         "error": format!("{e}"),
                     })),
                 "final summary LLM call failed after iteration exhaustion; bailing"
             );
             emit_summary_attempt_usage(event_tx, &summary_attempts).await;
-            history.pop();
-            return Err(e).context(format!(
-                "Agent exceeded maximum tool iterations ({max_iterations})"
-            ));
+            return Err(e).context(exhaustion);
         }
         SummaryCall::Done(Ok(resp)) => {
             emit_summary_attempt_usage(event_tx, &summary_attempts).await;
@@ -323,8 +397,7 @@ pub(crate) async fn finish_after_max_iterations(
 
     let raw_text = resp.text.unwrap_or_default();
     if raw_text.is_empty() {
-        history.pop();
-        anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+        anyhow::bail!("{exhaustion}")
     }
     // The summary is raw provider text, and emitting it as a chunk makes this
     // a new automatic display sink: ACP renders `agent_message_chunk` live,
@@ -345,7 +418,7 @@ pub(crate) async fn finish_after_max_iterations(
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                 .with_attrs(::serde_json::json!({
                     "model": model,
-                    "max_iterations": max_iterations,
+                    "limit": format!("{limit:?}"),
                     "trace_id": turn_id,
                     "error": "malformed internal tool protocol omitted from max-iteration summary",
                 })),
@@ -358,11 +431,11 @@ pub(crate) async fn finish_after_max_iterations(
         display_text
     };
     if display_text.trim().is_empty() {
-        history.pop();
-        anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+        anyhow::bail!("{exhaustion}")
     }
     // History and result payloads keep the unmodified provider text; only the
     // display path is normalized, matching the final-response contract.
+    history.push(summary_prompt);
     let summary_msg = ChatMessage::assistant(raw_text.clone());
     if let Some(out) = &mut new_messages_out {
         out.push(summary_prompt_mirror);
@@ -371,10 +444,17 @@ pub(crate) async fn finish_after_max_iterations(
     history.push(summary_msg);
     // Graceful shutdown with a visible reason so the user knows why the
     // agent stopped making progress.
-    let stop_reason = crate::i18n::get_required_cli_string_with_args(
-        "turn-max-iterations-reached",
-        &[("max_iterations", &max_iterations.to_string())],
-    );
+    let stop_reason = match limit {
+        CompletionLimit::LocalIterations(max_iterations) => {
+            crate::i18n::get_required_cli_string_with_args(
+                "turn-max-iterations-reached",
+                &[("max_iterations", &max_iterations.to_string())],
+            )
+        }
+        CompletionLimit::ExecutionTree => {
+            crate::i18n::get_required_cli_string("turn-execution-tree-budget-reached")
+        }
+    };
     let segment = format!("{display_text}\n\n{stop_reason}");
     // This summary is the turn's only visible output on the max-iteration
     // exit path, and it comes from a fresh non-streaming call — there is no
@@ -393,7 +473,7 @@ pub(crate) async fn finish_after_max_iterations(
 
 #[cfg(test)]
 mod graceful_summary_metering_tests {
-    use super::finish_after_max_iterations;
+    use super::{CompletionLimit, finish_after_max_iterations};
     use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
     use crate::agent::turn::{LoopKnobs, StreamDelta};
     use async_trait::async_trait;
@@ -476,19 +556,22 @@ mod graceful_summary_metering_tests {
             "test-model",
             "test-model",
             None,
-            &multimodal_config,
             &pacing,
             None,
-            2,
+            CompletionLimit::LocalIterations(2),
             accumulated_display_text,
             "trace-req-test",
             &knobs,
             event_tx,
             on_delta,
             None,
-            ResolvedContextLimits::legacy_fallback(0),
+            None,
+            &multimodal_config,
+            None,
+            None,
+            |_, _| ResolvedContextLimits::legacy_fallback(0),
             &mut false,
-            super::super::DispatchTokenCounter::default(),
+            None,
             &crate::observability::NoopObserver,
         )
         .await
@@ -678,9 +761,11 @@ mod graceful_summary_metering_tests {
     /// test can assert on what actually reached the provider. `vision` lets a
     /// test decide whether the provider can see images, which the summary
     /// path consults exactly like the in-loop path.
+    #[derive(Default)]
     struct CapturingProvider {
         seen: Arc<std::sync::Mutex<Vec<String>>>,
         vision: bool,
+        expected_request: Option<(&'static str, usize)>,
     }
 
     #[async_trait]
@@ -705,9 +790,17 @@ mod graceful_summary_metering_tests {
         async fn chat(
             &self,
             request: ChatRequest<'_>,
-            _model: &str,
+            model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
+            if let Some((expected_model, token_budget)) = self.expected_request {
+                assert_eq!(model, expected_model);
+                assert!(request.tools.is_none());
+                assert!(
+                    crate::agent::history::estimate_history_tokens(request.messages)
+                        <= token_budget
+                );
+            }
             let joined = request
                 .messages
                 .iter()
@@ -734,12 +827,112 @@ mod graceful_summary_metering_tests {
     }
 
     #[tokio::test]
+    async fn graceful_summary_counts_hook_selected_request_without_repeating_hook() {
+        struct SummaryHook(Arc<AtomicUsize>);
+        #[async_trait]
+        impl crate::hooks::HookHandler for SummaryHook {
+            fn name(&self) -> &str {
+                "summary-context-hook"
+            }
+            async fn before_llm_call(
+                &self,
+                messages: &mut Vec<ChatMessage>,
+                model: &mut String,
+            ) -> crate::hooks::HookResult<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                *model = "summary-model".into();
+                messages.push(ChatMessage::user("hook context ".repeat(80)));
+                crate::hooks::HookResult::Continue(())
+            }
+        }
+
+        for budget in [512, 1] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let provider = CapturingProvider {
+                seen: Arc::clone(&seen),
+                expected_request: Some(("summary-model", budget)),
+                ..Default::default()
+            };
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut hooks = crate::hooks::HookRunner::new();
+            hooks.register(Box::new(SummaryHook(Arc::clone(&calls))));
+            let mut history = vec![
+                ChatMessage::user("obsolete context ".repeat(800)),
+                ChatMessage::assistant("obsolete answer"),
+                ChatMessage::user("latest real question"),
+                ChatMessage::assistant("latest completed work"),
+            ];
+            let mut crumb_present = false;
+            let result = finish_after_max_iterations(
+                &provider,
+                &mut history,
+                "custom",
+                "original-model",
+                "hint:original-model",
+                None,
+                &PacingConfig::default(),
+                None,
+                CompletionLimit::ExecutionTree,
+                String::new(),
+                "summary-hook-context",
+                &LoopKnobs::default(),
+                None,
+                None,
+                None,
+                None,
+                &MultimodalConfig::default(),
+                Some(&hooks),
+                None,
+                |provider, model| {
+                    assert_eq!(provider, "custom");
+                    assert_eq!(model, "summary-model");
+                    ResolvedContextLimits {
+                        model_context_window: budget,
+                        ..ResolvedContextLimits::legacy_fallback(budget)
+                    }
+                },
+                &mut crumb_present,
+                None,
+                &crate::observability::NoopObserver,
+            )
+            .await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(crumb_present);
+            assert!(history.iter().any(|m| m.content == "latest real question"));
+            assert!(history.iter().any(|m| m.content == "latest completed work"));
+            assert!(!history.iter().any(|m| m.content.contains("obsolete")));
+            assert!(!history.iter().any(|m| m.content.contains("hook context")));
+            let captured = seen.lock().unwrap();
+            if budget == 512 {
+                assert!(result.unwrap().contains("execution-tree iteration budget"));
+                assert_eq!(captured.len(), 1);
+                assert!(captured[0].contains("latest real question"));
+                assert!(captured[0].contains("hook context"));
+                assert!(!captured[0].contains("obsolete"));
+            } else {
+                let error = result.unwrap_err();
+                let exceeded = super::super::context_window_exceeded_from_error(&error)
+                    .expect("summary capacity rejection must retain its typed cause");
+                assert_eq!(exceeded.model_context_window, budget);
+                assert!(exceeded.estimated_tokens > budget);
+                assert!(captured.is_empty());
+                assert!(
+                    !history
+                        .iter()
+                        .any(|m| m.content.contains("execution-tree iteration budget"))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn graceful_summary_prompt_can_make_the_latest_turn_unsatisfiable() {
         for disable_soft_budget in [false, true] {
             let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
             let provider = CapturingProvider {
                 seen: Arc::clone(&seen),
                 vision: false,
+                ..Default::default()
             };
             let mut history = vec![
                 ChatMessage::user("current question"),
@@ -756,17 +949,20 @@ mod graceful_summary_metering_tests {
                 "test-model",
                 "test-model",
                 None,
-                &MultimodalConfig::default(),
                 &PacingConfig::default(),
                 None,
-                1,
+                CompletionLimit::LocalIterations(1),
                 String::new(),
                 "summary-prompt-floor",
                 &LoopKnobs::default(),
                 Some(&tx),
                 None,
                 None,
-                ResolvedContextLimits {
+                None,
+                &MultimodalConfig::default(),
+                None,
+                None,
+                |_, _| ResolvedContextLimits {
                     model_context_window: budget,
                     ..ResolvedContextLimits::legacy_fallback(if disable_soft_budget {
                         0
@@ -775,7 +971,7 @@ mod graceful_summary_metering_tests {
                     })
                 },
                 &mut crumb_present,
-                super::super::DispatchTokenCounter::default(),
+                None,
                 &crate::observability::NoopObserver,
             )
             .await
@@ -817,6 +1013,7 @@ mod graceful_summary_metering_tests {
         let provider = CapturingProvider {
             seen: Arc::clone(&seen),
             vision: false,
+            ..Default::default()
         };
         // A properly paired assistant tool_call + native tool-result JSON blob,
         // so the orphaned-tool-message sweep in finish_after_max_iterations keeps
@@ -841,19 +1038,22 @@ mod graceful_summary_metering_tests {
             "test-model",
             "test-model",
             None,
-            &multimodal_config,
             &pacing,
             None,
-            2,
+            CompletionLimit::LocalIterations(2),
             String::new(),
             "trace-req-audio",
             &knobs,
             None,
             None,
             None,
-            ResolvedContextLimits::legacy_fallback(0),
+            None,
+            &multimodal_config,
+            None,
+            None,
+            |_, _| ResolvedContextLimits::legacy_fallback(0),
             &mut false,
-            super::super::DispatchTokenCounter::default(),
+            None,
             &crate::observability::NoopObserver,
         )
         .await
@@ -887,6 +1087,7 @@ mod graceful_summary_metering_tests {
         let provider = CapturingProvider {
             seen: Arc::clone(&seen),
             vision: true,
+            ..Default::default()
         };
         // A properly paired assistant tool_call + native tool-result JSON
         // blob, so the orphan sweep keeps the exchange intact and the marker
@@ -913,19 +1114,22 @@ mod graceful_summary_metering_tests {
             "test-model",
             "test-model",
             None,
-            &multimodal_config,
             &pacing,
             None,
-            2,
+            CompletionLimit::LocalIterations(2),
             String::new(),
             "trace-req-img-drop",
             &knobs,
             None,
             None,
             None,
-            ResolvedContextLimits::legacy_fallback(0),
+            None,
+            &multimodal_config,
+            None,
+            None,
+            |_, _| ResolvedContextLimits::legacy_fallback(0),
             &mut false,
-            super::super::DispatchTokenCounter::default(),
+            None,
             &crate::observability::NoopObserver,
         )
         .await
@@ -966,6 +1170,7 @@ mod graceful_summary_metering_tests {
         let provider = CapturingProvider {
             seen: Arc::clone(&seen),
             vision: true,
+            ..Default::default()
         };
         let mut history = vec![
             ChatMessage::user("call the tool and describe both screenshots"),
@@ -989,19 +1194,22 @@ mod graceful_summary_metering_tests {
             "test-model",
             "test-model",
             None,
-            &multimodal_config,
             &pacing,
             None,
-            2,
+            CompletionLimit::LocalIterations(2),
             String::new(),
             "trace-req-img-inline",
             &knobs,
             None,
             None,
             None,
-            ResolvedContextLimits::legacy_fallback(0),
+            None,
+            &multimodal_config,
+            None,
+            None,
+            |_, _| ResolvedContextLimits::legacy_fallback(0),
             &mut false,
-            super::super::DispatchTokenCounter::default(),
+            None,
             &crate::observability::NoopObserver,
         )
         .await
@@ -1061,6 +1269,7 @@ mod graceful_summary_metering_tests {
         let provider = CapturingProvider {
             seen: Arc::clone(&seen),
             vision: true,
+            ..Default::default()
         };
         let pacing = PacingConfig::default();
         let knobs = LoopKnobs::default();
@@ -1073,19 +1282,22 @@ mod graceful_summary_metering_tests {
             "test-model",
             "test-model",
             None,
-            &multimodal_config,
             &pacing,
             None,
-            2,
+            CompletionLimit::LocalIterations(2),
             String::new(),
             "trace-req-signed-thinking",
             &knobs,
             None,
             None,
             None,
-            ResolvedContextLimits::legacy_fallback(0),
+            None,
+            &multimodal_config,
+            None,
+            None,
+            |_, _| ResolvedContextLimits::legacy_fallback(0),
             &mut false,
-            super::super::DispatchTokenCounter::default(),
+            None,
             &crate::observability::NoopObserver,
         )
         .await
@@ -1108,9 +1320,9 @@ mod graceful_summary_metering_tests {
     // when the primary that receives the request verifies thinking
     // signatures — so the summary's text-only degrade path must keep the
     // envelope byte-identical too, not just the one-shot seam. The history
-    // carries a path-form marker in the user turn so the summary actually
-    // takes the degrade branch; the placeholder in the captured request is
-    // the probe that it ran.
+    // carries a path-form marker in an earlier user turn so the summary
+    // actually takes the carried-over-image degrade branch; the placeholder in
+    // the captured request is the probe that it ran.
     #[tokio::test]
     async fn graceful_summary_degrade_replays_signed_thinking_unmodified() {
         let user_marker = format!("[{}:{}]", "IMAGE", "/tmp/degrade.png");
@@ -1137,11 +1349,13 @@ mod graceful_summary_metering_tests {
                 })
                 .to_string(),
             ),
+            ChatMessage::user("continue without images"),
         ];
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = CapturingProvider {
             seen: Arc::clone(&seen),
             vision: false,
+            ..Default::default()
         };
         let pacing = PacingConfig::default();
         let knobs = LoopKnobs::default();
@@ -1154,19 +1368,22 @@ mod graceful_summary_metering_tests {
             "test-model",
             "test-model",
             None,
-            &multimodal_config,
             &pacing,
             None,
-            2,
+            CompletionLimit::LocalIterations(2),
             String::new(),
             "trace-req-signed-thinking-degrade",
             &knobs,
             None,
             None,
             None,
-            ResolvedContextLimits::legacy_fallback(0),
+            None,
+            &multimodal_config,
+            None,
+            None,
+            |_, _| ResolvedContextLimits::legacy_fallback(0),
             &mut false,
-            super::super::DispatchTokenCounter::default(),
+            None,
             &crate::observability::NoopObserver,
         )
         .await
@@ -1195,6 +1412,7 @@ mod graceful_summary_metering_tests {
         let provider = CapturingProvider {
             seen: Arc::clone(&seen),
             vision: false,
+            ..Default::default()
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
 
