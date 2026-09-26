@@ -970,6 +970,7 @@ mod tests {
             wasm_path: Some("fixture.wasm".to_string()),
             wasm_sha256: None,
             capabilities: vec![capability],
+            provides: None,
             permissions: vec![PluginPermission::ConfigRead],
             config_schema: Some(serde_json::json!({
                 "$schema": "https://json-schema.org/draft/2020-12/schema",

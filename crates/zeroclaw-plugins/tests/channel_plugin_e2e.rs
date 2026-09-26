@@ -92,6 +92,7 @@ fn manifest() -> PluginManifest {
         wasm_path: Some("channel-fixture.wasm".to_string()),
         wasm_sha256: None,
         capabilities: vec![PluginCapability::Channel],
+        provides: None,
         // Every fixture channel is ConfigRead-granted so the typed-config and
         // scoped-secret contract is exercised on every instantiation, and
         // State-granted so the durable-state contract is too. The HttpClient

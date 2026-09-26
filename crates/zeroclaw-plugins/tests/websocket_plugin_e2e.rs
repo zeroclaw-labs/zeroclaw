@@ -90,6 +90,7 @@ fn manifest() -> PluginManifest {
         wasm_path: Some("tool-websocket-fixture.wasm".to_string()),
         wasm_sha256: None,
         capabilities: vec![PluginCapability::Tool],
+        provides: None,
         permissions: vec![
             PluginPermission::ConfigRead,
             PluginPermission::WebSocketClient,

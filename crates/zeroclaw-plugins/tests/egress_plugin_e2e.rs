@@ -107,6 +107,7 @@ async fn probe(url: &str, follow: bool, egress: Option<EgressHostService>) -> St
         wasm_path: Some("egress-fixture.wasm".to_string()),
         wasm_sha256: None,
         capabilities: vec![PluginCapability::Tool],
+        provides: None,
         permissions: vec![PluginPermission::HttpClient],
         config_schema: None,
         signature: None,

@@ -757,6 +757,7 @@ mod tests {
             wasm_path: Some("fixture.wasm".to_string()),
             wasm_sha256: None,
             capabilities: vec![PluginCapability::Tool],
+            provides: None,
             permissions: requests_config
                 .then_some(PluginPermission::ConfigRead)
                 .into_iter()
