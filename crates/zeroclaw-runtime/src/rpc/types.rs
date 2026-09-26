@@ -487,6 +487,8 @@ rpc_type! {
     /// `memory/get` params — fetch one entry's full content by key.
     pub struct MemoryGetParams {
         pub key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub agent: Option<String>,
     }
 }
 
@@ -577,6 +579,12 @@ rpc_type! {
         pub allowed_tools: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub delete_after_run: Option<bool>,
+        /// Agent jobs only: `false` disables memory recall (default `true`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub uses_memory: Option<bool>,
+        /// Shell jobs only: `"wrapped"` (default) or `"raw"`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub shell_output_format: Option<zeroclaw_config::schema::CronShellOutputFormat>,
     }
 }
 
@@ -597,6 +605,15 @@ rpc_type! {
         pub command: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub prompt: Option<String>,
+        /// Pause (`false`) or resume (`true`) without deleting the job.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub enabled: Option<bool>,
+        /// Agent jobs only: `false` disables memory recall.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub uses_memory: Option<bool>,
+        /// Shell jobs only: `"wrapped"` or `"raw"`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub shell_output_format: Option<zeroclaw_config::schema::CronShellOutputFormat>,
     }
 }
 
@@ -961,6 +978,63 @@ rpc_type! {
     }
 }
 
+impl From<crate::skills::EffectiveSkill> for AgentSkillEntry {
+    /// Flatten an effective skill for the wire: `origin` becomes a string
+    /// with optional `plugin`/`bundle` detail; `editable`, `directory` and
+    /// `shadowed` pass through. Shared by the HTTP and RPC surfaces.
+    fn from(s: crate::skills::EffectiveSkill) -> Self {
+        use crate::skills::SkillOrigin;
+        let (origin, plugin, bundle) = match s.origin {
+            SkillOrigin::Workspace => ("workspace", None, None),
+            SkillOrigin::OpenSkills => ("open-skills", None, None),
+            SkillOrigin::Plugin(p) => ("plugin", Some(p), None),
+            SkillOrigin::Bundle(a) => ("bundle", None, Some(a)),
+        };
+        Self {
+            name: s.name,
+            description: s.description,
+            origin: origin.to_string(),
+            plugin,
+            bundle,
+            directory: s.directory.map(|d| d.display().to_string()),
+            editable: s.editable,
+            shadowed: s
+                .shadowed
+                .into_iter()
+                .map(|sh| ShadowedSkillEntry {
+                    name: sh.name,
+                    origin: sh.origin_hint,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<crate::skills::DroppedSkill> for DroppedSkillEntry {
+    /// Flatten a dropped skill, splitting the drop reason into a
+    /// `(reason_kind, reason)` string pair a client can group on without
+    /// knowing the Rust enum. Shared by the HTTP and RPC surfaces.
+    fn from(d: crate::skills::DroppedSkill) -> Self {
+        use crate::skills::SkillDropReason;
+        let (reason_kind, reason, scripts_blocked) = match d.reason {
+            SkillDropReason::AuditFindings {
+                summary,
+                scripts_blocked,
+            } => ("audit_findings", summary, scripts_blocked),
+            SkillDropReason::AuditError(s) => ("audit_error", s, false),
+            SkillDropReason::ManifestParseError(s) => ("manifest_parse_error", s, false),
+        };
+        Self {
+            name: d.name,
+            origin: d.origin_hint,
+            reason_kind: reason_kind.to_string(),
+            reason,
+            scripts_blocked,
+            directory: d.location.map(|p| p.display().to_string()),
+        }
+    }
+}
+
 rpc_type! {
     pub struct AgentSkillsResult {
         pub agent: String,
@@ -997,6 +1071,44 @@ rpc_type! {
         #[serde(default)]
         pub body: String,
     }
+}
+
+rpc_type! {
+    /// Params for `skills/create`. Consolidates gateway `SkillCreateBody`.
+    pub struct SkillsCreateParams {
+        pub bundle: String,
+        pub name: String,
+        pub frontmatter: SkillFrontmatter,
+        /// Initial markdown body; empty writes a default heading.
+        #[serde(default)]
+        pub body: String,
+        /// Skip scaffolding the optional `scripts/`, `references/` and
+        /// `assets/` subdirectories.
+        #[serde(default)]
+        pub no_scaffold: bool,
+    }
+}
+
+rpc_type! {
+    pub struct SkillsCreateResult {
+        pub bundle: String,
+        pub name: String,
+        pub directory: String,
+    }
+}
+
+rpc_type! {
+    /// Params for `skills/effective`: the skills one agent actually loads.
+    pub struct SkillsEffectiveParams {
+        pub agent: String,
+    }
+}
+
+/// Result for `skills/slash-option-kinds`: the canonical typed-slash-option
+/// registry. Serialize-only, like the descriptor it carries.
+#[derive(Debug, Clone, Serialize)]
+pub struct SkillsSlashOptionKindsResult {
+    pub kinds: Vec<crate::skills::SlashOptionKindDescriptor>,
 }
 
 rpc_type! {
@@ -1079,6 +1191,10 @@ rpc_type! {
         pub agent: String,
         pub filename: String,
         pub content: String,
+        /// The mtime the editor last saw. When set, the write is refused
+        /// with `PRECONDITION_FAILED` if the file on disk has changed since.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub expected_mtime_ms: Option<i64>,
     }
 }
 
@@ -1610,6 +1726,9 @@ rpc_type! {
 rpc_type! {
     pub struct QuickstartValidateParams {
         pub submission: BuilderSubmission,
+        /// Surface driving the flow. Defaults to `tui`; `test` is refused.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub surface: Option<Surface>,
     }
 }
 
@@ -1638,6 +1757,9 @@ pub enum QuickstartValidateResult {
 rpc_type! {
     pub struct QuickstartApplyParams {
         pub submission: BuilderSubmission,
+        /// Surface driving the flow. Defaults to `tui`; `test` is refused.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub surface: Option<Surface>,
     }
 }
 

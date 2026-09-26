@@ -8,12 +8,12 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use zeroclaw_runtime::rpc::types::{
-    AgentSkillEntry, AgentSkillsResult, DroppedSkillEntry, ShadowedSkillEntry, SkillBundleEntry,
-    SkillListEntry, SkillsBundlesResult, SkillsListResult, SkillsReadResult,
+    AgentSkillEntry, AgentSkillsResult, DroppedSkillEntry, SkillBundleEntry, SkillListEntry,
+    SkillsBundlesResult, SkillsListResult, SkillsReadResult,
 };
 use zeroclaw_runtime::skills::{
-    DroppedSkill, EffectiveSkill, RemoveMode, ScaffoldOptions, ServiceError, SkillDropReason,
-    SkillFrontmatter, SkillOrigin, SkillsService, SlashOptionKindDescriptor,
+    RemoveMode, ScaffoldOptions, ServiceError, SkillFrontmatter, SkillsService,
+    SlashOptionKindDescriptor,
 };
 
 use super::AppState;
@@ -147,62 +147,15 @@ pub async fn handle_agent_skills(
     match service.resolve_effective_skills(&alias) {
         Ok(set) => Json(AgentSkillsResult {
             agent: alias,
-            skills: set.skills.into_iter().map(agent_skill_entry).collect(),
-            dropped: set.dropped.into_iter().map(dropped_skill_entry).collect(),
+            skills: set.skills.into_iter().map(AgentSkillEntry::from).collect(),
+            dropped: set
+                .dropped
+                .into_iter()
+                .map(DroppedSkillEntry::from)
+                .collect(),
         })
         .into_response(),
         Err(e) => service_error_response(e),
-    }
-}
-
-/// Map a runtime [`EffectiveSkill`] to its flat wire shape (`origin` string +
-/// optional `plugin`/`bundle` detail). `editable`/`directory`/`shadowed` pass
-/// through.
-fn agent_skill_entry(s: EffectiveSkill) -> AgentSkillEntry {
-    let (origin, plugin, bundle) = match s.origin {
-        SkillOrigin::Workspace => ("workspace", None, None),
-        SkillOrigin::OpenSkills => ("open-skills", None, None),
-        SkillOrigin::Plugin(p) => ("plugin", Some(p), None),
-        SkillOrigin::Bundle(a) => ("bundle", None, Some(a)),
-    };
-    AgentSkillEntry {
-        name: s.name,
-        description: s.description,
-        origin: origin.to_string(),
-        plugin,
-        bundle,
-        directory: s.directory.map(|d| d.display().to_string()),
-        editable: s.editable,
-        shadowed: s
-            .shadowed
-            .into_iter()
-            .map(|sh| ShadowedSkillEntry {
-                name: sh.name,
-                origin: sh.origin_hint,
-            })
-            .collect(),
-    }
-}
-
-/// Map a runtime [`DroppedSkill`] to its flat wire shape, splitting the
-/// [`SkillDropReason`] enum into a `(reason_kind, reason)` string pair the
-/// dashboard can group on without knowing the Rust enum.
-fn dropped_skill_entry(d: DroppedSkill) -> DroppedSkillEntry {
-    let (reason_kind, reason, scripts_blocked) = match d.reason {
-        SkillDropReason::AuditFindings {
-            summary,
-            scripts_blocked,
-        } => ("audit_findings", summary, scripts_blocked),
-        SkillDropReason::AuditError(s) => ("audit_error", s, false),
-        SkillDropReason::ManifestParseError(s) => ("manifest_parse_error", s, false),
-    };
-    DroppedSkillEntry {
-        name: d.name,
-        origin: d.origin_hint,
-        reason_kind: reason_kind.to_string(),
-        reason,
-        scripts_blocked,
-        directory: d.location.map(|p| p.display().to_string()),
     }
 }
 
@@ -356,7 +309,9 @@ fn service_error_response(err: ServiceError) -> Response {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use zeroclaw_runtime::skills::{ShadowedSkill, SkillOrigin};
+    use zeroclaw_runtime::skills::{
+        DroppedSkill, EffectiveSkill, ShadowedSkill, SkillDropReason, SkillOrigin,
+    };
 
     // the write-guard error maps to 403, distinct from 404/400.
     #[test]
@@ -383,7 +338,7 @@ mod tests {
                 origin_hint: "bundle".into(),
             }],
         };
-        let entry = agent_skill_entry(s);
+        let entry = AgentSkillEntry::from(s);
         assert_eq!(entry.origin, "workspace");
         assert_eq!(entry.shadowed.len(), 1);
         assert_eq!(entry.shadowed[0].name, "foo");
@@ -400,7 +355,7 @@ mod tests {
             location: Some(PathBuf::from("/x/n")),
         };
         assert_eq!(
-            dropped_skill_entry(mk(SkillDropReason::AuditFindings {
+            DroppedSkillEntry::from(mk(SkillDropReason::AuditFindings {
                 summary: "a".into(),
                 scripts_blocked: true,
             }))
@@ -408,7 +363,7 @@ mod tests {
             "audit_findings"
         );
         assert!(
-            dropped_skill_entry(mk(SkillDropReason::AuditFindings {
+            DroppedSkillEntry::from(mk(SkillDropReason::AuditFindings {
                 summary: "a".into(),
                 scripts_blocked: true,
             }))
@@ -416,10 +371,10 @@ mod tests {
             "scripts_blocked flag must pass through to the wire entry"
         );
         assert_eq!(
-            dropped_skill_entry(mk(SkillDropReason::AuditError("b".into()))).reason_kind,
+            DroppedSkillEntry::from(mk(SkillDropReason::AuditError("b".into()))).reason_kind,
             "audit_error"
         );
-        let mpe = dropped_skill_entry(mk(SkillDropReason::ManifestParseError("c".into())));
+        let mpe = DroppedSkillEntry::from(mk(SkillDropReason::ManifestParseError("c".into())));
         assert_eq!(mpe.reason_kind, "manifest_parse_error");
         assert_eq!(mpe.reason, "c");
         assert_eq!(mpe.directory.as_deref(), Some("/x/n"));

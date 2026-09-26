@@ -264,6 +264,10 @@ pub mod error_codes {
     pub const SESSION_LIMIT_REACHED: i32 = -32001;
     pub const SESSION_BUSY: i32 = -32002;
     pub const SESSION_NOT_OWNED: i32 = -32003;
+    /// A caller-supplied precondition no longer holds, such as an
+    /// `expected_mtime_ms` that disk has moved past. `data` carries the
+    /// current state so the caller can reconcile and retry.
+    pub const PRECONDITION_FAILED: i32 = -32005;
     pub const AUTH_REQUIRED: i32 = -32010;
     pub const VERSION_MISMATCH: i32 = -32011;
     pub const FORBIDDEN: i32 = -32012;

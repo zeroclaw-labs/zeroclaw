@@ -149,6 +149,9 @@ pub enum Method {
     SkillsRead,
     SkillsWrite,
     SkillsDelete,
+    SkillsCreate,
+    SkillsEffective,
+    SkillsSlashOptionKinds,
 
     // Personality
     PersonalityList,
@@ -271,6 +274,9 @@ impl Method {
         (Method::SkillsRead, "skills/read"),
         (Method::SkillsWrite, "skills/write"),
         (Method::SkillsDelete, "skills/delete"),
+        (Method::SkillsCreate, "skills/create"),
+        (Method::SkillsEffective, "skills/effective"),
+        (Method::SkillsSlashOptionKinds, "skills/slash-option-kinds"),
         // Personality
         (Method::PersonalityList, "personality/list"),
         (Method::PersonalityGet, "personality/get"),
@@ -403,7 +409,12 @@ impl Method {
 
             M::CostQuery | M::CostOrg => (Resource::Cost, Verb::Read),
 
-            M::SkillsBundles | M::SkillsList | M::SkillsRead => (Resource::Skills, Verb::Read),
+            M::SkillsBundles
+            | M::SkillsList
+            | M::SkillsRead
+            | M::SkillsEffective
+            | M::SkillsSlashOptionKinds => (Resource::Skills, Verb::Read),
+            M::SkillsCreate => (Resource::Skills, Verb::Create),
             M::SkillsWrite => (Resource::Skills, Verb::Update),
             M::SkillsDelete => (Resource::Skills, Verb::Delete),
 
@@ -861,6 +872,22 @@ pub struct RpcDispatcher {
 /// explicit no-follow option refuses a final component that is a link at all.
 /// An allowlisted `SOUL.md` planted as a symlink therefore cannot redirect the
 /// read outside the entitled agent's workspace.
+/// The surface a quickstart RPC call reports: `tui` when the caller does not
+/// say, which is what every RPC client was labelled before. `test` is refused
+/// so a client cannot tag production telemetry as test traffic.
+fn quickstart_surface(
+    requested: Option<crate::quickstart::Surface>,
+) -> Result<crate::quickstart::Surface, JsonRpcError> {
+    match requested {
+        None => Ok(crate::quickstart::Surface::Tui),
+        Some(crate::quickstart::Surface::Test) => Err(rpc_err(
+            INVALID_PARAMS,
+            "surface \"test\" is not accepted over RPC",
+        )),
+        Some(surface) => Ok(surface),
+    }
+}
+
 fn read_personality_file(
     workspace: &std::path::Path,
     filename: &str,
@@ -2094,6 +2121,44 @@ impl RpcDispatcher {
         }
     }
 
+    /// The memory store a memory method acts on. Without `agent` it is the
+    /// daemon's shared store, as before. With `agent` it is that agent's own
+    /// store, built the way `resolve_memory_handle` builds it for the HTTP
+    /// memory routes, after the principal is checked against the agent
+    /// selector so naming an agent cannot reach one it is not entitled to.
+    async fn memory_for(
+        &self,
+        method: Method,
+        agent: Option<&str>,
+    ) -> Result<Arc<dyn zeroclaw_api::memory_traits::Memory>, JsonRpcError> {
+        let Some(alias) = agent.map(str::trim).filter(|a| !a.is_empty()) else {
+            return self
+                .ctx
+                .memory
+                .clone()
+                .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"));
+        };
+        self.selector_agent(method, alias)?;
+        let config = self.ctx.config.read().clone();
+        if config.agent(alias).is_none() {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!("Unknown agent {alias:?} (no [agents.{alias}] entry configured)"),
+            ));
+        }
+        let api_key = config
+            .resolved_model_provider_for_agent(alias)
+            .and_then(|(_, _, cfg)| cfg.api_key.clone());
+        zeroclaw_memory::create_memory_for_agent(&config, alias, api_key.as_deref())
+            .await
+            .map_err(|e| {
+                rpc_err(
+                    INTERNAL_ERROR,
+                    format!("Failed to build per-agent memory: {e:#}"),
+                )
+            })
+    }
+
     /// TUI ID assigned during initialize, if any.
     pub fn tui_id(&self) -> Option<&str> {
         self.tui_id.as_deref()
@@ -2510,7 +2575,7 @@ impl RpcDispatcher {
                     if !is_notif {
                         match result {
                             Ok(_) => handle.send_result(id_clone, serde_json::json!({})).await,
-                            Err(e) => handle.send_error(id_clone, e.code, &e.message).await,
+                            Err(e) => handle.send_rpc_error(id_clone, e).await,
                         }
                     }
                 });
@@ -2589,6 +2654,9 @@ impl RpcDispatcher {
             Method::SkillsRead => self.handle_skills_read(&req.params),
             Method::SkillsWrite => self.handle_skills_write(&req.params),
             Method::SkillsDelete => self.handle_skills_delete(&req.params),
+            Method::SkillsCreate => self.handle_skills_create(&req.params),
+            Method::SkillsEffective => self.handle_skills_effective(&req.params),
+            Method::SkillsSlashOptionKinds => self.handle_skills_slash_option_kinds(),
 
             // Personality
             Method::PersonalityList => self.handle_personality_list(&req.params),
@@ -2661,7 +2729,7 @@ impl RpcDispatcher {
 
         match result {
             Ok(v) => self.send_result(req_id, v).await,
-            Err(e) => self.send_error(req_id, e.code, &e.message).await,
+            Err(e) => self.send_rpc_error(req_id, e).await,
         }
     }
 
@@ -6049,13 +6117,11 @@ impl RpcDispatcher {
     // ── Memory handlers ──────────────────────────────────────────
 
     async fn handle_memory_list(&self, params: &Value) -> RpcResult {
-        let mem = self
-            .ctx
-            .memory
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
         let req: MemoryListParams = parse_params(params)?;
         self.authorize_memory_access(req.session_id.as_deref(), Method::MemoryList)
+            .await?;
+        let mem = self
+            .memory_for(Method::MemoryList, req.agent.as_deref())
             .await?;
         let category = req
             .category
@@ -6071,13 +6137,11 @@ impl RpcDispatcher {
     }
 
     async fn handle_memory_search(&self, params: &Value) -> RpcResult {
-        let mem = self
-            .ctx
-            .memory
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
         let req: MemorySearchParams = parse_params(params)?;
         self.authorize_memory_access(req.session_id.as_deref(), Method::MemorySearch)
+            .await?;
+        let mem = self
+            .memory_for(Method::MemorySearch, req.agent.as_deref())
             .await?;
         let entries = mem
             .recall(
@@ -6099,13 +6163,11 @@ impl RpcDispatcher {
     /// rows in memory and fetch the full `content` only when the
     /// detail pane opens. Dropped on detail close.
     async fn handle_memory_get(&self, params: &Value) -> RpcResult {
-        let mem = self
-            .ctx
-            .memory
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
         let req: MemoryGetParams = parse_params(params)?;
         self.authorize_memory_access(None, Method::MemoryGet)
+            .await?;
+        let mem = self
+            .memory_for(Method::MemoryGet, req.agent.as_deref())
             .await?;
         let entry = mem
             .get(&req.key)
@@ -6121,13 +6183,11 @@ impl RpcDispatcher {
     }
 
     async fn handle_memory_store(&self, params: &Value) -> RpcResult {
-        let mem = self
-            .ctx
-            .memory
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
         let req: MemoryStoreParams = parse_params(params)?;
         self.authorize_memory_access(req.session_id.as_deref(), Method::MemoryStore)
+            .await?;
+        let mem = self
+            .memory_for(Method::MemoryStore, req.agent.as_deref())
             .await?;
         let category = req
             .category
@@ -6144,13 +6204,11 @@ impl RpcDispatcher {
     }
 
     async fn handle_memory_delete(&self, params: &Value) -> RpcResult {
-        let mem = self
-            .ctx
-            .memory
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
         let req: MemoryDeleteParams = parse_params(params)?;
         self.authorize_memory_access(None, Method::MemoryDelete)
+            .await?;
+        let mem = self
+            .memory_for(Method::MemoryDelete, req.agent.as_deref())
             .await?;
         mem.forget(&req.key)
             .await
@@ -6191,15 +6249,61 @@ impl RpcDispatcher {
             expr: req.schedule,
             tz: req.tz,
         };
-        let job = crate::cron::add_shell_job_with_approval(
-            &config,
-            &req.agent,
-            req.name,
-            schedule,
-            req.command.as_deref().unwrap_or(""),
-            req.delivery,
-            true, // RPC calls are pre-approved
-        )
+        // Same job-type rule as `POST /api/cron`: an explicit `job_type`, or
+        // an agent job when only a prompt is given.
+        let is_agent = matches!(req.job_type.as_deref(), Some("agent"))
+            || (req.job_type.is_none() && req.prompt.is_some());
+        let job = if is_agent {
+            if req.shell_output_format.is_some() {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    "shell_output_format is not applicable to agent jobs; agent execution ignores it",
+                ));
+            }
+            let prompt = req
+                .prompt
+                .as_deref()
+                .filter(|p| !p.trim().is_empty())
+                .ok_or_else(|| rpc_err(INVALID_PARAMS, "Missing 'prompt' for agent job"))?;
+            let session_target = match req.session_target.as_deref() {
+                Some(raw) => crate::cron::SessionTarget::try_parse(raw)
+                    .map_err(|e| rpc_err(INVALID_PARAMS, e))?,
+                None => crate::cron::SessionTarget::Isolated,
+            };
+            crate::cron::add_agent_job(
+                &config,
+                &req.agent,
+                req.name,
+                schedule,
+                prompt,
+                session_target,
+                req.model,
+                req.delivery,
+                req.delete_after_run.unwrap_or(false),
+                req.allowed_tools,
+                req.uses_memory.unwrap_or(true),
+            )
+        } else {
+            let command = req
+                .command
+                .as_deref()
+                .filter(|c| !c.trim().is_empty())
+                .ok_or_else(|| rpc_err(INVALID_PARAMS, "Missing 'command' for shell job"))?;
+            // Not pre-approved. An RPC caller is held to the owning agent's
+            // policy exactly as `POST /api/cron` is: a command that policy
+            // gates behind approval is refused here, not scheduled to run
+            // later without anyone having approved it.
+            crate::cron::add_shell_job_with_approval_and_format(
+                &config,
+                &req.agent,
+                req.name,
+                schedule,
+                command,
+                req.delivery,
+                false,
+                req.shell_output_format.unwrap_or_default(),
+            )
+        }
         .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron add failed: {e}")))?;
         to_result(job)
     }
@@ -6208,6 +6312,41 @@ impl RpcDispatcher {
         let req: CronPatchParams = parse_params(params)?;
         self.selector_agent(Method::CronPatch, &req.agent)?;
         let config = self.ctx.config.read().clone();
+        // The ownership test rides in the `UPDATE` itself for a scoped
+        // principal, so an agent rename landing between the check and the
+        // write cannot open a window. An operator-level principal patches
+        // any row, including the ownerless legacy ones.
+        let owner = self.authorize_cron_job(Method::CronPatch, &config, &req.id)?;
+        let is_agent = matches!(owner.job_type, crate::cron::JobType::Agent);
+        if req.shell_output_format.is_some() {
+            if is_agent {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    "shell_output_format is not applicable to agent jobs; agent execution ignores it",
+                ));
+            }
+            if owner.source == "declarative" {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    format!(
+                        "shell_output_format for declarative job '{}' is set in config.toml, \
+                         not over RPC; the stored value is not read for declarative jobs",
+                        req.id
+                    ),
+                ));
+            }
+        }
+        let (command, prompt) = (req.command, req.prompt);
+        // Validate a replacement command under the owning agent's policy
+        // before it is persisted, and without pre-approval: a command that
+        // policy gates behind approval is refused, as it is over HTTP and on
+        // `cron/add`, rather than swapped into a working job unapproved.
+        if let Some(command) = command.as_deref()
+            && !command.trim().is_empty()
+        {
+            crate::cron::validate_shell_command(&config, &owner.agent_alias, command, false)
+                .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron patch rejected: {e}")))?;
+        }
         let patch = CronJobPatch {
             schedule: req.schedule.map(|s| Schedule::Cron {
                 expr: s,
@@ -6217,26 +6356,14 @@ impl RpcDispatcher {
                     req.tz
                 },
             }),
-            command: req.command,
-            prompt: req.prompt,
+            command,
+            prompt,
             name: req.name,
+            enabled: req.enabled,
+            uses_memory: req.uses_memory,
+            shell_output_format: req.shell_output_format,
             ..Default::default()
         };
-        // The ownership test rides in the `UPDATE` itself for a scoped
-        // principal, so an agent rename landing between the check and the
-        // write cannot open a window. An operator-level principal patches
-        // any row, including the ownerless legacy ones.
-        let owner = self.authorize_cron_job(Method::CronPatch, &config, &req.id)?;
-        // Validate a replacement command under the owning agent's policy before
-        // it is persisted. `cron/add` validates on the way in; without the same
-        // check here an invalid command can replace a working job through the
-        // patch path, and the job only fails later, at execution.
-        if let Some(command) = patch.command.as_deref()
-            && !command.trim().is_empty()
-        {
-            crate::cron::validate_shell_command(&config, &owner.agent_alias, command, true)
-                .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron patch rejected: {e}")))?;
-        }
         let job = if self.has_admin_grants() {
             crate::cron::update_job(&config, &req.id, patch)
         } else {
@@ -7468,6 +7595,57 @@ impl RpcDispatcher {
         })
     }
 
+    fn handle_skills_create(&self, params: &Value) -> RpcResult {
+        let req: SkillsCreateParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let root = config.install_root_dir();
+        let svc = crate::skills::service::SkillsService::new(&config, &root);
+        let skill_ref = resolve_skill_ref(&svc, &req.name, &req.bundle)?;
+        let directory = svc
+            .scaffold_skill(
+                &skill_ref,
+                req.frontmatter,
+                crate::skills::ScaffoldOptions {
+                    create_optional_subdirs: !req.no_scaffold,
+                    body: req.body,
+                },
+            )
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Skill create failed: {e}")))?;
+        to_result(SkillsCreateResult {
+            bundle: skill_ref.bundle().to_string(),
+            name: skill_ref.name().to_string(),
+            directory: directory.display().to_string(),
+        })
+    }
+
+    /// The skills one agent actually loads, with the candidates the resolver
+    /// dropped. Same shape as `GET /api/agents/{alias}/skills`.
+    fn handle_skills_effective(&self, params: &Value) -> RpcResult {
+        let req: SkillsEffectiveParams = parse_params(params)?;
+        self.selector_agent(Method::SkillsEffective, &req.agent)?;
+        let config = self.ctx.config.read().clone();
+        let root = config.install_root_dir();
+        let svc = crate::skills::service::SkillsService::new(&config, &root);
+        let set = svc
+            .resolve_effective_skills(&req.agent)
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Skill resolution failed: {e}")))?;
+        to_result(AgentSkillsResult {
+            agent: req.agent,
+            skills: set.skills.into_iter().map(AgentSkillEntry::from).collect(),
+            dropped: set
+                .dropped
+                .into_iter()
+                .map(DroppedSkillEntry::from)
+                .collect(),
+        })
+    }
+
+    fn handle_skills_slash_option_kinds(&self) -> RpcResult {
+        to_result(SkillsSlashOptionKindsResult {
+            kinds: crate::skills::slash_option_kinds(),
+        })
+    }
+
     // ── Personality handlers ─────────────────────────────────────
 
     fn handle_personality_list(&self, params: &Value) -> RpcResult {
@@ -7579,6 +7757,31 @@ impl RpcDispatcher {
             ));
         }
         let workspace = config.agent_workspace_dir(&req.agent);
+        // Disk-drift guard, as on `PUT /api/personality/{filename}`: when the
+        // editor says which mtime it saw, refuse the write if the file has
+        // moved since, and hand back what is on disk now. Read through the
+        // same no-follow handle as every other personality read.
+        if let Some(expected) = req.expected_mtime_ms {
+            let (current_content, current_mtime_ms) =
+                match read_personality_file(&workspace, &req.filename) {
+                    Ok((content, mtime)) => (content, mtime),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => (String::new(), None),
+                    Err(e) => return Err(rpc_err(INTERNAL_ERROR, format!("Read failed: {e}"))),
+                };
+            if current_mtime_ms != Some(expected) {
+                let mut err = rpc_err(
+                    PRECONDITION_FAILED,
+                    format!("{} changed on disk since it was read", req.filename),
+                );
+                err.data = Some(serde_json::json!({
+                    "error": "personality_disk_drift",
+                    "filename": req.filename,
+                    "current_content": current_content,
+                    "current_mtime_ms": current_mtime_ms,
+                }));
+                return Err(err);
+            }
+        }
         // Write beneath a handle on the entitled agent's workspace, without
         // following a link out of it, for the same reason the read side does.
         let mtime_ms = write_personality_file(&workspace, &req.filename, &req.content)
@@ -8061,6 +8264,20 @@ impl RpcDispatcher {
         }
     }
 
+    /// Send a handler's error as it was built, `data` included, so a method
+    /// that returns structured error detail reaches the client intact.
+    async fn send_rpc_error(&self, id: Value, error: JsonRpcError) {
+        let resp = JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION,
+            result: None,
+            error: Some(error),
+            id,
+        };
+        if let Ok(json) = serde_json::to_string(&resp) {
+            let _ = self.rpc.send_raw(json).await;
+        }
+    }
+
     async fn send_error(&self, id: Value, code: i32, message: &str) {
         let resp = JsonRpcResponse {
             jsonrpc: JSONRPC_VERSION,
@@ -8092,15 +8309,13 @@ impl RpcDispatcher {
 
     fn handle_quickstart_validate(&self, params: &Value) -> RpcResult {
         let req: QuickstartValidateParams = parse_params(params)?;
+        let surface = quickstart_surface(req.surface)?;
         let cfg = self.ctx.config.read().clone();
-        let body = match crate::quickstart::validate_only_with_surface(
-            &req.submission,
-            &cfg,
-            crate::quickstart::Surface::Tui,
-        ) {
-            Ok(()) => QuickstartValidateResult::Ok,
-            Err(errors) => QuickstartValidateResult::Errors { errors },
-        };
+        let body =
+            match crate::quickstart::validate_only_with_surface(&req.submission, &cfg, surface) {
+                Ok(()) => QuickstartValidateResult::Ok,
+                Err(errors) => QuickstartValidateResult::Errors { errors },
+            };
         to_result(body)
     }
 
@@ -8875,6 +9090,7 @@ impl RpcDispatcher {
 
     async fn handle_quickstart_apply(&self, params: &Value) -> RpcResult {
         let req: QuickstartApplyParams = parse_params(params)?;
+        let surface = quickstart_surface(req.surface)?;
         // Serializes with every other config-mutating handler for the whole
         // clone-apply-save-swap below, so the install on success can't race
         // a concurrent config write (see `ctx.config_write_lock`).
@@ -8894,7 +9110,7 @@ impl RpcDispatcher {
         let result = crate::quickstart::apply_with_surface_checked(
             req.submission,
             &mut working,
-            crate::quickstart::Surface::Tui,
+            surface,
             &|staged| {
                 self.ctx
                     .auth
@@ -8907,7 +9123,7 @@ impl RpcDispatcher {
             Ok(agent) => {
                 self.save_and_swap_config(working, &config_write_guard)
                     .await?;
-                let reload_signalled = self.signal_daemon_reload();
+                let reload_signalled = self.signal_daemon_reload(surface);
                 QuickstartApplyResult::Applied {
                     agent,
                     daemon_restarted: reload_signalled,
@@ -8928,7 +9144,7 @@ impl RpcDispatcher {
     /// watch channel `/admin/reload` and the gateway's quickstart route
     /// use. Returns `true` when the supervisor was notified, `false`
     /// when no supervisor is attached (e.g. test harness).
-    fn signal_daemon_reload(&self) -> bool {
+    fn signal_daemon_reload(&self, surface: crate::quickstart::Surface) -> bool {
         if self.ctx.reload_tx.is_none() {
             ::zeroclaw_log::record!(
                 WARN,
@@ -8936,7 +9152,7 @@ impl RpcDispatcher {
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({
                         "reason": "no_supervisor",
-                        "surface": crate::quickstart::Surface::Tui.as_str(),
+                        "surface": surface.as_str(),
                     })),
                 "quickstart: daemon reload not available (standalone daemon)"
             );
@@ -8946,12 +9162,12 @@ impl RpcDispatcher {
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start).with_attrs(
                 ::serde_json::json!({
-                    "surface": crate::quickstart::Surface::Tui.as_str(),
+                    "surface": surface.as_str(),
                 })
             ),
             "quickstart: daemon reload signalled"
         );
-        self.schedule_daemon_reload(crate::quickstart::Surface::Tui.as_str())
+        self.schedule_daemon_reload(surface.as_str())
     }
 }
 
@@ -12285,6 +12501,7 @@ mod tests {
             .insert(
                 zeroclaw_api::grants::Resource::Skills,
                 vec![
+                    zeroclaw_api::grants::Verb::Create,
                     zeroclaw_api::grants::Verb::Read,
                     zeroclaw_api::grants::Verb::Update,
                     zeroclaw_api::grants::Verb::Delete,
@@ -12314,6 +12531,10 @@ mod tests {
                     json!({"bundle": "team", "name": name, "frontmatter": frontmatter, "body": "overwritten"}),
                 ),
                 ("skills/delete", json!({"bundle": "team", "name": name})),
+                (
+                    "skills/create",
+                    json!({"bundle": "team", "name": name, "frontmatter": frontmatter}),
+                ),
             ] {
                 id += 1;
                 let response = rpc(&mut alice, &mut rx, id, method, params).await;
@@ -28488,5 +28709,379 @@ mod tests {
             .await
             .expect("an aborted shutdown must still end the prompt it was joining")
             .expect_err("the prompt must be aborted rather than run to completion");
+    }
+
+    /// The config the P4 parity tests share: the cron roster (agents `alpha`
+    /// and `beta`), with `git` allowed so a medium-risk command exists that the
+    /// default supervised policy gates behind approval.
+    fn p4_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+        let mut config = cron_roster_config_in(tmp, 4242);
+        config
+            .risk_profiles
+            .get_mut("cron-profile")
+            .expect("the roster profile exists")
+            .allowed_commands
+            .push("git".into());
+        config
+    }
+
+    #[tokio::test]
+    async fn cron_add_over_rpc_refuses_an_unapproved_command_exactly_as_http() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = p4_config(&tmp);
+        let ctx = enforcement_ctx(config.clone());
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+
+        // The HTTP route's entry point, with the approval it passes.
+        let http = crate::cron::add_shell_job_with_approval_and_format(
+            &config,
+            "alpha",
+            None,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "git rebase main",
+            None,
+            false,
+            Default::default(),
+        )
+        .expect_err("HTTP refuses a command that needs approval")
+        .to_string();
+        assert!(http.contains("requires explicit approval"), "{http}");
+
+        let response = rpc(
+            &mut operator,
+            &mut rx,
+            1,
+            "cron/add",
+            json!({"agent": "alpha", "schedule": "*/5 * * * *", "command": "git rebase main"}),
+        )
+        .await;
+        let message = response["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("RPC must refuse: {response}"));
+        assert!(
+            message.ends_with(&http),
+            "RPC refusal {message:?} must carry the HTTP refusal {http:?}"
+        );
+        assert!(
+            crate::cron::list_jobs(&config)
+                .expect("store readable")
+                .is_empty(),
+            "a refused cron/add must not create a job"
+        );
+
+        // Control: a command the policy allows without approval still lands.
+        let response = rpc(
+            &mut operator,
+            &mut rx,
+            2,
+            "cron/add",
+            json!({"agent": "alpha", "schedule": "*/5 * * * *", "command": "echo hi"}),
+        )
+        .await;
+        assert_eq!(
+            response["result"]["command"],
+            json!("echo hi"),
+            "{response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_patch_over_rpc_refuses_an_unapproved_replacement_command() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = p4_config(&tmp);
+        let job = crate::cron::add_shell_job_with_approval(
+            &config,
+            "alpha",
+            Some("safe".into()),
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo hi",
+            None,
+            false,
+        )
+        .expect("an allowed command is added");
+        let ctx = enforcement_ctx(config.clone());
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+
+        let response = rpc(
+            &mut operator,
+            &mut rx,
+            1,
+            "cron/patch",
+            json!({"id": job.id, "agent": "alpha", "command": "git rebase main"}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(INVALID_PARAMS),
+            "{response}"
+        );
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("requires explicit approval")),
+            "{response}"
+        );
+        let stored = crate::cron::get_job(&config, &job.id).expect("the job still exists");
+        assert_eq!(
+            stored.command, "echo hi",
+            "a refused patch must not change the job"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_add_and_patch_over_rpc_cover_agent_jobs_and_the_http_fields() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = p4_config(&tmp);
+        let ctx = enforcement_ctx(config.clone());
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+
+        // A prompt alone makes an agent job, as on `POST /api/cron`.
+        let added = rpc(
+            &mut operator,
+            &mut rx,
+            1,
+            "cron/add",
+            json!({
+                "agent": "alpha",
+                "schedule": "*/5 * * * *",
+                "prompt": "summarise the day",
+                "uses_memory": false,
+            }),
+        )
+        .await;
+        let id = added["result"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{added}"))
+            .to_string();
+        let job = crate::cron::get_job(&config, &id).expect("the agent job exists");
+        assert!(
+            matches!(job.job_type, crate::cron::JobType::Agent),
+            "{added}"
+        );
+        assert_eq!(job.prompt.as_deref(), Some("summarise the day"));
+        assert!(!job.uses_memory, "uses_memory=false must be honoured");
+
+        // A shell-only field on an agent job is refused, not silently dropped.
+        let refused = rpc(
+            &mut operator,
+            &mut rx,
+            2,
+            "cron/add",
+            json!({
+                "agent": "alpha",
+                "schedule": "*/5 * * * *",
+                "prompt": "p",
+                "shell_output_format": "raw",
+            }),
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], json!(INVALID_PARAMS), "{refused}");
+
+        // Pause without deleting, and patch the agent job's prompt.
+        let patched = rpc(
+            &mut operator,
+            &mut rx,
+            3,
+            "cron/patch",
+            json!({"id": id, "agent": "alpha", "enabled": false, "prompt": "new prompt"}),
+        )
+        .await;
+        assert!(patched.get("error").is_none(), "{patched}");
+        let job = crate::cron::get_job(&config, &id).expect("the agent job exists");
+        assert!(!job.enabled, "enabled=false must pause the job");
+        assert_eq!(job.prompt.as_deref(), Some("new prompt"));
+    }
+
+    #[tokio::test]
+    async fn memory_agent_param_routes_to_that_agents_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = p4_config(&tmp);
+        let ctx = enforcement_ctx(config);
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+
+        let stored = rpc(
+            &mut operator,
+            &mut rx,
+            1,
+            "memory/store",
+            json!({"agent": "alpha", "key": "p4-key", "content": "alpha only"}),
+        )
+        .await;
+        assert_eq!(stored["result"]["stored"], json!(true), "{stored}");
+
+        let alpha = rpc(
+            &mut operator,
+            &mut rx,
+            2,
+            "memory/get",
+            json!({"agent": "alpha", "key": "p4-key"}),
+        )
+        .await;
+        assert_eq!(
+            alpha["result"]["entry"]["content"],
+            json!("alpha only"),
+            "{alpha}"
+        );
+
+        // Beta's store is a different store: the key is not there.
+        let beta = rpc(
+            &mut operator,
+            &mut rx,
+            3,
+            "memory/get",
+            json!({"agent": "beta", "key": "p4-key"}),
+        )
+        .await;
+        assert!(
+            beta.get("error").is_some(),
+            "beta must not see alpha's row: {beta}"
+        );
+        let beta_list = rpc(
+            &mut operator,
+            &mut rx,
+            4,
+            "memory/list",
+            json!({"agent": "beta"}),
+        )
+        .await;
+        let keys: Vec<&str> = beta_list["result"]["entries"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{beta_list}"))
+            .iter()
+            .filter_map(|e| e["key"].as_str())
+            .collect();
+        assert!(!keys.contains(&"p4-key"), "{beta_list}");
+
+        // An agent that is not configured is a parameter error, as over HTTP.
+        let unknown = rpc(
+            &mut operator,
+            &mut rx,
+            5,
+            "memory/list",
+            json!({"agent": "gamma"}),
+        )
+        .await;
+        assert_eq!(unknown["error"]["code"], json!(INVALID_PARAMS), "{unknown}");
+    }
+
+    #[tokio::test]
+    async fn personality_put_refuses_a_stale_expected_mtime() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = p4_config(&tmp);
+        let ctx = enforcement_ctx(config);
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+
+        let first = rpc(
+            &mut operator,
+            &mut rx,
+            1,
+            "personality/put",
+            json!({"agent": "alpha", "filename": "SOUL.md", "content": "v1"}),
+        )
+        .await;
+        let mtime = first["result"]["mtime_ms"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("{first}"));
+
+        let stale = rpc(
+            &mut operator,
+            &mut rx,
+            2,
+            "personality/put",
+            json!({
+                "agent": "alpha",
+                "filename": "SOUL.md",
+                "content": "v2",
+                "expected_mtime_ms": mtime - 1,
+            }),
+        )
+        .await;
+        assert_eq!(
+            stale["error"]["code"],
+            json!(PRECONDITION_FAILED),
+            "{stale}"
+        );
+        assert_eq!(
+            stale["error"]["data"]["current_content"],
+            json!("v1"),
+            "{stale}"
+        );
+        assert_eq!(
+            stale["error"]["data"]["current_mtime_ms"],
+            json!(mtime),
+            "{stale}"
+        );
+
+        let current = rpc(
+            &mut operator,
+            &mut rx,
+            3,
+            "personality/put",
+            json!({
+                "agent": "alpha",
+                "filename": "SOUL.md",
+                "content": "v2",
+                "expected_mtime_ms": mtime,
+            }),
+        )
+        .await;
+        assert!(current.get("error").is_none(), "{current}");
+    }
+
+    #[tokio::test]
+    async fn skills_effective_and_slash_option_kinds_answer_over_rpc() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = p4_config(&tmp);
+        let ctx = enforcement_ctx(config);
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+
+        let kinds = rpc(
+            &mut operator,
+            &mut rx,
+            1,
+            "skills/slash-option-kinds",
+            json!({}),
+        )
+        .await;
+        assert!(
+            kinds["result"]["kinds"]
+                .as_array()
+                .is_some_and(|k| !k.is_empty()),
+            "{kinds}"
+        );
+        let effective = rpc(
+            &mut operator,
+            &mut rx,
+            2,
+            "skills/effective",
+            json!({"agent": "alpha"}),
+        )
+        .await;
+        assert_eq!(effective["result"]["agent"], json!("alpha"), "{effective}");
+        assert!(effective["result"]["skills"].is_array(), "{effective}");
+    }
+
+    #[test]
+    fn quickstart_surface_defaults_to_tui_and_refuses_test() {
+        use crate::quickstart::Surface;
+        assert_eq!(quickstart_surface(None).unwrap(), Surface::Tui);
+        assert_eq!(
+            quickstart_surface(Some(Surface::Web)).unwrap(),
+            Surface::Web
+        );
+        assert_eq!(
+            quickstart_surface(Some(Surface::Test)).unwrap_err().code,
+            INVALID_PARAMS
+        );
+        // The param deserialises from the surface's wire name.
+        let surface: Surface =
+            serde_json::from_value(json!("web")).expect("surface wire name deserialises");
+        assert_eq!(surface, Surface::Web);
     }
 }
