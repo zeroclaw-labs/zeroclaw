@@ -10643,7 +10643,9 @@ mod tests {
         let _writer_guard = zeroclaw_log::__private_test_writer_lock();
         let _hook_guard = zeroclaw_log::__private_test_hook_lock();
         zeroclaw_log::try_install_capture_subscriber();
+        let hook_preexisting = zeroclaw_log::current_broadcast_hook().is_some();
         let mut log_rx = zeroclaw_log::subscribe_or_install();
+        let subscribed_hook = zeroclaw_log::current_broadcast_hook();
         while log_rx.try_recv().is_ok() {}
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
@@ -10658,31 +10660,73 @@ mod tests {
             ConversationMessage::Chat(ChatMessage::assistant("new assistant")),
         ];
 
-        let _ = agent.trim_history(Some("trim-test-turn"));
+        let trim_notice = agent
+            .trim_history(Some("trim-test-turn"))
+            .map(|notice| notice.dropped_messages);
 
         let mut selected = None;
         let mut candidates = Vec::new();
-        loop {
+        let mut received = 0_usize;
+        let mut lagged_reports = 0_usize;
+        let mut lagged_events = 0_u64;
+        let mut closed = false;
+        // `record_event` sends to the hook synchronously, so by now the trim
+        // event is either in this channel or it never will be; waiting cannot
+        // bring it back. The bounded wait only keeps reading while other
+        // threads' events are still arriving, so the counts reported below
+        // describe a settled channel rather than a single snapshot. The
+        // deadline is checked on every read because parallel tests can keep
+        // the channel from ever reporting `Empty`.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while selected.is_none() && std::time::Instant::now() < deadline {
             match log_rx.try_recv() {
-                Ok(value)
+                Ok(value) => {
+                    received += 1;
                     if value.get("message").and_then(serde_json::Value::as_str)
-                        == Some("trim_history: dropped oldest whole turns") =>
-                {
-                    if value.get("trace_id").and_then(serde_json::Value::as_str)
-                        == Some("trim-test-turn")
+                        == Some("trim_history: dropped oldest whole turns")
                     {
-                        selected = Some(value.clone());
+                        if value.get("trace_id").and_then(serde_json::Value::as_str)
+                            == Some("trim-test-turn")
+                        {
+                            selected = Some(value.clone());
+                        }
+                        candidates.push(value);
                     }
-                    candidates.push(value);
                 }
-                Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
-                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
+                    lagged_reports += 1;
+                    lagged_events += skipped;
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                    closed = true;
+                    break;
+                }
             }
         }
         let value = selected.unwrap_or_else(|| {
+            // Name which link dropped the event: the trim itself, the capture
+            // layer, the hook this receiver is attached to, or the ring buffer.
+            let current_hook = zeroclaw_log::current_broadcast_hook();
+            let same_hook = match (&subscribed_hook, &current_hook) {
+                (Some(subscribed), Some(current)) => Some(subscribed.same_channel(current)),
+                _ => None,
+            };
             panic!(
-                "trim LogEvent with trace_id=trim-test-turn was not captured; candidates: {candidates:#?}"
+                "trim LogEvent with trace_id=trim-test-turn was not captured\n\
+                 trim_history dropped messages: {trim_notice:?} (None = nothing trimmed, nothing logged)\n\
+                 capture layer active on this thread: {}\n\
+                 DEBUG enabled for zeroclaw_log_event: {}\n\
+                 hook already installed before subscribing: {hook_preexisting}\n\
+                 current hook is the subscribed hook: {same_hook:?} (None = hook missing)\n\
+                 receivers on current hook: {:?}\n\
+                 events received: {received}; lagged reports: {lagged_reports}, events skipped: {lagged_events}; closed: {closed}\n\
+                 candidates: {candidates:#?}",
+                zeroclaw_log::__private_test_capture_layer_active(),
+                zeroclaw_log::debug_enabled(),
+                current_hook.as_ref().map(tokio::sync::broadcast::Sender::receiver_count),
             )
         });
         let event: zeroclaw_log::LogEvent =
