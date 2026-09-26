@@ -27,7 +27,10 @@ importantly, what changes for existing remote connections.
    - `session/new` and `session/prompt` check the agent selector and hold
      the session's workspace to a directory that agent's policy lets it both
      read and write, whether the workspace was named by the request, stored
-     with a resumed session, or restored from a durable one. The other
+     with a resumed session, or restored from a durable one. The session is
+     bound to the resolved directory, not the requested spelling, so
+     retargeting a symlinked cwd after admission does not move it, and a
+     live session held under such an alias is refused. The other
      session methods do not check the agent yet, as described under
      [What this layer does not do (yet)](#what-this-layer-does-not-do-yet);
    - running or approving an SOP requires every agent it runs as, with the

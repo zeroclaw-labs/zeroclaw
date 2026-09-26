@@ -468,6 +468,24 @@ fn rpc_err(code: i32, msg: impl Into<String>) -> JsonRpcError {
     }
 }
 
+/// Bind an operator-level or unbound session workspace to its resolved
+/// directory.
+///
+/// An operator may already select any directory, so this is not an
+/// authorization check. It only keeps the session from holding a symlink
+/// whose later retargeting would move the jail root. When the path does not
+/// resolve, or resolves to a non-UTF-8 path a session cannot store, the
+/// requested spelling is kept as before; the agent adopts a workspace as
+/// given and does not require it to exist.
+fn bind_operator_workspace(workspace: &str) -> std::path::PathBuf {
+    let requested = std::path::Path::new(workspace);
+    requested
+        .canonicalize()
+        .ok()
+        .filter(|resolved| resolved.to_str().is_some())
+        .unwrap_or_else(|| requested.to_path_buf())
+}
+
 /// The single source of truth for a principal's per-run tool ceiling.
 ///
 /// Evaluated for one explicit grant set — creation, rehydration, and every
@@ -1475,6 +1493,12 @@ impl RpcDispatcher {
     /// components or a Windows network or device prefix, and every refusal
     /// carries the same message, so the answer does not reveal whether a path
     /// exists.
+    ///
+    /// Returns the directory the session must hold: the resolved path that
+    /// was checked, never the request's spelling. A caller that kept the
+    /// spelling would hand the agent a jail root that a retargeted symlink
+    /// could move after this check. The returned path is always valid UTF-8,
+    /// because a session stores its workspace as a string.
     fn confine_session_workspace_with_grants(
         &self,
         method: Method,
@@ -1482,21 +1506,10 @@ impl RpcDispatcher {
         config: &Config,
         alias: &str,
         workspace: &str,
-    ) -> Result<(), JsonRpcError> {
+    ) -> Result<std::path::PathBuf, JsonRpcError> {
         if grants.admin {
-            return Ok(());
+            return Ok(bind_operator_workspace(workspace));
         }
-        let refuse = |detail: String| {
-            let denied = rpc_err(FORBIDDEN, detail);
-            self.audit_auth_denial(
-                method,
-                &crate::rpc::auth::AuthDenied {
-                    code: denied.code,
-                    message: denied.message.clone(),
-                },
-            );
-            denied
-        };
         let policy =
             zeroclaw_config::policy::SecurityPolicy::for_agent(config, alias).map_err(|e| {
                 rpc_err(
@@ -1504,13 +1517,7 @@ impl RpcDispatcher {
                     format!("Failed to resolve agent policy: {e}"),
                 )
             })?;
-        let refusal = || {
-            refuse(format!(
-                "Session workspace {workspace:?} is not an existing directory agent {alias:?} \
-                 may both read and write; add it to the agent's risk profile allowed_roots to \
-                 authorize it",
-            ))
-        };
+        let refusal = || self.session_workspace_refusal(method, alias, workspace);
         let requested = std::path::Path::new(workspace);
         // The agent's configured workspace was chosen by the operator, not by
         // the request, so it is resolved even when it is spelled with `..` or
@@ -1525,17 +1532,49 @@ impl RpcDispatcher {
         // agent's own policy already lets it both read and write, so a
         // write-only sibling root cannot become readable this way.
         if resolved.is_dir()
+            && resolved.to_str().is_some()
             && policy.is_resolved_path_allowed(&resolved)
             && policy.is_resolved_path_readable(&resolved)
         {
-            return Ok(());
+            return Ok(resolved);
         }
         Err(refusal())
+    }
+
+    /// The one refusal every session-workspace check gives, audited as an
+    /// authorization denial. It names the requested spelling and nothing about
+    /// what that spelling resolves to, so it does not reveal whether a path
+    /// exists or where a link points.
+    fn session_workspace_refusal(
+        &self,
+        method: Method,
+        alias: &str,
+        workspace: &str,
+    ) -> JsonRpcError {
+        let denied = rpc_err(
+            FORBIDDEN,
+            format!(
+                "Session workspace {workspace:?} is not an existing directory agent {alias:?} \
+                 may both read and write; add it to the agent's risk profile allowed_roots to \
+                 authorize it",
+            ),
+        );
+        self.audit_auth_denial(
+            method,
+            &crate::rpc::auth::AuthDenied {
+                code: denied.code,
+                message: denied.message.clone(),
+            },
+        );
+        denied
     }
 
     /// Hold one session binding, its agent and its workspace, to `grants`:
     /// the agent and tool-posture selector, then workspace confinement. `None`
     /// is an unbound dispatcher (the direct unit-test handlers) and passes.
+    ///
+    /// Returns the workspace the session must be built with; see
+    /// [`Self::confine_session_workspace_with_grants`].
     fn authorize_session_binding(
         &self,
         method: Method,
@@ -1543,9 +1582,9 @@ impl RpcDispatcher {
         config: &Config,
         alias: &str,
         workspace: &str,
-    ) -> Result<(), JsonRpcError> {
+    ) -> Result<std::path::PathBuf, JsonRpcError> {
         let Some(grants) = grants else {
-            return Ok(());
+            return Ok(bind_operator_workspace(workspace));
         };
         // The parent slice fail-closed a constrained principal out of every
         // session because a binding authorized only agent + workspace, never a
@@ -1574,13 +1613,35 @@ impl RpcDispatcher {
         workspace_dir: &str,
     ) -> Result<(), JsonRpcError> {
         let config = self.ctx.config.read();
-        self.authorize_session_binding(
+        self.authorize_live_session_binding(
             Method::SessionNew,
             grants,
             &config,
             agent_alias,
             workspace_dir,
         )
+    }
+
+    /// [`Self::authorize_session_binding`] for a session that already holds a
+    /// workspace and will keep it. For a scoped principal the held workspace
+    /// must itself be the authorized directory. One held under an alias, such
+    /// as a symlink, is refused: the check resolves the alias now, but the
+    /// session's tools resolve it again on every use, so a link retargeted in
+    /// between would move the jail root outside what was authorized.
+    fn authorize_live_session_binding(
+        &self,
+        method: Method,
+        grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
+        config: &Config,
+        alias: &str,
+        workspace: &str,
+    ) -> Result<(), JsonRpcError> {
+        let bound = self.authorize_session_binding(method, grants, config, alias, workspace)?;
+        let scoped = grants.is_some_and(|grants| !grants.admin);
+        if scoped && bound != std::path::Path::new(workspace) {
+            return Err(self.session_workspace_refusal(method, alias, workspace));
+        }
+        Ok(())
     }
 
     /// Confine `fs/list_dir` to what the bound principal may read, before the
@@ -3490,15 +3551,22 @@ impl RpcDispatcher {
         // caller-selected cwd and a resumed ACP row's persisted workspace were
         // both chosen by a request, possibly another principal's or one made
         // under an older policy; the agent's own default passes trivially.
-        if let Some(grants) = grants.as_ref() {
-            self.confine_session_workspace_with_grants(
+        //
+        // The session is built from the directory that check authorized, not
+        // from the request's spelling, so a symlink retargeted after this
+        // point cannot move the jail root.
+        let cwd = match grants.as_ref() {
+            Some(grants) => self.confine_session_workspace_with_grants(
                 Method::SessionNew,
                 grants,
                 &config,
                 &req.agent_alias,
                 &cwd,
-            )?;
+            )?,
+            None => bind_operator_workspace(&cwd),
         }
+        .to_string_lossy()
+        .into_owned();
 
         let cwd_path = Some(std::path::Path::new(&cwd));
         // The environment comes from THIS connection's own registration, never
@@ -4298,7 +4366,10 @@ impl RpcDispatcher {
             }
         };
 
-        {
+        // The durable row's workspace was chosen by an earlier request, so the
+        // rebuilt session holds the directory authorized now, not the row's
+        // spelling.
+        let workspace_dir = {
             let config = self.ctx.config.read();
             self.authorize_session_binding(
                 Method::SessionPrompt,
@@ -4306,10 +4377,12 @@ impl RpcDispatcher {
                 &config,
                 &data.agent_alias,
                 &data.workspace_dir,
-            )?;
+            )?
         }
+        .to_string_lossy()
+        .into_owned();
 
-        let cwd_path = Some(std::path::Path::new(&data.workspace_dir));
+        let cwd_path = Some(std::path::Path::new(&workspace_dir));
         let tui_env = self
             .tui_registration()
             .and_then(|(id, epoch)| self.ctx.tui_registry.env_for_registration(id, epoch));
@@ -4417,7 +4490,7 @@ impl RpcDispatcher {
         let session = super::session::RpcSession::new(
             agent,
             &data.agent_alias,
-            &data.workspace_dir,
+            &workspace_dir,
             crate::rpc::types::ChatMode::Acp,
         )
         .with_owner(self.tui_id.clone())
@@ -4794,7 +4867,7 @@ impl RpcDispatcher {
             let binding = match self.ctx.sessions.get_workspace_dir(sid).await {
                 Some(workspace) => {
                     let config = self.ctx.config.read();
-                    self.authorize_session_binding(
+                    self.authorize_live_session_binding(
                         Method::SessionPrompt,
                         grants.as_ref(),
                         &config,
@@ -11322,6 +11395,171 @@ mod tests {
         );
     }
 
+    /// A cwd link to a directory inside the agent workspace, and a directory
+    /// outside it holding a different sentinel. Returns `(inside, outside,
+    /// link)`; the link starts out pointing at `inside`.
+    #[cfg(unix)]
+    fn retargetable_cwd_fixture(
+        tmp: &tempfile::TempDir,
+        config: &zeroclaw_config::schema::Config,
+        outside: &tempfile::TempDir,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let inside = config.agent_workspace_dir("test-agent").join("project");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::write(inside.join("sentinel.txt"), "INSIDE-SENTINEL").unwrap();
+        std::fs::write(outside.path().join("sentinel.txt"), "OUTSIDE-SENTINEL").unwrap();
+        let link = tmp.path().join("cwd-link");
+        std::os::unix::fs::symlink(&inside, &link).unwrap();
+        (inside, outside.path().to_path_buf(), link)
+    }
+
+    #[cfg(unix)]
+    fn retarget(link: &std::path::Path, target: &std::path::Path) {
+        std::fs::remove_file(link).unwrap();
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scoped_session_stays_bound_to_the_authorized_directory_after_its_cwd_link_is_retargeted()
+     {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let config = session_cwd_config(&tmp, 4242, None);
+        let (inside, outside_dir, link) = retargetable_cwd_fixture(&tmp, &config, &outside);
+        let ctx = enforcement_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+
+        let response = session_new_with_cwd(&mut alice, &mut rx, "s-link", &link).await;
+        assert_eq!(
+            response["result"]["session_id"],
+            json!("s-link"),
+            "a link resolving inside the workspace is admitted: {response}"
+        );
+        let canonical_inside = inside.canonicalize().unwrap();
+        assert_eq!(
+            ctx.sessions.get_workspace_dir("s-link").await.as_deref(),
+            Some(&*canonical_inside.to_string_lossy()),
+            "the session must hold the authorized directory, not the caller's link"
+        );
+
+        // The caller swaps the link to a directory the agent was never
+        // authorized for, after admission.
+        retarget(&link, &outside_dir);
+
+        let agent = ctx
+            .sessions
+            .get_agent("s-link")
+            .await
+            .expect("session exists");
+        let agent = agent.lock().await;
+        let result = agent
+            .execute_tool_for_test("file_read", json!({"path": "sentinel.txt"}))
+            .await
+            .expect("the fixture agent exposes file_read")
+            .expect("file_read runs");
+        assert!(
+            !result.output.contains("OUTSIDE-SENTINEL"),
+            "a retargeted cwd link must not move the file tools outside the authorized \
+             directory: {result:?}"
+        );
+        assert!(
+            result.success && result.output.contains("INSIDE-SENTINEL"),
+            "the file tools keep resolving under the authorized directory: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_live_session_held_under_a_cwd_alias_is_refused_to_a_scoped_principal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let config = session_cwd_config(&tmp, 4242, None);
+        let (inside, _outside_dir, link) = retargetable_cwd_fixture(&tmp, &config, &outside);
+        let ctx = enforcement_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        // Establish alice's bound grants.
+        let _ = session_new_with_cwd(&mut alice, &mut rx, "s-bind", &inside).await;
+        let grants = alice.stamped_grants();
+        assert!(
+            grants.is_some_and(|grants| !grants.admin),
+            "alice is scoped"
+        );
+
+        let canonical_inside = inside.canonicalize().unwrap();
+        alice
+            .authorize_resumed_session(grants, "test-agent", &canonical_inside.to_string_lossy())
+            .expect("a live session held at the authorized directory is kept");
+
+        let held_alias = alice
+            .authorize_resumed_session(grants, "test-agent", &link.to_string_lossy())
+            .expect_err("a live session held under an alias must be refused");
+        let held_outside = alice
+            .authorize_resumed_session(
+                grants,
+                "test-agent",
+                &outside.path().canonicalize().unwrap().to_string_lossy(),
+            )
+            .expect_err("a live session held outside the workspace must be refused");
+        assert_eq!(held_alias.code, FORBIDDEN);
+        assert_eq!(
+            held_alias
+                .message
+                .replace(&*link.to_string_lossy(), "<cwd>"),
+            held_outside.message.replace(
+                &*outside.path().canonicalize().unwrap().to_string_lossy(),
+                "<cwd>"
+            ),
+            "an alias refusal reads like any other, so it reveals nothing about the link"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn operator_session_is_bound_to_the_resolved_cwd_not_the_link() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let config = session_cwd_config(&tmp, 4242, None);
+        let (inside, _outside_dir, link) = retargetable_cwd_fixture(&tmp, &config, &outside);
+        let ctx = enforcement_ctx(config);
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+
+        let response = session_new_with_cwd(&mut operator, &mut rx, "s-op-link", &link).await;
+        assert_eq!(
+            response["result"]["session_id"],
+            json!("s-op-link"),
+            "{response}"
+        );
+        assert_eq!(
+            ctx.sessions.get_workspace_dir("s-op-link").await.as_deref(),
+            Some(&*inside.canonicalize().unwrap().to_string_lossy()),
+            "an operator session also holds the resolved directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_session_keeps_a_cwd_that_does_not_exist_yet() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = enforcement_ctx(session_cwd_config(&tmp, 4242, None));
+        let (mut operator, mut rx) = local_operator(&ctx).await;
+        let absent = tmp.path().join("not-created-yet");
+
+        let response = session_new_with_cwd(&mut operator, &mut rx, "s-op-absent", &absent).await;
+        assert_eq!(
+            response["result"]["session_id"],
+            json!("s-op-absent"),
+            "an operator cwd that does not resolve is admitted as before: {response}"
+        );
+        assert_eq!(
+            ctx.sessions
+                .get_workspace_dir("s-op-absent")
+                .await
+                .as_deref(),
+            Some(&*absent.to_string_lossy()),
+            "and kept as spelled, since there is nothing to resolve it to"
+        );
+    }
+
     #[tokio::test]
     async fn scoped_principal_may_select_a_configured_allowed_root() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -11803,7 +12041,13 @@ mod tests {
     async fn session_prompt_survives_an_unrelated_policy_republication_after_admission() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = session_cwd_config(&tmp, 4242, None);
-        let agent_workspace = config.agent_workspace_dir("test-agent");
+        // A live session holds the resolved workspace, as `session/new` and
+        // rehydration store it; the raw temp-dir spelling can be an alias
+        // (`/var` on macOS), which a scoped prompt now refuses.
+        let agent_workspace = config
+            .agent_workspace_dir("test-agent")
+            .canonicalize()
+            .unwrap();
         let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
         let (provider, mut started_rx, release_tx) = gated_provider();
         let sid = "s-prompt-republished";
@@ -13305,7 +13549,13 @@ mod tests {
     async fn oidc_principal_opens_and_prompts_sessions_at_an_unchanged_generation() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = oidc_session_config(&tmp);
-        let agent_workspace = config.agent_workspace_dir("test-agent");
+        // A live session holds the resolved workspace, as `session/new` and
+        // rehydration store it; the raw temp-dir spelling can be an alias
+        // (`/var` on macOS), which a scoped prompt now refuses.
+        let agent_workspace = config
+            .agent_workspace_dir("test-agent")
+            .canonicalize()
+            .unwrap();
         let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
         let (mut oidc, mut rx) = oidc_peer(&ctx);
 
