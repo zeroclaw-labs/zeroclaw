@@ -3838,7 +3838,8 @@ impl DelegateTool {
         // Delegate subagents start a fresh transcript: no prior trim, so no
         // crumb exists and none outlives this scoped loop.
         let mut subagent_crumb_present = false;
-        let mut subagent_injected_memory_preamble: Option<String> = None;
+        let mut subagent_injected_memory_preamble: Option<crate::agent::turn::MemoryPreamble> =
+            None;
         if let Some(system_prompt) = enriched_system_prompt.as_ref() {
             history.push(ChatMessage::system(system_prompt.clone()));
         }

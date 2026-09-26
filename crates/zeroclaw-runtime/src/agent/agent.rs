@@ -315,11 +315,40 @@ impl zeroclaw_api::channel::Channel for RoutedApprovalChannel {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TestTurnEntryPause {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl TestTurnEntryPause {
+    pub(crate) fn new() -> (Self, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        (
+            Self {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            },
+            entered,
+            release,
+        )
+    }
+
+    async fn wait(&self) {
+        self.entered.notify_one();
+        self.release.notified().await;
+    }
+}
+
 #[derive(Debug)]
 struct HistoryTrimNotice {
     dropped_messages: usize,
     kept_turns: usize,
     reason: String,
+    retained_context: zeroclaw_api::agent::RetainedContextSnapshot,
 }
 
 impl HistoryTrimNotice {
@@ -335,6 +364,7 @@ impl HistoryTrimNotice {
             tokens_before_source: None,
             tokens_after_source: None,
             unsatisfiable_floor: None,
+            retained_context: Some(self.retained_context),
         }
     }
 }
@@ -458,6 +488,8 @@ pub struct Agent {
     channel_name: String,
     #[cfg(any(test, feature = "test-util"))]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
+    #[cfg(test)]
+    turn_entry_pause: Option<TestTurnEntryPause>,
     /// The `DelegateTool` this Agent's registry registered, in its concrete
     /// type. Test-only: `tools` erases it behind `dyn Tool`, so a regression
     /// otherwise cannot drive the *constructed* delegate's nested-registry
@@ -633,6 +665,8 @@ pub struct AgentBuilder {
     #[cfg(any(test, feature = "test-util"))]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
     #[cfg(test)]
+    turn_entry_pause: Option<TestTurnEntryPause>,
+    #[cfg(test)]
     delegate_tool: Option<Arc<crate::tools::DelegateTool>>,
 }
 
@@ -693,6 +727,8 @@ impl AgentBuilder {
             provider_switch_config: None,
             #[cfg(any(test, feature = "test-util"))]
             turn_datetime: None,
+            #[cfg(test)]
+            turn_entry_pause: None,
             #[cfg(test)]
             delegate_tool: None,
         }
@@ -770,7 +806,7 @@ impl AgentBuilder {
     /// need a specific fraction must drive it through a runtime profile and
     /// the live resolver path instead.
     #[cfg(test)]
-    fn structured_max_history_messages(self, max: usize) -> Self {
+    pub(crate) fn structured_max_history_messages(self, max: usize) -> Self {
         self.structured_history_limits_resolver(Arc::new(move || {
             crate::agent::history_trim::HistoryTrimLimits {
                 max_messages: max,
@@ -1001,6 +1037,12 @@ impl AgentBuilder {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_turn_entry_pause(mut self, pause: TestTurnEntryPause) -> Self {
+        self.turn_entry_pause = Some(pause);
+        self
+    }
+
     pub fn exclude_memory(mut self, exclude: bool) -> Self {
         self.exclude_memory = exclude;
         self
@@ -1171,6 +1213,8 @@ impl AgentBuilder {
             #[cfg(any(test, feature = "test-util"))]
             turn_datetime: self.turn_datetime,
             #[cfg(test)]
+            turn_entry_pause: self.turn_entry_pause,
+            #[cfg(test)]
             delegate_tool: self.delegate_tool,
         })
     }
@@ -1281,6 +1325,38 @@ impl Agent {
         &self.history
     }
 
+    /// Return the owner-maintained structured history for native persistence.
+    /// The Agent history is already replayed from the provider buffer with
+    /// positional memory provenance applied; callers must not reconstruct it
+    /// from flat wire messages or infer tool pairs from text.
+    pub(crate) fn retained_context_snapshot(&self) -> zeroclaw_api::agent::RetainedContextSnapshot {
+        zeroclaw_api::agent::RetainedContextSnapshot {
+            retained_messages: self
+                .history
+                .iter()
+                .filter(|message| {
+                    !matches!(
+                        message,
+                        ConversationMessage::Chat(chat) if chat.role == "system"
+                    )
+                })
+                .map(|message| match message {
+                    ConversationMessage::AssistantToolCalls {
+                        text,
+                        tool_calls,
+                        reasoning_content: _,
+                    } => ConversationMessage::AssistantToolCalls {
+                        text: text.clone(),
+                        tool_calls: tool_calls.clone(),
+                        reasoning_content: None,
+                    },
+                    other => other.clone(),
+                })
+                .collect(),
+            breadcrumb: self.history_has_trim_breadcrumb,
+        }
+    }
+
     /// Remove the trailing assistant interruption marker
     /// (`turn-interrupted-by-user`) the tool loop appends to live history when a
     /// turn is cancelled, returning whether one was removed. When cancellation
@@ -1294,19 +1370,23 @@ impl Agent {
     /// string stays owned by the runtime here rather than being re-derived and
     /// content-matched at the call site.
     pub fn strip_trailing_interruption_marker(&mut self) -> bool {
+        Self::strip_interruption_marker_from(&mut self.history)
+    }
+
+    pub(crate) fn strip_interruption_marker_from(history: &mut Vec<ConversationMessage>) -> bool {
         let marker = crate::i18n::get_required_cli_string("turn-interrupted-by-user");
         let is_marker = matches!(
-            self.history.last(),
+            history.last(),
             Some(ConversationMessage::Chat(message))
                 if message.role == "assistant" && message.content == marker
         );
         if is_marker {
-            self.history.pop();
+            history.pop();
             return true;
         }
 
         let folded_suffix = format!("\n\n{marker}");
-        let Some(ConversationMessage::Chat(message)) = self.history.last_mut() else {
+        let Some(ConversationMessage::Chat(message)) = history.last_mut() else {
             return false;
         };
         if message.role != "assistant" || !message.content.ends_with(&folded_suffix) {
@@ -1343,6 +1423,76 @@ impl Agent {
             return 0;
         };
         crate::agent::turn::media_degrade::degrade_media_in_messages(&mut self.history[start..])
+    }
+
+    /// Replace one completed turn only after confirming that the live history
+    /// still ends with the exact messages the turn committed. A mismatch is a
+    /// fail-closed signal: callers must discard this Agent rather than mixing
+    /// generations in its provider history.
+    pub fn replace_history_suffix(
+        &mut self,
+        expected_suffix: &[ConversationMessage],
+        replacement: Vec<ConversationMessage>,
+    ) -> bool {
+        if expected_suffix.is_empty() || self.history.len() < expected_suffix.len() {
+            return false;
+        }
+        let start = self.history.len() - expected_suffix.len();
+        if !self.history[start..]
+            .iter()
+            .zip(expected_suffix)
+            .all(|(live, expected)| Self::conversation_messages_equal(live, expected))
+        {
+            return false;
+        }
+        self.history.truncate(start);
+        self.history.extend(replacement);
+        true
+    }
+
+    fn conversation_messages_equal(
+        left: &ConversationMessage,
+        right: &ConversationMessage,
+    ) -> bool {
+        match (left, right) {
+            (ConversationMessage::Chat(left), ConversationMessage::Chat(right)) => {
+                left.role == right.role && left.content == right.content
+            }
+            (
+                ConversationMessage::AssistantToolCalls {
+                    text: left_text,
+                    tool_calls: left_calls,
+                    reasoning_content: left_reasoning,
+                },
+                ConversationMessage::AssistantToolCalls {
+                    text: right_text,
+                    tool_calls: right_calls,
+                    reasoning_content: right_reasoning,
+                },
+            ) => {
+                left_text == right_text
+                    && left_reasoning == right_reasoning
+                    && left_calls.len() == right_calls.len()
+                    && left_calls.iter().zip(right_calls).all(|(left, right)| {
+                        left.id == right.id
+                            && left.name == right.name
+                            && left.arguments == right.arguments
+                            && left.extra_content == right.extra_content
+                    })
+            }
+            (
+                ConversationMessage::ToolResults(left_results),
+                ConversationMessage::ToolResults(right_results),
+            ) => {
+                left_results.len() == right_results.len()
+                    && left_results.iter().zip(right_results).all(|(left, right)| {
+                        left.tool_call_id == right.tool_call_id
+                            && left.content == right.content
+                            && left.tool_name == right.tool_name
+                    })
+            }
+            _ => false,
+        }
     }
 
     pub fn channel_handles(&self) -> &AgentChannelHandles {
@@ -2703,6 +2853,7 @@ impl Agent {
             dropped_messages: result.dropped_messages,
             kept_turns: result.kept_turns,
             reason,
+            retained_context: self.retained_context_snapshot(),
         })
     }
 
@@ -3084,6 +3235,7 @@ impl Agent {
                 .map(|_| target.index)
         });
         let mut replayed: Vec<ConversationMessage> = Vec::with_capacity(loop_messages.len());
+        let mut tool_names = std::collections::HashMap::<String, String>::new();
         let push_tool_results = |replayed: &mut Vec<ConversationMessage>,
                                  results: Vec<ToolResultMessage>| {
             if let Some(ConversationMessage::ToolResults(previous)) = replayed.last_mut() {
@@ -3103,7 +3255,7 @@ impl Agent {
                         && c.get("name").is_some_and(serde_json::Value::is_string)
                 })
             {
-                let tool_calls = calls
+                let tool_calls: Vec<_> = calls
                     .iter()
                     .map(|c| zeroclaw_providers::ToolCall {
                         id: c
@@ -3121,9 +3273,12 @@ impl Agent {
                             .and_then(|v| v.as_str())
                             .unwrap_or_default()
                             .to_string(),
-                        extra_content: None,
+                        extra_content: c.get("extra_content").filter(|v| !v.is_null()).cloned(),
                     })
                     .collect();
+                for call in &tool_calls {
+                    tool_names.insert(call.id.clone(), call.name.clone());
+                }
                 replayed.push(ConversationMessage::AssistantToolCalls {
                     text: obj
                         .get("content")
@@ -3149,10 +3304,10 @@ impl Agent {
                                     .and_then(|c| c.as_str())
                                     .unwrap_or_default()
                                     .to_string(),
-                                // Provider-wire tool messages do not carry the
-                                // producing tool name; replayed results fall back
-                                // to blind canonicalization
-                                tool_name: String::new(),
+                                tool_name: tool_names
+                                    .get(v.get("tool_call_id")?.as_str()?)
+                                    .cloned()
+                                    .unwrap_or_default(),
                             })
                         })
                         .collect();
@@ -3173,9 +3328,12 @@ impl Agent {
                             .and_then(|c| c.as_str())
                             .unwrap_or_default()
                             .to_string(),
-                        // No provenance on the provider-wire shape; blind canon
-                        // applies as before
-                        tool_name: String::new(),
+                        tool_name: v
+                            .get("tool_call_id")
+                            .and_then(|id| id.as_str())
+                            .and_then(|id| tool_names.get(id))
+                            .cloned()
+                            .unwrap_or_default(),
                     };
                     push_tool_results(&mut replayed, vec![result]);
                     continue;
@@ -3198,6 +3356,23 @@ impl Agent {
             }
         }
         replayed
+    }
+
+    pub(crate) fn replay_loop_messages_for_retention(
+        loop_messages: &[ChatMessage],
+    ) -> Vec<ConversationMessage> {
+        Self::replay_loop_messages(loop_messages, None)
+    }
+
+    pub(crate) fn replay_loop_messages_with_memory(
+        loop_messages: &[ChatMessage],
+        preamble: &str,
+        index: usize,
+    ) -> Vec<ConversationMessage> {
+        Self::replay_loop_messages(
+            loop_messages,
+            Some(MemoryPreambleTarget { preamble, index }),
+        )
     }
 
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
@@ -3349,7 +3524,7 @@ impl Agent {
         // Seed raw-transcript crumb provenance from the structured history's
         // owner-tracked state (the conversion preserves the crumb position).
         let mut loop_history_crumb_present = self.history_has_trim_breadcrumb;
-        let mut loop_injected_memory_preamble: Option<String> = None;
+        let mut loop_injected_memory_preamble: Option<super::turn::MemoryPreamble> = None;
         let mut loop_new_messages: Vec<ChatMessage> = provider_messages[split_idx..].to_vec();
         let knobs = crate::agent::loop_::LoopKnobs {
             dedup_enabled: false,
@@ -3538,10 +3713,10 @@ impl Agent {
             // message before stripping it.
             let injected =
                 loop_injected_memory_preamble
-                    .as_deref()
-                    .map(|preamble| MemoryPreambleTarget {
-                        preamble,
-                        index: new_prefix_len,
+                    .as_ref()
+                    .map(|target| MemoryPreambleTarget {
+                        preamble: &target.preamble,
+                        index: target.index,
                     });
             self.history.clear();
             self.history
@@ -3691,6 +3866,11 @@ impl Agent {
             });
         }
 
+        #[cfg(test)]
+        if let Some(pause) = self.turn_entry_pause.clone() {
+            pause.wait().await;
+        }
+
         // ── Preamble (identical to turn) ───────────────────────────────
         if self.history.is_empty() {
             let system_prompt = self
@@ -3836,7 +4016,7 @@ impl Agent {
         // Seed raw-transcript crumb provenance from the structured history's
         // owner-tracked state (the conversion preserves the crumb position).
         let mut loop_history_crumb_present = self.history_has_trim_breadcrumb;
-        let mut loop_injected_memory_preamble: Option<String> = None;
+        let mut loop_injected_memory_preamble: Option<super::turn::MemoryPreamble> = None;
         let user_msg_for_loop: Vec<ChatMessage> = provider_messages[split_idx..].to_vec();
         // Track total canonical ChatMessage length so prefix detection is not
         // confused by `sync_pending` which always grows `loop_history` via the
@@ -3894,7 +4074,12 @@ impl Agent {
                 new_msgs.push(interruption.clone());
                 self.history.push(interruption);
                 committed_response.push_str(&marker);
-                let notice = self.trim_history(Some(&turn_id));
+                let mut notice = self.trim_history(Some(&turn_id));
+                if let Some(notice) = notice.as_mut() {
+                    Self::strip_interruption_marker_from(
+                        &mut notice.retained_context.retained_messages,
+                    );
+                }
                 forward_history_trim_notice(&event_tx, notice).await;
                 return Err(StreamedTurnError {
                     error: crate::agent::loop_::ToolLoopCancelled.into(),
@@ -4134,10 +4319,10 @@ impl Agent {
                 // when retained, opens the canonical tail at `new_prefix_len`.
                 let injected =
                     loop_injected_memory_preamble
-                        .as_deref()
-                        .map(|preamble| MemoryPreambleTarget {
-                            preamble,
-                            index: new_prefix_len,
+                        .as_ref()
+                        .map(|target| MemoryPreambleTarget {
+                            preamble: &target.preamble,
+                            index: target.index,
                         });
                 self.history.clear();
                 self.history
@@ -4305,7 +4490,14 @@ impl Agent {
                         }
                         error
                     };
-                    let notice = self.trim_history(Some(&turn_id));
+                    let mut notice = self.trim_history(Some(&turn_id));
+                    if crate::agent::loop_::is_tool_loop_cancelled(&error)
+                        && let Some(notice) = notice.as_mut()
+                    {
+                        Self::strip_interruption_marker_from(
+                            &mut notice.retained_context.retained_messages,
+                        );
+                    }
                     forward_history_trim_notice(&event_tx, notice).await;
                     return Err(StreamedTurnError {
                         error,
@@ -10259,6 +10451,35 @@ mod tests {
             .expect("agent builder should succeed with valid config")
     }
 
+    #[test]
+    fn replace_history_suffix_is_atomic_on_structural_mismatch() {
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = trim_history_test_agent(32, observer);
+        agent.history = vec![
+            ConversationMessage::Chat(ChatMessage::user("old")),
+            ConversationMessage::Chat(ChatMessage::assistant("finished")),
+        ];
+        let expected = agent.history[1..].to_vec();
+        let replacement = vec![ConversationMessage::Chat(ChatMessage::assistant("safe"))];
+
+        assert!(agent.replace_history_suffix(&expected, replacement.clone()));
+        assert!(matches!(
+            agent.history.last(),
+            Some(ConversationMessage::Chat(message)) if message.content == "safe"
+        ));
+
+        let before = agent.history.clone();
+        assert!(!agent.replace_history_suffix(
+            &[ConversationMessage::Chat(ChatMessage::assistant("wrong"))],
+            vec![ConversationMessage::Chat(ChatMessage::assistant("partial"))],
+        ));
+        assert_eq!(
+            serde_json::to_value(&agent.history).unwrap(),
+            serde_json::to_value(&before).unwrap(),
+            "a mismatch must not partially mutate"
+        );
+    }
+
     fn seed_old_trim_test_turn(agent: &mut Agent) {
         agent.history = vec![
             ConversationMessage::Chat(ChatMessage::system("system")),
@@ -15969,6 +16190,33 @@ model_provider = "custom.only"
             Some(ConversationMessage::Chat(message))
                 if message.content == "ordinary assistant text"
         ));
+        agent
+            .history
+            .push(ConversationMessage::Chat(ChatMessage::assistant(marker)));
+        let mut snapshot = agent.retained_context_snapshot();
+        assert!(Agent::strip_interruption_marker_from(
+            &mut snapshot.retained_messages
+        ));
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap();
+        store
+            .create_session("bare-cancel", "agent", "/tmp", None)
+            .unwrap();
+        store
+            .persist_retained_context_seed("bare-cancel", &snapshot.retained_messages, false)
+            .unwrap();
+        drop(store);
+        let store = zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap();
+        let restored = store
+            .load_session("bare-cancel")
+            .unwrap()
+            .unwrap()
+            .retained_context
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(restored).unwrap(),
+            serde_json::to_value(snapshot.retained_messages).unwrap()
+        );
     }
 
     #[test]

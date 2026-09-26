@@ -43,6 +43,7 @@ async fn emit_summary_attempt_usage(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn finish_after_max_iterations(
+    injected_memory_preamble: &mut Option<super::MemoryPreamble>,
     model_provider: &dyn ModelProvider,
     history: &mut Vec<ChatMessage>,
     provider_name: &str,
@@ -147,6 +148,7 @@ pub(crate) async fn finish_after_max_iterations(
         let tokens = token_counter.count(crate::agent::history::estimate_history_tokens(&messages));
         let before = *tokens_before.get_or_insert(tokens);
         let mut trim = super::surface_oversized_dispatch_if_needed(
+            injected_memory_preamble,
             history,
             crumb_present,
             tokens,
@@ -187,6 +189,11 @@ pub(crate) async fn finish_after_max_iterations(
                         tokens_before_source: Some(source),
                         tokens_after_source: Some(source),
                         unsatisfiable_floor: floor.then_some(true),
+                        retained_context: Some(super::retained_context_snapshot(
+                            injected_memory_preamble,
+                            history,
+                            *crumb_present,
+                        )),
                     })
                     .await;
             }
@@ -463,6 +470,7 @@ mod graceful_summary_metering_tests {
         let knobs = LoopKnobs::default(); // GracefulSummary
         let multimodal_config = MultimodalConfig::default();
         finish_after_max_iterations(
+            &mut None,
             provider,
             &mut history,
             "custom",
@@ -742,6 +750,7 @@ mod graceful_summary_metering_tests {
             let mut crumb_present = false;
             let (tx, mut rx) = tokio::sync::mpsc::channel(8);
             let error = finish_after_max_iterations(
+                &mut None,
                 &provider,
                 &mut history,
                 "custom",
@@ -826,6 +835,7 @@ mod graceful_summary_metering_tests {
         let multimodal_config = MultimodalConfig::default();
 
         let out = finish_after_max_iterations(
+            &mut None,
             &provider,
             &mut history,
             "custom",
@@ -897,6 +907,7 @@ mod graceful_summary_metering_tests {
         let multimodal_config = MultimodalConfig::default();
 
         let out = finish_after_max_iterations(
+            &mut None,
             &provider,
             &mut history,
             "custom",
@@ -972,6 +983,7 @@ mod graceful_summary_metering_tests {
         let multimodal_config = MultimodalConfig::default();
 
         let out = finish_after_max_iterations(
+            &mut None,
             &provider,
             &mut history,
             "custom",
@@ -1055,6 +1067,7 @@ mod graceful_summary_metering_tests {
         let multimodal_config = MultimodalConfig::default();
 
         let out = finish_after_max_iterations(
+            &mut None,
             &provider,
             &mut history,
             "custom",
@@ -1135,6 +1148,7 @@ mod graceful_summary_metering_tests {
         let multimodal_config = MultimodalConfig::default();
 
         let out = finish_after_max_iterations(
+            &mut None,
             &provider,
             &mut history,
             "custom",

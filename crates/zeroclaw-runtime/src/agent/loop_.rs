@@ -866,7 +866,7 @@ pub async fn agent_turn(
     // preamble onto the last user message: the exact byte length injected,
     // so the caller can strip precisely that block before persisting —
     // see `ToolLoop::injected_memory_preamble`.
-    injected_memory_preamble: &mut Option<String>,
+    injected_memory_preamble: &mut Option<super::turn::MemoryPreamble>,
     tools_registry: &scoped::ScopedToolRegistry,
     observer: &dyn Observer,
     provider_name: &str,
@@ -935,7 +935,7 @@ async fn agent_turn_with_sop_reassembly(
     // Authoritative breadcrumb provenance for `history` — see `agent_turn`.
     history_has_trim_breadcrumb: &mut bool,
     // See `agent_turn`.
-    injected_memory_preamble: &mut Option<String>,
+    injected_memory_preamble: &mut Option<super::turn::MemoryPreamble>,
     tools_registry: &scoped::ScopedToolRegistry,
     observer: &dyn Observer,
     provider_name: &str,
@@ -1096,8 +1096,8 @@ async fn agent_turn_with_sop_reassembly(
 pub(crate) use super::turn::StreamCancelledAfterOutput;
 pub use super::turn::{
     ContextLimitsResolver, DRAFT_PLACEHOLDER, DraftEvent, LoopKnobs, MaxIterationBehavior,
-    ModelSwitchCallback, ModelSwitchRequested, PROGRESS_MIN_INTERVAL_MS, ProgressEvent,
-    REASONING_FULL_PREFIX, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
+    MemoryPreamble, ModelSwitchCallback, ModelSwitchRequested, PROGRESS_MIN_INTERVAL_MS,
+    ProgressEvent, REASONING_FULL_PREFIX, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
     ResolvedRuntimeKnobs, ServedRoute, ServedRouteSink, SopStepReassembly, StreamDelta,
     THINKING_STATUS_PREFIX, ToolLoop, ToolLoopCancelled, drain_steering_messages,
     is_model_switch_requested, is_thinking_status_text, is_tool_loop_cancelled, run_tool_call_loop,

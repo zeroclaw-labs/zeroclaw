@@ -9068,7 +9068,7 @@ async fn process_channel_message_body(
     // already captured and restored wholesale below (`outgoing_user_turn_raw_content`
     // / `strip_volatile_preamble_before_persist`), which covers the recalled-memory
     // preamble too, so there is no separate byte-length to record here.
-    let mut channel_injected_memory_preamble: Option<String> = None;
+    let mut channel_injected_memory_preamble = None;
 
     // Kept so a post-loop trim resync can restore the current turn to this
     // clean content before persisting; the durable transcript must never

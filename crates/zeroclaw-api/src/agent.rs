@@ -1,4 +1,6 @@
+use crate::model_provider::ConversationMessage;
 use crate::plan::PlanEntry;
+use std::fmt;
 
 /// Structured metadata for a tool that produced a file artifact (e.g.
 /// `deliver_file`). Carried on [`TurnEvent::ToolResult`] so a channel attaches
@@ -149,6 +151,10 @@ pub enum TurnEvent {
         /// authoritative "unsatisfiable" signal. `None`/absent for ordinary
         /// trims.
         unsatisfiable_floor: Option<bool>,
+        /// Native RPC-only provider context captured by the owning turn before
+        /// the trim is announced. Wire and observer adapters deliberately
+        /// ignore this field; it is never serialized as a turn event.
+        retained_context: Option<RetainedContextSnapshot>,
     },
     /// Per-LLM-call token usage and cost; a turn may emit several, one per
     /// model call. `None` means "unavailable for this call", not zero.
@@ -191,6 +197,25 @@ pub enum TurnEvent {
         /// context snapshot (ACP session token count, context-meter ceiling).
         accepted: bool,
     },
+}
+
+/// Provider-facing context captured at a trim boundary. This remains attached
+/// to the internal turn event so the serial RPC consumer can persist it before
+/// forwarding the public trim notice without borrowing the live agent again.
+#[derive(Clone)]
+pub struct RetainedContextSnapshot {
+    pub retained_messages: Vec<ConversationMessage>,
+    pub breadcrumb: bool,
+}
+
+impl fmt::Debug for RetainedContextSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RetainedContextSnapshot")
+            .field("retained_messages", &self.retained_messages.len())
+            .field("breadcrumb", &self.breadcrumb)
+            .finish()
+    }
 }
 
 #[cfg(test)]
