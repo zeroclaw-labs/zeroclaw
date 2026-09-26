@@ -551,29 +551,29 @@ use zeroclaw_config::schema::{
     AtlasCloudModelProviderConfig, AtomicChatModelProviderConfig, AuthMode,
     AvianModelProviderConfig, AzureModelProviderConfig, BaichuanModelProviderConfig,
     BasetenModelProviderConfig, BedrockModelProviderConfig, CerebrasModelProviderConfig,
-    CloudflareModelProviderConfig, CohereModelProviderConfig, CopilotModelProviderConfig,
-    CrusoeModelProviderConfig, CustomModelProviderConfig, DeepinfraModelProviderConfig,
-    DeepmystModelProviderConfig, DeepseekModelProviderConfig, DoubaoModelProviderConfig,
-    FeatherlessModelProviderConfig, FireworksModelProviderConfig, FriendliModelProviderConfig,
-    GeminiCliModelProviderConfig, GeminiModelProviderConfig, GithubModelsModelProviderConfig,
-    GlmModelProviderConfig, GrokCliModelProviderConfig, GroqModelProviderConfig,
-    HAILO_OLLAMA_DEFAULT_URI, HailoOllamaEndpoint, HailoOllamaModelProviderConfig,
-    HuggingfaceModelProviderConfig, HunyuanModelProviderConfig, HyperbolicModelProviderConfig,
-    InceptionModelProviderConfig, KiloCliModelProviderConfig, KiloModelProviderConfig,
-    LambdaAiModelProviderConfig, LeptonModelProviderConfig, LitellmModelProviderConfig,
-    LlamacppModelProviderConfig, LmstudioModelProviderConfig, ManifestModelProviderConfig,
-    MinimaxModelProviderConfig, MistralModelProviderConfig, MoonshotEndpoint,
-    MoonshotModelProviderConfig, MorphModelProviderConfig, NearaiModelProviderConfig,
-    NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
-    NvidiaModelProviderConfig, OllamaModelProviderConfig, OpenAIModelProviderConfig,
-    OpenRouterModelProviderConfig, OpencodeModelProviderConfig, OsaurusModelProviderConfig,
-    OvhModelProviderConfig, PerplexityModelProviderConfig, QianfanModelProviderConfig,
-    QwenModelProviderConfig, RekaModelProviderConfig, SambanovaModelProviderConfig,
-    SglangModelProviderConfig, SiliconflowModelProviderConfig, StepfunModelProviderConfig,
-    SyntheticModelProviderConfig, TelnyxModelProviderConfig, TogetherModelProviderConfig,
-    UpstageModelProviderConfig, VeniceModelProviderConfig, VercelModelProviderConfig,
-    VllmModelProviderConfig, XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
-    ZerorouterModelProviderConfig,
+    CheaperInferenceModelProviderConfig, CloudflareModelProviderConfig, CohereModelProviderConfig,
+    CopilotModelProviderConfig, CrusoeModelProviderConfig, CustomModelProviderConfig,
+    DeepinfraModelProviderConfig, DeepmystModelProviderConfig, DeepseekModelProviderConfig,
+    DoubaoModelProviderConfig, FeatherlessModelProviderConfig, FireworksModelProviderConfig,
+    FriendliModelProviderConfig, GeminiCliModelProviderConfig, GeminiModelProviderConfig,
+    GithubModelsModelProviderConfig, GlmModelProviderConfig, GrokCliModelProviderConfig,
+    GroqModelProviderConfig, HAILO_OLLAMA_DEFAULT_URI, HailoOllamaEndpoint,
+    HailoOllamaModelProviderConfig, HuggingfaceModelProviderConfig, HunyuanModelProviderConfig,
+    HyperbolicModelProviderConfig, InceptionModelProviderConfig, KiloCliModelProviderConfig,
+    KiloModelProviderConfig, LambdaAiModelProviderConfig, LeptonModelProviderConfig,
+    LitellmModelProviderConfig, LlamacppModelProviderConfig, LmstudioModelProviderConfig,
+    ManifestModelProviderConfig, MinimaxModelProviderConfig, MistralModelProviderConfig,
+    MoonshotEndpoint, MoonshotModelProviderConfig, MorphModelProviderConfig,
+    NearaiModelProviderConfig, NebiusModelProviderConfig, NovitaModelProviderConfig,
+    NscaleModelProviderConfig, NvidiaModelProviderConfig, OllamaModelProviderConfig,
+    OpenAIModelProviderConfig, OpenRouterModelProviderConfig, OpencodeModelProviderConfig,
+    OsaurusModelProviderConfig, OvhModelProviderConfig, PerplexityModelProviderConfig,
+    QianfanModelProviderConfig, QwenModelProviderConfig, RekaModelProviderConfig,
+    SambanovaModelProviderConfig, SglangModelProviderConfig, SiliconflowModelProviderConfig,
+    StepfunModelProviderConfig, SyntheticModelProviderConfig, TelnyxModelProviderConfig,
+    TogetherModelProviderConfig, UpstageModelProviderConfig, VeniceModelProviderConfig,
+    VercelModelProviderConfig, VllmModelProviderConfig, XaiModelProviderConfig,
+    YiModelProviderConfig, ZaiModelProviderConfig, ZerorouterModelProviderConfig,
 };
 
 #[must_use]
@@ -648,6 +648,12 @@ impl CompatFamilySpec for AtlasCloudModelProviderConfig {
     const DEFAULT_URL: &'static str = "https://api.atlascloud.ai/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const PUBLIC_MODEL_LISTING: bool = true;
+}
+impl CompatFamilySpec for CheaperInferenceModelProviderConfig {
+    const DISPLAY: &'static str = "Cheaper Inference";
+    const DEFAULT_URL: &'static str =
+        zeroclaw_config::schema::CheaperInferenceEndpoint::DEFAULT_URI;
+    const AUTH: AuthStyle = AuthStyle::Bearer;
 }
 impl CompatFamilySpec for ZerorouterModelProviderConfig {
     const DISPLAY: &'static str = "ZeroRouter";
@@ -2451,6 +2457,16 @@ mod tests {
         assert_eq!(
             get_default_url("atlascloud"),
             Some("https://api.atlascloud.ai/v1")
+        );
+    }
+
+    #[test]
+    fn cheaperinference_default_url_matches_schema_endpoint() {
+        use zeroclaw_config::schema::{CheaperInferenceEndpoint, ModelEndpoint};
+        assert_eq!(
+            <CheaperInferenceModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+            CheaperInferenceEndpoint::default().uri(),
+            "schema CheaperInferenceEndpoint and factory DEFAULT_URL disagree"
         );
     }
 

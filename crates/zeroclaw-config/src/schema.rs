@@ -2579,6 +2579,78 @@ pub struct AtlasCloudModelProviderConfig {
     pub base: ModelProviderConfig,
 }
 
+// ── Cheaper Inference ──
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CheaperInferenceEndpoint {
+    #[default]
+    Default,
+}
+
+impl CheaperInferenceEndpoint {
+    /// Canonical Cheaper Inference endpoint. Single source of truth:
+    /// `CompatFamilySpec::DEFAULT_URL` for `CheaperInferenceModelProviderConfig`
+    /// references this const so the schema and factory surfaces never drift.
+    pub const DEFAULT_URI: &'static str = "https://api.cheaperinference.com/v1";
+}
+
+impl ModelEndpoint for CheaperInferenceEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => Self::DEFAULT_URI,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.cheaperinference"]
+pub struct CheaperInferenceModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+#[cfg(test)]
+mod cheaperinference_tests {
+    use super::*;
+
+    #[test]
+    fn cheaperinference_endpoint_uri() {
+        assert_eq!(
+            CheaperInferenceEndpoint::Default.uri(),
+            "https://api.cheaperinference.com/v1"
+        );
+    }
+
+    #[test]
+    fn cheaperinference_config_defaults_empty() {
+        let cfg = CheaperInferenceModelProviderConfig::default();
+        assert!(cfg.base.api_key.is_none());
+        assert!(cfg.base.model.is_none());
+    }
+
+    #[test]
+    fn cheaperinference_alias_round_trips_through_config() {
+        let toml = r#"
+[providers.models.cheaperinference.default]
+model = "gpt-5.4-mini"
+"#;
+        let config: Config = toml::from_str(toml).expect("cheaperinference alias deserializes");
+        let alias = config
+            .providers
+            .models
+            .cheaperinference
+            .get("default")
+            .expect("cheaperinference.default present");
+        assert_eq!(alias.base.model.as_deref(), Some("gpt-5.4-mini"));
+    }
+}
+
 // ── OVH ──
 
 #[derive(
@@ -3685,6 +3757,7 @@ impl_default_family_endpoint! {
     VercelModelProviderConfig,
     CloudflareModelProviderConfig,
     AtlasCloudModelProviderConfig,
+    CheaperInferenceModelProviderConfig,
     OvhModelProviderConfig,
     CopilotModelProviderConfig,
     DoubaoModelProviderConfig,
