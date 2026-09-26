@@ -6305,9 +6305,21 @@ mod tests {
             calls: Arc::clone(&calls),
         };
 
-        let mut history = vec![ChatMessage::user(
-            "Analyze this [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
-        )];
+        // A structurally complete 1x1 PNG (IHDR + IDAT + IEND): preparation
+        // validates decoded data-URI bytes, so the fixture must frame a real
+        // image rather than reuse a bare signature prefix.
+        let minimal_png: &[u8] = &[
+            0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 0x00, 0x00, 0x00, 0x0d, b'I', b'H',
+            b'D', b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, b'I', b'D', b'A', b'T', 0x78,
+            0xda, 0x63, 0x64, 0x60, 0xf8, 0x5f, 0x0f, 0x00, 0x02, 0x87, 0x01, 0x80, 0xeb, 0x47,
+            0xba, 0x92, 0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82,
+        ];
+        let mut history = vec![ChatMessage::user(format!(
+            "Analyze this [{}:data:image/png;base64,{}]",
+            "IMAGE",
+            STANDARD.encode(minimal_png)
+        ))];
         let tools_registry =
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let observer = NoopObserver;
