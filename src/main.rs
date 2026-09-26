@@ -1440,6 +1440,13 @@ Examples:
         auth_command: AuthCommands,
     },
 
+    /// Enroll with an inbound OIDC identity provider to obtain an RPC auth token
+    #[cfg(feature = "agent-runtime")]
+    Oidc {
+        #[command(subcommand)]
+        oidc_command: OidcCommands,
+    },
+
     /// Discover and introspect USB hardware
     // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
@@ -5278,6 +5285,28 @@ enum AuthCommands {
     },
 }
 
+#[cfg(feature = "agent-runtime")]
+#[derive(Subcommand, Debug)]
+enum OidcCommands {
+    /// Sign in interactively: shows a verification code (device grant) or
+    /// opens your browser (--browser), then prints the access token on stdout
+    Login {
+        /// Alias of the [oidc.<alias>] config entry to enroll against
+        alias: String,
+        /// Sign in with the system browser via Authorization Code + PKCE (RFC 8252
+        /// loopback) instead of the device grant; the browser is opened automatically
+        /// on macOS and Linux, and the sign-in URL is always printed for manual opening
+        #[arg(long)]
+        browser: bool,
+    },
+    /// Obtain a service token via the client_credentials grant (requires the
+    /// entry's client_secret); prints the access token on stdout
+    Token {
+        /// Alias of the [oidc.<alias>] config entry to enroll against
+        alias: String,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 enum ModelCommands {
     /// Refresh and cache model_provider models
@@ -6346,6 +6375,18 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
     // The daemon reload arm calls the same helper against its reloaded config.
     #[cfg(feature = "agent-runtime")]
     warn_verifiable_intent_withheld(&config);
+    // Enrollment's contract is that stdout carries exactly the token and
+    // nothing else, so the `oidc` commands are dispatched before any
+    // startup prelude that may print: the OTP prelude below discloses a
+    // freshly minted seed's enrollment URI on stdout, which must never be
+    // captured alongside an access token by a command substitution.
+    #[cfg(feature = "agent-runtime")]
+    if matches!(cli.command, Commands::Oidc { .. }) {
+        let Commands::Oidc { oidc_command } = cli.command else {
+            unreachable!("matched the Oidc variant above")
+        };
+        return handle_oidc_command(oidc_command, &config).await;
+    }
     #[cfg(feature = "agent-runtime")]
     if config.security.otp.enabled {
         let config_dir = config
@@ -8585,6 +8626,9 @@ Add pricing to the active provider profile or supply a catalog entry."
         }
 
         Commands::Auth { auth_command } => handle_auth_command(auth_command, &config).await,
+
+        #[cfg(feature = "agent-runtime")]
+        Commands::Oidc { oidc_command } => handle_oidc_command(oidc_command, &config).await,
 
         Commands::Hardware { hardware_command } => {
             hardware::handle_command(hardware_command.clone(), &config)
@@ -11078,6 +11122,257 @@ async fn run_anthropic_setup_token_inline(alias: &str, config: &mut Config) -> R
     Ok(())
 }
 
+/// Spawn `program` with `args` detached from this process's standard streams.
+///
+/// `oidc login` prints the access token on stdout and callers capture that
+/// stdout, so a helper process must stay out of it: a detached child can
+/// neither write into the stdout that carries the token nor hold that pipe
+/// open after the command finishes. Fire and forget — the child is never
+/// waited on.
+#[cfg(feature = "agent-runtime")]
+fn spawn_detached(program: &str, args: &[&str]) -> std::io::Result<std::process::Child> {
+    use std::process::{Command, Stdio};
+
+    Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+}
+
+/// Launch the system browser at `url`, reporting whether an opener started.
+///
+/// Platforms other than macOS and Linux have no opener here and rely on the
+/// sign-in URL the caller prints for manual opening.
+#[cfg(feature = "agent-runtime")]
+fn open_url_in_system_browser(url: &str) -> bool {
+    if cfg!(target_os = "macos") {
+        spawn_detached("open", &[url]).is_ok()
+    } else if cfg!(target_os = "linux") {
+        spawn_detached("xdg-open", &[url]).is_ok()
+    } else {
+        false
+    }
+}
+
+/// Longest device-code lifetime this client will wait for approval. RFC 8628
+/// puts no ceiling on `expires_in`, so an issuer advertising hours would
+/// otherwise park the enrollment loop for that long; an hour is far above any
+/// real device code and still refuses the pathological values that make
+/// `Instant + Duration` meaningless.
+#[cfg(feature = "agent-runtime")]
+const MAX_DEVICE_CODE_LIFETIME_SECS: u64 = 3600;
+
+/// Longest advertised poll interval this client will honor, for the same
+/// reason: RFC 8628 puts no ceiling on `interval` either, and one measured in
+/// hours turns the flow into an indefinite sleep.
+#[cfg(feature = "agent-runtime")]
+const MAX_DEVICE_POLL_INTERVAL_SECS: u64 = 300;
+
+/// RFC 8628 section 3.5 default interval, used here as the floor: polling
+/// faster than this earns `slow_down` at best and a rate limit at worst, so a
+/// smaller (or absent, or zero) advertised value is raised to it.
+#[cfg(feature = "agent-runtime")]
+const MIN_DEVICE_POLL_INTERVAL_SECS: u64 = 5;
+
+/// Bound the timings the identity provider can put this client on.
+///
+/// RFC 8628 lets a server advertise any `expires_in` and `interval`, and the
+/// client is otherwise obliged to follow both; without a ceiling a remote
+/// value can leave the CLI sleeping between polls, or waiting for approval,
+/// for as long as the remote side likes. Mirrors zerocode's gateway-side
+/// bounds so both surfaces refuse the same responses.
+#[cfg(feature = "agent-runtime")]
+fn device_grant_bounds(expires_in: u64, interval: u64) -> Result<()> {
+    if expires_in == 0 {
+        bail!("the identity provider advertised an already-expired device code (expires_in = 0)");
+    }
+    if expires_in > MAX_DEVICE_CODE_LIFETIME_SECS {
+        bail!(
+            "the identity provider advertised a device code lifetime of {expires_in}s, above \
+             the {MAX_DEVICE_CODE_LIFETIME_SECS}s this client will wait for approval"
+        );
+    }
+    if interval > MAX_DEVICE_POLL_INTERVAL_SECS {
+        bail!(
+            "the identity provider advertised a poll interval of {interval}s, above the \
+             {MAX_DEVICE_POLL_INTERVAL_SECS}s this client will wait between polls"
+        );
+    }
+    Ok(())
+}
+
+/// How long to wait before the next poll: the advertised interval raised to
+/// [`MIN_DEVICE_POLL_INTERVAL_SECS`] and then clipped to what is left of the
+/// device code's lifetime, so a sleep never outlives the code it is waiting
+/// on and the loop always gets back to the deadline check.
+#[cfg(feature = "agent-runtime")]
+fn device_poll_wait(interval_secs: u64, remaining: std::time::Duration) -> std::time::Duration {
+    std::time::Duration::from_secs(interval_secs.max(MIN_DEVICE_POLL_INTERVAL_SECS)).min(remaining)
+}
+
+#[cfg(feature = "agent-runtime")]
+async fn handle_oidc_command(oidc_command: OidcCommands, config: &Config) -> Result<()> {
+    use zeroclaw_runtime::security::auth_provider::{DevicePollOutcome, Enrollment};
+
+    enum OidcFlow {
+        Device,
+        Browser,
+        ClientCredentials,
+    }
+    let (alias, flow) = match &oidc_command {
+        OidcCommands::Login {
+            alias,
+            browser: false,
+        } => (alias.clone(), OidcFlow::Device),
+        OidcCommands::Login {
+            alias,
+            browser: true,
+        } => (alias.clone(), OidcFlow::Browser),
+        OidcCommands::Token { alias } => (alias.clone(), OidcFlow::ClientCredentials),
+    };
+    let Some(entry) = config.oidc.get(&alias) else {
+        let mut known: Vec<&str> = config.oidc.keys().map(String::as_str).collect();
+        known.sort_unstable();
+        let known = if known.is_empty() {
+            "(none)".to_string()
+        } else {
+            known.join(", ")
+        };
+        bail!(ta(
+            "cli-oidc-unknown-alias",
+            &[("alias", &alias), ("known", &known)],
+            format!("No [oidc.{alias}] entry in the config. Configured entries: {known}"),
+        ));
+    };
+    let enrollment = Enrollment::new(&alias, entry.clone())?;
+
+    let token = match flow {
+        OidcFlow::ClientCredentials => enrollment.client_credentials().await?,
+        OidcFlow::Browser => {
+            use zeroclaw_runtime::security::auth_provider::LoopbackListener;
+            let listener = LoopbackListener::bind().await?;
+            let pkce = enrollment.pkce_start(&listener.redirect_uri()).await?;
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-oidc-browser-open",
+                    &[("uri", &pkce.authorize_url)],
+                    format!(
+                        "Opening your browser to sign in. If nothing opens, visit:\n{}",
+                        pkce.authorize_url
+                    ),
+                )
+            );
+            // The URL was printed above, so failing to launch an opener (or
+            // having none on this platform) only means opening it by hand.
+            let _ = open_url_in_system_browser(&pkce.authorize_url);
+            eprintln!(
+                "{}",
+                t(
+                    "cli-oidc-browser-waiting",
+                    "Waiting for the browser sign-in to complete...",
+                )
+            );
+            let code = listener
+                .wait_for_code(&pkce, std::time::Duration::from_mins(5))
+                .await?;
+            enrollment.pkce_exchange(&pkce, &code).await?
+        }
+        OidcFlow::Device => {
+            let start = enrollment.device_grant_start().await?;
+            // Before the user is sent anywhere: a code that is already dead,
+            // or timings that would park this loop for as long as the issuer
+            // likes, are refused rather than acted on.
+            device_grant_bounds(start.expires_in, start.interval)?;
+            let uri = start
+                .verification_uri_complete
+                .clone()
+                .unwrap_or_else(|| start.verification_uri.clone());
+            let expires = start.expires_in.to_string();
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-oidc-device-visit",
+                    &[("uri", &uri), ("code", &start.user_code)],
+                    format!("To sign in, visit {uri} and enter code {}", start.user_code),
+                )
+            );
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-oidc-device-waiting",
+                    &[("seconds", &expires)],
+                    format!(
+                        "Waiting for identity-provider approval (the code expires in {expires} seconds)..."
+                    ),
+                )
+            );
+            let expired = || {
+                t(
+                    "cli-oidc-device-expired",
+                    "The device code expired before approval; run the command again.",
+                )
+            };
+            let deadline = std::time::Instant::now()
+                .checked_add(std::time::Duration::from_secs(start.expires_in))
+                .ok_or_else(|| {
+                    anyhow::Error::msg(
+                        "the advertised device code lifetime does not fit this platform's clock",
+                    )
+                })?;
+            // Seeded at the floor so an RFC 8628 `slow_down` backs off from a
+            // legal interval rather than from an advertised zero.
+            let mut interval = start.interval.max(MIN_DEVICE_POLL_INTERVAL_SECS);
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    bail!(expired());
+                }
+                tokio::time::sleep(device_poll_wait(interval, remaining)).await;
+                // A wait clipped to the remaining lifetime lands exactly on the
+                // deadline, so re-check here rather than only at the top of the
+                // loop: the code is dead by now and the request must not go out.
+                if std::time::Instant::now() >= deadline {
+                    bail!(expired());
+                }
+                match enrollment.device_grant_poll(&start.device_code).await? {
+                    DevicePollOutcome::Pending => {}
+                    DevicePollOutcome::SlowDown => interval = interval.saturating_add(5),
+                    DevicePollOutcome::Denied(reason) => bail!("device grant failed: {reason}"),
+                    DevicePollOutcome::Token(token) => break *token,
+                }
+            }
+        }
+    };
+
+    eprintln!(
+        "{}",
+        ta(
+            "cli-oidc-enrolled",
+            &[("alias", &alias)],
+            format!(
+                "Enrolled with [oidc.{alias}]. The access token is on stdout; present it as \
+                 auth_token in the RPC handshake or export it as ZEROCLAW_AUTH_TOKEN."
+            ),
+        )
+    );
+    if let Some(secs) = token.expires_in {
+        let secs = secs.to_string();
+        eprintln!(
+            "{}",
+            ta(
+                "cli-oidc-token-expiry",
+                &[("seconds", &secs)],
+                format!("The token expires in {secs} seconds."),
+            )
+        );
+    }
+    println!("{}", token.access_token);
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 #[cfg(feature = "agent-runtime")]
 async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Result<()> {
@@ -12404,6 +12699,100 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::net::TcpListener;
+
+    /// `oidc login` prints the access token on stdout and shells capture it, so
+    /// the browser opener must not inherit the CLI's standard streams. The probe
+    /// child records whether its stdout and stderr are the null device, then
+    /// writes noise and exits nonzero: neither may disturb the spawn.
+    #[cfg(all(unix, feature = "agent-runtime"))]
+    #[test]
+    fn browser_opener_children_get_no_standard_streams() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
+        let marker = std::env::temp_dir().join(format!(
+            "zeroclaw-spawn-detached-{}-{nanos}.marker",
+            std::process::id()
+        ));
+        let marker_path = marker.to_string_lossy().into_owned();
+        let script = "if [ /dev/stdout -ef /dev/null ] && [ /dev/stderr -ef /dev/null ]; then \
+                      echo quiet > \"$0\"; else echo leak > \"$0\"; fi; echo NOISE; exit 3";
+
+        let spawned = spawn_detached("sh", &["-c", script, &marker_path]);
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(err) => {
+                let _ = std::fs::remove_file(&marker);
+                panic!("spawning a noisy opener must succeed; got: {err}");
+            }
+        };
+        // Reap the probe so it does not linger as a zombie; its nonzero exit is
+        // expected and must not have failed the spawn above.
+        let status = child.wait();
+        let observed = std::fs::read_to_string(&marker);
+        let _ = std::fs::remove_file(&marker);
+
+        let status = status.unwrap_or_else(|err| panic!("waiting on the probe failed: {err}"));
+        assert!(
+            !status.success(),
+            "probe must report its nonzero exit; got: {status}"
+        );
+        let observed = observed
+            .unwrap_or_else(|err| panic!("probe must have written {marker_path}; got: {err}"));
+        assert_eq!(
+            observed.trim(),
+            "quiet",
+            "spawn_detached must give the child no standard streams"
+        );
+    }
+
+    /// RFC 8628 lets an identity provider advertise any `expires_in` and
+    /// `interval`, and a client that follows both blindly can be parked for as
+    /// long as the remote side likes — or handed a lifetime that makes the
+    /// deadline arithmetic meaningless.
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn device_grant_bounds_refuse_hostile_timings() {
+        device_grant_bounds(600, 5).unwrap();
+        device_grant_bounds(MAX_DEVICE_CODE_LIFETIME_SECS, MAX_DEVICE_POLL_INTERVAL_SECS).unwrap();
+
+        let err = device_grant_bounds(0, 5).unwrap_err().to_string();
+        assert!(err.contains("expires_in = 0"), "{err}");
+        for lifetime in [MAX_DEVICE_CODE_LIFETIME_SECS + 1, u64::MAX] {
+            let err = device_grant_bounds(lifetime, 5).unwrap_err().to_string();
+            assert!(err.contains("will wait for approval"), "{err}");
+        }
+        for interval in [MAX_DEVICE_POLL_INTERVAL_SECS + 1, u64::MAX] {
+            let err = device_grant_bounds(600, interval).unwrap_err().to_string();
+            assert!(err.contains("between polls"), "{err}");
+        }
+    }
+
+    /// Every wait is floored at the RFC 8628 default and clipped to what is
+    /// left of the code's lifetime: an issuer advertising `expires_in = 1,
+    /// interval = 60` must not put this client to sleep for a minute past the
+    /// moment the code it is waiting on died.
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn device_poll_wait_floors_and_clips_the_interval() {
+        use std::time::Duration;
+
+        let lifetime = Duration::from_mins(10);
+        for advertised in [0, 1, 4, MIN_DEVICE_POLL_INTERVAL_SECS] {
+            assert_eq!(
+                device_poll_wait(advertised, lifetime),
+                Duration::from_secs(MIN_DEVICE_POLL_INTERVAL_SECS),
+                "an advertised {advertised}s must be raised to the floor"
+            );
+        }
+        assert_eq!(device_poll_wait(97, lifetime), Duration::from_secs(97));
+        assert_eq!(
+            device_poll_wait(60, Duration::from_secs(1)),
+            Duration::from_secs(1),
+            "no wait may outlive the device code"
+        );
+        assert_eq!(device_poll_wait(60, Duration::ZERO), Duration::ZERO);
+    }
 
     #[cfg(feature = "agent-runtime")]
     struct SelectorTestTerminal {

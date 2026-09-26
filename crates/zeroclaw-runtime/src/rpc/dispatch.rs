@@ -1861,6 +1861,65 @@ impl RpcDispatcher {
         Some(auth.principal.id.as_str().to_owned())
     }
 
+    /// The private-memory scope for `owner` on `agent_alias`: the owner
+    /// composed with the agent dimension. Namespace and tenant are not on the
+    /// RPC wire today, so they resolve to the backend's defaults.
+    fn memory_scope_for(
+        &self,
+        owner: String,
+        agent_alias: &str,
+    ) -> zeroclaw_api::memory_traits::PrincipalScope {
+        zeroclaw_api::memory_traits::PrincipalScope::new(owner)
+            .with_agent(Some(agent_alias.to_string()))
+    }
+
+    /// Which memory plane an RPC memory call acts on.
+    ///
+    /// The plane follows the caller's durable IDENTITY, not the admin bypass:
+    /// a named administrator's memory is their private plane like anyone
+    /// else's, so promoting or demoting a user never hides their notes or
+    /// silently redirects their writes. Only the unauthenticated shared
+    /// operator is on the shared plane by default. A caller may name
+    /// `plane: "shared"` explicitly; that is honoured only for callers with
+    /// the admin bypass (audited), and refused for scoped principals.
+    fn memory_plane(
+        &self,
+        requested: Option<&str>,
+        method: Method,
+    ) -> Result<Option<zeroclaw_api::memory_traits::PrincipalScope>, JsonRpcError> {
+        let owner = self.owner_principal_id();
+        match requested {
+            None | Some("private") => {
+                Ok(owner.map(zeroclaw_api::memory_traits::PrincipalScope::new))
+            }
+            Some("shared") => {
+                if self.scoped_principal_id().is_some() {
+                    return Err(rpc_err(
+                        FORBIDDEN,
+                        "The shared memory plane is not available to scoped principals",
+                    ));
+                }
+                if let Some(actor) = owner {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::System)
+                            .with_attrs(::serde_json::json!({
+                                "method": method.wire_name(),
+                                "principal_id": actor,
+                            })),
+                        "Administrator selected the shared memory plane explicitly"
+                    );
+                }
+                Ok(None)
+            }
+            Some(other) => Err(rpc_err(
+                INVALID_PARAMS,
+                format!("Unknown memory plane {other:?}; expected \"private\" or \"shared\""),
+            )),
+        }
+    }
+
     /// Resolve a session id to the ONE stored resource it names.
     ///
     /// The live incarnation, every chat-backend key the id can be stored
@@ -2057,40 +2116,20 @@ impl RpcDispatcher {
         Ok(current)
     }
 
-    /// Fail-closed memory scoping for scoped principals until
-    /// principal-owned memory lands: session-scoped queries against an
-    /// OWNED session pass; cross-session queries and bare-key operations
-    /// are refused.
-    async fn authorize_memory_access(
-        &self,
-        session_id: Option<&str>,
-        method: Method,
-    ) -> Result<(), JsonRpcError> {
-        if self.scoped_principal_id().is_none() {
-            return Ok(());
-        }
-        // Writes stay closed for scoped principals in this slice: the memory
-        // backend keys rows by (agent, key) with no owner predicate, so an
-        // upsert scoped only by its destination session could still replace
-        // or re-home another principal's row under the same key. Owner-
-        // predicated storage lands with private principal memory; until then
-        // reads are scoped to an owned session and writes are refused.
-        if matches!(method, Method::MemoryStore | Method::MemoryDelete) {
-            return Err(rpc_err(
+    /// Map a private-plane memory error: a backend that has not
+    /// implemented principal scoping FAILS CLOSED as a denial; anything
+    /// else is an internal error.
+    fn map_private_memory_err(e: &anyhow::Error) -> JsonRpcError {
+        let msg = format!("{e:#}");
+        if msg.contains("does not support principal-scoped memory") {
+            rpc_err(
                 FORBIDDEN,
-                "Scoped principals cannot write memory yet: the current backend cannot \
-                 isolate writes by owner, so store and delete remain unscoped-only until \
-                 principal-owned memory lands",
-            ));
-        }
-        match session_id {
-            Some(sid) => self.authorize_session_owner(sid, method).await.map(|_| ()),
-            None => Err(rpc_err(
-                FORBIDDEN,
-                "Scoped principals must scope memory operations to an owned session_id; \
-                 cross-session queries and bare-key memory operations remain \
-                 unscoped-only until principal-owned memory lands",
-            )),
+                "The configured memory backend does not support principal-scoped \
+                 memory; private memory is unavailable for scoped principals on \
+                 this deployment",
+            )
+        } else {
+            rpc_err(INTERNAL_ERROR, format!("Memory operation failed: {msg}"))
         }
     }
 
@@ -3101,6 +3140,26 @@ impl RpcDispatcher {
     }
 
     #[cfg(test)]
+    pub async fn handle_memory_store_for_test(&self, params: &Value) -> RpcResult {
+        self.handle_memory_store(params).await
+    }
+
+    #[cfg(test)]
+    pub async fn handle_memory_get_for_test(&self, params: &Value) -> RpcResult {
+        self.handle_memory_get(params).await
+    }
+
+    #[cfg(test)]
+    pub async fn handle_memory_search_for_test(&self, params: &Value) -> RpcResult {
+        self.handle_memory_search(params).await
+    }
+
+    #[cfg(test)]
+    pub async fn handle_memory_delete_for_test(&self, params: &Value) -> RpcResult {
+        self.handle_memory_delete(params).await
+    }
+
+    #[cfg(test)]
     pub async fn handle_session_messages_for_test(&self, params: &Value) -> RpcResult {
         self.handle_session_messages(params).await
     }
@@ -3565,6 +3624,20 @@ impl RpcDispatcher {
         // principal, for a caller without operator reach.
         if let Some(grants) = grants.as_ref() {
             self.apply_principal_grants_to_agent(grants, &mut agent);
+        }
+
+        // The session's memory follows its OWNER: an owned session works on
+        // the owner's private plane for its whole life, whoever prompts it
+        // later. The shared operator keeps the shared handle.
+        if let Some(owner) = self.owner_principal_id() {
+            agent
+                .route_memory_to_principal(self.memory_scope_for(owner, &req.agent_alias))
+                .map_err(|e| {
+                    rpc_err(
+                        INTERNAL_ERROR,
+                        format!("Failed to scope session memory: {e}"),
+                    )
+                })?;
         }
         agent.set_interaction_context(
             resolved_interaction_surface.map(crate::agent::prompt::InteractionSurface::resolve),
@@ -4365,6 +4438,26 @@ impl RpcDispatcher {
         // whatever the connection was stamped with.
         if let Some(grants) = grants {
             self.apply_principal_grants_to_agent(grants, &mut agent);
+        }
+
+        // Memory follows the DURABLE owner of the reaped session, not the
+        // principal restoring it.
+        if let Some(owner) = data.principal_id.clone()
+            && let Err(error) =
+                agent.route_memory_to_principal(self.memory_scope_for(owner, &data.agent_alias))
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "session_id": sid,
+                        "error": error.to_string(),
+                    })),
+                "session/prompt: refusing to rehydrate a session whose memory cannot be scoped to its owner"
+            );
+            return Ok(None);
         }
         let interaction_context = match data.interaction_surface.as_deref() {
             Some(value) => match crate::agent::prompt::InteractionSurface::from_persisted(value) {
@@ -6042,6 +6135,18 @@ impl RpcDispatcher {
 
     // ── Memory handlers ──────────────────────────────────────────
 
+    /// Parse a wire category name into the canonical variant, so `core`
+    /// names [`MemoryCategory::Core`] rather than a custom category that
+    /// happens to spell the same.
+    fn parse_memory_category(name: &str) -> MemoryCategory {
+        match name {
+            "core" => MemoryCategory::Core,
+            "daily" => MemoryCategory::Daily,
+            "conversation" => MemoryCategory::Conversation,
+            other => MemoryCategory::Custom(other.to_string()),
+        }
+    }
+
     async fn handle_memory_list(&self, params: &Value) -> RpcResult {
         let mem = self
             .ctx
@@ -6049,16 +6154,24 @@ impl RpcDispatcher {
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
         let req: MemoryListParams = parse_params(params)?;
-        self.authorize_memory_access(req.session_id.as_deref(), Method::MemoryList)
-            .await?;
-        let category = req
-            .category
-            .as_deref()
-            .map(|s| MemoryCategory::Custom(s.to_string()));
-        let entries = mem
-            .list(category.as_ref(), req.session_id.as_deref())
-            .await
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory list failed: {e}")))?;
+        let category = req.category.as_deref().map(Self::parse_memory_category);
+        // The plane follows the caller's identity (private for every
+        // authenticated principal, shared for the operator), composed with
+        // the agent dimension; see `memory_plane`.
+        let entries = match self.memory_plane(req.plane.as_deref(), Method::MemoryList)? {
+            Some(scope) => mem
+                .list_for_principal(
+                    &scope.with_agent(req.agent.clone()),
+                    category.as_ref(),
+                    req.session_id.as_deref(),
+                )
+                .await
+                .map_err(|e| Self::map_private_memory_err(&e))?,
+            None => mem
+                .list(category.as_ref(), req.session_id.as_deref())
+                .await
+                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory list failed: {e}")))?,
+        };
         let count = entries.len();
         let entries = truncate_memory_previews(entries);
         to_result(MemoryListResult { entries, count })
@@ -6071,18 +6184,29 @@ impl RpcDispatcher {
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
         let req: MemorySearchParams = parse_params(params)?;
-        self.authorize_memory_access(req.session_id.as_deref(), Method::MemorySearch)
-            .await?;
-        let entries = mem
-            .recall(
-                &req.query,
-                req.limit,
-                req.session_id.as_deref(),
-                req.since.as_deref(),
-                req.until.as_deref(),
-            )
-            .await
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory search failed: {e}")))?;
+        let entries = match self.memory_plane(req.plane.as_deref(), Method::MemorySearch)? {
+            Some(scope) => mem
+                .recall_for_principal(
+                    &scope.with_agent(req.agent.clone()),
+                    &req.query,
+                    req.limit,
+                    req.session_id.as_deref(),
+                    req.since.as_deref(),
+                    req.until.as_deref(),
+                )
+                .await
+                .map_err(|e| Self::map_private_memory_err(&e))?,
+            None => mem
+                .recall(
+                    &req.query,
+                    req.limit,
+                    req.session_id.as_deref(),
+                    req.since.as_deref(),
+                    req.until.as_deref(),
+                )
+                .await
+                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory search failed: {e}")))?,
+        };
         let count = entries.len();
         let entries = truncate_memory_previews(entries);
         to_result(MemorySearchResult { entries, count })
@@ -6099,12 +6223,16 @@ impl RpcDispatcher {
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
         let req: MemoryGetParams = parse_params(params)?;
-        self.authorize_memory_access(None, Method::MemoryGet)
-            .await?;
-        let entry = mem
-            .get(&req.key)
-            .await
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory get failed: {e}")))?;
+        let entry = match self.memory_plane(req.plane.as_deref(), Method::MemoryGet)? {
+            Some(scope) => mem
+                .get_for_principal(&scope.with_agent(req.agent.clone()), &req.key)
+                .await
+                .map_err(|e| Self::map_private_memory_err(&e))?,
+            None => mem
+                .get(&req.key)
+                .await
+                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory get failed: {e}")))?,
+        };
         match entry {
             Some(e) => to_result(MemoryGetResult { entry: Some(e) }),
             None => Err(rpc_err(
@@ -6121,16 +6249,27 @@ impl RpcDispatcher {
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
         let req: MemoryStoreParams = parse_params(params)?;
-        self.authorize_memory_access(req.session_id.as_deref(), Method::MemoryStore)
-            .await?;
         let category = req
             .category
             .as_deref()
-            .map(|s| MemoryCategory::Custom(s.to_string()))
+            .map(Self::parse_memory_category)
             .unwrap_or(MemoryCategory::Custom("user".into()));
-        mem.store(&req.key, &req.content, category, req.session_id.as_deref())
-            .await
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory store failed: {e}")))?;
+        match self.memory_plane(req.plane.as_deref(), Method::MemoryStore)? {
+            Some(scope) => mem
+                .store_for_principal(
+                    &scope.with_agent(req.agent.clone()),
+                    &req.key,
+                    &req.content,
+                    category,
+                    req.session_id.as_deref(),
+                )
+                .await
+                .map_err(|e| Self::map_private_memory_err(&e))?,
+            None => mem
+                .store(&req.key, &req.content, category, req.session_id.as_deref())
+                .await
+                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory store failed: {e}")))?,
+        }
         to_result(MemoryStoreResult {
             key: req.key,
             stored: true,
@@ -6144,11 +6283,16 @@ impl RpcDispatcher {
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
         let req: MemoryDeleteParams = parse_params(params)?;
-        self.authorize_memory_access(None, Method::MemoryDelete)
-            .await?;
-        mem.forget(&req.key)
-            .await
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory delete failed: {e}")))?;
+        match self.memory_plane(req.plane.as_deref(), Method::MemoryDelete)? {
+            Some(scope) => mem
+                .forget_for_principal(&scope.with_agent(req.agent.clone()), &req.key)
+                .await
+                .map_err(|e| Self::map_private_memory_err(&e))?,
+            None => mem
+                .forget(&req.key)
+                .await
+                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory delete failed: {e}")))?,
+        };
         to_result(MemoryDeleteResult {
             key: req.key,
             deleted: true,
@@ -15396,58 +15540,6 @@ mod tests {
         assert!(sessions.get_agent("operator-ok").await.is_some());
     }
 
-    /// Scoped memory writes stay closed until storage carries an owner
-    /// predicate: the same key from two principals can never overwrite or
-    /// re-home a row, because neither write is admitted. Reads scoped to an
-    /// owned session keep working; unscoped connections keep today's path.
-    #[tokio::test]
-    async fn scoped_memory_writes_are_refused_while_storage_cannot_isolate_them() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config = two_user_config(&tmp);
-        let data_dir = config.data_dir.clone();
-        let (fixture, _sessions, _chat_backend, _acp_store) =
-            make_persistence_test_dispatcher(config, &data_dir);
-        let ctx = Arc::clone(&fixture.ctx);
-        let alice = scoped_dispatcher(&ctx, 4242).await;
-        let bob = scoped_dispatcher(&ctx, 4343).await;
-        alice
-            .handle_session_new_for_test(&json!({
-                "agent_alias": "test-agent",
-                "session_id": "m1",
-                "chat_mode": "acp",
-            }))
-            .await
-            .unwrap();
-
-        for (who, label) in [(&alice, "the owner"), (&bob, "another principal")] {
-            for method in [Method::MemoryStore, Method::MemoryDelete] {
-                let err = who
-                    .authorize_memory_access(Some("m1"), method)
-                    .await
-                    .expect_err(label);
-                assert_eq!(err.code, FORBIDDEN, "{label} {}", method.wire_name());
-                assert!(
-                    err.message.contains("cannot write memory"),
-                    "{label}: {}",
-                    err.message
-                );
-            }
-        }
-        alice
-            .authorize_memory_access(Some("m1"), Method::MemoryList)
-            .await
-            .expect("reads scoped to an owned session pass");
-        let err = bob
-            .authorize_memory_access(Some("m1"), Method::MemoryList)
-            .await
-            .expect_err("reads scoped to someone else's session do not");
-        assert_eq!(err.code, FORBIDDEN);
-        fixture
-            .authorize_memory_access(None, Method::MemoryStore)
-            .await
-            .expect("unscoped connections keep today's behavior");
-    }
-
     /// The ownership boundary through the real request path: the coarse gate
     /// admits the method, the handler's ownership check refuses the foreign
     /// session with the uniform denial.
@@ -15559,39 +15651,322 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scoped_memory_access_is_fail_closed() {
+    async fn scoped_memory_routes_to_the_private_plane() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
         let tmp = tempfile::TempDir::new().unwrap();
         let config = two_user_config(&tmp);
-        let (fixture, _sessions) = make_acp_test_dispatcher(config);
-        let ctx = Arc::clone(&fixture.ctx);
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(config, sessions);
+        let mut ctx = Arc::try_unwrap(ctx)
+            .ok()
+            .expect("minimal test context should be uniquely owned");
+        let mem_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "sqlite".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        ctx.memory = Some(Arc::from(
+            zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None)
+                .expect("sqlite memory for tests"),
+        ));
+        let ctx = Arc::new(ctx);
+
         let alice = scoped_dispatcher(&ctx, 4242).await;
+        let bob = scoped_dispatcher(&ctx, 4343).await;
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut unscoped = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:test".into());
+        unscoped.set_authenticated_for_test();
 
+        // Alice stores privately; the unscoped (legacy) plane cannot see it.
         alice
-            .handle_session_new_for_test(&json!({
-                "agent_alias": "test-agent",
-                "session_id": "alice-mem",
-            }))
+            .handle_memory_store_for_test(&json!({"key": "note", "content": "alice-secret"}))
             .await
-            .expect("alice creates her session");
+            .expect("private store");
+        let err = unscoped
+            .handle_memory_get_for_test(&json!({"key": "note"}))
+            .await
+            .expect_err("the legacy plane must not see private rows");
+        assert!(err.message.contains("not found"), "{}", err.message);
 
-        // Owned-session scope passes the backstop.
-        alice
-            .authorize_memory_access(Some("alice-mem"), Method::MemoryList)
+        // A shared row under the same key coexists; each plane reads its own.
+        unscoped
+            .handle_memory_store_for_test(&json!({"key": "note", "content": "shared"}))
             .await
-            .expect("owned session scope passes");
-        // Cross-session (unscoped) queries and bare-key operations deny.
-        for sid in [None, Some("legacy-or-other")] {
-            let err = alice
-                .authorize_memory_access(sid, Method::MemoryList)
-                .await
-                .expect_err("scoped memory access outside owned sessions denies");
-            assert_eq!(err.code, zeroclaw_api::jsonrpc::error_codes::FORBIDDEN);
+            .expect("legacy store");
+        let got = alice
+            .handle_memory_get_for_test(&json!({"key": "note"}))
+            .await
+            .expect("alice reads her private row");
+        assert!(got.to_string().contains("alice-secret"));
+        assert!(!got.to_string().contains("\"shared\""));
+
+        // Bob's private plane is empty: same-key rows of others invisible.
+        let err = bob
+            .handle_memory_get_for_test(&json!({"key": "note"}))
+            .await
+            .expect_err("bob has no such private row");
+        assert!(err.message.contains("not found"), "{}", err.message);
+
+        // Search respects the plane split in both directions.
+        let hits = alice
+            .handle_memory_search_for_test(&json!({"query": "secret", "limit": 10}))
+            .await
+            .expect("private search");
+        assert!(hits.to_string().contains("alice-secret"));
+        let hits = unscoped
+            .handle_memory_search_for_test(&json!({"query": "secret", "limit": 10}))
+            .await
+            .expect("legacy search");
+        assert!(!hits.to_string().contains("alice-secret"));
+
+        // Private delete removes only Alice's row; the shared row survives.
+        alice
+            .handle_memory_delete_for_test(&json!({"key": "note"}))
+            .await
+            .expect("private delete");
+        let got = unscoped
+            .handle_memory_get_for_test(&json!({"key": "note"}))
+            .await
+            .expect("shared row survives");
+        assert!(got.to_string().contains("shared"));
+    }
+
+    /// A memory-enabled persistence context: two roster users plus a named
+    /// administrator, an SQLite memory backend, and the session stores.
+    fn memory_isolation_ctx(
+        tmp: &tempfile::TempDir,
+    ) -> (
+        Arc<RpcContext>,
+        Arc<crate::rpc::session::SessionStore>,
+        Arc<dyn zeroclaw_memory::Memory>,
+    ) {
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let mut config = two_user_config(tmp);
+        config
+            .permission_profiles
+            .get_mut("member")
+            .unwrap()
+            .grants
+            .insert(
+                zeroclaw_api::grants::Resource::Memory,
+                vec![
+                    zeroclaw_api::grants::Verb::Create,
+                    zeroclaw_api::grants::Verb::Read,
+                    zeroclaw_api::grants::Verb::Delete,
+                ],
+            );
+        config.permission_profiles.insert(
+            "admin".into(),
+            PermissionProfileConfig {
+                admin: true,
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "carol".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4444),
+                permission_profiles: vec!["admin".into()],
+            },
+        );
+        let data_dir = config.data_dir.clone();
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let chat_backend =
+            Arc::new(zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&data_dir).unwrap());
+        let acp_store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(&data_dir).unwrap());
+        let ctx = RpcContext::for_persistence_tests(
+            config,
+            Arc::clone(&sessions),
+            Some(chat_backend as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            Some(acp_store),
+        );
+        let mut ctx = Arc::try_unwrap(ctx)
+            .ok()
+            .expect("persistence test context should be uniquely owned");
+        let mem_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "sqlite".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let memory: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).expect("sqlite memory"),
+        );
+        ctx.memory = Some(Arc::clone(&memory));
+        (Arc::new(ctx), sessions, memory)
+    }
+
+    /// The memory plane follows the caller's identity, not the admin bypass:
+    /// a named administrator keeps her private notes across promotion and
+    /// demotion, reaches the shared plane only by naming it (audited), and a
+    /// scoped principal cannot name it at all.
+    #[tokio::test]
+    async fn memory_plane_follows_identity_not_the_admin_bypass() {
+        use zeroclaw_config::schema::PermissionProfileConfig;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, _sessions, _memory) = memory_isolation_ctx(&tmp);
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let carol = scoped_dispatcher(&ctx, 4444).await;
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut operator = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:test".into());
+        operator.set_authenticated_for_test();
+
+        // The operator's note is on the shared plane; carol's is private
+        // even though she holds admin; alice's is private.
+        operator
+            .handle_memory_store_for_test(&json!({"key": "note", "content": "shared"}))
+            .await
+            .unwrap();
+        carol
+            .handle_memory_store_for_test(&json!({"key": "note", "content": "carol-private"}))
+            .await
+            .unwrap();
+        alice
+            .handle_memory_store_for_test(&json!({"key": "note", "content": "alice-private"}))
+            .await
+            .unwrap();
+        let got = carol
+            .handle_memory_get_for_test(&json!({"key": "note"}))
+            .await
+            .unwrap();
+        assert!(got.to_string().contains("carol-private"), "{got}");
+        // The administrator reaches the shared plane only explicitly.
+        let got = carol
+            .handle_memory_get_for_test(&json!({"key": "note", "plane": "shared"}))
+            .await
+            .unwrap();
+        assert!(got.to_string().contains("\"shared\""), "{got}");
+        // A scoped principal cannot name the shared plane.
+        let err = alice
+            .handle_memory_get_for_test(&json!({"key": "note", "plane": "shared"}))
+            .await
+            .expect_err("scoped principals have no shared plane");
+        assert_eq!(err.code, FORBIDDEN);
+        let err = alice
+            .handle_memory_get_for_test(&json!({"key": "note", "plane": "elsewhere"}))
+            .await
+            .expect_err("unknown planes are refused");
+        assert_eq!(err.code, INVALID_PARAMS);
+
+        // Demote carol: her note is still hers, still private.
+        {
+            let mut config = ctx.config.read().clone();
+            config.permission_profiles.insert(
+                "admin".into(),
+                PermissionProfileConfig {
+                    admin: false,
+                    allowed_agents: vec!["*".into()],
+                    grants: std::collections::HashMap::from([(
+                        zeroclaw_api::grants::Resource::Memory,
+                        vec![
+                            zeroclaw_api::grants::Verb::Create,
+                            zeroclaw_api::grants::Verb::Read,
+                        ],
+                    )]),
+                    ..PermissionProfileConfig::default()
+                },
+            );
+            ctx.auth
+                .refresh_from_config(&config)
+                .expect("demotion is a valid refresh");
         }
-        // Unscoped connections keep today's behavior.
-        fixture
-            .authorize_memory_access(None, Method::MemoryList)
+        let got = carol
+            .handle_memory_get_for_test(&json!({"key": "note"}))
             .await
-            .expect("unscoped connections are unaffected");
+            .expect("a demoted administrator keeps her private note");
+        assert!(got.to_string().contains("carol-private"), "{got}");
+        carol
+            .handle_memory_store_for_test(&json!({"key": "note", "content": "carol-updated"}))
+            .await
+            .expect("her writes still land privately");
+        let got = operator
+            .handle_memory_get_for_test(&json!({"key": "note"}))
+            .await
+            .unwrap();
+        assert!(
+            got.to_string().contains("\"shared\""),
+            "the shared row is untouched: {got}"
+        );
+        // The agent dimension composes: the same key under another agent is
+        // another row.
+        alice
+            .handle_memory_store_for_test(
+                &json!({"key": "note", "content": "alice-on-test-agent", "agent": "test-agent"}),
+            )
+            .await
+            .unwrap();
+        let got = alice
+            .handle_memory_get_for_test(&json!({"key": "note"}))
+            .await
+            .unwrap();
+        assert!(got.to_string().contains("alice-private"), "{got}");
+        let got = alice
+            .handle_memory_get_for_test(&json!({"key": "note", "agent": "test-agent"}))
+            .await
+            .unwrap();
+        assert!(got.to_string().contains("alice-on-test-agent"), "{got}");
+    }
+
+    /// An owned session's memory handle is pinned to the owner's private
+    /// plane at construction and stays there whoever prompts it later; the
+    /// shared operator's session keeps the shared handle.
+    #[tokio::test]
+    async fn owned_sessions_memory_is_pinned_to_the_owners_private_plane() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, sessions, _memory) = memory_isolation_ctx(&tmp);
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let carol = scoped_dispatcher(&ctx, 4444).await;
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut operator = RpcDispatcher::new(Arc::clone(&ctx), tx, "unix:test".into());
+        operator.set_authenticated_for_test();
+        let new_acp =
+            |id: &str| json!({"agent_alias": "test-agent", "session_id": id, "chat_mode": "acp"});
+
+        alice
+            .handle_session_new_for_test(&new_acp("a-mem"))
+            .await
+            .unwrap();
+        let agent = sessions.get_agent("a-mem").await.expect("live");
+        assert_eq!(
+            agent.lock().await.memory_principal(),
+            Some("user:alice"),
+            "alice's session memory is pinned to her plane"
+        );
+        operator
+            .handle_session_new_for_test(&new_acp("op-mem"))
+            .await
+            .unwrap();
+        let agent = sessions.get_agent("op-mem").await.expect("live");
+        assert_eq!(
+            agent.lock().await.memory_principal(),
+            None,
+            "the shared operator's session keeps the shared handle"
+        );
+        carol
+            .handle_session_new_for_test(&new_acp("c-mem"))
+            .await
+            .unwrap();
+        let agent = sessions.get_agent("c-mem").await.expect("live");
+        assert_eq!(
+            agent.lock().await.memory_principal(),
+            Some("user:carol"),
+            "a named administrator's session is pinned to her own plane"
+        );
+
+        // Rehydration by an administrator keeps the durable owner's plane.
+        assert!(sessions.remove("a-mem").await);
+        carol
+            .rehydrate_reaped_session("a-mem", carol.stamped_grants())
+            .await
+            .expect("the administrator restores alice's session");
+        let agent = sessions.get_agent("a-mem").await.expect("restored");
+        assert_eq!(
+            agent.lock().await.memory_principal(),
+            Some("user:alice"),
+            "restoration pins memory to the durable owner, not the restorer"
+        );
     }
 
     #[test]
@@ -15604,6 +15979,7 @@ mod tests {
             ("session/new", Resource::Sessions, Verb::Create),
             ("memory/delete", Resource::Memory, Verb::Delete),
             ("sops/run", Resource::Sops, Verb::Execute),
+            ("sops/run-detail", Resource::Sops, Verb::Read),
             ("skills/write", Resource::Skills, Verb::Update),
             ("cron/trigger", Resource::Cron, Verb::Execute),
         ] {

@@ -54,8 +54,10 @@ const JWKS_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
 const JWKS_CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// Bound all untrusted OIDC metadata and introspection payloads, even when a
-/// peer omits Content-Length or uses chunked transfer encoding.
-const MAX_OIDC_RESPONSE_BYTES: usize = 1024 * 1024;
+/// peer omits Content-Length or uses chunked transfer encoding. Shared with
+/// the enrollment sibling, which reads the same untrusted IdP documents and
+/// bounds them to the same ceiling.
+pub(super) const MAX_OIDC_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// A JWKS is an untrusted network document; cap its key cardinality before
 /// materializing the selection map.
@@ -302,7 +304,12 @@ fn is_loopback_host(host: &str) -> bool {
 /// OIDC discovery endpoints are token-verification roots of trust. Apply the
 /// same HTTPS/exact-loopback transport rule as the configured issuer before
 /// a request can carry a bearer token or client credentials.
-fn validate_discovered_endpoint(endpoint: &str, field: &str) -> anyhow::Result<()> {
+/// The canonical URL policy for an endpoint a discovery document advertises:
+/// `https`, or `http` for an exact loopback host only, never with userinfo.
+/// Shared with the enrollment client, which must hold the endpoints it sends
+/// credentials to to the same rule the daemon holds its verification
+/// endpoints to.
+pub(super) fn validate_discovered_endpoint(endpoint: &str, field: &str) -> anyhow::Result<()> {
     let url = reqwest::Url::parse(endpoint)
         .map_err(|e| anyhow::Error::msg(format!("invalid discovery {field}: {e}")))?;
     if !url.username().is_empty() || url.password().is_some() {
@@ -318,7 +325,12 @@ fn validate_discovered_endpoint(endpoint: &str, field: &str) -> anyhow::Result<(
     }
 }
 
-async fn read_response_limited(mut response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
+/// Read a response body whole, refusing anything past
+/// [`MAX_OIDC_RESPONSE_BYTES`] whether or not the peer declares a
+/// Content-Length. Shared with the enrollment sibling.
+pub(super) async fn read_response_limited(
+    mut response: reqwest::Response,
+) -> anyhow::Result<Vec<u8>> {
     if response
         .content_length()
         .is_some_and(|len| len > MAX_OIDC_RESPONSE_BYTES as u64)

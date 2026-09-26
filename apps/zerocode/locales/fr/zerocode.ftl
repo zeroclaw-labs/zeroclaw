@@ -575,6 +575,11 @@ zc-config-footer-action-new-line = nouvelle ligne
 zc-config-field-edit-hint = { $keys } → appuyez pour modifier
 zc-doctor-log-path = log : { $path }
 
+zc-oidc-enroll-visit = Pour vous connecter, ouvrez { $uri } et saisissez le code { $code }
+zc-oidc-enroll-waiting = En attente de l'approbation du fournisseur d'identité (le code expire dans { $seconds } secondes)...
+zc-oidc-enroll-missing-url = auth_provider { $provider } est défini sans auth_token. Définissez [connection.wss] enroll_url sur l'origine HTTP de la passerelle pour vous connecter interactivement, ou exportez ZEROCLAW_AUTH_TOKEN (voir : zeroclaw oidc login).
+zc-oidc-enroll-done = Connecté. Le jeton n'est conservé que pour cette session ; exportez ZEROCLAW_AUTH_TOKEN pour éviter une nouvelle inscription.
+
 ## Config registry metadata. Stable identifiers are used for lookup while the
 ## RPC-provided English display strings remain compatibility fallbacks.
 zc-config-group-foundation = Fondations
