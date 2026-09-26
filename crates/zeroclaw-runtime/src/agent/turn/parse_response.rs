@@ -943,6 +943,240 @@ mod cost_usd_regression_tests {
         zeroclaw_log::clear_broadcast_hook();
     }
 
+    fn embedded_envelope_ctx<'a>(
+        pacing: &'a zeroclaw_config::schema::PacingConfig,
+        dedup_exempt_tools: &'a [String],
+        turn_id: &'a str,
+    ) -> TurnCtx<'a> {
+        TurnCtx {
+            parent_agent_alias: None,
+            observer: &crate::observability::NoopObserver,
+            provider_name: "openai.codex",
+            model: "gpt-5.6",
+            temperature: None,
+            approval: None,
+            channel_name: "",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools,
+            pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            agent_alias: None,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
+            turn_id,
+            serving_provider_name: None,
+            serving_model: None,
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
+        }
+    }
+
+    fn shell_specs() -> IterationToolSpecs {
+        IterationToolSpecs {
+            tool_specs: vec![crate::tools::ToolSpec::new(
+                "shell",
+                "run a command",
+                serde_json::json!({"type": "object"}),
+            )],
+            known_tool_names: HashSet::from(["shell".to_string()]),
+            use_native_tools: true,
+        }
+    }
+
+    async fn interpret_leak(text: &str, turn_id: &str) -> (bool, usize) {
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let dedup_exempt_tools = Vec::new();
+        let ctx = embedded_envelope_ctx(&pacing, &dedup_exempt_tools, turn_id);
+        let interpreted = interpret_chat_response(
+            &ctx,
+            "openai.codex",
+            "gpt-5.6",
+            ChatResponse {
+                text: Some(text.to_string()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            },
+            &[],
+            &shell_specs(),
+            false,
+            0,
+            false,
+        )
+        .await;
+        (
+            interpreted.parse_issue_detected,
+            interpreted.tool_calls.len(),
+        )
+    }
+
+    #[tokio::test]
+    async fn ordinary_explanations_and_code_examples_are_rendered() {
+        // The detector is bounded to complete protocol objects that name an
+        // active tool and are not framed as examples. Replies that discuss
+        // the protocol, quote API shapes, or show code must still render;
+        // each of these was rejected by a broader check considered for this
+        // change.
+        let envelope = r#"{"content":null,"tool_calls":[{"arguments":"{\"command\":\"id\"}","id":"c1","name":"shell"}]}"#;
+        let cases = [
+            (
+                "API explanation quoting a tool result",
+                r#"You append {"role":"tool","tool_call_id":"call_abc","content":"42"} to messages."#.to_string(),
+            ),
+            (
+                "Python code sample building a tool-call message",
+                r#"Here's how in Python: msg = {"role":"assistant","content": None, "tool_calls":[{"id":"c1","type":"function","function":{"name":"shell","arguments": json.dumps({"command":"ls"})}}]}"#.to_string(),
+            ),
+            (
+                "framed example with elided arguments",
+                r#"For example, the envelope looks like this: {"tool_calls":[{"name":"shell","arguments":{...}}]}"#.to_string(),
+            ),
+            (
+                "prose with a markdown link describing the protocol",
+                r#"See [the OpenAI docs](https://platform.openai.com/docs) for details. Each entry in the "tool_calls" array carries "name": "shell" and an arguments string."#.to_string(),
+            ),
+            (
+                "complete envelope framed as an example",
+                format!("For example, the protocol looks like this: {envelope}"),
+            ),
+        ];
+        for (label, text) in cases {
+            let (rejected, calls) = interpret_leak(&text, "ordinary-reply-regression").await;
+            assert_eq!(calls, 0, "{label}: must never execute");
+            assert!(
+                !rejected,
+                "{label}: an ordinary reply must render, not retry"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tag_example_beside_a_bare_leak_is_rejected_not_executed() {
+        // The tag is documentation, so it must not be parsed as a call; the
+        // separate unframed bare leak must still be rejected and retried.
+        let call =
+            r#"<tool_call>{"name":"shell","arguments":{"command":"rm -rf build"}}</tool_call>"#;
+        let envelope = r#"{"content":null,"tool_calls":[{"arguments":"{\"command\":\"id\"}","id":"c1","name":"shell"}]}"#;
+        let with_leak =
+            format!("For example, a call looks like this: {call} Now run it: {envelope}");
+        let (rejected, calls) = interpret_leak(&with_leak, "tag-plus-leak").await;
+        assert_eq!(calls, 0, "the example tag must never execute");
+        assert!(rejected, "the separate bare leak must be rejected");
+
+        // Two illustrations, the second introduced without an explicit
+        // phrase: whatever the verdict, the example tag must not execute.
+        let docs = format!(
+            "Here is an example of a tool call:\n{call}\nOpenAI-compatible providers wrap the same call like this:\n```json\n{{\"tool_calls\":[{{\"id\":\"call_1\",\"type\":\"function\",\"function\":{{\"name\":\"shell\",\"arguments\":\"{{\\\"command\\\":\\\"rm -rf build\\\"}}\"}}}}]}}\n```"
+        );
+        let (_rejected, calls) = interpret_leak(&docs, "two-illustrations").await;
+        assert_eq!(calls, 0, "a documented tag must never execute");
+    }
+
+    #[tokio::test]
+    async fn documentation_tag_examples_are_never_executed() {
+        // Tags are an executable format, so a tag example that lost its
+        // exemption would be parsed as a real call. Ordinary protocol
+        // documentation must render as text instead.
+        let call = r#"<tool_call>{"name":"shell","arguments":{"command":"ls"}}</tool_call>"#;
+        let cases = [
+            format!("Here is an example of a tool call.\n\n```xml\n{call}\n```"),
+            format!("For example, to edit config.toml the model emits: {call}"),
+            format!("For example:\n\nUser: list my files\nAssistant: {call}"),
+            format!(
+                "For example, a model can call several tools:\n1. List files:\n{call}\n2. Read a file:\n{call}"
+            ),
+            format!("{call}\n```\nThat is an example of a tool call."),
+            // Clear introductions that name the reply a sample or example.
+            format!("Sample tool call: {call}"),
+            format!("Example tool call: {call}"),
+            format!("示例如下: {call}"),
+        ];
+        for text in cases {
+            let (rejected, calls) = interpret_leak(&text, "tag-docs-regression").await;
+            assert_eq!(calls, 0, "documentation tag executed: {text:?}");
+            assert!(!rejected, "documentation tag must render: {text:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn envelope_leaked_into_prose_is_rejected_not_executed() {
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let dedup_exempt_tools = Vec::new();
+        let ctx = embedded_envelope_ctx(&pacing, &dedup_exempt_tools, "embedded-envelope-reject");
+        let leaked = concat!(
+            "Okay! I can create that webinar page for you.\n",
+            "{\"content\":null,\"tool_calls\":[{\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\",\"id\":\"call_1\",\"name\":\"shell\"}]}",
+            "{\"content\":\"Preparing the command now.\",\"tool_code\":\"print(shell(\\\"ls\\\"))\",\"tool_name\":\"shell\"}",
+            "Done in a moment.",
+        );
+
+        let interpreted = interpret_chat_response(
+            &ctx,
+            "openai.codex",
+            "gpt-5.6",
+            ChatResponse {
+                text: Some(leaked.to_string()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            },
+            &[],
+            &shell_specs(),
+            false,
+            0,
+            false,
+        )
+        .await;
+
+        assert!(
+            interpreted.tool_calls.is_empty(),
+            "an envelope leaked into prose must never execute: {:?}",
+            interpreted.tool_calls
+        );
+        assert!(
+            interpreted.parse_issue_detected,
+            "a leaked envelope must be rejected and retried, not rendered"
+        );
+    }
+
+    #[tokio::test]
+    async fn python_stub_leak_is_rejected() {
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let dedup_exempt_tools = Vec::new();
+        let ctx = embedded_envelope_ctx(&pacing, &dedup_exempt_tools, "embedded-stub-reject");
+        let leaked = concat!(
+            "Creating the draft now.\n",
+            "{\"content\":\"One moment.\",\"tool_code\":\"print(shell(\\\"ls\\\"))\",\"tool_name\":\"shell\"}",
+        );
+
+        let interpreted = interpret_chat_response(
+            &ctx,
+            "openai.codex",
+            "gpt-5.6",
+            ChatResponse {
+                text: Some(leaked.to_string()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            },
+            &[],
+            &shell_specs(),
+            false,
+            0,
+            false,
+        )
+        .await;
+
+        assert!(interpreted.tool_calls.is_empty());
+        assert!(
+            interpreted.parse_issue_detected,
+            "a leaked python stub must be rejected, not rendered"
+        );
+    }
+
     #[tokio::test]
     async fn malformed_protocol_retains_usage_without_accepted_usage_event() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(1);

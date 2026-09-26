@@ -6647,7 +6647,10 @@ fn is_tool_call_payload(value: &serde_json::Value, known_tool_names: &HashSet<St
         return false;
     };
 
-    has_args && known_tool_names.contains(&name.to_ascii_lowercase())
+    // Alias-aware, like the envelope branch above, which delegates to the
+    // parser: otherwise a line-isolated `{"name":"bash",...}` survives
+    // stripping while the identical payload naming `shell` is removed.
+    has_args && zeroclaw_tool_call_parser::names_known_tool(name, known_tool_names)
 }
 
 fn is_tool_result_payload(
@@ -29351,6 +29354,22 @@ BTC is currently around $65,000 based on latest tool output."#
             !assistant_turn.content.contains("[Used tools:"),
             "telegram history should not persist tool-summary prefix"
         );
+    }
+
+    #[test]
+    fn tool_call_payload_detection_is_alias_aware() {
+        // The envelope branch delegates to the parser, which normalizes
+        // aliases; this branch must agree, or a line-isolated payload naming
+        // `bash` survives stripping while the same payload naming `shell` is
+        // removed from the reply.
+        let known: HashSet<String> = ["shell".to_string()].into_iter().collect();
+        let aliased = serde_json::json!({"name": "bash", "arguments": {"command": "id"}});
+        assert!(is_tool_call_payload(&aliased, &known));
+        let canonical = serde_json::json!({"name": "shell", "arguments": {"command": "id"}});
+        assert!(is_tool_call_payload(&canonical, &known));
+        // A name that is not an active tool under any alias stays inert.
+        let unrelated = serde_json::json!({"name": "invoice", "arguments": {"total": 12}});
+        assert!(!is_tool_call_payload(&unrelated, &known));
     }
 
     #[tokio::test]
