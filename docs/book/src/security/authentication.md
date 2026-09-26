@@ -178,6 +178,38 @@ mapping, and the lifetime bounds are documented on the section reference:
 
 {{#config-fields oidc}}
 
+#### Enrolling (getting a token to present)
+
+The daemon only verifies tokens; clients obtain them from the IdP. Two
+browserless flows ship with the CLI:
+
+```sh
+# Interactive sign-in via the Device Authorization Grant (RFC 8628):
+# prints a verification code to enter in any browser, waits for
+# approval, then writes the access token to stdout.
+export ZEROCLAW_AUTH_TOKEN="$(zeroclaw oidc login corp)"
+
+# Headless service principals via client_credentials (requires the
+# entry's client_secret):
+export ZEROCLAW_AUTH_TOKEN="$(zeroclaw oidc token corp)"
+```
+
+Progress messages go to stderr; stdout carries only the token, so both
+commands compose with command substitution (the `oidc` commands run before
+any startup prelude that could print, the OTP seed disclosure included).
+Nothing is stored: present the token as `auth_token` in the RPC handshake
+(or via the environment variable) before it expires, then re-enroll.
+
+The client trusts the issuer the entry names and nothing else: the
+discovery document must assert exactly that issuer before any endpoint it
+advertises is used, every endpoint that receives a credential must satisfy
+the same URL policy as the issuer (`https`, or `http` only for an exact
+loopback host), redirects are never followed, response bodies are
+size-capped, and a token response is accepted only when it carries a
+non-empty `Bearer` access token. A confidential client (an entry with a
+`client_secret`) authenticates with HTTP Basic on every request; a public
+client sends its `client_id` in the form.
+
 ## Permission profiles
 
 {{#config-fields permission_profiles}}
@@ -293,6 +325,62 @@ Migration for existing remote zerocode users:
 
 An OIDC access token works the same way with `auth_provider = "oidc.<alias>"`.
 
+## The gateway HTTP API
+
+The gateway's configuration and onboarding routes (`/api/config*`,
+`/api/quickstart/*`, `/api/channels/bind`) enforce authentication
+structurally: one route-layer middleware guards the whole group, so no
+individual handler carries (or can forget) a check. The middleware
+speaks the same principal model as the RPC path, through the same
+provider registry and resolver:
+
+- A **paired bearer** (`Authorization: Bearer zc_...`) resolves to the
+  shared operator with full access, exactly as before. Denials keep the
+  historical 401 shape.
+- An **OIDC bearer** presented with the `X-ZeroClaw-Auth-Provider:
+  oidc.<alias>` header is verified by that provider and resolved to a
+  scoped principal. Selection is explicit, mirroring the RPC
+  handshake's `auth_provider` field: the named provider's denial is
+  authoritative, and there is never a fallback between providers.
+- CORS preflight (`OPTIONS`) passes through unauthenticated, as it
+  always has. Any other method outside GET, HEAD, POST, PUT, PATCH and
+  DELETE is refused.
+
+A scoped principal's `Config` grants are enforced in two steps. The
+route layer applies a coarse floor per HTTP method: a read needs
+`read`, anything else needs at least one of `create`, `update` or
+`delete`, so a read-only principal never reaches a mutating handler.
+Each mutating handler then authorizes its **complete write set** before
+its first side effect: every config path the mutation will persist,
+classified by what it does to the configuration (`create` for a path it
+brings into being, `delete` for one it removes, `update` otherwise) and
+matched against the profile's `config_write_paths` selectors. The
+classification follows the operation, not the method: creating a map
+key through `POST /api/config/map-key`, or implicitly through a `PUT`
+under a new alias, needs `create`; a JSON Patch `remove` and
+`DELETE /api/config/map-key` need `delete`; a rename needs `delete` on
+its source and `create` on its destination; the references a delete or
+rename cascade rewrites elsewhere are part of the write set too. One
+unauthorized member refuses the whole mutation, batch or cascade, and
+nothing is written. Operations whose write set cannot be enumerated up
+front (a schema migration of the file, a Quickstart apply) require the
+`*` selector. The persist boundary re-checks the paths about to be
+written against what the handler authorized, so a handler cannot
+persist more than it authorized.
+
+Policy moves only at that persist boundary: the handler that writes a
+configuration publishes the authorization state compiled from it as
+the next accepted revision, and every request is verified and resolved
+against the accepted snapshot as it stands. Nothing on the request
+path recompiles policy, so a request that read the configuration
+before a concurrent persist can never reinstall the older policy over
+the newer one; a persisted change to a provider's verification
+settings, a roster or a profile takes effect on the next request. The
+daemon's own RPC surface holds a separate live configuration and
+reaches the same state through the reload the gateway write flags.
+Other gateway surfaces keep the pairing check per handler and adopt the
+layer in follow-ups.
+
 ## Credential lifecycle
 
 - **Expiry** ends the connection's authorization at the deadline; the
@@ -326,19 +414,45 @@ session they were raised for. Sessions created before this change (or by
 unscoped connections) carry no owner: they stay fully visible to unscoped
 connections and invisible to scoped principals.
 
-Memory operations are fail-closed for scoped principals in the interim:
-queries must be scoped to an owned session, and bare-key or cross-session
-memory access stays unscoped-only until principal-owned memory storage
-lands.
+Every authenticated principal gets PRIVATE memory: their memory operations
+read and write a per-principal plane whose owner travels in every storage
+statement, composed with the agent, namespace and tenant dimensions (the
+same key under two agents is two rows). The plane follows the principal's
+identity, not the admin bypass: a named administrator's memory is their
+own private plane, so promoting or demoting a user never hides their notes
+or redirects their writes. Only the unauthenticated shared operator is on
+the shared plane by default; a caller with the admin bypass may name
+`plane = "shared"` on a `memory/*` request explicitly, which is audited,
+and a scoped principal cannot.
+
+The two planes are untouchable from each other in both directions: a
+shared write can neither name a private row's storage key nor overwrite a
+private row, a private write never converts a shared row, ordinary exports
+and the markdown snapshot carry shared rows only, and the legacy bulk
+purges reach shared rows only. Private rows are exported and purged
+through owner-carrying operations.
+
+A session created by a principal has its memory handle pinned to that
+principal's private plane for the session's whole life, whoever prompts it
+later (an administrator restoring a reaped session restores it on the
+durable owner's plane), so the memory tools and per-turn recall inside a
+scoped session never touch the shared plane. There is no grant that opens
+the shared plane to a scoped session. Private writes pass the same content
+scanning and policy gates as shared writes, and private operations are
+audited with the full scope. On memory backends without principal support
+(markdown, lucid, postgres, qdrant today) private memory fails closed with a
+clear denial rather than silently un-scoping, which for a scoped session
+means its memory tools refuse.
 
 ## What this layer does not do (yet)
 
-Memory records are not yet principal-owned at the storage layer (scoped
-access is fail-closed instead, as above). `sops/runs` and
-`sops/run-detail` return the run history of every procedure to a principal
-holding `Sops:Read`, whichever agents it ran as, unlike cron history.
-Gateway HTTP routes keep their existing pairing checks, and channel
-identities do not resolve into this principal model.
+Consolidation and governance derive shared-plane rows and do not run for
+private sessions, and administrative access into another principal's
+private memory has no surfaced pathway yet (deny-by-default).
+`sops/runs` and `sops/run-detail` return the run history of every
+procedure to a principal holding `Sops:Read`, whichever agents it ran as,
+unlike cron history. Gateway HTTP routes keep their existing pairing
+checks, and channel identities do not resolve into this principal model.
 
 While `security.trust_daemon_uid = true` (the default) and the policy
 compiles, the daemon's own uid on a Unix socket keeps full access, so a

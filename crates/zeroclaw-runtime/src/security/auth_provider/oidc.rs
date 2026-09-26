@@ -302,7 +302,12 @@ fn is_loopback_host(host: &str) -> bool {
 /// OIDC discovery endpoints are token-verification roots of trust. Apply the
 /// same HTTPS/exact-loopback transport rule as the configured issuer before
 /// a request can carry a bearer token or client credentials.
-fn validate_discovered_endpoint(endpoint: &str, field: &str) -> anyhow::Result<()> {
+/// The canonical URL policy for an endpoint a discovery document advertises:
+/// `https`, or `http` for an exact loopback host only, never with userinfo.
+/// Shared with the enrollment client, which must hold the endpoints it sends
+/// credentials to to the same rule the daemon holds its verification
+/// endpoints to.
+pub(super) fn validate_discovered_endpoint(endpoint: &str, field: &str) -> anyhow::Result<()> {
     let url = reqwest::Url::parse(endpoint)
         .map_err(|e| anyhow::Error::msg(format!("invalid discovery {field}: {e}")))?;
     if !url.username().is_empty() || url.password().is_some() {
@@ -318,7 +323,12 @@ fn validate_discovered_endpoint(endpoint: &str, field: &str) -> anyhow::Result<(
     }
 }
 
-async fn read_response_limited(mut response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
+/// Read a response body with a hard byte cap, so a hostile or broken IdP
+/// cannot make the client buffer an unbounded document. Shared with the
+/// enrollment client.
+pub(super) async fn read_response_limited(
+    mut response: reqwest::Response,
+) -> anyhow::Result<Vec<u8>> {
     if response
         .content_length()
         .is_some_and(|len| len > MAX_OIDC_RESPONSE_BYTES as u64)
