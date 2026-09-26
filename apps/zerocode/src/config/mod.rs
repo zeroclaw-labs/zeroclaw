@@ -5,6 +5,7 @@
 pub mod keybindings;
 
 use std::collections::HashMap;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -313,23 +314,74 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// The `[sidebar]` section: the shell-level agent sidebar.
+/// Shared shell dock sizing bounds.
+pub(crate) const SIDEBAR_WIDTH_MIN: u16 = 18;
+pub(crate) const SIDEBAR_WIDTH_MAX: u16 = 40;
+pub(crate) const SIDEBAR_SESSIONS_PERCENT_MIN: u16 = 20;
+pub(crate) const SIDEBAR_SESSIONS_PERCENT_MAX: u16 = 80;
+pub(crate) const SIDEBAR_QUEUE_PERCENT_MIN: u16 = 1;
+pub(crate) const SIDEBAR_QUEUE_PERCENT_MAX: u16 = 99;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SidebarSide {
+    Left,
+    Right,
+}
+
+impl SidebarSide {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+
+    pub(crate) fn opposite(self) -> Self {
+        match self {
+            Self::Left => Self::Right,
+            Self::Right => Self::Left,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SidebarSection {
-    /// Whether the agent sidebar is shown. Toggled at runtime and persisted.
+    /// Whether the Sessions dock section is shown. Toggled at runtime and persisted.
     #[serde(default = "default_sidebar_visible")]
     pub visible: bool,
-    /// Sidebar width in terminal columns. Clamped to the widget's supported
-    /// range at render time; edited on disk only (no runtime writer).
+    /// Dock section preferences only; Plan content and lifecycle stay pane-owned.
+    #[serde(default = "default_true")]
+    pub queue_visible: bool,
+    #[serde(default = "default_true")]
+    pub plan_visible: bool,
+    /// Dock width in terminal columns, clamped at the shell boundary.
     #[serde(default = "default_sidebar_width")]
     pub width: u16,
+    /// Explicit dock side. `None` preserves the legacy Todo location
+    /// migration until the user switches the dock explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side: Option<SidebarSide>,
+    /// Percentage of the dock body allocated to Sessions when Plan is also
+    /// visible. Clamped at the shell boundary.
+    #[serde(default = "default_sidebar_sessions_percent")]
+    pub sessions_percent: u16,
+    /// Percentage of the lower dock region allocated to Queue while Plan is
+    /// visible. Clamped at the shell boundary.
+    #[serde(default = "default_sidebar_queue_percent")]
+    pub queue_percent: u16,
 }
 
 impl Default for SidebarSection {
     fn default() -> Self {
         Self {
             visible: default_sidebar_visible(),
+            queue_visible: true,
+            plan_visible: true,
             width: default_sidebar_width(),
+            side: None,
+            sessions_percent: default_sidebar_sessions_percent(),
+            queue_percent: default_sidebar_queue_percent(),
         }
     }
 }
@@ -381,32 +433,17 @@ fn default_sidebar_width() -> u16 {
     24
 }
 
-impl TodoTrackerSection {
-    /// Reject values that must never reach the runtime.
-    ///
-    /// Run at **every** authoritative boundary: Config-pane saves call it
-    /// before persistence so a success message always describes the values
-    /// the next session will consume, and [`resolve_todo_tracker_checked`]
-    /// calls it on the effective (post-env-override) section so hand-edited
-    /// files and `ZEROCODE_todotracker__*` overrides fail visibly instead of
-    /// being normalized.
-    pub(crate) fn validate(&self) -> std::result::Result<(), UiSectionValidationError> {
-        if self.width == 0 || self.max_height == 0 {
-            return Err(UiSectionValidationError::PositiveRequired);
-        }
-        Ok(())
-    }
+fn default_sidebar_sessions_percent() -> u16 {
+    60
+}
 
-    /// Infallible view used by non-authoritative callers (e.g. the Config
-    /// pane's persisted-vs-effective comparison), which must render something
-    /// rather than fail.
-    ///
-    /// The `.max(1)` here is a last-resort clamp so a zero can never collapse
-    /// the panel if some future caller bypasses validation — it is **not** the
-    /// authority on validity. An explicit zero from the file or the
-    /// environment must fail visibly rather than be silently normalized to
-    /// `1`, which is enforced by [`ZerocodeConfig::validate_todo_tracker`];
-    /// every session boundary runs it via [`resolve_todo_tracker_checked`].
+fn default_sidebar_queue_percent() -> u16 {
+    50
+}
+
+impl TodoTrackerSection {
+    /// Legacy dimensions remain readable for compatibility, but the shell's
+    /// sidebar settings now own geometry. They cannot invalidate Plan toggles.
     pub(crate) fn resolve(&self) -> TodoTrackerSettings {
         TodoTrackerSettings {
             enabled: self.enabled,
@@ -457,23 +494,6 @@ impl Default for TodoTrackerSettings {
         }
     }
 }
-
-/// Validation failures shared by the local UI config sections. User-facing
-/// wording is supplied by the Config pane's Fluent catalogue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UiSectionValidationError {
-    PositiveRequired,
-}
-
-impl std::fmt::Display for UiSectionValidationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::PositiveRequired => f.write_str("numeric values must be greater than zero"),
-        }
-    }
-}
-
-impl std::error::Error for UiSectionValidationError {}
 
 // ── Default helpers ───────────────────────────────────────────────────────────
 
@@ -590,22 +610,39 @@ impl ZerocodeConfig {
             .map(|s| s.to_string())
     }
 
-    /// Convert the `[todotracker]` section into the runtime settings type
-    /// used by [`TodoTracker`](crate::todo_tracker::TodoTracker).
-    ///
-    /// This is the infallible view. Validity is enforced separately by
-    /// [`Self::validate_todo_tracker`] at the authoritative boundaries, so
-    /// an explicit zero surfaces an error instead of being normalized.
-    pub fn resolve_todo_tracker(&self) -> TodoTrackerSettings {
-        self.todotracker.resolve()
+    /// Effective dock side, with the legacy Todo location providing the
+    /// read-only migration fallback until the user explicitly switches side.
+    pub(crate) fn effective_sidebar_side(&self) -> SidebarSide {
+        self.sidebar
+            .side
+            .unwrap_or(match self.todotracker.location {
+                TodoTrackerLocation::Left => SidebarSide::Left,
+                TodoTrackerLocation::Right | TodoTrackerLocation::Bottom => SidebarSide::Right,
+            })
     }
 
-    /// Validate the effective `[todotracker]` section, whatever its origin
-    /// (file, defaults, or `ZEROCODE_todotracker__*` override).
-    pub(crate) fn validate_todo_tracker(
-        &self,
-    ) -> std::result::Result<(), UiSectionValidationError> {
-        self.todotracker.validate()
+    pub(crate) fn effective_sidebar_width(&self) -> u16 {
+        self.sidebar
+            .width
+            .clamp(SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX)
+    }
+
+    pub(crate) fn effective_sidebar_sessions_percent(&self) -> u16 {
+        self.sidebar
+            .sessions_percent
+            .clamp(SIDEBAR_SESSIONS_PERCENT_MIN, SIDEBAR_SESSIONS_PERCENT_MAX)
+    }
+
+    pub(crate) fn effective_sidebar_queue_percent(&self) -> u16 {
+        self.sidebar
+            .queue_percent
+            .clamp(SIDEBAR_QUEUE_PERCENT_MIN, SIDEBAR_QUEUE_PERCENT_MAX)
+    }
+
+    /// Convert the `[todotracker]` section into the runtime settings type
+    /// used by [`TodoTracker`](crate::todo_tracker::TodoTracker).
+    pub fn resolve_todo_tracker(&self) -> TodoTrackerSettings {
+        self.todotracker.resolve()
     }
 }
 
@@ -638,11 +675,8 @@ pub(crate) fn ensure_and_load(config_dir: &Path) -> Result<ZerocodeConfig> {
 /// *absent* section resolves exactly as `ensure_and_load` would, with
 /// `ZEROCODE_todotracker__*` overrides applied.
 ///
-/// The effective section is validated **after** env overrides are applied, so
-/// an explicit zero `width`/`max_height` fails visibly whether it came from
-/// the file or from the canonical environment surface, rather than being
-/// normalized to `1`. Callers keep their current settings on error, so an
-/// invalid value never resets a live tracker to defaults.
+/// Legacy numeric dimensions no longer control the dock and do not reject
+/// otherwise valid settings. Malformed fields and overrides still fail.
 pub(crate) fn resolve_todo_tracker_checked(config_dir: &Path) -> Result<TodoTrackerSettings> {
     let path = config_path(config_dir);
     if path.exists() {
@@ -656,9 +690,6 @@ pub(crate) fn resolve_todo_tracker_checked(config_dir: &Path) -> Result<TodoTrac
         }
     }
     let config = ensure_and_load(config_dir)?;
-    config
-        .validate_todo_tracker()
-        .map_err(|e| anyhow::Error::msg(format!("[todotracker] is invalid: {e}")))?;
     Ok(config.resolve_todo_tracker())
 }
 
@@ -867,6 +898,28 @@ fn write_document(path: &Path, doc: &toml::Table) -> Result<()> {
     crate::secure_file::write_private_atomic(path, body.as_bytes())
 }
 
+fn write_document_atomically(path: &Path, body: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".zerocode-config-")
+        .tempfile_in(parent)
+        .with_context(|| format!("creating temporary config beside {}", path.display()))?;
+    temporary
+        .write_all(body.as_bytes())
+        .with_context(|| format!("writing temporary config beside {}", path.display()))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("flushing temporary config beside {}", path.display()))?;
+    temporary.persist(path).map_err(|error| {
+        anyhow::Error::msg(format!("replacing {}: {}", path.display(), error.error))
+    })?;
+    Ok(())
+}
+
 /// Mutable borrow of `key`'s sub-table, inserting an empty one when absent.
 fn section_mut<'a>(doc: &'a mut toml::Table, key: &str) -> Result<&'a mut toml::Table> {
     doc.entry(key)
@@ -875,12 +928,164 @@ fn section_mut<'a>(doc: &'a mut toml::Table, key: &str) -> Result<&'a mut toml::
         .ok_or_else(|| anyhow::Error::msg(format!("'{key}' is not a table")))
 }
 
-/// Persist the sidebar visibility toggle, writing only `[sidebar].visible`.
-pub(crate) fn persist_sidebar_visible(config_dir: &Path, visible: bool) -> Result<()> {
+/// Persist one sidebar leaf without rewriting unrelated TOML formatting.
+/// Returns whether a valid environment override will shadow the saved value on
+/// the next effective load.
+fn persist_sidebar_leaf(
+    config_dir: &Path,
+    leaf: &str,
+    replacement: toml_edit::Item,
+    shadowed: bool,
+) -> Result<bool> {
+    std::fs::create_dir_all(config_dir)
+        .with_context(|| format!("creating config dir {}", config_dir.display()))?;
     let path = config_path(config_dir);
-    let mut doc = load_document(&path)?;
-    section_mut(&mut doc, "sidebar")?.insert("visible".to_string(), toml::Value::Boolean(visible));
-    write_document(&path, &doc)
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading {}", path.display()));
+        }
+    };
+    let semantic: toml::Table = if raw.trim().is_empty() {
+        toml::Table::new()
+    } else {
+        toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?
+    };
+    if let Some(value) = semantic.get("sidebar") {
+        value
+            .clone()
+            .try_into::<SidebarSection>()
+            .with_context(|| {
+                format!(
+                    "refusing to update {leaf} in malformed [sidebar] section in {}",
+                    path.display()
+                )
+            })?;
+    }
+
+    let mut doc = raw
+        .parse::<toml_edit::DocumentMut>()
+        .with_context(|| format!("parsing {} for an in-place edit", path.display()))?;
+    let sidebar = doc
+        .entry("sidebar")
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+    let sidebar = sidebar.as_table_like_mut().ok_or_else(|| {
+        anyhow::Error::msg(format!(
+            "refusing to update non-table [sidebar] in {}",
+            path.display()
+        ))
+    })?;
+    let mut replacement = replacement;
+    if let Some(existing) = sidebar.get_mut(leaf) {
+        if let (Some(existing), Some(replacement)) =
+            (existing.as_value(), replacement.as_value_mut())
+        {
+            *replacement.decor_mut() = existing.decor().clone();
+        }
+        *existing = replacement;
+    } else {
+        sidebar.insert(leaf, replacement);
+    }
+    write_document_atomically(&path, &doc.to_string())?;
+    Ok(shadowed)
+}
+
+/// Persist the sidebar visibility toggle, writing only `[sidebar].visible`.
+pub(crate) fn persist_sidebar_visible(config_dir: &Path, visible: bool) -> Result<bool> {
+    let shadowed = std::env::var("ZEROCODE_sidebar__visible")
+        .ok()
+        .and_then(|value| value.parse::<bool>().ok())
+        .is_some_and(|effective| effective != visible);
+    persist_sidebar_leaf(config_dir, "visible", toml_edit::value(visible), shadowed)
+}
+
+pub(crate) fn persist_sidebar_side(config_dir: &Path, side: SidebarSide) -> Result<bool> {
+    let shadowed = std::env::var("ZEROCODE_sidebar__side")
+        .ok()
+        .and_then(|value| match value.as_str() {
+            "left" => Some(SidebarSide::Left),
+            "right" => Some(SidebarSide::Right),
+            _ => None,
+        })
+        .is_some_and(|effective| effective != side);
+    persist_sidebar_leaf(
+        config_dir,
+        "side",
+        toml_edit::value(side.as_str()),
+        shadowed,
+    )
+}
+
+pub(crate) fn persist_sidebar_queue_visible(config_dir: &Path, visible: bool) -> Result<bool> {
+    let shadowed = std::env::var("ZEROCODE_sidebar__queue_visible")
+        .ok()
+        .and_then(|value| value.parse::<bool>().ok())
+        .is_some_and(|effective| effective != visible);
+    persist_sidebar_leaf(
+        config_dir,
+        "queue_visible",
+        toml_edit::value(visible),
+        shadowed,
+    )
+}
+
+pub(crate) fn persist_sidebar_plan_visible(config_dir: &Path, visible: bool) -> Result<bool> {
+    let shadowed = std::env::var("ZEROCODE_sidebar__plan_visible")
+        .ok()
+        .and_then(|value| value.parse::<bool>().ok())
+        .is_some_and(|effective| effective != visible);
+    persist_sidebar_leaf(
+        config_dir,
+        "plan_visible",
+        toml_edit::value(visible),
+        shadowed,
+    )
+}
+
+pub(crate) fn persist_sidebar_width(config_dir: &Path, width: u16) -> Result<bool> {
+    let shadowed = std::env::var("ZEROCODE_sidebar__width")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .map(|value| value.clamp(SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX))
+        .is_some_and(|effective| effective != width);
+    persist_sidebar_leaf(
+        config_dir,
+        "width",
+        toml_edit::value(i64::from(width)),
+        shadowed,
+    )
+}
+
+pub(crate) fn persist_sidebar_sessions_percent(
+    config_dir: &Path,
+    sessions_percent: u16,
+) -> Result<bool> {
+    let shadowed = std::env::var("ZEROCODE_sidebar__sessions_percent")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .map(|value| value.clamp(SIDEBAR_SESSIONS_PERCENT_MIN, SIDEBAR_SESSIONS_PERCENT_MAX))
+        .is_some_and(|effective| effective != sessions_percent);
+    persist_sidebar_leaf(
+        config_dir,
+        "sessions_percent",
+        toml_edit::value(i64::from(sessions_percent)),
+        shadowed,
+    )
+}
+
+pub(crate) fn persist_sidebar_queue_percent(config_dir: &Path, queue_percent: u16) -> Result<bool> {
+    let shadowed = std::env::var("ZEROCODE_sidebar__queue_percent")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .map(|value| value.clamp(SIDEBAR_QUEUE_PERCENT_MIN, SIDEBAR_QUEUE_PERCENT_MAX))
+        .is_some_and(|effective| effective != queue_percent);
+    persist_sidebar_leaf(
+        config_dir,
+        "queue_percent",
+        toml_edit::value(i64::from(queue_percent)),
+        shadowed,
+    )
 }
 
 /// Persist the selected theme name, editing only the `[theme]` section.
@@ -957,150 +1162,30 @@ pub(crate) fn persist_wss_route_ack(config_dir: &Path, uri: &str) -> Result<()> 
 /// Persist the entire `[todotracker]` section, editing only that section.
 /// Other sections (theme, keybindings, connection, etc.) are preserved.
 ///
-/// This is the owning read-modify-write boundary, so it enforces the
-/// preservation invariant for the section it replaces: if a `[todotracker]`
-/// section is currently present but is not *valid* — either unparseable or
-/// parseable-but-invalid, such as a zero dimension — the write is refused
-/// unless the caller passes a field-scoped repair `intent`, below.
-///
-/// A caller's snapshot of "the section was fine" can be arbitrarily old — a
-/// Config pane may stay open indefinitely while an external editor rewrites
-/// the file — so validating the *candidate* alone is not enough. Only the
-/// latest document, which this function already loads, can answer whether the
-/// value about to be overwritten is the user's invalid canonical data.
-#[cfg(test)]
+/// This is the owning read-modify-write boundary. Refuse to replace a current
+/// section that is unparseable, even if the caller's older snapshot
+/// and proposed section are valid.
 pub(crate) fn persist_todotracker(config_dir: &Path, section: &TodoTrackerSection) -> Result<()> {
-    persist_todotracker_with_intent(config_dir, section, TrackerWriteIntent::PreserveInvalid)
-        .map(|_| ())
-}
-
-/// One of the two editable numeric dimensions, used to scope repair authority
-/// to exactly the field the user typed into.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TrackerNumericField {
-    Width,
-    MaxHeight,
-}
-
-impl TrackerNumericField {
-    fn get(self, section: &TodoTrackerSection) -> u16 {
-        match self {
-            Self::Width => section.width,
-            Self::MaxHeight => section.max_height,
-        }
-    }
-
-    fn set(self, section: &mut TodoTrackerSection, value: u16) {
-        match self {
-            Self::Width => section.width = value,
-            Self::MaxHeight => section.max_height = value,
-        }
-    }
-
-    /// The repaired field must itself be usable, whatever the rest of the
-    /// section looks like: repair authority tolerates *other* fields being
-    /// invalid, never a fresh zero in the field being written.
-    fn validate_in(
-        self,
-        section: &TodoTrackerSection,
-    ) -> std::result::Result<(), UiSectionValidationError> {
-        if self.get(section) == 0 {
-            return Err(UiSectionValidationError::PositiveRequired);
-        }
-        Ok(())
-    }
-}
-
-/// Whether a tracker write is allowed to replace an invalid current section.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TrackerWriteIntent {
-    /// Default. Refuse to replace a current section that is unparseable or
-    /// invalid, so an unrelated edit cannot silently erase it.
-    PreserveInvalid,
-    /// The user is explicitly repairing one numeric field, so replacing *that
-    /// field's* invalid current value is the whole point. Authority stops
-    /// there: every other field keeps its latest on-disk value, so a stale
-    /// caller snapshot cannot erase an invalid value the user never touched.
-    /// An *unparseable* section is still refused outright: it cannot be shown
-    /// in the editor, so there is nothing the user could knowingly replace.
-    RepairField(TrackerNumericField),
-}
-
-/// Write the `[todotracker]` section and return the section as it was
-/// *actually* written, which under [`TrackerWriteIntent::RepairField`] is the
-/// latest on-disk section with only the repaired field applied — not
-/// necessarily the caller's candidate. Callers must report status against the
-/// returned value, never against what they proposed.
-pub(crate) fn persist_todotracker_with_intent(
-    config_dir: &Path,
-    section: &TodoTrackerSection,
-    intent: TrackerWriteIntent,
-) -> Result<TodoTrackerSection> {
-    // The whole candidate must be valid, except during an explicit repair:
-    // when several fields are invalid on disk, fixing them one at a time
-    // means every intermediate section is still partially invalid. Rejecting
-    // those would make such a section permanently unrepairable, so a repair
-    // validates only the field it is authorized to write. The caller is
-    // responsible for not reporting success until the result is valid.
-    match intent {
-        TrackerWriteIntent::PreserveInvalid => section.validate()?,
-        TrackerWriteIntent::RepairField(field) => field.validate_in(section)?,
-    }
     let path = config_path(config_dir);
     let mut doc = load_document(&path)?;
-    // Re-read the section as it exists *now*, immediately before replacing
-    // it: a caller's "the section was fine" snapshot can be arbitrarily old,
-    // since a Config pane may stay open indefinitely while an external editor
-    // rewrites the file. An unparseable section is refused under either
-    // intent — the user was never shown that text, so they cannot knowingly
-    // be replacing it.
-    let current = match doc.get("todotracker") {
-        Some(value) => Some(
-            value
-                .clone()
-                .try_into::<TodoTrackerSection>()
-                .with_context(|| {
-                    format!(
-                        "refusing to overwrite the malformed [todotracker] section in {}",
-                        path.display()
-                    )
-                })?,
-        ),
-        None => None,
-    };
-    let to_write = match (current, intent) {
-        // Nothing on disk to preserve: the candidate stands as written.
-        (None, _) => section.clone(),
-        // An ordinary edit may not replace a current section that parses but
-        // is not usable — a zero dimension is explicitly invalid canonical
-        // data, and a type check alone lets it through.
-        (Some(current), TrackerWriteIntent::PreserveInvalid) => {
-            current.validate().with_context(|| {
+    if let Some(value) = doc.get("todotracker") {
+        value
+            .clone()
+            .try_into::<TodoTrackerSection>()
+            .with_context(|| {
                 format!(
-                    "refusing to overwrite the invalid [todotracker] section in {}",
+                    "refusing to overwrite the malformed [todotracker] section in {}",
                     path.display()
                 )
             })?;
-            section.clone()
-        }
-        // A repair rebases onto the latest section and applies only the one
-        // field the user explicitly edited. Any other field — including one
-        // that is invalid, and including one an external editor changed after
-        // the caller's snapshot — is preserved exactly as it is on disk.
-        (Some(current), TrackerWriteIntent::RepairField(field)) => {
-            let mut merged = current;
-            field.set(&mut merged, field.get(section));
-            merged
-        }
-    };
-    let serialized = toml::Value::try_from(&to_write)
+    }
+    let serialized = toml::Value::try_from(section)
         .context("serializing todotracker section")?
         .as_table()
         .cloned()
         .unwrap_or_default();
     doc.insert("todotracker".to_string(), toml::Value::Table(serialized));
-    write_document(&path, &doc)?;
-    Ok(to_write)
+    write_document(&path, &doc)
 }
 
 pub(crate) fn persist_connection_field(
@@ -1227,6 +1312,14 @@ fn set_prop<T: Serialize + serde::de::DeserializeOwned>(
     let table = cursor.as_table_mut().ok_or_else(|| {
         anyhow::Error::msg(format!("path '{path}' did not resolve to a config field"))
     })?;
+    // Optional side is absent from the serialized shape until explicitly set.
+    if *leaf == "side"
+        && parents.len() == 1
+        && parents[0] == "sidebar"
+        && !table.contains_key(*leaf)
+    {
+        table.insert((*leaf).to_string(), toml::Value::String(value.to_string()));
+    }
     if !table.contains_key(*leaf) {
         anyhow::bail!("path '{path}' did not resolve to a config field");
     }
@@ -2073,6 +2166,202 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_leaf_writes_round_trip_side_width_and_split() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        persist_sidebar_side(dir.path(), SidebarSide::Left).unwrap();
+        persist_sidebar_width(dir.path(), 31).unwrap();
+        persist_sidebar_sessions_percent(dir.path(), 45).unwrap();
+        persist_sidebar_queue_percent(dir.path(), 65).unwrap();
+
+        let config = load_persisted(dir.path()).unwrap();
+        assert_eq!(config.sidebar.side, Some(SidebarSide::Left));
+        assert_eq!(config.sidebar.width, 31);
+        assert_eq!(config.sidebar.sessions_percent, 45);
+        assert_eq!(config.sidebar.queue_percent, 65);
+    }
+
+    #[test]
+    fn sidebar_effective_size_clamps_to_shell_bounds() {
+        let mut config = ZerocodeConfig::default();
+        config.sidebar.width = 1;
+        config.sidebar.sessions_percent = u16::MAX;
+        config.sidebar.queue_percent = u16::MAX;
+        assert_eq!(config.effective_sidebar_width(), SIDEBAR_WIDTH_MIN);
+        assert_eq!(
+            config.effective_sidebar_sessions_percent(),
+            SIDEBAR_SESSIONS_PERCENT_MAX
+        );
+        assert_eq!(
+            config.effective_sidebar_queue_percent(),
+            SIDEBAR_QUEUE_PERCENT_MAX
+        );
+        config.sidebar.width = u16::MAX;
+        config.sidebar.sessions_percent = 1;
+        config.sidebar.queue_percent = 1;
+        assert_eq!(config.effective_sidebar_width(), SIDEBAR_WIDTH_MAX);
+        assert_eq!(
+            config.effective_sidebar_sessions_percent(),
+            SIDEBAR_SESSIONS_PERCENT_MIN
+        );
+        assert_eq!(
+            config.effective_sidebar_queue_percent(),
+            SIDEBAR_QUEUE_PERCENT_MIN
+        );
+    }
+
+    #[test]
+    fn sidebar_leaf_write_preserves_comments_and_unknown_keys() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "# operator note\n[future] # keep this heading\nkeep   =   true # inline note\n\n[sidebar]\n# dock note\nvisible = false # keep this comment\nfuture_key = \"keep-me\"\n",
+        );
+
+        assert!(!persist_sidebar_visible(dir.path(), true).unwrap());
+        let after = read(dir.path());
+        assert!(after.contains("# operator note"));
+        assert!(after.contains("keep   =   true # inline note"));
+        assert!(after.contains("# dock note"));
+        assert!(after.contains("visible = true # keep this comment"));
+        assert!(after.contains("future_key = \"keep-me\""));
+    }
+
+    #[test]
+    fn sidebar_leaf_write_reports_valid_environment_shadowing() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _visible = EnvVarGuard::set("ZEROCODE_sidebar__visible", "false");
+        let _side = EnvVarGuard::set("ZEROCODE_sidebar__side", "left");
+        let _width = EnvVarGuard::set("ZEROCODE_sidebar__width", "30");
+        let _split = EnvVarGuard::set("ZEROCODE_sidebar__sessions_percent", "45");
+        let _queue_split = EnvVarGuard::set("ZEROCODE_sidebar__queue_percent", "40");
+
+        assert!(persist_sidebar_visible(dir.path(), true).unwrap());
+        assert!(persist_sidebar_side(dir.path(), SidebarSide::Right).unwrap());
+        assert!(persist_sidebar_width(dir.path(), 24).unwrap());
+        assert!(persist_sidebar_sessions_percent(dir.path(), 60).unwrap());
+        assert!(persist_sidebar_queue_percent(dir.path(), 50).unwrap());
+    }
+
+    #[test]
+    fn sidebar_leaf_write_refuses_malformed_or_non_table_data() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let before = "[sidebar]\nwidth = \"bad\"\n";
+        seed(dir.path(), before);
+        assert!(persist_sidebar_width(dir.path(), 28).is_err());
+        assert_eq!(read(dir.path()), before);
+
+        let before = "sidebar = \"not-a-table\"\n";
+        seed(dir.path(), before);
+        assert!(persist_sidebar_width(dir.path(), 28).is_err());
+        assert_eq!(read(dir.path()), before);
+    }
+
+    #[test]
+    fn effective_sidebar_side_migrates_legacy_todo_location_until_switch() {
+        let mut config = ZerocodeConfig::default();
+        config.todotracker.location = TodoTrackerLocation::Left;
+        assert_eq!(config.effective_sidebar_side(), SidebarSide::Left);
+        config.sidebar.side = Some(SidebarSide::Right);
+        assert_eq!(config.effective_sidebar_side(), SidebarSide::Right);
+    }
+
+    #[test]
+    fn sidebar_section_visibility_is_independent_and_preserves_document() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "# keep this note\n[sidebar]\nvisible = true # sessions\nwidth = 31\nside = \"left\"\nsessions_percent = 45\nqueue_percent = 65\nfuture_key = \"keep\"\n\n[todotracker]\nenabled = true\nenabled_at_start = true\nlocation = \"bottom\"\nwidth = 34\nmax_height = 7\n\n[future]\nkeep = true\n",
+        );
+        let initial = load_persisted(dir.path()).unwrap();
+        assert!(initial.sidebar.visible);
+        assert!(initial.sidebar.queue_visible);
+        assert!(initial.sidebar.plan_visible);
+        let before: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+
+        let writers: [fn(&Path, bool) -> Result<bool>; 3] = [
+            persist_sidebar_visible,
+            persist_sidebar_queue_visible,
+            persist_sidebar_plan_visible,
+        ];
+        let keys = ["visible", "queue_visible", "plan_visible"];
+        // Hide everything, then reopen each section independently.
+        for visible in [false, true] {
+            for (index, writer) in writers.iter().enumerate() {
+                assert!(!writer(dir.path(), visible).unwrap());
+                let cfg = load_persisted(dir.path()).unwrap();
+                let states = [
+                    cfg.sidebar.visible,
+                    cfg.sidebar.queue_visible,
+                    cfg.sidebar.plan_visible,
+                ];
+                for (other, state) in states.into_iter().enumerate() {
+                    assert_eq!(state, if other <= index { visible } else { !visible });
+                }
+                assert_eq!(cfg.todotracker, initial.todotracker);
+                let after: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+                for key in [
+                    "width",
+                    "side",
+                    "sessions_percent",
+                    "queue_percent",
+                    "future_key",
+                ] {
+                    assert_eq!(after["sidebar"][key], before["sidebar"][key]);
+                }
+                assert_eq!(after["sidebar"][keys[index]].as_bool(), Some(visible));
+                assert_eq!(after["future"], before["future"]);
+                assert!(read(dir.path()).contains("# keep this note"));
+                assert!(read(dir.path()).contains("# sessions"));
+            }
+        }
+    }
+
+    #[test]
+    fn sidebar_visibility_overrides_do_not_leak_into_sibling_writes() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _queue = EnvVarGuard::set("ZEROCODE_sidebar__queue_visible", "false");
+        let _plan = EnvVarGuard::set("ZEROCODE_sidebar__plan_visible", "false");
+        assert!(persist_sidebar_queue_visible(dir.path(), true).unwrap());
+        assert!(persist_sidebar_plan_visible(dir.path(), true).unwrap());
+        persist_sidebar_visible(dir.path(), false).unwrap();
+        let persisted = load_persisted(dir.path()).unwrap();
+        assert!(!persisted.sidebar.visible);
+        assert!(persisted.sidebar.queue_visible);
+        assert!(persisted.sidebar.plan_visible);
+        let effective = ensure_and_load(dir.path()).unwrap();
+        assert!(!effective.sidebar.queue_visible);
+        assert!(!effective.sidebar.plan_visible);
+        assert!(!persist_sidebar_queue_visible(dir.path(), false).unwrap());
+        assert!(!persist_sidebar_plan_visible(dir.path(), false).unwrap());
+    }
+
+    #[test]
+    fn sidebar_environment_side_and_splits_keep_strict_path_validation() {
+        let mut config = ZerocodeConfig::default();
+        assert!(config.sidebar.visible);
+        assert!(config.sidebar.queue_visible);
+        assert!(config.sidebar.plan_visible);
+        set_prop(&mut config, "sidebar.side", "left").unwrap();
+        set_prop(&mut config, "sidebar.width", "31").unwrap();
+        set_prop(&mut config, "sidebar.sessions_percent", "45").unwrap();
+        set_prop(&mut config, "sidebar.queue_percent", "65").unwrap();
+        assert_eq!(config.effective_sidebar_side(), SidebarSide::Left);
+        assert_eq!(config.effective_sidebar_width(), 31);
+        assert_eq!(config.effective_sidebar_sessions_percent(), 45);
+        assert_eq!(config.effective_sidebar_queue_percent(), 65);
+        assert!(set_prop(&mut config, "sidebar.side", "middle").is_err());
+        assert!(set_prop(&mut config, "sidebar.queue_visible", "invalid").is_err());
+        assert!(set_prop(&mut config, "sidebar.plan_visible", "invalid").is_err());
+        assert!(set_prop(&mut config, "sidebar.unknown", "true").is_err());
+    }
+
+    #[test]
     fn connection_section_round_trips() {
         let mut c = ZerocodeConfig::default();
         c.connection.wss.uri = Some("wss://host:9781".to_string());
@@ -2359,17 +2648,8 @@ mod tests {
         assert_eq!(c.todotracker.location, TodoTrackerLocation::Left);
     }
 
-    // ── Resolver validation / normalization (untrusted config boundary) ──────
-
-    // ── Zero-dimension rejection ────────────────────────────────────────────
-    //
-    // Explicit zero `width`/`max_height` must fail *visibly* at the session
-    // boundary rather than being silently normalized to 1 — for file values
-    // and for canonical environment overrides alike. The Config-pane edit
-    // path is covered separately by the pane's own save tests.
-
     #[test]
-    fn resolve_todo_tracker_checked_rejects_zero_width_from_file() {
+    fn resolve_todo_tracker_checked_accepts_legacy_zero_width_from_file() {
         let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -2378,17 +2658,12 @@ mod tests {
         )
         .unwrap();
 
-        let err = resolve_todo_tracker_checked(dir.path())
-            .expect_err("an explicit width = 0 in the file must fail, not normalize to 1");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("todotracker"),
-            "error must name the offending section, got: {msg}"
-        );
+        assert!(resolve_todo_tracker_checked(dir.path()).is_ok());
+        assert_eq!(load_persisted(dir.path()).unwrap().todotracker.width, 0);
     }
 
     #[test]
-    fn resolve_todo_tracker_checked_rejects_zero_max_height_from_file() {
+    fn resolve_todo_tracker_checked_accepts_legacy_zero_max_height_from_file() {
         let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -2398,17 +2673,15 @@ mod tests {
         .unwrap();
 
         assert!(
-            resolve_todo_tracker_checked(dir.path()).is_err(),
-            "an explicit max_height = 0 in the file must fail, not normalize to 1"
+            resolve_todo_tracker_checked(dir.path()).is_ok(),
+            "legacy height must not reject settings for the shell-owned dock"
         );
     }
 
     #[test]
-    fn resolve_todo_tracker_checked_rejects_zero_width_from_env() {
+    fn resolve_todo_tracker_checked_accepts_legacy_zero_width_from_env() {
         let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
-        // File is valid; only the canonical env override carries the zero, so
-        // this pins that validation happens *after* overrides are applied.
         std::fs::write(
             config_path(dir.path()),
             "[todotracker]\nwidth = 32\nmax_height = 5\n",
@@ -2417,20 +2690,20 @@ mod tests {
         let _v = EnvVarGuard::set("ZEROCODE_todotracker__width", "0");
 
         assert!(
-            resolve_todo_tracker_checked(dir.path()).is_err(),
-            "ZEROCODE_todotracker__width=0 must fail visibly, not normalize to 1"
+            resolve_todo_tracker_checked(dir.path()).is_ok(),
+            "legacy width override must not reject settings for the shell-owned dock"
         );
     }
 
     #[test]
-    fn resolve_todo_tracker_checked_rejects_zero_max_height_from_env() {
+    fn resolve_todo_tracker_checked_accepts_legacy_zero_max_height_from_env() {
         let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let _v = EnvVarGuard::set("ZEROCODE_todotracker__max_height", "0");
 
         assert!(
-            resolve_todo_tracker_checked(dir.path()).is_err(),
-            "ZEROCODE_todotracker__max_height=0 must fail visibly, not normalize to 1"
+            resolve_todo_tracker_checked(dir.path()).is_ok(),
+            "legacy height override must not reject settings for the shell-owned dock"
         );
     }
 

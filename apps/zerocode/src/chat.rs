@@ -310,6 +310,7 @@ pub(crate) struct Chat {
     /// One-shot app-level Help request, set by the `/help` slash command and
     /// drained immediately by `app.rs` after this pane handles the key.
     help_requested: bool,
+    plan_toggle_requested: bool,
     /// Owns the Chat-only entry retry so leaving the pane invalidates its result.
     entry_retry_attempt: Option<EntryRetryAttempt>,
     /// A temporary retry borrows retained queues until the resident pane adopts
@@ -568,6 +569,7 @@ impl Chat {
             pick_agent_double_click: crate::mouse::DoubleClickTracker::new(),
             session_list_double_click: crate::mouse::DoubleClickTracker::new(),
             help_requested: false,
+            plan_toggle_requested: false,
             entry_retry_attempt: None,
             entry_retry_preparing: false,
             entry_retry_session_ownership: None,
@@ -2854,7 +2856,53 @@ impl Chat {
         self.maybe_refresh_git_branch();
     }
 
+    #[cfg(test)]
     pub(crate) fn draw(&mut self, frame: &mut Frame, area: Rect) {
+        self.draw_with_plan_placement(frame, area, PlanPlacement::Legacy);
+    }
+
+    pub(crate) fn draw_with_dock(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        queue_area: Option<Rect>,
+        plan_area: Option<Rect>,
+    ) {
+        self.draw_with_plan_placement(
+            frame,
+            area,
+            PlanPlacement::External {
+                queue: queue_area,
+                plan: plan_area,
+            },
+        );
+    }
+
+    /// Draw the existing menu after shell chrome, without changing its geometry.
+    pub(crate) fn draw_dock_overlay(&self, frame: &mut Frame) {
+        if let ChatPhase::Active(state) = &self.phase
+            && !state.has_blocking_mouse_overlay()
+        {
+            render_context_menu(frame, state);
+        }
+    }
+
+    pub(crate) fn context_menu_open(&self) -> bool {
+        matches!(&self.phase, ChatPhase::Active(state)
+            if state.context_menu.is_some() && !state.has_blocking_mouse_overlay())
+    }
+
+    fn draw_with_plan_placement(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        plan_placement: PlanPlacement,
+    ) {
+        let external_queue = match plan_placement {
+            PlanPlacement::External { queue, .. } => queue,
+            #[cfg(test)]
+            PlanPlacement::Legacy => None,
+        };
         match &mut self.phase {
             ChatPhase::PickAgent {
                 agents,
@@ -2891,10 +2939,28 @@ impl Chat {
                 explorer.render(frame, area);
             }
             ChatPhase::Active(state) => {
-                render(frame, state, area, self.pane_kind);
+                render_with_plan_placement(frame, state, area, self.pane_kind, plan_placement);
             }
             ChatPhase::Error(msg) => {
                 draw_error(frame, area, msg, &self.pane_kind.name());
+            }
+        }
+
+        if !matches!(self.phase, ChatPhase::Active(_))
+            && let Some(queue_area) = external_queue
+        {
+            let queue_owner_idx = self
+                .last_focused_sid
+                .as_deref()
+                .and_then(|sid| {
+                    self.background
+                        .iter()
+                        .position(|state| state.session_id == sid)
+                })
+                .or_else(|| self.background.len().checked_sub(1));
+            match queue_owner_idx.and_then(|idx| self.background.get_mut(idx)) {
+                Some(state) => render_queue_sidebar(frame, state, queue_area),
+                None => render_empty_queue_sidebar(frame, queue_area),
             }
         }
     }
@@ -2906,6 +2972,13 @@ impl Chat {
         key: KeyEvent,
         term: &mut crate::config_manager::Term,
     ) -> bool {
+        if !matches!(self.phase, ChatPhase::Active(_))
+            && crate::keymap::ChatTabAction::from_chord(&key)
+                == Some(crate::keymap::ChatTabAction::TodoToggle)
+        {
+            self.plan_toggle_requested = true;
+            return false;
+        }
         // Determine which phase we're in without holding a borrow on self.
         // For the picker, extract what we need; for active, delegate below.
         match &mut self.phase {
@@ -3272,14 +3345,6 @@ impl Chat {
                     }
                     return false;
                 }
-                Some(QAction::QueueWiden) if state.queue_sidebar_open() => {
-                    state.widen_queue_sidebar();
-                    return false;
-                }
-                Some(QAction::QueueNarrow) if state.queue_sidebar_open() => {
-                    state.narrow_queue_sidebar();
-                    return false;
-                }
                 _ => {}
             }
         }
@@ -3609,9 +3674,7 @@ impl Chat {
                 state.mark_dirty_full();
             }
             Some(ChatTabAction::TodoToggle) => {
-                state.todo_tracker.toggle();
-                state.todo_close_hit_rect = None;
-                state.mark_dirty_full();
+                self.plan_toggle_requested = true;
             }
             Some(ChatTabAction::BrowseEnter) => {
                 if state.in_browse_mode() {
@@ -4093,6 +4156,71 @@ impl Chat {
         }
     }
 
+    /// Resolve the modal menu before the shell routes dock controls or content.
+    /// Returns true when the shell must stop routing this event.
+    pub(crate) async fn handle_context_menu_mouse(&mut self, mouse: MouseEvent) -> bool {
+        self.finish_transcript_drag_if_released(&mouse);
+        let ChatPhase::Active(state) = &mut self.phase else {
+            return false;
+        };
+        if state.context_menu.is_none() || state.has_blocking_mouse_overlay() {
+            return false;
+        }
+        let (consumed, request) = resolve_context_menu_mouse(state, mouse);
+        if let Some(request) = request {
+            self.execute_context_menu_request(request).await;
+        }
+        consumed
+            || matches!(
+                mouse.kind,
+                MouseEventKind::Down(MouseButton::Right)
+                    | MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+            )
+    }
+
+    /// Handle mouse input inside the shell-owned Queue rectangle. The shell
+    /// passes the same rectangle used for rendering, so dock reflow cannot
+    /// leave queue clicks targeting stale conversation geometry.
+    pub(crate) async fn handle_queue_mouse(&mut self, mouse: MouseEvent, area: Rect) {
+        self.finish_transcript_drag_if_released(&mouse);
+        if !mouse::in_rect(mouse.column, mouse.row, area) {
+            return;
+        }
+        let mut request = None;
+        if let ChatPhase::Active(state) = &mut self.phase {
+            if state.has_blocking_mouse_overlay() {
+                return;
+            }
+            let (consumed, context_menu_request) = resolve_context_menu_mouse(state, mouse);
+            request = context_menu_request;
+            if !consumed && state.point_in_queue_sidebar(mouse.column, mouse.row) {
+                let opens_context_menu =
+                    matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
+                        || (cfg!(target_os = "macos")
+                            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                            && mouse
+                                .modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL));
+                if opens_context_menu {
+                    state.open_queue_context_menu(mouse.column, mouse.row);
+                } else {
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => state.queue_scroll_by(-3),
+                        MouseEventKind::ScrollDown => state.queue_scroll_by(3),
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            state.queue_click_at(mouse.column, mouse.row);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if let Some(request) = request {
+            self.execute_context_menu_request(request).await;
+        }
+    }
+
     pub(crate) async fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
         self.finish_transcript_drag_if_released(&mouse);
 
@@ -4203,6 +4331,10 @@ impl Chat {
             return;
         }
 
+        if self.handle_context_menu_mouse(mouse).await {
+            return;
+        }
+
         if let ChatPhase::Active(ref mut state) = self.phase {
             // The file explorer renders above every parent overlay.
             if state.input_bar.has_file_explorer() {
@@ -4274,31 +4406,7 @@ impl Chat {
                 return;
             }
 
-            if state.context_menu.is_some() {
-                match mouse.kind {
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        let request = if state.context_menu_select_at(mouse.column, mouse.row) {
-                            state.take_context_menu_request()
-                        } else {
-                            state.dismiss_context_menu();
-                            None
-                        };
-                        if let Some(request) = request {
-                            self.execute_context_menu_request(request).await;
-                        }
-                        return;
-                    }
-                    MouseEventKind::Down(MouseButton::Right)
-                    | MouseEventKind::ScrollUp
-                    | MouseEventKind::ScrollDown => {
-                        state.dismiss_context_menu();
-                    }
-                    MouseEventKind::Drag(MouseButton::Left)
-                    | MouseEventKind::Up(MouseButton::Left) => return,
-                    _ => {}
-                }
-            }
-
+            #[cfg(test)]
             if let MouseEventKind::Down(MouseButton::Left) = mouse.kind
                 && !state.input_bar.has_attachment_manager()
                 && state.todo_tracker.is_visible()
@@ -4339,30 +4447,6 @@ impl Chat {
                         let tx = self.model_fetch_tx.clone();
                         Self::open_model_picker(&rpc, &tx, state).await;
                     }
-                }
-                return;
-            }
-
-            // Queue sidebar intercepts mouse events over its area before the
-            // conversation handler, so clicks select queued items and the wheel
-            // scrolls the queue rather than the transcript.
-            if state.queue_sidebar_open() && state.point_in_queue_sidebar(col, row) {
-                let opens_context_menu =
-                    matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
-                        || (cfg!(target_os = "macos")
-                            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-                            && mouse.modifiers.contains(KM::CONTROL));
-                if opens_context_menu {
-                    state.open_queue_context_menu(col, row);
-                    return;
-                }
-                match mouse.kind {
-                    MouseEventKind::ScrollUp => state.queue_scroll_by(-3),
-                    MouseEventKind::ScrollDown => state.queue_scroll_by(3),
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        state.queue_click_at(col, row);
-                    }
-                    _ => {}
                 }
                 return;
             }
@@ -4632,6 +4716,26 @@ impl Chat {
             return s.info_message.as_ref();
         }
         None
+    }
+
+    pub(crate) fn plan_visible(&self) -> bool {
+        matches!(
+            &self.phase,
+            ChatPhase::Active(state) if state.todo_tracker.is_visible()
+        )
+    }
+
+    pub(crate) fn set_plan_visible(&mut self, visible: bool) {
+        if let ChatPhase::Active(state) = &mut self.phase {
+            if state.todo_tracker.is_visible() != visible {
+                state.todo_tracker.toggle();
+            }
+            state.mark_dirty_full();
+        }
+    }
+
+    pub(crate) fn take_plan_toggle_request(&mut self) -> bool {
+        std::mem::take(&mut self.plan_toggle_requested)
     }
 
     /// Whether the active chat session is in browse mode.
@@ -5096,6 +5200,7 @@ fn draw_error(frame: &mut Frame, area: Rect, msg: &str, tab_title: &str) {
 
 // ── Active chat rendering ────────────────────────────────────────
 
+#[cfg(test)]
 fn carve_todo_area(tracker: &crate::todo_tracker::TodoTracker, area: Rect) -> (Rect, Option<Rect>) {
     if !tracker.wants_space() {
         return (area, None);
@@ -5130,28 +5235,65 @@ fn carve_todo_area(tracker: &crate::todo_tracker::TodoTracker, area: Rect) -> (R
     }
 }
 
-fn render(f: &mut Frame, state: &mut ChatState, area: Rect, pane_kind: PaneKind) {
-    // Carve the TodoWrite tracker's area first (outermost split), so the
-    // rest of the pane (queue sidebar, transcript, input) lays out in the
-    // remaining body. When the tracker wants no space, `body == area` and
-    // the existing layout is untouched.
-    state.todo_close_hit_rect = None;
-    let (area, todo_area) = carve_todo_area(&state.todo_tracker, area);
-    if let Some(panel) = todo_area {
-        state.todo_close_hit_rect = state.todo_tracker.render(f, panel);
-    }
+#[derive(Clone, Copy)]
+enum PlanPlacement {
+    #[cfg(test)]
+    Legacy,
+    External {
+        queue: Option<Rect>,
+        plan: Option<Rect>,
+    },
+}
 
-    let area = if state.queue_sidebar_open() {
-        let sidebar_w = state.queue_sidebar_width(area.width);
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(20), Constraint::Length(sidebar_w)])
-            .split(area);
-        render_queue_sidebar(f, state, cols[1]);
-        cols[0]
-    } else {
-        area
+#[cfg(test)]
+fn render(f: &mut Frame, state: &mut ChatState, area: Rect, pane_kind: PaneKind) {
+    render_with_plan_placement(f, state, area, pane_kind, PlanPlacement::Legacy);
+}
+
+fn render_with_plan_placement(
+    f: &mut Frame,
+    state: &mut ChatState,
+    area: Rect,
+    pane_kind: PaneKind,
+    plan_placement: PlanPlacement,
+) {
+    // The shell owns the dock split in production. Keep the old in-pane carve
+    // only for narrow widget tests that exercise the tracker in isolation.
+    #[cfg(test)]
+    {
+        state.todo_close_hit_rect = None;
+    }
+    let area = match plan_placement {
+        PlanPlacement::External {
+            plan: Some(panel), ..
+        } => {
+            if state.todo_tracker.is_visible() {
+                state.todo_tracker.render_docked(f, panel);
+            }
+            area
+        }
+        PlanPlacement::External { plan: None, .. } => area,
+        #[cfg(test)]
+        PlanPlacement::Legacy => {
+            let (body, todo_area) = carve_todo_area(&state.todo_tracker, area);
+            if let Some(panel) = todo_area {
+                state.todo_close_hit_rect = state.todo_tracker.render(f, panel);
+            }
+            body
+        }
     };
+
+    let queue_area = match plan_placement {
+        PlanPlacement::External { queue, .. } => queue,
+        #[cfg(test)]
+        PlanPlacement::Legacy => None,
+    };
+    if let Some(queue_area) = queue_area {
+        render_queue_sidebar(f, state, queue_area);
+    } else {
+        state.queue_item_rects.clear();
+        state.queue_sidebar_rect = None;
+    }
 
     let show_cursor = state.pending_approval().is_none() && state.pending_elicitation().is_none();
     let turn_status = state.turn_status.clone();
@@ -5227,6 +5369,10 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect, pane_kind: PaneKind)
     };
 
     render_conversation(f, state, actual_conv);
+    #[cfg(test)]
+    if matches!(plan_placement, PlanPlacement::Legacy) {
+        render_context_menu(f, state);
+    }
     state.input_bar.render_autocomplete_popup(f);
     state.input_bar.render_attachment_manager(f, area);
 
@@ -5347,10 +5493,6 @@ fn queue_sidebar_help_entries() -> Vec<crate::widgets::HelpEntry> {
             chord_label(A::QueueEdit),
             crate::i18n::t("zc-queue-help-edit"),
         ),
-        E::key(
-            chord_label_pair(A::QueueWiden, A::QueueNarrow),
-            crate::i18n::t("zc-queue-help-resize"),
-        ),
     ]
 }
 
@@ -5382,11 +5524,8 @@ fn chord_label_pair(
     Box::leak(format!("{}/{}", render(a), render(b)).into_boxed_str())
 }
 
-fn render_queue_sidebar(f: &mut Frame, state: &mut ChatState, area: Rect) {
-    let title = crate::i18n::t_args(
-        "zc-queue-title",
-        &[("count", &state.queue_len().to_string())],
-    );
+fn render_queue_shell(f: &mut Frame, area: Rect, count: usize) -> Rect {
+    let title = crate::i18n::t_args("zc-queue-title", &[("count", &count.to_string())]);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::dim_style())
@@ -5395,6 +5534,22 @@ fn render_queue_sidebar(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(Clear, area);
     f.render_widget(block, area);
+    inner
+}
+
+fn render_empty_queue_sidebar(f: &mut Frame, area: Rect) {
+    let inner = render_queue_shell(f, area, 0);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    f.render_widget(
+        Paragraph::new(crate::i18n::t("zc-queue-empty-list")).style(theme::dim_style()),
+        inner,
+    );
+}
+
+fn render_queue_sidebar(f: &mut Frame, state: &mut ChatState, area: Rect) {
+    let inner = render_queue_shell(f, area, state.queue_len());
     state.queue_item_rects.clear();
     state.queue_sidebar_rect = None;
     if inner.width == 0 || inner.height == 0 {
@@ -5476,6 +5631,36 @@ fn render_queue_sidebar(f: &mut Frame, state: &mut ChatState, area: Rect) {
         .style(theme::fill_style())
         .scroll((scroll, 0));
     f.render_widget(para, inner);
+}
+
+fn resolve_context_menu_mouse(
+    state: &mut ChatState,
+    mouse: MouseEvent,
+) -> (bool, Option<ChatContextMenuRequest>) {
+    if state.context_menu.is_none() {
+        return (false, None);
+    }
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let request = if state.context_menu_select_at(mouse.column, mouse.row) {
+                state.take_context_menu_request()
+            } else {
+                state.dismiss_context_menu();
+                None
+            };
+            (true, request)
+        }
+        MouseEventKind::Down(MouseButton::Right)
+        | MouseEventKind::ScrollUp
+        | MouseEventKind::ScrollDown => {
+            state.dismiss_context_menu();
+            (false, None)
+        }
+        MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
+            (true, None)
+        }
+        _ => (false, None),
+    }
 }
 
 fn first_line_preview(text: &str, max: usize) -> String {
@@ -6406,7 +6591,6 @@ fn render_conversation(
     }
     render_copy_feedback(f, state);
     render_message_copy_overlay(f, state, body_rect);
-    render_context_menu(f, state);
     let mut scrollbar_state = ScrollbarState::new(total_rows as usize)
         .position(scroll as usize)
         .viewport_content_length(inner_height as usize);
@@ -7879,7 +8063,6 @@ pub struct ChatState {
     queue_paused: bool,
     resume_override: bool,
     cancel_started_at: Option<Instant>,
-    queue_sidebar_cols: u16,
     /// Selected queued message id for sidebar edit/delete.
     queue_sel: Option<u64>,
     /// Per-item clickable rects from the last sidebar draw, mapping a queued
@@ -7896,6 +8079,7 @@ pub struct ChatState {
     /// Active model / model_provider picker overlay.
     model_picker: ModelPickerOverlay,
     /// Exact close-cell target from the last Todo panel draw.
+    #[cfg(test)]
     todo_close_hit_rect: Option<ratatui::layout::Rect>,
     /// Live TodoWrite tracker panel for this session. Read-only; fed by
     /// `SessionUpdate::Plan`, toggled by the user, laid out per config.
@@ -7989,13 +8173,13 @@ impl ChatState {
             queue_paused: false,
             resume_override: false,
             cancel_started_at: None,
-            queue_sidebar_cols: 36,
             queue_sel: None,
             queue_item_rects: Vec::new(),
             queue_sidebar_rect: None,
             queue_scroll: 0,
             info_message: None,
             model_picker: ModelPickerOverlay::None,
+            #[cfg(test)]
             todo_close_hit_rect: None,
             todo_tracker: crate::todo_tracker::TodoTracker::from_settings(todo_settings),
         }
@@ -8008,6 +8192,16 @@ impl ChatState {
             LinesDirty::Appended | LinesDirty::Full => {}
         }
         // Full is sticky — don't downgrade.
+    }
+
+    /// Higher-priority overlays own mouse input before the queue or its menu.
+    fn has_blocking_mouse_overlay(&self) -> bool {
+        self.input_bar.has_file_explorer()
+            || self.input_bar.has_attachment_manager()
+            || self.model_picker.is_open()
+            || !matches!(self.session_overlay, SessionOverlay::None)
+            || self.pending_approval().is_some()
+            || self.pending_elicitation().is_some()
     }
 
     fn mark_dirty_tail(&mut self, entry_index: usize) {
@@ -8078,6 +8272,15 @@ impl ChatState {
         self.copy_feedback = None;
     }
 
+    fn clear_transcript_selection_for_render_change(&mut self) {
+        let queue_menu = self
+            .context_menu
+            .take()
+            .filter(|menu| matches!(menu.target, ChatContextMenuTarget::Queue(_)));
+        self.clear_transcript_selection();
+        self.context_menu = queue_menu;
+    }
+
     fn begin_transcript_drag(&mut self, column: u16, row: u16) -> bool {
         let Some(snapshot) = &self.transcript_snapshot else {
             return false;
@@ -8141,7 +8344,7 @@ impl ChatState {
             .as_ref()
             .is_some_and(|current| current != &snapshot)
         {
-            self.clear_transcript_selection();
+            self.clear_transcript_selection_for_render_change();
         }
         self.transcript_snapshot = Some(snapshot);
     }
@@ -8300,7 +8503,14 @@ impl ChatState {
         };
         self.select_queued_by_id(id);
         let target = ChatContextMenuTarget::Queue(id);
-        let Some(rect) = context_menu_rect(column, row, bounds, target.actions()) else {
+        // The queue can be only three rows tall, while its four actions plus
+        // borders need six. Place the overlay in the conversation viewport so
+        // queue height controls hit-testing without hiding the action menu.
+        let menu_bounds = self
+            .transcript_snapshot
+            .as_ref()
+            .map_or(bounds, |snapshot| snapshot.area);
+        let Some(rect) = context_menu_rect(column, row, menu_bounds, target.actions()) else {
             return false;
         };
         self.context_menu = Some(ChatContextMenu {
@@ -8315,7 +8525,6 @@ impl ChatState {
     fn context_menu_select_step(&mut self, delta: isize) {
         if let Some(menu) = self.context_menu.as_mut() {
             menu.select_step(delta);
-            self.mark_dirty_full();
         }
     }
 
@@ -9701,10 +9910,6 @@ impl ChatState {
     }
 
     const QUEUE_CAP: usize = 32;
-    const QUEUE_SIDEBAR_COLS_MIN: u16 = 24;
-    const QUEUE_SIDEBAR_COLS_MAX: u16 = 80;
-    const QUEUE_SIDEBAR_COLS_STEP: u16 = 4;
-    const QUEUE_CHAT_COLS_MIN: u16 = 20;
 
     fn alloc_queue_id(&mut self) -> u64 {
         let id = self.next_queue_id;
@@ -9976,30 +10181,6 @@ impl ChatState {
             self.queue_scroll = new;
             self.mark_dirty_full();
         }
-    }
-
-    pub fn widen_queue_sidebar(&mut self) {
-        self.queue_sidebar_cols = (self.queue_sidebar_cols + Self::QUEUE_SIDEBAR_COLS_STEP)
-            .min(Self::QUEUE_SIDEBAR_COLS_MAX);
-        self.mark_dirty_full();
-    }
-
-    pub fn narrow_queue_sidebar(&mut self) {
-        self.queue_sidebar_cols = self
-            .queue_sidebar_cols
-            .saturating_sub(Self::QUEUE_SIDEBAR_COLS_STEP)
-            .max(Self::QUEUE_SIDEBAR_COLS_MIN);
-        self.mark_dirty_full();
-    }
-
-    /// Queue sidebar width in columns for a given chat area width. The stored
-    /// column width is clamped to the absolute range, then to whatever leaves
-    /// the chat column its floor on a terminal too narrow for both.
-    pub fn queue_sidebar_width(&self, area_width: u16) -> u16 {
-        let upper =
-            Self::QUEUE_SIDEBAR_COLS_MAX.min(area_width.saturating_sub(Self::QUEUE_CHAT_COLS_MIN));
-        let lower = Self::QUEUE_SIDEBAR_COLS_MIN.min(upper);
-        self.queue_sidebar_cols.clamp(lower, upper)
     }
 
     fn editable_ids(&self) -> Vec<u64> {
@@ -10356,7 +10537,10 @@ impl ChatState {
         // Rebuilding from freshly resolved settings also applies any Config-pane
         // edit made since this pane's `ChatState` was constructed.
         self.todo_tracker.reset_for_session(todo_settings);
-        self.todo_close_hit_rect = None;
+        #[cfg(test)]
+        {
+            self.todo_close_hit_rect = None;
+        }
         cleanup_report.merge(self.cleanup_active_turn_attachments());
         cleanup_report.merge(self.clear_queue());
         self.surface_cleanup_report(cleanup_report);
@@ -10611,6 +10795,8 @@ mod tests {
                 )
                 .await
         );
+        assert!(chat.take_plan_toggle_request());
+        chat.set_plan_visible(false);
         let ChatPhase::Active(state) = &mut chat.phase else {
             unreachable!()
         };
@@ -10634,6 +10820,8 @@ mod tests {
                 )
                 .await
         );
+        assert!(chat.take_plan_toggle_request());
+        chat.set_plan_visible(true);
         let ChatPhase::Active(state) = &chat.phase else {
             unreachable!()
         };
@@ -13014,19 +13202,15 @@ mod tests {
         );
     }
 
-    // An explicit zero dimension must fail visibly at the session boundary
-    // rather than normalizing to 1. At *this* layer, "fail visibly" means the
-    // transition keeps the user's current settings and logs the error instead
-    // of silently rendering a collapsed 1-cell tracker.
     #[tokio::test]
-    async fn resolve_todo_settings_preserves_fallback_on_zero_width_from_file() {
+    async fn resolve_todo_settings_applies_enabled_with_legacy_zero_width_from_file() {
         let _lock = env_test_lock_async().await;
         let dir = tempfile::tempdir().unwrap();
         let _guard = ConfigDirGuard::set(dir.path());
 
         std::fs::write(
             crate::config::config_path(dir.path()),
-            "[todotracker]\nwidth = 0\nmax_height = 5\n",
+            "[todotracker]\nenabled = false\nwidth = 0\nmax_height = 5\n",
         )
         .unwrap();
 
@@ -13039,21 +13223,22 @@ mod tests {
         };
 
         let resolved = Chat::resolve_todo_settings(current);
-        assert_eq!(
-            resolved, current,
-            "an explicit width = 0 must keep current settings, never resolve to a 1-cell tracker"
+        assert!(
+            !resolved.enabled,
+            "obsolete width must not retain stale settings"
         );
-        assert_ne!(resolved.width, 1, "the zero must not be normalized to 1");
     }
 
     // Same contract via the canonical environment surface.
     #[tokio::test]
-    async fn resolve_todo_settings_preserves_fallback_on_zero_width_from_env() {
+    async fn resolve_todo_settings_applies_enabled_with_legacy_zero_width_from_env() {
         let _lock = env_test_lock_async().await;
         let dir = tempfile::tempdir().unwrap();
         let _guard = ConfigDirGuard::set(dir.path());
 
         let _v = crate::test_support::EnvVarGuard::set("ZEROCODE_todotracker__width", "0");
+        let _enabled =
+            crate::test_support::EnvVarGuard::set("ZEROCODE_todotracker__enabled", "false");
 
         let current = crate::todo_tracker::TodoTrackerSettings {
             enabled: true,
@@ -13064,11 +13249,10 @@ mod tests {
         };
 
         let resolved = Chat::resolve_todo_settings(current);
-        assert_eq!(
-            resolved, current,
-            "ZEROCODE_todotracker__width=0 must keep current settings, not normalize to 1"
+        assert!(
+            !resolved.enabled,
+            "obsolete width must not retain stale settings"
         );
-        assert_ne!(resolved.width, 1, "the zero must not be normalized to 1");
     }
 
     #[tokio::test]
@@ -18485,6 +18669,459 @@ mod tests {
     }
 
     #[test]
+    fn queue_dock_renders_empty_count() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut state = state();
+        let area = Rect::new(0, 0, 24, 6);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render_queue_sidebar(frame, &mut state, area))
+            .expect("draw empty queue");
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            rendered.contains("Queue (0)"),
+            "rendered queue: {rendered:?}"
+        );
+        assert!(
+            rendered.contains(&crate::i18n::t("zc-queue-empty-list")),
+            "empty queue body must remain visible: {rendered:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_dock_preserves_transcript_queue_and_plan_state() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        for kind in [PaneKind::Chat, PaneKind::Acp] {
+            let mut chat = chat_with_active_input(kind);
+            let state = active_state(&mut chat);
+            state
+                .entries
+                .push(ChatEntry::AgentMessage(Arc::from("visible transcript")));
+            state
+                .enqueue_message("still queued".to_string(), Vec::new())
+                .unwrap();
+            state.todo_tracker.set_plan(vec![crate::wire::PlanEntry {
+                content: "retained plan".to_string(),
+                status: crate::wire::PlanStatus::Pending,
+                priority: crate::wire::PlanPriority::Medium,
+                active_form: None,
+            }]);
+            let conversation = Rect::new(0, 0, 56, 24);
+            let queue = Rect::new(56, 0, 24, 8);
+            let plan = Rect::new(56, 8, 24, 16);
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal
+                .draw(|frame| {
+                    chat.draw_with_dock(frame, conversation, Some(queue), Some(plan));
+                })
+                .unwrap();
+            assert!(active_state(&mut chat).todo_close_hit_rect.is_none());
+            let old_close = (plan.right() - 2, plan.y);
+            assert_ne!(terminal.backend().buffer()[old_close].symbol(), "✕");
+            assert!(active_state(&mut chat).queue_sidebar_rect.is_some());
+
+            terminal
+                .draw(|frame| {
+                    chat.draw_with_dock(frame, Rect::new(0, 0, 40, 24), None, None);
+                })
+                .unwrap();
+            let state = active_state(&mut chat);
+            assert!(state.queue_sidebar_rect.is_none());
+            assert!(state.queue_item_rects.is_empty());
+            assert!(state.todo_close_hit_rect.is_none());
+            assert_eq!(state.queue_len(), 1);
+            assert_eq!(state.todo_tracker.total(), 1);
+            assert!(state.todo_tracker.is_visible());
+            let rendered: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(rendered.contains("visible transcript"));
+            assert!(!rendered.contains("Queue ("));
+            assert!(!rendered.contains("retained plan"));
+            assert!(!rendered.contains("still queued"));
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_mouse_uses_reflowed_dock_rect_for_delete_target() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        let queued_id = {
+            let state = active_state(&mut chat);
+            state.turn_in_flight = true;
+            state
+                .enqueue_message("delete me".to_string(), Vec::new())
+                .expect("queue message");
+            state.message_queue[0].id
+        };
+        let old_queue = Rect::new(50, 4, 24, 8);
+        let moved_queue = Rect::new(50, 12, 24, 8);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                let state = active_state(&mut chat);
+                render_queue_sidebar(frame, state, old_queue);
+                render_queue_sidebar(frame, state, moved_queue);
+            })
+            .expect("draw reflowed queue");
+
+        let right_click = |row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: moved_queue.x.saturating_add(2),
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        chat.handle_queue_mouse(right_click(old_queue.y.saturating_add(1)), moved_queue)
+            .await;
+        assert!(active_state(&mut chat).context_menu.is_none());
+
+        chat.handle_queue_mouse(right_click(moved_queue.y.saturating_add(1)), moved_queue)
+            .await;
+        let (menu_x, menu_y) = {
+            let state = active_state(&mut chat);
+            let menu = state.context_menu.as_ref().expect("queue menu");
+            (
+                menu.rect.x.saturating_add(1),
+                menu.rect
+                    .y
+                    .saturating_add(QUEUE_CONTEXT_ACTIONS.len() as u16),
+            )
+        };
+        chat.handle_queue_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: menu_x,
+                row: menu_y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            moved_queue,
+        )
+        .await;
+        let state = active_state(&mut chat);
+        assert_eq!(state.queued_text(queued_id), None);
+        assert!(state.context_menu.is_none());
+    }
+
+    #[tokio::test]
+    async fn dock_queue_mouse_respects_higher_priority_overlays() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let directory = tempfile::tempdir().unwrap();
+        let visible_file = directory.path().join("visible.txt");
+        std::fs::write(&visible_file, "fixture").unwrap();
+        for kind in [PaneKind::Chat, PaneKind::Acp] {
+            for overlay in [
+                "files",
+                "attachments",
+                "model",
+                "session",
+                "approval",
+                "elicitation",
+            ] {
+                let mut chat = chat_with_active_input(kind);
+                let queue = Rect::new(0, 0, 24, 10);
+                let state = active_state(&mut chat);
+                state.enqueue_message("first".into(), Vec::new()).unwrap();
+                state.enqueue_message("second".into(), Vec::new()).unwrap();
+                let selected = state.message_queue[1].id;
+                state.select_queued_by_id(selected);
+                let mut terminal = Terminal::new(TestBackend::new(24, 10)).unwrap();
+                terminal
+                    .draw(|frame| render_queue_sidebar(frame, state, queue))
+                    .unwrap();
+                match overlay {
+                    "files" => state
+                        .input_bar
+                        .open_file_explorer_for_test(visible_file.clone()),
+                    "attachments" => {
+                        state.input_bar.add_attachment(PendingAttachment {
+                            path: directory.path().join("attachment.png"),
+                            mime_type: "image/png".into(),
+                            filename: "attachment.png".into(),
+                            size_bytes: 1,
+                            source: crate::attachment::AttachmentSource::File,
+                        });
+                        state.input_bar.clear_input();
+                        state.input_bar.insert_text("/attachments");
+                        assert!(matches!(
+                            state
+                                .input_bar
+                                .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                            InputBarAction::Consumed
+                        ));
+                    }
+                    "model" => state.model_picker = ModelPickerOverlay::Loading,
+                    "session" => {
+                        state.session_overlay = SessionOverlay::List {
+                            sessions: Vec::new(),
+                            list_state: ListState::default(),
+                        }
+                    }
+                    "approval" => state.pending_approval = Some(approval()),
+                    "elicitation" => state.pending_elicitation = Some(single_elicitation()),
+                    _ => unreachable!(),
+                }
+                let input = state.input_bar.input().to_string();
+                let event = |kind| MouseEvent {
+                    kind,
+                    column: 2,
+                    row: 1,
+                    modifiers: KeyModifiers::NONE,
+                };
+                for kind in [
+                    MouseEventKind::Down(MouseButton::Left),
+                    MouseEventKind::Down(MouseButton::Right),
+                    MouseEventKind::ScrollDown,
+                ] {
+                    chat.handle_queue_mouse(event(kind), queue).await;
+                }
+                let state = active_state(&mut chat);
+                assert_eq!(state.queue_sel, Some(selected), "{overlay}");
+                assert_eq!(state.queue_scroll, 0, "{overlay}");
+                assert!(state.context_menu.is_none(), "{overlay}");
+
+                // A previously opened queue menu must also stay inert beneath a modal.
+                assert!(state.open_queue_context_menu(2, 1));
+                let menu = state.context_menu.as_ref().unwrap();
+                let delete = MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: menu.rect.x + 1,
+                    row: menu.rect.y + QUEUE_CONTEXT_ACTIONS.len() as u16,
+                    modifiers: KeyModifiers::NONE,
+                };
+                assert!(!chat.handle_context_menu_mouse(delete).await, "{overlay}");
+                chat.handle_queue_mouse(delete, queue).await;
+                let state = active_state(&mut chat);
+                assert_eq!(state.queue_len(), 2, "{overlay}");
+                assert!(state.context_menu.is_some(), "{overlay}");
+                assert_eq!(state.input_bar.input(), input, "{overlay}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_mouse_release_finishes_drag_even_when_modal_blocks_queue() {
+        for kind in [PaneKind::Chat, PaneKind::Acp] {
+            for moved in [false, true] {
+                let mut chat = chat_with_active_input(kind);
+                chat.begin_transcript_drag_for_test(moved);
+                active_state(&mut chat).model_picker = ModelPickerOverlay::Loading;
+                chat.handle_queue_mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::Up(MouseButton::Left),
+                        column: 22,
+                        row: 5,
+                        modifiers: crossterm::event::KeyModifiers::NONE,
+                    },
+                    Rect::new(20, 0, 24, 10),
+                )
+                .await;
+                let state = active_state(&mut chat);
+                if moved {
+                    assert_eq!(state.transcript_selected_text().as_deref(), Some("hello"));
+                } else {
+                    assert!(state.transcript_selection.is_none());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn picker_queue_mouse_does_not_mutate_retained_session() {
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        let state = active_state(&mut chat);
+        state
+            .enqueue_message("retained".into(), Vec::new())
+            .unwrap();
+        state.queue_sidebar_rect = Some(Rect::new(1, 1, 22, 8));
+        state.queue_item_rects = vec![(state.message_queue[0].id, Rect::new(1, 1, 22, 1))];
+        chat.stash_active();
+        chat.handle_queue_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: 2,
+                row: 1,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 24, 10),
+        )
+        .await;
+        assert_eq!(chat.background.len(), 1);
+        assert_eq!(chat.background[0].queue_len(), 1);
+        assert!(chat.background[0].context_menu.is_none());
+        assert!(!matches!(chat.phase, ChatPhase::Active(_)));
+    }
+
+    #[tokio::test]
+    async fn queue_context_menu_survives_redraw_and_routes_outside_dock() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        let queued_id = {
+            let state = active_state(&mut chat);
+            state.turn_in_flight = true;
+            state
+                .entries
+                .push(ChatEntry::AgentMessage(Arc::from("visible transcript")));
+            state
+                .enqueue_message("delete me".to_string(), Vec::new())
+                .expect("queue message");
+            state.message_queue[0].id
+        };
+        let conversation = Rect::new(0, 0, 56, 24);
+        let queue = Rect::new(56, 0, 24, 3);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| chat.draw_with_dock(frame, conversation, Some(queue), None))
+            .expect("draw conversation dock");
+
+        let right_click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: queue.x.saturating_add(2),
+            row: queue.y.saturating_add(1),
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        assert!(mouse::in_rect(right_click.column, right_click.row, queue));
+        chat.handle_queue_mouse(right_click, queue).await;
+        let (menu_x, menu_y) = {
+            let state = active_state(&mut chat);
+            let menu = state.context_menu.as_ref().expect("queue menu");
+            (
+                menu.rect.x.saturating_add(1),
+                menu.rect
+                    .y
+                    .saturating_add(QUEUE_CONTEXT_ACTIONS.len() as u16),
+            )
+        };
+        assert!(
+            !mouse::in_rect(menu_x, menu_y, queue),
+            "Delete action must exercise the shell's conversation route"
+        );
+
+        terminal
+            .draw(|frame| chat.draw_with_dock(frame, conversation, Some(queue), None))
+            .expect("redraw open queue menu");
+        let before_overlay: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            !before_overlay.contains(&context_menu_action_label(ChatContextMenuAction::Delete))
+        );
+        terminal
+            .draw(|frame| {
+                chat.draw_with_dock(frame, conversation, Some(queue), None);
+                let menu_rect = active_state(&mut chat).context_menu.as_ref().unwrap().rect;
+                frame.render_widget(Paragraph::new("shell chrome"), menu_rect);
+                chat.draw_dock_overlay(frame);
+            })
+            .expect("draw menu after shell chrome");
+        assert!(
+            active_state(&mut chat).context_menu.is_some(),
+            "transcript recapture must not dismiss a queue-owned menu"
+        );
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            rendered.contains(&context_menu_action_label(ChatContextMenuAction::Delete)),
+            "redrawn terminal must still show the queue action menu: {rendered:?}"
+        );
+
+        assert!(
+            chat.handle_context_menu_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: menu_x,
+                row: menu_y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },)
+                .await
+        );
+        let state = active_state(&mut chat);
+        assert_eq!(state.queued_text(queued_id), None);
+        assert!(state.context_menu.is_none());
+    }
+
+    #[tokio::test]
+    async fn picker_dock_preserves_stashed_queue_or_renders_truthful_empty_state() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let area = Rect::new(0, 0, 80, 20);
+        let queue = Rect::new(56, 4, 24, 16);
+        for kind in [PaneKind::Chat, PaneKind::Acp] {
+            let mut chat = chat_with_active_input(kind);
+            active_state(&mut chat)
+                .enqueue_message("preserved while picking".to_string(), Vec::new())
+                .expect("queue message");
+            chat.stash_active();
+            let mut terminal =
+                Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
+            terminal
+                .draw(|frame| chat.draw_with_dock(frame, area, Some(queue), None))
+                .expect("draw populated picker queue");
+            let rendered: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(
+                rendered.contains("Queue (1)"),
+                "rendered queue: {rendered:?}"
+            );
+            assert!(
+                rendered.contains("preserved while"),
+                "stashed queue body must remain visible: {rendered:?}"
+            );
+
+            let (mut empty_chat, _rx) = test_chat();
+            empty_chat.pane_kind = kind;
+            let mut empty_terminal =
+                Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
+            empty_terminal
+                .draw(|frame| empty_chat.draw_with_dock(frame, area, Some(queue), None))
+                .expect("draw ownerless picker queue");
+            let empty_rendered: String = empty_terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(
+                empty_rendered.contains("Queue (0)"),
+                "ownerless picker queue: {empty_rendered:?}"
+            );
+        }
+    }
+
+    #[test]
     fn session_list_overlay_uses_theme_background_after_clear() {
         use ratatui::{Terminal, backend::TestBackend};
 
@@ -20449,17 +21086,27 @@ mod tests {
         s.enqueue_message("first".to_string(), Vec::new()).unwrap();
         s.enqueue_message("second".to_string(), Vec::new()).unwrap();
         let second_id = s.message_queue[1].id;
-        s.queue_sidebar_rect = Some(Rect::new(40, 2, 30, 12));
+        let transcript_bounds = Rect::new(5, 2, 30, 12);
+        s.transcript_snapshot = Some(transcript_snapshot(
+            transcript_bounds,
+            &["conversation                  "],
+        ));
+        s.queue_sidebar_rect = Some(Rect::new(40, 2, 30, 3));
         s.queue_item_rects = vec![
-            (s.message_queue[0].id, Rect::new(41, 3, 28, 2)),
-            (second_id, Rect::new(41, 5, 28, 2)),
+            (s.message_queue[0].id, Rect::new(41, 3, 28, 1)),
+            (second_id, Rect::new(41, 4, 28, 1)),
         ];
 
-        assert!(s.open_queue_context_menu(45, 5));
+        assert!(s.open_queue_context_menu(45, 4));
         assert_eq!(s.queue_sel, Some(second_id));
         let menu = s.context_menu.as_ref().expect("queue menu opens");
         assert_eq!(menu.target.actions(), QUEUE_CONTEXT_ACTIONS);
         assert!(matches!(menu.target, ChatContextMenuTarget::Queue(id) if id == second_id));
+        assert_eq!(menu.rect.height, QUEUE_CONTEXT_ACTIONS.len() as u16 + 2);
+        assert!(menu.rect.x >= transcript_bounds.x);
+        assert!(menu.rect.right() <= transcript_bounds.right());
+        assert!(menu.rect.y >= transcript_bounds.y);
+        assert!(menu.rect.bottom() <= transcript_bounds.bottom());
 
         s.context_menu_select_step(1);
         assert_eq!(
@@ -20974,48 +21621,6 @@ mod tests {
         s.scroll_to_bottom();
         assert_eq!(s.scroll_offset, bottom);
         assert!(s.pinned_to_bottom);
-    }
-
-    #[test]
-    fn queue_sidebar_resize_clamps_to_bounds() {
-        let mut s = state();
-        for _ in 0..40 {
-            s.widen_queue_sidebar();
-        }
-        assert_eq!(s.queue_sidebar_cols, ChatState::QUEUE_SIDEBAR_COLS_MAX);
-        for _ in 0..40 {
-            s.narrow_queue_sidebar();
-        }
-        assert_eq!(s.queue_sidebar_cols, ChatState::QUEUE_SIDEBAR_COLS_MIN);
-    }
-
-    #[test]
-    fn queue_sidebar_narrow_then_widen_responds_immediately() {
-        let mut s = state();
-        s.narrow_queue_sidebar();
-        s.narrow_queue_sidebar();
-        let narrowed = s.queue_sidebar_width(200);
-        s.widen_queue_sidebar();
-        assert!(
-            s.queue_sidebar_width(200) > narrowed,
-            "one widen after narrowing must increase width, not burn a banked deficit"
-        );
-    }
-
-    #[test]
-    fn queue_sidebar_width_respects_absolute_clamps() {
-        let s = state();
-        let wide = s.queue_sidebar_width(400);
-        assert!(
-            wide <= ChatState::QUEUE_SIDEBAR_COLS_MAX,
-            "sidebar exceeded absolute column cap"
-        );
-        // Narrow terminal: chat column keeps its minimum, sidebar shrinks.
-        let tight = s.queue_sidebar_width(40);
-        assert!(
-            tight <= 40u16.saturating_sub(ChatState::QUEUE_CHAT_COLS_MIN),
-            "sidebar starved the chat column on a narrow terminal"
-        );
     }
 
     #[test]
