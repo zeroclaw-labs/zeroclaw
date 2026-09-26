@@ -117,7 +117,24 @@ impl FileExplorerState {
         self.list_state.select(Some(visible_index));
     }
 
+    /// Directory picker over the local filesystem, rooted at `start_dir`.
+    ///
+    /// Unlike [`FileExplorerState::new`] (a file picker) this mode confirms a
+    /// directory, which is what a session root selection needs.
+    pub fn new_dir_picker(start_dir: PathBuf) -> Self {
+        Self::dir_picker_at(start_dir, None)
+    }
+
     pub fn new_dir_picker_remote(start_dir: PathBuf, rpc: Arc<crate::client::RpcClient>) -> Self {
+        Self::dir_picker_at(start_dir, Some(rpc))
+    }
+
+    /// Shared dir-picker constructor: `remote_rpc` decides whether listings
+    /// come from the daemon or the local filesystem.
+    fn dir_picker_at(
+        start_dir: PathBuf,
+        remote_rpc: Option<Arc<crate::client::RpcClient>>,
+    ) -> Self {
         let mut state = Self {
             cwd: start_dir,
             entries: Vec::new(),
@@ -128,7 +145,7 @@ impl FileExplorerState {
             search_query: String::new(),
             searching: false,
             dir_picker: true,
-            remote_rpc: Some(rpc),
+            remote_rpc,
             last_list_area: Rect::default(),
         };
         state.load_entries();
@@ -720,6 +737,24 @@ mod tests {
             matches!(action, ExplorerAction::ConfirmDir(ref p) if p == &tmp),
             "expected ConfirmDir({:?}), got something else",
             tmp
+        );
+    }
+
+    #[test]
+    fn new_dir_picker_confirms_a_local_directory() {
+        // The local directory picker must be able to confirm a directory;
+        // `new` builds a file picker, which never emits `ConfirmDir`.
+        let tmp = std::env::temp_dir();
+        let mut state = FileExplorerState::new_dir_picker(tmp.clone());
+        assert!(state.dir_picker, "must be in dir-picker mode");
+        assert!(
+            state.remote_rpc.is_none(),
+            "a local picker must list the local filesystem"
+        );
+        let action = state.handle_key(KeyEvent::from(KeyCode::Char('c')));
+        assert!(
+            matches!(action, ExplorerAction::ConfirmDir(ref p) if p == &tmp),
+            "expected ConfirmDir({tmp:?})"
         );
     }
 

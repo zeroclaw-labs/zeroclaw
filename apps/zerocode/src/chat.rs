@@ -86,10 +86,37 @@ enum ChatPhase {
         /// Interactive directory picker.
         explorer: FileExplorerState,
     },
+    /// Code-only picker opened by `/change-directory`; the current session is
+    /// stashed in `background` until the new session succeeds or the picker
+    /// closes. A running session is never re-rooted in place.
+    PickChangeDirectory {
+        /// The agent the new session starts for — the active session's agent.
+        agent_alias: String,
+        /// Interactive directory picker (local or daemon-side).
+        explorer: FileExplorerState,
+    },
     /// Active chat session.
     Active(Box<ChatState>),
     /// Unrecoverable error.
     Error(String),
+}
+
+/// Outcome of a session-start attempt.
+///
+/// `start_session_with_cancel` renders its own failure into the pane, but a
+/// caller that *frames* the start differently (`/change-directory` reports a
+/// directory selection failure, not a bare session failure) needs the
+/// underlying error text without re-deriving it from pane state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionStartOutcome {
+    /// A session was created (or resumed) and is now the active phase.
+    Started,
+    /// The attempt was abandoned before creation completed, either by a
+    /// cancellation signal or because another retry owns the creation.
+    Cancelled,
+    /// Creation, or the post-creation history replay, failed. Carries the raw
+    /// error text already surfaced by the pane.
+    Failed(String),
 }
 
 /// Distinguishes which kind of chat pane this is.
@@ -99,67 +126,184 @@ pub(crate) enum PaneKind {
     Acp,
 }
 
-/// Why pinning a local Code session to the launch directory failed.
+/// Why converting an explicitly selected session root into a JSON-RPC `cwd`
+/// failed.
 ///
-/// A local Code session promises that file and shell tools operate on the
-/// project zerocode was launched from. If that directory cannot be captured we
-/// must not silently fall through to an omitted cwd: `session/new` would then
-/// resolve the selected agent's workspace and the session would look healthy
-/// while acting on a different project tree.
+/// An explicit selection is a promise that the session's file and shell tools
+/// operate on *that* directory. If the selection cannot be represented
+/// faithfully we must not fall through to an omitted cwd: `session/new` would
+/// then resolve the selected agent's workspace and the session would look
+/// healthy while acting on a different project tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LocalCodeCwdError {
-    /// `std::env::current_dir()` failed (e.g. the directory was deleted or is
-    /// unreadable). Carries the OS error text.
-    Unavailable(String),
-    /// The launch directory is not valid UTF-8, so it cannot be represented in
-    /// the JSON-RPC `cwd` string. Carries the lossy rendering for diagnosis.
+    /// The selected directory is not valid UTF-8, so it cannot be represented
+    /// in the JSON-RPC `cwd` string. Carries the lossy rendering for display.
     NotUtf8(String),
+    /// An explicitly selected root is not absolute. A relative `cwd` would be
+    /// resolved against the daemon's process directory, not the directory the
+    /// user picked. Carries the rejected path.
+    NotAbsolute(String),
 }
 
 impl LocalCodeCwdError {
-    /// Localized, user-facing text for this capture failure.
+    /// Localized, user-facing text for this conversion failure.
     fn localized(&self) -> String {
         match self {
-            LocalCodeCwdError::Unavailable(error) => {
-                crate::i18n::t_args("zc-chat-code-cwd-unavailable", &[("error", error.as_str())])
-            }
             LocalCodeCwdError::NotUtf8(path) => {
                 crate::i18n::t_args("zc-chat-code-cwd-not-utf8", &[("path", path.as_str())])
+            }
+            LocalCodeCwdError::NotAbsolute(path) => {
+                crate::i18n::t_args("zc-chat-code-cwd-not-absolute", &[("path", path.as_str())])
             }
         }
     }
 }
 
-/// Process cwd for a fresh local Code session. Chat and remote transports
-/// return `Ok(None)` to deliberately omit cwd so the daemon uses the agent
-/// workspace or an explicit picker.
+/// Convert an explicitly selected session root into the JSON-RPC `cwd` string.
 ///
-/// Returns `Err` when a local Code session *should* pin the launch directory
-/// but cannot. Callers must surface that error rather than starting a session
-/// against a different project.
-fn local_code_session_cwd(
-    pane_kind: PaneKind,
+/// A non-UTF-8 selection is rejected rather than lossily converted: a lossy
+/// string names a *different* directory, so the session would silently root
+/// somewhere the user never picked. The error carries only the lossy rendering
+/// for display.
+///
+/// A non-absolute selection is rejected for the same reason: the daemon would
+/// resolve it against *its* process directory rather than the picked one.
+/// "Absolute" is judged for `transport`'s daemon, not for this client — see
+/// [`is_absolute_session_root`].
+fn explicit_cwd(
+    path: &std::path::Path,
     transport: crate::client::Transport,
-) -> Result<Option<String>, LocalCodeCwdError> {
-    if pane_kind == PaneKind::Acp && transport == crate::client::Transport::Local {
-        resolve_local_code_cwd(std::env::current_dir()).map(Some)
-    } else {
-        // Deliberate omission: Chat uses the agent workspace, remote Code uses
-        // the directory picker. Neither is a failure.
-        Ok(None)
+) -> Result<String, LocalCodeCwdError> {
+    let cwd = path
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| LocalCodeCwdError::NotUtf8(path.display().to_string()))?;
+    if !is_absolute_session_root(&cwd, transport) {
+        return Err(LocalCodeCwdError::NotAbsolute(cwd));
+    }
+    Ok(cwd)
+}
+
+/// Whether `root` is an absolute path *on the machine that will run the
+/// session*, which `transport` identifies.
+///
+/// `Path::is_absolute` answers for the platform zerocode was compiled for, and
+/// that is authoritative only for a local session. A WSS picker browses the
+/// *daemon's* filesystem, so the client's platform says nothing about the
+/// selection: a Windows client can legitimately confirm a POSIX root
+/// (`/srv/project`) on a Unix daemon, and a Unix client can confirm a drive
+/// (`C:\project`) or UNC (`\\host\share`) root on a Windows one. Remote
+/// validation therefore accepts every wire form and leaves the final ruling to
+/// the daemon, which is the only party that can make it.
+///
+/// Local validation stays native: a Windows form is not a root on a Unix
+/// machine, it is a relative directory name that would resolve against the
+/// daemon's process directory.
+fn is_absolute_session_root(root: &str, transport: crate::client::Transport) -> bool {
+    match transport {
+        crate::client::Transport::Local => std::path::Path::new(root).is_absolute(),
+        crate::client::Transport::Wss => is_remote_absolute_session_root(root),
     }
 }
 
-/// Pure capture step, split out so tests can inject both failure modes without
-/// mutating global process state.
-fn resolve_local_code_cwd(
-    current_dir: std::io::Result<std::path::PathBuf>,
-) -> Result<String, LocalCodeCwdError> {
-    let path = current_dir.map_err(|e| LocalCodeCwdError::Unavailable(e.to_string()))?;
-    match path.to_str() {
-        Some(s) => Ok(s.to_string()),
-        None => Err(LocalCodeCwdError::NotUtf8(path.display().to_string())),
+/// Whether `root` is absolute in any wire form a remote daemon can report.
+///
+/// Deliberately `cfg`-neutral: the answer depends on the daemon's platform,
+/// which this build knows nothing about.
+fn is_remote_absolute_session_root(root: &str) -> bool {
+    // POSIX root (which also covers `//server/share`), and UNC / device roots.
+    if root.starts_with('/') || root.starts_with(r"\\") {
+        return true;
     }
+    // Drive-letter root: `C:\...` or `C:/...`. A bare `C:` is drive-relative,
+    // not absolute, so the separator is required.
+    matches!(
+        root.as_bytes(),
+        [drive, b':', separator, ..]
+            if drive.is_ascii_alphabetic() && (*separator == b'\\' || *separator == b'/')
+    )
+}
+
+/// Root a remote picker opens at when the session has no directory to lead
+/// with.
+///
+/// The daemon exposes no "where should a picker start" RPC, so this is the
+/// existing daemon-side picker convention rather than a discovered root: the
+/// remote explorer lists `/` and the user navigates from there. It is a
+/// protocol root, not a local path, and is kept identical for the startup and
+/// restart pickers so a remote session never browses this machine.
+const WSS_PICKER_ROOT: &str = "/";
+
+/// Filesystem root of the machine zerocode itself runs on.
+///
+/// Used only as the last-resort start directory for a *local* picker, where a
+/// POSIX `/` would name nothing on Windows.
+fn local_picker_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(if cfg!(windows) { r"C:\" } else { "/" })
+}
+
+/// Directory the `/change-directory` picker opens at.
+///
+/// The session's own root leads. The fallback is transport-aware: a WSS picker
+/// lists the *daemon's* filesystem, where this process's directory names
+/// nothing, so it starts at [`WSS_PICKER_ROOT`]. A local picker falls back to
+/// this machine's root. Either way the start directory satisfies the same
+/// absoluteness rule confirmation applies, so the picker never opens on a
+/// directory the user could not select.
+fn change_directory_start_dir(
+    session_cwd: Option<&str>,
+    transport: crate::client::Transport,
+    current_dir: impl FnOnce() -> Option<std::path::PathBuf>,
+) -> std::path::PathBuf {
+    if let Some(cwd) = session_cwd.filter(|cwd| !cwd.trim().is_empty()) {
+        return std::path::PathBuf::from(cwd);
+    }
+    if transport == crate::client::Transport::Wss {
+        return std::path::PathBuf::from(WSS_PICKER_ROOT);
+    }
+    current_dir()
+        .filter(|dir| {
+            dir.to_str()
+                .is_some_and(|dir| is_absolute_session_root(dir, crate::client::Transport::Local))
+        })
+        .unwrap_or_else(local_picker_root)
+}
+
+/// Combine a directory-change report with the notice the session restore
+/// already left on the focused session.
+///
+/// `superseded` is the generic session-start error the restore surfaced: the
+/// directory-change report carries the same underlying failure in the terms
+/// the user asked for, so repeating it is noise. Anything else *that same
+/// restore* appended — a dropped-resume count, for instance — is information
+/// the report does not carry and is preserved after it.
+///
+/// Existing text is only ever carried over when a `superseded` notice is given
+/// *and* matches as a prefix of it: that pairing is the sole proof the text
+/// belongs to the restore this report supersedes. Without it the existing
+/// notice is unrelated or expired — an older, already-stale message that this
+/// report replaces outright — so it is dropped rather than resurrected.
+fn merge_change_directory_notice(
+    notice: String,
+    existing: Option<&str>,
+    superseded: Option<&str>,
+) -> String {
+    let Some(existing) = existing.map(str::trim).filter(|text| !text.is_empty()) else {
+        return notice;
+    };
+    // No superseded notice: nothing ties `existing` to this restore.
+    let Some(superseded) = superseded.map(str::trim).filter(|text| !text.is_empty()) else {
+        return notice;
+    };
+    // A mismatched prefix means `existing` came from somewhere else entirely.
+    let Some(remainder) = existing.strip_prefix(superseded) else {
+        return notice;
+    };
+    let remainder = remainder.trim();
+    if remainder.is_empty() || notice.contains(remainder) {
+        return notice;
+    }
+    format!("{notice} {remainder}")
 }
 
 impl PaneKind {
@@ -1394,6 +1538,33 @@ impl Chat {
             .await;
     }
 
+    /// Give up the focused-resume slot before a session start that must *not*
+    /// reattach to it.
+    ///
+    /// `start_session` prefers `resume_focused`'s stable id over any
+    /// `cwd_override` and deliberately sends no cwd on a resume, so a retained
+    /// failed-reconnect identity would swallow an explicitly chosen root and
+    /// silently reopen that session at its own. Demoting to a background resume
+    /// keeps the identity (and its queued messages) for a later retry instead
+    /// of discarding it.
+    ///
+    /// Callers demote at whichever point the focused slot stops being the right
+    /// target, which is the moment a valid explicit cwd is about to be sent:
+    ///
+    /// - `add_agent_session` demotes up front: adding a session is by
+    ///   definition a request for a *different* session than the retained one,
+    ///   and no path can be rejected on the way there.
+    /// - The `PickCwd` and `/change-directory` confirm paths demote only after
+    ///   `explicit_cwd` accepts the selection, so a cancelled picker or a
+    ///   rejected path leaves resume ownership untouched and the pending
+    ///   reconnect can still reattach.
+    fn demote_focused_resume_to_background(&mut self) {
+        if let Some(mut retained) = self.resume_focused.take() {
+            retained.was_focused = false;
+            self.resume_backgrounds.push(retained);
+        }
+    }
+
     async fn pick_or_start_session_inner(
         &mut self,
         agent_alias: &str,
@@ -1414,7 +1585,7 @@ impl Chat {
         if self.pane_kind == PaneKind::Acp && self.rpc.transport() == crate::client::Transport::Wss
         {
             // Remote ACP: start from the daemon root, not a local path.
-            let start_dir = std::path::PathBuf::from("/");
+            let start_dir = std::path::PathBuf::from(WSS_PICKER_ROOT);
             self.phase = ChatPhase::PickCwd {
                 agent_alias: agent_alias.to_string(),
                 explorer: FileExplorerState::new_dir_picker_remote(
@@ -1425,6 +1596,163 @@ impl Chat {
         } else {
             self.start_session_with_cancel(agent_alias, None, cancellation, phase)
                 .await;
+        }
+    }
+
+    /// Open the Code directory picker for `/change-directory`.
+    ///
+    /// Code-only: a Chat session follows its agent's workspace, so there is no
+    /// root for the user to re-select. The active session is stashed (never
+    /// closed or re-rooted) so cancelling, a rejected path, or a failed start
+    /// can return to it untouched.
+    fn begin_change_directory(&mut self) {
+        if self.pane_kind != PaneKind::Acp {
+            // Chat follows the selected agent's workspace. Say so instead of
+            // dropping the command: a silent no-op reads as a broken command.
+            if let ChatPhase::Active(ref mut state) = self.phase {
+                state.set_info_notice(crate::i18n::t("zc-chat-change-directory-chat-only"));
+            }
+            return;
+        }
+        let ChatPhase::Active(state) = &self.phase else {
+            return;
+        };
+        let agent_alias = state.agent_alias.clone();
+        // Start browsing where this session is rooted; the fallback is
+        // transport-aware so a remote picker never opens on a local path.
+        let start_dir =
+            change_directory_start_dir(state.cwd.as_deref(), self.rpc.transport(), || {
+                std::env::current_dir().ok()
+            });
+
+        // A confirmed directory starts an *additional* session, so the pane cap
+        // applies here exactly as it does to the sidebar "+". Refusing before
+        // the stash keeps the live session focused instead of parking it
+        // behind a picker that cannot add the ninth tracked session it would
+        // need to honor the selection.
+        if self.tracked_session_count() >= MAX_TRACKED_SESSIONS_PER_PANE {
+            if let ChatPhase::Active(ref mut state) = self.phase {
+                state.set_info_notice(crate::i18n::t_args(
+                    "zc-chat-session-cap",
+                    &[("max", &MAX_TRACKED_SESSIONS_PER_PANE.to_string())],
+                ));
+            }
+            return;
+        }
+        // A retained failed-reconnect identity is *not* given up here: the user
+        // has only asked to browse. Demotion happens at confirmation, once a
+        // valid explicit root exists to replace it, so cancelling the picker or
+        // choosing an unusable path leaves the pending reconnect able to
+        // reattach.
+
+        self.stash_active();
+        let explorer = if self.rpc.transport() == crate::client::Transport::Wss {
+            // Remote Code browses the daemon's filesystem, not this machine's.
+            FileExplorerState::new_dir_picker_remote(start_dir, Arc::clone(&self.rpc))
+        } else {
+            FileExplorerState::new_dir_picker(start_dir)
+        };
+        self.phase = ChatPhase::PickChangeDirectory {
+            agent_alias,
+            explorer,
+        };
+    }
+
+    /// Apply a confirmed `/change-directory` selection: start a new session
+    /// rooted at `path`, keeping the stashed session as the fallback.
+    ///
+    /// Both transports go through the ordinary session-start path with an
+    /// explicit cwd, so the daemon remains the authority on the resulting root.
+    async fn apply_change_directory_selection(
+        &mut self,
+        agent_alias: &str,
+        path: &std::path::Path,
+    ) {
+        let (notice, superseded) = match explicit_cwd(path, self.rpc.transport()) {
+            Ok(cwd) => {
+                // Only now that a valid explicit root will be sent: release the
+                // focused-resume slot so `session/new` carries this directory
+                // instead of a retained session's id (and old cwd).
+                self.demote_focused_resume_to_background();
+                match self.start_session(agent_alias, Some(&cwd)).await {
+                    SessionStartOutcome::Started => return,
+                    // Defensive only: this call passes no cancellation token or
+                    // entry-retry phase, the two things `start_session_with_cancel`
+                    // reports `Cancelled` for, so this path is unreachable today.
+                    // It is kept so a future cancellable start cannot strand the
+                    // pane in a picker whose session is already parked in
+                    // `background` — the restore below puts it back.
+                    SessionStartOutcome::Cancelled => (None, None),
+                    SessionStartOutcome::Failed(error) => (
+                        Some(crate::i18n::t_args(
+                            "zc-chat-change-directory-error",
+                            &[("error", error.as_str())],
+                        )),
+                        Some(crate::i18n::t_args(
+                            "zc-chat-error-create-session",
+                            &[("error", error.as_str())],
+                        )),
+                    ),
+                }
+            }
+            // A selection that cannot be sent faithfully never reaches
+            // `session/new`: a lossy or relative cwd would root the session in
+            // a directory the user never picked. Each rejection is reported in
+            // its own terms, naming the path, so an encoding problem is
+            // distinguishable from a non-absolute one.
+            Err(error) => (Some(error.localized()), None),
+        };
+        self.restore_change_directory_session(notice, superseded)
+            .await;
+    }
+
+    /// Return to the session stashed by [`Chat::begin_change_directory`] and,
+    /// when there is something to report, say why the new root was not
+    /// adopted. `superseded` names a notice the restore may already have set
+    /// that `notice` replaces outright.
+    async fn restore_change_directory_session(
+        &mut self,
+        notice: Option<String>,
+        superseded: Option<String>,
+    ) {
+        // A failed start with a live background session is already restored by
+        // `after_session_start`; only a path rejected before the request (or a
+        // start that left the error screen up) still needs the restore here.
+        if !matches!(self.phase, ChatPhase::Active(_)) {
+            self.restore_last_focused().await;
+        }
+        match &mut self.phase {
+            // Replace the generic session-start notice: the user asked for a
+            // directory change, so the failure is reported in those terms.
+            ChatPhase::Active(state) => {
+                let Some(notice) = notice else {
+                    return;
+                };
+                let merged = merge_change_directory_notice(
+                    notice,
+                    state.info_message.as_ref().map(|msg| msg.text.as_str()),
+                    superseded.as_deref(),
+                );
+                // A directory change that did not happen is a failure, not a
+                // completed action: the neutral note styling reads as "done".
+                state.info_message = Some(crate::widgets::InfoMessage::error(merged));
+                state.mark_dirty_full();
+            }
+            _ => match notice {
+                Some(notice) => self.phase = ChatPhase::Error(notice),
+                // Nothing to report and nothing to return to: the stashed
+                // session was closed while the picker was open. Fall back to
+                // the agent picker rather than leaving a picker on screen
+                // whose session no longer exists.
+                None => {
+                    self.phase = ChatPhase::PickAgent {
+                        agents: Vec::new(),
+                        list_state: ListState::default(),
+                        loading: true,
+                    };
+                    let _ = self.init().await;
+                }
+            },
         }
     }
 
@@ -1457,10 +1785,7 @@ impl Chat {
             return;
         }
         // A fresh launch must not consume a failed reconnect's stable ID or queue.
-        if let Some(mut retained) = self.resume_focused.take() {
-            retained.was_focused = false;
-            self.resume_backgrounds.push(retained);
-        }
+        self.demote_focused_resume_to_background();
         self.stash_active();
         self.pick_or_start_session(agent_alias).await;
     }
@@ -1621,9 +1946,13 @@ impl Chat {
         }
     }
 
-    async fn start_session(&mut self, agent_alias: &str, cwd_override: Option<&str>) {
+    async fn start_session(
+        &mut self,
+        agent_alias: &str,
+        cwd_override: Option<&str>,
+    ) -> SessionStartOutcome {
         self.start_session_with_cancel(agent_alias, cwd_override, None, None)
-            .await;
+            .await
     }
 
     async fn start_session_with_cancel(
@@ -1632,9 +1961,9 @@ impl Chat {
         cwd_override: Option<&str>,
         cancellation: Option<&Arc<AtomicBool>>,
         phase: Option<&Arc<AtomicU8>>,
-    ) {
+    ) -> SessionStartOutcome {
         if is_cancelled(cancellation) {
-            return;
+            return SessionStartOutcome::Cancelled;
         }
         // TodoWrite display is a ZeroCode UI concern owned by
         // `zerocode-config.toml` — the daemon holds no TodoWrite display schema
@@ -1657,47 +1986,31 @@ impl Chat {
         } else {
             EntryRetrySessionOwnership::RetryCreated
         };
-        // A resume must not re-point the session at the TUI's launch directory:
-        // pass no cwd so the daemon keeps the retained session's own cwd.
+        // A resume must not re-point the session at a new root: pass no cwd so
+        // the daemon keeps the retained session's own saved cwd, whatever this
+        // process's directory or the agent's workspace is now.
         //
-        // Fresh Chat sessions omit cwd so the daemon uses the selected agent's
-        // workspace. Fresh local Code sessions pin the process cwd so file and
-        // shell tools operate on the project zerocode was launched from. An
-        // explicit caller-supplied cwd (the remote ACP picker) still wins.
-        //
-        // If a local Code session cannot capture its launch directory we fail
-        // the creation instead of omitting cwd: a silent fallback would start a
-        // healthy-looking session rooted at the agent workspace, letting file
-        // and shell tools act on a different project.
-        let explicit_cwd = cwd_override
-            .filter(|s| !s.trim().is_empty())
-            .map(str::to_string);
+        // A fresh session sends a root only when one was explicitly selected
+        // (the startup picker or `/change-directory`). Otherwise cwd is
+        // omitted so the daemon resolves the selected agent's configured
+        // workspace — the default session root for Chat and Code alike.
         let cwd_str: Option<String> = if resume_id.is_some() {
             None
-        } else if let Some(cwd) = explicit_cwd {
-            Some(cwd)
         } else {
-            match local_code_session_cwd(self.pane_kind, self.rpc.transport()) {
-                Ok(cwd) => cwd,
-                Err(e) => {
-                    self.phase = ChatPhase::Error(crate::i18n::t_args(
-                        "zc-chat-error-create-session",
-                        &[("error", &e.localized())],
-                    ));
-                    return;
-                }
-            }
+            cwd_override
+                .filter(|cwd| !cwd.trim().is_empty())
+                .map(str::to_owned)
         };
         if is_cancelled(cancellation) {
-            return;
+            return SessionStartOutcome::Cancelled;
         }
         if let Some(phase) = phase
             && !claim_entry_retry_session_creation(phase)
         {
-            return;
+            return SessionStartOutcome::Cancelled;
         }
         if is_cancelled(cancellation) {
-            return;
+            return SessionStartOutcome::Cancelled;
         }
         let result = if self.pane_kind == PaneKind::Acp {
             self.rpc
@@ -1708,7 +2021,7 @@ impl Chat {
                 .session_new_with_id(agent_alias, cwd_str.as_deref(), resume_id)
                 .await
         };
-        match result {
+        let outcome = match result {
             Ok(session) => {
                 let resumed_sid = resume.as_ref().map(|_| session.session_id.clone());
                 let recovery_session_id = session.session_id.clone();
@@ -1725,7 +2038,7 @@ impl Chat {
                         Some(session_ownership),
                     )
                     .await;
-                    return;
+                    return SessionStartOutcome::Cancelled;
                 }
                 // `todo_settings` is resolved fresh at this boundary from
                 // `zerocode-config.toml` (the canonical owner); the removed
@@ -1745,7 +2058,7 @@ impl Chat {
                         Some(session_ownership),
                     )
                     .await;
-                    return;
+                    return SessionStartOutcome::Cancelled;
                 }
                 Self::refresh_model_identity(&self.rpc, &mut state).await;
                 if is_cancelled(cancellation) {
@@ -1755,7 +2068,7 @@ impl Chat {
                         Some(session_ownership),
                     )
                     .await;
-                    return;
+                    return SessionStartOutcome::Cancelled;
                 }
                 // On a resume, replay the daemon-retained transcript so the
                 // reattached pane shows the prior conversation rather than an
@@ -1764,12 +2077,13 @@ impl Chat {
                     let msgs = match self.rpc.session_messages(&sid).await {
                         Ok(msgs) => msgs,
                         Err(error) => {
+                            let error = error.to_string();
                             self.phase = ChatPhase::Error(crate::i18n::t_args(
                                 "zc-chat-error-resume-history",
-                                &[("error", &error.to_string())],
+                                &[("error", &error)],
                             ));
                             self.after_session_start().await;
-                            return;
+                            return SessionStartOutcome::Failed(error);
                         }
                     };
                     state.message_count = msgs.total;
@@ -1795,21 +2109,25 @@ impl Chat {
                         Some(session_ownership),
                     )
                     .await;
-                    return;
+                    return SessionStartOutcome::Cancelled;
                 }
                 self.phase = ChatPhase::Active(Box::new(state));
                 if needs_terminal_recovery {
                     self.begin_session_resync(recovery_session_id);
                 }
+                SessionStartOutcome::Started
             }
             Err(e) => {
+                let error = e.to_string();
                 self.phase = ChatPhase::Error(crate::i18n::t_args(
                     "zc-chat-error-create-session",
-                    &[("error", &e.to_string())],
+                    &[("error", &error)],
                 ));
+                SessionStartOutcome::Failed(error)
             }
-        }
+        };
         self.after_session_start().await;
+        outcome
     }
 
     /// Post-`start_session` bookkeeping for the multi-session pane:
@@ -2045,34 +2363,21 @@ impl Chat {
                 return None;
             }
             // Remote ACP picker must start from a path the daemon understands.
-            let start_dir = std::path::PathBuf::from("/");
+            let start_dir = std::path::PathBuf::from(WSS_PICKER_ROOT);
             return Some(ChatPhase::PickCwd {
                 agent_alias: alias,
                 explorer: FileExplorerState::new_dir_picker_remote(start_dir, Arc::clone(rpc)),
             });
         }
 
-        // Chat restarts omit cwd so the daemon keeps the agent workspace.
-        // Local Code restarts pin the process cwd. Remote ACP re-prompts via
-        // the picker above.
-        //
-        // A capture failure aborts the restart and keeps the existing session
-        // rather than minting one rooted at the agent workspace, which would
-        // silently move file and shell tools to a different project.
-        let cwd_str = match local_code_session_cwd(pane_kind, rpc.transport()) {
-            Ok(cwd) => cwd,
-            Err(e) => {
-                state.set_info_notice(crate::i18n::t_args(
-                    "zc-chat-session-restart-error",
-                    &[("error", &e.localized())],
-                ));
-                return None;
-            }
-        };
+        // A restart mints a *fresh* session, so it follows the fresh-session
+        // default: omit cwd and let the daemon root the replacement at the
+        // selected agent's workspace. Remote ACP re-prompts via the picker
+        // above, which supplies an explicit root through `start_session`.
         let new_session = if pane_kind == PaneKind::Acp {
-            rpc.session_new_acp(&alias, cwd_str.as_deref(), None).await
+            rpc.session_new_acp(&alias, None, None).await
         } else {
-            rpc.session_new(&alias, cwd_str.as_deref()).await
+            rpc.session_new(&alias, None).await
         };
         match new_session {
             Ok(s) => {
@@ -2887,7 +3192,8 @@ impl Chat {
                     Some(crate::i18n::t("zc-chat-session-list-resume-note")),
                 );
             }
-            ChatPhase::PickCwd { explorer, .. } => {
+            ChatPhase::PickCwd { explorer, .. }
+            | ChatPhase::PickChangeDirectory { explorer, .. } => {
                 explorer.render(frame, area);
             }
             ChatPhase::Active(state) => {
@@ -2998,8 +3304,27 @@ impl Chat {
                 match action {
                     ExplorerAction::ConfirmDir(path) => {
                         let alias = agent_alias.clone();
-                        let cwd_str = path.to_str().map(str::to_string);
-                        self.start_session(&alias, cwd_str.as_deref()).await;
+                        match explicit_cwd(&path, self.rpc.transport()) {
+                            Ok(cwd) => {
+                                // Only now that a valid explicit root will be
+                                // sent: release the focused-resume slot so
+                                // `session/new` carries this directory instead
+                                // of a retained session's id (and old cwd).
+                                self.demote_focused_resume_to_background();
+                                self.start_session(&alias, Some(&cwd)).await;
+                            }
+                            // Never fall back to an omitted cwd: the daemon
+                            // would root the session at the agent workspace
+                            // while the user believes they picked this
+                            // directory. A rejection sends nothing, so resume
+                            // ownership stays as it was.
+                            Err(error) => {
+                                self.phase = ChatPhase::Error(crate::i18n::t_args(
+                                    "zc-chat-error-create-session",
+                                    &[("error", &error.localized())],
+                                ));
+                            }
+                        }
                     }
                     ExplorerAction::Cancel => {
                         // With live background sessions, a cancelled CWD pick
@@ -3012,6 +3337,34 @@ impl Chat {
                                 loading: true,
                             };
                             // Re-fetch agents asynchronously.
+                            let _ = self.init().await;
+                        }
+                    }
+                    ExplorerAction::Confirm(_) | ExplorerAction::None => {}
+                }
+                return false;
+            }
+            ChatPhase::PickChangeDirectory {
+                agent_alias,
+                explorer,
+            } => {
+                let action = explorer.handle_key(key);
+                match action {
+                    ExplorerAction::ConfirmDir(path) => {
+                        let alias = agent_alias.clone();
+                        self.apply_change_directory_selection(&alias, &path).await;
+                    }
+                    ExplorerAction::Cancel => {
+                        // The session this picker was opened from is stashed,
+                        // so cancelling returns to it without sending
+                        // `session/new`. The fallback mirrors the CWD picker
+                        // for the (unexpected) case of no stashed session.
+                        if !self.restore_last_focused().await {
+                            self.phase = ChatPhase::PickAgent {
+                                agents: Vec::new(),
+                                list_state: ListState::default(),
+                                loading: true,
+                            };
                             let _ = self.init().await;
                         }
                     }
@@ -3411,6 +3764,10 @@ impl Chat {
                         self.phase = next_phase;
                     }
                     self.note_session_replaced(&old_sid);
+                    return false;
+                }
+                InputBarAction::ChangeDirectory => {
+                    self.begin_change_directory();
                     return false;
                 }
                 InputBarAction::ResumeQueue => {
@@ -4097,7 +4454,9 @@ impl Chat {
         self.finish_transcript_drag_if_released(&mouse);
 
         // Dir-picker explorer handles its own mouse events.
-        if let ChatPhase::PickCwd { explorer, .. } = &mut self.phase {
+        if let ChatPhase::PickCwd { explorer, .. }
+        | ChatPhase::PickChangeDirectory { explorer, .. } = &mut self.phase
+        {
             explorer.handle_mouse(mouse);
             return;
         }
@@ -4609,7 +4968,8 @@ impl Chat {
     pub(crate) fn selected_agent(&self) -> Option<&str> {
         match &self.phase {
             ChatPhase::Active(s) => Some(s.agent_alias.as_str()),
-            ChatPhase::PickCwd { agent_alias, .. } => Some(agent_alias.as_str()),
+            ChatPhase::PickCwd { agent_alias, .. }
+            | ChatPhase::PickChangeDirectory { agent_alias, .. } => Some(agent_alias.as_str()),
             _ => None,
         }
     }
@@ -4674,8 +5034,8 @@ impl Chat {
 
     pub(crate) fn wants_text_input(&self) -> bool {
         match &self.phase {
-            // CWD picker always captures text input.
-            ChatPhase::PickCwd { .. } => true,
+            // Directory pickers always capture text input.
+            ChatPhase::PickCwd { .. } | ChatPhase::PickChangeDirectory { .. } => true,
             ChatPhase::PickSession { .. } => false,
             ChatPhase::Active(s) => {
                 // The model picker is modal: claim text-input so global keys
@@ -4756,7 +5116,8 @@ impl crate::widgets::HelpContext for Chat {
                     HelpNode::entries(entries)
                 }
             }
-            ChatPhase::PickCwd { explorer, .. } => explorer.help_context(),
+            ChatPhase::PickCwd { explorer, .. }
+            | ChatPhase::PickChangeDirectory { explorer, .. } => explorer.help_context(),
             ChatPhase::PickSession { .. } => {
                 use crate::keymap::{ChatTabAction as C, ModalAction as M, action_key_labels};
                 let nav = action_key_labels(M::Up)
@@ -4947,6 +5308,12 @@ impl crate::widgets::HelpContext for Chat {
                     ),
                 ];
                 pane_entries.extend(queue_sidebar_help_entries());
+                // Code owns a session root the user can re-select; Chat
+                // sessions follow their agent's workspace, so the hint is
+                // scoped to this pane.
+                if self.pane_kind == PaneKind::Acp {
+                    pane_entries.push(E::desc(crate::i18n::t("zc-chat-help-change-directory")));
+                }
                 let pane = HelpNode::entries(pane_entries);
                 pane.with_child(state.input_bar.help_context())
             }
@@ -10731,6 +11098,19 @@ mod tests {
     }
 
     #[test]
+    fn change_directory_command_is_a_dedicated_input_action() {
+        // `/change-directory` must reach the pane as its own action; falling
+        // back to `Submit` would send the command to the agent as chat text.
+        assert!(matches!(
+            command_action_from_initialize(
+                serde_json::json!({"server_version": env!("CARGO_PKG_VERSION")}),
+                "/change-directory",
+            ),
+            InputBarAction::ChangeDirectory
+        ));
+    }
+
+    #[test]
     fn present_empty_command_catalogue_remains_authoritative() {
         let response = serde_json::json!({
             "server_version": env!("CARGO_PKG_VERSION"),
@@ -15169,60 +15549,35 @@ mod tests {
         assert!(matches!(chat.phase, ChatPhase::Error(_)));
     }
 
-    #[test]
-    fn local_code_session_cwd_only_pins_local_acp() {
-        assert_eq!(
-            local_code_session_cwd(PaneKind::Chat, crate::client::Transport::Local),
-            Ok(None)
-        );
-        assert_eq!(
-            local_code_session_cwd(PaneKind::Chat, crate::client::Transport::Wss),
-            Ok(None)
-        );
-        assert_eq!(
-            local_code_session_cwd(PaneKind::Acp, crate::client::Transport::Wss),
-            Ok(None)
-        );
-        let expected = std::env::current_dir()
-            .expect("process cwd")
-            .to_str()
-            .expect("utf-8 cwd")
-            .to_string();
-        assert_eq!(
-            local_code_session_cwd(PaneKind::Acp, crate::client::Transport::Local),
-            Ok(Some(expected))
-        );
+    /// A path that is absolute for the platform these tests run on, so local
+    /// transport assertions stay meaningful on Windows as well as Unix.
+    fn native_absolute_root() -> &'static str {
+        if cfg!(windows) {
+            r"C:\tmp\project"
+        } else {
+            "/tmp/project"
+        }
     }
 
     #[test]
-    fn local_code_cwd_capture_failure_is_an_error_not_an_omission() {
-        // A failed capture must never look like the deliberate `None` used by
-        // Chat and remote Code: omitting cwd here would silently root the
-        // session at the agent workspace, i.e. a different project.
-        let err = resolve_local_code_cwd(Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "no such file or directory",
-        )))
-        .expect_err("cwd capture failure must be reported");
-        let LocalCodeCwdError::Unavailable(msg) = &err else {
-            panic!("expected Unavailable, got {err:?}");
-        };
-        assert!(msg.contains("no such file or directory"), "got {msg}");
-        // And it renders as real localized text, not a `{key}` placeholder.
-        let shown = err.localized();
-        assert!(!shown.starts_with('{'), "unlocalized error text: {shown}");
-        assert!(shown.contains("no such file or directory"), "got {shown}");
+    fn explicit_cwd_accepts_utf8_selection() {
+        let root = native_absolute_root();
+        assert_eq!(
+            explicit_cwd(std::path::Path::new(root), crate::client::Transport::Local),
+            Ok(root.to_string())
+        );
     }
 
     #[cfg(unix)]
     #[test]
-    fn local_code_cwd_rejects_non_utf8_launch_path() {
+    fn explicit_cwd_rejects_non_utf8_selection() {
         use std::os::unix::ffi::OsStrExt;
-        // 0xFF is never valid UTF-8, so this models a launch directory that
-        // cannot be sent as a JSON-RPC `cwd` string.
+        // 0xFF is never valid UTF-8: the selection cannot be sent as a
+        // JSON-RPC `cwd` string, and must be rejected rather than repaired
+        // into a lossy path that names a different directory.
         let raw = std::ffi::OsStr::from_bytes(b"/tmp/proj-\xFF");
-        let err = resolve_local_code_cwd(Ok(std::path::PathBuf::from(raw)))
-            .expect_err("non-UTF-8 cwd must be reported");
+        let err = explicit_cwd(std::path::Path::new(raw), crate::client::Transport::Local)
+            .expect_err("non-UTF-8 selections must be rejected");
         let LocalCodeCwdError::NotUtf8(shown_path) = &err else {
             panic!("expected NotUtf8, got {err:?}");
         };
@@ -15231,11 +15586,932 @@ mod tests {
         assert!(!shown.starts_with('{'), "unlocalized error text: {shown}");
     }
 
-    #[test]
-    fn local_code_cwd_accepts_utf8_launch_path() {
+    /// A local Code pane holding one active session rooted at `cwd`.
+    fn local_code_chat_with_session(rpc: &Arc<RpcOutbound>, session_id: &str, cwd: &str) -> Chat {
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            Arc::clone(rpc),
+            crate::client::Transport::Local,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        let mut state = ChatState::new(
+            session_id.to_string(),
+            "alpha".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        state.cwd = Some(cwd.to_string());
+        chat.session_order.push(session_id.to_string());
+        chat.phase = ChatPhase::Active(Box::new(state));
+        chat
+    }
+
+    fn headless_term() -> crate::config_manager::Term {
+        ratatui::Terminal::with_options(
+            crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+            },
+        )
+        .expect("test terminal")
+    }
+
+    fn active_info_message(chat: &Chat) -> crate::widgets::InfoMessage {
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected an active session, got another phase");
+        };
+        state
+            .info_message
+            .clone()
+            .expect("the restored session should carry a notice")
+    }
+
+    fn active_info_notice(chat: &Chat) -> String {
+        active_info_message(chat).text
+    }
+
+    #[tokio::test]
+    async fn begin_change_directory_stashes_the_session_and_opens_a_picker() {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+
+        chat.begin_change_directory();
+
+        let ChatPhase::PickChangeDirectory { agent_alias, .. } = &chat.phase else {
+            panic!("expected the change-directory picker");
+        };
+        assert_eq!(agent_alias, "alpha");
+        // The live session is parked, never closed: the picker can be
+        // cancelled without losing the running conversation.
+        assert_eq!(chat.background.len(), 1);
+        assert_eq!(chat.last_focused_sid.as_deref(), Some("sess-old"));
+    }
+
+    #[tokio::test]
+    async fn change_directory_cancel_restores_existing_session() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        chat.begin_change_directory();
+
+        let mut term = headless_term();
+        chat.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut term)
+            .await;
+
+        assert_eq!(chat.current_session_id(), Some("sess-old"));
+        assert_eq!(chat.current_cwd(), Some("/old/project"));
+        assert!(
+            rx.try_recv().is_err(),
+            "a cancelled picker must not create or close any session"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn change_directory_invalid_path_restores_existing_session() {
+        use std::os::unix::ffi::OsStrExt;
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        chat.begin_change_directory();
+
+        let raw = std::ffi::OsStr::from_bytes(b"/tmp/proj-\xFF");
+        chat.apply_change_directory_selection("alpha", std::path::Path::new(raw))
+            .await;
+
+        assert_eq!(chat.current_session_id(), Some("sess-old"));
+        assert_eq!(chat.current_cwd(), Some("/old/project"));
+        let message = active_info_message(&chat);
+        // The rejected path is named: "not valid UTF-8" with no path leaves
+        // the user guessing which selection failed.
+        let LocalCodeCwdError::NotUtf8(shown_path) =
+            explicit_cwd(std::path::Path::new(raw), crate::client::Transport::Local)
+                .expect_err("the fixture path is not UTF-8")
+        else {
+            panic!("expected NotUtf8 for a non-UTF-8 fixture path");
+        };
         assert_eq!(
-            resolve_local_code_cwd(Ok(std::path::PathBuf::from("/tmp/project"))),
-            Ok("/tmp/project".to_string())
+            message.text,
+            crate::i18n::t_args(
+                "zc-chat-code-cwd-not-utf8",
+                &[("path", shown_path.as_str())]
+            )
+        );
+        assert_eq!(
+            message.kind,
+            crate::widgets::InfoKind::Error,
+            "a refused directory change is a failure, not a neutral note"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a rejected path must not reach session/new"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_directory_failure_restores_existing_session() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        chat.begin_change_directory();
+        let selected_root = native_absolute_root();
+
+        let task = tokio::spawn(async move {
+            chat.apply_change_directory_selection("alpha", std::path::Path::new(selected_root))
+                .await;
+            chat
+        });
+
+        let request =
+            next_rpc_request(&mut rx, "confirming a directory should start a session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["cwd"], selected_root);
+        respond_err(&rpc, &request, -32000, "workspace unavailable");
+
+        let chat = task.await.unwrap();
+        assert_eq!(chat.current_session_id(), Some("sess-old"));
+        assert_eq!(chat.current_cwd(), Some("/old/project"));
+        let message = active_info_message(&chat);
+        let notice = message.text.clone();
+        assert_eq!(
+            message.kind,
+            crate::widgets::InfoKind::Error,
+            "a failed directory change is a failure, not a neutral note"
+        );
+        let template =
+            crate::i18n::t_args("zc-chat-change-directory-error", &[("error", "SENTINEL")]);
+        let (prefix, suffix) = template
+            .split_once("SENTINEL")
+            .expect("the change-directory error carries an { $error } placeholder");
+        assert!(
+            notice.starts_with(prefix) && notice.ends_with(suffix),
+            "failure must be reported as a change-directory error, got {notice}"
+        );
+        assert!(
+            notice.contains("workspace unavailable"),
+            "the notice must carry the underlying failure, got {notice}"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_directory_success_keeps_the_old_session_at_its_root() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        chat.begin_change_directory();
+        let selected_root = native_absolute_root();
+
+        let task = tokio::spawn(async move {
+            chat.apply_change_directory_selection("alpha", std::path::Path::new(selected_root))
+                .await;
+            chat
+        });
+
+        let request =
+            next_rpc_request(&mut rx, "confirming a directory should start a session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["cwd"], selected_root);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({"session_id": "sess-new", "workspace_dir": selected_root}),
+        );
+        let request = next_rpc_request(&mut rx, "a new session refreshes model identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let chat = task.await.unwrap();
+        assert_eq!(chat.current_session_id(), Some("sess-new"));
+        assert_eq!(chat.current_cwd(), Some(selected_root));
+        // The prior session keeps its own root; a new root never re-points a
+        // session that is already running.
+        assert_eq!(
+            chat.state_for_session("sess-old")
+                .and_then(|state| state.cwd.as_deref()),
+            Some("/old/project")
+        );
+    }
+
+    #[tokio::test]
+    async fn change_directory_at_the_session_cap_reports_the_cap_and_keeps_the_session() {
+        // A confirmed directory starts an *additional* session, so the picker
+        // must refuse at the cap exactly like the sidebar "+": opening it
+        // would stash the live session behind a picker that cannot add the
+        // ninth tracked session it would need to honor the selection.
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        for idx in 2..=MAX_TRACKED_SESSIONS_PER_PANE {
+            let session_id = format!("sess-{idx}");
+            chat.session_order.push(session_id.clone());
+            chat.background.push(state_for(&session_id, "alpha"));
+        }
+        assert_eq!(chat.tracked_session_count(), MAX_TRACKED_SESSIONS_PER_PANE);
+
+        chat.begin_change_directory();
+
+        assert_eq!(chat.current_session_id(), Some("sess-old"));
+        assert_eq!(
+            active_info_notice(&chat),
+            crate::i18n::t_args(
+                "zc-chat-session-cap",
+                &[("max", &MAX_TRACKED_SESSIONS_PER_PANE.to_string())]
+            )
+        );
+        assert_eq!(
+            chat.background.len(),
+            MAX_TRACKED_SESSIONS_PER_PANE - 1,
+            "a refused picker must not stash the focused session"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_directory_demotes_a_retained_resume_identity() {
+        // A failed reconnect leaves `resume_focused` set. Without demoting it
+        // the next `session/new` would carry that stable id (and its cwd),
+        // silently swallowing the directory the user just picked.
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        chat.session_order.push("sess-retained".to_string());
+        chat.resume_focused = Some(resume_entry("sess-retained", "alpha", true));
+        let selected_root = native_absolute_root();
+
+        chat.begin_change_directory();
+        assert!(
+            chat.resume_focused.is_some(),
+            "opening the picker must not give up the retained identity: the \
+             user has not confirmed a directory yet"
+        );
+        assert!(
+            chat.resume_backgrounds.is_empty(),
+            "nothing is demoted before a directory is confirmed"
+        );
+
+        let task = tokio::spawn(async move {
+            chat.apply_change_directory_selection("alpha", std::path::Path::new(selected_root))
+                .await;
+            chat
+        });
+
+        let request =
+            next_rpc_request(&mut rx, "confirming a directory should start a session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["cwd"], selected_root);
+        assert!(
+            request["params"]["session_id"].is_null(),
+            "an explicit directory choice must not resume a retained session"
+        );
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({"session_id": "sess-new", "workspace_dir": selected_root}),
+        );
+        let request = next_rpc_request(&mut rx, "a new session refreshes model identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        // The demoted identity is retried as a background resume, carrying its
+        // own stable id — proof it was preserved rather than consumed by the
+        // directory change.
+        let request = next_rpc_request(&mut rx, "the demoted entry is re-attached").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["session_id"], "sess-retained");
+        respond_err(&rpc, &request, -32000, "retained session gone");
+
+        let chat = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the directory change should finish")
+            .unwrap();
+        assert_eq!(chat.current_session_id(), Some("sess-new"));
+        assert_eq!(chat.current_cwd(), Some(selected_root));
+        assert!(
+            chat.resume_focused.is_none(),
+            "a confirmed directory releases the focused-resume slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_directory_cancel_preserves_a_retained_resume_identity() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        // Cancelling the picker is not a request for a different session, so
+        // the pending reconnect must still own the focused slot and be able to
+        // reattach.
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        chat.session_order.push("sess-retained".to_string());
+        chat.resume_focused = Some(resume_entry("sess-retained", "alpha", true));
+
+        chat.begin_change_directory();
+        let mut term = headless_term();
+        chat.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut term)
+            .await;
+
+        assert_eq!(
+            chat.resume_focused
+                .as_ref()
+                .map(|entry| entry.session_id.as_str()),
+            Some("sess-retained"),
+            "a cancelled picker must leave resume ownership untouched"
+        );
+        assert!(chat.resume_backgrounds.is_empty());
+        assert!(
+            rx.try_recv().is_err(),
+            "a cancelled picker must not talk to the daemon"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_directory_invalid_path_preserves_a_retained_resume_identity() {
+        // A rejected selection sends no cwd, so the retained identity is still
+        // the right target for the pending reconnect.
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        chat.session_order.push("sess-retained".to_string());
+        chat.resume_focused = Some(resume_entry("sess-retained", "alpha", true));
+
+        chat.begin_change_directory();
+        chat.apply_change_directory_selection("alpha", std::path::Path::new("relative/project"))
+            .await;
+
+        assert_eq!(
+            chat.resume_focused
+                .as_ref()
+                .map(|entry| entry.session_id.as_str()),
+            Some("sess-retained"),
+            "a rejected path must leave resume ownership untouched"
+        );
+        assert!(chat.resume_backgrounds.is_empty());
+        assert_eq!(chat.current_session_id(), Some("sess-old"));
+        assert!(
+            rx.try_recv().is_err(),
+            "a rejected path must not reach session/new"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_directory_on_the_chat_pane_explains_why_it_is_unavailable() {
+        // Chat follows the selected agent's workspace, so there is no root to
+        // re-select — but a silent no-op looks like a broken command.
+        let mut chat = active_chat();
+
+        chat.begin_change_directory();
+
+        assert!(matches!(chat.phase, ChatPhase::Active(_)));
+        assert!(chat.background.is_empty());
+        let message = active_info_message(&chat);
+        assert_eq!(
+            message.text,
+            crate::i18n::t("zc-chat-change-directory-chat-only")
+        );
+        assert_eq!(
+            message.kind,
+            crate::widgets::InfoKind::Note,
+            "explaining where Chat is rooted is a note, not a failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn restoring_from_the_picker_without_a_notice_returns_the_stashed_session() {
+        // Exercises `restore_change_directory_session` directly — the helper
+        // the defensive `SessionStartOutcome::Cancelled` arm calls — rather
+        // than the `apply_change_directory_selection` path, which passes no
+        // cancellation token and so cannot produce `Cancelled` today. A
+        // notice-less restore must still leave the picker phase: otherwise the
+        // pane strands in `PickChangeDirectory` with the live session parked
+        // in `background`. Escape cancellation is covered separately by
+        // `change_directory_cancel_restores_existing_session`.
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        chat.begin_change_directory();
+        assert!(matches!(chat.phase, ChatPhase::PickChangeDirectory { .. }));
+
+        chat.restore_change_directory_session(None, None).await;
+
+        assert_eq!(chat.current_session_id(), Some("sess-old"));
+        assert_eq!(chat.current_cwd(), Some("/old/project"));
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected the stashed session to be restored");
+        };
+        assert!(
+            state.info_message.is_none(),
+            "a restore with no notice has nothing to report"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "restoring a stashed session must not talk to the daemon"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_directory_failure_keeps_extra_notice_information() {
+        // `after_session_start` may add information the directory-change
+        // report does not carry (a dropped-resume count). Replacing the whole
+        // notice would throw that away.
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        chat.begin_change_directory();
+        chat.restore_last_focused().await;
+        let start_error = crate::i18n::t_args("zc-chat-error-create-session", &[("error", "boom")]);
+        let dropped = crate::i18n::t_args("zc-chat-resume-dropped", &[("count", "1")]);
+        if let ChatPhase::Active(ref mut state) = chat.phase {
+            state.set_info_notice(format!("{start_error} {dropped}"));
+        }
+
+        let notice = crate::i18n::t_args("zc-chat-change-directory-error", &[("error", "boom")]);
+        chat.restore_change_directory_session(Some(notice.clone()), Some(start_error.clone()))
+            .await;
+
+        let shown = active_info_notice(&chat);
+        assert!(
+            shown.starts_with(&notice),
+            "the directory-change report leads, got {shown}"
+        );
+        assert!(
+            shown.contains(&dropped),
+            "extra session-start information must survive, got {shown}"
+        );
+        assert!(
+            !shown.contains(&start_error),
+            "the superseded generic start error must not be repeated, got {shown}"
+        );
+    }
+
+    #[test]
+    fn merge_notice_keeps_only_the_extra_information_after_a_matching_superseded_prefix() {
+        // The restore left "<generic start error> <dropped resume count>".
+        // The report re-states the failure in directory-change terms, so only
+        // the dropped-resume tail is new information worth carrying over.
+        let start_error = crate::i18n::t_args("zc-chat-error-create-session", &[("error", "boom")]);
+        let dropped = crate::i18n::t_args("zc-chat-resume-dropped", &[("count", "1")]);
+        let notice = crate::i18n::t_args("zc-chat-change-directory-error", &[("error", "boom")]);
+
+        let merged = merge_change_directory_notice(
+            notice.clone(),
+            Some(&format!("{start_error} {dropped}")),
+            Some(&start_error),
+        );
+
+        assert_eq!(merged, format!("{notice} {dropped}"));
+        assert!(
+            !merged.contains(&start_error),
+            "the superseded generic start error must not be repeated, got {merged}"
+        );
+    }
+
+    #[test]
+    fn merge_notice_drops_existing_text_when_there_is_no_superseded_notice() {
+        // Without a superseded notice nothing ties the existing text to this
+        // restore: it is an unrelated or expired message, not information the
+        // report is missing, so resurrecting it would mislead.
+        let stale = crate::i18n::t("zc-chat-change-directory-chat-only");
+        let notice = crate::i18n::t_args("zc-chat-change-directory-error", &[("error", "boom")]);
+
+        let merged = merge_change_directory_notice(notice.clone(), Some(&stale), None);
+
+        assert_eq!(merged, notice);
+        assert!(
+            !merged.contains(&stale),
+            "an unattributed prior notice must not be resurrected, got {merged}"
+        );
+    }
+
+    #[test]
+    fn merge_notice_drops_existing_text_when_the_superseded_prefix_does_not_match() {
+        // The existing notice does not start with the notice this report
+        // supersedes, so it was left by something else entirely — keeping any
+        // of it would staple an unrelated message onto the report.
+        let start_error = crate::i18n::t_args("zc-chat-error-create-session", &[("error", "boom")]);
+        let unrelated = crate::i18n::t_args(
+            "zc-chat-code-cwd-not-utf8",
+            &[("path", "/tmp/proj-\u{FFFD}")],
+        );
+        let notice = crate::i18n::t_args("zc-chat-change-directory-error", &[("error", "boom")]);
+
+        let merged =
+            merge_change_directory_notice(notice.clone(), Some(&unrelated), Some(&start_error));
+
+        assert_eq!(merged, notice);
+        assert!(
+            !merged.contains(&unrelated),
+            "a mismatched prior notice must not survive, got {merged}"
+        );
+    }
+
+    #[test]
+    fn explicit_cwd_rejects_a_relative_selection() {
+        // A relative root would be resolved against the *daemon's* process
+        // directory, not the directory the user picked — on either transport.
+        for transport in [
+            crate::client::Transport::Local,
+            crate::client::Transport::Wss,
+        ] {
+            let err = explicit_cwd(std::path::Path::new("relative/project"), transport)
+                .expect_err("relative roots must be rejected");
+            let LocalCodeCwdError::NotAbsolute(shown_path) = &err else {
+                panic!("expected NotAbsolute, got {err:?}");
+            };
+            assert_eq!(shown_path, "relative/project");
+            let shown = err.localized();
+            assert!(!shown.starts_with('{'), "unlocalized error text: {shown}");
+        }
+    }
+
+    #[test]
+    fn explicit_cwd_accepts_windows_roots_from_a_remote_daemon() {
+        // A Unix client may browse a Windows daemon: drive-letter and UNC
+        // roots are absolute there and must not be rejected by Unix rules.
+        assert_eq!(
+            explicit_cwd(
+                std::path::Path::new(r"C:\Users\dev\project"),
+                crate::client::Transport::Wss
+            ),
+            Ok(r"C:\Users\dev\project".to_string())
+        );
+        assert_eq!(
+            explicit_cwd(
+                std::path::Path::new(r"\\server\share\project"),
+                crate::client::Transport::Wss
+            ),
+            Ok(r"\\server\share\project".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_cwd_accepts_posix_roots_from_a_remote_daemon() {
+        // The mirror case: a Windows client browsing a Unix daemon confirms a
+        // slash-rooted wire path. `Path::is_absolute` says "no" there, but the
+        // daemon that will run the session says "yes", and it is the authority.
+        assert_eq!(
+            explicit_cwd(
+                std::path::Path::new("/srv/project"),
+                crate::client::Transport::Wss
+            ),
+            Ok("/srv/project".to_string())
+        );
+        assert_eq!(
+            explicit_cwd(std::path::Path::new("/"), crate::client::Transport::Wss),
+            Ok("/".to_string())
+        );
+    }
+
+    #[test]
+    fn remote_absolute_roots_do_not_depend_on_the_client_platform() {
+        // The daemon's platform decides, and this build cannot know it, so the
+        // remote rule consults no `cfg` and no `Path::is_absolute`. This test
+        // therefore asserts the same answers on every client platform.
+        for root in [
+            "/",
+            "/srv/project",
+            r"C:\project",
+            "C:/project",
+            r"\\host\share",
+            "//host/share",
+        ] {
+            assert!(
+                is_remote_absolute_session_root(root),
+                "{root} is a root on some daemon platform"
+            );
+        }
+        for root in ["", "relative/project", "C:", "C:project", r"\project"] {
+            assert!(
+                !is_remote_absolute_session_root(root),
+                "{root} is absolute on no platform"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_cwd_rejects_foreign_roots_for_a_local_unix_daemon() {
+        // Local transport runs the session on *this* machine, so a Windows
+        // form is not a root here — it is a relative directory name that would
+        // resolve against the daemon's process directory.
+        for root in [r"C:\Users\dev\project", r"\\server\share\project"] {
+            let err = explicit_cwd(std::path::Path::new(root), crate::client::Transport::Local)
+                .expect_err("a foreign root must not be accepted locally");
+            assert!(
+                matches!(&err, LocalCodeCwdError::NotAbsolute(shown) if shown == root),
+                "expected NotAbsolute({root}), got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn change_directory_start_dir_never_leaks_a_local_path_to_a_remote_daemon() {
+        // The picker browses the daemon's filesystem over WSS; a local
+        // process directory is meaningless (and leaky) there.
+        assert_eq!(
+            change_directory_start_dir(
+                Some("/remote/project"),
+                crate::client::Transport::Wss,
+                || Some(std::path::PathBuf::from("/local/launch")),
+            ),
+            std::path::PathBuf::from("/remote/project")
+        );
+        assert_eq!(
+            change_directory_start_dir(None, crate::client::Transport::Wss, || Some(
+                std::path::PathBuf::from("/local/launch")
+            )),
+            std::path::PathBuf::from("/"),
+            "a rootless remote session starts at the daemon root"
+        );
+        assert_eq!(
+            change_directory_start_dir(Some("  "), crate::client::Transport::Wss, || None),
+            std::path::PathBuf::from("/")
+        );
+    }
+
+    #[test]
+    fn change_directory_start_dir_stays_absolute_locally() {
+        let launch = std::path::PathBuf::from(native_absolute_root());
+        assert_eq!(
+            change_directory_start_dir(None, crate::client::Transport::Local, || Some(
+                launch.clone()
+            )),
+            launch
+        );
+        // Never `.`: a relative root is rejected at confirmation, so the
+        // picker would open on a directory the user could not select. The
+        // fallback is the local platform's root, not a hardcoded POSIX `/`
+        // that names nothing on Windows.
+        let fallback = change_directory_start_dir(None, crate::client::Transport::Local, || None);
+        assert!(
+            fallback.is_absolute(),
+            "the local fallback must be absolute, got {}",
+            fallback.display()
+        );
+        assert_eq!(
+            fallback,
+            std::path::PathBuf::from(if cfg!(windows) { r"C:\" } else { "/" })
+        );
+        // A launch directory that is not a root on *this* platform is
+        // filtered by the same transport-aware rule confirmation uses.
+        assert_eq!(
+            change_directory_start_dir(None, crate::client::Transport::Local, || Some(
+                std::path::PathBuf::from("relative/launch")
+            )),
+            fallback
+        );
+    }
+
+    #[test]
+    fn change_directory_start_dir_preserves_nonblank_saved_root_whitespace() {
+        let saved_root = if cfg!(windows) {
+            r"C:\\project "
+        } else {
+            "/tmp/project "
+        };
+        assert_eq!(
+            change_directory_start_dir(
+                Some(saved_root),
+                crate::client::Transport::Local,
+                || panic!("a saved root should win without probing the process cwd"),
+            ),
+            std::path::PathBuf::from(saved_root)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn change_directory_start_dir_rejects_a_foreign_root_locally() {
+        // A Windows form is not a local root on Unix; opening the picker
+        // there would strand it on a directory confirmation rejects.
+        assert_eq!(
+            change_directory_start_dir(None, crate::client::Transport::Local, || Some(
+                std::path::PathBuf::from(r"C:\Users\dev")
+            )),
+            std::path::PathBuf::from("/")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn change_directory_over_wss_browses_the_daemon_root() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            Arc::clone(&rpc),
+            crate::client::Transport::Wss,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        let state = ChatState::new(
+            "sess-remote".to_string(),
+            "alpha".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        chat.session_order.push("sess-remote".to_string());
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        let task = tokio::task::spawn_blocking(move || {
+            chat.begin_change_directory();
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "a remote picker lists the daemon root").await;
+        assert_eq!(request["method"], method::FS_LIST_DIR);
+        assert_eq!(
+            request["params"]["path"], "/",
+            "a rootless remote session must not browse the local process directory"
+        );
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({"cwd": "/", "entries": []}),
+        );
+
+        let chat = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the remote picker should open")
+            .unwrap();
+        assert!(matches!(chat.phase, ChatPhase::PickChangeDirectory { .. }));
+    }
+
+    #[tokio::test]
+    async fn startup_cwd_picker_rejects_a_relative_directory() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        // The startup picker must not fall back to an omitted cwd on a path
+        // it cannot send: the session would silently root at the agent
+        // workspace instead of the picked directory.
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            Arc::clone(&rpc),
+            crate::client::Transport::Wss,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        chat.phase = ChatPhase::PickCwd {
+            agent_alias: "alpha".to_string(),
+            explorer: FileExplorerState::new_dir_picker(std::path::PathBuf::from("relative/dir")),
+        };
+        // A retained failed-reconnect identity is only demoted when a valid
+        // root will actually be sent; a rejection must leave ownership alone.
+        chat.session_order.push("sess-retained".to_string());
+        chat.resume_focused = Some(resume_entry("sess-retained", "alpha", true));
+
+        let mut term = headless_term();
+        chat.handle_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+            &mut term,
+        )
+        .await;
+
+        let ChatPhase::Error(message) = &chat.phase else {
+            panic!("expected the create-session error, got another phase");
+        };
+        assert!(
+            message
+                .contains(&LocalCodeCwdError::NotAbsolute("relative/dir".to_string()).localized()),
+            "the rejection must be reported, got {message}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a rejected path must not reach session/new"
+        );
+        assert_eq!(
+            chat.resume_focused
+                .as_ref()
+                .map(|entry| entry.session_id.as_str()),
+            Some("sess-retained"),
+            "a path that never reaches session/new must not move resume ownership"
+        );
+        assert!(
+            chat.resume_backgrounds.is_empty(),
+            "a rejected path must not demote the retained identity"
+        );
+    }
+
+    /// Helper for the startup CWD picker tests: a WSS Code pane parked in
+    /// `PickCwd`. The explorer lists locally on purpose — `ConfirmDir` returns
+    /// its `cwd` either way, and a local listing keeps `fs/list_dir` chatter
+    /// out of the RPC channel the assertions read.
+    fn wss_code_chat_in_cwd_picker(rpc: &Arc<RpcOutbound>, start_dir: &str) -> Chat {
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            Arc::clone(rpc),
+            crate::client::Transport::Wss,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        chat.phase = ChatPhase::PickCwd {
+            agent_alias: "alpha".to_string(),
+            explorer: FileExplorerState::new_dir_picker(std::path::PathBuf::from(start_dir)),
+        };
+        chat
+    }
+
+    #[tokio::test]
+    async fn startup_cwd_picker_sends_the_selected_directory() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        // Happy path for the WSS Code picker: a confirmed absolute directory is
+        // the explicit root for a *fresh* session, so `session/new` carries it
+        // and no session id.
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = wss_code_chat_in_cwd_picker(&rpc, "/selected/project");
+
+        let task = tokio::spawn(async move {
+            let mut term = headless_term();
+            chat.handle_key(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+                &mut term,
+            )
+            .await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "confirming a directory starts a session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["agent_alias"], "alpha");
+        assert_eq!(request["params"]["cwd"], "/selected/project");
+        assert!(
+            request["params"]["session_id"].is_null(),
+            "a picked directory starts a fresh session"
+        );
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({"session_id": "sess-new", "workspace_dir": "/selected/project"}),
+        );
+        let request = next_rpc_request(&mut rx, "a new session refreshes model identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let chat = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the picked directory should start a session")
+            .unwrap();
+        assert_eq!(chat.current_session_id(), Some("sess-new"));
+        assert_eq!(chat.current_cwd(), Some("/selected/project"));
+    }
+
+    #[tokio::test]
+    async fn startup_cwd_picker_demotes_a_retained_resume_identity() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        // A failed reconnect leaves `resume_focused` set, and the WSS Code
+        // restart path re-opens this picker without clearing it. `start_session`
+        // prefers a resume id over `cwd_override`, so without demoting the
+        // retained entry the confirmed directory would be dropped and the old
+        // session silently resumed at *its* root — the same leak
+        // `begin_change_directory`/`add_agent_session` already guard against.
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = wss_code_chat_in_cwd_picker(&rpc, "/selected/project");
+        chat.session_order.push("sess-retained".to_string());
+        chat.resume_focused = Some(resume_entry("sess-retained", "alpha", true));
+
+        let task = tokio::spawn(async move {
+            let mut term = headless_term();
+            chat.handle_key(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+                &mut term,
+            )
+            .await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "confirming a directory starts a session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(
+            request["params"]["cwd"], "/selected/project",
+            "the explicit root must survive the retained resume identity"
+        );
+        assert!(
+            request["params"]["session_id"].is_null(),
+            "an explicit directory choice must not resume a retained session"
+        );
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({"session_id": "sess-new", "workspace_dir": "/selected/project"}),
+        );
+        let request = next_rpc_request(&mut rx, "a new session refreshes model identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        // The demoted identity is retried separately, carrying its own stable
+        // id — proof it was preserved rather than consumed by the pick.
+        let request = next_rpc_request(&mut rx, "the demoted entry is re-attached").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["session_id"], "sess-retained");
+        respond_err(&rpc, &request, -32000, "retained session gone");
+
+        let chat = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the picked directory should start a session")
+            .unwrap();
+        assert_eq!(chat.current_session_id(), Some("sess-new"));
+        assert_eq!(chat.current_cwd(), Some("/selected/project"));
+        assert!(
+            chat.resume_focused.is_none(),
+            "the retained identity must no longer own the focused resume slot"
+        );
+        assert!(
+            chat.resume_backgrounds
+                .iter()
+                .any(|entry| entry.session_id == "sess-retained" && !entry.was_focused),
+            "a failed background retry keeps the retained identity queued"
         );
     }
 
@@ -15279,16 +16555,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_local_acp_session_sends_process_cwd() {
+    async fn fresh_local_acp_session_omits_cwd_so_agent_workspace_wins() {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
         let mut chat = Chat::new(client, PaneKind::Acp);
-        let expected_cwd = std::env::current_dir()
-            .expect("process cwd")
-            .to_str()
-            .expect("utf-8 cwd")
-            .to_string();
 
         let init = tokio::spawn(async move {
             let _ = chat.init().await;
@@ -15328,11 +16599,121 @@ mod tests {
         assert_eq!(params["agent_alias"], "alpha");
         assert!(params["session_id"].is_null());
         assert_eq!(params["chat_mode"], "acp");
-        // Code sessions pin the directory zerocode was launched from so file
-        // and shell tools operate on that project, not the agent workspace.
-        assert_eq!(params["cwd"], expected_cwd);
+        // Regression guard: a fresh Code session must not send the TUI's
+        // launch directory. Omitting cwd lets the daemon root the session at
+        // the selected agent's configured workspace.
+        assert!(params["cwd"].is_null());
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-fresh",
+                "workspace_dir": "/agents/alpha/workspace"
+            }),
+        );
 
-        start.abort();
+        let request = next_rpc_request(&mut rx, "new session refreshes identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), start)
+            .await
+            .expect("start should finish")
+            .unwrap();
+        // The daemon-selected workspace is the session root of record.
+        assert_eq!(chat.current_cwd(), Some("/agents/alpha/workspace"));
+    }
+
+    #[tokio::test]
+    async fn fresh_local_acp_session_sends_explicit_cwd() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            Arc::clone(&rpc),
+            crate::client::Transport::Local,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        let task = tokio::spawn(async move {
+            chat.start_session("alpha", Some("/selected/project")).await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "explicit local Code session should start").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert!(request["params"]["session_id"].is_null());
+        // An explicit selection is sent verbatim: the daemon must root the
+        // session exactly where the picker confirmed.
+        assert_eq!(request["params"]["cwd"], "/selected/project");
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-selected",
+                "workspace_dir": "/selected/project"
+            }),
+        );
+
+        let request = next_rpc_request(&mut rx, "new session refreshes identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("start should finish")
+            .unwrap();
+        assert_eq!(chat.current_cwd(), Some("/selected/project"));
+    }
+
+    #[tokio::test]
+    async fn resumed_local_acp_session_keeps_saved_cwd() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            Arc::clone(&rpc),
+            crate::client::Transport::Local,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        chat.set_resume_sessions(vec![resume_entry("sess-saved", "alpha", true)]);
+        let task = tokio::spawn(async move {
+            chat.start_session("alpha", None).await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "resume should reattach the saved session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["session_id"], "sess-saved");
+        // A resume must send no replacement cwd: the daemon keeps the root the
+        // retained session was created with, whatever this process's directory
+        // or the agent's workspace is now.
+        assert!(request["params"]["cwd"].is_null());
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-saved",
+                "workspace_dir": "/saved/project"
+            }),
+        );
+
+        let request = next_rpc_request(&mut rx, "resume refreshes identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let request = next_rpc_request(&mut rx, "resume replays the retained transcript").await;
+        assert_eq!(request["method"], method::SESSION_MESSAGES);
+        assert_eq!(request["params"]["session_id"], "sess-saved");
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({ "messages": [], "total": 0 }),
+        );
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("resume should finish")
+            .unwrap();
+        assert_eq!(chat.current_session_id(), Some("sess-saved"));
+        assert_eq!(chat.current_cwd(), Some("/saved/project"));
     }
 
     #[tokio::test]
@@ -15381,15 +16762,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_local_acp_session_sends_process_cwd() {
+    async fn restart_local_acp_session_omits_cwd_so_agent_workspace_wins() {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let expected_cwd = std::env::current_dir()
-            .expect("process cwd")
-            .to_str()
-            .expect("utf-8 cwd")
-            .to_string();
         let mut state = ChatState::new(
             "sess-old".to_string(),
             "alpha".to_string(),
@@ -15397,7 +16773,8 @@ mod tests {
         );
 
         let restart = tokio::spawn(async move {
-            Chat::restart_session_for_state(&client, PaneKind::Acp, &mut state).await
+            let phase = Chat::restart_session_for_state(&client, PaneKind::Acp, &mut state).await;
+            (state, phase)
         });
 
         let request = next_rpc_request(&mut rx, "restart should start a fresh ACP session").await;
@@ -15406,11 +16783,16 @@ mod tests {
         assert_eq!(params["agent_alias"], "alpha");
         assert!(params["session_id"].is_null());
         assert_eq!(params["chat_mode"], "acp");
-        assert_eq!(params["cwd"], expected_cwd);
+        // Regression guard: a restart mints a *fresh* session, so it must not
+        // send the TUI's launch directory either.
+        assert!(params["cwd"].is_null());
         respond_ok(
             &rpc,
             &request,
-            serde_json::json!({ "session_id": "sess-fresh", "workspace_dir": expected_cwd }),
+            serde_json::json!({
+                "session_id": "sess-fresh",
+                "workspace_dir": "/agents/alpha/workspace"
+            }),
         );
 
         let request = next_rpc_request(&mut rx, "restart should close the old session").await;
@@ -15422,11 +16804,13 @@ mod tests {
         assert_eq!(request["method"], method::CONFIG_LIST);
         respond_ok(&rpc, &request, serde_json::json!([]));
 
-        let phase = tokio::time::timeout(Duration::from_secs(2), restart)
+        let (state, phase) = tokio::time::timeout(Duration::from_secs(2), restart)
             .await
             .expect("restart should finish")
             .unwrap();
         assert!(phase.is_none());
+        // The replacement session adopts the daemon-selected workspace.
+        assert_eq!(state.cwd.as_deref(), Some("/agents/alpha/workspace"));
     }
 
     #[tokio::test]

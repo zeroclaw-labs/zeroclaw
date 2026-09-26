@@ -422,8 +422,10 @@ zc-chat-resyncing = Se perdieron algunas actualizaciones en vivo. Recargando est
 zc-chat-resynced = Se perdieron actualizaciones en vivo, por lo que se recargó la conversación persistente. Se canceló cualquier aprobación o pregunta en curso.
 zc-chat-resync-failed = Se perdieron actualizaciones en vivo y no se pudo recargar la sesión: { $error }
 zc-chat-session-restart-error = No se pudo iniciar una nueva sesión: { $error }
-zc-chat-code-cwd-unavailable = No se puede determinar el directorio desde el que se inició zerocode: { $error }. Una sesión local de Code debe comenzar en ese proyecto, por lo que no se creó.
-zc-chat-code-cwd-not-utf8 = El directorio desde el que se inició zerocode no es UTF-8 válido ({ $path }), por lo que una sesión local de Code no puede iniciarse allí. Reinicie zerocode desde una ruta UTF-8.
+zc-chat-code-cwd-not-utf8 = El directorio seleccionado no es UTF-8 válido ({ $path }), por lo que no se creó la sesión de Code. Elija un directorio cuya ruta sea UTF-8 válido.
+zc-chat-code-cwd-not-absolute = El directorio seleccionado no es una ruta absoluta ({ $path }), por lo que no se creó la nueva sesión de Code. Elija un directorio desde la raíz del sistema de archivos en el que se ejecuta la sesión.
+zc-chat-change-directory-error = No se pudo iniciar una sesión en el directorio seleccionado: { $error }
+zc-chat-change-directory-chat-only = Las sesiones de Chat siguen el espacio de trabajo del agente seleccionado, por lo que aquí no hay ningún directorio que elegir. Use el panel Code para iniciar una sesión en otro directorio.
 zc-chat-thinking-visible = Salida de razonamiento: visible
 zc-chat-thinking-hidden = Salida de razonamiento: oculta
 zc-model-picker-hint = Escribe un nombre de modelo después de /model, o Tab para autocompletar.
@@ -464,6 +466,7 @@ zc-chat-help-browse-mode = Modo de navegación
 zc-chat-help-scroll-conversation = Desplazar conversación
 zc-chat-help-toggle-thoughts = Alternar pensamientos
 zc-chat-help-new-session = Nueva sesión
+zc-chat-help-change-directory = Elija un directorio e inicie una nueva sesión de Code
 zc-chat-session-list-resume-title = Sesiones guardadas (Intro=reanudar, Esc=nueva)
 zc-chat-session-list-switch-title = Sesiones (Intro=cambiar, Esc=cerrar)
 zc-elicit-help-toggle = Alternar opción

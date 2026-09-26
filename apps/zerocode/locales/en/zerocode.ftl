@@ -471,8 +471,10 @@ zc-chat-resyncing = Some live updates were missed. Reloading this session before
 zc-chat-resynced = Live updates were missed, so the durable transcript was reloaded. Any in-progress approval or question was cancelled.
 zc-chat-resync-failed = Live updates were missed and the session could not be reloaded: { $error }
 zc-chat-session-restart-error = Failed to start a new session: { $error }
-zc-chat-code-cwd-unavailable = Cannot determine the directory zerocode was launched from: { $error }. A local Code session must start in that project, so it was not created.
-zc-chat-code-cwd-not-utf8 = The directory zerocode was launched from is not valid UTF-8 ({ $path }), so a local Code session cannot start there. Relaunch zerocode from a UTF-8 path.
+zc-chat-code-cwd-not-utf8 = The selected directory is not valid UTF-8 ({ $path }), so the Code session was not created. Pick a directory whose path is valid UTF-8.
+zc-chat-code-cwd-not-absolute = The selected directory is not an absolute path ({ $path }), so the new Code session was not created. Pick a directory from the root of the filesystem the session runs on.
+zc-chat-change-directory-error = Failed to start a session in the selected directory: { $error }
+zc-chat-change-directory-chat-only = Chat sessions follow the selected agent's workspace, so there is no directory to choose here. Use the Code pane to start a session in a different directory.
 
 zc-chat-thinking-visible = Thinking output: visible
 zc-chat-thinking-hidden = Thinking output: hidden
@@ -519,6 +521,7 @@ zc-chat-help-browse-mode = Browse mode
 zc-chat-help-scroll-conversation = Scroll conversation
 zc-chat-help-toggle-thoughts = Toggle thoughts
 zc-chat-help-new-session = New session
+zc-chat-help-change-directory = Choose a directory and start a new Code session
 zc-chat-help-acp-memory = History saved & resumable; persistent memory isolated
 zc-chat-session-list-resume-title = Saved sessions (Enter=resume, Esc=new)
 zc-chat-session-list-resume-note = Session history saved & resumable · Persistent memory isolated

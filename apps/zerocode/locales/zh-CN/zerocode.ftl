@@ -422,8 +422,10 @@ zc-chat-resyncing = 部分实时更新丢失。正在重新加载此会话，然
 zc-chat-resynced = 实时更新丢失，因此已重新加载持久化对话。任何进行中的审批或提问均已取消。
 zc-chat-resync-failed = 实时更新丢失，且无法重新加载会话：{ $error }
 zc-chat-session-restart-error = 无法启动新会话：{ $error }
-zc-chat-code-cwd-unavailable = 无法确定启动 zerocode 的目录：{ $error }。本地 Code 会话必须在该项目中启动，因此未创建会话。
-zc-chat-code-cwd-not-utf8 = 启动 zerocode 的目录不是有效的 UTF-8（{ $path }），因此本地 Code 会话无法在该目录启动。请从 UTF-8 路径重新启动 zerocode。
+zc-chat-code-cwd-not-utf8 = 所选目录不是有效的 UTF-8（{ $path }），因此未创建 Code 会话。请选择路径为有效 UTF-8 的目录。
+zc-chat-code-cwd-not-absolute = 所选目录不是绝对路径（{ $path }），因此未创建新的 Code 会话。请从会话所在文件系统的根目录开始选择。
+zc-chat-change-directory-error = 无法在所选目录中启动会话：{ $error }
+zc-chat-change-directory-chat-only = Chat 会话跟随所选代理的工作区，因此这里没有可选择的目录。若要在其他目录中启动会话，请使用 Code 面板。
 zc-chat-thinking-visible = 思考输出：可见
 zc-chat-thinking-hidden = 思考输出：已隐藏
 zc-model-picker-hint = 在 /model 后输入模型名称，或按 Tab 自动补全。
@@ -464,6 +466,7 @@ zc-chat-help-browse-mode = 浏览模式
 zc-chat-help-scroll-conversation = 滚动对话
 zc-chat-help-toggle-thoughts = 切换思考
 zc-chat-help-new-session = 新建会话
+zc-chat-help-change-directory = 选择一个目录并启动新的 Code 会话
 zc-chat-session-list-resume-title = 已保存会话（Enter=恢复，Esc=新建）
 zc-chat-session-list-switch-title = 会话（Enter=切换，Esc=关闭）
 zc-elicit-help-toggle = 切换选项

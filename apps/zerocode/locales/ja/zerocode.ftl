@@ -422,8 +422,10 @@ zc-chat-resyncing = 一部のライブ更新を受信できませんでした。
 zc-chat-resynced = ライブ更新を受信できなかったため、永続化された会話を再読み込みしました。進行中の承認や質問はキャンセルされました。
 zc-chat-resync-failed = ライブ更新を受信できず、セッションを再読み込みできませんでした: { $error }
 zc-chat-session-restart-error = 新しいセッションを開始できませんでした: { $error }
-zc-chat-code-cwd-unavailable = zerocode を起動したディレクトリを特定できません: { $error }。ローカルの Code セッションはそのプロジェクトで開始する必要があるため、作成されませんでした。
-zc-chat-code-cwd-not-utf8 = zerocode を起動したディレクトリが有効な UTF-8 ではないため ({ $path })、ローカルの Code セッションを開始できません。UTF-8 のパスから zerocode を起動し直してください。
+zc-chat-code-cwd-not-utf8 = 選択したディレクトリが有効な UTF-8 ではないため ({ $path })、Code セッションは作成されませんでした。パスが有効な UTF-8 のディレクトリを選んでください。
+zc-chat-code-cwd-not-absolute = 選択したディレクトリは絶対パスではないため ({ $path })、新しい Code セッションは作成されませんでした。セッションが動作するファイルシステムのルートからディレクトリを選んでください。
+zc-chat-change-directory-error = 選択したディレクトリでセッションを開始できませんでした: { $error }
+zc-chat-change-directory-chat-only = Chat セッションは選択したエージェントのワークスペースに従うため、ここで選べるディレクトリはありません。別のディレクトリでセッションを開始するには Code ペインを使用してください。
 zc-chat-thinking-visible = 思考出力: 表示
 zc-chat-thinking-hidden = 思考出力: 非表示
 zc-model-picker-hint = /model の後にモデル名を入力するか、Tab で自動補完します。
@@ -464,6 +466,7 @@ zc-chat-help-browse-mode = 閲覧モード
 zc-chat-help-scroll-conversation = 会話をスクロール
 zc-chat-help-toggle-thoughts = 思考を切り替え
 zc-chat-help-new-session = 新しいセッション
+zc-chat-help-change-directory = ディレクトリを選んで新しい Code セッションを開始
 zc-chat-session-list-resume-title = 保存済みセッション (Enter=再開, Esc=新規)
 zc-chat-session-list-switch-title = セッション (Enter=切替, Esc=閉じる)
 zc-elicit-help-toggle = 選択を切り替え
