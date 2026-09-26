@@ -1722,7 +1722,7 @@ pub async fn run(
         tool_descs.push(("cron_runs", "Show recent run history for a cron job."));
         tool_descs.push((
         "screenshot",
-        "Capture a screenshot of the current screen. Returns file path and base64-encoded PNG. Use when: visual verification, UI inspection, debugging displays.",
+        "Capture a screenshot of the current screen. Returns the saved file path. Use when: visual verification, UI inspection, debugging displays.",
     ));
         tool_descs.push((
         "image_info",

@@ -159,7 +159,7 @@ tool-sessions-history-header = Session '{ $session_id }': showing { $shown }/{ $
 tool-sessions-send-error-acp-unsupported = { $tool } does not support { $channel } sessions because durable transcript writes do not deliver messages to the live { $product } session.
 tool-sessions-current-channel = Channel: { $channel }
 
-tool-screenshot = Capture a screenshot of the current screen. Returns the file path and base64-encoded PNG data.
+tool-screenshot = Capture a screenshot of the current screen. Returns the saved file path.
 tool-browser-screenshot-error-path-not-allowed = Screenshot path '{ $path }' is not in the workspace allowlist
 tool-browser-screenshot-error-parent-not-exist = Screenshot path '{ $path }' parent directory '{ $parent }' does not exist
 tool-browser-screenshot-error-path-outside-workspace = Screenshot path '{ $path }' resolves to '{ $canonical }' which is outside the workspace

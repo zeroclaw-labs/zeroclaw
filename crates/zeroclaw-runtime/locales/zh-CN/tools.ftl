@@ -99,7 +99,7 @@ tool-project-intel = 项目交付智能：生成状态报告、检测风险、�
 tool-proxy-config = 管理 ZeroClaw 代理设置（范围：environment | zeroclaw | services），包括运行时和进程环境变量应用
 tool-pushover = 向你的设备发送 Pushover 通知。需要 .env 文件中的 PUSHOVER_TOKEN 和 PUSHOVER_USER_KEY。
 tool-schedule = 管理仅限 shell 的定时任务。操作：create/add/once/list/get/cancel/remove/pause/resume。警告：此工具创建的 shell 任务输出仅被记录，不会投递到任何频道。要向 Discord/Telegram/Slack/Matrix 发送定时消息，请使用 cron_add 工具，并设置 job_type='agent' 和如 {"{"}"mode":"announce","channel":"discord","to":"<channel_id>"{"}"} 的 delivery 配置。
-tool-screenshot = 捕获当前屏幕的截图。返回文件路径和 base64 编码的 PNG 数据。
+tool-screenshot = 捕获当前屏幕的截图。返回已保存文件的路径。
 tool-browser-screenshot-error-path-not-allowed = 截图路径 '{ $path }' 不在工作区允许列表中
 tool-browser-screenshot-error-parent-not-exist = 截图路径 '{ $path }' 的父目录 '{ $parent }' 不存在
 tool-browser-screenshot-error-path-outside-workspace = 截图路径 '{ $path }' 解析为 '{ $canonical }'，位于工作区之外

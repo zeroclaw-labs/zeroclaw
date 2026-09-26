@@ -13948,6 +13948,8 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "cap-fs-ext",
+ "cap-std",
  "chrono",
  "clap",
  "clap-markdown",

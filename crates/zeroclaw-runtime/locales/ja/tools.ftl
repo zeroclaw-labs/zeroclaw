@@ -99,7 +99,7 @@ tool-project-intel = プロジェクト配信インテリジェンス：ステ�
 tool-proxy-config = ZeroClawプロキシ設定を管理（スコープ：environment | zeroclaw | services）。ランタイムおよびプロセス環境アプリケーション含む
 tool-pushover = Pushover通知をデバイスに送信します。.envファイルにPUSHOVER_TOKENおよびPUSHOVER_USER_KEYが必要。
 tool-schedule = スケジュール済みシェルのみのタスクを管理します。アクション：create/add/once/list/get/cancel/remove/pause/resume。警告：このツールは、出力がログに記録されるのみで、チャネルに配信されないシェルジョブを作成します。Discord/Telegram/Slack/Matrixにスケジュール済みメッセージを送信するには、job_type='agent'とdelivery配信設定（例：{"{"}"mode":"announce","channel":"discord","to":"<channel_id>"{"}"}）付きのcron_addツールを使用してください。
-tool-screenshot = 現在の画面のスクリーンショットをキャプチャします。ファイルパスと基数64エンコード済みPNGデータを返します。
+tool-screenshot = 現在の画面のスクリーンショットをキャプチャします。保存先のファイルパスを返します。
 tool-browser-screenshot-error-path-not-allowed = スクリーンショットのパス「{ $path }」はワークスペースの許可リストに含まれていません
 tool-browser-screenshot-error-parent-not-exist = スクリーンショットのパス「{ $path }」の親ディレクトリ「{ $parent }」が存在しません
 tool-browser-screenshot-error-path-outside-workspace = スクリーンショットのパス「{ $path }」は「{ $canonical }」に解決されますが、ワークスペース外です

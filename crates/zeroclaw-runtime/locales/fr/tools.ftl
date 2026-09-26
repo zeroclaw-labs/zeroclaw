@@ -99,7 +99,7 @@ tool-project-intel = Intelligence de livraison de projet : générer des rapport
 tool-proxy-config = Gérer les paramètres du proxy ZeroClaw (portée : environment | zeroclaw | services), y compris l'application des variables d'environnement de l'environnement d'exécution et du processus.
 tool-pushover = Envoyer une notification Pushover à votre appareil. Nécessite PUSHOVER_TOKEN et PUSHOVER_USER_KEY dans le fichier .env.
 tool-schedule = Gérer les tâches planifiées en mode shell uniquement. Actions : create/add/once/list/get/cancel/remove/pause/resume. AVERTISSEMENT : Cet outil crée des jobs shell dont la sortie est uniquement enregistrée et n’est envoyée à aucun canal. Pour envoyer un message planifié à Discord/Telegram/Slack/Matrix, utilisez l’outil cron_add avec job_type='agent' et une configuration de livraison comme {"{"}"mode":"announce","channel":"discord","to":"<channel_id>"{"}"}.
-tool-screenshot = Capture une capture d'écran de l'écran actuel. Renvoie le chemin du fichier et les données PNG encodées en base64.
+tool-screenshot = Capture une capture d'écran de l'écran actuel. Renvoie le chemin du fichier enregistré.
 tool-browser-screenshot-error-path-not-allowed = Le chemin de Screenshot « { $path } » ne figure pas dans la liste des chemins autorisés de l’espace de travail
 tool-browser-screenshot-error-parent-not-exist = Le répertoire parent « { $parent } » du chemin de Screenshot « { $path } » n’existe pas
 tool-browser-screenshot-error-path-outside-workspace = Le chemin de Screenshot « { $path } » correspond à « { $canonical } », qui se trouve en dehors de l’espace de travail
