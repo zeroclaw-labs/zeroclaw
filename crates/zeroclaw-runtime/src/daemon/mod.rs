@@ -100,6 +100,53 @@ impl GatewayReadinessReporter {
     }
 }
 
+/// Start the live-pricing refresher for the process that owns the runtime.
+///
+/// The daemon calls this once per generation, and the standalone
+/// `zeroclaw gateway` command calls it when there is no daemon. Each call
+/// re-binds the refresher to the given config, so a reload is honored without
+/// a restart, and the refresher itself starts at most once per process. It is
+/// a no-op unless a provider sets `live_pricing = true`.
+pub fn spawn_pricing_refresher(config: &Config) {
+    zeroclaw_providers::pricing::spawn_refresher(std::sync::Arc::new(parking_lot::RwLock::new(
+        config.clone(),
+    )));
+}
+
+/// Wrap a gateway readiness reporter so the `on_gateway_start` hook fires when
+/// the gateway reports the address it actually bound.
+///
+/// The process that owns the gateway (the daemon, or the standalone
+/// `zeroclaw gateway` command) owns the hook, not the gateway listener. The
+/// hook fires at most once per reporter, and each gateway start gets a fresh
+/// reporter, so every start fires it exactly once even if readiness is
+/// reported again. `host` is the configured bind host; the port is the one the
+/// listener actually bound, which differs from the configured port when that
+/// is 0. The hook runs on its own task so a slow handler cannot delay the
+/// listener. Returns `inner` unchanged when hooks are disabled.
+pub fn gateway_start_hook_reporter(
+    hooks: Option<std::sync::Arc<crate::hooks::HookRunner>>,
+    host: String,
+    inner: Option<GatewayReadinessReporter>,
+) -> Option<GatewayReadinessReporter> {
+    let Some(hooks) = hooks else {
+        return inner;
+    };
+    let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    Some(GatewayReadinessReporter::new(move |addr| {
+        if !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let hooks = std::sync::Arc::clone(&hooks);
+            let host = host.clone();
+            zeroclaw_spawn::spawn!(async move {
+                hooks.fire_gateway_start(&host, addr.port()).await;
+            });
+        }
+        if let Some(inner) = &inner {
+            inner.report_ready(addr);
+        }
+    }))
+}
+
 #[derive(Clone)]
 pub struct SocketReadinessReporter(std::sync::Arc<dyn Fn() + Send + Sync>);
 
@@ -531,6 +578,10 @@ pub async fn run(
 
     crate::agent::pricing_catalog::load_global_pricing_catalog(&config.data_dir);
 
+    // The daemon owns the live-pricing refresher, so it runs whether or not the
+    // gateway is enabled.
+    spawn_pricing_refresher(&config);
+
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
 
     // Reload channel: gateway's /admin/reload writes here; our wait loop
@@ -577,6 +628,12 @@ pub async fn run(
         let gateway_tui_registry = tui_registry.clone();
         let gateway_start = std::sync::Arc::new(gateway_start);
         let gateway_readiness_tx = startup_readiness_tx.clone();
+        // The daemon owns the gateway-start hook. It is built once per daemon
+        // generation and fired from each gateway start's readiness report.
+        let gateway_hooks: Option<std::sync::Arc<crate::hooks::HookRunner>> = config
+            .hooks
+            .enabled
+            .then(|| std::sync::Arc::new(crate::hooks::HookRunner::from_config(&config.hooks)));
         handles.push(spawn_component_supervisor(
             "gateway",
             initial_backoff,
@@ -592,6 +649,11 @@ pub async fn run(
                 let pairing = gateway_pairing.as_ref().clone();
                 let (readiness_attempt, readiness_reporter) =
                     StartupReadinessAttempt::gateway(gateway_readiness_tx.clone());
+                let readiness_reporter = gateway_start_hook_reporter(
+                    gateway_hooks.clone(),
+                    host.clone(),
+                    readiness_reporter,
+                );
                 async move {
                     let _readiness_attempt = readiness_attempt;
                     start(
@@ -6421,5 +6483,150 @@ mod tests {
 
         // `_hook_guard` drops here, releasing the serialising lock
         // and clearing the global hook for the next test.
+    }
+
+    /// The daemon owns the live-pricing refresher, so it must run with the
+    /// gateway disabled. This drives the real daemon with no gateway registered
+    /// and a provider opted into live pricing, and waits for the refresher.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn pricing_refresher_runs_with_the_gateway_disabled() {
+        use tokio::time::{Duration, Instant, sleep};
+
+        let _broadcast_guard = hold_log_broadcast();
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.providers.models.ollama.insert(
+            "priced".to_string(),
+            zeroclaw_config::schema::OllamaModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    // Discard port: the refresher's fetch fails fast, which
+                    // keeps the previous (empty) snapshot. Only the start matters.
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    model: Some("priced-model".to_string()),
+                    live_pricing: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert!(
+            !zeroclaw_providers::pricing::refresher_running(),
+            "nothing else in this process opts into live pricing"
+        );
+
+        // No gateway is registered: the daemon runs with the gateway disabled.
+        let registry = DaemonRegistry::new();
+        let daemon = run(config, "127.0.0.1".to_string(), 0, registry, false, false);
+        tokio::pin!(daemon);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if zeroclaw_providers::pricing::refresher_running() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the daemon must start the pricing refresher without a gateway"
+            );
+            tokio::select! {
+                result = &mut daemon => panic!("daemon exited before the check: {result:?}"),
+                () = sleep(Duration::from_millis(20)) => {}
+            }
+        }
+    }
+
+    /// Records every `on_gateway_start` call.
+    struct RecordingGatewayStartHook(std::sync::Arc<std::sync::Mutex<Vec<(String, u16)>>>);
+
+    #[async_trait::async_trait]
+    impl crate::hooks::HookHandler for RecordingGatewayStartHook {
+        fn name(&self) -> &str {
+            "record-gateway-start"
+        }
+        async fn on_gateway_start(&self, host: &str, port: u16) {
+            self.0.lock().unwrap().push((host.to_string(), port));
+        }
+    }
+
+    /// The gateway-start hook fires exactly once per gateway start, with the
+    /// port the listener actually bound, even if readiness is reported again,
+    /// and the wrapped readiness reporter still sees every report.
+    #[tokio::test]
+    async fn gateway_start_hook_fires_once_per_gateway_start_with_the_bound_port() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::time::{Duration, sleep};
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut runner = crate::hooks::HookRunner::new();
+        runner.register(Box::new(RecordingGatewayStartHook(seen.clone())));
+        let runner = std::sync::Arc::new(runner);
+
+        let inner_reports = std::sync::Arc::new(AtomicUsize::new(0));
+        let inner = {
+            let inner_reports = inner_reports.clone();
+            GatewayReadinessReporter::new(move |_addr| {
+                inner_reports.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+
+        // First gateway start. The configured port was 0; the listener bound 43210.
+        let first = gateway_start_hook_reporter(
+            Some(runner.clone()),
+            "0.0.0.0".to_string(),
+            Some(inner.clone()),
+        )
+        .expect("hooks enabled yields a reporter");
+        let bound: std::net::SocketAddr = "0.0.0.0:43210".parse().unwrap();
+        first.report_ready(bound);
+        first.report_ready(bound);
+
+        let wait_for = |n: usize| {
+            let seen = seen.clone();
+            async move {
+                for _ in 0..100 {
+                    if seen.lock().unwrap().len() >= n {
+                        return;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+            }
+        };
+        wait_for(1).await;
+        // Give a wrongly repeated fire time to land before asserting it did not.
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![("0.0.0.0".to_string(), 43210)],
+            "one gateway start fires the hook once, with the bound port"
+        );
+        assert_eq!(
+            inner_reports.load(Ordering::SeqCst),
+            2,
+            "every readiness report still reaches the wrapped reporter"
+        );
+
+        // A later gateway start (supervisor restart or reload) gets a fresh
+        // reporter and fires once more.
+        let second = gateway_start_hook_reporter(Some(runner), "0.0.0.0".to_string(), Some(inner))
+            .expect("hooks enabled yields a reporter");
+        second.report_ready("0.0.0.0:43211".parse().unwrap());
+        wait_for(2).await;
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "each gateway start fires the hook exactly once"
+        );
+    }
+
+    #[test]
+    fn gateway_start_hook_reporter_is_a_passthrough_when_hooks_are_disabled() {
+        assert!(gateway_start_hook_reporter(None, "127.0.0.1".to_string(), None).is_none());
+        let inner = GatewayReadinessReporter::new(|_addr| {});
+        assert!(
+            gateway_start_hook_reporter(None, "127.0.0.1".to_string(), Some(inner)).is_some(),
+            "with hooks disabled the readiness reporter is returned unchanged"
+        );
     }
 }

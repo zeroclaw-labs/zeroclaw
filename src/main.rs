@@ -12177,12 +12177,23 @@ async fn run_gateway_if_enabled(
     // can self-respawn after the listener is released. Must mirror the same
     // call in the Daemon branch.
     zeroclaw_runtime::restart::record_launch();
+    // With no daemon, this command owns what the daemon would: the
+    // live-pricing refresher and the gateway-start hook, which fires once
+    // the listener reports its bound address.
+    zeroclaw_runtime::daemon::spawn_pricing_refresher(&config);
+    let hooks = config.hooks.enabled.then(|| {
+        std::sync::Arc::new(zeroclaw_runtime::hooks::HookRunner::from_config(
+            &config.hooks,
+        ))
+    });
+    let readiness =
+        zeroclaw_runtime::daemon::gateway_start_hook_reporter(hooks, host.to_string(), None);
     // Standalone gateway (no daemon supervisor): pass None for reload_tx so
     // /admin/reload returns 503 with a clear "no supervisor; restart
     // manually" message, None for tui_registry (no TUI socket), and None
     // for canvas_store so the gateway falls back to its own default.
     let result = Box::pin(gateway::run_gateway(
-        host, port, config, tx, None, None, None, None, None, None, None, None,
+        host, port, config, tx, None, None, None, None, None, None, None, readiness,
     ))
     .await;
     // Self-respawn after the listener is released, if an in-app upgrade

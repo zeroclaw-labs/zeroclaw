@@ -141,6 +141,15 @@ fn any_live_pricing(config: &Config) -> bool {
         .any(|(_, _, base)| base.live_pricing)
 }
 
+/// Whether the background price refresher has been started in this process.
+///
+/// Read-only: it reports the once-per-process guard [`spawn_refresher`]
+/// claims, so an owner can confirm the refresher runs without depending on
+/// which component started it.
+pub fn refresher_running() -> bool {
+    REFRESHER_STARTED.get().is_some()
+}
+
 /// Spawn the background price refresher, once per process.
 ///
 /// No-op when no provider currently sets `live_pricing = true`: zero network,

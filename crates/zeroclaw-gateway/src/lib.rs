@@ -903,16 +903,6 @@ pub async fn run_gateway_with_plugin_webhooks(
     }
     let config_state = Arc::new(RwLock::new(config.clone()));
 
-    // ── Hooks ──────────────────────────────────────────────────────
-    let hooks: Option<std::sync::Arc<zeroclaw_runtime::hooks::HookRunner>> = if config.hooks.enabled
-    {
-        Some(std::sync::Arc::new(
-            zeroclaw_runtime::hooks::HookRunner::new(),
-        ))
-    } else {
-        None
-    };
-
     let addr: SocketAddr = match zeroclaw_infra::parse_gateway_bind_socket_addr(host, port) {
         Ok(a) => a,
         Err(e) => {
@@ -1290,11 +1280,10 @@ pub async fn run_gateway_with_plugin_webhooks(
     // Cost tracker — process-global singleton so channels share the same instance
     let cost_tracker = CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir);
 
-    // Live model-pricing refresher (once per process; idempotent, no-op unless a
-    // provider sets `live_pricing = true`). Each call re-binds the refresher's
-    // config handle, so reloads that re-instantiate the config Arc are honored
-    // without a restart; shares the global price snapshot the cost path reads.
-    zeroclaw_providers::pricing::spawn_refresher(config_state.clone());
+    // The live-pricing refresher and the gateway-start hook belong to the
+    // process that owns this listener (the daemon, or the standalone
+    // `zeroclaw gateway` command), not to the listener: the refresher must run
+    // with the gateway disabled, and the hook fires from the readiness report.
 
     // SSE broadcast channel for real-time events.
     // Use an externally provided sender (e.g. from the daemon) so that other
@@ -1729,11 +1718,6 @@ pub async fn run_gateway_with_plugin_webhooks(
     println!("  Press Ctrl+C to stop.\n");
 
     zeroclaw_runtime::health::mark_component_ok("gateway");
-
-    // Fire gateway start hook
-    if let Some(ref hooks) = hooks {
-        hooks.fire_gateway_start(host, actual_port).await;
-    }
 
     let broadcast_layer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::new(
         sse::BroadcastObserver::new(event_tx.clone(), event_buffer.clone()),
