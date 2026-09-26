@@ -5239,14 +5239,18 @@ impl RpcDispatcher {
 
         // Keep the terminal count aligned with session/new and session/messages:
         // it is the durable projected conversation length, not the number of
-        // visible TUI bubbles or local user turns.
+        // visible TUI bubbles or local user turns. The store maintains this
+        // counter as turns are appended, so reading it here avoids hydrating
+        // the whole history on every turn end.
         let message_count = match chat_mode {
-            crate::rpc::types::ChatMode::Acp => self
-                .ctx
-                .acp_session_store
-                .as_ref()
-                .and_then(|store| store.load_session(&req.session_id).ok().flatten())
-                .map(|data| conversation_message_entries(&data.messages).len()),
+            crate::rpc::types::ChatMode::Acp => {
+                self.ctx.acp_session_store.as_ref().and_then(|store| {
+                    store
+                        .projected_message_count(&req.session_id)
+                        .ok()
+                        .flatten()
+                })
+            }
             crate::rpc::types::ChatMode::Chat => self
                 .ctx
                 .session_backend
@@ -20541,6 +20545,212 @@ mod tests {
         ));
     }
 
+    /// The representative parity shape both count-parity tests replay: a
+    /// user chat, a batch with text and two calls, a folded and a duplicate
+    /// result, a reused call id, a degenerate empty batch, and results
+    /// including an orphan. Projects to 7 entries.
+    fn parity_fixture() -> Vec<ConversationMessage> {
+        use zeroclaw_api::model_provider::{ToolCall, ToolResultMessage};
+
+        vec![
+            ConversationMessage::Chat(ChatMessage::user("plain chat")),
+            ConversationMessage::AssistantToolCalls {
+                text: Some("batch with text".into()),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "shared".into(),
+                        name: "shell".into(),
+                        arguments: r#"{"command":"pwd"}"#.into(),
+                        extra_content: None,
+                    },
+                    ToolCall {
+                        id: "solo".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    },
+                ],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![
+                ToolResultMessage {
+                    tool_call_id: "shared".into(),
+                    content: "/tmp".into(),
+                    tool_name: "shell".into(),
+                },
+                ToolResultMessage {
+                    tool_call_id: "shared".into(),
+                    content: "duplicate result".into(),
+                    tool_name: "shell".into(),
+                },
+            ]),
+            ConversationMessage::AssistantToolCalls {
+                text: Some(String::new()),
+                tool_calls: vec![ToolCall {
+                    id: "shared".into(),
+                    name: "shell".into(),
+                    arguments: r#"{"command":"ls"}"#.into(),
+                    extra_content: None,
+                }],
+                reasoning_content: None,
+            },
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![
+                ToolResultMessage {
+                    tool_call_id: "solo".into(),
+                    content: "contents".into(),
+                    tool_name: "read".into(),
+                },
+                ToolResultMessage {
+                    tool_call_id: "shared".into(),
+                    content: "second fold".into(),
+                    tool_name: "shell".into(),
+                },
+                ToolResultMessage {
+                    tool_call_id: "orphan".into(),
+                    content: "late result".into(),
+                    tool_name: "shell".into(),
+                },
+            ]),
+        ]
+    }
+
+    #[tokio::test]
+    async fn acp_turn_complete_and_list_acp_report_the_same_projected_count() {
+        use zeroclaw_api::model_provider::projected_entry_count;
+        use zeroclaw_infra::acp_session_store::AcpSessionStore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let acp_store = Arc::new(AcpSessionStore::new(tmp.path()).unwrap());
+        let ctx = RpcContext::for_persistence_tests(
+            config,
+            Arc::clone(&sessions),
+            None,
+            Some(Arc::clone(&acp_store)),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        let sid = "boundary-count";
+        let ws = tmp.path().to_str().unwrap();
+
+        // Seed the store with the representative parity shape (the shared
+        // fixture above).
+        acp_store
+            .create_session(sid, "test-agent", ws, None)
+            .unwrap();
+        let history = parity_fixture();
+        acp_store.append_turn(sid, &history).unwrap();
+        let seeded = projected_entry_count(&history);
+        assert_eq!(seeded, 7);
+        assert_eq!(
+            acp_store.projected_message_count(sid).unwrap(),
+            Some(seeded)
+        );
+
+        // A live ACP-mode session served by the dummy provider. Hydrate the
+        // live agent with the seeded transcript the way a real session/new
+        // restore does: turn completion replaces the durable transcript with
+        // the agent's own post-turn history, so an unhydrated agent would
+        // clobber the seeded rows instead of extending them.
+        let mut agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(DummyModelProvider))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .build()
+            .unwrap();
+        agent.seed_conversation_history(history.clone());
+        sessions
+            .insert(
+                sid.into(),
+                crate::rpc::session::RpcSession::new(
+                    agent,
+                    "test-agent",
+                    ws,
+                    crate::rpc::types::ChatMode::Acp,
+                ),
+            )
+            .await
+            .unwrap();
+
+        dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": sid,
+                "prompt": "hello",
+                "client_turn_generation": 7,
+            }))
+            .await
+            .expect("the dummy turn must complete");
+
+        // Drain the outbound channel and keep the terminal notification.
+        let mut turn_count = None;
+        while let Ok(raw) = rx.try_recv() {
+            let v: serde_json::Value =
+                serde_json::from_str(&raw).expect("notification must be JSON");
+            if v["method"] == notification::SESSION_UPDATE
+                && v["params"]["type"] == "turn_complete"
+                && v["params"]["session_id"] == sid
+            {
+                assert_eq!(v["params"]["client_turn_generation"], 7);
+                assert_eq!(v["params"]["outcome"], "completed");
+                turn_count = Some(
+                    v["params"]["message_count"]
+                        .as_u64()
+                        .expect("TurnComplete must carry message_count")
+                        as usize,
+                );
+            }
+        }
+        let turn_count =
+            turn_count.expect("the completed turn must emit a TurnComplete notification");
+
+        // The picker listing must report the same number over serialized JSON.
+        let listed = dispatcher
+            .handle_session_list_acp(&json!({}))
+            .await
+            .unwrap();
+        let entry = listed["sessions"]
+            .as_array()
+            .expect("session/list-acp returns a sessions array")
+            .iter()
+            .find(|e| e["session_id"] == sid)
+            .expect("the seeded session must be listed");
+        assert_eq!(
+            entry["message_count"].as_u64().unwrap() as usize,
+            turn_count
+        );
+
+        // So must the transcript pager's total.
+        let messages = dispatcher
+            .handle_session_messages_for_test(&json!({ "session_id": sid }))
+            .await
+            .unwrap();
+        assert_eq!(messages["total"].as_u64().unwrap() as usize, turn_count);
+
+        // Ground truth: the reloaded history scored by the shared rule and
+        // the runtime projection. Turn completion replaces the durable
+        // transcript with the live agent's history (the system row is never
+        // persisted), which carries the seeded base plus the dummy turn's
+        // prompt and reply, so exactly two entries over the seeded base.
+        let reloaded = acp_store.load_session(sid).unwrap().unwrap().messages;
+        assert_eq!(turn_count, projected_entry_count(&reloaded));
+        assert_eq!(turn_count, conversation_message_entries(&reloaded).len());
+        assert_eq!(turn_count - seeded, 2);
+    }
+
     #[tokio::test]
     async fn session_mode_replacement_preserves_fresh_capacity_rejection() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -21479,6 +21689,21 @@ mod tests {
         assert_eq!(entries[4].kind, MessageEntryKind::ToolResult);
         assert_eq!(entries[4].tool_call_id.as_deref(), Some("orphan"));
         assert_eq!(entries[4].tool_output.as_deref(), Some("late result"));
+    }
+
+    #[test]
+    fn projected_entry_count_matches_conversation_message_entries() {
+        use zeroclaw_api::model_provider::projected_entry_count;
+
+        let msgs = parity_fixture();
+
+        assert_eq!(
+            projected_entry_count(&msgs),
+            conversation_message_entries(&msgs).len()
+        );
+        // 1 chat + (text + 2 calls) + folded result + orphan duplicate
+        // result + reused-call entry + 2 folded results + 1 orphan result.
+        assert_eq!(projected_entry_count(&msgs), 7);
     }
 
     #[test]

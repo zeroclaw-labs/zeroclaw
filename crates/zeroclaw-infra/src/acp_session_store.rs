@@ -5,7 +5,9 @@ use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
-use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall, ToolResultMessage};
+use zeroclaw_api::model_provider::{
+    ChatMessage, ConversationMessage, ToolCall, ToolResultMessage, projected_entry_count,
+};
 use zeroclaw_api::plan::PlanEntry;
 use zeroclaw_log::{Action, EventOutcome};
 
@@ -25,6 +27,29 @@ impl ToolEventKind {
             Self::Out => "out",
         }
     }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "in" => Some(Self::In),
+            "out" => Some(Self::Out),
+            _ => None,
+        }
+    }
+}
+
+/// Open-call balance after replaying one tool-call id's rows in order. An
+/// `in` opens one call; an `out` folds into an open call while the balance
+/// is positive and otherwise is an orphan entry that leaves the balance
+/// untouched, so an orphan cannot consume a later call that reuses the id.
+fn open_calls_after(events: impl IntoIterator<Item = ToolEventKind>) -> usize {
+    let mut open = 0usize;
+    for event in events {
+        match event {
+            ToolEventKind::In => open += 1,
+            ToolEventKind::Out => open = open.saturating_sub(1),
+        }
+    }
+    open
 }
 
 /// Canonical breadcrumb text, duplicated from
@@ -86,6 +111,38 @@ pub struct AcpSessionSummary {
     pub created_at: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
     pub message_count: usize,
+}
+
+/// The sessions one projected-count refresh pass may score: the scope of
+/// the listing about to run, or the one session a count read names. Scoring
+/// stays scoped to the rows that listing returns, before any caller-side
+/// principal filter, so an agent-scoped listing never rescores the sessions
+/// of other agents.
+enum ProjectedCountScope<'a> {
+    /// The live sessions of every agent (the unscoped picker listing).
+    Live,
+    /// Every session of one agent, live or killed (the export listing).
+    Agent(&'a str),
+    /// The live sessions of one agent (the live discovery listing).
+    LiveAgent(&'a str),
+    /// One session, by uuid (the persisted count getter).
+    Session(&'a str),
+}
+
+impl ProjectedCountScope<'_> {
+    /// The `acp_sessions` predicate that narrows a refresh pass to this
+    /// scope, as a `WHERE` tail plus the one value it binds.
+    fn session_filter(&self) -> (&'static str, Option<&str>) {
+        match *self {
+            Self::Live => (" AND s.killed_at IS NULL", None),
+            Self::Agent(agent) => (" AND s.agent_alias = ?1", Some(agent)),
+            Self::LiveAgent(agent) => (
+                " AND s.agent_alias = ?1 AND s.killed_at IS NULL",
+                Some(agent),
+            ),
+            Self::Session(session_uuid) => (" AND s.session_uuid = ?1", Some(session_uuid)),
+        }
+    }
 }
 
 impl AcpSessionStore {
@@ -167,6 +224,8 @@ impl AcpSessionStore {
         Self::ensure_interaction_surface_column(&conn)
             .context("Failed to migrate ACP session interaction surface")?;
 
+        Self::ensure_projected_message_count_columns(&conn)
+            .context("Failed to migrate ACP session projected message count")?;
         Self::ensure_trim_breadcrumb_column(&conn)
             .context("Failed to migrate ACP session trim breadcrumb column")?;
         Self::ensure_principal_id_column(&conn)
@@ -327,6 +386,78 @@ impl AcpSessionStore {
             }
             Err(e) => Err(e).context("Failed to add ACP session interaction surface"),
         }
+    }
+
+    /// Idempotent migration adding the persisted projected conversation-entry
+    /// count the session picker reports, together with the message-id
+    /// watermark that says when that count is still valid. The message and
+    /// tool-call rows remain the single source of truth: the
+    /// (count, watermark) pair on `acp_sessions` is a cache of their
+    /// projection, and a cache entry is valid exactly when
+    /// `projected_count_through IS (SELECT MAX(id) FROM acp_messages WHERE
+    /// session_id = s.id)` (SQLite `IS` is null-safe: an empty session with
+    /// a NULL watermark is valid at count 0). Message ids are AUTOINCREMENT,
+    /// so every insert by any binary lands past any earlier watermark and
+    /// turns the cache stale instead of silently wrong. Stale sessions are
+    /// rescored lazily from their rows on the read paths, never at open, so
+    /// this migration is two plain idempotent column adds and the
+    /// constructor never scores a session. A database an earlier build of
+    /// this store already completed its one-pass scoring on needs nothing:
+    /// that build's schema stamp is simply unused, and its sessions carry a
+    /// NULL watermark and rescore lazily.
+    fn ensure_projected_message_count_columns(conn: &Connection) -> Result<()> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(acp_sessions)")
+            .context("Failed to inspect ACP session schema")?;
+        let mut rows = stmt
+            .query([])
+            .context("Failed to read ACP session schema")?;
+        let mut count_present = false;
+        let mut watermark_present = false;
+        while let Some(row) = rows
+            .next()
+            .context("Failed to read ACP session schema row")?
+        {
+            let column: String = row
+                .get(1)
+                .context("Failed to read ACP session column name")?;
+            if column == "projected_message_count" {
+                count_present = true;
+            }
+            if column == "projected_count_through" {
+                watermark_present = true;
+            }
+        }
+        drop(rows);
+        drop(stmt);
+
+        if !count_present {
+            match conn.execute(
+                "ALTER TABLE acp_sessions ADD COLUMN projected_message_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            ) {
+                Ok(_) => {}
+                Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                    if msg.contains("duplicate column name") => {}
+                Err(e) => {
+                    return Err(e).context("Failed to add ACP session projected message count");
+                }
+            }
+        }
+        if !watermark_present {
+            match conn.execute(
+                "ALTER TABLE acp_sessions ADD COLUMN projected_count_through INTEGER",
+                [],
+            ) {
+                Ok(_) => {}
+                Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                    if msg.contains("duplicate column name") => {}
+                Err(e) => {
+                    return Err(e).context("Failed to add ACP session projected count watermark");
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Idempotent migration adding the `trim_breadcrumb` column: whether the
@@ -800,8 +931,11 @@ impl AcpSessionStore {
     /// activity first. This is the picker-facing read: it avoids the full
     /// message-history hydration that `load_session` performs. Killed rows keep
     /// history/export data but are terminal and must not be offered for restore.
+    /// Stale projected counts are rescored from the rows first, so the listing
+    /// never reports a cache another writer left behind.
     pub fn list_sessions(&self) -> Result<Vec<AcpSessionSummary>> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
+        Self::refresh_stale_projected_counts(&mut conn, ProjectedCountScope::Live)?;
         let mut stmt = conn
             .prepare(
                 "SELECT s.session_uuid,
@@ -810,7 +944,7 @@ impl AcpSessionStore {
                         s.token_count,
                         s.created_at,
                         s.last_activity,
-                        (SELECT COUNT(*) FROM acp_messages m WHERE m.session_id = s.id) AS message_count,
+                        s.projected_message_count AS message_count,
                         s.principal_id
                  FROM acp_sessions s
                  WHERE s.killed_at IS NULL
@@ -864,7 +998,11 @@ impl AcpSessionStore {
     /// transcripts remain readable through `load_session_for_agent` and they
     /// remain available to export through `list_sessions_by_agent`.
     pub fn list_live_sessions_by_agent(&self, agent_alias: &str) -> Result<Vec<AcpSessionSummary>> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
+        Self::refresh_stale_projected_counts(
+            &mut conn,
+            ProjectedCountScope::LiveAgent(agent_alias),
+        )?;
         let mut stmt = conn
             .prepare(
                 "SELECT s.session_uuid,
@@ -873,7 +1011,7 @@ impl AcpSessionStore {
                         s.token_count,
                         s.created_at,
                         s.last_activity,
-                        (SELECT COUNT(*) FROM acp_messages m WHERE m.session_id = s.id) AS message_count,
+                        s.projected_message_count AS message_count,
                         s.principal_id
                  FROM acp_sessions s
                  WHERE s.agent_alias = ?1 AND s.killed_at IS NULL
@@ -1013,22 +1151,26 @@ impl AcpSessionStore {
                 }
             }
 
-            if ins.is_empty() && outs.is_empty() {
-                // Pure chat message.
+            // A row with no 'in' rows is a chat message, with any 'out' rows
+            // following it as their own entries: the persisted counter
+            // scores the parent row once for its text and each unmatched
+            // result once, so the reload must present the same entries.
+            if ins.is_empty() {
                 out.push(ConversationMessage::Chat(ChatMessage { role, content }));
-            } else {
-                if !ins.is_empty() {
-                    // Assistant turn that issued tool calls. The text may be empty.
-                    out.push(ConversationMessage::AssistantToolCalls {
-                        text: if content.is_empty() {
-                            None
-                        } else {
-                            Some(content)
-                        },
-                        tool_calls: ins,
-                        reasoning_content,
-                    });
+                if !outs.is_empty() {
+                    out.push(ConversationMessage::ToolResults(outs));
                 }
+            } else {
+                // Assistant turn that issued tool calls. The text may be empty.
+                out.push(ConversationMessage::AssistantToolCalls {
+                    text: if content.is_empty() {
+                        None
+                    } else {
+                        Some(content)
+                    },
+                    tool_calls: ins,
+                    reasoning_content,
+                });
                 if !outs.is_empty() {
                     out.push(ConversationMessage::ToolResults(outs));
                 }
@@ -1038,9 +1180,100 @@ impl AcpSessionStore {
         Ok(out)
     }
 
+    /// Refresh the persisted projected-entry counts whose watermark has gone
+    /// stale, so the listing or getter about to read one never trusts a
+    /// cache another writer left behind. Scoring is per session and
+    /// non-fatal: each stale session is reloaded and rescored in its own
+    /// short transaction from its rows through the shared counting rule. A
+    /// session whose rows cannot be reloaded (an unknown `event_kind`) is
+    /// logged at ERROR and left untouched: it still lists with its stored
+    /// count (0 for a session never scored), still fails closed on
+    /// `load_session`, and never blocks the store, the other sessions, or
+    /// the open. A genuine SQLite failure on the scoring UPDATE (busy, disk
+    /// full) propagates.
+    fn refresh_stale_projected_counts(
+        conn: &mut Connection,
+        scope: ProjectedCountScope<'_>,
+    ) -> Result<()> {
+        let (filter_sql, filter_value) = scope.session_filter();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT s.id, s.session_uuid
+                   FROM acp_sessions s
+                  WHERE NOT (s.projected_count_through IS
+                             (SELECT MAX(m.id) FROM acp_messages m
+                               WHERE m.session_id = s.id))
+                        {filter_sql}
+                  ORDER BY s.id"
+            ))
+            .context("Failed to prepare stale projected-count query")?;
+        let stale_sessions: Vec<(i64, String)> = match filter_value {
+            Some(value) => stmt
+                .query_map(params![value], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .context("Failed to read stale ACP sessions")?
+                .collect::<Result<Vec<_>, _>>()
+                .context("Failed to read stale ACP sessions")?,
+            None => stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .context("Failed to read stale ACP sessions")?
+                .collect::<Result<Vec<_>, _>>()
+                .context("Failed to read stale ACP sessions")?,
+        };
+        drop(stmt);
+
+        for (session_id, session_uuid) in stale_sessions {
+            let tx = conn
+                .transaction()
+                .context("Failed to begin projected-count refresh transaction")?;
+            let messages = match Self::load_messages(&tx, session_id) {
+                Ok(messages) => messages,
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Read,)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "session_uuid": session_uuid,
+                                "error": error.to_string(),
+                            })),
+                        "Failed to reload ACP session for projected-count refresh; leaving its persisted count untouched"
+                    );
+                    continue;
+                }
+            };
+            let count = projected_entry_count(&messages) as i64;
+            let watermark: Option<i64> = tx
+                .query_row(
+                    "SELECT MAX(id) FROM acp_messages WHERE session_id = ?1",
+                    params![session_id],
+                    |row| row.get(0),
+                )
+                .context("Failed to read ACP session watermark")?;
+            tx.execute(
+                "UPDATE acp_sessions
+                    SET projected_message_count = ?1,
+                        projected_count_through = ?2
+                  WHERE id = ?3",
+                params![count, watermark, session_id],
+            )
+            .context("Failed to refresh ACP session projected message count")?;
+            tx.commit()
+                .context("Failed to commit projected-count refresh")?;
+        }
+        Ok(())
+    }
+
     /// Append all ConversationMessages from one completed turn, decomposing
     /// AssistantToolCalls / ToolResults variants into the appropriate tables.
-    /// Single transaction.
+    /// Single transaction. The transaction also keeps the persisted
+    /// projected-entry count cache in step: the batch's score is added only
+    /// while the session's watermark still matches its rows, and a cache a
+    /// writer without the columns left behind is recomputed from the rows
+    /// instead.
     pub fn append_turn(&self, session_uuid: &str, messages: &[ConversationMessage]) -> Result<()> {
         if messages.is_empty() {
             return Ok(());
@@ -1062,13 +1295,84 @@ impl AcpSessionStore {
         let tx = conn
             .transaction()
             .context("Failed to begin append_turn transaction")?;
-        Self::insert_messages(&tx, session_id, messages, &now)?;
-
-        tx.execute(
-            "UPDATE acp_sessions SET last_activity = ?1 WHERE id = ?2",
-            params![now, session_id],
-        )
-        .context("Failed to update last_activity")?;
+        // The persisted pair is a cache of the rows' projection, valid only
+        // while the watermark matches the session's current MAX(id). Read
+        // both before inserting: a mismatch means a writer this store did
+        // not observe (a binary without the cache columns) left rows past
+        // the watermark, and the increment below would build on a stale
+        // base.
+        let (watermark, max_id): (Option<i64>, Option<i64>) = tx
+            .query_row(
+                "SELECT s.projected_count_through,
+                        (SELECT MAX(m.id) FROM acp_messages m
+                          WHERE m.session_id = s.id)
+                   FROM acp_sessions s
+                  WHERE s.id = ?1",
+                params![session_id],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .context("Failed to read ACP session projected count cache")?;
+        let projected_increment = Self::insert_messages(&tx, session_id, messages, &now)?;
+        let watermark_now: Option<i64> = tx
+            .query_row(
+                "SELECT MAX(id) FROM acp_messages WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .context("Failed to read ACP session watermark")?;
+        if watermark == max_id {
+            // A valid cache: keep the increment and move the watermark to
+            // the rows this transaction just wrote.
+            tx.execute(
+                "UPDATE acp_sessions
+                    SET last_activity = ?1,
+                        projected_message_count = projected_message_count + ?2,
+                        projected_count_through = ?3
+                  WHERE id = ?4",
+                params![now, projected_increment, watermark_now, session_id],
+            )
+            .context("Failed to update last_activity")?;
+        } else {
+            // A stale cache: recompute the whole projection from the rows
+            // so the increment never builds on the stale base. A session
+            // whose rows cannot be reloaded keeps its stale pair untouched
+            // (the reload logs it) and stays stale for a later read to heal
+            // once the rows are repaired; the cache must not fail the
+            // append itself.
+            match Self::load_messages(&tx, session_id) {
+                Ok(messages) => {
+                    let projected_count = projected_entry_count(&messages) as i64;
+                    tx.execute(
+                        "UPDATE acp_sessions
+                            SET last_activity = ?1,
+                                projected_message_count = ?2,
+                                projected_count_through = ?3
+                          WHERE id = ?4",
+                        params![now, projected_count, watermark_now, session_id],
+                    )
+                    .context("Failed to update last_activity")?;
+                }
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write,)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "session_uuid": session_uuid,
+                                "error": error.to_string(),
+                            })),
+                        "Failed to reload ACP session for projected-count resync; leaving its persisted count untouched"
+                    );
+                    tx.execute(
+                        "UPDATE acp_sessions
+                            SET last_activity = ?1
+                          WHERE id = ?2",
+                        params![now, session_id],
+                    )
+                    .context("Failed to update last_activity")?;
+                }
+            }
+        }
 
         tx.commit().context("Failed to commit append_turn")?;
         Ok(())
@@ -1104,13 +1408,30 @@ impl AcpSessionStore {
             params![session_id],
         )
         .context("Failed to clear prior messages")?;
-        Self::insert_messages(&tx, session_id, messages, &now)?;
-
+        // The cascade above removed the prior tool-call rows, so the fold
+        // inside insert_messages starts from an empty open-call balance and
+        // its return value is the projected entry count of the new
+        // transcript as a whole: the counter is set to it, not incremented.
+        let projected_count = Self::insert_messages(&tx, session_id, messages, &now)?;
+        // The new transcript is authoritative, so the cache pair is set
+        // from it: the count to its projection and the watermark to the
+        // rows just written (NULL for an empty transcript, valid at 0).
+        let watermark: Option<i64> = tx
+            .query_row(
+                "SELECT MAX(id) FROM acp_messages WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .context("Failed to read ACP session watermark")?;
         tx.execute(
-            "UPDATE acp_sessions SET last_activity = ?1 WHERE id = ?2",
-            params![now, session_id],
+            "UPDATE acp_sessions
+                SET last_activity = ?1,
+                    projected_message_count = ?2,
+                    projected_count_through = ?3
+              WHERE id = ?4",
+            params![now, projected_count, watermark, session_id],
         )
-        .context("Failed to update last_activity")?;
+        .context("Failed to update last_activity and projected_message_count")?;
 
         tx.commit().context("Failed to commit replace_messages")?;
         Ok(())
@@ -1148,12 +1469,36 @@ impl AcpSessionStore {
             params![session_id],
         )
         .context("Failed to clear prior messages")?;
-        Self::insert_messages(&tx, session_id, messages, &now)?;
+        // Same contract as replace_messages: the cascade emptied the
+        // open-call balance, so the returned count is the new transcript's
+        // projected entry count and the counter is set to it.
+        let projected_count = Self::insert_messages(&tx, session_id, messages, &now)?;
+        // Same cache contract as replace_messages: the count is set to the
+        // new transcript's projection and the watermark to the rows just
+        // written (NULL for an empty transcript).
+        let watermark: Option<i64> = tx
+            .query_row(
+                "SELECT MAX(id) FROM acp_messages WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .context("Failed to read ACP session watermark")?;
         tx.execute(
-            "UPDATE acp_sessions SET last_activity = ?1, trim_breadcrumb = ?2 WHERE id = ?3",
-            params![now, i64::from(breadcrumb_present), session_id],
+            "UPDATE acp_sessions
+                SET last_activity = ?1,
+                    trim_breadcrumb = ?2,
+                    projected_message_count = ?3,
+                    projected_count_through = ?4
+              WHERE id = ?5",
+            params![
+                now,
+                i64::from(breadcrumb_present),
+                projected_count,
+                watermark,
+                session_id
+            ],
         )
-        .context("Failed to update last_activity and trim_breadcrumb")?;
+        .context("Failed to update last_activity, trim_breadcrumb and projected_message_count")?;
 
         tx.commit()
             .context("Failed to commit replace_messages_and_breadcrumb")?;
@@ -1171,15 +1516,25 @@ impl AcpSessionStore {
     /// here (the one write path both callers share) means a caller that
     /// persists an agent's full `history()` — which always starts with the
     /// system prompt — can't leak it into durable ACP transcript rows.
+    ///
+    /// Returns the projected conversation-entry count of the inserted batch,
+    /// folded against the tool-call rows already visible in this transaction:
+    /// `append_turn` adds it to the persisted counter, and the replace paths
+    /// (whose prior rows the FK cascade already removed) set the counter to
+    /// it, which is the counting rule over the new transcript as a whole.
     fn insert_messages(
         tx: &rusqlite::Transaction<'_>,
         session_id: i64,
         messages: &[ConversationMessage],
         now: &str,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         // Track the most recent assistant message_id so a following
         // ToolResults variant can attach its 'out' rows back to it.
         let mut last_assistant_msg_id: Option<i64> = None;
+        // Persisted counter mirroring the runtime's projected conversation
+        // length: one entry per chat message, non-empty assistant text plus
+        // one per tool call, results folding into the call awaiting them.
+        let mut projected_increment: i64 = 0;
 
         for msg in messages {
             match msg {
@@ -1192,6 +1547,7 @@ impl AcpSessionStore {
                         params![session_id, chat.role, chat.content, now],
                     )
                     .context("Failed to insert chat message")?;
+                    projected_increment += 1;
                     if chat.role == "assistant" {
                         last_assistant_msg_id = Some(tx.last_insert_rowid());
                     }
@@ -1201,6 +1557,17 @@ impl AcpSessionStore {
                     tool_calls,
                     reasoning_content,
                 } => {
+                    if text.as_deref().is_some_and(|text| !text.is_empty()) {
+                        projected_increment += 1;
+                    }
+                    projected_increment += tool_calls.len() as i64;
+                    // Zero-entry batch: nothing to persist, keeps the counter
+                    // and the reloaded projection equal.
+                    if tool_calls.is_empty()
+                        && !text.as_deref().is_some_and(|text| !text.is_empty())
+                    {
+                        continue;
+                    }
                     tx.execute(
                         "INSERT INTO acp_messages
                            (session_id, role, content, reasoning_content, created_at)
@@ -1255,6 +1622,17 @@ impl AcpSessionStore {
                             ));
                         }
                     };
+                    // This id's rows for the session, in write order; the
+                    // fold below replays them through the shared clamp rule.
+                    let mut history_stmt = tx
+                        .prepare(
+                            "SELECT tc.event_kind
+                               FROM acp_tool_calls tc
+                               JOIN acp_messages m ON m.id = tc.message_id
+                              WHERE m.session_id = ?1 AND tc.tool_call_id = ?2
+                              ORDER BY tc.id",
+                        )
+                        .context("Failed to prepare tool call history query")?;
                     for result in results {
                         let tool_name: String = tx
                             .query_row(
@@ -1265,6 +1643,25 @@ impl AcpSessionStore {
                                 |row| row.get(0),
                             )
                             .unwrap_or_else(|_| String::from("unknown"));
+                        let events: Vec<ToolEventKind> = history_stmt
+                            .query_map(params![session_id, result.tool_call_id], |row| {
+                                row.get::<_, String>(0)
+                            })
+                            .context("Failed to look up tool call history")?
+                            .collect::<Result<Vec<_>, _>>()
+                            .context("Failed to read tool call history rows")?
+                            .into_iter()
+                            .map(|kind| ToolEventKind::parse(&kind))
+                            .collect::<Option<Vec<_>>>()
+                            .context("Unknown event_kind in tool call history")?;
+                        // A result folds into its call (no entry) while an
+                        // 'in' row for this tool_call_id is still unconsumed;
+                        // beyond that it is an orphan entry. An orphan leaves
+                        // the open-call balance untouched, so a later call
+                        // reusing the id still opens fresh.
+                        if open_calls_after(events) == 0 {
+                            projected_increment += 1;
+                        }
                         tx.execute(
                             "INSERT INTO acp_tool_calls
                                (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
@@ -1285,7 +1682,7 @@ impl AcpSessionStore {
             }
         }
 
-        Ok(())
+        Ok(projected_increment)
     }
 
     pub fn set_token_count(&self, session_uuid: &str, token_count: u64) -> Result<()> {
@@ -1464,7 +1861,8 @@ impl AcpSessionStore {
     /// Summaries of every ACP session (live or killed) attributed to
     /// `agent_alias`, for the export-then-delete archive.
     pub fn list_sessions_by_agent(&self, agent_alias: &str) -> Result<Vec<AcpSessionSummary>> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
+        Self::refresh_stale_projected_counts(&mut conn, ProjectedCountScope::Agent(agent_alias))?;
         let mut stmt = conn
             .prepare(
                 "SELECT s.session_uuid,
@@ -1473,7 +1871,7 @@ impl AcpSessionStore {
                         s.token_count,
                         s.created_at,
                         s.last_activity,
-                        (SELECT COUNT(*) FROM acp_messages m WHERE m.session_id = s.id) AS message_count,
+                        s.projected_message_count AS message_count,
                         s.principal_id
                  FROM acp_sessions s
                  WHERE s.agent_alias = ?1
@@ -1520,6 +1918,29 @@ impl AcpSessionStore {
             });
         }
         Ok(out)
+    }
+
+    /// Persisted projected conversation-entry count for the session, the
+    /// same number the session picker lists and `turn_end` reports. Reading
+    /// it avoids hydrating the full message history that `load_session`
+    /// performs just to re-derive the count; a cache another writer left
+    /// stale is rescored from the session's rows here first. `None` when the
+    /// session UUID is unknown.
+    pub fn projected_message_count(&self, session_uuid: &str) -> Result<Option<usize>> {
+        let mut conn = self.conn.lock();
+        Self::refresh_stale_projected_counts(
+            &mut conn,
+            ProjectedCountScope::Session(session_uuid),
+        )?;
+        let count: Option<i64> = conn
+            .query_row(
+                "SELECT projected_message_count FROM acp_sessions WHERE session_uuid = ?1",
+                params![session_uuid],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to query projected_message_count")?;
+        Ok(count.map(|n| n.max(0) as usize))
     }
 
     /// Delete every ACP session (live or killed) for `agent_alias`, returning the
@@ -1620,7 +2041,9 @@ fn parse_ts(s: &str, field: &'static str, session_uuid: &str) -> DateTime<Utc> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use zeroclaw_api::model_provider::{ChatMessage, ToolCall, ToolResultMessage};
+    use zeroclaw_api::model_provider::{
+        ChatMessage, ToolCall, ToolResultMessage, projected_entry_count,
+    };
 
     fn open_store() -> (TempDir, AcpSessionStore) {
         let tmp = TempDir::new().unwrap();
@@ -1661,6 +2084,21 @@ mod tests {
                 )
                 .unwrap_or_else(|_| panic!("table {table} should exist"));
             assert_eq!(name, table);
+        }
+        // A fresh database carries the projected-count cache columns, added
+        // idempotently at open and never scored there.
+        let mut stmt = conn.prepare("PRAGMA table_info(acp_sessions)").unwrap();
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        drop(stmt);
+        for column in ["projected_message_count", "projected_count_through"] {
+            assert!(
+                columns.contains(&column.to_string()),
+                "fresh store must carry the {column} cache column"
+            );
         }
     }
 
@@ -2001,6 +2439,106 @@ mod tests {
     }
 
     #[test]
+    fn replace_paths_reset_the_projected_count_to_the_new_transcript() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-count-replace", "alpha", "/tmp/proj", None)
+            .unwrap();
+
+        // A tool-loop turn whose projected count (5) exceeds its chat rows:
+        // one chat entry, a batch contributing its text plus two call
+        // entries, both results folding into open calls, one more chat.
+        let seeded = vec![
+            ConversationMessage::Chat(ChatMessage::user("fold me")),
+            ConversationMessage::AssistantToolCalls {
+                text: Some("batch".into()),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "c1".into(),
+                        name: "shell".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    },
+                    ToolCall {
+                        id: "c2".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    },
+                ],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![
+                ToolResultMessage {
+                    tool_call_id: "c1".into(),
+                    content: "ok".into(),
+                    tool_name: "shell".into(),
+                },
+                ToolResultMessage {
+                    tool_call_id: "c2".into(),
+                    content: "ok".into(),
+                    tool_name: "read".into(),
+                },
+            ]),
+            ConversationMessage::Chat(ChatMessage::user("orphan")),
+        ];
+        store.append_turn("sess-count-replace", &seeded).unwrap();
+        assert_eq!(projected_entry_count(&seeded), 5);
+        assert_eq!(
+            store.projected_message_count("sess-count-replace").unwrap(),
+            Some(5)
+        );
+
+        // A trim-driven replace swaps the transcript for two chat turns: the
+        // persisted counter must follow the new transcript, not keep the
+        // pre-trim value or grow by the replaced batch.
+        store
+            .replace_messages(
+                "sess-count-replace",
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("kept")),
+                    ConversationMessage::Chat(ChatMessage::assistant("kept answer")),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            store.projected_message_count("sess-count-replace").unwrap(),
+            Some(2)
+        );
+
+        // The breadcrumb variant carries the same contract.
+        store
+            .replace_messages_and_breadcrumb(
+                "sess-count-replace",
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("trimmed")),
+                    ConversationMessage::Chat(ChatMessage::assistant("trimmed answer")),
+                    ConversationMessage::Chat(ChatMessage::user("next")),
+                ],
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            store.projected_message_count("sess-count-replace").unwrap(),
+            Some(3)
+        );
+
+        // Appends after a replace build on the replaced base, so the store
+        // and the runtime projection stay in step across a trim.
+        store
+            .append_turn(
+                "sess-count-replace",
+                &[ConversationMessage::Chat(ChatMessage::user("more"))],
+            )
+            .unwrap();
+        assert_eq!(
+            store.projected_message_count("sess-count-replace").unwrap(),
+            Some(4)
+        );
+        assert_eq!(raw_count_pair(&store, "sess-count-replace"), (4, Some(9)));
+    }
+
+    #[test]
     fn insert_messages_never_persists_a_system_row() {
         let (_tmp, store) = open_store();
         store
@@ -2220,6 +2758,43 @@ mod tests {
         store.append_turn("sess-empty", &[]).unwrap();
         let data = store.load_session("sess-empty").unwrap().unwrap();
         assert!(data.messages.is_empty());
+    }
+
+    #[test]
+    fn append_turn_skips_zero_entry_tool_call_batches() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-degenerate", "alpha", "/tmp/proj", None)
+            .unwrap();
+        store
+            .append_turn(
+                "sess-degenerate",
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("first")),
+                    // Degenerate zero-entry batches: no text, no calls. The
+                    // counting contract scores them zero entries, so nothing
+                    // may be persisted for them; a stored row would reload
+                    // as a plain chat message and project as 1.
+                    ConversationMessage::AssistantToolCalls {
+                        text: None,
+                        tool_calls: vec![],
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::AssistantToolCalls {
+                        text: Some(String::new()),
+                        tool_calls: vec![],
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::Chat(ChatMessage::user("second")),
+                ],
+            )
+            .unwrap();
+
+        let summary = &store.list_sessions().unwrap()[0];
+        assert_eq!(summary.message_count, 2);
+        let data = store.load_session("sess-degenerate").unwrap().unwrap();
+        assert_eq!(data.messages.len(), 2);
+        assert_eq!(projected_entry_count(&data.messages), 2);
     }
 
     #[test]
@@ -2597,6 +3172,938 @@ mod tests {
         let list = store.list_sessions().unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].session_uuid, "sess-live");
+    }
+
+    fn tool_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+            extra_content: None,
+        }
+    }
+
+    fn tool_result(id: &str) -> ToolResultMessage {
+        ToolResultMessage {
+            tool_call_id: id.to_string(),
+            content: "out".into(),
+            tool_name: "shell".into(),
+        }
+    }
+
+    fn assert_list_matches_projection(
+        store: &AcpSessionStore,
+        session_uuid: &str,
+        expected: usize,
+    ) {
+        let summary = &store
+            .list_sessions()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.session_uuid == session_uuid)
+            .unwrap_or_else(|| panic!("session {session_uuid} should be listed"));
+        let data = store.load_session(session_uuid).unwrap().unwrap();
+        assert_eq!(summary.message_count, expected, "session {session_uuid}");
+        assert_eq!(
+            summary.message_count,
+            projected_entry_count(&data.messages),
+            "session {session_uuid} persisted count must match the projection"
+        );
+        // The live agent-scoped listing must agree with the other listings:
+        // it reads the same persisted counter, never a fresh row count.
+        let live = &store
+            .list_live_sessions_by_agent(&summary.agent_alias)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.session_uuid == session_uuid)
+            .unwrap_or_else(|| {
+                panic!("session {session_uuid} should be live-listed for its agent")
+            });
+        assert_eq!(
+            live.message_count, expected,
+            "session {session_uuid} live listing must match the projection"
+        );
+    }
+
+    #[test]
+    fn list_sessions_message_count_matches_projection_after_mixed_writes() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-mixed", "alpha", "/tmp/mixed", None)
+            .unwrap();
+
+        // Chat only.
+        store
+            .append_turn(
+                "sess-mixed",
+                &[ConversationMessage::Chat(ChatMessage::user("hi"))],
+            )
+            .unwrap();
+        assert_list_matches_projection(&store, "sess-mixed", 1);
+
+        // One batch of 3 calls with text: text + 3 calls = +4. Results come
+        // in a later turn so the cross-turn fold is exercised there.
+        store
+            .append_turn(
+                "sess-mixed",
+                &[ConversationMessage::AssistantToolCalls {
+                    text: Some("inspecting".into()),
+                    tool_calls: vec![tool_call("a"), tool_call("b"), tool_call("c")],
+                    reasoning_content: None,
+                }],
+            )
+            .unwrap();
+        assert_list_matches_projection(&store, "sess-mixed", 5);
+
+        // One batch of 2 calls with empty text: calls only = +2.
+        store
+            .append_turn(
+                "sess-mixed",
+                &[ConversationMessage::AssistantToolCalls {
+                    text: Some(String::new()),
+                    tool_calls: vec![tool_call("d"), tool_call("e")],
+                    reasoning_content: None,
+                }],
+            )
+            .unwrap();
+        assert_list_matches_projection(&store, "sess-mixed", 7);
+
+        // Results folding into the same-turn call ("f") and into calls
+        // written in PREVIOUS append_turns ("a", "b", "c"): only the new
+        // call adds an entry.
+        store
+            .append_turn(
+                "sess-mixed",
+                &[
+                    ConversationMessage::AssistantToolCalls {
+                        text: None,
+                        tool_calls: vec![tool_call("f")],
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::ToolResults(vec![
+                        tool_result("f"),
+                        tool_result("a"),
+                        tool_result("b"),
+                        tool_result("c"),
+                    ]),
+                ],
+            )
+            .unwrap();
+        assert_list_matches_projection(&store, "sess-mixed", 8);
+
+        // An orphan result (no call was ever written for it) counts as its
+        // own entry on top of the same-turn call; the unconsumed previous
+        // turn's call ("d") still folds.
+        store
+            .append_turn(
+                "sess-mixed",
+                &[
+                    ConversationMessage::AssistantToolCalls {
+                        text: None,
+                        tool_calls: vec![tool_call("g")],
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::ToolResults(vec![
+                        tool_result("g"),
+                        tool_result("d"),
+                        tool_result("orphan"),
+                    ]),
+                ],
+            )
+            .unwrap();
+        assert_list_matches_projection(&store, "sess-mixed", 10);
+    }
+
+    #[test]
+    fn append_turn_orphan_result_does_not_consume_later_reused_call() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-reuse", "alpha", "/tmp/reuse", None)
+            .unwrap();
+
+        // Turn 1 issues x. Turn 2 must open a batch before its results, so y
+        // rides along and never resolves; its second x result has no call
+        // left to fold into. Turn 3 reuses the x id.
+        store
+            .append_turn(
+                "sess-reuse",
+                &[ConversationMessage::AssistantToolCalls {
+                    text: None,
+                    tool_calls: vec![tool_call("x")],
+                    reasoning_content: None,
+                }],
+            )
+            .unwrap();
+        store
+            .append_turn(
+                "sess-reuse",
+                &[
+                    ConversationMessage::AssistantToolCalls {
+                        text: None,
+                        tool_calls: vec![tool_call("y")],
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::ToolResults(vec![tool_result("x"), tool_result("x")]),
+                ],
+            )
+            .unwrap();
+        store
+            .append_turn(
+                "sess-reuse",
+                &[
+                    ConversationMessage::AssistantToolCalls {
+                        text: None,
+                        tool_calls: vec![tool_call("x")],
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::ToolResults(vec![tool_result("x")]),
+                ],
+            )
+            .unwrap();
+
+        // Entries: call x, call y, folded result, orphan duplicate result,
+        // reused call x, folded result. The orphan duplicate must leave the
+        // open-call balance untouched so the reused call's result folds.
+        assert_list_matches_projection(&store, "sess-reuse", 4);
+    }
+
+    #[test]
+    fn open_calls_after_clamps_orphan_results_at_zero() {
+        assert_eq!(open_calls_after([ToolEventKind::In]), 1);
+        assert_eq!(open_calls_after([ToolEventKind::In, ToolEventKind::Out]), 0);
+        // A duplicate out is an orphan entry and leaves the balance at zero.
+        assert_eq!(
+            open_calls_after([ToolEventKind::In, ToolEventKind::Out, ToolEventKind::Out]),
+            0
+        );
+        // So a later call reusing the id still opens fresh.
+        assert_eq!(
+            open_calls_after([
+                ToolEventKind::In,
+                ToolEventKind::Out,
+                ToolEventKind::Out,
+                ToolEventKind::In,
+            ]),
+            1
+        );
+        assert_eq!(open_calls_after([ToolEventKind::Out]), 0);
+        assert_eq!(
+            open_calls_after([ToolEventKind::In, ToolEventKind::In, ToolEventKind::Out]),
+            1
+        );
+    }
+
+    #[test]
+    fn append_turn_orphan_result_after_callless_assistant_chat_keeps_parent() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-callless-chat", "alpha", "/tmp/callless-chat", None)
+            .unwrap();
+
+        // An orphan result attaches to the most recent assistant message,
+        // which may be a plain chat with no calls in the turn. The persisted
+        // counter scores the parent text and the orphan result as separate
+        // entries, so the reload must keep both.
+        store
+            .append_turn(
+                "sess-callless-chat",
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("q")),
+                    ConversationMessage::Chat(ChatMessage::assistant("a")),
+                    ConversationMessage::ToolResults(vec![tool_result("z")]),
+                ],
+            )
+            .unwrap();
+
+        let list = store.list_sessions().unwrap();
+        assert_eq!(list[0].message_count, 3);
+        let data = store.load_session("sess-callless-chat").unwrap().unwrap();
+        assert_eq!(list[0].message_count, projected_entry_count(&data.messages));
+        assert!(matches!(
+            &data.messages[1],
+            ConversationMessage::Chat(m) if m.role == "assistant" && m.content == "a"
+        ));
+        match &data.messages[2] {
+            ConversationMessage::ToolResults(results) => {
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].tool_call_id, "z");
+            }
+            other => panic!("expected ToolResults, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn append_turn_orphan_result_after_callless_batch_keeps_parent_text() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-callless-batch", "alpha", "/tmp/callless-batch", None)
+            .unwrap();
+
+        // A text-only batch (no calls) persists its text as an assistant
+        // row and sets the parent for later results, so an orphan result
+        // riding the same turn must not drop that text on reload.
+        store
+            .append_turn(
+                "sess-callless-batch",
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("q")),
+                    ConversationMessage::AssistantToolCalls {
+                        text: Some("t".into()),
+                        tool_calls: vec![],
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::ToolResults(vec![tool_result("z")]),
+                ],
+            )
+            .unwrap();
+
+        let list = store.list_sessions().unwrap();
+        assert_eq!(list[0].message_count, 3);
+        let data = store.load_session("sess-callless-batch").unwrap().unwrap();
+        assert_eq!(list[0].message_count, projected_entry_count(&data.messages));
+        assert!(matches!(
+            &data.messages[1],
+            ConversationMessage::Chat(m) if m.role == "assistant" && m.content == "t"
+        ));
+        assert!(matches!(
+            &data.messages[2],
+            ConversationMessage::ToolResults(results)
+                if results.len() == 1 && results[0].tool_call_id == "z"
+        ));
+    }
+
+    /// The schema as it was before the projected-count columns existed.
+    /// `AcpSessionStore::new` adds the rest of the current columns through
+    /// its idempotent migrations, so tests only hand-build what predates
+    /// the change under test.
+    fn legacy_schema_without_projected_count(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE acp_sessions (
+                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_uuid  TEXT NOT NULL UNIQUE,
+                 agent_alias   TEXT NOT NULL,
+                 workspace_dir TEXT NOT NULL,
+                 interaction_surface TEXT,
+                 token_count   INTEGER NOT NULL DEFAULT 0,
+                 killed_at     TEXT,
+                 created_at    TEXT NOT NULL,
+                 last_activity TEXT NOT NULL
+             );
+             CREATE TABLE acp_messages (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id  INTEGER NOT NULL REFERENCES acp_sessions(id) ON DELETE CASCADE,
+                 role        TEXT NOT NULL,
+                 content     TEXT NOT NULL,
+                 reasoning_content TEXT,
+                 created_at  TEXT NOT NULL
+             );
+             CREATE TABLE acp_tool_calls (
+                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                 message_id   INTEGER NOT NULL REFERENCES acp_messages(id) ON DELETE CASCADE,
+                 tool_call_id TEXT NOT NULL,
+                 tool_name    TEXT NOT NULL,
+                 event_kind   TEXT NOT NULL,
+                 payload      TEXT NOT NULL,
+                 outcome      TEXT,
+                 created_at   TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+    }
+
+    /// Read the raw cache pair, bypassing the read paths, so a test can tell
+    /// a session that was never scored (0, NULL) apart from one the store
+    /// scored (count, watermark) and from a cache another writer left
+    /// behind the rows.
+    fn raw_count_pair(store: &AcpSessionStore, session_uuid: &str) -> (i64, Option<i64>) {
+        store
+            .conn
+            .lock()
+            .query_row(
+                "SELECT projected_message_count, projected_count_through
+                  FROM acp_sessions WHERE session_uuid = ?1",
+                params![session_uuid],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn rollback_writes_by_an_older_binary_self_heal_on_the_next_list() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("sessions").join("acp-sessions.db");
+        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        store
+            .create_session("self-heal-s", "alpha", "/tmp/s", None)
+            .unwrap();
+        store
+            .append_turn(
+                "self-heal-s",
+                &[ConversationMessage::Chat(ChatMessage::user("first"))],
+            )
+            .unwrap();
+        assert_list_matches_projection(&store, "self-heal-s", 1);
+        drop(store);
+
+        // A binary without the cache columns writes the same file: it
+        // inserts session T and appends rows to S without touching either
+        // column, so both caches are left behind the rows.
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO acp_sessions
+               (session_uuid, agent_alias, workspace_dir, token_count, created_at, last_activity)
+             VALUES ('old-binary-t', 'alpha', '/tmp/t', 0, 't', 't')",
+            [],
+        )
+        .unwrap();
+        let s_id: i64 = conn
+            .query_row(
+                "SELECT id FROM acp_sessions WHERE session_uuid = 'self-heal-s'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let t_id: i64 = conn
+            .query_row(
+                "SELECT id FROM acp_sessions WHERE session_uuid = 'old-binary-t'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (?1, 'user', 'old binary q', 't')",
+            params![t_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (?1, 'assistant', 'old binary a', 't')",
+            params![t_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (?1, 'user', 'old binary turn', 't')",
+            params![s_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        // The next list self-heals both sessions from their rows.
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        assert_list_matches_projection(&store, "self-heal-s", 2);
+        assert_list_matches_projection(&store, "old-binary-t", 2);
+
+        // A later append then increments the healed base, never a stale one.
+        store
+            .append_turn(
+                "self-heal-s",
+                &[ConversationMessage::Chat(ChatMessage::user(
+                    "after upgrade",
+                ))],
+            )
+            .unwrap();
+        assert_list_matches_projection(&store, "self-heal-s", 3);
+        assert_eq!(
+            store.projected_message_count("self-heal-s").unwrap(),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn old_binary_emptying_a_transcript_reads_as_zero() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("sessions").join("acp-sessions.db");
+        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        store
+            .create_session("emptied-s", "alpha", "/tmp/e", None)
+            .unwrap();
+        store
+            .append_turn(
+                "emptied-s",
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("q")),
+                    ConversationMessage::Chat(ChatMessage::assistant("a")),
+                ],
+            )
+            .unwrap();
+        assert_list_matches_projection(&store, "emptied-s", 2);
+        drop(store);
+
+        // A binary without the cache columns empties the transcript without
+        // knowing either column, leaving the pair behind rows that no longer
+        // exist.
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "DELETE FROM acp_messages WHERE session_id =
+                 (SELECT id FROM acp_sessions WHERE session_uuid = 'emptied-s')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // The next read heals to the empty transcript: zero rows, zero
+        // count, NULL watermark (valid at 0).
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        let list = store.list_sessions().unwrap();
+        let emptied = list.iter().find(|s| s.session_uuid == "emptied-s").unwrap();
+        assert_eq!(emptied.message_count, 0);
+        assert_eq!(store.projected_message_count("emptied-s").unwrap(), Some(0));
+        assert_eq!(raw_count_pair(&store, "emptied-s"), (0, None));
+    }
+
+    #[test]
+    fn unreadable_session_does_not_block_the_store_or_other_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("sessions").join("acp-sessions.db");
+        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+        legacy_schema_without_projected_count(&conn);
+
+        // Session A (healthy): a chat, a batch with text and two calls,
+        // both results folding: 4 entries.
+        conn.execute(
+            "INSERT INTO acp_sessions
+               (session_uuid, agent_alias, workspace_dir, token_count, created_at, last_activity)
+             VALUES ('healthy-a', 'alpha', '/tmp/a', 0, 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (1, 'user', 'hi', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (1, 'assistant', 'working', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, created_at)
+             VALUES (2, 'x', 'shell', 'in', '{}', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, created_at)
+             VALUES (2, 'y', 'read', 'in', '{}', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (2, 'x', 'shell', 'out', '/tmp', 'unknown', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (2, 'y', 'read', 'out', 'data', 'unknown', 't')",
+            [],
+        )
+        .unwrap();
+
+        // Session B: an assistant text and one call, plus one row whose
+        // event_kind no reload accepts.
+        conn.execute(
+            "INSERT INTO acp_sessions
+               (session_uuid, agent_alias, workspace_dir, token_count, created_at, last_activity)
+             VALUES ('unreadable-b', 'alpha', '/tmp/b', 0, 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (2, 'assistant', 'plan', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, created_at)
+             VALUES (3, 'z', 'shell', 'in', '{}', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (3, 'z', 'shell', 'bogus', 'lost', 'unknown', 't')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = AcpSessionStore::new(tmp.path())
+            .expect("an unreadable session must not fail the store open");
+        let list = store.list_sessions().unwrap();
+        assert_eq!(list.len(), 2, "both sessions must list");
+        assert_list_matches_projection(&store, "healthy-a", 4);
+        let unreadable = list
+            .iter()
+            .find(|s| s.session_uuid == "unreadable-b")
+            .unwrap();
+        assert_eq!(
+            unreadable.message_count, 0,
+            "a session that was never scored lists with its stored count"
+        );
+        assert!(
+            store.load_session("unreadable-b").is_err(),
+            "the unreadable session must still fail closed on load"
+        );
+
+        // Repairing the row lets the next list score the session.
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE acp_tool_calls SET event_kind = 'out' WHERE event_kind = 'bogus'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert_list_matches_projection(&store, "unreadable-b", 2);
+    }
+
+    #[test]
+    fn lazy_refresh_scores_pre_column_rows_on_first_list() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("sessions").join("acp-sessions.db");
+        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+
+        // A pre-column database: the helper builds the schema as it was,
+        // and the open adds the rest of the current columns.
+        let conn = Connection::open(&db_path).unwrap();
+        legacy_schema_without_projected_count(&conn);
+
+        // Session 1: chat (1), batch with text + 2 calls (3), results fold.
+        conn.execute(
+            "INSERT INTO acp_sessions
+               (session_uuid, agent_alias, workspace_dir, token_count, created_at, last_activity)
+             VALUES ('old-full', 'alpha', '/tmp/a', 0, 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (1, 'user', 'hi', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (1, 'assistant', 'working', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, created_at)
+             VALUES (2, 'x', 'shell', 'in', '{}', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, created_at)
+             VALUES (2, 'y', 'read', 'in', '{}', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (2, 'x', 'shell', 'out', '/tmp', 'unknown', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (2, 'y', 'read', 'out', 'data', 'unknown', 't')",
+            [],
+        )
+        .unwrap();
+
+        // Session 2: empty-text batch (0 text entries), one call whose
+        // result folds, and one orphan 'out' row for a call never issued.
+        conn.execute(
+            "INSERT INTO acp_sessions
+               (session_uuid, agent_alias, workspace_dir, token_count, created_at, last_activity)
+             VALUES ('old-orphan', 'alpha', '/tmp/b', 0, 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (2, 'assistant', '', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, created_at)
+             VALUES (3, 'z', 'shell', 'in', '{}', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (3, 'z', 'shell', 'out', 'ok', 'unknown', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (3, 'ghost', 'shell', 'out', 'lost', 'unknown', 't')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Opening the store adds the cache columns without scoring anyone:
+        // the pre-column rows stay at the column default with a NULL
+        // watermark until a read scores them.
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        assert_eq!(raw_count_pair(&store, "old-full"), (0, None));
+        assert_eq!(raw_count_pair(&store, "old-orphan"), (0, None));
+
+        // The first list scores both sessions from their rows and moves
+        // each watermark to the session's own highest row id.
+        assert_list_matches_projection(&store, "old-full", 4);
+        assert_list_matches_projection(&store, "old-orphan", 2);
+        assert_eq!(raw_count_pair(&store, "old-full"), (4, Some(2)));
+        assert_eq!(raw_count_pair(&store, "old-orphan"), (2, Some(3)));
+
+        // A post-scoring append keeps incrementing from the scored base.
+        store
+            .append_turn(
+                "old-full",
+                &[ConversationMessage::Chat(ChatMessage::user("again"))],
+            )
+            .unwrap();
+        assert_list_matches_projection(&store, "old-full", 5);
+
+        // A valid cache is not rescored: rewriting the count by raw SQL
+        // without moving the watermark pins the refresh to the watermark
+        // and not to the list itself.
+        {
+            let conn = store.conn.lock();
+            conn.execute(
+                "UPDATE acp_sessions SET projected_message_count = 99 WHERE session_uuid = 'old-full'",
+                [],
+            )
+            .unwrap();
+        }
+        let list = store.list_sessions().unwrap();
+        let full = list.iter().find(|s| s.session_uuid == "old-full").unwrap();
+        assert_eq!(
+            full.message_count, 99,
+            "a valid cache must survive a list without rescore"
+        );
+        let orphan = list
+            .iter()
+            .find(|s| s.session_uuid == "old-orphan")
+            .unwrap();
+        assert_eq!(orphan.message_count, 2);
+    }
+
+    #[test]
+    fn lazy_refresh_partitions_tool_call_pairing_by_session() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("sessions").join("acp-sessions.db");
+        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+
+        // A pre-column database: the helper builds the schema as it was,
+        // and the open adds the rest of the current columns.
+        let conn = Connection::open(&db_path).unwrap();
+        legacy_schema_without_projected_count(&conn);
+
+        // Session A (id 1): an unmatched 'in' row for tool-call ID 'x'.
+        conn.execute(
+            "INSERT INTO acp_sessions
+               (session_uuid, agent_alias, workspace_dir, token_count, created_at, last_activity)
+             VALUES ('session-a', 'alpha', '/tmp/a', 0, 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (1, 'assistant', '', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, created_at)
+             VALUES (1, 'x', 'shell', 'in', '{}', 't')",
+            [],
+        )
+        .unwrap();
+
+        // Session B (id 2): 'in y' followed by an orphan 'out x'. Tool-call
+        // IDs are scoped per session, so B's 'out x' must NOT consume A's
+        // unmatched 'in x'.
+        conn.execute(
+            "INSERT INTO acp_sessions
+               (session_uuid, agent_alias, workspace_dir, token_count, created_at, last_activity)
+             VALUES ('session-b', 'alpha', '/tmp/b', 0, 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (2, 'assistant', '', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, created_at)
+             VALUES (2, 'y', 'shell', 'in', '{}', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (2, 'x', 'shell', 'out', 'lost', 'unknown', 't')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // The open adds the cache columns without scoring anyone.
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        assert_eq!(raw_count_pair(&store, "session-a"), (0, None));
+        assert_eq!(raw_count_pair(&store, "session-b"), (0, None));
+
+        // The first list scores both: A: 1 entry for the unmatched 'in x'.
+        // B: 1 for 'in y' plus 1 for the orphan 'out x' (2 total); a
+        // cross-session pairing would fold B's orphan into A's call and
+        // undercount B to 1.
+        assert_list_matches_projection(&store, "session-a", 1);
+        assert_list_matches_projection(&store, "session-b", 2);
+    }
+
+    #[test]
+    fn lazy_refresh_orphan_result_does_not_consume_later_reused_call() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("sessions").join("acp-sessions.db");
+        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+
+        // A pre-column database: the helper builds the schema as it was,
+        // and the open adds the rest of the current columns.
+        let conn = Connection::open(&db_path).unwrap();
+        legacy_schema_without_projected_count(&conn);
+
+        // One session, one id: the call, its result, a duplicate result with
+        // no call left to fold into, then a reused call and its result.
+        conn.execute(
+            "INSERT INTO acp_sessions
+                (session_uuid, agent_alias, workspace_dir, token_count, created_at, last_activity)
+             VALUES ('old-reuse', 'alpha', '/tmp/r', 0, 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (1, 'assistant', '', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (1, 'assistant', '', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, created_at)
+             VALUES (1, 'x', 'shell', 'in', '{}', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (1, 'x', 'shell', 'out', 'ok', 'unknown', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (1, 'x', 'shell', 'out', 'duplicate', 'unknown', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, created_at)
+             VALUES (2, 'x', 'shell', 'in', '{}', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (2, 'x', 'shell', 'out', 'again', 'unknown', 't')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Entries: call, fold, orphan duplicate, reused call, fold = 3. The
+        // orphan duplicate must not consume the reused call. The open adds
+        // the cache columns without scoring anyone; the first list scores.
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        assert_eq!(raw_count_pair(&store, "old-reuse"), (0, None));
+        assert_list_matches_projection(&store, "old-reuse", 3);
+    }
+
+    #[test]
+    fn lazy_refresh_keeps_callless_parent_with_orphan_result() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("sessions").join("acp-sessions.db");
+        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+
+        // A pre-column database: the helper builds the schema as it was,
+        // and the open adds the rest of the current columns.
+        let conn = Connection::open(&db_path).unwrap();
+        legacy_schema_without_projected_count(&conn);
+
+        // One session: a user chat, an assistant row with text and no
+        // calls, and an orphan result attached to that assistant row.
+        conn.execute(
+            "INSERT INTO acp_sessions
+               (session_uuid, agent_alias, workspace_dir, token_count, created_at, last_activity)
+             VALUES ('old-callless', 'alpha', '/tmp/c', 0, 't', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (1, 'user', 'q', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_messages (session_id, role, content, created_at)
+             VALUES (1, 'assistant', 'a', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (2, 'z', 'shell', 'out', 'lost', 'unknown', 't')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // The open adds the cache columns without scoring anyone. The
+        // refresh scores the reloaded projection, so the callless parent
+        // text and the orphan result must both reload for the scored count
+        // to see all three entries.
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        assert_eq!(raw_count_pair(&store, "old-callless"), (0, None));
+        assert_list_matches_projection(&store, "old-callless", 3);
+        let data = store.load_session("old-callless").unwrap().unwrap();
+        assert!(matches!(
+            &data.messages[1],
+            ConversationMessage::Chat(m) if m.role == "assistant" && m.content == "a"
+        ));
     }
 
     #[test]
