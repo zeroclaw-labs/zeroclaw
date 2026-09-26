@@ -1154,6 +1154,10 @@ async fn prepare_messages_inner(
                         "images_before": before,
                         "images_after": after,
                         "images_dropped": before - after,
+                        "earliest_mutated_index": first_changed_message(
+                            &normalized_messages,
+                            &trimmed,
+                        ),
                     })),
                 "multimodal: age-trimmed old images from conversation history"
             );
@@ -1165,19 +1169,26 @@ async fn prepare_messages_inner(
 
     // Apply the per-request image cap after normalization so failed image refs
     // do not consume budget and evict older images that could still be sent.
+    // The trim runs before the event so its attrs can name the first mutated
+    // message: a provider prompt cache is rewritten from that message to the
+    // end of history on this request, and the index attributes that cost.
     let capped_messages = if has_successful_images && count_image_markers(&age_trimmed) > max_images
     {
+        let images_before_cap = count_image_markers(&age_trimmed);
+        let trimmed = trim_old_images(&age_trimmed, max_images);
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                 .with_attrs(::serde_json::json!({
-                    "images_after_normalization": count_image_markers(&age_trimmed),
+                    "images_after_normalization": images_before_cap,
                     "max_images": max_images,
+                    "earliest_mutated_index": first_changed_message(&age_trimmed, &trimmed),
+                    "images_evicted": images_before_cap - count_image_markers(&trimmed),
                 })),
             "multimodal: post-normalization image cap exceeded — trimming oldest images"
         );
-        trim_old_images(&age_trimmed, max_images)
+        trimmed
     } else {
         age_trimmed
     };
@@ -1288,6 +1299,18 @@ fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessa
             trim_message_images(m, drop_here)
         })
         .collect()
+}
+
+/// First index whose role or content differs between the pre-trim and
+/// post-trim history. `None` when a trim left every message untouched; a
+/// provider prompt cache is rewritten from the first changed message to the
+/// end of history, so trim events name that index to attribute the rewrite
+/// cost to the trim that caused it.
+fn first_changed_message(before: &[ChatMessage], after: &[ChatMessage]) -> Option<usize> {
+    before
+        .iter()
+        .zip(after.iter())
+        .position(|(a, b)| a.role != b.role || a.content != b.content)
 }
 
 /// Drop the `drop_here` oldest image markers from `text`, keeping the newest.
@@ -4020,6 +4043,173 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// At the cap, one new image rewrites exactly the oldest image-bearing
+    /// message; an image-free follow-up produces a byte-identical provider
+    /// view; the next new image evicts the next-oldest image. This pins the
+    /// bounded, deterministic eviction the cap events report.
+    #[tokio::test]
+    async fn image_cap_eviction_is_bounded_and_prefix_stable() {
+        let temp = tempfile::tempdir().unwrap();
+        let png_data = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2, 0x21, 0xBC,
+            0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        let config = MultimodalConfig {
+            max_images: 4,
+            max_image_size_mb: 5,
+            allow_remote_fetch: false,
+            max_image_turns: 0,
+            ..Default::default()
+        };
+        let img = |i: usize| {
+            let p = temp.path().join(format!("img{i}.png"));
+            std::fs::write(&p, png_data).unwrap();
+            p
+        };
+        // Four image turns (one image-only, three with captions), each answered.
+        let mut history = vec![ChatMessage::system("sys")];
+        for i in 0..4 {
+            let p = img(i);
+            let content = if i == 1 {
+                format!("[IMAGE:{}]", p.display())
+            } else {
+                format!("[IMAGE:{}]\ncaption {i}", p.display())
+            };
+            history.push(ChatMessage::user(content));
+            history.push(ChatMessage::assistant(format!("saw {i}")));
+        }
+        let p0 = prepare_messages_for_provider(&history, &config)
+            .await
+            .unwrap();
+
+        // Fifth image arrives: only the oldest image message is rewritten, and
+        // it keeps its caption while losing the image.
+        history.push(ChatMessage::user(format!(
+            "[IMAGE:{}]\ncaption 4",
+            img(4).display()
+        )));
+        let p1 = prepare_messages_for_provider(&history, &config)
+            .await
+            .unwrap();
+        let changed1: Vec<usize> = p0
+            .messages
+            .iter()
+            .zip(p1.messages.iter())
+            .enumerate()
+            .filter(|(_, (x, y))| x.content != y.content)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            changed1,
+            vec![1],
+            "fifth image mutates only the oldest image message"
+        );
+        assert!(p1.messages[1].content.contains("caption 0"));
+        assert!(!p1.messages[1].content.contains("data:image"));
+
+        // Following image-free request: the provider view is byte-stable.
+        history.push(ChatMessage::assistant("saw 4"));
+        history.push(ChatMessage::user("no image this time"));
+        let p2 = prepare_messages_for_provider(&history, &config)
+            .await
+            .unwrap();
+        let prefix_equal = p1
+            .messages
+            .iter()
+            .zip(p2.messages.iter())
+            .all(|(x, y)| x.role == y.role && x.content == y.content);
+        assert!(prefix_equal, "image-free follow-up must be byte-stable");
+
+        // Sixth image: the next mutation lands on the second-oldest image
+        // message, the image-only one, which becomes the removal placeholder.
+        history.push(ChatMessage::assistant("ok"));
+        history.push(ChatMessage::user(format!(
+            "[IMAGE:{}]\ncaption 5",
+            img(5).display()
+        )));
+        let p3 = prepare_messages_for_provider(&history, &config)
+            .await
+            .unwrap();
+        let d3 = first_changed_message(&p2.messages, &p3.messages);
+        assert_eq!(
+            d3,
+            Some(3),
+            "sixth image mutates the second-oldest image message"
+        );
+        assert_eq!(p3.messages[3].content, "[image removed from history]");
+    }
+
+    #[tokio::test]
+    async fn image_cap_eviction_event_names_the_rewritten_message() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let temp = tempfile::tempdir().unwrap();
+        let png_data = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2, 0x21, 0xBC,
+            0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        let config = MultimodalConfig {
+            max_images: 4,
+            max_image_size_mb: 5,
+            allow_remote_fetch: false,
+            max_image_turns: 0,
+            ..Default::default()
+        };
+        let img = |i: usize| {
+            let p = temp.path().join(format!("img{i}.png"));
+            std::fs::write(&p, png_data).unwrap();
+            p
+        };
+        let mut history = vec![ChatMessage::system("sys")];
+        for i in 0..5 {
+            let content = if i == 1 {
+                format!("[IMAGE:{}]", img(i).display())
+            } else {
+                format!("[IMAGE:{}]\ncaption {i}", img(i).display())
+            };
+            history.push(ChatMessage::user(content));
+            history.push(ChatMessage::assistant(format!("saw {i}")));
+        }
+
+        // The fifth image trips the cap; the WARN must name the message the
+        // trim rewrote, not just the counts.
+        let _ = prepare_messages_for_provider(&history, &config)
+            .await
+            .unwrap();
+
+        // Other tests in this process emit into the same channel; select the
+        // cap WARN frame, never just the first frame.
+        let mut found = None;
+        while let Ok(value) = rx.try_recv() {
+            let attrs = &value["attributes"];
+            if value["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("post-normalization image cap exceeded"))
+                && value["severity_text"] == "WARN"
+                && attrs["max_images"] == 4
+                && attrs["images_after_normalization"] == 5
+            {
+                found = Some(value);
+                break;
+            }
+        }
+        let frame =
+            found.expect("cap WARN frame with max_images 4 and 5 images after normalization");
+        assert_eq!(frame["attributes"]["earliest_mutated_index"], 1);
+        assert_eq!(frame["attributes"]["images_evicted"], 1);
+        zeroclaw_log::clear_broadcast_hook();
     }
 
     #[tokio::test]
