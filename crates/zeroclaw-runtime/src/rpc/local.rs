@@ -1,7 +1,7 @@
 //! Local IPC transport for the RPC layer.
 
 use super::context::RpcContext;
-use super::dispatch::RpcDispatcher;
+use super::dispatch::{LocalRpcSessionChannelFactory, RpcDispatcher};
 use super::transport::RpcTransport;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -172,6 +172,19 @@ pub async fn run_local_listener(
     client_count: Arc<AtomicUsize>,
     readiness: Option<crate::daemon::SocketReadinessReporter>,
 ) -> Result<()> {
+    run_local_listener_with_factory(ctx, cancel, client_count, readiness, None).await
+}
+
+/// Run the local IPC listener with a host-provided session channel factory.
+/// WSS has no corresponding entry point, so local-only channel capabilities
+/// cannot be minted by a remote connection.
+pub async fn run_local_listener_with_factory(
+    ctx: Arc<RpcContext>,
+    cancel: CancellationToken,
+    client_count: Arc<AtomicUsize>,
+    readiness: Option<crate::daemon::SocketReadinessReporter>,
+    channel_factory: Option<LocalRpcSessionChannelFactory>,
+) -> Result<()> {
     let path = {
         let config = ctx.config.read();
         socket_path(&config)
@@ -232,6 +245,7 @@ pub async fn run_local_listener(
 
                 let ctx = ctx.clone();
                 let conn_cancel = cancel.child_token();
+                let channel_factory = channel_factory.clone();
 
                 // Counted here rather than inside the task so an accepted
                 // connection is visible to the daemon immediately.
@@ -252,6 +266,9 @@ pub async fn run_local_listener(
                     // The transport's kind and kernel-supplied peer credential
                     // feed principal authentication at `initialize`.
                     .with_transport(transport.kind(), transport.credential());
+                    if let Some(factory) = channel_factory {
+                        dispatcher = dispatcher.with_local_session_channel_factory(factory);
+                    }
                     tokio::select! {
                         _ = dispatcher.run(&mut transport) => {}
                         _ = conn_cancel.cancelled() => {}

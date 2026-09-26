@@ -35,6 +35,18 @@ use zeroclaw_commands::{CommandSurface, commands_for_surface};
 /// Wire protocol version. Bump on breaking changes.
 pub const RPC_PROTOCOL_VERSION: u64 = 1;
 
+/// Application-provided factory for channels that belong to one local RPC
+/// session. The runtime owns the seam and only knows the API-level `Channel`
+/// trait; channel implementations remain replaceable by the host.
+pub type LocalRpcSessionChannelFactory = Arc<
+    dyn Fn(
+            Arc<parking_lot::RwLock<Config>>,
+            String,
+        ) -> std::collections::HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>
+        + Send
+        + Sync,
+>;
+
 mod notification {
     pub const SESSION_UPDATE: &str = "session/update";
     pub const LOGS_EVENT: &str = "logs/event";
@@ -817,6 +829,9 @@ pub struct RpcDispatcher {
     auth: Option<crate::rpc::auth::ConnectionAuth>,
     /// Which transport class this connection arrived on.
     transport_kind: crate::rpc::transport::TransportKind,
+    /// Host-provided local-only channels to attach to newly constructed or
+    /// rehydrated sessions. Remote listeners never supply this factory.
+    local_session_channel_factory: Option<LocalRpcSessionChannelFactory>,
     /// The transport-intrinsic credential (kernel peer uid on local
     /// sockets), presented during `initialize` when no explicit token is.
     transport_credential: crate::security::auth_provider::Credential,
@@ -932,6 +947,7 @@ impl RpcDispatcher {
             rpc: Arc::new(RpcOutbound::new(writer_tx)),
             auth: None,
             transport_kind: crate::rpc::transport::TransportKind::Local,
+            local_session_channel_factory: None,
             transport_credential: crate::security::auth_provider::Credential::None,
             tui_id: None,
             tui_epoch: None,
@@ -982,6 +998,64 @@ impl RpcDispatcher {
         self.transport_kind = kind;
         self.transport_credential = credential;
         self
+    }
+
+    /// Attach the host's local-only session channel factory. This is a
+    /// separate builder from transport metadata so only the local listener can
+    /// opt in while every direct/test constructor retains the empty default.
+    #[must_use]
+    pub fn with_local_session_channel_factory(
+        mut self,
+        factory: LocalRpcSessionChannelFactory,
+    ) -> Self {
+        self.local_session_channel_factory = Some(factory);
+        self
+    }
+
+    fn populate_local_session_channels(
+        &self,
+        agent: &mut crate::agent::agent::Agent,
+        agent_alias: &str,
+    ) {
+        if self.transport_kind != crate::rpc::transport::TransportKind::Local {
+            return;
+        }
+        let Some(factory) = self.local_session_channel_factory.as_ref() else {
+            return;
+        };
+        for (name, channel) in factory(Arc::clone(&self.ctx.config), agent_alias.to_string()) {
+            // Session-local Git channels intentionally feed only the
+            // reaction/forge path. The synthetic RPC approval channel is
+            // registered across every populated handle below.
+            agent
+                .channel_handles()
+                .reaction
+                .write()
+                .insert(name, channel);
+        }
+    }
+
+    async fn ensure_transport_can_use_session_agent(
+        &self,
+        agent: &Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
+    ) -> Result<(), JsonRpcError> {
+        if self.transport_kind == crate::rpc::transport::TransportKind::Local {
+            return Ok(());
+        }
+        let guard = agent.lock().await;
+        let has_local_session_channels = guard
+            .channel_handles()
+            .reaction
+            .read()
+            .keys()
+            .any(|name| name != "rpc");
+        if has_local_session_channels {
+            return Err(rpc_err(
+                SESSION_NOT_OWNED,
+                "Remote caller cannot use this session's local capabilities",
+            ));
+        }
+        Ok(())
     }
 
     /// Per-operation authorization: credential expiry, revalidation
@@ -2195,6 +2269,7 @@ impl RpcDispatcher {
             rpc: Arc::clone(&self.rpc),
             auth: self.auth.clone(),
             transport_kind: self.transport_kind,
+            local_session_channel_factory: self.local_session_channel_factory.clone(),
             transport_credential: self.transport_credential.clone(),
             tui_id: self.tui_id.clone(),
             // Same connection, so the same registration: this handle shares the
@@ -3155,8 +3230,20 @@ impl RpcDispatcher {
         session_id: String,
         chat_mode: &crate::rpc::types::ChatMode,
         existing: crate::rpc::session::ResumedRpcSession,
+        admission: Option<zeroclaw_infra::session_queue::SessionGuard>,
     ) -> RpcResult {
+        // Recheck the exact Agent returned by the atomic resume lookup before
+        // replacing its RPC approval back-channel. The pre-resume check below
+        // rejects the ordinary case before store mutation; this closes the
+        // replacement race without letting WSS capture the back-channel.
+        self.ensure_transport_can_use_session_agent(&existing.agent)
+            .await?;
         self.rebind_rpc_approval_channel(Arc::clone(&existing.agent), session_id.clone());
+        // The permit fences authority refresh, exact-Agent validation, and
+        // approval-channel rebinding. Do not retain it while plan forwarding
+        // or hooks await external consumers: those are post-admission effects
+        // and must not block later prompt, close, or replacement operations.
+        drop(admission);
         if matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
             && let Some(plan) = self.ctx.sessions.get_plan(&session_id).await
         {
@@ -3178,6 +3265,7 @@ impl RpcDispatcher {
         let req: SessionNewParams = parse_params(params)?;
         self.selector_session_agent(Method::SessionNew, &req.agent_alias)?;
         let resuming = req.session_id.is_some();
+        let mut authorized_resume = None;
         if let Some(existing) = req.session_id.as_deref() {
             // Resuming targets an EXISTING session: enforce its ownership
             // before any store is touched (scoped principals get the
@@ -3185,7 +3273,8 @@ impl RpcDispatcher {
             // because it exists nowhere yet). The live rebind below repeats
             // the check under the store lock against the exact incarnation.
             if self.resolve_session_record(existing).await?.is_some() {
-                self.authorize_session_owner(existing, Method::SessionNew)
+                authorized_resume = self
+                    .authorize_session_owner(existing, Method::SessionNew)
                     .await?;
             }
         }
@@ -3210,15 +3299,47 @@ impl RpcDispatcher {
         // A caller-supplied ID is a resume selector. The live RpcSession is
         // the canonical in-process incarnation, including provider history;
         // same-mode reconnects only rebind the existing canonical session.
-        // Resolve them before queue admission so an active turn can retain its
-        // real permit while the reattach completes. New sessions and
-        // cross-mode replacements remain serialized below.
+        // Local reconnects resolve before queue admission so an active turn can
+        // retain its real permit while the reattach completes. A non-local
+        // reconnect takes the permit first: that fences capability-changing
+        // replacement while transport eligibility is checked, without making
+        // the ordinary local reconnect blocking. New sessions and cross-mode
+        // replacements remain serialized below.
         // Ownership of the live incarnation is decided inside `resume_existing`,
         // under the store lock, against the record being rebound: the read
         // above authorized whatever existed then, this authorizes what exists
         // now. A scoped mismatch surfaces as the uniform ownership denial.
         let resume_scope = self.scoped_principal_id();
         if resuming {
+            let non_local = self.transport_kind != crate::rpc::transport::TransportKind::Local;
+            let remote_resume_admission = if non_local {
+                let guard = self
+                    .ctx
+                    .sessions
+                    .session_queue
+                    .acquire(&session_id)
+                    .await
+                    .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+                let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
+                if let Some(grants) = grants.as_ref() {
+                    self.selector_session_agent_with_grants(
+                        Method::SessionNew,
+                        grants,
+                        &req.agent_alias,
+                    )?;
+                }
+                self.revalidate_admitted_session(&session_id, authorized_resume.as_ref())
+                    .await?;
+                if let Some(agent) = self.ctx.sessions.get_agent(&session_id).await {
+                    self.ensure_transport_can_use_session_agent(&agent).await?;
+                }
+                Some((guard, grants))
+            } else {
+                None
+            };
+            let resume_grants = remote_resume_admission
+                .as_ref()
+                .map_or_else(|| self.stamped_grants(), |(_, grants)| grants.as_ref());
             match self
                 .ctx
                 .sessions
@@ -3228,17 +3349,23 @@ impl RpcDispatcher {
                     &chat_mode,
                     self.tui_id.clone(),
                     resume_scope.as_deref(),
-                    // Nothing has waited yet, so the stamped grants are as
-                    // current as the gate that just ran.
+                    // Local resume has not waited, so the stamped grants are
+                    // current as of the gate that just ran. Non-local resume
+                    // supplies the post-admission snapshot resolved above.
                     |alias, workspace| {
-                        self.authorize_resumed_session(self.stamped_grants(), alias, workspace)
+                        self.authorize_resumed_session(resume_grants, alias, workspace)
                     },
                 )
                 .await
             {
                 Ok(Some(existing)) => {
                     return self
-                        .finish_existing_session_resume(session_id, &chat_mode, existing?)
+                        .finish_existing_session_resume(
+                            session_id,
+                            &chat_mode,
+                            existing?,
+                            remote_resume_admission.map(|(guard, _)| guard),
+                        )
                         .await;
                 }
                 Ok(None) | Err("session uses a different chat mode") => {}
@@ -3250,6 +3377,7 @@ impl RpcDispatcher {
                 }
                 Err(message) => return Err(rpc_err(INVALID_PARAMS, message)),
             }
+            drop(remote_resume_admission);
         }
 
         // Session replacement and prompt execution share one admission
@@ -3322,7 +3450,7 @@ impl RpcDispatcher {
                 })?
         {
             return self
-                .finish_existing_session_resume(session_id, &chat_mode, existing?)
+                .finish_existing_session_resume(session_id, &chat_mode, existing?, None)
                 .await;
         }
         if admitted_mode.is_some() {
@@ -3566,6 +3694,7 @@ impl RpcDispatcher {
         if let Some(grants) = grants.as_ref() {
             self.apply_principal_grants_to_agent(grants, &mut agent);
         }
+        self.populate_local_session_channels(&mut agent, &req.agent_alias);
         agent.set_interaction_context(
             resolved_interaction_surface.map(crate::agent::prompt::InteractionSurface::resolve),
         );
@@ -4366,6 +4495,7 @@ impl RpcDispatcher {
         if let Some(grants) = grants {
             self.apply_principal_grants_to_agent(grants, &mut agent);
         }
+        self.populate_local_session_channels(&mut agent, &data.agent_alias);
         let interaction_context = match data.interaction_surface.as_deref() {
             Some(value) => match crate::agent::prompt::InteractionSurface::from_persisted(value) {
                 Some(surface) => Some(surface.resolve()),
@@ -4953,6 +5083,12 @@ impl RpcDispatcher {
             .get_agent(sid)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+
+        if let Err(denied) = self.ensure_transport_can_use_session_agent(&agent).await {
+            return Err(self
+                .refuse_admitted_prompt(sid, req.client_turn_generation, denied)
+                .await);
+        }
 
         // The grants were re-resolved after admission, so apply that posture
         // to this session's static and already-activated deferred tools. It is
@@ -9594,6 +9730,308 @@ pub(crate) mod connection_test_support {
 #[cfg(test)]
 mod tests {
     use zeroclaw_api::model_provider::ChatMessage;
+
+    struct SessionFactoryStubChannel;
+
+    impl zeroclaw_api::attribution::Attributable for SessionFactoryStubChannel {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Channel(zeroclaw_api::attribution::ChannelKind::Cli)
+        }
+
+        fn alias(&self) -> &str {
+            "stub"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl zeroclaw_api::channel::Channel for SessionFactoryStubChannel {
+        fn name(&self) -> &str {
+            "git"
+        }
+
+        async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn session_factory_stub() -> super::LocalRpcSessionChannelFactory {
+        std::sync::Arc::new(|_, _| {
+            let mut channels = std::collections::HashMap::new();
+            channels.insert(
+                "git.main".to_string(),
+                std::sync::Arc::new(SessionFactoryStubChannel)
+                    as std::sync::Arc<dyn zeroclaw_api::channel::Channel>,
+            );
+            channels
+        })
+    }
+
+    #[tokio::test]
+    async fn local_session_factory_populates_channels_and_resume_preserves_them() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, sessions) = make_acp_test_dispatcher(config);
+        dispatcher = dispatcher.with_local_session_channel_factory(session_factory_stub());
+        dispatcher.set_tui_id_for_test(Some("tui-local".into()));
+
+        let request = serde_json::json!({
+            "agent_alias": "test-agent",
+            "session_id": "local-factory-session",
+        });
+        dispatcher
+            .handle_session_new_for_test(&request)
+            .await
+            .expect("session/new should succeed");
+
+        let before = sessions
+            .get_agent("local-factory-session")
+            .await
+            .expect("session should be live");
+        {
+            let agent = before.lock().await;
+            let reaction = agent.channel_handles().reaction.read();
+            assert_eq!(reaction.len(), 2);
+            assert!(reaction.contains_key("git.main"));
+            assert!(reaction.contains_key("rpc"));
+        }
+
+        dispatcher
+            .handle_session_new_for_test(&request)
+            .await
+            .expect("same-mode resume should succeed");
+        let after = sessions
+            .get_agent("local-factory-session")
+            .await
+            .expect("resumed session should remain live");
+        assert!(
+            std::sync::Arc::ptr_eq(&before, &after),
+            "same-mode resume must rebind the existing session rather than rebuilding it"
+        );
+        assert!(
+            after
+                .lock()
+                .await
+                .channel_handles()
+                .reaction
+                .read()
+                .contains_key("git.main"),
+            "same-mode resume must preserve local channel handles"
+        );
+    }
+
+    #[tokio::test]
+    async fn wss_prompt_rejects_same_principal_local_capability_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut local, _sessions) = make_acp_test_dispatcher(config);
+        local = local.with_local_session_channel_factory(session_factory_stub());
+        local.set_tui_id_for_test(Some("tui-shared".into()));
+        local
+            .handle_session_new_for_test(&serde_json::json!({
+                "agent_alias": "test-agent",
+                "session_id": "local-capability-session",
+            }))
+            .await
+            .expect("local session/new should succeed");
+
+        let original_rpc_channel = local
+            .ctx
+            .sessions
+            .get_agent("local-capability-session")
+            .await
+            .expect("local session should remain live")
+            .lock()
+            .await
+            .channel_handles()
+            .get_channel("rpc")
+            .expect("local session should have an RPC approval channel");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut remote =
+            super::RpcDispatcher::new(std::sync::Arc::clone(&local.ctx), tx, "wss:test".into())
+                .with_transport(
+                    crate::rpc::transport::TransportKind::Wss,
+                    crate::security::auth_provider::Credential::None,
+                );
+        remote.set_authenticated_for_test();
+        remote.set_tui_id_for_test(Some("tui-remote".into()));
+
+        let resume_error = remote
+            .handle_session_new_for_test(&serde_json::json!({
+                "agent_alias": "test-agent",
+                "session_id": "local-capability-session",
+            }))
+            .await
+            .expect_err("WSS resume must not capture the local session back-channel");
+        assert_eq!(
+            resume_error.code,
+            zeroclaw_api::jsonrpc::error_codes::SESSION_NOT_OWNED
+        );
+        let retained_rpc_channel = local
+            .ctx
+            .sessions
+            .get_agent("local-capability-session")
+            .await
+            .expect("refused resume must retain the local session")
+            .lock()
+            .await
+            .channel_handles()
+            .get_channel("rpc")
+            .expect("refused resume must preserve the local RPC approval channel");
+        assert!(
+            std::sync::Arc::ptr_eq(&original_rpc_channel, &retained_rpc_channel),
+            "refused WSS resume must not replace the local approval back-channel"
+        );
+        assert_eq!(
+            local
+                .ctx
+                .sessions
+                .session_owner_tui_id("local-capability-session")
+                .await
+                .flatten()
+                .as_deref(),
+            Some("tui-shared"),
+            "refused WSS resume must not change the session's TUI owner"
+        );
+
+        let error = remote
+            .handle_session_prompt(&serde_json::json!({
+                "session_id": "local-capability-session",
+                "prompt": "must be rejected before tool execution",
+                "client_turn_generation": 17,
+            }))
+            .await
+            .expect_err("WSS prompt must not inherit local capabilities");
+        assert_eq!(
+            error.code,
+            zeroclaw_api::jsonrpc::error_codes::SESSION_NOT_OWNED
+        );
+        let raw = rx
+            .try_recv()
+            .expect("refused admitted WSS prompt must emit terminal TurnComplete");
+        let notification: serde_json::Value =
+            serde_json::from_str(&raw).expect("notification must be JSON");
+        assert_eq!(notification["method"], notification::SESSION_UPDATE);
+        assert_eq!(
+            notification["params"]["session_id"],
+            "local-capability-session"
+        );
+        assert_eq!(notification["params"]["outcome"], "failed");
+        assert_eq!(notification["params"]["client_turn_generation"], 17);
+    }
+
+    #[tokio::test]
+    async fn wss_resume_rechecks_local_capabilities_under_admission_fence() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut local, sessions) = make_acp_test_dispatcher(config);
+        local.set_tui_id_for_test(Some("tui-local".into()));
+        let sid = "local-capability-race";
+        local
+            .handle_session_new_for_test(&serde_json::json!({
+                "agent_alias": "test-agent",
+                "session_id": sid,
+            }))
+            .await
+            .expect("local session/new should succeed");
+
+        let permit = sessions
+            .session_queue
+            .acquire(sid)
+            .await
+            .expect("test owns the session admission permit");
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut remote =
+            super::RpcDispatcher::new(std::sync::Arc::clone(&local.ctx), tx, "wss:test".into())
+                .with_transport(
+                    crate::rpc::transport::TransportKind::Wss,
+                    crate::security::auth_provider::Credential::None,
+                );
+        remote.set_authenticated_for_test();
+        remote.set_tui_id_for_test(Some("tui-remote".into()));
+        let request = serde_json::json!({
+            "agent_alias": "test-agent",
+            "session_id": sid,
+        });
+        let resume =
+            zeroclaw_spawn::spawn!(
+                async move { remote.handle_session_new_for_test(&request).await }
+            );
+        wait_for_session_admission_waiter(&local.ctx, sid).await;
+
+        let agent = sessions
+            .get_agent(sid)
+            .await
+            .expect("session remains live while resume waits");
+        agent
+            .lock()
+            .await
+            .channel_handles()
+            .reaction
+            .write()
+            .insert(
+                "git.main".to_string(),
+                std::sync::Arc::new(SessionFactoryStubChannel)
+                    as std::sync::Arc<dyn zeroclaw_api::channel::Channel>,
+            );
+        drop(permit);
+
+        let error = resume
+            .await
+            .expect("resume task must not panic")
+            .expect_err("post-admission capability recheck must refuse WSS resume");
+        assert_eq!(
+            error.code,
+            zeroclaw_api::jsonrpc::error_codes::SESSION_NOT_OWNED
+        );
+        assert_eq!(
+            sessions
+                .session_owner_tui_id(sid)
+                .await
+                .flatten()
+                .as_deref(),
+            Some("tui-local"),
+            "refused WSS resume must not take the local session's TUI ownership stamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_acp_rehydration_restores_session_channels() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let dispatcher = dispatcher.with_local_session_channel_factory(session_factory_stub());
+        let sid = "acp-rehydrated-factory";
+        dispatcher
+            .handle_session_new_for_test(&serde_json::json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new should create the ACP session");
+        assert!(sessions.remove(sid).await, "reap must remove live state");
+
+        let recovered = dispatcher
+            .rehydrate_reaped_session(sid, dispatcher.stamped_grants())
+            .await
+            .expect("rehydration should not fail")
+            .expect("restorable ACP session must rehydrate");
+        let agent = recovered.lock().await;
+        let reaction = agent.channel_handles().reaction.read();
+        assert_eq!(reaction.len(), 2);
+        assert!(reaction.contains_key("git.main"));
+        assert!(reaction.contains_key("rpc"));
+    }
 
     /// The personality filename allowlist constrains the name, not its target.
     /// Both sides must therefore refuse an allowlisted name planted as a link
