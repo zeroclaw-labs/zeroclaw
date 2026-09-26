@@ -1,0 +1,16 @@
+{
+  "agents": [
+    "bot",
+    "helper"
+  ],
+  "channel_types": [],
+  "channels": [],
+  "knowledge_bundles": [],
+  "mcp_bundles": [],
+  "model_providers": [
+    "anthropic.default"
+  ],
+  "risk_profiles": [],
+  "runtime_profiles": [],
+  "skill_bundles": []
+}

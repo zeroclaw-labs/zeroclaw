@@ -18,6 +18,10 @@ pub type StarterFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 pub struct GatewayReloadControls {
     pub shutdown_tx: watch::Sender<bool>,
     pub reload_tx: watch::Sender<bool>,
+    /// Set when an accepted config write needs a daemon reload to reach the
+    /// subsystems built from it. Owned by the daemon generation and shared by
+    /// every surface that writes config, so a fresh generation starts clear.
+    pub pending_reload: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub type GatewayStarter = Box<

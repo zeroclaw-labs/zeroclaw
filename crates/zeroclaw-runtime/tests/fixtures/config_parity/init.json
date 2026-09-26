@@ -1,0 +1,14 @@
+{
+  "initialized": [
+    "tunnel.cloudflare",
+    "tunnel.tailscale",
+    "tunnel.ngrok",
+    "tunnel.custom",
+    "tunnel.pinggy",
+    "wss.client_auth",
+    "transcription.openai",
+    "transcription.deepgram",
+    "transcription.assemblyai",
+    "transcription.google"
+  ]
+}

@@ -763,6 +763,10 @@ rpc_type! {
         pub path: String,
         pub key: String,
         pub deleted: bool,
+        /// Agent delete only: post-commit steps (workspace archive, owned-state
+        /// removal) that did not complete. Absent when everything completed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub warnings: Option<Vec<String>>,
     }
 }
 
@@ -811,6 +815,23 @@ impl From<zeroclaw_config::traits::MapKeySection> for ConfigTemplateEntry {
 rpc_type! {
     pub struct ConfigTemplatesResult {
         pub templates: Vec<ConfigTemplateEntry>,
+    }
+}
+
+rpc_type! {
+    /// Returned by `config/drift`. Same shape as `GET /api/config/drift`.
+    pub struct ConfigDriftResult {
+        pub drifted: Vec<crate::config_ops::drift::DriftEntry>,
+    }
+}
+
+rpc_type! {
+    /// Returned by `config/reload-status`. Same shape as the gateway's
+    /// `GET /api/config/reload-status`.
+    pub struct ConfigReloadStatusResult {
+        /// Whether an accepted config write has landed since the last daemon
+        /// reload and may still need subsystem re-instantiation to take effect.
+        pub pending_reload: bool,
     }
 }
 
@@ -1222,6 +1243,28 @@ rpc_type! {
         pub section: String,
         pub items: Vec<PickerItem>,
         pub help: String,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigInitParams {
+        /// Optional section prefix to scope the init pass. Without it, every
+        /// uninitialized nested section gets its defaults.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub section: Option<String>,
+    }
+}
+
+rpc_type! {
+    pub struct ProvidersRefreshContextWindowParams {
+        pub provider_type: String,
+        pub alias: String,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigSectionPickerParams {
+        pub section: String,
     }
 }
 

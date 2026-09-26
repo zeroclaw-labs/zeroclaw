@@ -1,0 +1,5 @@
+{
+  "code": "path_not_found",
+  "message": "section `hardware` is a direct-form section with no picker; render fields via GET /api/config/list?prefix=hardware",
+  "path": "hardware"
+}

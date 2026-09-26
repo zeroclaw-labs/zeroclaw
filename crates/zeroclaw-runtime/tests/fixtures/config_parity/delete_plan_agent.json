@@ -1,0 +1,14 @@
+{
+  "allowed": true,
+  "blockers": [],
+  "cascades_owned_state": true,
+  "key": "bot",
+  "live_acp_sessions": 0,
+  "path": "agents",
+  "scrubs": [
+    {
+      "path": "heartbeat.agent",
+      "raw_value": "bot"
+    }
+  ]
+}

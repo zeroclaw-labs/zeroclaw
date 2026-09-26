@@ -1752,9 +1752,23 @@ pub async fn run_gateway_with_plugin_webhooks(
     );
 
     let (owned_shutdown_tx, _) = tokio::sync::watch::channel(false);
-    let (shutdown_tx, reload_tx) = reload_controls
-        .map(|controls| (controls.shutdown_tx, Some(controls.reload_tx)))
-        .unwrap_or((owned_shutdown_tx, None));
+    // Supervised runs share the daemon generation's pending-reload flag, so the
+    // gateway and RPC report one answer; a standalone gateway owns its own.
+    let (shutdown_tx, reload_tx, pending_reload) = reload_controls
+        .map(|controls| {
+            (
+                controls.shutdown_tx,
+                Some(controls.reload_tx),
+                controls.pending_reload,
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                owned_shutdown_tx,
+                None,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+        });
     let mut shutdown_rx = shutdown_tx.subscribe();
 
     // Node registry for dynamic node discovery
@@ -1879,7 +1893,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         web_dist_dir,
         canvas_store,
         cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        pending_reload,
         tui_registry,
         sop_engine,
         sop_audit,
@@ -6249,6 +6263,7 @@ path = "{trigger_path}"
         let reload_controls = zeroclaw_runtime::daemon::GatewayReloadControls {
             shutdown_tx: shutdown_tx.clone(),
             reload_tx,
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(None);
         let readiness = zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {

@@ -260,25 +260,6 @@ pub struct ListResponse {
     pub drifted: Vec<DriftEntry>,
 }
 
-/// One drift entry surfaced when in-memory Config diverges from the on-disk file.
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct DriftEntry {
-    pub path: String,
-    /// `true` for secret fields where values cannot be exposed.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub secret: bool,
-    /// Always `true` when surfaced. Present so secret entries unambiguously
-    /// communicate the drift signal in shape `{path, secret: true, drifted: true}`.
-    pub drifted: bool,
-    /// In-memory value (the daemon's view). Absent for secrets.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub in_memory_value: Option<serde_json::Value>,
-    /// On-disk value (what the file contains right now). Absent for secrets.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_disk_value: Option<serde_json::Value>,
-}
-
 fn is_false(b: &bool) -> bool {
     !*b
 }
@@ -343,43 +324,6 @@ fn lookup_prop_field(
                 }
             })
         })
-}
-
-fn scoped_validate(
-    working: &zeroclaw_config::schema::Config,
-) -> Result<Vec<zeroclaw_config::validation_warnings::ValidationWarning>, ConfigApiError> {
-    if let Err(e) = working.validate() {
-        let api_err = ConfigApiError::from_validation(e);
-        let err_path = api_err.path.as_deref().unwrap_or("");
-        let touches_dirty = !err_path.is_empty()
-            && working.dirty_paths.iter().any(|d| {
-                err_path == d.as_str()
-                    || err_path.starts_with(&format!("{d}."))
-                    || d.starts_with(&format!("{err_path}."))
-            });
-        if touches_dirty || err_path.is_empty() {
-            return Err(api_err);
-        }
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"path": err_path})),
-            &format!(
-                "validate() failed on a path outside this PATCH's dirty set; saving anyway and \
-             surfacing as a warning: {}",
-                api_err.message
-            )
-        );
-        return Ok(vec![
-            zeroclaw_config::validation_warnings::ValidationWarning::new(
-                "pre_existing_validation_error",
-                api_err.message,
-                err_path.to_string(),
-            ),
-        ]);
-    }
-    Ok(Vec::new())
 }
 
 /// Save `new_config` to disk, then install it as the live config.
@@ -605,114 +549,12 @@ pub async fn handle_api_channel_bind(
     .into_response()
 }
 
-/// Fields the gateway owns end-to-end (mints, rotates, persists itself).
-/// They're skipped by [`compute_drift`] so the dashboard doesn't surface a
-/// banner the operator can't act on. Add new entries here when a similar
-/// gateway-managed field lands (e.g. webhook secret rotation).
-fn is_gateway_managed_field(name: &str) -> bool {
-    // Match the prop-field name actually emitted by the `Configurable` derive,
-    // which preserves the Rust field's snake_case (`paired_tokens`), not kebab.
-    matches!(name, "gateway.paired_tokens")
-}
-
-pub async fn compute_drift(in_memory: &zeroclaw_config::schema::Config) -> Vec<DriftEntry> {
-    try_compute_drift(in_memory).await.unwrap_or_default()
-}
-
-pub(crate) async fn try_compute_drift(
-    in_memory: &zeroclaw_config::schema::Config,
-) -> Result<Vec<DriftEntry>, ConfigApiError> {
-    let path = &in_memory.config_path;
-    let raw = match tokio::fs::read_to_string(path).await {
-        Ok(s) => s,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(ConfigApiError::new(
-                ConfigApiCode::ConfigChangedExternally,
-                format!("cannot inspect the canonical config before comparing changes: {error}"),
-            ));
-        }
-    };
-
-    // Re-parse the on-disk form into a fresh Config for value-by-value comparison.
-    let mut on_disk = toml::from_str::<zeroclaw_config::schema::Config>(&raw).map_err(|_| {
-        ConfigApiError::new(
-            ConfigApiCode::ConfigChangedExternally,
-            "cannot compare changes because the canonical config is malformed",
-        )
-    })?;
-    on_disk.config_path = path.clone();
-
-    let in_memory_props: std::collections::HashMap<String, zeroclaw_config::traits::PropFieldInfo> =
-        in_memory
-            .prop_fields()
-            .into_iter()
-            .map(|p| (p.name.clone(), p))
-            .collect();
-    let on_disk_props: std::collections::HashMap<String, zeroclaw_config::traits::PropFieldInfo> =
-        on_disk
-            .prop_fields()
-            .into_iter()
-            .map(|p| (p.name.clone(), p))
-            .collect();
-
-    let mut drift: Vec<DriftEntry> = Vec::new();
-    let mut all_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    all_names.extend(in_memory_props.keys().map(String::as_str));
-    all_names.extend(on_disk_props.keys().map(String::as_str));
-    for name in all_names {
-        if is_gateway_managed_field(name) {
-            continue;
-        }
-        // Env overrides (`ZEROCLAW_<path>`) apply in memory but never persist to
-        // disk, so a disk comparison always reports drift the operator can't fix.
-        if in_memory.prop_is_env_overridden(name) {
-            continue;
-        }
-        let mem = in_memory_props.get(name);
-        let disk = on_disk_props.get(name);
-        let mem_display = mem
-            .map(|p| p.display_value.as_str())
-            .unwrap_or(zeroclaw_config::traits::UNSET_DISPLAY);
-        let disk_display = disk
-            .map(|p| p.display_value.as_str())
-            .unwrap_or(zeroclaw_config::traits::UNSET_DISPLAY);
-        if mem_display == disk_display {
-            continue;
-        }
-        let is_sensitive = mem
-            .or(disk)
-            .map(|p| p.is_secret || p.derived_from_secret)
-            .unwrap_or(false);
-        if is_sensitive {
-            use sha2::{Digest, Sha256};
-            let mem_hash = Sha256::digest(mem_display.as_bytes());
-            let disk_hash = Sha256::digest(disk_display.as_bytes());
-            if mem_hash == disk_hash {
-                continue;
-            }
-            drift.push(DriftEntry {
-                path: name.to_string(),
-                secret: true,
-                drifted: true,
-                in_memory_value: None,
-                on_disk_value: None,
-            });
-        } else {
-            drift.push(DriftEntry {
-                path: name.to_string(),
-                secret: false,
-                drifted: true,
-                in_memory_value: Some(serde_json::Value::String(mem_display.to_string())),
-                on_disk_value: Some(serde_json::Value::String(disk_display.to_string())),
-            });
-        }
-    }
-
-    // Stable order so callers can diff snapshots.
-    drift.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(drift)
-}
+pub use zeroclaw_runtime::config_ops::document::{
+    InitResponse, MigrateResponse, apply_init, migrate_config_file, scoped_validate,
+};
+pub use zeroclaw_runtime::config_ops::drift::{
+    DriftEntry, compute_drift, is_gateway_managed_field, try_compute_drift,
+};
 
 // ── Handlers ────────────────────────────────────────────────────────
 
@@ -1106,25 +948,13 @@ pub async fn handle_delete_map_key(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-    // Acquired before this read-for-modify, threaded into the cascade
-    // helpers below, and held through whichever branch's swap runs.
-    let _cfg_guard = Arc::clone(&state.config_write_lock).lock_owned().await;
-    let working = state.config.read().clone();
-    match zeroclaw_config::alias_refs::alias_kind_for_map_path(&q.path) {
-        Some(zeroclaw_config::alias_refs::AliasKind::Agent) => {
-            // Agent deletion is special: it must scrub config references
-            // (heartbeat, peer-groups, delegates, workspace.access, …) via
-            // `delete_with_cascade` and cascade owned non-config state (memory /
-            // cron / acp / session).
-            return delete_agent_cascade(&state, working, &q.key, _cfg_guard).await;
-        }
-        Some(kind) => {
-            return delete_config_cascade(&state, working, &kind, &q.path, &q.key, &_cfg_guard)
-                .await;
-        }
-        None => {}
+    // Acquired before this read-for-modify and held through the swap and, for
+    // an agent, through its owned-state cleanup.
+    let cfg_guard = Arc::clone(&state.config_write_lock).lock_owned().await;
+    let mut working = state.config.read().clone();
+    if let Some(kind) = zeroclaw_config::alias_refs::alias_kind_for_map_path(&q.path) {
+        return delete_alias_cascade(&state, working, &kind, &q.path, &q.key, cfg_guard).await;
     }
-    let mut working = working;
     let removed = match working.delete_map_key(&q.path, &q.key) {
         Ok(b) => b,
         Err(msg) => {
@@ -1135,7 +965,7 @@ pub async fn handle_delete_map_key(
     };
     if removed {
         working.mark_dirty(&format!("{}.{}", q.path, q.key));
-        if let Err(e) = persist_and_swap(&state, working, &_cfg_guard).await {
+        if let Err(e) = persist_and_swap(&state, working, &cfg_guard).await {
             return error_response(e);
         }
     }
@@ -1148,202 +978,79 @@ pub async fn handle_delete_map_key(
     .into_response()
 }
 
-/// Agent-deletion cascade: refuse on HARD references (enabled `heartbeat.agent`
-/// or live ACP sessions), else scrub config refs + remove the entry via
-/// `delete_with_cascade`, archive the workspace, run the owned-state cascade
-/// (export-then-delete memory/cron/acp + clear session attribution), and persist.
-async fn delete_agent_cascade(
-    state: &AppState,
-    mut working: zeroclaw_config::schema::Config,
-    alias: &str,
-    guard: ConfigWriteGuard,
-) -> Response {
-    use zeroclaw_config::alias_refs::{self, AliasKind, CascadePolicy};
-
-    if !working.agents.contains_key(alias) {
-        return error_response(
-            ConfigApiError::new(
-                ConfigApiCode::PathNotFound,
-                format!("agents.{alias} is not configured"),
-            )
-            .with_path("agents"),
-        );
-    }
-
-    // Refuse on HARD: config blockers (e.g. enabled heartbeat.agent) OR live ACP
-    // sessions (the operator must end those first). The ACP gate FAILS CLOSED:
-    // if the session store can't be read we refuse rather than risk orphaning
-    // live sessions.
-    let plan = alias_refs::plan_delete(&working, &AliasKind::Agent, alias);
-    let live_acp = match crate::agent_owned_state::live_acp_session_count(&working, alias) {
-        Ok(n) => n,
-        Err(e) => {
-            return error_response(
-                ConfigApiError::new(
-                    ConfigApiCode::ValidationFailed,
-                    format!(
-                        "cannot delete agent `{alias}`: could not verify live ACP sessions ({e}); refusing to avoid orphaning active sessions"
-                    ),
-                )
-                .with_path(format!("agents.{alias}")),
-            );
-        }
-    };
-    if !plan.allowed || live_acp > 0 {
-        let mut reasons: Vec<String> = plan
-            .blockers
-            .iter()
-            .map(|b| format!("{} (hard config reference)", b.path))
-            .collect();
-        if live_acp > 0 {
-            reasons.push(format!("{live_acp} live ACP session(s) — end them first"));
-        }
-        return error_response(
-            ConfigApiError::new(
-                ConfigApiCode::ValidationFailed,
-                format!("cannot delete agent `{alias}`: {}", reasons.join("; ")),
-            )
-            .with_path(format!("agents.{alias}")),
-        );
-    }
-
-    let workspace = working.agent_workspace_dir(alias);
-
-    // Config cascade: scrub soft refs + remove the agents entry.
-    let cascade = match alias_refs::delete_with_cascade(
-        &mut working,
-        &AliasKind::Agent,
-        alias,
-        CascadePolicy::RefuseOnHard,
-    ) {
-        Ok(report) => report,
-        Err(e) => {
-            return error_response(
-                ConfigApiError::new(
-                    ConfigApiCode::ValidationFailed,
-                    format!("agent config cascade failed: {e}"),
-                )
-                .with_path(format!("agents.{alias}")),
-            );
-        }
-    };
-
-    for path in cascade.dirty_paths() {
-        working.mark_dirty(&path);
-    }
-    if let Err(e) = persist_and_swap(state, working, &guard).await {
-        return error_response(e);
-    }
-    // Config is committed (saved + swapped). Release before the post-commit
-    // side effects below: workspace archive and the memory/cron/ACP/session
-    // cascade can be slow or wedge, and holding the lock across them would
-    // stall every other gateway config write process-wide.
-    drop(guard);
-    // Config is durably committed: the agent is GONE from the persisted config.
-    // Read it back from the (now-swapped) AppState for the side-effects below.
-    let committed = state.config.read().clone();
-
-    let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
-    let archive_dir = committed
-        .data_dir
-        .join("agents")
-        .join("_deleted")
-        .join(format!("{alias}-{ts}"));
-    let mut warnings: Vec<String> = Vec::new();
-    if let Err(err) = tokio::fs::create_dir_all(&archive_dir).await {
-        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": alias, "archive": archive_dir.display().to_string(), "err": err.to_string()})), "agent delete: archive dir creation failed");
-        warnings.push(format!(
-            "archive dir creation failed ({}): {err}",
-            archive_dir.display()
-        ));
-    }
-    if workspace.exists() {
-        let dest = archive_dir.join("workspace");
-        if let Err(err) = tokio::fs::rename(&workspace, &dest).await {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"agent": alias, "from": workspace.display().to_string(), "to": dest.display().to_string(), "err": err.to_string()})),
-                "agent delete: workspace archive failed"
-            );
-            warnings.push(format!(
-                "workspace archive failed ({} -> {}): {err}",
-                workspace.display(),
-                dest.display()
-            ));
-        }
-    }
-
-    // Owned-state cascade (export-then-delete memory/cron/acp + clear sessions).
-    let owned = crate::agent_owned_state::cascade_owned_state(
-        &committed,
-        &state.mem,
-        state.session_backend.as_ref(),
-        alias,
-        &archive_dir,
-    )
-    .await;
-    // Combine per-side-effect failures (archive dir / workspace rename) with
-    // the per-store failures surfaced by `cascade_owned_state`, so the operator
-    // sees the FULL partial-failure picture in the response, not just the
-    // server log.
-    warnings.extend(owned.warnings.iter().cloned());
-    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"agent": alias, "memory": owned.memory_purged, "cron": owned.cron_removed, "acp": owned.acp_removed, "sessions_cleared": owned.sessions_cleared, "archive": archive_dir.display().to_string(), "warnings": warnings.len()})), "agent deleted with owned-state cascade");
-
-    axum::Json(MapKeyResponse {
-        path: "agents".to_string(),
-        key: alias.to_string(),
-        created: false,
-        warnings: if warnings.is_empty() {
-            None
-        } else {
-            Some(warnings)
-        },
-    })
-    .into_response()
-}
-
-/// Config-only delete cascade for providers/channels (no owned state): refuse
-/// on hard refs, scrub soft refs, mark every touched path dirty, persist.
-async fn delete_config_cascade(
+/// Aliased delete through the shared cascade: refuse on hard references (and,
+/// for an agent, on live ACP sessions), scrub soft ones and persist. An agent's
+/// workspace archive and owned-state removal run before the lock is released.
+async fn delete_alias_cascade(
     state: &AppState,
     mut working: zeroclaw_config::schema::Config,
     kind: &zeroclaw_config::alias_refs::AliasKind,
     path: &str,
     key: &str,
-    guard: &ConfigWriteGuard,
+    guard: ConfigWriteGuard,
 ) -> Response {
-    let report = match zeroclaw_config::alias_refs::delete_with_cascade(
-        &mut working,
-        kind,
-        key,
-        zeroclaw_config::alias_refs::CascadePolicy::RefuseOnHard,
-    ) {
-        Ok(r) => r,
-        Err(e) => return delete_error_response(path, key, e),
+    let prepared = match prepare_alias_delete(&mut working, kind, path, key) {
+        Ok(prepared) => prepared,
+        Err(e) => return error_response(e),
     };
-    let dirty_paths = report.dirty_paths();
-    for dirty_path in &dirty_paths {
-        working.mark_dirty(dirty_path);
-    }
-    if let Err(e) = persist_and_swap(state, working, guard).await {
+    if let Err(e) = persist_and_swap(state, working, &guard).await {
         return error_response(e);
     }
-    ::zeroclaw_log::record!(
-        INFO,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-            ::serde_json::json!({"path": path, "key": key, "dirty_paths": dirty_paths.len()})
-        ),
-        "alias deleted with config-ref cascade"
-    );
+    // The lock stays held through the owned-state cleanup: released earlier,
+    // a concurrent create could re-add the same alias and have its fresh
+    // workspace and state removed by this delete.
+    let mut warnings = Vec::new();
+    if let Some(workspace) = prepared.agent_workspace {
+        // Config is durably committed: the agent is gone from the persisted
+        // config. Read it back from the swapped state for the side effects.
+        let committed = state.config.read().clone();
+        warnings = finish_agent_delete(
+            &committed,
+            &state.mem,
+            state.session_backend.as_ref(),
+            key,
+            &workspace,
+        )
+        .await;
+    } else {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"path": path, "key": key, "dirty_paths": prepared.dirty_paths.len()})),
+            "alias deleted with config-ref cascade"
+        );
+    }
+    drop(guard);
+    let path = if matches!(kind, zeroclaw_config::alias_refs::AliasKind::Agent) {
+        "agents"
+    } else {
+        path
+    };
     axum::Json(MapKeyResponse {
         path: path.to_string(),
         key: key.to_string(),
         created: false,
-        warnings: None,
+        warnings: (!warnings.is_empty()).then_some(warnings),
     })
     .into_response()
+}
+
+#[cfg(test)]
+async fn delete_agent_cascade(
+    state: &AppState,
+    working: zeroclaw_config::schema::Config,
+    alias: &str,
+    guard: ConfigWriteGuard,
+) -> Response {
+    delete_alias_cascade(
+        state,
+        working,
+        &zeroclaw_config::alias_refs::AliasKind::Agent,
+        "agents",
+        alias,
+        guard,
+    )
+    .await
 }
 
 pub async fn handle_map_key(
@@ -1420,43 +1127,10 @@ pub async fn handle_map_key(
     .into_response()
 }
 
-/// A single config reference site to an aliased entry, for the delete preview.
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct RefSiteDto {
-    /// Dotted config path that references the alias, e.g.
-    /// `agents.forge.model_provider` or `heartbeat.agent`.
-    pub path: String,
-    /// The stored reference text, e.g. `anthropic.default`.
-    pub raw_value: String,
-}
-
-/// Dry-run impact of deleting an aliased entry — the cascade preview a surface
-/// renders before confirming. Pure/read-only: computed from `plan_delete` (the
-/// same reference walk the real delete uses) plus the live-ACP gate for agents.
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct DeletePlanResponse {
-    pub path: String,
-    pub key: String,
-    /// True iff nothing HARD blocks the delete (no hard config reference and,
-    /// for agents, no live ACP session). Mirrors the real delete's refusal gate.
-    pub allowed: bool,
-    /// HARD references that block the delete — the operator must change these
-    /// first (e.g. an enabled `heartbeat.agent`).
-    pub blockers: Vec<RefSiteDto>,
-    /// SOFT references the delete would scrub automatically.
-    pub scrubs: Vec<RefSiteDto>,
-    /// Agent delete only: number of live ACP sessions (a non-zero count blocks
-    /// the delete; `null` for non-agent sections or if the count couldn't be
-    /// read — in which case the delete fails closed too).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub live_acp_sessions: Option<usize>,
-    /// Agent delete only: the agent's owned non-config state (memory / cron /
-    /// session history) is exported and removed on delete. Counts are not
-    /// enumerated in the preview.
-    pub cascades_owned_state: bool,
-}
+pub use zeroclaw_runtime::config_ops::delete::{
+    DeletePlanResponse, RefSiteDto, build_delete_plan, finish_agent_delete, prepare_alias_delete,
+    unsupported_delete_cascade_message,
+};
 
 /// `GET /api/config/delete-plan?path=<section>&key=<alias>` — dry-run the delete
 /// cascade for an aliased entry. Read-only; never mutates.
@@ -1469,62 +1143,9 @@ pub async fn handle_delete_plan(
         return e.into_response();
     }
     let config = state.config.read().clone();
-    let to_dto = |s: &zeroclaw_config::alias_refs::RefSite| RefSiteDto {
-        path: s.path.clone(),
-        raw_value: s.raw_value.clone(),
-    };
-    let Some(kind) = zeroclaw_config::alias_refs::alias_kind_for_map_path(&q.path) else {
-        // Non-aliased section (e.g. `mcp.servers`): generic key removal with no
-        // reference cascade — nothing to preview.
-        return axum::Json(DeletePlanResponse {
-            path: q.path,
-            key: q.key,
-            allowed: true,
-            blockers: Vec::new(),
-            scrubs: Vec::new(),
-            live_acp_sessions: None,
-            cascades_owned_state: false,
-        })
-        .into_response();
-    };
-    if let Some(message) = unsupported_delete_cascade_message(&kind) {
-        return error_response(
-            ConfigApiError::new(ConfigApiCode::OpNotSupported, message)
-                .with_path(format!("{}.{}", q.path, q.key)),
-        );
-    }
-    let plan = zeroclaw_config::alias_refs::plan_delete(&config, &kind, &q.key);
-    let is_agent = matches!(kind, zeroclaw_config::alias_refs::AliasKind::Agent);
-    // For agents the live-ACP gate also blocks; it fails closed (an error
-    // counting sessions ⇒ "not allowed"), matching the real delete.
-    let live_acp = if is_agent {
-        crate::agent_owned_state::live_acp_session_count(&config, &q.key).ok()
-    } else {
-        None
-    };
-    let allowed = plan.allowed && (!is_agent || live_acp == Some(0));
-    axum::Json(DeletePlanResponse {
-        path: q.path,
-        key: q.key,
-        allowed,
-        blockers: plan.blockers.iter().map(to_dto).collect(),
-        scrubs: plan.scrubs.iter().map(to_dto).collect(),
-        live_acp_sessions: live_acp,
-        cascades_owned_state: is_agent,
-    })
-    .into_response()
-}
-
-fn unsupported_delete_cascade_message(
-    kind: &zeroclaw_config::alias_refs::AliasKind,
-) -> Option<&'static str> {
-    use zeroclaw_config::alias_refs::{AliasKind, ProviderCategory};
-    match kind {
-        AliasKind::Provider {
-            category: ProviderCategory::Tts | ProviderCategory::Transcription,
-            ..
-        } => Some("TTS/transcription provider delete-with-cascade is not yet implemented"),
-        _ => None,
+    match build_delete_plan(&config, &q.path, &q.key) {
+        Ok(plan) => axum::Json(plan).into_response(),
+        Err(e) => error_response(e),
     }
 }
 
@@ -1574,42 +1195,6 @@ fn rename_error_response(
         ),
     };
     error_response(ConfigApiError::new(code, msg).with_path(format!("{path}.{from}")))
-}
-
-/// Map a [`CascadeError`](zeroclaw_config::alias_refs::CascadeError) to the
-/// HTTP error response for config-only alias deletes. `Refused` and
-/// `NotImplemented` are expected operator-facing outcomes, while
-/// `PostCondition` is an internal guard failure and must not be persisted.
-fn delete_error_response(
-    path: &str,
-    key: &str,
-    err: zeroclaw_config::alias_refs::CascadeError,
-) -> Response {
-    use zeroclaw_config::alias_refs::CascadeError;
-    let (code, msg) = match err {
-        CascadeError::Refused(report) => {
-            let blockers: Vec<_> = report.blockers.iter().map(|b| b.path.as_str()).collect();
-            let detail = if blockers.is_empty() {
-                "hard references remain".to_string()
-            } else {
-                format!("hard reference(s) remain: {}", blockers.join(", "))
-            };
-            (
-                ConfigApiCode::ValidationFailed,
-                format!("cannot delete alias `{key}`: {detail}"),
-            )
-        }
-        CascadeError::NotFound(p) => (
-            ConfigApiCode::PathNotFound,
-            format!("{p} is not configured"),
-        ),
-        CascadeError::NotImplemented(m) => (ConfigApiCode::OpNotSupported, m),
-        CascadeError::PostCondition(m) => (
-            ConfigApiCode::InternalError,
-            format!("delete cascade post-condition failed: {m}"),
-        ),
-    };
-    error_response(ConfigApiError::new(code, msg).with_path(format!("{path}.{key}")))
 }
 
 pub async fn handle_rename_map_key(
@@ -1870,112 +1455,40 @@ pub async fn handle_refresh_context_window(
     headers: HeaderMap,
     axum::extract::Path((provider_type, alias)): axum::extract::Path<(String, String)>,
 ) -> Response {
+    use zeroclaw_runtime::config_ops::context_window;
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
 
-    let path = format!("providers.models.{provider_type}.{alias}");
-
-    // Build the minimal provider config the fetch below needs from a brief,
-    // un-witnessed read that clones what it needs out immediately (the
-    // `parking_lot` guard never survives past this block, well before the
-    // network `.await`). Deliberately NOT under `config_write_lock`: the
-    // outbound provider fetch can be slow or hang, and holding the witness
-    // across it would block every other gateway config write process-wide
-    // for the duration -- a self-inflicted availability bottleneck.
-    let provider_config = {
+    // Deliberately NOT under `config_write_lock`: the outbound provider fetch
+    // can be slow or hang, and holding the witness across it would block every
+    // other gateway config write process-wide. The `parking_lot` read guard
+    // is dropped before the fetch `.await`.
+    let request = {
         let snapshot = state.config.read();
-        if snapshot.get_prop(&format!("{path}.model")).is_err() {
-            return error_response(
-                ConfigApiError::new(
-                    ConfigApiCode::PathNotFound,
-                    format!("model provider '{provider_type}.{alias}' not found"),
-                )
-                .with_path(&path),
-            );
-        }
-        let model = snapshot
-            .get_prop(&format!("{path}.model"))
-            .ok()
-            .unwrap_or_default();
-        let uri = snapshot.get_prop(&format!("{path}.uri")).ok();
-        // Read api_key via JSON serialization to bypass #[secret] masking in get_prop.
-        let api_key = serde_json::to_value(&snapshot.providers)
-            .ok()
-            .and_then(|v| {
-                v.pointer(&format!("/models/{provider_type}/{alias}/api_key"))
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty() && *s != "<unset>")
-                    .map(String::from)
-            });
-        zeroclaw_config::schema::ModelProviderConfig {
-            model: Some(model),
-            uri,
-            api_key,
-            ..Default::default()
-        }
+        context_window::fetch_request(&snapshot, &provider_type, &alias)
     };
-
-    // Fetch context window from provider. No lock -- neither `config` nor
-    // `config_write_lock` -- is held across this await.
-    let context_window = match zeroclaw_providers::fetch_context_window(
-        &provider_type,
-        &provider_config,
-    )
-    .await
-    {
-        Some(ctx) => ctx,
-        None => {
-            return error_response(
-                ConfigApiError::new(
-                    ConfigApiCode::InvalidFormat,
-                    format!("provider '{provider_type}' does not support context window auto-detection or fetch failed"),
-                )
-                .with_path(&path),
-            );
-        }
+    let request = match request {
+        Ok(request) => request,
+        Err(e) => return error_response(e),
+    };
+    let fetched = match context_window::fetch(&provider_type, &alias, &request).await {
+        Ok(fetched) => fetched,
+        Err(e) => return error_response(e),
     };
 
     // The witness is acquired only now, spanning just the config mutation:
     // read-for-modify, apply the fetched value, save, swap.
     let _cfg_guard = Arc::clone(&state.config_write_lock).lock_owned().await;
     let mut working = state.config.read().clone();
-
-    // Re-verify: a concurrent writer could have removed this entry while
-    // the un-witnessed fetch above was in flight.
-    if working.get_prop(&format!("{path}.model")).is_err() {
-        return error_response(
-            ConfigApiError::new(
-                ConfigApiCode::PathNotFound,
-                format!("model provider '{provider_type}.{alias}' not found"),
-            )
-            .with_path(&path),
-        );
-    }
-
-    if let Err(e) = working.set_prop_persistent(
-        &format!("{path}.context_window"),
-        &context_window.to_string(),
-    ) {
-        return error_response(
-            ConfigApiError::new(
-                ConfigApiCode::InternalError,
-                format!("failed to persist context_window: {e}"),
-            )
-            .with_path(&path),
-        );
-    }
-
-    working.mark_dirty(&format!("{path}.context_window"));
+    let response = match context_window::apply(&mut working, &provider_type, &alias, fetched) {
+        Ok(response) => response,
+        Err(e) => return error_response(e),
+    };
     if let Err(e) = persist_and_swap(&state, working, &_cfg_guard).await {
         return error_response(e);
     }
-
-    axum::Json(serde_json::json!({
-        "path": path,
-        "context_window": context_window,
-    }))
-    .into_response()
+    axum::Json(response).into_response()
 }
 
 pub async fn handle_patch(
@@ -2280,12 +1793,6 @@ pub struct InitQuery {
     pub section: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct InitResponse {
-    pub initialized: Vec<String>,
-}
-
 /// POST /api/config/init?section=model_providers — instantiate `None` nested
 /// sections with defaults, and only those: dynamic-map aliases are created
 /// through `POST /api/config/map-key`. When every requested section is already
@@ -2301,39 +1808,16 @@ pub async fn handle_init(
 
     let _cfg_guard = Arc::clone(&state.config_write_lock).lock_owned().await;
     let mut working = state.config.read().clone();
-    let initialized: Vec<String> = working
-        .init_defaults(q.section.as_deref())
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-
-    if initialized.is_empty() {
-        return axum::Json(InitResponse { initialized }).into_response();
-    }
-
-    for section in &initialized {
-        working.mark_dirty(section);
-    }
-
-    if let Err(err) = scoped_validate(&working) {
-        return error_response(err);
-    }
-    if let Err(e) = persist_and_swap(&state, working, &_cfg_guard).await {
+    let initialized = match apply_init(&mut working, q.section.as_deref()) {
+        Ok(initialized) => initialized,
+        Err(err) => return error_response(err),
+    };
+    if !initialized.is_empty()
+        && let Err(e) = persist_and_swap(&state, working, &_cfg_guard).await
+    {
         return error_response(e);
     }
-
     axum::Json(InitResponse { initialized }).into_response()
-}
-
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct MigrateResponse {
-    pub migrated: bool,
-    /// Backup path written when migration ran; absent when the config was
-    /// already at the current schema version.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub backup_path: Option<String>,
-    pub schema_version: u32,
 }
 
 pub async fn handle_migrate(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -2348,149 +1832,16 @@ pub async fn handle_migrate(State(state): State<AppState>, headers: HeaderMap) -
         let live = state.config.read();
         (live.config_path.clone(), live.data_dir.clone())
     };
-
-    let raw = match tokio::fs::read_to_string(&config_path).await {
-        Ok(s) => s,
-        Err(e) => {
-            return error_response(ConfigApiError::new(
-                ConfigApiCode::InternalError,
-                format!("failed to read config file: {e}"),
-            ));
+    match migrate_config_file(&config_path, data_dir, |_| Ok(())).await {
+        Ok(outcome) => {
+            if outcome.needs_reload {
+                state
+                    .pending_reload
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            axum::Json(outcome.response).into_response()
         }
-    };
-
-    let migrated = match zeroclaw_config::migration::migrate_file(&raw) {
-        Ok(out) => out,
-        Err(e) => {
-            return error_response(ConfigApiError::new(
-                ConfigApiCode::ValidationFailed,
-                format!("migration failed: {e}"),
-            ));
-        }
-    };
-
-    match migrated {
-        Some(new_content) => {
-            // Validate the migrated snapshot before touching the canonical
-            // file. `config_path` and `data_dir` are runtime-selected and
-            // skipped by serde, so restore them explicitly on the parsed live
-            // snapshot.
-            let mut new_cfg: zeroclaw_config::schema::Config = match toml::from_str(&new_content) {
-                Ok(c) => c,
-                Err(e) => {
-                    return error_response(ConfigApiError::new(
-                        ConfigApiCode::ReloadFailed,
-                        format!("re-parse after migration failed: {e}"),
-                    ));
-                }
-            };
-            new_cfg.config_path = config_path.clone();
-            new_cfg.data_dir = data_dir;
-
-            let backup_path = config_path.with_extension("toml.bak");
-            let parent = match config_path.parent() {
-                Some(p) => p.to_path_buf(),
-                None => {
-                    return error_response(ConfigApiError::new(
-                        ConfigApiCode::InternalError,
-                        format!(
-                            "config path has no parent: {}",
-                            config_path.display().to_string()
-                        ),
-                    ));
-                }
-            };
-            let file_name = match config_path.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n.to_string(),
-                None => {
-                    return error_response(ConfigApiError::new(
-                        ConfigApiCode::InternalError,
-                        format!(
-                            "config path has no file name: {}",
-                            config_path.display().to_string()
-                        ),
-                    ));
-                }
-            };
-            let temp_path = parent.join(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
-
-            // 1. Write migrated content to temp + fsync.
-            match tokio::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&temp_path)
-                .await
-            {
-                Ok(mut temp) => {
-                    use tokio::io::AsyncWriteExt;
-                    if let Err(e) = temp.write_all(new_content.as_bytes()).await {
-                        let _ = tokio::fs::remove_file(&temp_path).await;
-                        return error_response(ConfigApiError::new(
-                            ConfigApiCode::InternalError,
-                            format!("failed to write migrated config to temp: {e}"),
-                        ));
-                    }
-                    if let Err(e) = temp.sync_all().await {
-                        let _ = tokio::fs::remove_file(&temp_path).await;
-                        return error_response(ConfigApiError::new(
-                            ConfigApiCode::InternalError,
-                            format!("failed to fsync migrated config temp: {e}"),
-                        ));
-                    }
-                }
-                Err(e) => {
-                    return error_response(ConfigApiError::new(
-                        ConfigApiCode::InternalError,
-                        format!("failed to create temp config file: {e}"),
-                    ));
-                }
-            }
-
-            // 2. Backup BEFORE replacing the original.
-            if let Err(e) = tokio::fs::copy(&config_path, &backup_path).await {
-                let _ = tokio::fs::remove_file(&temp_path).await;
-                return error_response(ConfigApiError::new(
-                    ConfigApiCode::InternalError,
-                    format!("failed to write backup: {e}"),
-                ));
-            }
-
-            // 3. Atomic rename. On failure, restore from backup.
-            if let Err(e) = tokio::fs::rename(&temp_path, &config_path).await {
-                let _ = tokio::fs::remove_file(&temp_path).await;
-                if backup_path.exists() {
-                    let _ = tokio::fs::copy(&backup_path, &config_path).await;
-                }
-                return error_response(ConfigApiError::new(
-                    ConfigApiCode::InternalError,
-                    format!("failed to atomically replace config: {e}"),
-                ));
-            }
-
-            // 4. Fsync the parent directory so the rename is durable.
-            #[cfg(unix)]
-            if let Ok(dir) = tokio::fs::File::open(&parent).await {
-                let _ = dir.sync_all().await;
-            }
-
-            *state.config.write() = new_cfg;
-            state
-                .pending_reload
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-
-            axum::Json(MigrateResponse {
-                migrated: true,
-                backup_path: Some(backup_path.display().to_string()),
-                schema_version: zeroclaw_config::migration::CURRENT_SCHEMA_VERSION,
-            })
-            .into_response()
-        }
-        None => axum::Json(MigrateResponse {
-            migrated: false,
-            backup_path: None,
-            schema_version: zeroclaw_config::migration::CURRENT_SCHEMA_VERSION,
-        })
-        .into_response(),
+        Err(e) => error_response(e),
     }
 }
 
@@ -2631,6 +1982,225 @@ mod tests {
     use std::time::Duration;
     use zeroclaw_providers::ModelProvider;
     use zeroclaw_runtime::security::pairing::PairingGuard;
+
+    // ── RPC parity: each HTTP route and its `config/*` RPC twin must return
+    // the same JSON for the same state. ────────────────────────────────────
+
+    // ── Config parity goldens ────────────────────────────────────────
+    //
+    // Each HTTP route below runs against the runtime's parity fixture and must
+    // produce the same JSON file its RPC twin is pinned to in
+    // `zeroclaw_runtime::rpc::dispatch` tests. A refusal is compared by its
+    // body, which RPC carries in the error's `data`.
+
+    const PARITY_DIR: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../zeroclaw-runtime/tests/fixtures/config_parity"
+    );
+
+    async fn parity_state(tmp: &tempfile::TempDir) -> AppState {
+        let raw = std::fs::read_to_string(format!("{PARITY_DIR}/config.toml")).unwrap();
+        let mut config: zeroclaw_config::schema::Config = toml::from_str(&raw).unwrap();
+        config.config_path = tmp.path().join("config.toml");
+        config.data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.save().await.expect("save the parity fixture");
+        test_state(config)
+    }
+
+    fn assert_parity_golden(name: &str, actual: &serde_json::Value) {
+        let path = format!("{PARITY_DIR}/{name}.json");
+        let expected: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("missing parity golden {path}: {e}")),
+        )
+        .unwrap();
+        assert_eq!(
+            actual, &expected,
+            "HTTP output for {name} no longer matches its RPC twin's golden"
+        );
+    }
+
+    async fn parity_body(response: Response) -> serde_json::Value {
+        response_json(response).await.1
+    }
+
+    fn parity_state_projection(config: &zeroclaw_config::schema::Config) -> serde_json::Value {
+        let mut agents: Vec<&String> = config.agents.keys().collect();
+        agents.sort();
+        serde_json::json!({"agents": agents, "heartbeat_agent": config.heartbeat.agent})
+    }
+
+    fn map_key_query(path: &str, key: &str) -> Query<MapKeyQuery> {
+        Query(MapKeyQuery {
+            path: path.into(),
+            key: key.into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn parity_golden_reload_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = parity_state(&tmp).await;
+        let body = parity_body(handle_reload_status(State(state), HeaderMap::new()).await).await;
+        assert_parity_golden("reload_status", &body);
+    }
+
+    #[tokio::test]
+    async fn parity_golden_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = parity_state(&tmp).await;
+        state.config.write().heartbeat.agent = "helper".into();
+        let body = parity_body(handle_drift(State(state), HeaderMap::new()).await).await;
+        assert_parity_golden("drift", &body);
+    }
+
+    #[tokio::test]
+    async fn parity_golden_agent_options() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = parity_state(&tmp).await;
+        let body = parity_body(
+            crate::api_sections::handle_agent_options(State(state), HeaderMap::new()).await,
+        )
+        .await;
+        assert_parity_golden("agent_options", &body);
+    }
+
+    #[tokio::test]
+    async fn parity_golden_section_picker() {
+        use crate::api_sections::{SectionPath, handle_section_picker};
+        let tmp = tempfile::tempdir().unwrap();
+        let state = parity_state(&tmp).await;
+        for (section, golden) in [
+            ("agents", "section_picker_agents"),
+            ("hardware", "section_picker_direct_form_error"),
+        ] {
+            let body = parity_body(
+                handle_section_picker(
+                    State(state.clone()),
+                    HeaderMap::new(),
+                    axum::extract::Path(SectionPath {
+                        section: section.into(),
+                    }),
+                )
+                .await,
+            )
+            .await;
+            assert_parity_golden(golden, &body);
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_golden_section_select() {
+        use crate::api_sections::{SectionItemPath, handle_section_select};
+        for (section, key, golden) in [
+            ("agents", "newbie", "section_select_agents"),
+            ("memory", "none", "section_select_memory"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = parity_state(&tmp).await;
+            let body = parity_body(
+                handle_section_select(
+                    State(state),
+                    HeaderMap::new(),
+                    axum::extract::Path(SectionItemPath {
+                        section: section.into(),
+                        key: key.into(),
+                    }),
+                    None,
+                )
+                .await,
+            )
+            .await;
+            assert_parity_golden(golden, &body);
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_golden_delete_plan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = parity_state(&tmp).await;
+        let body = parity_body(
+            handle_delete_plan(
+                State(state),
+                HeaderMap::new(),
+                map_key_query("agents", "bot"),
+            )
+            .await,
+        )
+        .await;
+        assert_parity_golden("delete_plan_agent", &body);
+    }
+
+    #[tokio::test]
+    async fn parity_golden_map_key_delete_cascade() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = parity_state(&tmp).await;
+        let (status, _) = response_json(
+            handle_delete_map_key(
+                State(state.clone()),
+                HeaderMap::new(),
+                map_key_query("agents", "bot"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let projection = parity_state_projection(&state.config.read());
+        assert_parity_golden("map_key_delete_agent_state", &projection);
+    }
+
+    #[tokio::test]
+    async fn parity_golden_init() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = parity_state(&tmp).await;
+        let body = parity_body(
+            handle_init(State(state), HeaderMap::new(), Query(InitQuery::default())).await,
+        )
+        .await;
+        assert_parity_golden("init", &body);
+    }
+
+    #[tokio::test]
+    async fn parity_golden_migrate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = parity_state(&tmp).await;
+        let body = parity_body(handle_migrate(State(state), HeaderMap::new()).await).await;
+        assert_parity_golden("migrate", &body);
+    }
+
+    #[tokio::test]
+    async fn parity_golden_config_get() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = parity_state(&tmp).await;
+        let full = parity_body(handle_config_get(State(state), HeaderMap::new()).await).await;
+        let projection = serde_json::json!({
+            "provider": full["providers"]["models"]["anthropic"]["default"]["api_key"],
+            "provider_model": full["providers"]["models"]["anthropic"]["default"]["model"],
+            "agents": {
+                "bot": full["agents"]["bot"]["model_provider"],
+                "helper": full["agents"]["helper"]["enabled"],
+            },
+            "heartbeat": full["heartbeat"]["agent"],
+        });
+        assert_parity_golden("config_get", &projection);
+    }
+
+    #[tokio::test]
+    async fn parity_golden_refresh_context_window_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = parity_state(&tmp).await;
+        let body = parity_body(
+            handle_refresh_context_window(
+                State(state),
+                HeaderMap::new(),
+                axum::extract::Path(("anthropic".to_string(), "missing".to_string())),
+            )
+            .await,
+        )
+        .await;
+        assert_parity_golden("refresh_context_window_not_found", &body);
+    }
 
     #[test]
     fn invalid_etag_value_is_omitted_instead_of_panicking() {
@@ -3014,7 +2584,7 @@ mod tests {
         assert_eq!(
             live_schema_version,
             zeroclaw_config::migration::CURRENT_SCHEMA_VERSION,
-            "migration must publish the upgraded schema version live"
+            "the live config stays on the current schema; the rewritten file loads on reload"
         );
         assert_eq!(
             disk_value

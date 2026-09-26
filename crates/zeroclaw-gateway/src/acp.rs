@@ -287,6 +287,7 @@ mod tests {
         let reload_controls = zeroclaw_runtime::daemon::GatewayReloadControls {
             shutdown_tx: shutdown_tx.clone(),
             reload_tx,
+            pending_reload: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let server = zeroclaw_spawn::spawn!(crate::run_gateway(

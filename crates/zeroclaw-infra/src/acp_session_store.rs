@@ -1525,6 +1525,20 @@ impl AcpSessionStore {
     /// Delete every ACP session (live or killed) for `agent_alias`, returning the
     /// row count. Child tables (`acp_messages`/`acp_tool_calls`/`acp_session_events`)
     /// cascade via their `ON DELETE CASCADE` FKs (`foreign_keys = ON`).
+    /// Delete only the ended (`killed_at` set) sessions of `agent_alias`,
+    /// returning the row count. A session that started after the caller's
+    /// live-session check keeps its row.
+    pub fn delete_killed_sessions_by_agent(&self, agent_alias: &str) -> Result<usize> {
+        let conn = self.conn.lock();
+        let rows = conn
+            .execute(
+                "DELETE FROM acp_sessions WHERE agent_alias = ?1 AND killed_at IS NOT NULL",
+                params![agent_alias],
+            )
+            .context("Failed to delete ended ACP sessions for agent")?;
+        Ok(rows)
+    }
+
     pub fn delete_sessions_by_agent(&self, agent_alias: &str) -> Result<usize> {
         let conn = self.conn.lock();
         let rows = conn
