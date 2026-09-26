@@ -40,6 +40,11 @@ const TELEGRAM_CONTINUES_SUFFIX: &str = "\n\n(continues...)";
 const TELEGRAM_FENCE_REOPEN: &str = "```\n";
 const TELEGRAM_FENCE_CLOSE: &str = "```";
 const TELEGRAM_ACK_REACTIONS: &[&str] = &["⚡️", "👌", "👀", "🔥", "👍"];
+
+/// Bound on the per-channel reaction-slot map. Entries only matter while a
+/// conversation is live, so a fixed LRU bound covers any realistic window
+/// while capping memory for long-lived bots in busy chats.
+const TELEGRAM_REACTION_CACHE_CAPACITY: usize = 4096;
 const TELEGRAM_MEDIA_GROUP_SETTLE_DELAY: Duration = Duration::from_millis(700);
 const TELEGRAM_IDLE_POLL_TIMEOUT_SECS: u64 = 30;
 const TELEGRAM_PENDING_MEDIA_GROUP_POLL_TIMEOUT_SECS: u64 = 1;
@@ -478,7 +483,10 @@ enum ReactionWrite {
 
 /// Shared `setMessageReaction` writer. Holds the reaction-state lock across
 /// the request so concurrent ack and tool writes serialize and the tracked
-/// slot stays consistent with what Telegram last received.
+/// slot stays consistent with what Telegram last received. The map is a
+/// bounded LRU cache: the oldest-touched message state is evicted at
+/// capacity, and an evicted message is untracked — explicit removals on it
+/// fail loudly, the same as after a restart.
 ///
 /// Telegram has no emoji-scoped removal: the `reaction` list we send replaces
 /// the bot's whole reaction, and bots hold a single slot. Removal therefore
@@ -495,7 +503,7 @@ enum ReactionWrite {
 /// a repeated explicit removal of the same message reports success from
 /// memory rather than fabricating it.
 async fn send_reaction_request(
-    state: &tokio::sync::Mutex<std::collections::HashMap<(String, i64), ReactionSlot>>,
+    state: &tokio::sync::Mutex<lru::LruCache<(String, i64), ReactionSlot>>,
     client: reqwest::Client,
     url: String,
     chat_id: String,
@@ -618,7 +626,7 @@ async fn send_reaction_request(
         ReactionWrite::Clear => {
             // Keep a verified-clear tombstone so a repeated explicit removal
             // reports honest success instead of an unverifiable-state error.
-            tracked.insert(
+            tracked.put(
                 key,
                 ReactionSlot {
                     emoji: None,
@@ -627,7 +635,7 @@ async fn send_reaction_request(
             );
         }
         ReactionWrite::Set(emoji) => {
-            tracked.insert(
+            tracked.put(
                 key,
                 ReactionSlot {
                     emoji: Some(emoji),
@@ -924,7 +932,7 @@ pub struct TelegramChannel {
     /// whole list, so every reaction write funnels through one lock-guarded
     /// state. The `explicit` flag marks agent-driven (tool) reactions, which
     /// automatic acknowledgement cleanup must never overwrite.
-    reactions: Arc<tokio::sync::Mutex<std::collections::HashMap<(String, i64), ReactionSlot>>>,
+    reactions: Arc<tokio::sync::Mutex<lru::LruCache<(String, i64), ReactionSlot>>>,
     tts_manager: Option<Arc<super::tts::TtsManager>>,
     voice_chats: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Resolves voice peers from canonical config at call-time.
@@ -1264,7 +1272,10 @@ impl TelegramChannel {
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
             ack_reactions: true,
-            reactions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            reactions: Arc::new(tokio::sync::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(TELEGRAM_REACTION_CACHE_CAPACITY)
+                    .expect("reaction cache capacity is a non-zero constant"),
+            ))),
             tts_manager: None,
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             voice_peer_resolver: Arc::new(Vec::new) as Arc<dyn Fn() -> Vec<String> + Send + Sync>,
@@ -1304,6 +1315,17 @@ impl TelegramChannel {
     /// Configure whether Telegram-native acknowledgement reactions are sent.
     pub fn with_ack_reactions(mut self, enabled: bool) -> Self {
         self.ack_reactions = enabled;
+        self
+    }
+
+    /// Shrink the reaction-slot cache so an eviction test does not insert
+    /// thousands of entries. Test-only: the capacity is not operator-tunable
+    /// — it exists to bound memory, not to be tuned.
+    #[cfg(test)]
+    fn with_reaction_slot_capacity(mut self, cap: usize) -> Self {
+        self.reactions = Arc::new(tokio::sync::Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(cap).expect("test capacity is non-zero"),
+        )));
         self
     }
 
@@ -16661,6 +16683,40 @@ mod tests {
             bodies[1]["reaction"],
             serde_json::json!([]),
             "only the first removal sends the clear call"
+        );
+    }
+
+    /// The reaction-slot map is a bounded LRU cache: once capacity is
+    /// exhausted the oldest-touched message state is evicted, and an evicted
+    /// message is untracked — an explicit removal there fails loudly instead
+    /// of reporting unverifiable success.
+    #[tokio::test]
+    async fn explicit_removal_fails_after_lru_eviction() {
+        let server = wiremock::MockServer::start().await;
+        mount_reaction_ok(&server).await;
+        let ch = reaction_channel(server.uri()).with_reaction_slot_capacity(1);
+
+        ch.set_explicit_reaction("8943231406", "893", "\u{1F44D}", true)
+            .await
+            .unwrap();
+        // Second write evicts the first message's slot.
+        ch.set_explicit_reaction("8943231407", "894", "\u{1F44D}", true)
+            .await
+            .unwrap();
+        let err = ch
+            .set_explicit_reaction("8943231406", "telegram_8943231406_893", "\u{1F44D}", false)
+            .await
+            .expect_err("removal of an evicted reaction must not report success");
+        assert!(
+            err.to_string().contains("cannot verify removal"),
+            "rendered: {err}"
+        );
+
+        let bodies = reaction_request_bodies(&server).await;
+        assert_eq!(
+            bodies.len(),
+            2,
+            "failed removal after eviction must not reach Telegram: {bodies:?}"
         );
     }
 
