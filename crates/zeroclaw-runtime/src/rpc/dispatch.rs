@@ -507,6 +507,27 @@ fn principal_tool_ceiling(grants: &zeroclaw_api::grants::ResolvedGrants) -> Opti
     Some(grants.allowed_tools.clone())
 }
 
+/// Reject a caller-supplied session id that is not canonical.
+///
+/// Every RPC method that keys the chat backend derives `rpc_{session_id}`, and
+/// the JSONL store sanitizes that into a filename — so `alpha.beta` and
+/// `alpha/beta` would collapse onto the same transcript/ownership record while
+/// the caller sees two distinct ids. Enforcing canonicality on *every* entry
+/// point that accepts a caller id keeps the persistence key injective (matching
+/// the HTTP/WS gates) and keeps the read/state/delete probes from ever
+/// addressing a collided key. Auto-generated UUIDs are always canonical, so
+/// only explicit ids are affected.
+fn ensure_canonical_session_id(session_id: &str) -> Result<(), JsonRpcError> {
+    if zeroclaw_api::session_keys::is_canonical_session_key(session_id) {
+        Ok(())
+    } else {
+        Err(rpc_err(
+            INVALID_PARAMS,
+            "session_id must contain only [A-Za-z0-9_-] and be non-empty",
+        ))
+    }
+}
+
 fn not_yet_implemented(method: Method) -> RpcResult {
     Err(rpc_err(
         INTERNAL_ERROR,
@@ -3193,6 +3214,14 @@ impl RpcDispatcher {
             .session_id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
+        // Reject noncanonical caller-supplied session ids before any backend
+        // keying or permit acquisition (see ensure_canonical_session_id).
+        // Auto-generated UUIDs are always canonical, so this only affects
+        // explicit ids.
+        if resuming {
+            ensure_canonical_session_id(&session_id)?;
+        }
+
         let chat_mode = req
             .chat_mode
             .clone()
@@ -3751,7 +3780,59 @@ impl RpcDispatcher {
                 crate::rpc::types::ChatMode::Chat => {
                     if let Some(ref backend) = self.ctx.session_backend {
                         let session_key = format!("rpc_{session_id}");
-                        let _ = backend.set_session_agent_alias(&session_key, &req.agent_alias);
+                        // Atomic ownership admission BEFORE any read or publish:
+                        // a caller-controlled session id can never reassign the
+                        // owner of an existing session and then read another
+                        // agent's transcript. Ordinary claim rejects cross-agent
+                        // conflict and ownerless-nonempty (unmigrated) sessions;
+                        // backends without ownership tracking fail closed
+                        // uniformly across WS / HTTP / RPC, even for empty
+                        // sessions.
+                        match backend.claim_session_agent_alias(&session_key, &req.agent_alias) {
+                            Ok(zeroclaw_infra::session_backend::ClaimOutcome::Claimed) => {}
+                            Ok(zeroclaw_infra::session_backend::ClaimOutcome::Conflict(owner)) => {
+                                return Err(rpc_err(
+                                    INVALID_PARAMS,
+                                    format!(
+                                        "Session belongs to agent '{owner}', not '{}'",
+                                        req.agent_alias
+                                    ),
+                                ));
+                            }
+                            Ok(zeroclaw_infra::session_backend::ClaimOutcome::NeedsMigration) => {
+                                return Err(rpc_err(
+                                    INVALID_PARAMS,
+                                    "Cannot resume session: ownerless session has unowned history; run `migrate session-ownership` to adopt",
+                                ));
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                                // A backend that cannot enforce ownership claims
+                                // admits no session that must survive under an
+                                // isolation boundary. For a scoped creator the
+                                // owner stamp is that boundary, so the failure is
+                                // an INTERNAL_ERROR "not created" (aligned with
+                                // `set_session_principal`, where a scoped creator
+                                // facing an unstampable backend fails closed and
+                                // unwinds the live entry). An unscoped creator
+                                // only loses attribution — there is no isolation
+                                // to preserve — so admission proceeds and the
+                                // later `set_session_principal` report (if any)
+                                // is attribution-only.
+                                if self.scoped_principal_id().is_some() {
+                                    return Err(rpc_err(
+                                        INTERNAL_ERROR,
+                                        "The session was not created: backend does not track agent ownership",
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                return Err(rpc_err(
+                                    INTERNAL_ERROR,
+                                    format!("Failed to claim session ownership: {e}"),
+                                ));
+                            }
+                        }
+
                         // Fail closed: an unreadable transcript must not become
                         // an empty history that a later turn authoritatively
                         // persists over the existing durable session.
@@ -4647,6 +4728,7 @@ impl RpcDispatcher {
 
     async fn handle_session_prompt(&self, params: &Value) -> RpcResult {
         let req: SessionPromptParams = parse_params(params)?;
+        ensure_canonical_session_id(&req.session_id)?;
         let sid = &req.session_id;
         let authorized = self
             .authorize_session_owner(sid, Method::SessionPrompt)
@@ -5790,6 +5872,7 @@ impl RpcDispatcher {
 
     async fn handle_session_messages(&self, params: &Value) -> RpcResult {
         let req: SessionMessagesParams = parse_params(params)?;
+        ensure_canonical_session_id(&req.session_id)?;
         let record = self
             .authorize_session_owner(&req.session_id, Method::SessionMessages)
             .await?;
@@ -5855,6 +5938,7 @@ impl RpcDispatcher {
 
     async fn handle_session_state(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
+        ensure_canonical_session_id(&req.session_id)?;
         let record = self
             .authorize_session_owner(&req.session_id, Method::SessionState)
             .await?;
@@ -5916,6 +6000,7 @@ impl RpcDispatcher {
 
     async fn handle_session_delete(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
+        ensure_canonical_session_id(&req.session_id)?;
         let authorized = self
             .authorize_session_owner(&req.session_id, Method::SessionDelete)
             .await?;
@@ -20127,6 +20212,15 @@ mod tests {
         chat_backend
             .replace_conversation_state(&session_key, &over_cap, false)
             .unwrap();
+        {
+            use zeroclaw_infra::session_backend::{AdoptOutcome, SessionBackend};
+            assert!(matches!(
+                chat_backend
+                    .adopt_session_agent_alias(&session_key, "test-agent")
+                    .unwrap(),
+                AdoptOutcome::Adopted
+            ));
+        }
 
         dispatcher
             .handle_session_new_for_test(&json!({
@@ -20636,6 +20730,15 @@ mod tests {
                 &ChatMessage::assistant("Chat history"),
             )
             .unwrap();
+        {
+            use zeroclaw_infra::session_backend::{AdoptOutcome, SessionBackend};
+            assert!(matches!(
+                chat_backend
+                    .adopt_session_agent_alias(&format!("rpc_{sid}"), "test-agent")
+                    .unwrap(),
+                AdoptOutcome::Adopted
+            ));
+        }
         let mut previous = None;
         for (mode, expected_history) in [
             ("chat", "Chat history"),
@@ -21180,6 +21283,71 @@ mod tests {
                 .unwrap()
                 .messages
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_rejects_non_empty_ownerless_session() {
+        // Boundary regression: a non-empty ownerless session must not be
+        // adopted through the ordinary `claim` path. The first agent to
+        // resume such a key would otherwise silently read another
+        // agent's transcript. The handler must refuse, clean up the
+        // just-inserted live session, and point the operator at the
+        // migration CLI.
+        use zeroclaw_api::model_provider::ChatMessage;
+        use zeroclaw_infra::session_backend::SessionBackend;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, sessions, chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, tmp.path());
+
+        // Pre-seed: transcript history exists, but no recorded owner.
+        // The RPC chat-mode path keys claims under `rpc_<session_id>`,
+        // so the fixture must use the same prefix the dispatcher will
+        // look up.
+        let sid = "restored-non-empty";
+        let key = format!("rpc_{sid}");
+        chat_backend
+            .append(&key, &ChatMessage::user("historical message"))
+            .unwrap();
+        assert_eq!(
+            chat_backend.get_session_agent_alias(&key).unwrap(),
+            None,
+            "fixture: session must start ownerless"
+        );
+
+        let params = serde_json::json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "chat",
+            "session_id": sid,
+        });
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        let err = result.expect_err("session/new must refuse a non-empty ownerless session");
+        let msg = err.message.clone();
+        assert!(
+            msg.contains("ownerless") || msg.contains("migrate"),
+            "error must point the operator at the migration CLI, got: {msg}"
+        );
+
+        // The just-inserted RpcSession must be cleaned up so a failed
+        // candidate cannot leak or remove an existing live session.
+        assert!(
+            sessions.get_agent(sid).await.is_none(),
+            "failed candidate must be removed from the live session map"
+        );
+
+        // The original ownerless transcript must still be there, untouched.
+        let history = chat_backend.load(&key);
+        assert_eq!(
+            history.len(),
+            1,
+            "transcript must not be deleted by refusal"
+        );
+        assert_eq!(
+            chat_backend.get_session_agent_alias(&key).unwrap(),
+            None,
+            "session must remain ownerless after refusal"
         );
     }
 
@@ -22102,6 +22270,538 @@ mod tests {
             "Chat session must stamp its agent_alias in session_backend (got: {:?})",
             entry.agent_alias
         );
+    }
+
+    /// A caller-controlled RPC session id must not reassign an existing chat
+    /// session's owner. Pre-own `rpc_{sid}` for one agent, then resume with a
+    /// different alias: the atomic claim must Conflict → INVALID_PARAMS, and
+    /// the prior transcript must NOT be loaded into a live session for the
+    /// second agent.
+    #[tokio::test]
+    async fn chat_session_new_resume_rejects_agent_alias_mismatch() {
+        use zeroclaw_infra::session_backend::SessionBackend;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        // The Chat resume path constructs the agent BEFORE the ownership claim,
+        // so the second alias must be a real, constructible agent — otherwise
+        // the test would fail at agent construction (INTERNAL_ERROR) instead of
+        // the claim conflict (INVALID_PARAMS) we mean to exercise.
+        let second = zeroclaw_config::schema::AliasedAgentConfig {
+            enabled: true,
+            model_provider: "openai.test-provider".into(),
+            risk_profile: "test-profile".into(),
+            ..Default::default()
+        };
+        config.agents.insert("other-agent".to_string(), second);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "chat-alias-mismatch-001";
+        let key = format!("rpc_{sid}");
+        // Pre-existing owner + transcript recorded by the first agent.
+        chat_backend
+            .set_session_agent_alias(&key, "test-agent")
+            .expect("seed owner");
+        chat_backend
+            .append(
+                &key,
+                &zeroclaw_providers::ChatMessage::user("secret history"),
+            )
+            .expect("seed history");
+
+        let resumed = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "other-agent",
+                "session_id": sid,
+            }))
+            .await;
+
+        let err = resumed.expect_err("chat session/new must reject a cross-agent resume");
+        assert_eq!(
+            err.code, INVALID_PARAMS,
+            "cross-agent resume must be rejected at the ownership claim, not elsewhere"
+        );
+        // Ownership is unchanged and the transcript is preserved for the owner.
+        assert_eq!(
+            chat_backend.get_session_agent_alias(&key).unwrap(),
+            Some("test-agent".to_string()),
+            "a rejected resume must not reassign ownership"
+        );
+        assert!(
+            !chat_backend.load(&key).is_empty(),
+            "the original transcript must be preserved"
+        );
+        // The rejected resume must not leave a live session bound to the
+        // second agent (the claim fires before history is seeded).
+        assert!(
+            sessions.get_agent(sid).await.is_none()
+                || sessions.get_agent_alias(sid).await.as_deref() != Some("other-agent"),
+            "a rejected mismatched resume must not expose the transcript to the second agent"
+        );
+    }
+
+    /// RPC `session/new` must admit Chat ownership BEFORE installing the
+    /// session: a caller-controlled id colliding with a LIVE session owned
+    /// by another agent is rejected at the claim and must never replace
+    /// (thus dropping) the live predecessor.
+    #[tokio::test]
+    async fn chat_session_new_same_id_does_not_evict_live_predecessor() {
+        use zeroclaw_infra::session_backend::SessionBackend;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        // The colliding alias must be a real, constructible agent — the claim
+        // runs after agent construction, so an unbuildable agent would fail
+        // earlier (INTERNAL_ERROR) than the ownership conflict we target.
+        let second = zeroclaw_config::schema::AliasedAgentConfig {
+            enabled: true,
+            model_provider: "openai.test-provider".into(),
+            risk_profile: "test-profile".into(),
+            ..Default::default()
+        };
+        config.agents.insert("other-agent".to_string(), second);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "live-predecessor-001";
+        let key = format!("rpc_{sid}");
+
+        // First agent opens a LIVE session under sid.
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": sid,
+            }))
+            .await
+            .expect("first agent must be able to open a live session");
+
+        let gen_before = sessions
+            .get_generation(sid)
+            .await
+            .expect("live session must exist after the first open");
+
+        // Second agent colliding on the SAME id must be rejected at the claim.
+        let err = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "other-agent",
+                "session_id": sid,
+            }))
+            .await
+            .expect_err("same-id cross-agent session/new must be rejected");
+        assert_eq!(err.code, INVALID_PARAMS);
+
+        // The live predecessor must survive UNTOUCHED — same generation in the
+        // map (not replaced, not dropped) and the backend owner unchanged.
+        assert_eq!(
+            sessions.get_generation(sid).await,
+            Some(gen_before),
+            "a rejected same-id session/new must not replace or evict the live predecessor"
+        );
+        assert_eq!(
+            chat_backend.get_session_agent_alias(&key).unwrap(),
+            Some("test-agent".to_string()),
+            "the rejected session/new must not reassign ownership"
+        );
+    }
+
+    /// A same-id collision must not disturb the live predecessor's in-flight
+    /// turn: after another agent's `session/new` on the same id is rejected at
+    /// the claim, the predecessor's generation and ownership are untouched AND
+    /// its cancel token survives (nothing cleared by the rejection path).
+    #[tokio::test]
+    async fn chat_session_new_same_id_preserves_live_inflight_cancel_token() {
+        use tokio_util::sync::CancellationToken;
+        use zeroclaw_infra::session_backend::SessionBackend;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        // The colliding alias must be a real, constructible agent — the claim
+        // runs after agent construction, so an unbuildable agent would fail
+        // earlier (INTERNAL_ERROR) than the ownership conflict we target.
+        let second = zeroclaw_config::schema::AliasedAgentConfig {
+            enabled: true,
+            model_provider: "openai.test-provider".into(),
+            risk_profile: "test-profile".into(),
+            ..Default::default()
+        };
+        config.agents.insert("other-agent".to_string(), second);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "live-inflight-002";
+        let key = format!("rpc_{sid}");
+
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": sid,
+            }))
+            .await
+            .expect("first agent must be able to open a live session");
+
+        let gen_before = sessions
+            .get_generation(sid)
+            .await
+            .expect("live session must exist after the first open");
+
+        // Simulate a turn in flight on the live predecessor.
+        let inflight = CancellationToken::new();
+        sessions.register_cancel_token(sid, inflight.clone());
+        assert!(sessions.has_inflight_turn(sid));
+
+        // Second agent colliding on the SAME id must be rejected at the claim.
+        let err = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "other-agent",
+                "session_id": sid,
+            }))
+            .await
+            .expect_err("same-id cross-agent session/new must be rejected");
+        assert_eq!(err.code, INVALID_PARAMS);
+
+        // The predecessor survives with its generation, ownership, and in-flight
+        // turn token all intact — the collision must not cancel a live turn.
+        assert_eq!(
+            sessions.get_generation(sid).await,
+            Some(gen_before),
+            "a rejected same-id session/new must not replace or evict the live predecessor"
+        );
+        assert!(
+            sessions.has_inflight_turn(sid),
+            "a same-id collision must not clear the live predecessor's turn token"
+        );
+        assert!(
+            !inflight.is_cancelled(),
+            "the live predecessor's turn token must not be cancelled"
+        );
+        assert_eq!(
+            chat_backend.get_session_agent_alias(&key).unwrap(),
+            Some("test-agent".to_string()),
+            "the rejected session/new must not reassign ownership"
+        );
+    }
+
+    /// An ownerless session that already carries transcript history must be
+    /// refused by the ordinary claim (`NeedsMigration`): adopting it here would
+    /// let the first claimant read another agent's history. The refusal must
+    /// name the operator path, and must not persist an owner on the way.
+    #[tokio::test]
+    async fn chat_session_new_refuses_ownerless_history_until_migrated() {
+        use zeroclaw_infra::session_backend::SessionBackend;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "ownerless-history-001";
+        let key = format!("rpc_{sid}");
+        // History recorded with no owner: the shape a pre-upgrade deployment
+        // leaves behind.
+        chat_backend
+            .append(&key, &ChatMessage::user("pre-upgrade turn"))
+            .unwrap();
+
+        let err = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": sid,
+            }))
+            .await
+            .expect_err("an ownerless non-empty session must not be adopted by a plain claim");
+
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            err.message
+                .contains("run `migrate session-ownership` to adopt"),
+            "the refusal must point at the migration path, got: {}",
+            err.message
+        );
+        assert_eq!(
+            chat_backend.get_session_agent_alias(&key).unwrap(),
+            None,
+            "a NeedsMigration refusal must not persist an owner"
+        );
+        assert_eq!(
+            sessions.get_generation(sid).await,
+            None,
+            "a NeedsMigration refusal must not install a live session"
+        );
+    }
+
+    /// The capacity pre-check runs *before* the ownership claim. With the live
+    /// store full and the target key durably owned by another agent, the
+    /// request must come back as `SESSION_LIMIT_REACHED`; if the claim ran
+    /// first it would surface the claim's `INVALID_PARAMS` conflict instead.
+    /// The two paths are distinguishable precisely because the owner is held
+    /// by someone else, so this pins the documented ordering rather than just
+    /// the rejection code.
+    #[tokio::test]
+    async fn chat_session_new_capacity_pre_check_precedes_ownership_claim() {
+        use zeroclaw_infra::session_backend::{ClaimOutcome, SessionBackend};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        // One slot, so a single live session fills the store.
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(1, queue));
+        let chat_backend =
+            Arc::new(zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&data_dir).unwrap());
+        let ctx = RpcContext::for_persistence_tests(
+            config,
+            Arc::clone(&sessions),
+            Some(Arc::clone(&chat_backend) as Arc<dyn SessionBackend>),
+            None,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher.set_authenticated_for_test();
+
+        let occupant = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(DummyModelProvider))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .build()
+            .unwrap();
+        sessions
+            .insert(
+                "occupant".to_string(),
+                crate::rpc::session::RpcSession::new(
+                    occupant,
+                    "test-agent",
+                    tmp.path().to_str().unwrap(),
+                    crate::rpc::types::ChatMode::Chat,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let sid = "capacity-probe";
+        let key = format!("rpc_{sid}");
+        assert!(matches!(
+            chat_backend
+                .claim_session_agent_alias(&key, "other-agent")
+                .unwrap(),
+            ClaimOutcome::Claimed
+        ));
+
+        let err = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": sid,
+            }))
+            .await
+            .expect_err("a full live store must be rejected before the claim runs");
+
+        assert_eq!(
+            err.code, SESSION_LIMIT_REACHED,
+            "capacity must be checked before the claim, got: {}",
+            err.message
+        );
+        assert_eq!(
+            chat_backend.get_session_agent_alias(&key).unwrap(),
+            Some("other-agent".to_string()),
+            "the rejected request must leave the durable owner untouched"
+        );
+    }
+
+    /// A `session/new` for a non-empty session is allowed for an unscoped
+    /// caller even when the backend returns `Unsupported` for
+    /// `claim_session_agent_alias`. Ownership enforcement only fails closed
+    /// for a scoped creator (where the owner stamp is the isolation
+    /// boundary); an unscoped creator loses only attribution, so admission
+    /// proceeds — matching `set_session_principal`.
+    #[tokio::test]
+    async fn rpc_allows_unscoped_nonempty_session_when_claim_unsupported() {
+        use std::sync::Arc;
+        use zeroclaw_infra::session_backend::{ClaimOutcome, SessionBackend};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        struct MockBackend {
+            messages: Vec<ChatMessage>,
+        }
+
+        impl SessionBackend for MockBackend {
+            fn load(&self, _session_key: &str) -> Vec<ChatMessage> {
+                self.messages.clone()
+            }
+            fn append(&self, _session_key: &str, _message: &ChatMessage) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+                Ok(false)
+            }
+            fn list_sessions(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn claim_session_agent_alias(
+                &self,
+                _session_key: &str,
+                _agent_alias: &str,
+            ) -> std::io::Result<ClaimOutcome> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "claim not supported by mock",
+                ))
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let mock = Arc::new(MockBackend {
+            messages: vec![ChatMessage::user("hi")],
+        });
+        let ctx = RpcContext::for_persistence_tests(
+            config,
+            Arc::clone(&sessions),
+            Some(mock as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            None,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher.set_authenticated_for_test();
+
+        let result = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "test-session",
+                "chat_mode": "chat",
+            }))
+            .await;
+
+        result
+            .expect("an unscoped creator may create a non-empty session even when the backend does not track ownership");
+    }
+
+    /// A `session/new` for an empty session is allowed for an unscoped caller
+    /// even when the backend returns `Unsupported` for
+    /// `claim_session_agent_alias`. Ownership enforcement fails closed only
+    /// for a scoped creator (isolated proprietor); an unscoped creator has no
+    /// isolation to preserve, so admission proceeds just as for the
+    /// non-empty case above.
+    #[tokio::test]
+    async fn rpc_allows_unscoped_session_when_claim_unsupported() {
+        use std::sync::Arc;
+        use zeroclaw_infra::session_backend::{ClaimOutcome, SessionBackend};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        struct MockBackend {
+            messages: Vec<ChatMessage>,
+        }
+
+        impl SessionBackend for MockBackend {
+            fn load(&self, _session_key: &str) -> Vec<ChatMessage> {
+                self.messages.clone()
+            }
+            fn append(&self, _session_key: &str, _message: &ChatMessage) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+                Ok(false)
+            }
+            fn list_sessions(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn claim_session_agent_alias(
+                &self,
+                _session_key: &str,
+                _agent_alias: &str,
+            ) -> std::io::Result<ClaimOutcome> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "claim not supported by mock",
+                ))
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let mock = Arc::new(MockBackend {
+            messages: Vec::new(),
+        });
+        let ctx = RpcContext::for_persistence_tests(
+            config,
+            Arc::clone(&sessions),
+            Some(mock as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            None,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher.set_authenticated_for_test();
+
+        let result = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "test-session",
+                "chat_mode": "chat",
+            }))
+            .await;
+
+        result
+            .expect("an unscoped creator may create an empty session even when the backend does not track ownership");
+    }
+
+    /// Noncanonical caller-supplied session ids must be rejected before any
+    /// backend keying, mirroring the HTTP/WS canonical gate — otherwise
+    /// `alpha.beta` and `alpha/beta` would collapse to the same `rpc_*`
+    /// transcript once the JSONL store sanitizes the filename.
+    #[tokio::test]
+    async fn chat_session_new_rejects_noncanonical_session_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        for bad in ["alpha.beta", "alpha/beta", "has space", ""] {
+            let result = dispatcher
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "session_id": bad,
+                }))
+                .await;
+            let err = result.expect_err(&format!(
+                "noncanonical session_id {bad:?} must be rejected, not accepted"
+            ));
+            assert_eq!(
+                err.code, INVALID_PARAMS,
+                "noncanonical session_id {bad:?} must be rejected"
+            );
+        }
+        // No ghost transcripts were created for the rejected ids.
+        assert!(
+            chat_backend.list_sessions().is_empty(),
+            "rejected noncanonical ids must not create any session rows"
+        );
+
+        // The read path (session/messages) must reject the same ids, so a
+        // caller cannot probe a collided key even though no such session can
+        // be created — closing the injectivity surface on both sides.
+        for bad in ["alpha.beta", "alpha/beta"] {
+            let result = dispatcher
+                .handle_session_messages_for_test(&json!({ "session_id": bad }))
+                .await;
+            let err = result.expect_err(&format!(
+                "session/messages must reject noncanonical id {bad:?}"
+            ));
+            assert_eq!(err.code, INVALID_PARAMS);
+        }
     }
 
     // ── config/set secret-routing ────────────────────────────────

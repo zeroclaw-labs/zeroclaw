@@ -8231,7 +8231,7 @@ data: [DONE]\n\n";
         let tmp = tempfile::tempdir().expect("transport test temp dir");
         let (state, _) = production_sse_state(&tmp, &fixture.base_url(), 1.0, false);
         let (gateway_addr, gateway_server) = spawn_test_ws_gateway(state.clone()).await;
-        let session_id = "transport.ws-to.sse";
+        let session_id = "transport-ws-to-sse";
         let session_key = gateway_cancel_key(session_id);
 
         // This URL connects only to the test's loopback listener. Keep the
@@ -8431,20 +8431,30 @@ data: [DONE]\n\n";
                 zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(session_db.path())
                     .expect("sqlite session backend"),
             );
-        // Seed the transcript under the legacy raw gateway key: dot-bearing
-        // display ids persisted this exact key before cancellation keys were
-        // normalized, so a reconnect must resume it unchanged.
-        let legacy_key = format!("{GW_SESSION_PREFIX}{}", "transport.legacy-resume");
+        // Seed the transcript under the gateway key before connecting. Use a
+        // canonical (dot-free) session id: the ownership-aware claim gate
+        // rejects non-canonical ids outright, so a dotted display id can no
+        // longer be resumed against an ownership-tracking backend (it must be
+        // migrated to a canonical id first). This seeds an owned session so the
+        // connection's claim passes instead of hitting the ownerless-non-empty
+        // `NeedsMigration` refusal.
+        let legacy_key = format!("{GW_SESSION_PREFIX}{}", "transport-legacy-resume");
         backend
             .append(
                 &legacy_key,
                 &zeroclaw_providers::ChatMessage::user("seeded legacy turn"),
             )
             .expect("seed legacy transcript");
+        assert_eq!(
+            backend
+                .adopt_session_agent_alias(&legacy_key, "web")
+                .unwrap(),
+            zeroclaw_infra::session_backend::AdoptOutcome::Adopted,
+        );
         state.session_backend = Some(backend);
 
         let (gateway_addr, gateway_server) = spawn_test_ws_gateway(state.clone()).await;
-        let session_id = "transport.legacy-resume";
+        let session_id = "transport-legacy-resume";
         // This URL connects only to the test's loopback listener. Keep the
         // scheme split so the static insecure-transport rule does not flag a
         // non-production fixture.
@@ -8467,7 +8477,7 @@ data: [DONE]\n\n";
         assert_eq!(session_start["type"], "session_start");
         assert_eq!(
             session_start["resumed"], true,
-            "legacy raw-key transcript must resume for a dotted display id"
+            "seeded transcript must resume for the owned canonical display id"
         );
         assert_eq!(session_start["message_count"], 1);
 
@@ -8507,7 +8517,7 @@ data: [DONE]\n\n";
             as std::sync::Arc<dyn zeroclaw_infra::session_backend::SessionBackend>);
 
         let (gateway_addr, gateway_server) = spawn_test_ws_gateway(state.clone()).await;
-        let session_id = "transport.api-delivery";
+        let session_id = "transport-api-delivery";
         // This URL connects only to the test's loopback listener. Keep the
         // scheme split so the static insecure-transport rule does not flag a
         // non-production fixture.
