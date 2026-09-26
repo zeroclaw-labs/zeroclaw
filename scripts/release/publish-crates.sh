@@ -80,7 +80,7 @@ if [[ -n "$EXPECTED_VERSION" && "$VERSION" != "$EXPECTED_VERSION" ]]; then
 fi
 
 # The root package intentionally includes the generated, gitignored web/dist
-# tree. Both workflow jobs build it immediately before invoking this script,
+# tree. The preflight job builds it and the publish job restores that build,
 # so Cargo needs --allow-dirty to package those files. Keep that exception
 # narrow: tracked changes or ordinary untracked files mean the checkout is not
 # the immutable release source and must fail before any registry operation.
@@ -101,6 +101,24 @@ if [[ ! -s web/dist/index.html ]]; then
   echo "error: web/dist/index.html is missing or empty." >&2
   echo "       Run cargo web build before publishing." >&2
   exit 1
+fi
+
+# The workflow builds the dashboard once, in preflight, and hands that tree to
+# the publish job as an artifact. WEB_DIST_DIGEST is the digest preflight
+# recorded; recomputing it here proves the tarball about to be packaged carries
+# the bundle that was verified, not a rebuild or a partial download.
+if [[ -n "${WEB_DIST_DIGEST:-}" ]]; then
+  if ! actual_web_digest="$(bash "$REPO_ROOT/scripts/release/web_dist_digest.sh" web/dist)"; then
+    echo "error: could not compute the web/dist digest; refusing to publish." >&2
+    exit 1
+  fi
+  if [[ "$actual_web_digest" != "$WEB_DIST_DIGEST" ]]; then
+    echo "error: web/dist does not match the bundle preflight verified." >&2
+    echo "       expected: $WEB_DIST_DIGEST" >&2
+    echo "       actual:   $actual_web_digest" >&2
+    exit 1
+  fi
+  echo "web/dist matches the verified bundle ($actual_web_digest)."
 fi
 
 META="$(cargo metadata --format-version 1 --no-deps)"

@@ -454,6 +454,55 @@ fn crates_io_publisher_is_preflighted_gated_and_resumable() {
         );
     }
 
+    // The dashboard is built once. Preflight records its digest and hands the
+    // verified tree to the publish job, which must not rebuild it and must make
+    // the publisher recheck the digest before anything reaches crates.io.
+    for required in [
+        "cargo web build",
+        "web_dist_digest: ${{ steps.web_digest.outputs.digest }}",
+        "bash scripts/release/web_dist_digest.sh web/dist",
+        "WEB_DIST_DIGEST: ${{ steps.web_digest.outputs.digest }}",
+        "uses: actions/upload-artifact@",
+        "name: crates-io-web-dist",
+        "include-hidden-files: true",
+        "retention-days: 30",
+    ] {
+        assert!(
+            preflight.contains(required),
+            "crates.io preflight is missing web bundle invariant: {required}"
+        );
+    }
+    let preflight_run = preflight
+        .split_once("      - name: Preflight\n")
+        .expect("crates.io preflight must define the Preflight step")
+        .1;
+    assert!(
+        preflight_run.contains("uses: actions/upload-artifact@"),
+        "the web bundle artifact must be uploaded only after the verifying dry run"
+    );
+    for required in [
+        "uses: actions/download-artifact@",
+        "name: crates-io-web-dist",
+        "path: web/dist/",
+        "WEB_DIST_DIGEST: ${{ needs.preflight.outputs.web_dist_digest }}",
+        "^[0-9a-f]{64}$",
+    ] {
+        assert!(
+            publish.contains(required),
+            "crates.io publish job is missing web bundle invariant: {required}"
+        );
+    }
+    for forbidden in ["cargo web build", "actions/setup-node@", "npm "] {
+        assert!(
+            !publish.contains(forbidden),
+            "the crates.io publish job must reuse the verified bundle, not rebuild it: {forbidden}"
+        );
+    }
+    assert!(
+        !release.contains("name: crates-io-web-dist"),
+        "the crates.io artifact name must stay distinct from the release run's artifacts"
+    );
+
     for required in [
         "EXECUTE=0",
         "--execute) EXECUTE=1",
@@ -461,6 +510,8 @@ fn crates_io_publisher_is_preflighted_gated_and_resumable() {
         "git diff --quiet",
         "git ls-files --others --exclude-standard",
         "web/dist/index.html",
+        "scripts/release/web_dist_digest.sh\" web/dist",
+        "web/dist does not match the bundle preflight verified",
         "cargo publish --dry-run --locked --allow-dirty",
         "--locked --no-verify --allow-dirty",
         "python3 \"$REPO_ROOT/scripts/release/publish_order.py\" \"$VERSION\" <<<\"$META\"",

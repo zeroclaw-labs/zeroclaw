@@ -597,7 +597,9 @@ deleted. Fix the failing crate at the same release commit, then re-run
 `Pub crates.io` for the same tag with `dry_run: false`; the publisher queries
 every `<crate>@<version>` first and skips versions that already landed. Read the
 Publish step for the last successful crate. If preflight failed, no upload was
-attempted and the problem is still reversible.
+attempted and the problem is still reversible. If the publish job reports that
+`web/dist` does not match the bundle preflight verified, nothing was uploaded;
+dispatch `Pub crates.io` again so a fresh preflight rebuilds and re-verifies it.
 
 **The `scoop` job failed with `remote: Permission ... denied to <account>` (403):**
 A permissions problem, not a manifest problem: the bucket token is dead or

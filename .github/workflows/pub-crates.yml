@@ -61,6 +61,7 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       sha: ${{ steps.meta.outputs.sha }}
       msrv: ${{ steps.meta.outputs.msrv }}
+      web_dist_digest: ${{ steps.web_digest.outputs.digest }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -136,7 +137,9 @@ jobs:
       # The root crate's `include` ships `/web/dist/**/*`, and those files are
       # gitignored build output, so a checkout alone leaves only logo.png. Build
       # it here exactly as the release workflow's `web` job does, so the
-      # published tarball is complete rather than half-empty.
+      # published tarball is complete rather than half-empty. This is the only
+      # build: the publish job restores this tree from an artifact and checks
+      # its digest, so the bundle uploaded is the bundle verified here.
       #
       # Note what this does NOT do: `cargo install` copies executables into
       # ~/.cargo/bin and does not install packaged data files, and the gateway
@@ -149,6 +152,15 @@ jobs:
       - name: Build web dashboard
         run: cargo web build
 
+      - name: Record web dashboard digest
+        id: web_digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest="$(bash scripts/release/web_dist_digest.sh web/dist)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "web/dist digest: $digest"
+
       - name: Validate crates.io publish contract
         run: cargo test --locked --test architecture publish_contract
 
@@ -160,7 +172,21 @@ jobs:
         # the earlier contract test still benefits from rust-cache.
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/crates-io-package-target
+          WEB_DIST_DIGEST: ${{ steps.web_digest.outputs.digest }}
         run: ./scripts/release/publish-crates.sh "${{ steps.meta.outputs.version }}"
+
+      # Uploaded only after the dry run passed, so the artifact is the tree that
+      # was packaged and compiled. The name must not collide with the release
+      # workflow's `web-dist`: a called workflow shares its caller's run.
+      # Retention covers the longest a pending `crates-io` review can wait, so a
+      # late approval or a re-run of the failed publish job still finds it.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: crates-io-web-dist
+          path: web/dist/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Summarize
         if: always()
@@ -169,12 +195,14 @@ jobs:
           VERSION: ${{ steps.meta.outputs.version }}
           TAG: ${{ inputs.release_tag }}
           DRY_RUN: ${{ inputs.dry_run }}
+          WEB_DIST_DIGEST: ${{ steps.web_digest.outputs.digest }}
         run: |
           {
             echo "### crates.io preflight"
             echo "- tag: \`${TAG}\`"
             echo "- version: \`${VERSION}\`"
             echo "- dry_run: \`${DRY_RUN}\`"
+            echo "- web/dist digest: \`${WEB_DIST_DIGEST}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
   publish:
@@ -203,14 +231,13 @@ jobs:
         with:
           toolchain: ${{ needs.preflight.outputs.msrv }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version-file: '.nvmrc'
-          cache: npm
-          cache-dependency-path: web/package-lock.json
 
-      - name: Build web dashboard
-        run: cargo web build
+      # No rebuild here. Restore the dashboard preflight packaged and verified;
+      # the publisher recomputes its digest and refuses to upload on mismatch.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: crates-io-web-dist
+          path: web/dist/
 
       - name: Publish
         id: publish
@@ -218,8 +245,14 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           VERSION: ${{ needs.preflight.outputs.version }}
+          WEB_DIST_DIGEST: ${{ needs.preflight.outputs.web_dist_digest }}
         run: |
           set -euo pipefail
+          # An empty digest would silently skip the bundle check in the script.
+          if [[ ! "${WEB_DIST_DIGEST:-}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Preflight did not record a web/dist digest; refusing to publish an unverified bundle."
+            exit 1
+          fi
           if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
             echo "::error::The repository secret CARGO_REGISTRY_TOKEN is required to publish."
             echo "::error::Mint one at https://crates.io/settings/tokens. A crate that does not"
