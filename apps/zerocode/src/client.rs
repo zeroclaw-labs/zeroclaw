@@ -88,6 +88,7 @@ pub mod method {
     pub const INITIALIZE: &str = "initialize";
     pub const CONFIG_LIST: &str = "config/list";
     pub const CONFIG_SET: &str = "config/set";
+    pub const CONFIG_VALIDATE: &str = "config/validate";
     pub const CONFIG_DELETE: &str = "config/delete";
     pub const CONFIG_RELOAD: &str = "config/reload";
     pub const CONFIG_MAP_KEYS: &str = "config/map-keys";
@@ -2317,6 +2318,14 @@ impl RpcClient {
         Ok(())
     }
 
+    pub async fn config_validate(&self, agent: Option<&str>) -> Result<ConfigValidateResult> {
+        self.call(
+            method::CONFIG_VALIDATE,
+            serde_json::json!({ "agent": agent }),
+        )
+        .await
+    }
+
     pub async fn config_delete(&self, prop: &str) -> Result<()> {
         let _: ConfigDeleteResult = self
             .call(method::CONFIG_DELETE, serde_json::json!({ "prop": prop }))
@@ -3279,6 +3288,13 @@ pub struct ConfigDeleteResult {}
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ConfigReloadResult {}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ConfigValidateResult {
+    pub valid: bool,
+    pub error: Option<String>,
+}
 
 /// One selectable locale (`locales/list`).
 #[derive(Debug, Clone, serde::Deserialize)]
