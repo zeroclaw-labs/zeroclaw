@@ -424,7 +424,8 @@ impl WebSearchTool {
             .header("Accept-Language", headers.accept_language)
             .header("DNT", "1")
             .send()
-            .await?;
+            .await
+            .map_err(|error| transport_search_failure("duckduckgo", "request", &error))?;
         let status = response.status();
         let final_url_is_block =
             contains_ascii_case_insensitive(response.url().as_str(), "/wr.do?");
@@ -517,7 +518,8 @@ impl WebSearchTool {
             .header("Accept", "application/json")
             .header("X-Subscription-Token", &api_key)
             .send()
-            .await?;
+            .await
+            .map_err(|error| transport_search_failure("brave", "request", &error))?;
 
         if !response.status().is_success() {
             return Err(http_search_failure("brave", response.status()));
@@ -1760,7 +1762,8 @@ impl WebSearchTool {
             .get(&search_url)
             .header("Accept", "application/json")
             .send()
-            .await?;
+            .await
+            .map_err(|error| transport_search_failure("searxng", "request", &error))?;
 
         if !response.status().is_success() {
             return Err(http_search_failure("searxng", response.status()));
