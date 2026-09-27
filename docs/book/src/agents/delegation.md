@@ -18,7 +18,7 @@ This page documents `spawn_subagent` end to end. `delegate` lives at `crates/zer
 Two spawn sites converge on `SubAgentSpawn` (`crates/zeroclaw-runtime/src/subagent/mod.rs:97`):
 
 1. **From an agent loop**: the model calls the `spawn_subagent` tool with a `prompt` string. The tool is registered like any other in the registry (`crates/zeroclaw-runtime/src/tools/mod.rs`, `SpawnSubagentTool::new`).
-2. **From cron**: `JobType::Agent` jobs run through `run_agent_job` (`crates/zeroclaw-runtime/src/cron/scheduler.rs`) which builds the same `SubAgentContext` but flags the child as a top-level run (not a SubAgent) so it can itself spawn one level of subagent.
+2. **From cron**: `JobType::Agent` jobs are admitted by `run_agent_job` (`crates/zeroclaw-cron/src/scheduler.rs`) and executed by `RuntimeCronAgentExecutor` (`crates/zeroclaw-runtime/src/cron_host.rs`), which flags the child as a top-level run (not a SubAgent) so it can itself spawn one level of subagent.
 
 Both paths invoke:
 

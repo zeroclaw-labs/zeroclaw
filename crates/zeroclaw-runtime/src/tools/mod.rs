@@ -22,7 +22,6 @@ pub mod security_ops;
 pub mod send_message_to_peer;
 pub mod shell;
 pub(crate) mod shell_env;
-pub(crate) mod shell_output;
 pub mod skill_http;
 pub mod skill_manage;
 pub mod skill_tool;

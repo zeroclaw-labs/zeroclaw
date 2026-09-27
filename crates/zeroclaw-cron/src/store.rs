@@ -1,4 +1,4 @@
-use crate::cron::{
+use crate::{
     CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
     next_run_for_schedule, schedule_cron_expression, validate_delivery_config, validate_schedule,
 };
@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::types::{FromSqlResult, ValueRef};
 use rusqlite::{Connection, OpenFlags, params};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use uuid::Uuid;
 use zeroclaw_config::schema::{Config, CronShellOutputFormat};
@@ -23,7 +23,7 @@ static CRON_PROCESS_LOCK_OWNER: OnceLock<String> = OnceLock::new();
 static LIVE_AGENT_CLAIM_TOKENS: LazyLock<Mutex<HashSet<(std::path::PathBuf, String, String)>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 static FORCED_RELEASE_FAILURES: LazyLock<Mutex<HashSet<std::path::PathBuf>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
@@ -46,7 +46,7 @@ fn register_live_agent_claim(config: &Config, job_id: &str, lock_token: &str) {
     ));
 }
 
-pub(crate) fn finish_agent_claim(config: &Config, job_id: &str, lock_token: &str) {
+pub fn finish_agent_claim(config: &Config, job_id: &str, lock_token: &str) {
     let mut claims = LIVE_AGENT_CLAIM_TOKENS
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -57,8 +57,8 @@ pub(crate) fn finish_agent_claim(config: &Config, job_id: &str, lock_token: &str
     ));
 }
 
-#[cfg(test)]
-pub(crate) fn force_release_failure_for_tests(config: &Config, enabled: bool) {
+#[cfg(any(test, feature = "test-util"))]
+pub fn force_release_failure_for_tests(config: &Config, enabled: bool) {
     let mut failures = FORCED_RELEASE_FAILURES
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -70,7 +70,25 @@ pub(crate) fn force_release_failure_for_tests(config: &Config, enabled: bool) {
     }
 }
 
-#[cfg(test)]
+/// Seed a claim carrying `lock_token`, as another process or an older build
+/// would have left it. `None` reproduces a row claimed before tokens existed.
+#[cfg(any(test, feature = "test-util"))]
+pub fn force_claim_for_tests(
+    config: &Config,
+    job_id: &str,
+    lock_token: Option<&str>,
+) -> Result<()> {
+    with_initialized_connection(config, |conn| {
+        conn.execute(
+            "UPDATE cron_jobs SET locked_at = ?1, lock_token = ?2 WHERE id = ?3",
+            params![Utc::now().to_rfc3339(), lock_token, job_id],
+        )
+        .context("Failed to seed cron claim for test")?;
+        Ok(())
+    })
+}
+
+#[cfg(any(test, feature = "test-util"))]
 fn should_force_release_failure(config: &Config) -> bool {
     FORCED_RELEASE_FAILURES
         .lock()
@@ -876,6 +894,12 @@ pub fn reschedule_after_run_with_status(
     }
 }
 
+/// Advance or disable an overdue job at startup without executing it.
+///
+/// Both updates skip rows with a live claim. Startup can race a manual trigger
+/// that the gateway accepted before the scheduler finished initializing, and
+/// rewriting `next_run` or disabling a row underneath that run would clobber
+/// the state its own completion is about to write.
 pub fn skip_missed_run(config: &Config, job: &CronJob, now: DateTime<Utc>) -> Result<()> {
     if matches!(job.schedule, Schedule::At { .. }) {
         // One-shot job whose scheduled moment has already passed —
@@ -885,7 +909,7 @@ pub fn skip_missed_run(config: &Config, job: &CronJob, now: DateTime<Utc>) -> Re
             conn.execute(
                 "UPDATE cron_jobs
                  SET enabled = 0, last_run = ?1, last_status = 'skipped', last_output = ?2
-                 WHERE id = ?3",
+                 WHERE id = ?3 AND locked_at IS NULL",
                 params![now.to_rfc3339(), bounded_output, job.id],
             )
             .context("Failed to disable overdue one-shot cron job on startup skip")?;
@@ -896,7 +920,7 @@ pub fn skip_missed_run(config: &Config, job: &CronJob, now: DateTime<Utc>) -> Re
         let next_run = next_run_for_schedule(&job.schedule, now)?;
         with_initialized_connection(config, |conn| {
             conn.execute(
-                "UPDATE cron_jobs SET next_run = ?1 WHERE id = ?2",
+                "UPDATE cron_jobs SET next_run = ?1 WHERE id = ?2 AND locked_at IS NULL",
                 params![next_run.to_rfc3339(), job.id],
             )
             .context("Failed to advance next_run on startup skip")?;
@@ -948,6 +972,31 @@ pub fn claim_job_for_agent_with_token(
     agent_alias: &str,
     now: DateTime<Utc>,
 ) -> Result<Option<String>> {
+    claim_with_live_token(config, job_id, Some(agent_alias), now)
+}
+
+/// Claim a job for a manual run and return the opaque claim token.
+///
+/// Gateway and RPC triggers can be accepted before the scheduler finishes
+/// starting, and startup recovery clears every lock whose token is not
+/// registered live. An untokened claim taken there would be cleared mid-run
+/// and let a second run overlap it, so manual runs claim through the same
+/// live-token registry as agent triggers. There is no owner predicate: the
+/// caller has already resolved the job.
+pub fn claim_job_with_token(
+    config: &Config,
+    job_id: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<String>> {
+    claim_with_live_token(config, job_id, None, now)
+}
+
+fn claim_with_live_token(
+    config: &Config,
+    job_id: &str,
+    agent_alias: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<Option<String>> {
     let lock_token = new_agent_lock_token();
     register_live_agent_claim(config, job_id, &lock_token);
     let result = with_initialized_connection(config, |conn| {
@@ -955,10 +1004,10 @@ pub fn claim_job_for_agent_with_token(
             .execute(
                 "UPDATE cron_jobs
                  SET locked_at = ?1, lock_token = ?2
-                 WHERE id = ?3 AND agent_alias = ?4 AND locked_at IS NULL",
+                 WHERE id = ?3 AND (?4 IS NULL OR agent_alias = ?4) AND locked_at IS NULL",
                 params![now.to_rfc3339(), lock_token, job_id, agent_alias],
             )
-            .context("Failed to claim agent-owned cron job for execution")?;
+            .context("Failed to claim cron job for execution")?;
         Ok(if claimed == 1 {
             Some(lock_token.clone())
         } else {
@@ -980,7 +1029,7 @@ pub fn claim_job_for_agent_with_token(
 
 /// Release an agent claim only when it still owns the supplied token.
 pub fn release_job_for_token(config: &Config, job_id: &str, lock_token: &str) -> Result<bool> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     if should_force_release_failure(config) {
         anyhow::bail!("forced cron lock release failure for test");
     }
@@ -1512,7 +1561,43 @@ fn decode_allowed_tools(raw: Option<&str>) -> Result<Option<Vec<String>>> {
     Ok(None)
 }
 
+/// Whether this process's most recent declarative reconciliation succeeded,
+/// per cron database.
+///
+/// A declarative row stores the job body as of the last successful sync, while
+/// its precondition gate is always resolved from live config. Until a sync has
+/// succeeded in this process, a row may pair an old body with a new gate, so
+/// every path that runs a declarative job has to be able to ask. Absent means
+/// no reconciliation has run here yet, which is treated the same as a failure.
+static DECLARATIVE_RECONCILED: LazyLock<Mutex<HashMap<std::path::PathBuf, bool>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Whether declarative rows for this database reflect live config.
+///
+/// True only after `sync_declarative_jobs` has succeeded in this process and
+/// has not failed since.
+pub fn declarative_jobs_reconciled(config: &Config) -> bool {
+    DECLARATIVE_RECONCILED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&cron_db_path(config))
+        .copied()
+        .unwrap_or(false)
+}
+
 pub fn sync_declarative_jobs(
+    config: &Config,
+    decls: &std::collections::HashMap<String, zeroclaw_config::schema::CronJobDecl>,
+) -> Result<()> {
+    let result = sync_declarative_jobs_inner(config, decls);
+    DECLARATIVE_RECONCILED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(cron_db_path(config), result.is_ok());
+    result
+}
+
+fn sync_declarative_jobs_inner(
     config: &Config,
     decls: &std::collections::HashMap<String, zeroclaw_config::schema::CronJobDecl>,
 ) -> Result<()> {
@@ -1542,6 +1627,7 @@ pub fn sync_declarative_jobs(
     // Validate declarations before touching the DB.
     for (id, decl) in decls {
         validate_decl(id, decl)?;
+        validate_sole_owner(config, id)?;
     }
 
     let now = Utc::now();
@@ -1607,6 +1693,28 @@ pub fn sync_declarative_jobs(
                 .unwrap_or(false);
 
             if exists {
+                // Ownership lives in `[agents.<x>].cron_jobs`, so it can move
+                // between agents while the row's id stays the same. The stored
+                // `agent_alias` is what every agent-scoped read, update and
+                // delete filters on, so leaving it behind on an update splits
+                // the row in two: the scheduler runs it as the new owner while
+                // the old owner keeps the only handle to it.
+                //
+                // Resolve it the same way the insert branch does, and skip
+                // rather than fall back when nothing claims the id - a row no
+                // enabled agent owns must not stay reachable by whoever
+                // happened to own it last.
+                let Some(current_owner) = config.agent_for_cron_job(id) else {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"job_id": id})),
+                        "Skipping declarative cron job update: no [agents.<x>].cron_jobs entry claims this id"
+                    );
+                    continue;
+                };
+
                 // Update existing declarative job — preserve runtime state
                 // (next_run, last_run, last_status, last_output, created_at).
                 // Only update the schedule's next_run if the schedule itself changed.
@@ -1625,8 +1733,8 @@ pub fn sync_declarative_jobs(
                              prompt = ?5, name = ?6, session_target = ?7, model = ?8,
                              enabled = ?9, delivery = ?10, delete_after_run = ?11,
                              allowed_tools = ?12, source = 'declarative', next_run = ?13,
-                             uses_memory = ?14
-                         WHERE id = ?15",
+                             uses_memory = ?14, agent_alias = ?15
+                         WHERE id = ?16",
                         params![
                             expression,
                             command,
@@ -1642,6 +1750,7 @@ pub fn sync_declarative_jobs(
                             allowed_tools_json,
                             next_run.to_rfc3339(),
                             i32::from(decl.uses_memory),
+                            current_owner,
                             id,
                         ],
                     )
@@ -1653,8 +1762,8 @@ pub fn sync_declarative_jobs(
                              prompt = ?5, name = ?6, session_target = ?7, model = ?8,
                              enabled = ?9, delivery = ?10, delete_after_run = ?11,
                              allowed_tools = ?12, source = 'declarative',
-                             uses_memory = ?13
-                         WHERE id = ?14",
+                             uses_memory = ?13, agent_alias = ?14
+                         WHERE id = ?15",
                         params![
                             expression,
                             command,
@@ -1669,6 +1778,7 @@ pub fn sync_declarative_jobs(
                             i32::from(delete_after_run),
                             allowed_tools_json,
                             i32::from(decl.uses_memory),
+                            current_owner,
                             id,
                         ],
                     )
@@ -1741,6 +1851,34 @@ pub fn sync_declarative_jobs(
 }
 
 /// Validate a declarative cron job definition.
+/// Reject a declarative job that more than one enabled agent claims.
+///
+/// Caught here as well as at execution time so the failure surfaces at daemon
+/// start rather than at first fire. Ownership decides which allowlist,
+/// workspace, autonomy level, and action budget a scheduled command runs
+/// under, and `Config::agents` is a `HashMap`, so leaving two claimants in
+/// place would let map order pick the security policy and let a restart change
+/// it. Zero owners is not rejected here: a job can legitimately be declared
+/// before an agent adopts it, and execution refuses it anyway.
+///
+/// Like every other check in this validation pass, an error aborts the whole
+/// sync rather than skipping one job. That is deliberate and matches the
+/// existing contract, but it does mean one ambiguous job holds back every
+/// declarative job until the config is fixed.
+fn validate_sole_owner(config: &Config, id: &str) -> Result<()> {
+    let owners = super::enabled_cron_owners(config, id);
+    if owners.len() > 1 {
+        anyhow::bail!(
+            "Declarative cron job '{id}': claimed by {count} enabled agents ({owners}); \
+             exactly one agent must list it in [agents.<x>].cron_jobs so the job runs \
+             under a determinate security policy",
+            count = owners.len(),
+            owners = owners.join(", ")
+        );
+    }
+    Ok(())
+}
+
 fn validate_decl(id: &str, decl: &zeroclaw_config::schema::CronJobDecl) -> Result<()> {
     if id.trim().is_empty() {
         anyhow::bail!("Declarative cron job has empty id");
@@ -1777,6 +1915,17 @@ fn validate_decl(id: &str, decl: &zeroclaw_config::schema::CronJobDecl) -> Resul
     if let Some(raw) = decl.session_target.as_deref() {
         SessionTarget::try_parse(raw)
             .map_err(|err| anyhow::Error::msg(format!("Declarative cron job '{id}': {err}")))?;
+    }
+
+    if let Some(pre_hook) = &decl.pre_hook {
+        if pre_hook.command.trim().is_empty() {
+            anyhow::bail!("Declarative cron job '{id}': pre_hook requires a non-empty 'command'");
+        }
+        if pre_hook.timeout_secs == 0 {
+            anyhow::bail!(
+                "Declarative cron job '{id}': pre_hook 'timeout_secs' must be at least 1"
+            );
+        }
     }
 
     Ok(())
@@ -1877,12 +2026,7 @@ fn with_existing_initialized_connection<T>(
         &db_path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .with_context(|| {
-        format!(
-            "Failed to open existing cron DB: {}",
-            db_path.display().to_string()
-        )
-    })?;
+    .with_context(|| format!("Failed to open existing cron DB: {}", db_path.display()))?;
 
     initialize_schema(&conn)?;
 
@@ -1905,16 +2049,12 @@ pub(super) fn with_initialized_connection<T>(
     }
 
     if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "Failed to create cron directory: {}",
-                parent.display().to_string()
-            )
-        })?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create cron directory: {}", parent.display()))?;
     }
 
     let conn = Connection::open(&db_path)
-        .with_context(|| format!("Failed to open cron DB: {}", db_path.display().to_string()))?;
+        .with_context(|| format!("Failed to open cron DB: {}", db_path.display()))?;
 
     initialize_schema(&conn)?;
 
@@ -2223,7 +2363,7 @@ mod tests {
         let config = test_config(&tmp);
         let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
 
-        crate::cron::update_shell_job_with_approval(
+        crate::update_shell_job_with_approval(
             &config,
             "some-other-agent",
             &job.id,
@@ -3281,6 +3421,7 @@ mod tests {
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
+            pre_hook: None,
         };
         config.cron.insert("raw-shadow".to_string(), decl);
 
@@ -3413,6 +3554,7 @@ mod tests {
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
+            pre_hook: None,
         };
         config.cron.insert("blob-shadow".to_string(), decl);
 
@@ -3620,6 +3762,7 @@ mod tests {
                 session_target: None,
                 delivery: None,
                 shell_output_format: Default::default(),
+                pre_hook: None,
             },
         )
     }
@@ -3647,6 +3790,7 @@ mod tests {
                 session_target: None,
                 delivery: None,
                 shell_output_format: Default::default(),
+                pre_hook: None,
             },
         )
     }
@@ -3687,6 +3831,77 @@ mod tests {
         assert_eq!(job.command, "echo backup");
         assert_eq!(job.source, "declarative");
         assert_eq!(job.name.as_deref(), Some("decl-daily-backup"));
+    }
+
+    /// Moving a declaration between agents must move the row's owner with it.
+    ///
+    /// Ownership lives in `[agents.<x>].cron_jobs`, but every agent-scoped
+    /// read, update and delete filters on the row's stored `agent_alias`. When
+    /// sync left that behind, the scheduler ran the job as the new owner while
+    /// only the old owner could still reach it through the cron tools: the new
+    /// owner could not see its own job, and the old one could delete a job it
+    /// no longer owned.
+    #[test]
+    fn sync_moves_the_stored_owner_when_the_declaration_moves() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["movable"]);
+
+        let decls = decls_map(vec![make_shell_decl("movable", "0 2 * * *", "echo v1")]);
+        sync_declarative_jobs(&config, &decls).unwrap();
+        assert!(
+            get_job_for_agent(&config, "movable", "test-agent").is_ok(),
+            "the original owner starts with the row"
+        );
+
+        // The operator moves the entry to a different agent. Nothing else
+        // about the declaration changes.
+        config.agents.remove("test-agent");
+        config.agents.insert(
+            "second-agent".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                cron_jobs: vec!["movable".to_string()],
+                ..Default::default()
+            },
+        );
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        assert!(
+            get_job_for_agent(&config, "movable", "second-agent").is_ok(),
+            "the new owner must be able to reach the job it now owns"
+        );
+        assert!(
+            get_job_for_agent(&config, "movable", "test-agent").is_err(),
+            "the previous owner must lose its handle on the row"
+        );
+    }
+
+    /// A declaration nothing claims must not stay bound to its last owner.
+    #[test]
+    fn sync_skips_an_existing_row_no_enabled_agent_claims() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["orphanable"]);
+
+        let decls = decls_map(vec![make_shell_decl("orphanable", "0 2 * * *", "echo v1")]);
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        // The claiming agent is disabled, so nothing owns the declaration.
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("seeded agent")
+            .enabled = false;
+
+        let moved = decls_map(vec![make_shell_decl("orphanable", "0 2 * * *", "echo v2")]);
+        sync_declarative_jobs(&config, &moved).unwrap();
+
+        let job = get_job(&config, "orphanable").unwrap();
+        assert_eq!(
+            job.command, "echo v1",
+            "an unclaimed declaration must not be applied to the stored row"
+        );
     }
 
     #[test]
@@ -3928,6 +4143,7 @@ mod tests {
             session_target: None,
             delivery: None,
             shell_output_format: Default::default(),
+            pre_hook: None,
         };
 
         let mut decls = std::collections::HashMap::new();
@@ -3976,6 +4192,178 @@ schedule = { kind = "every", every_ms = 300000 }
             health.schedule,
             zeroclaw_config::schema::CronScheduleDecl::Every { every_ms: 300_000 }
         ));
+    }
+
+    #[test]
+    fn declarative_pre_hook_parses_from_toml() {
+        let toml_str = r#"
+[cron.daily-triage]
+job_type = "agent"
+prompt = "Run daily personal triage"
+schedule = { kind = "cron", expr = "0 6 * * *" }
+
+[cron.daily-triage.pre_hook]
+command = "python3 scripts/check_sources.py"
+timeout_secs = 45
+
+[cron.nightly-sync]
+command = "echo sync"
+schedule = { kind = "cron", expr = "0 2 * * *" }
+
+[cron.nightly-sync.pre_hook]
+command = "test -f /var/run/sync.ready"
+        "#;
+
+        #[derive(serde::Deserialize)]
+        struct Wrap {
+            cron: std::collections::HashMap<String, zeroclaw_config::schema::CronJobDecl>,
+        }
+        let parsed: Wrap = toml::from_str(toml_str).unwrap();
+
+        let triage = parsed.cron.get("daily-triage").unwrap();
+        let hook = triage.pre_hook.as_ref().expect("pre_hook should parse");
+        assert_eq!(hook.command, "python3 scripts/check_sources.py");
+        assert_eq!(hook.timeout_secs, 45);
+        validate_decl("daily-triage", triage).expect("a complete pre_hook should validate");
+
+        // `timeout_secs` is optional and falls back to the documented default.
+        let sync = parsed.cron.get("nightly-sync").unwrap();
+        let hook = sync.pre_hook.as_ref().expect("pre_hook should parse");
+        assert_eq!(
+            hook.timeout_secs,
+            zeroclaw_config::schema::DEFAULT_CRON_PRE_HOOK_TIMEOUT_SECS
+        );
+
+        // A job with no `pre_hook` table stays ungated.
+        assert!(
+            parsed
+                .cron
+                .values()
+                .all(|decl| decl.pre_hook.is_some() || decl.command.is_some())
+        );
+    }
+
+    /// Add an enabled agent that claims `cron_alias`.
+    fn add_owner(config: &mut Config, alias: &str, cron_alias: &str) {
+        config.agents.insert(
+            alias.to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                cron_jobs: vec![cron_alias.to_string()],
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    fn validate_sole_owner_rejects_two_enabled_claimants() {
+        let mut config = Config::default();
+        add_owner(&mut config, "alpha", "nightly");
+        add_owner(&mut config, "beta", "nightly");
+
+        let err = validate_sole_owner(&config, "nightly")
+            .expect_err("two enabled owners must not validate");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("claimed by 2 enabled agents"),
+            "unexpected: {msg}"
+        );
+        // Both claimants are named so the operator knows what to change.
+        assert!(
+            msg.contains("alpha") && msg.contains("beta"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_sole_owner_accepts_one_owner_and_tolerates_none() {
+        let mut config = Config::default();
+        add_owner(&mut config, "alpha", "nightly");
+        assert!(validate_sole_owner(&config, "nightly").is_ok());
+
+        // A job nobody has adopted yet is not a validation error: execution
+        // refuses it, and rejecting here would block declaring a job before
+        // wiring up its agent.
+        assert!(validate_sole_owner(&config, "unclaimed").is_ok());
+    }
+
+    #[test]
+    fn validate_sole_owner_ignores_disabled_claimants() {
+        let mut config = Config::default();
+        add_owner(&mut config, "alpha", "nightly");
+        add_owner(&mut config, "retired", "nightly");
+        config
+            .agents
+            .get_mut("retired")
+            .expect("agent exists")
+            .enabled = false;
+
+        assert!(
+            validate_sole_owner(&config, "nightly").is_ok(),
+            "a disabled claimant is not a competing owner"
+        );
+    }
+
+    #[test]
+    fn sync_declarative_jobs_refuses_an_ambiguously_owned_job() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        add_owner(&mut config, "alpha", "contested");
+        add_owner(&mut config, "beta", "contested");
+
+        let decl = zeroclaw_config::schema::CronJobDecl {
+            job_type: "shell".to_string(),
+            command: Some("echo hi".to_string()),
+            schedule: zeroclaw_config::schema::CronScheduleDecl::Cron {
+                expr: "0 2 * * *".to_string(),
+                tz: None,
+            },
+            ..Default::default()
+        };
+        let decls = decls_map(vec![("contested".to_string(), decl)]);
+
+        let err = sync_declarative_jobs(&config, &decls)
+            .expect_err("sync must refuse an ambiguously owned job");
+        assert!(err.to_string().contains("claimed by 2 enabled agents"));
+    }
+
+    #[test]
+    fn validate_decl_rejects_an_unusable_pre_hook() {
+        use zeroclaw_config::schema::{CronJobDecl, CronPreHookDecl, CronScheduleDecl};
+
+        let base = CronJobDecl {
+            job_type: "shell".into(),
+            command: Some("echo ok".into()),
+            schedule: CronScheduleDecl::Cron {
+                expr: "0 2 * * *".into(),
+                tz: None,
+            },
+            ..CronJobDecl::default()
+        };
+
+        let empty_command = CronJobDecl {
+            pre_hook: Some(CronPreHookDecl {
+                command: "   ".into(),
+                timeout_secs: 30,
+            }),
+            ..base.clone()
+        };
+        let err = validate_decl("gated", &empty_command).expect_err("empty command is unusable");
+        assert!(err.to_string().contains("non-empty 'command'"));
+
+        // A zero timeout would expire before the hook could answer, turning
+        // every run into a precondition failure. Reject it at sync time.
+        let zero_timeout = CronJobDecl {
+            pre_hook: Some(CronPreHookDecl {
+                command: "check.sh".into(),
+                timeout_secs: 0,
+            }),
+            ..base
+        };
+        let err = validate_decl("gated", &zero_timeout).expect_err("zero timeout is unusable");
+        assert!(
+            err.to_string()
+                .contains("'timeout_secs' must be at least 1")
+        );
     }
 
     #[test]
@@ -4099,7 +4487,7 @@ schedule = { kind = "every", every_ms = 300000 }
         let schedule_json = serde_json::to_string(&job.schedule).unwrap();
         let delivery_json = serde_json::to_string(&job.delivery).unwrap();
         let allowed_tools_json =
-            crate::cron::store::encode_allowed_tools(job.allowed_tools.as_ref()).unwrap();
+            crate::store::encode_allowed_tools(job.allowed_tools.as_ref()).unwrap();
         with_initialized_connection(config, |conn| {
             conn.execute(
                 "INSERT INTO cron_jobs
@@ -4273,6 +4661,7 @@ schedule = { kind = "every", every_ms = 300000 }
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
+            pre_hook: None,
         };
         let decls = decls_map(vec![("raw-decl".to_string(), decl.clone())]);
         // Populate config.cron so resolution finds the canonical source.
@@ -4327,6 +4716,7 @@ schedule = { kind = "every", every_ms = 300000 }
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
+            pre_hook: None,
         };
         let decls = decls_map(vec![("raw-decl".to_string(), decl.clone())]);
         config.cron.insert("raw-decl".to_string(), decl.clone());
@@ -4455,6 +4845,7 @@ schedule = { kind = "every", every_ms = 300000 }
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+            pre_hook: None,
         };
         let decls = decls_map(vec![("decl-job".to_string(), decl.clone())]);
         config.cron.insert("decl-job".to_string(), decl);
@@ -4503,6 +4894,7 @@ schedule = { kind = "every", every_ms = 300000 }
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+            pre_hook: None,
         };
         let decls = decls_map(vec![("decl-job".to_string(), decl.clone())]);
         config.cron.insert("decl-job".to_string(), decl);
@@ -4611,6 +5003,7 @@ schedule = { kind = "every", every_ms = 300000 }
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+            pre_hook: None,
         };
         let decls = decls_map(vec![("orphan-decl".to_string(), decl.clone())]);
         config.cron.insert("orphan-decl".to_string(), decl.clone());

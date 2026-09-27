@@ -1,10 +1,10 @@
-use crate::cron;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
+use zeroclaw_cron as cron;
 
 pub struct CronRemoveTool {
     config: Arc<Config>,
@@ -277,7 +277,7 @@ mod tests {
             &cfg,
             TEST_AGENT,
             Some("daily_sync".into()),
-            crate::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "0 8 * * *".into(),
                 tz: None,
             },
@@ -304,12 +304,12 @@ mod tests {
         Arc::new(config)
     }
 
-    fn named_job(cfg: &Config, agent: &str, name: &str, command: &str) -> crate::cron::CronJob {
+    fn named_job(cfg: &Config, agent: &str, name: &str, command: &str) -> zeroclaw_cron::CronJob {
         cron::add_shell_job(
             cfg,
             agent,
             Some(name.into()),
-            crate::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "0 8 * * *".into(),
                 tz: None,
             },

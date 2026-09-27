@@ -230,8 +230,8 @@ impl Tool for SkillShellTool {
 
         match result {
             Ok(Ok(output)) => {
-                let mut stdout = super::shell_output::decode_shell_output(&output.stdout);
-                let mut stderr = super::shell_output::decode_shell_output(&output.stderr);
+                let mut stdout = zeroclaw_infra::shell_output::decode_shell_output(&output.stdout);
+                let mut stderr = zeroclaw_infra::shell_output::decode_shell_output(&output.stderr);
 
                 if stdout.len() > MAX_OUTPUT_BYTES {
                     let mut b = MAX_OUTPUT_BYTES.min(stdout.len());

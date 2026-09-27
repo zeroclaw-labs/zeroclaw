@@ -1,4 +1,4 @@
-pub use zeroclaw_runtime::cron::*;
+pub use zeroclaw_cron::*;
 
 use crate::config::Config;
 use anyhow::{Result, bail};

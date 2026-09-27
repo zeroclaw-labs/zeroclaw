@@ -1,4 +1,3 @@
-use crate::cron;
 use crate::security::SecurityPolicy;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -8,6 +7,7 @@ use std::sync::Arc;
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
+use zeroclaw_cron as cron;
 
 /// Tool that lets the agent manage recurring and one-shot scheduled tasks.
 pub struct ScheduleTool {

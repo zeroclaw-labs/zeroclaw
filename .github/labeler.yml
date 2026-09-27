@@ -266,7 +266,8 @@
   - changed-files:
       - any-glob-to-any-file:
           - "src/cron/**"
-          - "crates/zeroclaw-runtime/src/cron/**"
+          - "crates/zeroclaw-cron/**"
+          - "crates/zeroclaw-runtime/src/cron_host.rs"
 
 "daemon":
   - changed-files:
