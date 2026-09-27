@@ -71,6 +71,7 @@ use crate::text_browser::TextBrowserTool;
 use crate::tool_search::ToolSearchTool;
 use crate::weather_tool::WeatherTool;
 use crate::web_fetch::WebFetchTool;
+use crate::web_research::WebResearchTool;
 use crate::web_search_tool::WebSearchTool;
 
 tool_attribution!(AskUserTool, ToolKind::Wait);
@@ -140,6 +141,7 @@ tool_attribution!(TextBrowserTool, ToolKind::Plugin);
 tool_attribution!(ToolSearchTool, ToolKind::Search);
 tool_attribution!(WeatherTool, ToolKind::Plugin);
 tool_attribution!(WebFetchTool, ToolKind::FetchUrl);
+tool_attribution!(WebResearchTool, ToolKind::Search);
 tool_attribution!(WebSearchTool, ToolKind::Search);
 
 #[cfg(test)]

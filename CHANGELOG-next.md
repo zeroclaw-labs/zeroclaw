@@ -10,6 +10,7 @@ ZeroClaw v0.8.5 is a security, connectivity, and operator-experience release spa
 - **Plugin and skill boundaries get substantially tighter:** typed instance configuration, scoped secrets, host-owned egress, bounded exports, path-traversal protection, and fail-closed skill HTTP execution now cover the main package and network trust boundaries (#9126, #9128, #9137, #9403, #9582, #10369, GHSA-93f6-34w8-5g98).
 - **Operator feedback improves across surfaces:** Matrix, Telegram, Slack, WhatsApp Web, SOP, MCP, logs, queued messages, and clipboard flows expose clearer progress and recovery behavior (#8443, #9822, #8985, #9385, #9476, #9196, #10057, #10096).
 - **Release portability improves:** routine builders move to Rust 1.98 while source compatibility remains at Rust 1.96, release tools use pinned binaries, MUSL and Alpine coverage expands, and the coordinated 23-crate workspace gains protected crates.io publication (#9527, #10122, #10174, #9286, #9514, #10158).
+- **Web research delegate:** search moves behind a bounded sub-agent. The main agent asks a question, the delegate searches and fetches with the configured `[web_search]` backend, and returns a distilled, source-cited summary instead of raw search-result text (#9824).
 
 ## What's New
 
@@ -21,6 +22,7 @@ ZeroClaw v0.8.5 is a security, connectivity, and operator-experience release spa
 - Add Grok Build ACP and Atlas Cloud providers, accept data-wrapped compatible responses, and centralize provider endpoint metadata (#9104, #9200, #9404, #9747).
 - Preserve OpenRouter attribution and streaming metadata, model context during Gemini requests, compatible tool-result image policy, and accurate served-model and lifecycle accounting (#9974, #9782, #10435, #10448, #10027, #10144).
 - Improve terminal provider errors, model-list bounds, OAuth refresh behavior, proxy handling, and reasoning-tool fallback classification; retry replay-safe empty streams once and evict compatible-provider images individually (#10234, #10314, #10012, #9606, #9400, #10211, #10602, #10564).
+- **`web_research` replaces raw `web_search_tool` in the default registry** (#9824): the raw tool now lives inside the delegate's scope (search + `web_fetch` only, bounded turns and wall clock, mandatory Sources section) and is auto-approved in its place. The delegate's nested tools are scoped by the active profile's denylist and bounded by the same wall clock, its model calls bill against the shared spend budget, and its `Sources:` list is rebuilt from pages actually retrieved. **Migration:** agents that need the raw tool back add `web_search_tool` to `allowed_tools`; `[web_search]` provider/key config is unchanged.
 
 ### Dashboard, ZeroCode, and RPC
 
