@@ -188,6 +188,10 @@ pub struct ArcToolRef(pub Arc<dyn Tool>);
 
 #[async_trait]
 impl Tool for ArcToolRef {
+    fn requires_unrestricted_principal(&self) -> bool {
+        self.0.requires_unrestricted_principal()
+    }
+
     fn name(&self) -> &str {
         self.0.name()
     }
@@ -217,6 +221,10 @@ impl Tool for ArcToolRef {
 
     fn invocation_triggers(&self) -> Vec<String> {
         self.0.invocation_triggers()
+    }
+
+    fn rebind_forwarded_env(&self, env: Option<std::collections::HashMap<String, String>>) {
+        self.0.rebind_forwarded_env(env);
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -270,6 +278,10 @@ impl ::zeroclaw_api::attribution::Attributable for ArcDelegatingTool {
 
 #[async_trait]
 impl Tool for ArcDelegatingTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        self.inner.requires_unrestricted_principal()
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -299,6 +311,10 @@ impl Tool for ArcDelegatingTool {
 
     fn invocation_triggers(&self) -> Vec<String> {
         self.inner.invocation_triggers()
+    }
+
+    fn rebind_forwarded_env(&self, env: Option<std::collections::HashMap<String, String>>) {
+        self.inner.rebind_forwarded_env(env);
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -543,6 +559,8 @@ pub const BUILTIN_TOOL_INTEGRATIONS: &[(&str, &str)] = &[
     ),
 ];
 
+pub use shell_env::ForwardedEnvironment;
+
 /// Bundled return values from tool registry construction.
 /// Named struct to avoid an ever-growing positional tuple that's painful
 /// to destructure across many callers.
@@ -756,13 +774,64 @@ fn plugin_egress_policy(
     config: &Config,
     instance_key: &str,
 ) -> Result<zeroclaw_plugins::egress::EgressPolicy, zeroclaw_plugins::egress::EgressError> {
+    use zeroclaw_plugins::egress::{
+        EgressError, EgressPolicy, TlsClientIdentity, TlsProfile, TlsProfileName,
+    };
     let (hosts, allow_private) = config.plugins.entry_egress(instance_key);
-    zeroclaw_plugins::egress::EgressPolicy::new(
+    let profiles = config
+        .plugins
+        .entry_tls_profiles(instance_key)
+        .into_iter()
+        .map(|profile| {
+            let secret = |field: &str, name: Option<String>| {
+                name.map(|name| {
+                    zeroclaw_api::plugin_key::SecretPropertyRef::parse(name).map_err(|_| {
+                        EgressError::InvalidTlsProfile {
+                            profile: profile.name.clone(),
+                            reason: format!("{field} is not a portable secret property"),
+                        }
+                    })
+                })
+                .transpose()
+            };
+            let custom_ca = secret("custom_ca_secret", profile.custom_ca_secret.clone())?;
+            let certificate = secret(
+                "client_certificate_secret",
+                profile.client_certificate_secret.clone(),
+            )?;
+            let private_key = secret(
+                "client_private_key_secret",
+                profile.client_private_key_secret.clone(),
+            )?;
+            let identity = match (certificate, private_key) {
+                (Some(certificate), Some(private_key)) => {
+                    Some(TlsClientIdentity::new(certificate, private_key))
+                }
+                (None, None) => None,
+                _ => {
+                    return Err(EgressError::InvalidTlsProfile {
+                        profile: profile.name.clone(),
+                        reason: "client certificate and private key must be set together"
+                            .to_string(),
+                    });
+                }
+            };
+            TlsProfile::new(
+                TlsProfileName::new(profile.name.clone())?,
+                &profile.hosts,
+                profile.system_roots,
+                custom_ca,
+                identity,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    EgressPolicy::new(
         &hosts,
         &allow_private,
         &config.security.nat64_prefixes,
         config.plugins.limits.max_connections_per_instance,
-    )
+    )?
+    .with_tls_profiles(profiles)
 }
 
 /// The one host-owned egress authority shared by every plugin instance in a
@@ -803,6 +872,34 @@ pub(crate) fn plugin_egress_service(
     )
 }
 
+/// The secret properties an instance's TLS profiles reference.
+///
+/// That material (a CA bundle, a client certificate and its private key) is
+/// read by the host when it builds a TLS connection. Resolved config marks it
+/// host-only so the guest's `secrets` import cannot return it. A reference that
+/// is not a portable property name is skipped here: the egress policy rejects
+/// the profile, and no secret by that name can be resolved.
+#[cfg(feature = "plugins-wasm")]
+fn plugin_tls_secret_properties(
+    config: &Config,
+    instance_key: &str,
+) -> Vec<zeroclaw_api::plugin_key::SecretPropertyRef> {
+    config
+        .plugins
+        .entry_tls_profiles(instance_key)
+        .into_iter()
+        .flat_map(|profile| {
+            [
+                profile.custom_ca_secret,
+                profile.client_certificate_secret,
+                profile.client_private_key_secret,
+            ]
+        })
+        .flatten()
+        .filter_map(|name| zeroclaw_api::plugin_key::SecretPropertyRef::parse(name).ok())
+        .collect()
+}
+
 #[cfg(feature = "plugins-wasm")]
 fn plugin_config_values(
     config: &Config,
@@ -826,6 +923,12 @@ pub(crate) fn plugin_host_services(
     config: Arc<Config>,
     live_config: Option<Arc<parking_lot::RwLock<Config>>>,
 ) -> zeroclaw_plugins::services::PluginHostServices {
+    let data_dir = config.data_dir.clone();
+    let config_dir = config
+        .config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
     // A live daemon handle and a fallback snapshot are mutually exclusive in
     // the long-lived service, so the resolver never retains two config sources.
     let fallback_config = live_config.is_none().then_some(config);
@@ -835,12 +938,17 @@ pub(crate) fn plugin_host_services(
         let manifest = host
             .manifest(package)
             .ok_or_else(|| zeroclaw_plugins::error::PluginError::NotFound(package.to_string()))?;
-        if let Some(live_config) = &live_config {
+        // Filled from the same config view the values come from, so the
+        // reserved set and the secrets it withholds share one revision.
+        let mut host_only = Vec::new();
+        let resolved = if let Some(live_config) = &live_config {
             zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
                 // Transient per-call view: schema/grant checks happen before
                 // this access, and the global lock is released before guest
                 // setup.
-                plugin_config_values(&live_config.read(), &config_entry_key, package)
+                let config = live_config.read();
+                host_only = plugin_tls_secret_properties(&config, &config_entry_key);
+                plugin_config_values(&config, &config_entry_key, package)
             })
         } else {
             let config = fallback_config.as_ref().ok_or_else(|| {
@@ -849,11 +957,16 @@ pub(crate) fn plugin_host_services(
                 )
             })?;
             zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
+                host_only = plugin_tls_secret_properties(config, &config_entry_key);
                 plugin_config_values(config, &config_entry_key, package)
             })
-        }
+        };
+        resolved.map(|resolved| resolved.reserve_for_host(host_only))
     });
-    zeroclaw_plugins::services::PluginHostServices::new(config)
+    let state = zeroclaw_plugins::services::PluginStateService::new(
+        crate::plugin_state::PluginStateStore::new(&data_dir, &config_dir),
+    );
+    zeroclaw_plugins::services::PluginHostServices::new(config, state)
 }
 
 /// Stack reserved for the dedicated registry-builder thread. The registry
@@ -942,7 +1055,7 @@ pub fn all_tools_with_runtime(
         root_config,
         canvas_store,
         is_subagent_caller,
-        tui_env,
+        tui_env.map(Arc::new),
         sop_engine,
         sop_audit,
         live_config,
@@ -974,7 +1087,7 @@ pub fn all_tools_with_runtime_and_acp_sessions(
     root_config: &zeroclaw_config::schema::Config,
     canvas_store: Option<CanvasStore>,
     is_subagent_caller: bool,
-    tui_env: Option<HashMap<String, String>>,
+    tui_env: Option<ForwardedEnvironment>,
     sop_engine: Option<Arc<Mutex<SopEngine>>>,
     sop_audit: Option<Arc<SopAuditLogger>>,
     // Live config handle for `send_via` peer-group authority. `Some` from the
@@ -1062,7 +1175,7 @@ fn all_tools_with_runtime_on_thread(
     root_config: &zeroclaw_config::schema::Config,
     canvas_store: Option<CanvasStore>,
     is_subagent_caller: bool,
-    tui_env: Option<HashMap<String, String>>,
+    tui_env: Option<ForwardedEnvironment>,
     sop_engine: Option<Arc<Mutex<SopEngine>>>,
     sop_audit: Option<Arc<SopAuditLogger>>,
     // Live config handle for `send_via` peer-group authority. `Some` from the
@@ -1099,7 +1212,7 @@ fn all_tools_with_runtime_on_thread(
                 } else {
                     root_config.shell_tool.timeout_secs
                 })
-                .with_tui_env(tui_env)
+                .with_shared_tui_env(tui_env)
                 .with_persistent_writes(persistent_writes),
             security.clone(),
         )),
@@ -1659,19 +1772,23 @@ fn all_tools_with_runtime_on_thread(
 
     // Backup tool (enabled by default)
     if root_config.backup.enabled {
-        tool_arcs.push(Arc::new(BackupTool::new(
-            workspace_dir.to_path_buf(),
+        tool_arcs.push(Arc::new(BackupTool::new_with_data_root_and_security(
+            config.data_dir.clone(),
             root_config.backup.include_dirs.clone(),
             root_config.backup.max_keep,
+            security.clone(),
         )));
     }
 
     // Data management tool (disabled by default)
     if root_config.data_retention.enabled {
-        tool_arcs.push(Arc::new(DataManagementTool::new(
-            workspace_dir.to_path_buf(),
-            root_config.data_retention.retention_days,
-        )));
+        tool_arcs.push(Arc::new(
+            DataManagementTool::new_with_data_root_and_security(
+                config.data_dir.clone(),
+                root_config.data_retention.retention_days,
+                security.clone(),
+            ),
+        ));
     }
 
     // Cloud operations advisory tools (read-only analysis)
@@ -1919,7 +2036,9 @@ fn all_tools_with_runtime_on_thread(
         tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(sop_engine))));
         if let Some(ref sop_audit) = sop_audit {
             tool_arcs.push(Arc::new(
-                SopExecuteTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
+                SopExecuteTool::new(Arc::clone(sop_engine))
+                    .with_audit(Arc::clone(sop_audit))
+                    .with_initiator(agent_alias),
             ));
             tool_arcs.push(Arc::new(
                 SopAdvanceTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
@@ -1930,7 +2049,9 @@ fn all_tools_with_runtime_on_thread(
                     .with_audit(Arc::clone(sop_audit)),
             ));
         } else {
-            tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(sop_engine))));
+            tool_arcs.push(Arc::new(
+                SopExecuteTool::new(Arc::clone(sop_engine)).with_initiator(agent_alias),
+            ));
             tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(sop_engine))));
             tool_arcs.push(Arc::new(
                 SopApproveTool::new(Arc::clone(sop_engine)).with_agent_alias(agent_alias),
@@ -2207,19 +2328,7 @@ fn all_tools_with_runtime_on_thread(
                     if root_config.pipeline.enabled {
                         registered_names.insert(PipelineTool::NAME.to_string());
                     }
-                    let plugin_limits = zeroclaw_plugins::component::PluginLimits {
-                        call_fuel: config.plugins.limits.call_fuel,
-                        max_memory_bytes: config
-                            .plugins
-                            .limits
-                            .max_memory_mb
-                            .saturating_mul(1024 * 1024),
-                        max_table_elements: config.plugins.limits.max_table_elements,
-                        max_instances: config.plugins.limits.max_instances,
-                        call_timeout: std::time::Duration::from_millis(
-                            config.plugins.limits.call_timeout_ms,
-                        ),
-                    };
+                    let plugin_limits = crate::plugin_runtime::plugin_limits(&config);
                     let egress_service =
                         plugin_egress_service(Arc::clone(&config), live_config.clone());
                     register_plugin_tools(
@@ -2732,6 +2841,7 @@ const = true
             config: HashMap::from([("enabled".to_string(), enabled.to_string())]),
             egress_hosts: Vec::new(),
             egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
         };
         let mut snapshot = Config::default();
         snapshot.plugins.entries = vec![
@@ -2825,6 +2935,7 @@ permissions = ["http_client"]
             config: HashMap::new(),
             egress_hosts: vec!["api.example.com".to_string()],
             egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
         };
         let request = || {
             zeroclaw_plugins::egress::EgressRequest::new(
@@ -2867,6 +2978,60 @@ permissions = ["http_client"]
             ),
             "a raw package or binding entry must not bypass the canonical key"
         );
+
+        // The same row carries the instance's TLS profiles into policy, read at
+        // use time like the grant itself.
+        let profile = |hosts: &[&str]| zeroclaw_config::schema::PluginTlsProfileConfig {
+            name: "corp".to_string(),
+            hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
+            system_roots: true,
+            custom_ca_secret: Some("corp_ca".to_string()),
+            client_certificate_secret: None,
+            client_private_key_secret: None,
+        };
+        let mut with_profile = Config::default();
+        let mut row = entry(&instance_key);
+        row.tls_profiles = vec![profile(&["api.example.com"])];
+        with_profile.plugins.entries = vec![row];
+        let authorized = plugin_egress_service(Arc::new(with_profile), None)
+            .authorize_addresses(request().with_tls_profile("corp").unwrap(), addresses)
+            .expect("a configured profile for a granted host must authorize");
+        assert_eq!(
+            authorized
+                .tls_profile()
+                .and_then(|profile| profile.custom_ca())
+                .map(|secret| secret.as_str()),
+            Some("corp_ca")
+        );
+
+        // The same profile's material is reserved for the host, so the guest's
+        // `secrets` import cannot return it.
+        let mut with_identity = Config::default();
+        let mut row = entry(&instance_key);
+        row.tls_profiles = vec![zeroclaw_config::schema::PluginTlsProfileConfig {
+            client_certificate_secret: Some("client_cert".to_string()),
+            client_private_key_secret: Some("client_key".to_string()),
+            ..profile(&["api.example.com"])
+        }];
+        with_identity.plugins.entries = vec![row];
+        let reserved = plugin_tls_secret_properties(&with_identity, &instance_key);
+        assert_eq!(
+            reserved.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+            ["corp_ca", "client_cert", "client_key"]
+        );
+        assert!(plugin_tls_secret_properties(&Config::default(), &instance_key).is_empty());
+
+        // A profile that names an ungranted host fails the whole policy
+        // closed, even if it slipped past load-time validation.
+        let mut widened = Config::default();
+        let mut row = entry(&instance_key);
+        row.tls_profiles = vec![profile(&["other.example.com"])];
+        widened.plugins.entries = vec![row];
+        assert!(matches!(
+            plugin_egress_service(Arc::new(widened), None)
+                .authorize_addresses(request(), addresses),
+            Err(zeroclaw_plugins::egress::EgressError::TlsProfileHostNotGranted { .. })
+        ));
     }
 
     #[test]
@@ -3006,7 +3171,13 @@ permissions = ["http_client"]
         reserved: &[&str],
     ) -> Vec<String> {
         let (resolver, probed) = recording_resolver(host);
-        let services = zeroclaw_plugins::services::PluginHostServices::new(resolver);
+        let state_dir = tempfile::tempdir().expect("plugin state dir");
+        let services = zeroclaw_plugins::services::PluginHostServices::new(
+            resolver,
+            zeroclaw_plugins::services::PluginStateService::new(
+                crate::plugin_state::PluginStateStore::new(state_dir.path(), state_dir.path()),
+            ),
+        );
         let mut registered_names: std::collections::HashSet<String> =
             reserved.iter().map(|name| (*name).to_string()).collect();
         let mut tool_arcs: Vec<Arc<dyn Tool>> = Vec::new();
@@ -4026,6 +4197,7 @@ permissions = ["http_client"]
             admission_policy: SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }]);
         let action = engine
             .start_run(
@@ -4194,6 +4366,192 @@ permissions = ["http_client"]
             !workspace_dir.join("sessions").exists(),
             "session tools must not open/create a store under the per-agent workspace_dir"
         );
+    }
+
+    #[tokio::test]
+    async fn backup_and_data_management_use_shared_data_dir_not_agent_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("shared-data");
+        let workspace_dir = tmp.path().join("agent-workspace");
+        std::fs::create_dir_all(data_dir.join("config")).unwrap();
+        std::fs::create_dir_all(workspace_dir.join("config")).unwrap();
+        std::fs::write(data_dir.join("config/shared.txt"), "shared").unwrap();
+        std::fs::write(workspace_dir.join("config/agent.txt"), "agent").unwrap();
+        let shared_old = data_dir.join("shared-old.txt");
+        let agent_old = workspace_dir.join("agent-old.txt");
+        std::fs::write(&shared_old, "old").unwrap();
+        std::fs::write(&agent_old, "old-agent").unwrap();
+        let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(&shared_old)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&agent_old)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: workspace_dir.clone(),
+            ..SecurityPolicy::default()
+        });
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig::default();
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let web = zeroclaw_config::schema::WebFetchConfig::default();
+        let risk = zeroclaw_config::schema::RiskProfileConfig::default();
+        let mut root_config = test_config(&tmp);
+        root_config.data_dir = data_dir.clone();
+        root_config.backup.enabled = true;
+        root_config.backup.include_dirs = vec!["config".into()];
+        root_config.data_retention.enabled = true;
+        root_config.data_retention.retention_days = 1;
+        let config = Config {
+            data_dir: data_dir.clone(),
+            ..Config::default()
+        };
+
+        let tools = all_tools_with_runtime(
+            Arc::new(config),
+            &security,
+            &risk,
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &web,
+            workspace_dir.as_path(),
+            &HashMap::new(),
+            None,
+            &root_config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("tool registry builds")
+        .tools;
+        assert!(!security.allowed_roots.contains(&data_dir));
+
+        let backup = tools
+            .iter()
+            .find(|tool| tool.name() == "backup")
+            .expect("enabled backup tool must register");
+        let created = backup
+            .execute(serde_json::json!({"command": "create"}))
+            .await
+            .unwrap();
+        assert!(created.success, "backup failed: {:?}", created.error);
+        let created: serde_json::Value = serde_json::from_str(&created.output).unwrap();
+        let backup_name = created["backup"].as_str().unwrap();
+        assert!(
+            data_dir
+                .join("backups")
+                .join(backup_name)
+                .join("manifest.json")
+                .exists()
+        );
+        assert!(
+            data_dir
+                .join("backups")
+                .join(backup_name)
+                .join("config/shared.txt")
+                .exists()
+        );
+        assert!(
+            !data_dir
+                .join("backups")
+                .join(backup_name)
+                .join("config/agent.txt")
+                .exists()
+        );
+        assert!(!workspace_dir.join("backups").exists());
+
+        let listed = backup
+            .execute(serde_json::json!({"command": "list"}))
+            .await
+            .unwrap();
+        assert!(listed.success, "list failed: {:?}", listed.error);
+        let listed: serde_json::Value = serde_json::from_str(&listed.output).unwrap();
+        assert!(
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["name"] == backup_name)
+        );
+
+        let verified = backup
+            .execute(serde_json::json!({
+                "command": "verify",
+                "backup_name": backup_name
+            }))
+            .await
+            .unwrap();
+        assert!(verified.success, "verify failed: {:?}", verified.error);
+
+        std::fs::write(data_dir.join("config/shared.txt"), "changed").unwrap();
+        let restored = backup
+            .execute(serde_json::json!({
+                "command": "restore",
+                "backup_name": backup_name,
+                "confirm": true
+            }))
+            .await
+            .unwrap();
+        assert!(restored.success, "restore failed: {:?}", restored.error);
+        assert_eq!(
+            std::fs::read_to_string(data_dir.join("config/shared.txt")).unwrap(),
+            "shared"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace_dir.join("config/agent.txt")).unwrap(),
+            "agent"
+        );
+
+        let data_management = tools
+            .iter()
+            .find(|tool| tool.name() == "data_management")
+            .expect("enabled data-management tool must register");
+        let status = data_management
+            .execute(serde_json::json!({"command": "retention_status"}))
+            .await
+            .unwrap();
+        assert!(status.success, "status failed: {:?}", status.error);
+        let status: serde_json::Value = serde_json::from_str(&status.output).unwrap();
+        assert_eq!(status["affected_files"], 1);
+
+        let preview = data_management
+            .execute(serde_json::json!({"command": "purge", "dry_run": true}))
+            .await
+            .unwrap();
+        assert!(preview.success, "preview failed: {:?}", preview.error);
+        let preview: serde_json::Value = serde_json::from_str(&preview.output).unwrap();
+        assert_eq!(preview["files"], 1);
+        assert_eq!(preview["bytes_freed"], 3);
+
+        let stats = data_management
+            .execute(serde_json::json!({"command": "stats"}))
+            .await
+            .unwrap();
+        assert!(stats.success, "stats failed: {:?}", stats.error);
+        let stats: serde_json::Value = serde_json::from_str(&stats.output).unwrap();
+        assert!(stats["subdirectories"].get("backups").is_some());
+        assert!(!workspace_dir.join("backups").exists());
     }
 
     #[tokio::test]

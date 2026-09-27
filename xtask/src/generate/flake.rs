@@ -88,6 +88,7 @@ pub fn render_zone(root: &Path) -> anyhow::Result<String> {
             .to_string(),
         "            doCheck = false;".to_string(),
         "            buildInputs = [ pkgs.stdenv.cc.cc ];".to_string(),
+        "            meta = { mainProgram = pname; };".to_string(),
         "          };".to_string(),
     ];
     let body = lines.join("\n");
@@ -147,6 +148,23 @@ mod tests {
         assert!(
             z.contains("buildRustPackage"),
             "real package build, not just toolchain"
+        );
+        assert!(
+            z.contains("meta = { mainProgram = pname; }"),
+            "mainProgram derived from pname so lib.getExe needs no guess"
+        );
+    }
+
+    #[test]
+    fn zone_main_program_uses_pname() {
+        let z = render_zone(&root()).unwrap();
+        let meta_line = z
+            .lines()
+            .find(|l| l.contains("mainProgram"))
+            .expect("mainProgram line present");
+        assert!(
+            meta_line.contains("pname"),
+            "mainProgram must track pname (zeroclaw vs zerocode)"
         );
     }
 

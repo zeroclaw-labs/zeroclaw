@@ -399,12 +399,22 @@ fn trust_environment() -> TrustEnvironment {
 /// short one must not be able to cancel the store read that the *next* request
 /// needs. What a timeout cancels here is the waiter, never the work.
 struct TrustSlot {
-    ready: tokio::sync::watch::Receiver<Option<Arc<rustls::ClientConfig>>>,
+    ready: tokio::sync::watch::Receiver<Option<TrustMaterial>>,
     /// Held for its `Drop` alone. [`wasmtime_wasi::runtime::spawn_blocking`]
     /// hands back a handle that aborts its task when dropped, so letting this
     /// fall at the end of the miss branch would abort the very assembly the
     /// waiters are about to await.
     _assembly: wasmtime_wasi::runtime::AbortOnDropJoinHandle<()>,
+}
+
+/// One assembled trust decision: the client configuration plugin HTTPS dials
+/// with, and the root store it was built from. The roots travel with the
+/// configuration so TLS-profile transports extend exactly the trust plugin
+/// HTTPS already has, never a second, separately assembled set.
+#[derive(Clone)]
+struct TrustMaterial {
+    config: Arc<rustls::ClientConfig>,
+    roots: Arc<rustls::RootCertStore>,
 }
 
 /// Test-only delay injected ahead of the store read.
@@ -462,6 +472,30 @@ static ASSEMBLY_DELAY: std::sync::Mutex<Option<std::time::Duration>> = std::sync
 /// the assembly lands, and [`ErrorCode::TlsProtocolError`] when the assembly
 /// task itself died without producing a configuration.
 async fn plugin_tls_config(deadline: Instant) -> Result<Arc<rustls::ClientConfig>, ErrorCode> {
+    plugin_trust_material(deadline)
+        .await
+        .map(|material| material.config)
+}
+
+/// The root store plugin HTTPS verifies against: the bundled program plus this
+/// machine's store, from the same cached assembly as [`plugin_tls_config`].
+///
+/// TLS-profile transports start from this store when a profile keeps system
+/// roots, so a socket, a WebSocket, and an HTTPS request from one plugin trust
+/// the same authorities.
+///
+/// # Errors
+///
+/// As [`plugin_tls_config`].
+pub(crate) async fn plugin_trust_roots(
+    deadline: Instant,
+) -> Result<Arc<rustls::RootCertStore>, ErrorCode> {
+    plugin_trust_material(deadline)
+        .await
+        .map(|material| material.roots)
+}
+
+async fn plugin_trust_material(deadline: Instant) -> Result<TrustMaterial, ErrorCode> {
     static CACHE: OnceLock<std::sync::Mutex<HashMap<TrustEnvironment, TrustSlot>>> =
         OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
@@ -480,8 +514,8 @@ async fn plugin_tls_config(deadline: Instant) -> Result<Arc<rustls::ClientConfig
             // must not inherit an unrelated panic.
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(slot) = guard.get(&key) {
-            if let Some(config) = slot.ready.borrow().clone() {
-                return Ok(config);
+            if let Some(material) = slot.ready.borrow().clone() {
+                return Ok(material);
             }
             slot.ready.clone()
         } else {
@@ -498,14 +532,15 @@ async fn plugin_tls_config(deadline: Instant) -> Result<Arc<rustls::ClientConfig
                 }
                 let anchors = build_trust_anchors();
                 record_trust_anchors(&anchors);
+                let roots = Arc::new(anchors.store);
                 let config = Arc::new(
                     rustls::ClientConfig::builder()
-                        .with_root_certificates(anchors.store)
+                        .with_root_certificates(Arc::clone(&roots))
                         .with_no_client_auth(),
                 );
                 // The slot keeps a receiver alive for the life of the process,
                 // so this send lands whether or not anyone is still waiting.
-                let _ = sender.send(Some(config));
+                let _ = sender.send(Some(TrustMaterial { config, roots }));
             });
             guard.insert(
                 key.clone(),

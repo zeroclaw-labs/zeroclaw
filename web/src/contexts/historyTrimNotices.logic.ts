@@ -8,7 +8,10 @@
  * never present the configured budget as the trim target.
  */
 
+import { formatHistoryTrimmedNotice } from '../lib/historyTrimNotice.ts';
+
 export interface HistoryTrimmedNoticeMessage {
+  dropped_turns?: number;
   reason?: string;
   dropped_messages?: number;
   kept_turns?: number;
@@ -25,7 +28,7 @@ export function buildHistoryTrimmedNotice(
   t: (key: string) => string,
 ): string {
   const reason = msg.reason || t('agent.history_trimmed_unknown_reason');
-  const dropped = String(msg.dropped_messages ?? 0);
+  const dropped = String(msg.dropped_turns ?? msg.dropped_messages ?? 0);
   const kept = String(msg.kept_turns ?? 0);
   const hasTokens = msg.tokens_before != null && msg.tokens_after != null;
   // The unsatisfiable newest-turn/schema floor is flagged explicitly by the
@@ -42,17 +45,16 @@ export function buildHistoryTrimmedNotice(
       .replace('{budget}', String(msg.token_budget));
   }
   if (!hasTokens) {
-    return t('agent.history_trimmed')
-      .replace('{reason}', reason)
-      .replace('{dropped}', dropped)
-      .replace('{kept}', kept);
+    return formatHistoryTrimmedNotice({ type: 'history_trimmed', ...msg }, t);
   }
-  let content = t('agent.history_trimmed_tokens')
+  let content = t(msg.dropped_turns !== undefined ? 'agent.history_trimmed_tokens_turns' : 'agent.history_trimmed_tokens')
     .replace('{reason}', reason)
     .replace('{before}', String(msg.tokens_before))
     .replace('{after}', String(msg.tokens_after))
     .replace('{dropped}', dropped)
-    .replace('{kept}', kept);
+    .replace('{kept}', kept)
+    .replace('{dropped_unit}', t(msg.dropped_turns === 1 ? 'agent.history_trimmed_turn_singular' : 'agent.history_trimmed_turn_plural'))
+    .replace('{kept_unit}', t(msg.kept_turns === 1 ? 'agent.history_trimmed_turn_singular' : 'agent.history_trimmed_turn_plural'));
   if (msg.token_budget != null) {
     content += t('agent.history_trimmed_tokens_budget_clause').replace(
       '{budget}',

@@ -15,6 +15,7 @@ use crate::cost::types::BudgetCheck;
 use crate::observability::ObserverEvent;
 use crate::tools::ToolSpec;
 use anyhow::Result;
+use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
 use zeroclaw_config::schema::StreamReasoningMode;
 use zeroclaw_providers::dispatch::{AcceptedRoute, AccountedAttempt, with_exact_dispatch_route};
@@ -31,9 +32,63 @@ pub(crate) struct ProviderCallOutcome {
     pub(crate) streamed_visible_text: String,
 }
 
+/// Fingerprints of a request's cacheable prompt prefix: the contiguous
+/// leading system messages and the tool list. Hashes are the first 16 hex
+/// chars of SHA-256, enough to compare two `llm_request` trace rows without
+/// capturing request bodies.
+struct PrefixFingerprint {
+    /// Char count of the contiguous leading system message contents, summed
+    /// over the whole run, 0 when there are none.
+    system_chars: usize,
+    /// Hash of the leading system message contents serialized as a JSON
+    /// array, absent when there are no leading system messages. The whole
+    /// run is hashed, not just the first message: a before-call hook may
+    /// insert or edit a later leading system message, and provider adapters
+    /// then keep, merge, or drop it, which is outside the hashed bytes.
+    system_sha256: Option<String>,
+    /// Number of tool specs, 0 when the request carries no tools.
+    tools_count: usize,
+    /// Hash of the tool specs serialized as a JSON array (order-preserving,
+    /// so a reordered tool set fingerprints differently), absent when the
+    /// request carries no tools.
+    tools_sha256: Option<String>,
+}
+
+fn prefix_fingerprint(
+    request_messages: &[ChatMessage],
+    request_tools: Option<&[ToolSpec]>,
+) -> PrefixFingerprint {
+    let leading_system: Vec<&str> = request_messages
+        .iter()
+        .take_while(|message| message.role == "system")
+        .map(|message| message.content.as_str())
+        .collect();
+    PrefixFingerprint {
+        system_chars: leading_system
+            .iter()
+            .map(|content| content.chars().count())
+            .sum(),
+        system_sha256: if leading_system.is_empty() {
+            None
+        } else {
+            Some(short_sha256_prefix(
+                &::serde_json::to_vec(&leading_system).unwrap_or_default(),
+            ))
+        },
+        tools_count: request_tools.map_or(0, <[ToolSpec]>::len),
+        tools_sha256: request_tools
+            .map(|tools| short_sha256_prefix(&::serde_json::to_vec(tools).unwrap_or_default())),
+    }
+}
+
+fn short_sha256_prefix(bytes: &[u8]) -> String {
+    hex::encode(&Sha256::digest(bytes)[..8])
+}
+
 pub(crate) async fn announce_llm_request(
     ctx: &TurnCtx<'_>,
     request_messages: &[ChatMessage],
+    request_tools: Option<&[ToolSpec]>,
     active_model_provider: &dyn ModelProvider,
     active_model_provider_name: &str,
     active_model: &str,
@@ -59,12 +114,26 @@ pub(crate) async fn announce_llm_request(
     });
     {
         let _provider_guard = ::zeroclaw_log::attribution_span!(active_model_provider).entered();
+        // Prefix fingerprints are hashes and counts, not content: they carry
+        // no credentials or message text, so unlike the payload capture
+        // below they are emitted on every event, whatever the policy.
+        let fingerprint = prefix_fingerprint(request_messages, request_tools);
         let mut attrs = ::serde_json::json!({
             "iteration": iteration + 1,
             "messages_count": request_messages.len(),
+            "system_chars": fingerprint.system_chars,
+            "tools_count": fingerprint.tools_count,
             "model": active_model,
             "trace_id": ctx.turn_id,
         });
+        if let ::serde_json::Value::Object(map) = &mut attrs {
+            if let Some(system_sha256) = fingerprint.system_sha256.as_deref() {
+                map.insert("system_sha256".to_string(), system_sha256.into());
+            }
+            if let Some(tools_sha256) = fingerprint.tools_sha256.as_deref() {
+                map.insert("tools_sha256".to_string(), tools_sha256.into());
+            }
+        }
         // Opt-in request payload capture (observability.log_llm_request_payload,
         // default off). When enabled, attach the scrubbed + truncated message
         // history; when off (or no writer installed) `attrs` is unchanged.
@@ -419,8 +488,10 @@ pub(crate) async fn call_provider(
 mod payload_capture_tests {
     use super::super::context::TurnCtx;
     use super::super::events::{ProgressEvent, StreamDelta, thinking_status_text};
-    use super::announce_llm_request;
+    use super::{announce_llm_request, prefix_fingerprint};
+    use crate::hooks::{HookHandler, HookResult, HookRunner};
     use crate::observability::NoopObserver;
+    use crate::tools::ToolSpec;
     use async_trait::async_trait;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use zeroclaw_config::schema::{PacingConfig, StreamReasoningMode};
@@ -505,7 +576,8 @@ mod payload_capture_tests {
         for mode in [StreamReasoningMode::Off, StreamReasoningMode::Full] {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamDelta>(4);
             let ctx = test_ctx_with_delta(&observer, &pacing, Some(&tx), mode);
-            let _ = announce_llm_request(&ctx, &history, &provider, "stub", "stub-model", 0).await;
+            let _ = announce_llm_request(&ctx, &history, None, &provider, "stub", "stub-model", 0)
+                .await;
             drop(tx);
             assert!(matches!(
                 rx.recv().await,
@@ -519,7 +591,8 @@ mod payload_capture_tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamDelta>(4);
         let ctx = test_ctx_with_delta(&observer, &pacing, Some(&tx), StreamReasoningMode::Status);
-        let _ = announce_llm_request(&ctx, &history, &provider, "stub", "stub-model", 3).await;
+        let _ =
+            announce_llm_request(&ctx, &history, None, &provider, "stub", "stub-model", 3).await;
         drop(tx);
         assert!(matches!(
             rx.recv().await,
@@ -599,7 +672,8 @@ mod payload_capture_tests {
         while rx.try_recv().is_ok() {}
 
         let ctx = test_ctx(&observer, &pacing);
-        let _ = announce_llm_request(&ctx, &history, &provider, "stub", "stub-model", 0).await;
+        let _ =
+            announce_llm_request(&ctx, &history, None, &provider, "stub", "stub-model", 0).await;
         let on_record = next_llm_request(&mut rx).await;
 
         let attrs = on_record
@@ -638,7 +712,8 @@ mod payload_capture_tests {
         while rx.try_recv().is_ok() {}
 
         let ctx = test_ctx(&observer, &pacing);
-        let _ = announce_llm_request(&ctx, &history, &provider, "stub", "stub-model", 0).await;
+        let _ =
+            announce_llm_request(&ctx, &history, None, &provider, "stub", "stub-model", 0).await;
         let off_record = next_llm_request(&mut rx).await;
 
         let off_attrs = off_record
@@ -655,6 +730,257 @@ mod payload_capture_tests {
         assert!(
             off_attrs.get("messages_count").is_some(),
             "messages_count is present regardless of payload policy"
+        );
+
+        zeroclaw_log::clear_broadcast_hook();
+    }
+
+    fn test_tool_spec(name: &str) -> ToolSpec {
+        ToolSpec::new(name, "test tool", serde_json::json!({}))
+    }
+
+    #[test]
+    fn prefix_fingerprint_tracks_system_and_tools_separately() {
+        let messages = vec![
+            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::user("hello"),
+        ];
+        let tools = vec![test_tool_spec("alpha"), test_tool_spec("beta")];
+
+        // Same messages and same tools produce identical fingerprints.
+        let base = prefix_fingerprint(&messages, Some(&tools));
+        let repeat = prefix_fingerprint(&messages, Some(&tools));
+        assert_eq!(
+            base.system_chars,
+            "You are a helpful assistant.".chars().count()
+        );
+        assert_eq!(base.system_sha256, repeat.system_sha256);
+        assert_eq!(base.tools_count, 2);
+        assert_eq!(base.tools_sha256, repeat.tools_sha256);
+
+        // Changing one char of the system message moves only the system
+        // hash, not the tools hash.
+        let mut edited_system = messages.clone();
+        edited_system[0].content.pop();
+        edited_system[0].content.push('!');
+        let system_changed = prefix_fingerprint(&edited_system, Some(&tools));
+        assert_ne!(system_changed.system_sha256, base.system_sha256);
+        assert_eq!(system_changed.tools_sha256, base.tools_sha256);
+
+        // Reordering the tool list moves only the tools hash: the specs are
+        // serialized as a JSON array, so order is part of the fingerprint a
+        // provider caches.
+        let reordered_tools = vec![test_tool_spec("beta"), test_tool_spec("alpha")];
+        let tools_changed = prefix_fingerprint(&messages, Some(&reordered_tools));
+        assert_ne!(tools_changed.tools_sha256, base.tools_sha256);
+        assert_eq!(tools_changed.system_sha256, base.system_sha256);
+
+        // No leading system message: zero chars and no system hash at all.
+        let no_system = prefix_fingerprint(&[ChatMessage::user("hello")], Some(&tools));
+        assert_eq!(no_system.system_chars, 0);
+        assert!(no_system.system_sha256.is_none());
+
+        // No tools: zero count and no tools hash at all.
+        let no_tools = prefix_fingerprint(&messages, None);
+        assert_eq!(no_tools.tools_count, 0);
+        assert!(no_tools.tools_sha256.is_none());
+    }
+
+    #[test]
+    fn prefix_fingerprint_covers_every_leading_system_message() {
+        let tools = vec![test_tool_spec("alpha"), test_tool_spec("beta")];
+        let single = vec![
+            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::user("hello"),
+        ];
+        let base = prefix_fingerprint(&single, Some(&tools));
+
+        // Two leading system messages: the char count is the sum over the
+        // whole run, and the hash differs from the single-message case.
+        let doubled = vec![
+            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::system("Always cite your sources."),
+            ChatMessage::user("hello"),
+        ];
+        let two_leading = prefix_fingerprint(&doubled, Some(&tools));
+        assert_eq!(
+            two_leading.system_chars,
+            "You are a helpful assistant.".chars().count()
+                + "Always cite your sources.".chars().count()
+        );
+        assert_ne!(two_leading.system_sha256, base.system_sha256);
+
+        // Editing the SECOND leading system message moves the system hash
+        // and leaves the tools hash unchanged.
+        let mut edited_second = doubled.clone();
+        edited_second[1].content.push('!');
+        let second_changed = prefix_fingerprint(&edited_second, Some(&tools));
+        assert_ne!(second_changed.system_sha256, two_leading.system_sha256);
+        assert_eq!(second_changed.tools_sha256, two_leading.tools_sha256);
+
+        // A system message placed after the first user message is not part
+        // of the prefix: neither hash moves relative to the base.
+        let trailing = vec![
+            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::user("hello"),
+            ChatMessage::system("mid-conversation reminder"),
+        ];
+        let non_leading = prefix_fingerprint(&trailing, Some(&tools));
+        assert_eq!(non_leading.system_chars, base.system_chars);
+        assert_eq!(non_leading.system_sha256, base.system_sha256);
+        assert_eq!(non_leading.tools_sha256, base.tools_sha256);
+
+        // The JSON-array serialization keeps one message "a\n\nb" distinct
+        // from two messages "a", "b": merging with a separator would not.
+        let joined = vec![ChatMessage::system("a\n\nb"), ChatMessage::user("hello")];
+        let split = vec![
+            ChatMessage::system("a"),
+            ChatMessage::system("b"),
+            ChatMessage::user("hello"),
+        ];
+        assert_ne!(
+            prefix_fingerprint(&joined, Some(&tools)).system_sha256,
+            prefix_fingerprint(&split, Some(&tools)).system_sha256
+        );
+    }
+
+    /// Inserts a second leading system message at index 1, the way a
+    /// before-call hook may mutate the request messages.
+    struct SystemInjectingHook;
+
+    #[async_trait]
+    impl HookHandler for SystemInjectingHook {
+        fn name(&self) -> &str {
+            "inject-second-system"
+        }
+        fn priority(&self) -> i32 {
+            0
+        }
+        async fn before_llm_call(
+            &self,
+            messages: &mut Vec<ChatMessage>,
+            _model: &mut String,
+        ) -> HookResult<()> {
+            messages.insert(1, ChatMessage::system("injected guidance"));
+            HookResult::Continue(())
+        }
+    }
+
+    #[tokio::test]
+    async fn before_llm_call_hook_inserting_system_message_moves_system_fingerprint() {
+        let tools = vec![test_tool_spec("alpha")];
+        let mut messages = vec![
+            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::user("hello"),
+        ];
+        let before = prefix_fingerprint(&messages, Some(&tools));
+
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(SystemInjectingHook));
+        let mut model = String::from("stub-model");
+        let result = runner.run_before_llm_call(&mut messages, &mut model).await;
+        assert!(matches!(result, HookResult::Continue(())));
+
+        // The hook inserted a second leading system message, so the runtime
+        // prefix the provider sees changed: the system fingerprint must move
+        // with it while the tools fingerprint stays put.
+        assert_eq!(messages.len(), 3);
+        let after = prefix_fingerprint(&messages, Some(&tools));
+        assert_ne!(after.system_sha256, before.system_sha256);
+        assert_eq!(
+            after.system_chars,
+            before.system_chars + "injected guidance".chars().count()
+        );
+        assert_eq!(after.tools_sha256, before.tools_sha256);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn llm_request_payload_off_still_carries_prefix_fingerprints() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+
+        install_writer("off");
+        while rx.try_recv().is_ok() {}
+
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let provider = StubProvider;
+        let history = vec![
+            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::user("hello"),
+        ];
+        let tools = vec![test_tool_spec("alpha"), test_tool_spec("beta")];
+        let expected = prefix_fingerprint(&history, Some(&tools));
+
+        let ctx = test_ctx(&observer, &pacing);
+        let _ = announce_llm_request(
+            &ctx,
+            &history,
+            Some(&tools),
+            &provider,
+            "stub",
+            "stub-model",
+            0,
+        )
+        .await;
+        let record = next_llm_request(&mut rx).await;
+
+        let attrs = record
+            .get("attributes")
+            .expect("llm_request record carries attributes");
+        assert!(
+            attrs.get("request_messages").is_none(),
+            "payload capture stays off: no message content may be recorded"
+        );
+        assert_eq!(
+            attrs.get("system_chars").and_then(|v| v.as_u64()),
+            Some(expected.system_chars as u64),
+            "system_chars counts the leading system message content"
+        );
+        let system_sha256 = attrs
+            .get("system_sha256")
+            .and_then(|v| v.as_str())
+            .expect("system_sha256 is present with a leading system message");
+        assert_eq!(system_sha256.len(), 16, "hash is truncated to 16 hex chars");
+        assert!(
+            system_sha256
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "hash is lowercase hex"
+        );
+        assert_eq!(
+            system_sha256,
+            expected
+                .system_sha256
+                .as_deref()
+                .expect("helper computes a system hash")
+        );
+        assert_eq!(
+            attrs.get("tools_count").and_then(|v| v.as_u64()),
+            Some(expected.tools_count as u64),
+            "tools_count counts the requested tool specs"
+        );
+        let tools_sha256 = attrs
+            .get("tools_sha256")
+            .and_then(|v| v.as_str())
+            .expect("tools_sha256 is present when tools are sent");
+        assert_eq!(tools_sha256.len(), 16, "hash is truncated to 16 hex chars");
+        assert!(
+            tools_sha256
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "hash is lowercase hex"
+        );
+        assert_eq!(
+            tools_sha256,
+            expected
+                .tools_sha256
+                .as_deref()
+                .expect("helper computes a tools hash")
         );
 
         zeroclaw_log::clear_broadcast_hook();

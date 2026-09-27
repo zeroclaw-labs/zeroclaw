@@ -1175,6 +1175,7 @@ mod tests {
             channel_id: channel_id.map(str::to_string),
             room_id: None,
             sender_id: None,
+            principal_id: None,
         }
     }
 
@@ -2017,7 +2018,9 @@ mod tests {
         let current = "11111111-1111-4111-8111-111111111111".to_string();
         let other = "22222222-2222-4222-8222-222222222222".to_string();
         let foreign = "foreign-acp-session".to_string();
-        store.create_session(&current, "rowan", "/current").unwrap();
+        store
+            .create_session(&current, "rowan", "/current", None)
+            .unwrap();
         store
             .append_turn(
                 &current,
@@ -2026,7 +2029,9 @@ mod tests {
                 )],
             )
             .unwrap();
-        store.create_session(&other, "rowan", "/other").unwrap();
+        store
+            .create_session(&other, "rowan", "/other", None)
+            .unwrap();
         store
             .append_turn(
                 &other,
@@ -2035,7 +2040,9 @@ mod tests {
                 )],
             )
             .unwrap();
-        store.create_session(&foreign, "sable", "/foreign").unwrap();
+        store
+            .create_session(&foreign, "sable", "/foreign", None)
+            .unwrap();
         let view = AcpSessionReadView::new(store.clone(), "rowan");
         (tmp, store, view, current, other, foreign)
     }
@@ -2176,6 +2183,7 @@ mod tests {
             channel_id: Some("telegram.default".into()),
             room_id: None,
             sender_id: None,
+            principal_id: None,
         };
         let backend: Arc<dyn SessionBackend> =
             Arc::new(MetadataBackend::new(inner, vec![old_chat]));

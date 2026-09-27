@@ -207,6 +207,8 @@ If the underlying bug or feature is still valid, preserve it in an issue, tracke
 
 ## Automation override
 
+`zeroclaw-reviewer[bot]` and similar review automation are advisory; human reviewers own the verdict. Check stale, noisy, false, or overbroad findings against live evidence and explain the correction instead of turning them into author work. Automation should read existing human review threads when available and must not present an existing human finding as a new bot discovery. A real unresolved finding still needs reconciliation; advisory status is not a reason to ignore it.
+
 Use this when automation output creates review side effects:
 
 1. **Incorrect risk label**: set the intended `risk:*` label. If future risk automation is active, also follow the [labels automation contract](./labels.md#automation-contract) for `risk:manual`; the override does not bypass the `risk:high OR domain:security` approval rule.

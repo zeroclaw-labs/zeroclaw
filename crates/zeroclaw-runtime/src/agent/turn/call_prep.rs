@@ -316,7 +316,15 @@ pub(crate) async fn prepare_tool_calls(
                     return Err(ToolLoopCancelled.into());
                 }
             };
-        crate::agent::set_runtime_approved_arg(&tool_name, &mut tool_args, approved);
+        let runtime_command_approved = approved
+            && ctx
+                .approval
+                .is_none_or(crate::approval::ApprovalManager::propagates_runtime_command_approval);
+        crate::agent::set_runtime_approved_arg(
+            &tool_name,
+            &mut tool_args,
+            runtime_command_approved,
+        );
 
         let signature = tool_call_signature(&tool_name, &tool_args);
         let dedup_exempt =
@@ -940,6 +948,57 @@ mod tests {
             ],
             "a denial that prevents execution abandons the context instead of leaving it pending"
         );
+    }
+
+    #[tokio::test]
+    async fn bounded_tool_approval_never_becomes_runtime_command_approval() {
+        use zeroclaw_config::autonomy::AutonomyLevel;
+        use zeroclaw_config::schema::RiskProfileConfig;
+
+        let full_profile = RiskProfileConfig {
+            level: AutonomyLevel::Full,
+            ..RiskProfileConfig::default()
+        };
+        let bounded = crate::approval::ApprovalManager::for_bounded_non_interactive(&full_profile);
+        let explicit_profile = RiskProfileConfig {
+            auto_approve: vec!["*".to_string()],
+            ..RiskProfileConfig::default()
+        };
+        let derived = bounded.derive_for_risk_profile(&explicit_profile);
+
+        for (case, approval) in [("full", &bounded), ("auto_approve", &derived)] {
+            for tool_name in ["shell", "schedule", "cron_add", "cron_update", "cron_run"] {
+                let observer = NoopObserver;
+                let pacing = PacingConfig::default();
+                let (tx, _rx) = mpsc::channel(8);
+                let ctx = lifecycle_ctx(&observer, &pacing, &tx, Some(approval), None);
+                let tool_calls = [parsed_call(
+                    tool_name,
+                    serde_json::json!({"approved": true}),
+                    "call-1",
+                )];
+                let mut seen = HashSet::new();
+                let mut prompt_seen = HashSet::new();
+                let prepared = prepare_tool_calls(
+                    &ctx,
+                    &[],
+                    None,
+                    &tool_calls,
+                    &mut seen,
+                    &mut prompt_seen,
+                    0,
+                    false,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{case}/{tool_name} preparation failed: {error}"));
+
+                assert_eq!(prepared.executable_calls.len(), 1, "{case}/{tool_name}");
+                assert_eq!(
+                    prepared.executable_calls[0].arguments["approved"], false,
+                    "{case}/{tool_name} target policy may approve tool dispatch but not the caller-owned command"
+                );
+            }
+        }
     }
 
     /// Channel that answers every approval request with a DenyWithEdit

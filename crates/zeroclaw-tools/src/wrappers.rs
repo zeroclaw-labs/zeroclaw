@@ -60,6 +60,10 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
         self.inner.invocation_triggers()
     }
 
+    fn rebind_forwarded_env(&self, env: Option<std::collections::HashMap<String, String>>) {
+        self.inner.rebind_forwarded_env(env);
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let reservation = match self.security.reserve_action() {
             Some(reservation) => reservation,
@@ -159,6 +163,10 @@ impl<T: Tool> Tool for PathGuardedTool<T> {
 
     fn invocation_triggers(&self) -> Vec<String> {
         self.inner.invocation_triggers()
+    }
+
+    fn rebind_forwarded_env(&self, env: Option<std::collections::HashMap<String, String>>) {
+        self.inner.rebind_forwarded_env(env);
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {

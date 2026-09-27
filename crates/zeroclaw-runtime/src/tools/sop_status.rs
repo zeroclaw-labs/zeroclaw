@@ -280,6 +280,7 @@ mod tests {
             admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }
     }
 
@@ -413,6 +414,7 @@ mod tests {
         let run = SopRun {
             run_id: "r1".into(),
             sop_name: "s1".into(),
+            initiating_agent: None,
             trigger_event: manual_event(),
             frame_marker_id: "marker-r1".into(),
             status: SopRunStatus::Completed,
@@ -434,6 +436,7 @@ mod tests {
             llm_calls_saved: 0,
             revision: 0,
             revision_base: 0,
+            decided_mode: None,
         };
         collector.record_run_complete(&run);
 
@@ -455,6 +458,7 @@ mod tests {
         let run = SopRun {
             run_id: "r1".into(),
             sop_name: "s1".into(),
+            initiating_agent: None,
             trigger_event: manual_event(),
             frame_marker_id: "marker-r1".into(),
             status: SopRunStatus::Failed,
@@ -476,6 +480,7 @@ mod tests {
             llm_calls_saved: 0,
             revision: 0,
             revision_base: 0,
+            decided_mode: None,
         };
         collector.record_run_complete(&run);
 

@@ -554,9 +554,20 @@ pub async fn run(
     let tui_registry =
         std::sync::Arc::new(crate::rpc::tui_identity::TuiRegistry::new(&config.data_dir));
 
+    // Canonical live pairing authority for this daemon generation. The
+    // gateway serves /pair, rotation, and revocation from THIS instance
+    // and the RPC native auth provider verifies against it, so a pairing
+    // change reaches both surfaces immediately (no boot-time snapshot).
+    let pairing_guard = std::sync::Arc::new(zeroclaw_config::pairing::PairingGuard::new(
+        config.gateway.require_pairing,
+        &config.gateway.paired_tokens,
+        config.gateway.pairing_code,
+    ));
+
     if let Some(gateway_start) = registry.take_gateway_start() {
         gateway_required = true;
         let gateway_cfg = config.clone();
+        let gateway_pairing = pairing_guard.clone();
         let gateway_host = host.clone();
         let gateway_event_tx = event_tx.clone();
         let gateway_reload_controls = GatewayReloadControls {
@@ -578,6 +589,7 @@ pub async fn run(
                 let reload_controls = gateway_reload_controls.clone();
                 let tui_reg = gateway_tui_registry.clone();
                 let start = gateway_start.clone();
+                let pairing = gateway_pairing.as_ref().clone();
                 let (readiness_attempt, readiness_reporter) =
                     StartupReadinessAttempt::gateway(gateway_readiness_tx.clone());
                 async move {
@@ -589,6 +601,7 @@ pub async fn run(
                         Some(tx),
                         Some(reload_controls),
                         Some(tui_reg),
+                        Some(pairing),
                         readiness_reporter,
                     )
                     .await
@@ -663,7 +676,7 @@ pub async fn run(
         || registry.has_enroll_start();
 
     // Extract shared SOP engine from registry for RpcContext.
-    let (sop_engine, sop_audit) = registry.take_sop_engine();
+    let (sop_engine, sop_audit, sop_driver_handles) = registry.take_sop_engine();
 
     let rpc_ctx = if need_rpc_ctx {
         use crate::rpc::context::RpcContext;
@@ -783,12 +796,22 @@ pub async fn run(
             };
 
         let hooks: Option<std::sync::Arc<crate::hooks::HookRunner>> = if config.hooks.enabled {
-            Some(std::sync::Arc::new(crate::hooks::HookRunner::from_config(
-                &config.hooks,
-            )))
+            Some(std::sync::Arc::new(
+                crate::hooks::HookRunner::from_root_config(&config),
+            ))
         } else {
             None
         };
+
+        let rpc_auth = std::sync::Arc::new(
+            crate::rpc::auth::RpcInboundAuth::from_config(&config, pairing_guard.clone()).map_err(
+                |e| {
+                    anyhow::Error::msg(format!(
+                        "building the RPC inbound authentication layer: {e:#}"
+                    ))
+                },
+            )?,
+        );
 
         Some(std::sync::Arc::new(RpcContext {
             #[cfg(test)]
@@ -815,8 +838,10 @@ pub async fn run(
             acp_session_store,
             sop_engine,
             sop_audit,
+            sop_driver_handles,
             hooks,
             cert_audit,
+            auth: rpc_auth,
         }))
     } else {
         None
@@ -1171,7 +1196,10 @@ async fn await_socket_startup(
         Ok(SocketStartupState::Fatal { kind, message }) => {
             Err(std::io::Error::new(kind, message).into())
         }
-        Ok(SocketStartupState::Pending) => unreachable!("wait_for excludes pending state"),
+        Ok(SocketStartupState::Pending) => Err(std::io::Error::other(
+            "socket startup remained pending after readiness wait",
+        )
+        .into()),
         Err(_) => Ok(()),
     }
 }
@@ -3865,7 +3893,14 @@ mod tests {
 
         let mut registry = DaemonRegistry::new();
         registry.register_gateway(Box::new(
-            move |host, port, config, event_tx, reload_controls, tui_registry, _ready_tx| {
+            move |host,
+                  port,
+                  config,
+                  event_tx,
+                  reload_controls,
+                  tui_registry,
+                  _pairing,
+                  _ready_tx| {
                 let seen_tx = seen_tx.clone();
                 Box::pin(async move {
                     let has_event_tx = event_tx.is_some();
@@ -4157,7 +4192,14 @@ mod tests {
         // The gateway asks for the reload once the connection exists, then
         // parks: an unrelated pending component must not extend shutdown.
         registry.register_gateway(Box::new(
-            move |_host, _port, _config, _event_tx, reload_controls, _tui_reg, _ready_tx| {
+            move |_host,
+                  _port,
+                  _config,
+                  _event_tx,
+                  reload_controls,
+                  _tui_reg,
+                  _pairing,
+                  _ready_tx| {
                 let accepted = accepted.clone();
                 Box::pin(async move {
                     let reload_tx = reload_controls
@@ -4210,7 +4252,14 @@ mod tests {
 
         let mut registry = DaemonRegistry::new();
         registry.register_gateway(Box::new(
-            move |_host, _port, _config, _event_tx, reload_controls, _tui_reg, _ready_tx| {
+            move |_host,
+                  _port,
+                  _config,
+                  _event_tx,
+                  reload_controls,
+                  _tui_reg,
+                  _pairing,
+                  _ready_tx| {
                 Box::pin(async move {
                     let reload_tx = reload_controls
                         .map(|controls| controls.reload_tx)

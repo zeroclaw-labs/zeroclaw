@@ -40,6 +40,9 @@ pub struct AcpSessionStore {
 
 pub struct AcpSessionData {
     pub session_uuid: String,
+    /// Owning principal (RFC 7141 session isolation). `None` marks an
+    /// unscoped/legacy row, visible only to unscoped connections.
+    pub principal_id: Option<String>,
     pub agent_alias: String,
     pub workspace_dir: String,
     pub interaction_surface: Option<String>,
@@ -75,6 +78,8 @@ pub enum AcpSessionAccess {
 /// message history just to render a one-line label per session.
 pub struct AcpSessionSummary {
     pub session_uuid: String,
+    /// Owning principal (RFC 7141). `None` = unscoped/legacy row.
+    pub principal_id: Option<String>,
     pub agent_alias: String,
     pub workspace_dir: String,
     pub token_count: u64,
@@ -164,10 +169,58 @@ impl AcpSessionStore {
 
         Self::ensure_trim_breadcrumb_column(&conn)
             .context("Failed to migrate ACP session trim breadcrumb column")?;
+        Self::ensure_principal_id_column(&conn)
+            .context("Failed to migrate ACP session principal owner")?;
 
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Add the `principal_id` owner column on upgrade (RFC 7141 session
+    /// isolation). Existing rows keep a NULL owner -- visible only to unscoped
+    /// connections -- mirroring the unified `session_backend` model.
+    fn ensure_principal_id_column(conn: &Connection) -> Result<()> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(acp_sessions)")
+            .context("Failed to inspect ACP session schema")?;
+        let mut rows = stmt
+            .query([])
+            .context("Failed to read ACP session schema")?;
+        let mut column_present = false;
+        while let Some(row) = rows
+            .next()
+            .context("Failed to read ACP session schema row")?
+        {
+            let column: String = row
+                .get(1)
+                .context("Failed to read ACP session column name")?;
+            if column == "principal_id" {
+                column_present = true;
+                break;
+            }
+        }
+        drop(rows);
+        drop(stmt);
+
+        // The column and its index are one migration. An interrupted earlier
+        // run can leave the column without the index, so the index statement
+        // runs whenever the column exists, not only when it was just added.
+        if !column_present {
+            match conn.execute("ALTER TABLE acp_sessions ADD COLUMN principal_id TEXT", []) {
+                Ok(_) => {}
+                Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                    if msg.contains("duplicate column name") => {}
+                Err(e) => return Err(e).context("Failed to add ACP session principal owner"),
+            }
+        }
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_acp_sessions_principal \
+             ON acp_sessions(principal_id)",
+            [],
+        )
+        .context("Failed to index ACP session principal owner")?;
+        Ok(())
     }
 
     fn ensure_killed_at_column(conn: &Connection) -> Result<()> {
@@ -365,40 +418,90 @@ impl AcpSessionStore {
         Ok(())
     }
 
-    /// Record a new session. Returns the integer `id` assigned by SQLite.
+    /// Record a new session stamped with its owning principal (RFC 7141
+    /// session isolation). `principal_id` is the caller's scope, or `None` for
+    /// an unscoped/admin connection (NULL owner => visible only to unscoped
+    /// connections). Returns the integer `id` assigned by SQLite.
     pub fn create_session(
         &self,
         session_uuid: &str,
         agent_alias: &str,
         workspace_dir: &str,
+        principal_id: Option<&str>,
     ) -> Result<i64> {
-        self.create_session_with_interaction_surface(session_uuid, agent_alias, workspace_dir, None)
+        self.create_session_with_interaction_surface(
+            session_uuid,
+            agent_alias,
+            workspace_dir,
+            None,
+            principal_id,
+        )
     }
 
-    /// Record a session with an optional host-validated interaction surface.
+    /// Record a session with an optional host-validated interaction surface,
+    /// stamped with its owning principal (RFC 7141).
     pub fn create_session_with_interaction_surface(
         &self,
         session_uuid: &str,
         agent_alias: &str,
         workspace_dir: &str,
         interaction_surface: Option<&str>,
+        principal_id: Option<&str>,
     ) -> Result<i64> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO acp_sessions
-               (session_uuid, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, trim_breadcrumb)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5, 0)",
+               (session_uuid, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, trim_breadcrumb, principal_id)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5, 0, ?6)",
             params![
                 session_uuid,
                 agent_alias,
                 workspace_dir,
                 interaction_surface,
-                now
+                now,
+                principal_id
             ],
         )
         .context("Failed to create ACP session")?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// Delete a session ONLY if `owner_principal_id` matches the stored
+    /// owner, in one predicated statement (RFC 7141 atomic ownership).
+    /// Child-row cleanup follows the same cascade as [`Self::delete_session`].
+    pub fn delete_session_owned(
+        &self,
+        session_uuid: &str,
+        owner_principal_id: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock();
+        let rows = conn
+            .execute(
+                "DELETE FROM acp_sessions WHERE session_uuid = ?1 AND principal_id = ?2",
+                params![session_uuid, owner_principal_id],
+            )
+            .context("Failed to delete owned ACP session")?;
+        Ok(rows > 0)
+    }
+
+    /// The owning principal of a session, for authorization on mutation paths
+    /// (RFC 7141 F2) without hydrating its full message history. Returns
+    /// `Ok(None)` when the session does not exist, `Ok(Some(None))` for a
+    /// NULL-owner (unscoped/legacy) row, and `Ok(Some(Some(id)))` when owned.
+    #[allow(clippy::option_option)]
+    pub fn session_principal(&self, session_uuid: &str) -> Result<Option<Option<String>>> {
+        let conn = self.conn.lock();
+        let row = conn.query_row(
+            "SELECT principal_id FROM acp_sessions WHERE session_uuid = ?1",
+            params![session_uuid],
+            |row| row.get::<_, Option<String>>(0),
+        );
+        match row {
+            Ok(owner) => Ok(Some(owner)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e).context("Failed to query ACP session owner"),
+        }
     }
 
     /// Bind an unlabelled legacy session to a validated surface exactly once.
@@ -431,7 +534,7 @@ impl AcpSessionStore {
         let conn = self.conn.lock();
 
         let row = conn.query_row(
-            "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, trim_breadcrumb
+            "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, trim_breadcrumb, principal_id
              FROM acp_sessions WHERE session_uuid = ?1",
             params![session_uuid],
             |row| {
@@ -444,6 +547,7 @@ impl AcpSessionStore {
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
                     row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             },
         );
@@ -457,6 +561,7 @@ impl AcpSessionStore {
             created_at_s,
             last_activity_s,
             trim_breadcrumb_raw,
+            principal_id,
         ) = match row {
             Ok(r) => r,
             Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
@@ -486,6 +591,7 @@ impl AcpSessionStore {
             last_activity,
             messages,
             trim_breadcrumb,
+            principal_id,
         }))
     }
 
@@ -503,7 +609,7 @@ impl AcpSessionStore {
 
         let row = conn
             .query_row(
-                "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, trim_breadcrumb
+                "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, trim_breadcrumb, principal_id
                  FROM acp_sessions
                  WHERE session_uuid = ?1 AND agent_alias = ?2",
                 params![session_uuid, agent_alias],
@@ -517,6 +623,7 @@ impl AcpSessionStore {
                         row.get::<_, String>(5)?,
                         row.get::<_, String>(6)?,
                         row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
                     ))
                 },
             )
@@ -532,6 +639,7 @@ impl AcpSessionStore {
             created_at_s,
             last_activity_s,
             trim_breadcrumb_raw,
+            principal_id,
         )) = row
         else {
             return Ok(None);
@@ -559,6 +667,7 @@ impl AcpSessionStore {
             last_activity,
             messages,
             trim_breadcrumb,
+            principal_id,
         }))
     }
 
@@ -621,7 +730,7 @@ impl AcpSessionStore {
         let conn = self.conn.lock();
 
         let row = conn.query_row(
-            "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, killed_at, trim_breadcrumb
+            "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, killed_at, trim_breadcrumb, principal_id
              FROM acp_sessions WHERE session_uuid = ?1",
             params![session_uuid],
             |row| {
@@ -635,6 +744,7 @@ impl AcpSessionStore {
                     row.get::<_, String>(6)?,
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
                 ))
             },
         );
@@ -649,6 +759,7 @@ impl AcpSessionStore {
             last_activity_s,
             killed_at,
             trim_breadcrumb_raw,
+            principal_id,
         ) = match row {
             Ok(r) => r,
             Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(AcpSessionRestore::Missing),
@@ -673,6 +784,7 @@ impl AcpSessionStore {
 
         Ok(AcpSessionRestore::Restorable(AcpSessionData {
             session_uuid: session_uuid.to_string(),
+            principal_id,
             agent_alias,
             workspace_dir,
             interaction_surface,
@@ -698,7 +810,8 @@ impl AcpSessionStore {
                         s.token_count,
                         s.created_at,
                         s.last_activity,
-                        (SELECT COUNT(*) FROM acp_messages m WHERE m.session_id = s.id) AS message_count
+                        (SELECT COUNT(*) FROM acp_messages m WHERE m.session_id = s.id) AS message_count,
+                        s.principal_id
                  FROM acp_sessions s
                  WHERE s.killed_at IS NULL
                  ORDER BY s.last_activity DESC",
@@ -715,6 +828,7 @@ impl AcpSessionStore {
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                 ))
             })
             .context("Failed to query ACP sessions")?;
@@ -729,11 +843,13 @@ impl AcpSessionStore {
                 created_s,
                 activity_s,
                 msg_count,
+                principal_id,
             ) = row.context("Failed to read ACP session row")?;
             out.push(AcpSessionSummary {
                 created_at: parse_ts(&created_s, "created_at", &session_uuid),
                 last_activity: parse_ts(&activity_s, "last_activity", &session_uuid),
                 session_uuid,
+                principal_id,
                 agent_alias,
                 workspace_dir,
                 token_count: token_count.max(0) as u64,
@@ -757,7 +873,8 @@ impl AcpSessionStore {
                         s.token_count,
                         s.created_at,
                         s.last_activity,
-                        (SELECT COUNT(*) FROM acp_messages m WHERE m.session_id = s.id) AS message_count
+                        (SELECT COUNT(*) FROM acp_messages m WHERE m.session_id = s.id) AS message_count,
+                        s.principal_id
                  FROM acp_sessions s
                  WHERE s.agent_alias = ?1 AND s.killed_at IS NULL
                  ORDER BY s.last_activity DESC",
@@ -774,6 +891,7 @@ impl AcpSessionStore {
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                 ))
             })
             .context("Failed to query live ACP sessions for agent")?;
@@ -788,11 +906,13 @@ impl AcpSessionStore {
                 created_s,
                 activity_s,
                 msg_count,
+                principal_id,
             ) = row.context("Failed to read live ACP session row")?;
             out.push(AcpSessionSummary {
                 created_at: parse_ts(&created_s, "created_at", &session_uuid),
                 last_activity: parse_ts(&activity_s, "last_activity", &session_uuid),
                 session_uuid,
+                principal_id,
                 agent_alias: owner_alias,
                 workspace_dir,
                 token_count: token_count.max(0) as u64,
@@ -1353,7 +1473,8 @@ impl AcpSessionStore {
                         s.token_count,
                         s.created_at,
                         s.last_activity,
-                        (SELECT COUNT(*) FROM acp_messages m WHERE m.session_id = s.id) AS message_count
+                        (SELECT COUNT(*) FROM acp_messages m WHERE m.session_id = s.id) AS message_count,
+                        s.principal_id
                  FROM acp_sessions s
                  WHERE s.agent_alias = ?1
                  ORDER BY s.last_activity DESC",
@@ -1370,6 +1491,7 @@ impl AcpSessionStore {
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                 ))
             })
             .context("Failed to query ACP sessions for agent")?;
@@ -1384,11 +1506,13 @@ impl AcpSessionStore {
                 created_s,
                 activity_s,
                 msg_count,
+                principal_id,
             ) = row.context("Failed to read ACP session row")?;
             out.push(AcpSessionSummary {
                 created_at: parse_ts(&created_s, "created_at", &session_uuid),
                 last_activity: parse_ts(&activity_s, "last_activity", &session_uuid),
                 session_uuid,
+                principal_id,
                 agent_alias,
                 workspace_dir,
                 token_count: token_count.max(0) as u64,
@@ -1551,10 +1675,113 @@ mod tests {
     }
 
     #[test]
+    fn principal_id_roundtrips_through_create_load_and_list() {
+        // RFC 7141 F2: the owning principal is persisted on create and read
+        // back by load/list; a NULL owner (unscoped/legacy) stays NULL.
+        let (_tmp, store) = open_store();
+        store
+            .create_session("owned", "alpha", "/ws/o", Some("alice"))
+            .unwrap();
+        store
+            .create_session("unowned", "alpha", "/ws/u", None)
+            .unwrap();
+
+        assert_eq!(
+            store.load_session("owned").unwrap().unwrap().principal_id,
+            Some("alice".to_string()),
+        );
+        assert_eq!(
+            store.load_session("unowned").unwrap().unwrap().principal_id,
+            None,
+        );
+
+        let summaries = store.list_sessions().unwrap();
+        let owner = |uuid: &str| {
+            summaries
+                .iter()
+                .find(|s| s.session_uuid == uuid)
+                .unwrap()
+                .principal_id
+                .clone()
+        };
+        assert_eq!(owner("owned"), Some("alice".to_string()));
+        assert_eq!(owner("unowned"), None);
+    }
+
+    #[test]
+    fn session_principal_reports_owner_missing_and_null() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("owned", "alpha", "/ws/o", Some("alice"))
+            .unwrap();
+        store
+            .create_session("unowned", "alpha", "/ws/u", None)
+            .unwrap();
+
+        // Owned -> Some(Some(id)); NULL owner -> Some(None); missing -> None.
+        assert_eq!(
+            store.session_principal("owned").unwrap(),
+            Some(Some("alice".to_string())),
+        );
+        assert_eq!(store.session_principal("unowned").unwrap(), Some(None));
+        assert_eq!(store.session_principal("ghost").unwrap(), None);
+    }
+
+    #[test]
+    fn principal_index_is_repaired_when_the_column_exists_without_it() {
+        // An interrupted first migration can leave the column in place with
+        // no index. The migration must not treat "column present" as "done".
+        let tmp = TempDir::new().unwrap();
+        {
+            let store = AcpSessionStore::new(tmp.path()).unwrap();
+            store
+                .conn
+                .lock()
+                .execute("DROP INDEX idx_acp_sessions_principal", [])
+                .unwrap();
+        }
+        let reopened = AcpSessionStore::new(tmp.path()).unwrap();
+        let indexed: bool = reopened
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+                 AND name = 'idx_acp_sessions_principal'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+            == 1;
+        assert!(
+            indexed,
+            "reopening must recreate the missing principal index"
+        );
+    }
+
+    #[test]
+    fn principal_id_migration_is_idempotent_across_reopen() {
+        // Reopening the same DB re-runs ensure_principal_id_column; it must
+        // no-op when the column already exists and preserve stamped owners.
+        let tmp = TempDir::new().unwrap();
+        {
+            let store = AcpSessionStore::new(tmp.path()).unwrap();
+            store
+                .create_session("s1", "alpha", "/ws", Some("alice"))
+                .unwrap();
+        }
+        let reopened = AcpSessionStore::new(tmp.path()).unwrap();
+        assert_eq!(
+            reopened.session_principal("s1").unwrap(),
+            Some(Some("alice".to_string())),
+            "owner must survive a reopen + repeated migration",
+        );
+    }
+
+    #[test]
     fn create_and_load_session_metadata() {
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-abc", "personal_code", "/home/user/project")
+            .create_session("sess-abc", "personal_code", "/home/user/project", None)
             .unwrap();
 
         let data = store.load_session("sess-abc").unwrap().unwrap();
@@ -1575,6 +1802,7 @@ mod tests {
                 "alpha",
                 "/tmp/proj",
                 Some("zerocode_code"),
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -1588,7 +1816,7 @@ mod tests {
         );
 
         store
-            .create_session("sess-legacy", "alpha", "/tmp/proj")
+            .create_session("sess-legacy", "alpha", "/tmp/proj", None)
             .unwrap();
         assert_eq!(
             store
@@ -1616,7 +1844,7 @@ mod tests {
         use zeroclaw_api::plan::{PlanEntry, PlanPriority, PlanStatus};
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-plan", "alpha", "/tmp/proj")
+            .create_session("sess-plan", "alpha", "/tmp/proj", None)
             .unwrap();
 
         // No plan yet → empty.
@@ -1660,7 +1888,7 @@ mod tests {
     fn append_turn_round_trips_chat_messages() {
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-msgs", "alpha", "/tmp/proj")
+            .create_session("sess-msgs", "alpha", "/tmp/proj", None)
             .unwrap();
 
         let msgs = vec![
@@ -1685,7 +1913,7 @@ mod tests {
     fn replace_messages_drops_prior_rows_and_cascades_to_tool_calls() {
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-replace", "alpha", "/tmp/proj")
+            .create_session("sess-replace", "alpha", "/tmp/proj", None)
             .unwrap();
 
         // An existing turn with a tool call, to prove the old row (and its
@@ -1776,7 +2004,7 @@ mod tests {
     fn insert_messages_never_persists_a_system_row() {
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-system", "alpha", "/tmp/proj")
+            .create_session("sess-system", "alpha", "/tmp/proj", None)
             .unwrap();
 
         // An agent's authoritative `history()` always leads with the system
@@ -1824,7 +2052,7 @@ mod tests {
     fn load_session_filters_a_legacy_system_row_written_before_the_write_path_fix() {
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-legacy-system", "alpha", "/tmp/proj")
+            .create_session("sess-legacy-system", "alpha", "/tmp/proj", None)
             .unwrap();
         store
             .append_turn(
@@ -1888,7 +2116,7 @@ mod tests {
     fn append_turn_decomposes_assistant_tool_calls_and_results() {
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-variants", "alpha", "/tmp/proj")
+            .create_session("sess-variants", "alpha", "/tmp/proj", None)
             .unwrap();
 
         let msgs = vec![
@@ -1949,7 +2177,7 @@ mod tests {
         // acp_tool_calls. The assistant's message row carries only the text.
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-dup", "alpha", "/tmp/proj")
+            .create_session("sess-dup", "alpha", "/tmp/proj", None)
             .unwrap();
 
         store
@@ -1987,7 +2215,7 @@ mod tests {
     fn append_turn_empty_slice_is_noop() {
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-empty", "alpha", "/tmp/proj")
+            .create_session("sess-empty", "alpha", "/tmp/proj", None)
             .unwrap();
         store.append_turn("sess-empty", &[]).unwrap();
         let data = store.load_session("sess-empty").unwrap().unwrap();
@@ -1998,7 +2226,7 @@ mod tests {
     fn last_activity_updated_on_append() {
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-activity", "alpha", "/tmp/proj")
+            .create_session("sess-activity", "alpha", "/tmp/proj", None)
             .unwrap();
         let before = store
             .load_session("sess-activity")
@@ -2039,7 +2267,7 @@ mod tests {
     fn delete_session_cascades_to_children() {
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-del", "alpha", "/tmp/proj")
+            .create_session("sess-del", "alpha", "/tmp/proj", None)
             .unwrap();
         store
             .append_turn(
@@ -2085,10 +2313,40 @@ mod tests {
     }
 
     #[test]
+    fn owned_delete_is_an_atomic_ownership_predicate() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("owned", "agent", "/ws", Some("user:alice"))
+            .unwrap();
+
+        assert!(
+            !store.delete_session_owned("owned", "user:bob").unwrap(),
+            "the wrong owner deletes nothing"
+        );
+        assert!(store.load_session("owned").unwrap().is_some());
+
+        assert!(store.delete_session_owned("owned", "user:alice").unwrap());
+        assert!(store.load_session("owned").unwrap().is_none());
+    }
+
+    #[test]
+    fn owned_delete_refuses_null_owner_rows() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("legacy", "agent", "/ws", None)
+            .unwrap();
+        assert!(
+            !store.delete_session_owned("legacy", "user:alice").unwrap(),
+            "NULL never equals a principal id"
+        );
+        assert!(store.load_session("legacy").unwrap().is_some());
+    }
+
+    #[test]
     fn mark_session_killed_persists_without_deleting_history() {
         let (tmp, store) = open_store();
         store
-            .create_session("sess-kill", "alpha", "/tmp/proj")
+            .create_session("sess-kill", "alpha", "/tmp/proj", None)
             .unwrap();
         store
             .append_turn(
@@ -2131,7 +2389,7 @@ mod tests {
     fn touch_session_updates_last_activity() {
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-touch", "alpha", "/tmp/proj")
+            .create_session("sess-touch", "alpha", "/tmp/proj", None)
             .unwrap();
         let before = store
             .load_session("sess-touch")
@@ -2152,7 +2410,7 @@ mod tests {
     fn set_token_count_persists_and_load_reads_it() {
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-tok", "alpha", "/tmp/proj")
+            .create_session("sess-tok", "alpha", "/tmp/proj", None)
             .unwrap();
         assert_eq!(
             store.load_session("sess-tok").unwrap().unwrap().token_count,
@@ -2191,7 +2449,7 @@ mod tests {
     fn clear_token_count_resets_snapshot_to_unknown() {
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-clr", "alpha", "/tmp/proj")
+            .create_session("sess-clr", "alpha", "/tmp/proj", None)
             .unwrap();
         store.set_token_count("sess-clr", 152_306).unwrap();
         store.clear_token_count("sess-clr").unwrap();
@@ -2218,7 +2476,7 @@ mod tests {
         // snapshot must clear, not retain A's count.
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-seq", "alpha", "/tmp/proj")
+            .create_session("sess-seq", "alpha", "/tmp/proj", None)
             .unwrap();
         store
             .persist_usage_snapshot("sess-seq", Some(1000), true)
@@ -2241,7 +2499,7 @@ mod tests {
     fn persist_usage_snapshot_rejected_never_touches_store() {
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-rej", "alpha", "/tmp/proj")
+            .create_session("sess-rej", "alpha", "/tmp/proj", None)
             .unwrap();
         store
             .persist_usage_snapshot("sess-rej", Some(1000), true)
@@ -2263,7 +2521,7 @@ mod tests {
     fn append_event_writes_action_outcome_payload() {
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-evt", "alpha", "/tmp/proj")
+            .create_session("sess-evt", "alpha", "/tmp/proj", None)
             .unwrap();
 
         store
@@ -2291,9 +2549,13 @@ mod tests {
     #[test]
     fn list_sessions_returns_summaries_ordered_by_recent_activity() {
         let (_tmp, store) = open_store();
-        store.create_session("sess-old", "alpha", "/tmp/a").unwrap();
+        store
+            .create_session("sess-old", "alpha", "/tmp/a", None)
+            .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
-        store.create_session("sess-new", "beta", "/tmp/b").unwrap();
+        store
+            .create_session("sess-new", "beta", "/tmp/b", None)
+            .unwrap();
         store
             .append_turn(
                 "sess-new",
@@ -2324,11 +2586,11 @@ mod tests {
     fn list_sessions_omits_killed_sessions() {
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-live", "alpha", "/tmp/live")
+            .create_session("sess-live", "alpha", "/tmp/live", None)
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
         store
-            .create_session("sess-killed", "alpha", "/tmp/killed")
+            .create_session("sess-killed", "alpha", "/tmp/killed", None)
             .unwrap();
         store.mark_session_killed("sess-killed").unwrap();
 
@@ -2341,11 +2603,11 @@ mod tests {
     fn list_live_sessions_by_agent_filters_owner_and_killed_rows() {
         let (_tmp, store) = open_store();
         store
-            .create_session("alpha-old", "alpha", "/ws/old")
+            .create_session("alpha-old", "alpha", "/ws/old", None)
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
         store
-            .create_session("alpha-new", "alpha", "/ws/new")
+            .create_session("alpha-new", "alpha", "/ws/new", None)
             .unwrap();
         store
             .append_turn(
@@ -2354,11 +2616,11 @@ mod tests {
             )
             .unwrap();
         store
-            .create_session("alpha-killed", "alpha", "/ws/killed")
+            .create_session("alpha-killed", "alpha", "/ws/killed", None)
             .unwrap();
         store.mark_session_killed("alpha-killed").unwrap();
         store
-            .create_session("beta-live", "beta", "/ws/beta")
+            .create_session("beta-live", "beta", "/ws/beta", None)
             .unwrap();
 
         let list = store.list_live_sessions_by_agent("alpha").unwrap();
@@ -2384,6 +2646,7 @@ mod tests {
                 "alpha",
                 "/ws/alpha",
                 Some("zerocode_code"),
+                None,
             )
             .unwrap();
         store
@@ -2477,10 +2740,16 @@ mod tests {
     #[test]
     fn per_agent_cascade_counts_live_and_deletes_only_that_agent() {
         let (_tmp, store) = open_store();
-        store.create_session("a-live", "alpha", "/ws/a1").unwrap();
-        store.create_session("a-killed", "alpha", "/ws/a2").unwrap();
+        store
+            .create_session("a-live", "alpha", "/ws/a1", None)
+            .unwrap();
+        store
+            .create_session("a-killed", "alpha", "/ws/a2", None)
+            .unwrap();
         store.mark_session_killed("a-killed").unwrap();
-        store.create_session("b-live", "beta", "/ws/b1").unwrap();
+        store
+            .create_session("b-live", "beta", "/ws/b1", None)
+            .unwrap();
 
         // Only un-killed sessions count as live (the HARD-refuse signal).
         assert_eq!(store.count_live_sessions_by_agent("alpha").unwrap(), 1);
@@ -2499,10 +2768,16 @@ mod tests {
     #[test]
     fn rename_sessions_by_agent_repoints_live_and_killed() {
         let (_tmp, store) = open_store();
-        store.create_session("a-live", "alpha", "/ws/a1").unwrap();
-        store.create_session("a-killed", "alpha", "/ws/a2").unwrap();
+        store
+            .create_session("a-live", "alpha", "/ws/a1", None)
+            .unwrap();
+        store
+            .create_session("a-killed", "alpha", "/ws/a2", None)
+            .unwrap();
         store.mark_session_killed("a-killed").unwrap();
-        store.create_session("b-live", "beta", "/ws/b1").unwrap();
+        store
+            .create_session("b-live", "beta", "/ws/b1", None)
+            .unwrap();
 
         // Rename re-points BOTH live and killed sessions; unlike delete, a live
         // session is no obstacle.
@@ -2527,7 +2802,7 @@ mod tests {
         // false` regardless of message content.
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-genuine-text", "alpha", "/tmp/proj")
+            .create_session("sess-genuine-text", "alpha", "/tmp/proj", None)
             .unwrap();
         // A real user message that happens to equal a breadcrumb-shaped string.
         store
@@ -2560,7 +2835,7 @@ mod tests {
         // breadcrumb" and drop/miscount the marker.
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-legacy-marker", "alpha", "/tmp/proj")
+            .create_session("sess-legacy-marker", "alpha", "/tmp/proj", None)
             .unwrap();
         store
             .append_turn(
@@ -2604,7 +2879,7 @@ mod tests {
         // A genuine colliding user turn (no synthetic marker at all) must
         // NOT be misclassified when the column is legacy-NULL either.
         store
-            .create_session("sess-legacy-no-marker", "alpha", "/tmp/proj")
+            .create_session("sess-legacy-no-marker", "alpha", "/tmp/proj", None)
             .unwrap();
         store
             .append_turn(
@@ -2644,7 +2919,7 @@ mod tests {
     fn trim_breadcrumb_survives_restore_and_a_second_trim() {
         let (_tmp, store) = open_store();
         store
-            .create_session("sess-trimmed", "alpha", "/tmp/proj")
+            .create_session("sess-trimmed", "alpha", "/tmp/proj", None)
             .unwrap();
         store
             .append_turn(

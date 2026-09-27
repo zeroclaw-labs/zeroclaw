@@ -154,6 +154,7 @@ pub mod method {
     pub const SOPS_SAVE: &str = "sops/save";
     pub const SOPS_CREATE: &str = "sops/create";
     pub const SOPS_DELETE: &str = "sops/delete";
+    pub const SOPS_RENAME: &str = "sops/rename";
     pub const SOPS_DECIDE: &str = "sops/decide";
     pub const SOPS_WIRE_DRAFT: &str = "sops/wire-draft";
     pub const SOPS_GRAPH_DRAFT: &str = "sops/graph-draft";
@@ -291,6 +292,7 @@ pub enum SessionUpdate {
     HistoryTrimmed {
         session_id: String,
         dropped_messages: u64,
+        dropped_turns: Option<u64>,
         kept_turns: u64,
         reason: String,
         /// Configured context token budget, when the trim was token-budget
@@ -405,6 +407,7 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
         "history_trimmed" => Some(SessionUpdate::HistoryTrimmed {
             session_id: sid,
             dropped_messages: params.get("dropped_messages")?.as_u64()?,
+            dropped_turns: params.get("dropped_turns").and_then(|v| v.as_u64()),
             kept_turns: params.get("kept_turns")?.as_u64()?,
             reason: params.get("reason")?.as_str()?.to_string(),
             token_budget: params.get("token_budget").and_then(|v| v.as_u64()),
@@ -1815,11 +1818,18 @@ impl RpcClient {
     /// daemon CA to trust) and `client_cert_path` / `client_key_path` (the client
     /// certificate to present). `skip_verify` disables server verification
     /// (self-signed dev only).
+    ///
+    /// `auth_token` (with an optional `auth_provider` selection, default
+    /// `native`) is presented in the initialize handshake; remote daemons
+    /// require it since the RFC 7141 enforcement boundary. The mTLS cert is
+    /// transport/device admission; the token is principal authentication.
     pub async fn connect_wss_direct(
         url: &str,
         prev_tui_id: Option<&str>,
         prev_tui_sig: Option<&str>,
         tls: &ClientTls,
+        auth_token: Option<&str>,
+        auth_provider: Option<&str>,
     ) -> Result<Self> {
         // The built-in (webpki-roots) connector only for the plain default (no
         // client cert, no custom CA, no skip-verify); any custom TLS material
@@ -1840,7 +1850,15 @@ impl RpcClient {
         .await
         .with_context(|| format!("WSS connect to {url}"))?;
         // No relay pump on the direct path: the socket IS the transport.
-        Self::spawn_ws_session(ws_stream, prev_tui_id, prev_tui_sig, None).await
+        Self::spawn_ws_session(
+            ws_stream,
+            prev_tui_id,
+            prev_tui_sig,
+            auth_token,
+            auth_provider,
+            None,
+        )
+        .await
     }
 
     /// Connect to the daemon through a nominated relay.
@@ -1855,6 +1873,8 @@ impl RpcClient {
         prev_tui_sig: Option<&str>,
         tls: &ClientTls,
         relay: &RelayDial,
+        auth_token: Option<&str>,
+        auth_provider: Option<&str>,
     ) -> Result<Self> {
         // ONE deadline for the whole client-side setup. It is created here, before
         // the first packet, and every step below shares what is left of it: the
@@ -1886,7 +1906,15 @@ impl RpcClient {
         // `?` here would drop the guard and retire the pump, which is exactly
         // what a failed handshake wants.
         let (ws_stream, _response) = handshake?;
-        Self::spawn_ws_session(ws_stream, prev_tui_id, prev_tui_sig, pump.release()).await
+        Self::spawn_ws_session(
+            ws_stream,
+            prev_tui_id,
+            prev_tui_sig,
+            auth_token,
+            auth_provider,
+            pump.release(),
+        )
+        .await
     }
 
     /// Drive a connected WSS stream: spawn the writer/reader tasks and complete
@@ -1900,6 +1928,8 @@ impl RpcClient {
         ws_stream: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<S>>,
         prev_tui_id: Option<&str>,
         prev_tui_sig: Option<&str>,
+        auth_token: Option<&str>,
+        auth_provider: Option<&str>,
         relay_pump: Option<tokio::task::JoinHandle<()>>,
     ) -> Result<Self>
     where
@@ -2010,6 +2040,12 @@ impl RpcClient {
         if let Some(sig) = prev_tui_sig {
             init_params["tui_sig"] = serde_json::Value::String(sig.to_string());
         }
+        if let Some(token) = auth_token {
+            init_params["auth_token"] = serde_json::Value::String(token.to_string());
+        }
+        if let Some(provider) = auth_provider {
+            init_params["auth_provider"] = serde_json::Value::String(provider.to_string());
+        }
         // NOTE: We intentionally do NOT forward the TUI's environment here.
         // In a WSS connection the daemon is on a remote machine, so env values
         // like SSH_AUTH_SOCK, VIRTUAL_ENV, or any path-based socket/credential
@@ -2069,7 +2105,10 @@ impl RpcClient {
     /// Build a rustls `ClientConfig` from a [`ClientTls`]: server verification via
     /// the configured CA (or `NoVerify` when `skip_verify`), presenting the client
     /// certificate for mutual TLS when one is configured.
-    fn wss_tls_config(tls: &ClientTls) -> Result<std::sync::Arc<rustls::ClientConfig>> {
+    ///
+    /// Crate-visible because the gateway enrollment leg that precedes the WSS
+    /// connection must be given exactly the same trust material.
+    pub(crate) fn wss_tls_config(tls: &ClientTls) -> Result<std::sync::Arc<rustls::ClientConfig>> {
         use std::sync::Arc;
 
         let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -2626,6 +2665,18 @@ impl RpcClient {
     pub async fn sops_create(&self, sop: Value) -> Result<Value> {
         self.call(method::SOPS_CREATE, serde_json::json!({ "sop": sop }))
             .await
+    }
+
+    /// Move a SOP to a new name. Separate from `sops_save`, which persists
+    /// under the submitted SOP's own name and so can only overwrite the SOP it
+    /// was loaded from; the daemon collision-checks the target and moves the
+    /// definition rather than copying it.
+    pub async fn sops_rename(&self, from: &str, to: &str) -> Result<Value> {
+        self.call(
+            method::SOPS_RENAME,
+            serde_json::json!({ "from": from, "to": to }),
+        )
+        .await
     }
 
     pub async fn sops_delete(&self, name: &str) -> Result<Value> {
@@ -4235,6 +4286,8 @@ pub struct LogsQueryParams {
     pub outcome: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sop_run_id: Option<String>,
     #[serde(default)]
     pub hide_internal: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5529,7 +5582,7 @@ mod notification_tests {
             WebSocketStream::from_raw_socket(MaybeTlsStream::Plain(client_io), Role::Client, None)
                 .await;
         let client = Arc::new(
-            RpcClient::spawn_ws_session(client_ws, None, None, None)
+            RpcClient::spawn_ws_session(client_ws, None, None, None, None, None)
                 .await
                 .unwrap(),
         );
@@ -5830,7 +5883,7 @@ mod notification_tests {
             WebSocketStream::from_raw_socket(MaybeTlsStream::Plain(client_io), Role::Client, None)
                 .await;
         let client = Arc::new(
-            RpcClient::spawn_ws_session(client_ws, None, None, Some(pump))
+            RpcClient::spawn_ws_session(client_ws, None, None, None, None, Some(pump))
                 .await
                 .unwrap(),
         );
@@ -6487,6 +6540,7 @@ mod plan_parse_tests {
             "type": "history_trimmed",
             "session_id": "sess-3",
             "dropped_messages": 12,
+            "dropped_turns": 4,
             "kept_turns": 3,
             "reason": "history message limit exceeded"
         });
@@ -6496,6 +6550,7 @@ mod plan_parse_tests {
             Some(SessionUpdate::HistoryTrimmed {
                 session_id,
                 dropped_messages: 12,
+                dropped_turns: Some(4),
                 kept_turns: 3,
                 reason,
                 token_budget: None,
@@ -6505,6 +6560,25 @@ mod plan_parse_tests {
                 tokens_after_source: None,
                 unsatisfiable_floor: None,
             }) if session_id == "sess-3" && reason == "history message limit exceeded"
+        ));
+    }
+
+    #[test]
+    fn parses_legacy_history_trimmed_update_without_dropped_turns() {
+        let params = serde_json::json!({
+            "type": "history_trimmed",
+            "session_id": "sess-3",
+            "dropped_messages": 12,
+            "kept_turns": 3,
+            "reason": "history message limit exceeded"
+        });
+
+        assert!(matches!(
+            parse_session_update(&params),
+            Some(SessionUpdate::HistoryTrimmed {
+                dropped_turns: None,
+                ..
+            })
         ));
     }
 
@@ -6528,6 +6602,7 @@ mod plan_parse_tests {
             Some(SessionUpdate::HistoryTrimmed {
                 session_id,
                 dropped_messages: 12,
+                dropped_turns: None,
                 kept_turns: 33,
                 reason,
                 token_budget: Some(500000),
@@ -6659,6 +6734,8 @@ mod relay_transport_tests {
                     ..Default::default()
                 },
                 &relay,
+                None,
+                None,
             )
             .await
             .expect_err("a silent relay must not hold the connect")

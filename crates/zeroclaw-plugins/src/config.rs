@@ -6,13 +6,16 @@
 //! duration of a host call.
 
 #[cfg(any(feature = "plugins-wasmtime", test))]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(any(feature = "plugins-wasmtime", test))]
 use std::sync::Arc;
 
 #[cfg(any(feature = "plugins-wasmtime", test))]
 use serde_json::Map;
 use serde_json::Value;
+use zeroclaw_api::plugin_key::SecretPropertyRef;
+#[cfg(any(feature = "plugins-wasmtime", test))]
+use zeroize::Zeroizing;
 
 use crate::error::PluginError;
 #[cfg(any(feature = "plugins-wasmtime", test))]
@@ -75,7 +78,8 @@ const DYNAMIC_KEY_KEYWORDS: [&str; 3] = [
 pub struct ResolvedPluginConfig {
     scope: PluginInstanceScope,
     public_json: Value,
-    secrets: HashMap<String, String>,
+    secrets: HashMap<SecretPropertyRef, Zeroizing<String>>,
+    host_only: HashSet<SecretPropertyRef>,
 }
 
 #[cfg(any(feature = "plugins-wasmtime", test))]
@@ -83,13 +87,36 @@ impl ResolvedPluginConfig {
     fn new(
         scope: &PluginInstanceScope,
         public_json: Value,
-        secrets: HashMap<String, String>,
+        secrets: HashMap<SecretPropertyRef, Zeroizing<String>>,
     ) -> Self {
         Self {
             scope: scope.clone(),
             public_json,
             secrets,
+            host_only: HashSet::new(),
         }
+    }
+
+    /// Withhold `references` from the guest while leaving them readable by
+    /// the host.
+    ///
+    /// The runtime marks the secret properties an instance's TLS profiles
+    /// reference: that material, a client private key included, is consumed
+    /// when the host builds a TLS connection and must not come back through
+    /// the guest's `secrets` import.
+    #[must_use]
+    pub fn reserve_for_host(
+        mut self,
+        references: impl IntoIterator<Item = SecretPropertyRef>,
+    ) -> Self {
+        self.host_only.extend(references);
+        self
+    }
+
+    /// Whether the guest-facing `secrets` import must refuse `name`.
+    #[must_use]
+    pub(crate) fn is_host_only(&self, name: &str) -> bool {
+        SecretPropertyRef::parse(name).is_ok_and(|reference| self.host_only.contains(&reference))
     }
 
     /// Borrow the validated non-secret JSON object for immediate guest injection.
@@ -101,7 +128,15 @@ impl ResolvedPluginConfig {
     /// Borrow one schema-designated secret for an immediate host-mediated use.
     #[must_use]
     pub(crate) fn secret(&self, name: &str) -> Option<&str> {
-        self.secrets.get(name).map(String::as_str)
+        SecretPropertyRef::parse(name)
+            .ok()
+            .and_then(|reference| self.secret_ref(&reference))
+    }
+
+    /// Borrow one secret through the canonical portable reference type.
+    #[must_use]
+    pub(crate) fn secret_ref(&self, reference: &SecretPropertyRef) -> Option<&str> {
+        self.secrets.get(reference).map(|secret| secret.as_str())
     }
 
     /// Reject pairing this materialized view with another admission decision.
@@ -318,6 +353,12 @@ fn compile_manifest_config(
                 manifest.name
             )));
         }
+        if is_secret_property(property) && SecretPropertyRef::parse(name.clone()).is_err() {
+            return Err(invalid_manifest(format!(
+                "plugin '{}' config_schema secret property '{name}' is not a portable top-level property reference",
+                manifest.name
+            )));
+        }
     }
     let has_secret_consumer = manifest.capabilities.iter().any(|capability| {
         matches!(
@@ -440,7 +481,13 @@ pub fn resolve_plugin_config_from(
                     manifest.name
                 )));
             };
-            secrets.insert(name, secret);
+            let reference = SecretPropertyRef::parse(name).map_err(|_| {
+                PluginError::InvalidConfig(format!(
+                    "plugin '{}' resolved secret property is not portable",
+                    manifest.name
+                ))
+            })?;
+            secrets.insert(reference, Zeroizing::new(secret));
         } else {
             public.insert(name, value);
         }
@@ -1080,6 +1127,25 @@ x-secret = true
     }
 
     #[test]
+    fn secret_property_references_use_the_shared_portable_key_grammar() {
+        for name in [
+            "plugin://other/key",
+            "../key",
+            "key:value",
+            "other\\key",
+            "café",
+        ] {
+            let schema = object_schema(json!({
+                (name): {"type": "string", "x-secret": true}
+            }));
+            assert!(matches!(
+                validate_manifest_config(&manifest(Some(schema), true)),
+                Err(PluginError::InvalidManifest(_))
+            ));
+        }
+    }
+
+    #[test]
     fn secret_annotations_require_a_tool_or_channel_consumer() {
         let schema = object_schema(json!({
             "api_key": {"type": "string", "x-secret": true}
@@ -1171,6 +1237,15 @@ x-secret = true
         assert_eq!(resolved.secret("api_key"), Some("secret-value"));
         assert_eq!(resolved.secret("endpoint"), None);
         assert_eq!(resolved.secret("missing"), None);
+        assert!(!resolved.is_host_only("api_key"));
+        let resolved =
+            resolved.reserve_for_host([SecretPropertyRef::parse("api_key").expect("portable")]);
+        assert!(resolved.is_host_only("api_key"));
+        assert_eq!(
+            resolved.secret("api_key"),
+            Some("secret-value"),
+            "reserving a secret hides it from the guest, not from the host"
+        );
         assert!(!resolved.public_json().to_string().contains("secret-value"));
     }
 

@@ -113,14 +113,16 @@ impl Attributable for WasmChannel {
     }
 }
 
-fn build_linker(http: bool) -> Result<Linker<PluginState>> {
+fn build_linker(imports: crate::component::OptionalImports) -> Result<Linker<PluginState>> {
     let mut linker = Linker::new(engine());
     crate::component::add_wasi(&mut linker)?;
-    if http {
+    if imports.http {
         crate::component::add_wasi_http(&mut linker)?;
     }
     let mut options = crate::component::bindings::channel::LinkOptions::default();
     options.plugins_wit_v0(true);
+    options.plugins_wit_v0_sockets(imports.sockets);
+    options.plugins_wit_v0_websocket(imports.websocket);
     wt(
         ChannelPlugin::add_to_linker::<_, wasmtime::component::HasSelf<_>>(
             &mut linker,
@@ -317,9 +319,9 @@ pub async fn verify_channel_loads(
         InboundQueue::default(),
         None,
     );
-    let http = store.data().http_enabled();
-    let linker = build_linker(http)?;
-    crate::component::ensure_http_coherent(&store, http)?;
+    let imports = crate::component::OptionalImports::for_store(store.data());
+    let linker = build_linker(imports)?;
+    crate::component::ensure_imports_coherent(&store, imports)?;
     call_store!(store, async |store: &mut Store<PluginState>| {
         wt_instantiate(
             ChannelPlugin::instantiate_async(store, &component, &linker).await,
@@ -351,9 +353,9 @@ impl ChannelInstanceFactory {
             inbound,
             self.egress.clone(),
         );
-        let http = store.data().http_enabled();
-        let linker = build_linker(http)?;
-        crate::component::ensure_http_coherent(&store, http)?;
+        let imports = crate::component::OptionalImports::for_store(store.data());
+        let linker = build_linker(imports)?;
+        crate::component::ensure_imports_coherent(&store, imports)?;
         let bindings = call_store!(store, async |store: &mut Store<PluginState>| {
             wt_instantiate(
                 ChannelPlugin::instantiate_async(store, self.component.as_ref(), &linker).await,
@@ -1138,8 +1140,12 @@ impl Channel for WasmChannel {
     }
 
     fn supports_multi_message_streaming(&self) -> bool {
-        self.capabilities
-            .contains(ChannelCapabilities::SUPPORTS_MULTI_MESSAGE_STREAMING)
+        // WASM plugins only advertise a rendering capability; the ABI has no
+        // confirmed-delivery coordinate to reconcile against a sanitized final
+        // response. Keep the generic finalizer on the canonical-response path
+        // until that contract exists rather than treating attempted updates as
+        // confirmed paragraphs.
+        false
     }
 
     fn multi_message_delay_ms(&self) -> u64 {
@@ -1468,7 +1474,7 @@ mod tests {
     async fn channel_validates_config_before_loading_guest_code() {
         let scope = crate::instance::test_scope(PluginCapability::Channel, "main", []);
         let endpoint = PluginChannelEndpoint::new(scope, "plugin").unwrap();
-        let services = PluginHostServices::new(PluginConfigResolver::new(|_| {
+        let services = crate::services::test_services(PluginConfigResolver::new(|_| {
             Err(crate::error::PluginError::InvalidConfig(
                 "invalid-before-load".to_string(),
             ))

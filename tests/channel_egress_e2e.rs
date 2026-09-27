@@ -138,6 +138,7 @@ fn entry_row(
             .iter()
             .map(|h| (*h).to_string())
             .collect(),
+        tls_profiles: Vec::new(),
     }
 }
 

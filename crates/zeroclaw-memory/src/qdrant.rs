@@ -172,6 +172,7 @@ impl QdrantMemory {
                 };
 
                 Some(MemoryEntry {
+                    principal_id: None,
                     id,
                     key: payload.key,
                     content: payload.content,
@@ -311,6 +312,7 @@ impl QdrantMemory {
                     kind: None,
                     pinned: false,
                     tenant_id: None,
+                    principal_id: None,
                     agent_alias: payload.agent_id.clone(),
                     agent_id: payload.agent_id,
                 });
@@ -575,6 +577,7 @@ impl QdrantMemory {
                 _ => return None,
             };
             Some(MemoryEntry {
+                principal_id: None,
                 id,
                 key: payload.key,
                 content: payload.content,
@@ -784,6 +787,7 @@ impl Memory for QdrantMemory {
                 };
 
                 Some(MemoryEntry {
+                    principal_id: None,
                     id,
                     key: payload.key,
                     content: payload.content,
@@ -871,6 +875,7 @@ impl Memory for QdrantMemory {
                 };
 
                 Some(MemoryEntry {
+                    principal_id: None,
                     id,
                     key: payload.key,
                     content: payload.content,
@@ -1173,6 +1178,7 @@ impl Memory for QdrantMemory {
                 };
 
                 Some(MemoryEntry {
+                    principal_id: None,
                     id,
                     key: payload.key,
                     content: payload.content,

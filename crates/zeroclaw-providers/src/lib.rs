@@ -750,18 +750,19 @@ pub struct ModelProviderRuntimeOptions {
     pub chat_template_kwargs: Option<serde_json::Value>,
     /// Path to a custom CA certificate file for TLS connections.
     pub tls_ca_cert_path: Option<String>,
+    /// The configured `[multimodal]` policy.
+    ///
+    /// Providers normalize image markers on their own boundary (a channel can
+    /// call `chat` with raw `[IMAGE:<path>]` markers that never passed through
+    /// the runtime), and that normalization now decodes pixels and applies
+    /// `max_images` / `max_image_size_mb`. Carrying the configured policy here
+    /// keeps that second pass on the same rules the runtime already applied,
+    /// instead of silently reverting to defaults and re-trimming history a
+    /// configured request had legitimately accepted.
+    pub multimodal: zeroclaw_config::schema::MultimodalConfig,
     /// How compatible chat-completions providers handle image markers in
     /// native role=`tool` results.
     pub tool_result_image_policy: zeroclaw_config::schema::ToolResultImagePolicy,
-    /// Root `[multimodal]` policy applied when a provider expands
-    /// `[IMAGE:...]` markers into inline data URIs.
-    ///
-    /// Provider adapters run their own `prepare_messages_for_provider` pass, so
-    /// without this they silently fall back to `MultimodalConfig::default()` and
-    /// an operator's `max_images` / `max_image_size_mb` / `max_image_turns`
-    /// never reach the request that actually carries the images. Root-scoped,
-    /// not per-entry: every alias resolves the same section.
-    pub multimodal: zeroclaw_config::schema::MultimodalConfig,
 }
 
 impl Default for ModelProviderRuntimeOptions {
@@ -858,10 +859,10 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         vision: entry.and_then(|e| e.vision),
         chat_template_kwargs: entry.and_then(|e| e.chat_template_kwargs.clone()),
         tls_ca_cert_path,
+        multimodal: config.multimodal.clone(),
         tool_result_image_policy: entry
             .map(|e| e.tool_result_image_policy)
             .unwrap_or_default(),
-        multimodal: config.multimodal.clone(),
     }
 }
 
@@ -948,28 +949,6 @@ pub fn options_for_provider_ref(
     }
 }
 
-/// Runtime options for a **bare family** reference (`ollama`) or an inline
-/// `custom:<url>` reference, neither of which resolves a configured entry.
-///
-/// Everything provider-specific (kind, URI, credentials, `vision`, ...) stays at
-/// its default because there is no entry to read it from. The root
-/// `[multimodal]` policy is not provider-specific, so it must still reach the
-/// adapter: `ModelProviderRuntimeOptions::default()` embeds
-/// `MultimodalConfig::default()`, and an adapter built that way re-applies
-/// library image limits to messages the runtime already prepared under the
-/// operator's policy — silently dropping attachments the operator allowed.
-///
-/// This path is reached in production by `resolve_vision_provider` for a
-/// configured `multimodal.vision_model_provider`.
-fn bare_family_runtime_options(
-    config: &zeroclaw_config::schema::Config,
-) -> ModelProviderRuntimeOptions {
-    ModelProviderRuntimeOptions {
-        multimodal: config.multimodal.clone(),
-        ..ModelProviderRuntimeOptions::default()
-    }
-}
-
 fn is_secret_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':')
 }
@@ -988,12 +967,13 @@ fn token_end(input: &str, from: usize) -> usize {
 
 /// Remove credentials from HTTP(S) URLs embedded in error text.
 ///
-/// Query-value punctuation cannot safely identify where a credential ends:
-/// commas, apostrophes, and parentheses are all legal query data. Treat the
-/// URL's entire non-whitespace query tail as sensitive instead. This also
-/// covers credential parameter names that the sanitizer does not know about.
-/// URL userinfo is likewise always sensitive and is replaced as one unit while
-/// retaining the host and path needed for an actionable endpoint diagnostic.
+/// Query and fragment punctuation cannot safely identify where a credential
+/// ends: commas, apostrophes, and parentheses are all legal data. Treat the
+/// URL's entire non-whitespace query or fragment tail as sensitive instead.
+/// This also covers credential parameter names that the sanitizer does not know
+/// about. URL userinfo is likewise always sensitive and is replaced as one unit
+/// while retaining the host and path needed for an actionable endpoint
+/// diagnostic.
 fn scrub_url_credentials(input: &str) -> String {
     let lowercase = input.to_ascii_lowercase();
     let mut scrubbed = String::with_capacity(input.len());
@@ -1019,22 +999,25 @@ fn scrub_url_credentials(input: &str) -> String {
         let url_tail = &input[url_start..];
         let url_end = url_start + url_tail.find(char::is_whitespace).unwrap_or(url_tail.len());
         let url_token = &input[url_start..url_end];
-        let without_query = url_token
-            .find('?')
-            .map_or(url_token, |query_start| &url_token[..query_start]);
-        let scheme_end = without_query
+        let sensitive_suffix_start = [url_token.find('?'), url_token.find('#')]
+            .into_iter()
+            .flatten()
+            .min();
+        let without_query_or_fragment =
+            sensitive_suffix_start.map_or(url_token, |suffix_start| &url_token[..suffix_start]);
+        let scheme_end = without_query_or_fragment
             .find("://")
             .map_or(0, |separator| separator + 3);
-        let authority_end = without_query[scheme_end..]
-            .find(['/', '#'])
-            .map_or(without_query.len(), |end| scheme_end + end);
-        let authority = &without_query[scheme_end..authority_end];
+        let authority_end = without_query_or_fragment[scheme_end..]
+            .find('/')
+            .map_or(without_query_or_fragment.len(), |end| scheme_end + end);
+        let authority = &without_query_or_fragment[scheme_end..authority_end];
         if let Some(userinfo_end) = authority.rfind('@') {
-            scrubbed.push_str(&without_query[..scheme_end]);
+            scrubbed.push_str(&without_query_or_fragment[..scheme_end]);
             scrubbed.push_str("[REDACTED]@");
-            scrubbed.push_str(&without_query[scheme_end + userinfo_end + 1..]);
+            scrubbed.push_str(&without_query_or_fragment[scheme_end + userinfo_end + 1..]);
         } else {
-            scrubbed.push_str(without_query);
+            scrubbed.push_str(without_query_or_fragment);
         }
         cursor = url_end;
     }
@@ -1045,9 +1028,9 @@ fn scrub_url_credentials(input: &str) -> String {
 /// Scrub known secret-like token prefixes from model_provider error strings.
 /// Provider API-key prefixes come from the same canonical table used for
 /// credential-family validation; non-provider prefixes cover Slack, GitHub,
-/// and Google/Gemini credentials. Complete query strings are removed from
-/// embedded HTTP(S) URLs because query parameters may carry credentials under
-/// provider-specific names.
+/// and Google/Gemini credentials. Complete query strings and fragments are
+/// removed from embedded HTTP(S) URLs because either suffix may carry
+/// credentials under provider-specific names.
 pub fn scrub_secret_patterns(input: &str) -> String {
     const NON_PROVIDER_SECRET_PREFIXES: &[&str] = &[
         "xoxb-",
@@ -1991,18 +1974,46 @@ pub fn create_model_provider_from_ref_with_model(
             .map(ToString::to_string);
         return Ok(ResolvedModelProviderRef { provider, model });
     }
-    let provider = create_model_provider_inner(
-        None,
-        name,
-        "default",
-        None,
-        None,
-        &bare_family_runtime_options(config),
-    )?;
+    let options = provider_runtime_options_for_bare_family(config);
+    let provider = create_model_provider_inner(None, name, "default", None, None, &options)?;
     Ok(ResolvedModelProviderRef {
         provider,
         model: None,
     })
+}
+
+/// Runtime options for a **bare family** reference (e.g. `ollama`), which has no
+/// alias entry to resolve.
+///
+/// Provider construction for these names stays on the family-default path
+/// (`config = None` at `create_model_provider_inner`) — that is what keeps a
+/// dotted-but-dangling ref fail-closed, per the exclusions documented in
+/// [`create_model_provider_from_ref_with_model`]. The config-owned
+/// `[multimodal]` policy must still reach the provider, though.
+///
+/// `ModelProviderRuntimeOptions::default()` embeds `MultimodalConfig::default()`
+/// (`max_images = 4`, `max_image_size_mb = 5`). A configured
+/// `vision_model_provider = "ollama"` with `max_images = 8` would otherwise
+/// re-normalize already-prepared messages under the default cap at the provider
+/// boundary, evicting the request's oldest images down to 4 even though the
+/// operator's configuration legitimately accepted 8.
+///
+/// Only config-owned policy is carried across; every entry-specific option
+/// (kind, URI, credentials, `vision`, ...) stays at its default, since a bare
+/// family name names no entry to take them from.
+///
+/// Public because the runtime's live model-switch path builds a replacement
+/// provider from the same config and must resolve the same options — a bare
+/// family switch that fell back to `ModelProviderRuntimeOptions::default()`
+/// would rebuild the provider boundary under default caps, exactly the
+/// mismatch above.
+pub fn provider_runtime_options_for_bare_family(
+    config: &zeroclaw_config::schema::Config,
+) -> ModelProviderRuntimeOptions {
+    ModelProviderRuntimeOptions {
+        multimodal: config.multimodal.clone(),
+        ..ModelProviderRuntimeOptions::default()
+    }
 }
 
 fn create_resilient_model_provider_from_ref_with_model_override(
@@ -4048,10 +4059,21 @@ mod tests {
         }
 
         let temp = tempfile::tempdir().unwrap();
+        // Image preparation validates and decodes every candidate before it
+        // reaches the provider. Keep this fixture a real 1x1 PNG rather than
+        // only the eight-byte signature, otherwise the test measures decoder
+        // rejection instead of the configured image cap.
+        const DECODABLE_PNG: [u8; 67] = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
         let mut markers = Vec::new();
         for index in 0..2 {
             let path = temp.path().join(format!("bare-{index}.png"));
-            std::fs::write(&path, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+            std::fs::write(&path, DECODABLE_PNG).unwrap();
             markers.push(format!("[IMAGE:{}]", path.display()));
         }
         // One image per message: `trim_old_images` evicts whole messages, so
@@ -4158,6 +4180,48 @@ mod tests {
         );
         // Same fail-closed behavior as the legacy factory the vision route used.
         assert!(create_model_provider("llamacpp.typo", None).is_err());
+    }
+
+    #[test]
+    fn bare_family_vision_provider_carries_the_configured_multimodal_policy() {
+        use zeroclaw_config::schema::Config;
+        // A bare `vision_model_provider = "ollama"` resolves through the
+        // family-default branch, which previously passed
+        // `ModelProviderRuntimeOptions::default()` and so silently reverted the
+        // provider boundary to `max_images = 4` / `max_image_size_mb = 5`.
+        //
+        // The runtime prepares history under the configured policy, then the
+        // vision provider re-normalizes the already-prepared markers. Running
+        // that second pass under defaults re-trims a history the operator's
+        // configuration had legitimately accepted, evicting the oldest images
+        // down to the default cap of 4.
+        //
+        // Dotted aliases already resolved this through
+        // `provider_runtime_options_for_alias`; this pins the bare branch.
+        let mut config = Config::default();
+        config.multimodal.max_images = 8;
+        config.multimodal.max_image_size_mb = 10;
+
+        let options = provider_runtime_options_for_bare_family(&config);
+
+        assert_eq!(
+            options.multimodal.max_images, 8,
+            "a bare family ref must carry the configured max_images, not the default 4"
+        );
+        assert_eq!(
+            options.multimodal.max_image_size_mb, 10,
+            "a bare family ref must carry the configured max_image_size_mb, not the default 5"
+        );
+
+        // Entry-specific options have no alias to come from and must stay unset,
+        // exactly as they were before the multimodal policy was threaded through.
+        let defaults = ModelProviderRuntimeOptions::default();
+        assert_eq!(options.provider_kind, defaults.provider_kind);
+        assert_eq!(options.provider_api_url, defaults.provider_api_url);
+        assert_eq!(
+            options.vision, defaults.vision,
+            "a bare family ref must not inherit a provider-specific vision override"
+        );
     }
 
     // ── Error cases ──────────────────────────────────────────
@@ -4704,6 +4768,17 @@ mod tests {
         assert!(!result.contains("hunter2secret"), "{result}");
         assert!(!result.contains("region=us"), "{result}");
         assert!(result.contains("HTTPS://api.example.com/v1/thing"));
+    }
+
+    #[test]
+    fn sanitize_removes_complete_url_fragment() {
+        let input =
+            "GET https://api.example.com/v1/models#access_token=fragment-secret-value failed";
+        let result = sanitize_api_error(input);
+
+        assert!(!result.contains("fragment-secret-value"), "{result}");
+        assert!(!result.contains("#access_token="), "{result}");
+        assert!(result.contains("https://api.example.com/v1/models"));
     }
 
     #[test]

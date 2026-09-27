@@ -68,7 +68,7 @@ impl SubprocessTool {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_timeouts(
         mut self,
         first_output_timeout: Duration,

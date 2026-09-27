@@ -21,6 +21,7 @@ mod dockerignore_test;
 mod gateway;
 mod gemini_capabilities;
 mod hardware_probe_feature_graph;
+mod oidc_enrollment_cli;
 mod otel_dependency_feature_regression;
 mod plugin_feature_graph;
 mod provider_resolution;
@@ -32,3 +33,6 @@ mod skills_bundle_cli;
 #[cfg(feature = "agent-runtime")]
 mod verifiable_intent_notice_visibility;
 mod whatsapp_webhook_security;
+
+#[cfg(feature = "plugins-wasm")]
+mod plugin_info_cli;

@@ -1687,7 +1687,7 @@ fn start_linux(config: &Config, init_system: InitSystem) -> Result<()> {
                 Command::new("rc-service").args(linux_openrc_action_args(config, "start")),
             )?;
         }
-        InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
+        InitSystem::Auto => anyhow::bail!("init system must be resolved before service start"),
     }
     println!("✅ Service started");
     Ok(())
@@ -1732,7 +1732,7 @@ fn stop_linux(config: &Config, init_system: InitSystem) -> Result<()> {
                 Command::new("rc-service").args(linux_openrc_action_args(config, "stop")),
             );
         }
-        InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
+        InitSystem::Auto => anyhow::bail!("init system must be resolved before service stop"),
     }
     println!("✅ Service stopped");
     Ok(())
@@ -1774,7 +1774,7 @@ fn restart_linux(config: &Config, init_system: InitSystem) -> Result<()> {
                 Command::new("rc-service").args(linux_openrc_action_args(config, "restart")),
             )?;
         }
-        InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
+        InitSystem::Auto => anyhow::bail!("init system must be resolved before service restart"),
     }
     println!("✅ Service restarted");
     Ok(())
@@ -1850,7 +1850,7 @@ fn status_linux(config: &Config, init_system: InitSystem) -> Result<()> {
             println!("Service state: {}", out.trim());
             println!("Unit: /etc/init.d/{}", linux_openrc_service(config));
         }
-        InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
+        InitSystem::Auto => anyhow::bail!("init system must be resolved before service status"),
     }
     Ok(())
 }
@@ -1930,7 +1930,7 @@ fn logs_linux(config: &Config, init_system: InitSystem, lines: usize, follow: bo
             report_empty_capture(&targets, &log_dir, follow);
             tail_files(&targets, lines, follow)?;
         }
-        InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
+        InitSystem::Auto => anyhow::bail!("init system must be resolved before reading logs"),
     }
     Ok(())
 }
@@ -2132,7 +2132,7 @@ fn uninstall_linux(config: &Config, init_system: InitSystem) -> Result<()> {
             }
             println!("✅ Service uninstalled (/etc/init.d/zeroclaw)");
         }
-        InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
+        InitSystem::Auto => anyhow::bail!("init system must be resolved before service uninstall"),
     }
     Ok(())
 }
@@ -2305,7 +2305,7 @@ fn install_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => install_linux_systemd(config),
         InitSystem::Openrc => install_linux_openrc(config),
-        InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
+        InitSystem::Auto => anyhow::bail!("init system must be resolved before service install"),
     }
 }
 

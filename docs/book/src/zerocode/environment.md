@@ -10,8 +10,9 @@ agent.
 When zerocode connects it captures its own process environment and sends it to
 the daemon as part of the `initialize` handshake. The daemon stores that
 snapshot in `TuiRegistry` keyed by zerocode's unique `tui_id`. When you open a
-new chat session (`session/new`), the daemon looks up zerocode's snapshot and
-clones it into the agent's `ShellTool`. That clone is then overlaid on top of
+new chat session (`session/new`), the daemon looks up the snapshot registered
+by the calling connection itself, never one named by the request, and clones
+it into the agent's `ShellTool`. That clone is then overlaid on top of
 the safe-env baseline for every shell subprocess the agent spawns:
 
 ```
@@ -43,8 +44,15 @@ echo $SSH_AUTH_SOCK
 
 </div>
 
-zerocode sends its full environment. On a shared or remote daemon where that's
-a concern, use WSS with a dedicated user account.
+zerocode sends its full environment on every connection, but the daemon keeps
+the snapshot only where it is trusted: an operator-level principal on a local
+connection (the Unix socket or the Windows named pipe), which is the local IDE
+flow described above. On a WSS connection the snapshot describes the client's
+host rather than the daemon's, and a roster principal with a permission
+profile must not choose what runs as the daemon account, so in both cases the
+daemon drops the snapshot at `initialize`, logs that it did, and the session's
+shell subprocesses see only Layer 1. Use `shell_env_passthrough` on the risk
+profile to supply specific variables from the daemon's own environment there.
 
 ## Multiple connected clients: no cross-session clobbering
 
@@ -69,8 +77,8 @@ cloned and used. The other clients' envs are never touched. Concretely:
 | Client A disconnects while Client B's session is running | Client B is unaffected; env was **cloned at session creation** |
 | Client A reconnects with the same `tui_id` | Old entry is removed, new entry with fresh env is registered; already-running sessions keep their original clone |
 
-The last point matters: `get_env` returns a **clone**, not a reference. Once a
-session is created it owns its env snapshot. Reconnects or disconnects of the
+The last point matters: the registry hands the session a **clone**, not a
+reference. Once a session is created it owns its env snapshot. Reconnects or disconnects of the
 originating client have no effect on running sessions.
 
 ## Risk profile passthrough (explicit allowlist)

@@ -32,11 +32,16 @@ pub struct Plugin {
     state: Arc<Mutex<WarmPluginState<ToolPlugin>>>,
 }
 
-fn base_linker() -> Result<Linker<PluginState>> {
+fn base_linker(imports: crate::component::OptionalImports) -> Result<Linker<PluginState>> {
     let mut linker = Linker::new(engine());
     crate::component::add_wasi(&mut linker)?;
+    if imports.http {
+        crate::component::add_wasi_http(&mut linker)?;
+    }
     let mut options = crate::component::bindings::tool::LinkOptions::default();
     options.plugins_wit_v0(true);
+    options.plugins_wit_v0_sockets(imports.sockets);
+    options.plugins_wit_v0_websocket(imports.websocket);
     wt(
         ToolPlugin::add_to_linker::<_, wasmtime::component::HasSelf<_>>(
             &mut linker,
@@ -48,22 +53,26 @@ fn base_linker() -> Result<Linker<PluginState>> {
     Ok(linker)
 }
 
-/// Cached linker for plugins without `HttpClient`: base WASI plus the tool
-/// world, no network.
-fn tool_linker() -> &'static Linker<PluginState> {
-    static LINKER: OnceLock<Linker<PluginState>> = OnceLock::new();
-    LINKER.get_or_init(|| base_linker().expect("tool linker"))
-}
-
-/// Cached linker for `HttpClient` plugins: the base surface plus `wasi:http`.
-/// Built only once, on first use by an HTTP-granted plugin.
-fn tool_linker_http() -> &'static Linker<PluginState> {
-    static LINKER: OnceLock<Linker<PluginState>> = OnceLock::new();
-    LINKER.get_or_init(|| {
-        let mut linker = base_linker().expect("tool linker");
-        crate::component::add_wasi_http(&mut linker).expect("tool http linker");
-        linker
-    })
+/// The tool linker for one combination of granted optional imports, built on
+/// first use and shared after that. The combinations are the grant flags in
+/// [`crate::component::OptionalImports`], so the cache is bounded by them.
+fn tool_linker(imports: crate::component::OptionalImports) -> Result<Arc<Linker<PluginState>>> {
+    type Linkers = std::sync::Mutex<
+        std::collections::HashMap<crate::component::OptionalImports, Arc<Linker<PluginState>>>,
+    >;
+    static LINKERS: OnceLock<Linkers> = OnceLock::new();
+    let mut linkers = LINKERS
+        .get_or_init(Linkers::default)
+        .lock()
+        // The map holds finished linkers only; a panic elsewhere cannot leave
+        // one half-built, so a poisoned lock is still sound to read.
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(linker) = linkers.get(&imports) {
+        return Ok(Arc::clone(linker));
+    }
+    let linker = Arc::new(base_linker(imports)?);
+    linkers.insert(imports, Arc::clone(&linker));
+    Ok(linker)
 }
 
 /// Compile and instantiate a tool plugin under one host-issued scope.
@@ -101,16 +110,12 @@ pub async fn create_plugin_with_egress(
             .with_granted_http()
             .with_egress_policy(egress),
     );
-    let http = store.data().http_enabled();
-    let linker = if http {
-        tool_linker_http()
-    } else {
-        tool_linker()
-    };
-    crate::component::ensure_http_coherent(&store, http)?;
+    let imports = crate::component::OptionalImports::for_store(store.data());
+    let linker = tool_linker(imports)?;
+    crate::component::ensure_imports_coherent(&store, imports)?;
     let bindings = call_store!(store, async move |store: &mut Store<PluginState>| {
         wt_instantiate(
-            ToolPlugin::instantiate_async(store, &component, linker).await,
+            ToolPlugin::instantiate_async(store, &component, &linker).await,
             "failed to instantiate tool plugin",
         )
     })?;

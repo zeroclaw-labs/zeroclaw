@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
-use std::net::IpAddr;
+use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use crate::agent::loop_::scrub_for_export;
@@ -9,18 +10,40 @@ use crate::hooks::traits::{HookHandler, HookResult};
 use zeroclaw_api::hook::ToolCallHookContext;
 use zeroclaw_api::tool::ToolResult;
 use zeroclaw_config::schema::WebhookAuditConfig;
+use zeroclaw_infra::net_guard::{Nat64Prefix, PrivateNetworkAccess, ResolvedDestination};
 
-fn validate_webhook_url(url: &str) -> Result<(), String> {
-    let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid webhook URL: {e}"))?;
+struct WebhookUrlPolicy {
+    url: reqwest::Url,
+    host: String,
+    port: u16,
+    private_access: PrivateNetworkAccess,
+}
+
+struct ValidatedWebhookTarget {
+    url: reqwest::Url,
+    destination: ResolvedDestination,
+}
+
+fn validate_webhook_url(
+    url: &str,
+    nat64_prefixes: &[Nat64Prefix],
+) -> Result<WebhookUrlPolicy, String> {
+    let mut parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid webhook URL: {e}"))?;
 
     let scheme = parsed.scheme();
-    let host_str = parsed.host_str().unwrap_or("");
+    let request_host = parsed
+        .host_str()
+        .ok_or_else(|| "webhook URL must include a host".to_string())?;
+    let host = zeroclaw_infra::net_guard::normalize_host(request_host)
+        .map_err(|error| format!("invalid webhook host: {error}"))?;
 
     // Scheme check: require https, allow http only for localhost in debug builds.
-    let is_localhost = host_str == "localhost" || host_str == "127.0.0.1" || host_str == "::1";
+    let is_debug_localhost = cfg!(debug_assertions)
+        && scheme == "http"
+        && matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1");
 
     if scheme != "https" {
-        if scheme == "http" && is_localhost && cfg!(debug_assertions) {
+        if is_debug_localhost {
             // Allow http://localhost in dev/debug builds.
         } else {
             return Err(format!(
@@ -29,73 +52,123 @@ fn validate_webhook_url(url: &str) -> Result<(), String> {
         }
     }
 
-    // Resolve the host to check for private/loopback/link-local IPs.
-    if let Some(host) = parsed.host_str() {
-        // Strip brackets from IPv6 literals.
-        let bare = host.trim_start_matches('[').trim_end_matches(']');
-        if let Ok(ip) = bare.parse::<IpAddr>() {
-            reject_private_ip(ip)?;
-        } else {
-            // Domain name — check for well-known loopback domains.
-            if bare == "localhost" && !(cfg!(debug_assertions) && scheme == "http") {
-                return Err("webhook URL must not target localhost".to_string());
-            }
-        }
+    let private_access = if is_debug_localhost {
+        PrivateNetworkAccess::Allow
+    } else {
+        PrivateNetworkAccess::Deny
+    };
+    if zeroclaw_infra::net_guard::is_private_or_local_host(&host)
+        && private_access == PrivateNetworkAccess::Deny
+    {
+        return Err(format!(
+            "webhook URL must not target private or local host ({host})"
+        ));
     }
 
-    Ok(())
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| "webhook URL must include a valid port".to_string())?;
+    if host.parse::<IpAddr>().is_err() {
+        parsed
+            .set_host(Some(&host))
+            .map_err(|_| "invalid webhook host".to_string())?;
+    }
+
+    // Literal addresses can be fully checked during construction. Hostnames
+    // are resolved and checked again for every delivery.
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        ResolvedDestination::new(
+            &host,
+            port,
+            [SocketAddr::new(ip, port)],
+            private_access,
+            nat64_prefixes,
+        )
+        .map_err(|error| format!("webhook destination rejected by network policy: {error}"))?;
+    }
+
+    Ok(WebhookUrlPolicy {
+        url: parsed,
+        host,
+        port,
+        private_access,
+    })
 }
 
-fn reject_private_ip(addr: IpAddr) -> Result<(), String> {
-    match addr {
-        IpAddr::V4(ip) => {
-            if ip.is_loopback() {
-                return Err(format!(
-                    "webhook URL must not target loopback address ({ip})"
-                ));
-            }
-            let octets = ip.octets();
-            // 10.0.0.0/8
-            if octets[0] == 10 {
-                return Err(format!(
-                    "webhook URL must not target private address ({ip})"
-                ));
-            }
-            // 172.16.0.0/12
-            if octets[0] == 172 && (octets[1] & 0xf0) == 16 {
-                return Err(format!(
-                    "webhook URL must not target private address ({ip})"
-                ));
-            }
-            // 192.168.0.0/16
-            if octets[0] == 192 && octets[1] == 168 {
-                return Err(format!(
-                    "webhook URL must not target private address ({ip})"
-                ));
-            }
-            // 169.254.0.0/16 (link-local)
-            if octets[0] == 169 && octets[1] == 254 {
-                return Err(format!(
-                    "webhook URL must not target link-local address ({ip})"
-                ));
-            }
-        }
-        IpAddr::V6(ip) => {
-            if ip.is_loopback() {
-                return Err(format!(
-                    "webhook URL must not target loopback address ({ip})"
-                ));
-            }
-            let segments = ip.segments();
-            // fe80::/10 (link-local)
-            if (segments[0] & 0xffc0) == 0xfe80 {
-                return Err(format!(
-                    "webhook URL must not target link-local address ({ip})"
-                ));
-            }
-        }
+async fn validate_webhook_target_with_resolver<F, Fut>(
+    raw_url: &str,
+    nat64_prefixes: &[Nat64Prefix],
+    resolve_host: F,
+) -> Result<ValidatedWebhookTarget, String>
+where
+    F: FnOnce(String, u16) -> Fut,
+    Fut: Future<Output = Result<Vec<SocketAddr>, String>>,
+{
+    let policy = validate_webhook_url(raw_url, nat64_prefixes)?;
+    let addresses = if let Ok(ip) = policy.host.parse::<IpAddr>() {
+        vec![SocketAddr::new(ip, policy.port)]
+    } else {
+        resolve_host(policy.host.clone(), policy.port).await?
+    };
+    let destination = ResolvedDestination::new(
+        &policy.host,
+        policy.port,
+        addresses,
+        policy.private_access,
+        nat64_prefixes,
+    )
+    .map_err(|error| format!("webhook destination rejected by network policy: {error}"))?;
+
+    Ok(ValidatedWebhookTarget {
+        url: policy.url,
+        destination,
+    })
+}
+
+async fn resolve_webhook_host(host: String, port: u16) -> Result<Vec<SocketAddr>, String> {
+    let addresses = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|_| "failed to resolve webhook destination".to_string())?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err("failed to resolve webhook destination".to_string());
     }
-    Ok(())
+    Ok(addresses)
+}
+
+fn build_webhook_client(target: &ValidatedWebhookTarget) -> Result<reqwest::Client, String> {
+    let builder = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5));
+    let builder = if target.destination.host().parse::<IpAddr>().is_ok() {
+        builder
+    } else {
+        builder.resolve_to_addrs(target.destination.host(), target.destination.addresses())
+    };
+    builder
+        .build()
+        .map_err(|_| "failed to build webhook HTTP client".to_string())
+}
+
+async fn post_webhook_payload_with_resolver<F, Fut>(
+    url: &str,
+    payload: &Value,
+    nat64_prefixes: &[Nat64Prefix],
+    resolve_host: F,
+) -> Result<reqwest::Response, String>
+where
+    F: FnOnce(String, u16) -> Fut,
+    Fut: Future<Output = Result<Vec<SocketAddr>, String>>,
+{
+    let target = validate_webhook_target_with_resolver(url, nat64_prefixes, resolve_host).await?;
+    let client = build_webhook_client(&target)?;
+    client
+        .post(target.url)
+        .json(payload)
+        .send()
+        .await
+        .map_err(|_| "failed to POST audit payload".to_string())
 }
 
 /// Sends an HTTP POST with a JSON audit payload for matching tool calls.
@@ -107,21 +180,27 @@ fn reject_private_ip(addr: IpAddr) -> Result<(), String> {
 /// timeout or cancellation.
 pub struct WebhookAuditHook {
     config: WebhookAuditConfig,
-    client: reqwest::Client,
+    nat64_prefixes: Vec<Nat64Prefix>,
 }
 
 impl WebhookAuditHook {
     pub fn new(config: WebhookAuditConfig) -> Result<Self, String> {
+        Self::new_with_nat64_prefixes(config, &[])
+    }
+
+    pub(crate) fn new_with_nat64_prefixes(
+        config: WebhookAuditConfig,
+        nat64_prefixes: &[Nat64Prefix],
+    ) -> Result<Self, String> {
         if config.url.is_empty() {
             return Err("webhook URL is required when webhook audit is enabled".to_string());
         }
-        validate_webhook_url(&config.url)?;
+        validate_webhook_url(&config.url, nat64_prefixes)?;
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .map_err(|e| format!("failed to build webhook HTTP client: {e}"))?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            nat64_prefixes: nat64_prefixes.to_vec(),
+        })
     }
 }
 
@@ -313,12 +392,19 @@ impl HookHandler for WebhookAuditHook {
             return;
         };
 
-        let client = self.client.clone();
         let url = self.config.url.clone();
+        let nat64_prefixes = self.nat64_prefixes.clone();
 
         // Fire-and-forget — never block the agent loop.
         zeroclaw_spawn::spawn!(async move {
-            match client.post(&url).json(&payload).send().await {
+            match post_webhook_payload_with_resolver(
+                &url,
+                &payload,
+                &nat64_prefixes,
+                resolve_webhook_host,
+            )
+            .await
+            {
                 Ok(resp) => {
                     if !resp.status().is_success() {
                         ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"hook": "webhook-audit", "url": url, "status": resp.status().to_string()})), "webhook endpoint returned non-success status");
@@ -867,41 +953,157 @@ mod tests {
 
     #[test]
     fn validate_url_rejects_loopback_ipv4() {
-        assert!(validate_webhook_url("https://127.0.0.1/hook").is_err());
-        assert!(validate_webhook_url("https://127.0.0.100/hook").is_err());
+        assert!(validate_webhook_url("https://127.0.0.1/hook", &[]).is_err());
+        assert!(validate_webhook_url("https://127.0.0.100/hook", &[]).is_err());
     }
 
     #[test]
     fn validate_url_rejects_loopback_ipv6() {
-        assert!(validate_webhook_url("https://[::1]/hook").is_err());
+        assert!(validate_webhook_url("https://[::1]/hook", &[]).is_err());
     }
 
     #[test]
     fn validate_url_rejects_private_rfc1918() {
-        assert!(validate_webhook_url("https://10.0.0.1/hook").is_err());
-        assert!(validate_webhook_url("https://172.16.5.1/hook").is_err());
-        assert!(validate_webhook_url("https://192.168.1.1/hook").is_err());
+        assert!(validate_webhook_url("https://10.0.0.1/hook", &[]).is_err());
+        assert!(validate_webhook_url("https://172.16.5.1/hook", &[]).is_err());
+        assert!(validate_webhook_url("https://192.168.1.1/hook", &[]).is_err());
     }
 
     #[test]
     fn validate_url_rejects_link_local() {
-        assert!(validate_webhook_url("https://169.254.1.1/hook").is_err());
-        assert!(validate_webhook_url("https://[fe80::1]/hook").is_err());
+        assert!(validate_webhook_url("https://169.254.1.1/hook", &[]).is_err());
+        assert!(validate_webhook_url("https://[fe80::1]/hook", &[]).is_err());
     }
 
     #[test]
     fn validate_url_rejects_http_non_localhost() {
-        assert!(validate_webhook_url("http://example.com/hook").is_err());
+        assert!(validate_webhook_url("http://example.com/hook", &[]).is_err());
+        assert!(validate_webhook_url("http://10.0.0.1/hook", &[]).is_err());
+        assert!(validate_webhook_url("http://127.0.0.2/hook", &[]).is_err());
+        assert!(validate_webhook_url("https://localhost/hook", &[]).is_err());
     }
 
     #[test]
     fn validate_url_accepts_https_public() {
-        assert!(validate_webhook_url("https://audit.example.com/webhook").is_ok());
-        assert!(validate_webhook_url("https://8.8.8.8/hook").is_ok());
+        assert!(validate_webhook_url("https://audit.example.com/webhook", &[]).is_ok());
+        assert!(validate_webhook_url("https://8.8.8.8/hook", &[]).is_ok());
     }
 
     #[test]
     fn validate_url_rejects_non_http_scheme() {
-        assert!(validate_webhook_url("ftp://example.com/hook").is_err());
+        assert!(validate_webhook_url("ftp://example.com/hook", &[]).is_err());
+    }
+
+    #[tokio::test]
+    async fn resolved_private_destination_is_rejected() {
+        let error = validate_webhook_target_with_resolver(
+            "https://audit.example.com/hook",
+            &[],
+            |_, port| async move {
+                Ok(vec![SocketAddr::new(
+                    "169.254.169.254".parse().expect("metadata fixture"),
+                    port,
+                )])
+            },
+        )
+        .await
+        .err()
+        .expect("metadata resolution must be rejected");
+
+        assert!(error.contains("metadata"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn answer_set_with_private_member_is_rejected() {
+        let error = validate_webhook_target_with_resolver(
+            "https://audit.example.com/hook",
+            &[],
+            |_, port| async move {
+                Ok(vec![
+                    SocketAddr::new("93.184.216.34".parse().expect("public fixture"), port),
+                    SocketAddr::new("10.0.0.1".parse().expect("private fixture"), port),
+                ])
+            },
+        )
+        .await
+        .err()
+        .expect("mixed resolution must be rejected");
+
+        assert!(error.contains("10.0.0.1"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn validated_public_answer_is_retained_as_dns_pin() {
+        let expected = SocketAddr::new("93.184.216.34".parse().expect("public fixture"), 443);
+        let target = validate_webhook_target_with_resolver(
+            "https://audit.example.com/hook",
+            &[],
+            |_, _| async move { Ok(vec![expected]) },
+        )
+        .await
+        .expect("public resolution must be accepted");
+
+        assert_eq!(target.destination.host(), "audit.example.com");
+        assert_eq!(target.destination.addresses(), &[expected]);
+    }
+
+    #[tokio::test]
+    async fn configured_nat64_prefix_blocks_embedded_metadata() {
+        let prefixes = zeroclaw_infra::net_guard::parse_nat64_prefixes(
+            &["2001:db8:122:344::/96".to_string()],
+            "test",
+        )
+        .expect("valid NAT64 fixture");
+        let translated: IpAddr = "2001:db8:122:344::a9fe:a9fe"
+            .parse()
+            .expect("translated metadata fixture");
+
+        let error = validate_webhook_target_with_resolver(
+            "https://audit.example.com/hook",
+            &prefixes,
+            |_, port| async move { Ok(vec![SocketAddr::new(translated, port)]) },
+        )
+        .await
+        .err()
+        .expect("translated metadata must be rejected");
+
+        assert!(error.contains("metadata"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn webhook_client_does_not_follow_redirects() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/redirect"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/final", server.uri())),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(path("/final"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let response = post_webhook_payload_with_resolver(
+            &format!("{}/redirect", server.uri()),
+            &serde_json::json!({"event": "test"}),
+            &[],
+            |_, _| async { Err("literal host must not be resolved".to_string()) },
+        )
+        .await
+        .expect("redirect response must be returned");
+
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        let requests = server
+            .received_requests()
+            .await
+            .expect("request recording enabled");
+        assert_eq!(requests.len(), 1, "redirect target must not be requested");
+        assert_eq!(requests[0].url.path(), "/redirect");
     }
 }

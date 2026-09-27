@@ -176,6 +176,8 @@ Before you write a single line of review, name out loud:
 
 The take-stock pass is what stops you from re-raising settled points and what surfaces who's actually waiting on what.
 
+Reconcile advisory findings against live evidence using the [automation override guidance](../maintainers/reviewer-playbook.md#automation-override).
+
 ## Label hygiene
 
 Labels are maintainer metadata, not a contributor blocker. If the right label is obvious and you have permission, fix it yourself before finalizing the review. If you are acting through an assistant, draft the exact label change and get the human reviewer's approval before mutating GitHub.
@@ -223,6 +225,7 @@ verdict:
 
 | Situation | Verdict flag |
 |---|---|
+| The only confirmed problem is a merge conflict that prevents merging or meaningful review | `--comment` with one concise refresh request and defer deeper review; independently established substantive defects may still warrant `--request-changes` |
 | Your review is approving, the template/truthfulness checks are satisfied, and prior substantive concerns are resolved, dismissed, stale, or explicitly reconciled in your review | `--approve` |
 | Your review is rejecting on substantive grounds you'd block on personally | `--request-changes` |
 | The PR's central intended result is a visual presentation change, but actual-interface smoke or required screenshot evidence is missing | `--request-changes` |
@@ -294,6 +297,10 @@ the required gate reports.
 <!-- >>> end generated:review-ci-freshness-policy <<< -->
 
 ## Validation evidence gaps
+
+An evidence hold withholds approval because required evidence is missing or stale; it is not automatically an author blocker. Reserve `--request-changes` for a gap that leaves the central behavior unproven, requires an author-owned code, design, or test change or author-only proof, or leaves materially false PR-body claims that a maintainer cannot safely correct from public exact-head evidence. Otherwise, name the missing evidence and withhold approval with `--comment`.
+
+Correct or propose deterministic public-record repairs from public exact-head evidence as maintainer-owned cleanup, including stale validation wording. Do not turn them into author work or apply `needs-author-action` when the next step is not author-owned. Before treating screenshots from an earlier head as stale, apply the [behavior-preserving refresh rule](./user-boundary-proof.md#reuse-evidence-after-a-refresh).
 
 <!-- >>> generated:review-validation-evidence-gaps by `cargo generate review-docs` - do not edit <<< -->
 When validation is the concern, identify the exact evidence gap instead of asking for "full Cargo" by reflex. Check the current required CI jobs and the changed surface, then ask for extra validation only where required CI does not prove the thing under review: tests for a platform that only received compile checks, Clippy for a platform or path outside the required lint job, desktop coverage when the desktop workflow did not trigger, release targets outside the PR matrix, stale CI beyond the base-drift-only case classified above, or unavailable CI.

@@ -760,6 +760,7 @@ mod tests {
             admission_policy: Default::default(),
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         }
     }
 
@@ -1042,6 +1043,7 @@ mod tests {
         SopRun {
             run_id: "r1".into(),
             sop_name: "g".into(),
+            initiating_agent: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,
@@ -1060,6 +1062,7 @@ mod tests {
             llm_calls_saved: 0,
             revision: 0,
             revision_base: 0,
+            decided_mode: None,
         }
     }
 

@@ -348,6 +348,17 @@ pub enum AgentsCommands {
         /// New agent alias (lowercase alphanumeric + single underscore)
         alias: String,
     },
+    /// Export an agent and the config closure it needs to a portable bundle
+    Export {
+        /// Agent alias to export
+        alias: String,
+        /// Destination bundle directory (created if it does not exist)
+        #[arg(long, short)]
+        out: std::path::PathBuf,
+        /// Replace the contents of a destination directory that already has files
+        #[arg(long)]
+        force: bool,
+    },
     /// Rename an agent alias, rewriting every reference to it
     Rename {
         /// Current alias
@@ -1087,6 +1098,17 @@ pub enum SopCommands {
     },
     /// List SOP runs currently waiting for approval (talks to the running daemon)
     Pending,
+    /// Show persisted logs for one SOP run (talks to the running daemon)
+    Logs {
+        /// The run ID to inspect
+        run_id: String,
+        /// Maximum number of newest matching events to return
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        /// Print the complete gateway response as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Render an SOP's node graph as text
     Graph {
         /// Name of the SOP to render
@@ -1099,6 +1121,13 @@ pub enum SopCommands {
     Delete {
         /// Name of the SOP to delete
         name: String,
+    },
+    /// Rename an SOP definition on disk
+    Rename {
+        /// Name the SOP is stored under today
+        from: String,
+        /// Name to move it to (must not already be taken)
+        to: String,
     },
 }
 

@@ -32,6 +32,7 @@ pub mod policy;
 pub mod policy_gate;
 #[cfg(feature = "memory-postgres")]
 pub mod postgres;
+pub mod principal_plane;
 pub mod qdrant;
 pub mod redact;
 pub mod rerank;
@@ -63,6 +64,7 @@ pub use policy::PolicyEnforcer;
 #[cfg(feature = "memory-postgres")]
 #[allow(unused_imports)]
 pub use postgres::PostgresMemory;
+pub use principal_plane::PrincipalPlaneMemory;
 pub use qdrant::QdrantMemory;
 pub use rerank::{RerankConfig, RerankStrategy};
 pub use response_cache::ResponseCache;

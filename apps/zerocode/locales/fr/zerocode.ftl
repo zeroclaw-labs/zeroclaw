@@ -422,8 +422,10 @@ zc-chat-resyncing = Des mises à jour en direct ont été manquées. Rechargemen
 zc-chat-resynced = Des mises à jour en direct ont été manquées ; la conversation persistante a donc été rechargée. Toute approbation ou question en cours a été annulée.
 zc-chat-resync-failed = Des mises à jour en direct ont été manquées et la session n’a pas pu être rechargée : { $error }
 zc-chat-session-restart-error = Échec du démarrage d'une nouvelle session : { $error }
-zc-chat-code-cwd-unavailable = Impossible de déterminer le répertoire depuis lequel zerocode a été lancé : { $error }. Une session Code locale doit démarrer dans ce projet, elle n'a donc pas été créée.
-zc-chat-code-cwd-not-utf8 = Le répertoire depuis lequel zerocode a été lancé n'est pas un UTF-8 valide ({ $path }), une session Code locale ne peut donc pas y démarrer. Relancez zerocode depuis un chemin UTF-8.
+zc-chat-code-cwd-not-utf8 = Le répertoire sélectionné n'est pas un UTF-8 valide ({ $path }), la session Code n'a donc pas été créée. Choisissez un répertoire dont le chemin est un UTF-8 valide.
+zc-chat-code-cwd-not-absolute = Le répertoire sélectionné n'est pas un chemin absolu ({ $path }), la nouvelle session Code n'a donc pas été créée. Choisissez un répertoire depuis la racine du système de fichiers sur lequel la session s'exécute.
+zc-chat-change-directory-error = Échec du démarrage d'une session dans le répertoire sélectionné : { $error }
+zc-chat-change-directory-chat-only = Les sessions Chat suivent l'espace de travail de l'agent sélectionné : il n'y a donc aucun répertoire à choisir ici. Utilisez le panneau Code pour démarrer une session dans un autre répertoire.
 zc-chat-thinking-visible = Sortie de réflexion : visible
 zc-chat-thinking-hidden = Sortie de réflexion : masquée
 zc-model-picker-hint = Tapez un nom de modèle après /model, ou Tab pour l'autocomplétion.
@@ -436,6 +438,7 @@ zc-model-switch-provider-ok = model_provider changé pour { $provider } (modèle
 zc-model-switch-failed = Échec du changement de modèle : { $error }
 zc-model-catalog-no-provider = Impossible de résoudre le model_provider de cet agent à partir de la configuration.
 zc-model-catalog-empty = Aucun modèle disponible pour le model_provider actif.
+zc-model-catalog-failed = Impossible de charger les modèles du model_provider actif : { $error }
 zc-model-catalog-loading = Chargement des modèles…
 zc-model-provider-catalog-failed = Impossible de charger les model_providers : { $error }
 zc-chat-label-you = Vous :
@@ -461,8 +464,10 @@ zc-chat-help-yank-selection = Copier la sélection
 zc-chat-help-return-to-input = Revenir à la saisie
 zc-chat-help-browse-mode = Mode navigation
 zc-chat-help-scroll-conversation = Faire défiler la conversation
+zc-chat-help-open-link = Cliquez sur un lien pour l’ouvrir ; faites glisser depuis ailleurs pour sélectionner du texte
 zc-chat-help-toggle-thoughts = Basculer les réflexions
 zc-chat-help-new-session = Nouvelle session
+zc-chat-help-change-directory = Choisissez un répertoire et démarrez une nouvelle session Code
 zc-chat-session-list-resume-title = Sessions enregistrées (Entrée=reprendre, Échap=nouveau)
 zc-chat-session-list-switch-title = Sessions (Entrée=changer, Échap=fermer)
 zc-elicit-help-toggle = Basculer le choix
@@ -479,6 +484,10 @@ zc-chat-copied-clipboard = Copié dans le presse-papiers
 zc-chat-copy-message = [Copier]
 zc-chat-copy-message-copied = [Copié]
 zc-chat-context-menu-copy = Copier
+zc-chat-context-menu-copy-selection = Copier la sélection
+zc-chat-context-menu-open-link = Ouvrir le lien
+zc-chat-context-menu-copy-link = Copier le lien
+zc-chat-open-link-failed = Impossible d’ouvrir le lien : { $error }
 zc-chat-context-menu-send-now = Envoyer maintenant
 zc-chat-context-menu-edit = Modifier
 zc-chat-context-menu-delete = Supprimer
@@ -573,6 +582,11 @@ zc-config-footer-action-help = aide
 zc-config-footer-action-new-line = nouvelle ligne
 zc-config-field-edit-hint = { $keys } → appuyez pour modifier
 zc-doctor-log-path = log : { $path }
+
+zc-oidc-enroll-visit = Pour vous connecter, ouvrez { $uri } et saisissez le code { $code }
+zc-oidc-enroll-waiting = En attente de l'approbation du fournisseur d'identité (le code expire dans { $seconds } secondes)...
+zc-oidc-enroll-missing-url = auth_provider { $provider } est défini sans auth_token. Définissez [connection.wss] enroll_url sur l'origine HTTP de la passerelle pour vous connecter interactivement, ou exportez ZEROCLAW_AUTH_TOKEN (voir : zeroclaw oidc login).
+zc-oidc-enroll-done = Connecté. Le jeton n'est conservé que pour cette session ; exportez ZEROCLAW_AUTH_TOKEN pour éviter une nouvelle inscription.
 
 ## Config registry metadata. Stable identifiers are used for lookup while the
 ## RPC-provided English display strings remain compatibility fallbacks.

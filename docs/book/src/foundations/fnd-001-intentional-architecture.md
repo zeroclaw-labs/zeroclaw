@@ -353,7 +353,7 @@ Every release target enables exactly one backend: `cranelift` where it is suppor
 Two flags require a deliberate team decision before the v0.8.0 release and are surfaced here rather than resolved unilaterally:
 
 - **`observability-prometheus`**: currently in `default`. Prometheus metrics add measurable binary size overhead. The question is whether a production runtime should ship observability on by default, or whether operators opt in. Recommendation: keep in `default` for the standard release; operators on severely size-constrained targets can build with `--no-default-features`.
-- **`observability-otel`**: OTLP export carries a larger dependency footprint (opentelemetry + reqwest blocking client). Recommendation: remains opt-in, not in `default`. Production deployments that need trace export enable it explicitly.
+- **`observability-otel`**: OTLP trace, metric, and log export carries a larger dependency footprint (opentelemetry + reqwest blocking client). Recommendation: remains opt-in, not in `default`. Production deployments that need native OTLP export enable it explicitly.
 
 The `ci-all` meta-feature simplifies substantially as channel and tool flags retire. By v1.0.0 it covers only the remaining platform and infrastructure flags.
 

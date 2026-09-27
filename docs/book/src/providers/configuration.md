@@ -109,8 +109,7 @@ output headroom. The fields have separate owners:
   not an input-history limit.
 - `runtime_profiles.astra.max_context_tokens` is ZeroClaw's estimated local
   trimming threshold. It may be smaller than `context_window`.
-- `runtime_profiles.astra.max_tool_iterations` limits the agentic tool loop,
-  while `max_history_messages` separately bounds retained message count.
+- `runtime_profiles.astra.max_tool_iterations` limits the agentic tool loop, while `max_history_messages` separately bounds retained complete user turns, including their tool exchanges. The channel sender cache retains its separate row-based limit.
 - `runtime.reasoning_effort` is the global provider-facing reasoning level.
   ZeroClaw currently accepts `minimal`, `low`, `medium`, `high`, and `xhigh`.
   Astra's public API accepts `low`, `medium`, `high`, `xhigh`, and `max`, so use

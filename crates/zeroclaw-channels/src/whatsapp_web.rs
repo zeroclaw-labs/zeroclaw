@@ -377,6 +377,10 @@ pub struct WhatsAppWebChannel {
     /// When true, allowed unaddressed group messages become context-only
     /// history entries instead of being dropped.
     passive_group_context: bool,
+    /// Whether outgoing PDF documents get a first-page preview. Read from
+    /// `[channels.whatsapp.<alias>].document_thumbnails` in
+    /// [`WhatsAppWebChannel::new`].
+    document_thumbnails: bool,
     /// Bot phone number (digits only), resolved from pair_phone or device identity at runtime
     bot_phone: Arc<Mutex<Option<String>>>,
     /// Bot LID number (digits only), resolved from device identity at runtime
@@ -489,6 +493,7 @@ impl WhatsAppWebChannel {
         let push_name = config.push_name.clone();
         let mention_only = config.mention_only;
         let passive_group_context = config.passive_group_context;
+        let document_thumbnails = config.document_thumbnails;
         let mode = config.mode.clone();
         let dm_policy = config.dm_policy.clone();
         let group_policy = config.group_policy.clone();
@@ -551,6 +556,7 @@ impl WhatsAppWebChannel {
             peer_resolver,
             mention_only,
             passive_group_context,
+            document_thumbnails,
             bot_phone: Arc::new(Mutex::new(bot_phone)),
             bot_lid: Arc::new(Mutex::new(None)),
             mode,
@@ -1753,6 +1759,48 @@ impl WhatsAppWebChannel {
         String::new()
     }
 
+    /// Hold `content` as this chat's pending voice reply, unless something says
+    /// it must not be spoken. Returns the reason it was not queued.
+    ///
+    /// The refusal happens before the queue is touched, which is the whole
+    /// point: a suppressed notice must not overwrite the conversational reply
+    /// already waiting to be spoken, nor push its timer out by arriving.
+    #[cfg(feature = "whatsapp-web")]
+    fn queue_pending_voice(
+        &self,
+        recipient: &str,
+        content: &str,
+        suppress_voice: bool,
+    ) -> Option<&'static str> {
+        let skip = Self::voice_queue_skip_reason(suppress_voice, content);
+        if skip.is_none()
+            && let Ok(mut pv) = self.pending_voice.lock()
+        {
+            pv.insert(
+                recipient.to_string(),
+                (content.to_string(), std::time::Instant::now()),
+            );
+        }
+        skip
+    }
+
+    /// Why an outbound message must not join the automatic voice queue, or
+    /// `None` when it may.
+    ///
+    /// `suppress_voice` is asked first and on its own terms: the sender of a
+    /// system notice or of an explicitly text-only reply has already decided,
+    /// and that decision does not depend on what the text looks like. It is
+    /// answered before the queue is touched, so a suppressed message cannot
+    /// replace the conversational reply already waiting there, nor push its
+    /// timer out by arriving.
+    #[cfg(feature = "whatsapp-web")]
+    fn voice_queue_skip_reason(suppress_voice: bool, content: &str) -> Option<&'static str> {
+        if suppress_voice {
+            return Some("suppress_voice");
+        }
+        crate::util::voice_reply_skip_reason(content)
+    }
+
     #[cfg(feature = "whatsapp-web")]
     fn group_context_scope(
         passive_group_context: bool,
@@ -1922,6 +1970,7 @@ impl WhatsAppWebChannel {
         to: &wacore_binary::jid::Jid,
         marker: &WhatsAppMediaMarker,
         path: &Path,
+        document_thumbnails: bool,
     ) -> Result<()> {
         let bytes = tokio::fs::read(path)
             .await
@@ -1939,10 +1988,27 @@ impl WhatsAppWebChannel {
         };
 
         use whatsapp_rust::upload::UploadOptions;
-        let upload = client
-            .upload(bytes, media_type, UploadOptions::default())
-            .await
-            .map_err(|e| anyhow::Error::msg(format!("WhatsApp media upload failed: {e}")))?;
+        // The preview is rendered and uploaded while the file uploads, so it
+        // adds latency only when it outlasts the upload, bounded by the
+        // preview timeouts. Its upload is encrypted under the document's
+        // media key, so the key is chosen here rather than by the library.
+        let wants_preview = wants_document_preview(document_thumbnails, marker.kind, &mime);
+        let media_key: [u8; 32] = rand::random();
+        let options = if wants_preview {
+            UploadOptions::default().with_media_key(media_key)
+        } else {
+            UploadOptions::default()
+        };
+        let (upload, preview) =
+            tokio::join!(Box::pin(client.upload(bytes, media_type, options)), async {
+                if wants_preview {
+                    document_preview(client, path, &media_key).await
+                } else {
+                    DocumentPreview::default()
+                }
+            });
+        let upload =
+            upload.map_err(|e| anyhow::Error::msg(format!("WhatsApp media upload failed: {e}")))?;
 
         let media_key = upload.media_key.to_vec();
         let file_enc_sha256 = upload.file_enc_sha256.to_vec();
@@ -2007,20 +2073,21 @@ impl WhatsAppWebChannel {
                     .and_then(|name| name.to_str())
                     .unwrap_or("attachment")
                     .to_string();
+                let mut document = waproto::whatsapp::message::DocumentMessage {
+                    url: Some(upload.url),
+                    direct_path: Some(upload.direct_path),
+                    media_key: Some(media_key),
+                    file_enc_sha256: Some(file_enc_sha256),
+                    file_sha256: Some(file_sha256),
+                    file_length: Some(upload.file_length),
+                    mimetype: Some(mime),
+                    file_name: Some(file_name.clone()),
+                    title: Some(file_name),
+                    ..Default::default()
+                };
+                preview.apply_to(&mut document);
                 waproto::whatsapp::Message {
-                    document_message: waproto::whatsapp::message::DocumentMessage {
-                        url: Some(upload.url),
-                        direct_path: Some(upload.direct_path),
-                        media_key: Some(media_key),
-                        file_enc_sha256: Some(file_enc_sha256),
-                        file_sha256: Some(file_sha256),
-                        file_length: Some(upload.file_length),
-                        mimetype: Some(mime),
-                        file_name: Some(file_name.clone()),
-                        title: Some(file_name),
-                        ..Default::default()
-                    }
-                    .into(),
+                    document_message: document.into(),
                     ..Default::default()
                 }
             }
@@ -2375,6 +2442,489 @@ enum WhatsAppMediaKind {
     Video,
     Audio,
     Voice,
+}
+
+/// Upper bound for each preview step (a tool run, or the whole preview
+/// upload). The preview is best-effort, so a slow or stuck step must not hold
+/// up the document it decorates.
+///
+/// For the upload this is a budget for the host loop, not the deadline that
+/// stops a request: dropping a future cannot cancel work already handed to a
+/// blocking client. The deadline that does the stopping is
+/// [`DOCUMENT_THUMBNAIL_TIMEOUT_SECS`], enforced by the transport itself.
+#[cfg(feature = "whatsapp-web")]
+const DOCUMENT_PREVIEW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Transport deadlines for one thumbnail upload request.
+///
+/// The thumbnail is decoration: a CDN host that accepts the connection and
+/// then says nothing must cost the document a few seconds, not the send. These
+/// are deliberately shorter than anything the document's own upload uses, and
+/// they are enforced by the HTTP client, so the request ends rather than being
+/// abandoned while it runs on.
+#[cfg(feature = "whatsapp-web")]
+const DOCUMENT_THUMBNAIL_TIMEOUT_SECS: u64 = 4;
+
+#[cfg(feature = "whatsapp-web")]
+const DOCUMENT_THUMBNAIL_CONNECT_TIMEOUT_SECS: u64 = 2;
+
+/// Longest side of the JPEG carried inline in the message. Phones drop a
+/// larger inline preview (a 600 px one never showed), so this stays at the
+/// size the official apps send.
+#[cfg(feature = "whatsapp-web")]
+const DOCUMENT_PREVIEW_INLINE_SIDE: u32 = 96;
+
+/// Longest side of the preview uploaded next to the document. Phones download
+/// it to draw the card sharply; the inline one alone looks blurred there.
+#[cfg(feature = "whatsapp-web")]
+const DOCUMENT_PREVIEW_UPLOAD_SIDE: u32 = 480;
+
+/// The inline JPEG travels in the message itself.
+#[cfg(feature = "whatsapp-web")]
+const DOCUMENT_PREVIEW_INLINE_MAX_BYTES: usize = 16 * 1024;
+
+#[cfg(feature = "whatsapp-web")]
+const DOCUMENT_PREVIEW_UPLOAD_MAX_BYTES: usize = 96 * 1024;
+
+/// HKDF info for a document's uploaded preview. It is encrypted with the
+/// document's own media key; `wacore::download::MediaType` has no variant for
+/// it, so the upload is done here.
+#[cfg(feature = "whatsapp-web")]
+const DOCUMENT_THUMBNAIL_KEY_INFO: &[u8] = b"WhatsApp Document Thumbnail Keys";
+
+#[cfg(feature = "whatsapp-web")]
+const DOCUMENT_THUMBNAIL_UPLOAD_PATH: &str = "/mms/thumbnail-document";
+
+/// First-page preview metadata for an outgoing document card. Every part may
+/// be missing; whatever is present is attached.
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DocumentPreview {
+    inline: Option<DocumentThumbnail>,
+    uploaded: Option<UploadedThumbnail>,
+    page_count: Option<u32>,
+}
+
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, PartialEq, Eq)]
+struct DocumentThumbnail {
+    jpeg: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+/// Where the uploaded preview lives and how the recipient checks it.
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, PartialEq, Eq)]
+struct UploadedThumbnail {
+    direct_path: String,
+    sha256: [u8; 32],
+    enc_sha256: [u8; 32],
+    width: u32,
+    height: u32,
+}
+
+/// Page 1 rendered at both sizes, before anything is uploaded.
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RenderedPreview {
+    inline: Option<DocumentThumbnail>,
+    upload: Option<DocumentThumbnail>,
+    page_count: Option<u32>,
+}
+
+/// Media ciphertext as WhatsApp stores it: AES-256-CBC, then a 10-byte
+/// truncated HMAC-SHA256, with the hashes the message carries.
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug)]
+struct EncryptedBlob {
+    data: Vec<u8>,
+    sha256: [u8; 32],
+    enc_sha256: [u8; 32],
+}
+
+#[cfg(feature = "whatsapp-web")]
+impl DocumentPreview {
+    fn apply_to(self, document: &mut waproto::whatsapp::message::DocumentMessage) {
+        if let Some(inline) = self.inline {
+            document.thumbnail_width = Some(inline.width);
+            document.thumbnail_height = Some(inline.height);
+            document.jpeg_thumbnail = Some(inline.jpeg);
+        }
+        // The declared size is that of the best preview on offer.
+        if let Some(uploaded) = self.uploaded {
+            document.thumbnail_width = Some(uploaded.width);
+            document.thumbnail_height = Some(uploaded.height);
+            document.thumbnail_direct_path = Some(uploaded.direct_path);
+            document.thumbnail_sha256 = Some(uploaded.sha256.to_vec());
+            document.thumbnail_enc_sha256 = Some(uploaded.enc_sha256.to_vec());
+        }
+        if let Some(page_count) = self.page_count {
+            document.page_count = Some(page_count);
+        }
+    }
+}
+
+#[cfg(feature = "whatsapp-web")]
+impl DocumentThumbnail {
+    fn from_jpeg(jpeg: Vec<u8>, max_bytes: usize) -> Option<Self> {
+        if jpeg.is_empty() || jpeg.len() > max_bytes {
+            return None;
+        }
+        let (width, height) = jpeg_dimensions(&jpeg)?;
+        Some(Self {
+            jpeg,
+            width,
+            height,
+        })
+    }
+}
+
+/// Only PDF documents get a preview, and only when the operator enabled it.
+#[cfg(feature = "whatsapp-web")]
+fn wants_document_preview(enabled: bool, kind: WhatsAppMediaKind, mime: &str) -> bool {
+    enabled && matches!(kind, WhatsAppMediaKind::Document) && mime == "application/pdf"
+}
+
+/// Render the preview of the PDF at `path` and upload its larger copy under
+/// `media_key`, the key the document itself is uploaded with. Never fails:
+/// each part that cannot be produced is left empty.
+#[cfg(feature = "whatsapp-web")]
+async fn document_preview(
+    client: &whatsapp_rust::Client,
+    path: &Path,
+    media_key: &[u8; 32],
+) -> DocumentPreview {
+    let rendered = render_pdf_preview(path).await;
+    let uploaded = match rendered.upload {
+        Some(thumbnail) => {
+            match tokio::time::timeout(
+                DOCUMENT_PREVIEW_TIMEOUT,
+                upload_document_thumbnail(client, media_key, thumbnail),
+            )
+            .await
+            {
+                Ok(Ok(uploaded)) => Some(uploaded),
+                Ok(Err(reason)) => {
+                    note_preview_skipped("thumbnail-upload", &reason);
+                    None
+                }
+                Err(_) => {
+                    note_preview_skipped(
+                        "thumbnail-upload",
+                        &format!("timed out after {DOCUMENT_PREVIEW_TIMEOUT:?}"),
+                    );
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    DocumentPreview {
+        inline: rendered.inline,
+        uploaded,
+        page_count: rendered.page_count,
+    }
+}
+
+/// Render page 1 of the PDF at `path` at the inline and upload sizes, and read
+/// its page count, using `pdftoppm` and `pdfinfo` from poppler-utils. A
+/// missing tool, a non-zero exit, a timeout, or unusable output leaves that
+/// part empty.
+#[cfg(feature = "whatsapp-web")]
+async fn render_pdf_preview(path: &Path) -> RenderedPreview {
+    // The official apps send a progressive inline JPEG; the uploaded copy is
+    // a plain baseline one.
+    let inline_args = pdftoppm_args(path, DOCUMENT_PREVIEW_INLINE_SIDE, true);
+    let upload_args = pdftoppm_args(path, DOCUMENT_PREVIEW_UPLOAD_SIDE, false);
+    let info_args = [path.as_os_str().to_os_string()];
+    let (inline, upload, info) = tokio::join!(
+        run_preview_tool("pdftoppm", &inline_args, DOCUMENT_PREVIEW_TIMEOUT),
+        run_preview_tool("pdftoppm", &upload_args, DOCUMENT_PREVIEW_TIMEOUT),
+        run_preview_tool("pdfinfo", &info_args, DOCUMENT_PREVIEW_TIMEOUT),
+    );
+
+    let page_count = match info {
+        Ok(stdout) => pdfinfo_page_count(&String::from_utf8_lossy(&stdout)),
+        Err(reason) => {
+            note_preview_skipped("pdfinfo", &reason);
+            None
+        }
+    };
+    RenderedPreview {
+        inline: rendered_thumbnail(inline, DOCUMENT_PREVIEW_INLINE_MAX_BYTES),
+        upload: rendered_thumbnail(upload, DOCUMENT_PREVIEW_UPLOAD_MAX_BYTES),
+        page_count,
+    }
+}
+
+#[cfg(feature = "whatsapp-web")]
+fn pdftoppm_args(path: &Path, max_side: u32, progressive: bool) -> Vec<std::ffi::OsString> {
+    let jpeg_options = if progressive {
+        "quality=70,progressive=y"
+    } else {
+        "quality=75"
+    };
+    let mut args: Vec<std::ffi::OsString> = [
+        "-f",
+        "1",
+        "-l",
+        "1",
+        "-singlefile",
+        "-jpeg",
+        "-jpegopt",
+        jpeg_options,
+        "-scale-to",
+    ]
+    .into_iter()
+    .map(Into::into)
+    .collect();
+    args.push(max_side.to_string().into());
+    args.push(path.as_os_str().to_os_string());
+    args
+}
+
+#[cfg(feature = "whatsapp-web")]
+fn rendered_thumbnail(
+    render: std::result::Result<Vec<u8>, String>,
+    max_bytes: usize,
+) -> Option<DocumentThumbnail> {
+    match render {
+        Ok(jpeg) => {
+            let thumbnail = DocumentThumbnail::from_jpeg(jpeg, max_bytes);
+            if thumbnail.is_none() {
+                note_preview_skipped(
+                    "pdftoppm",
+                    "output was not a usable JPEG within the size cap",
+                );
+            }
+            thumbnail
+        }
+        Err(reason) => {
+            note_preview_skipped("pdftoppm", &reason);
+            None
+        }
+    }
+}
+
+/// Encrypt `plaintext` the way WhatsApp media is encrypted, with keys expanded
+/// from `media_key` under `info`.
+#[cfg(feature = "whatsapp-web")]
+fn encrypt_media_blob(
+    media_key: &[u8; 32],
+    info: &[u8],
+    plaintext: &[u8],
+) -> std::result::Result<EncryptedBlob, String> {
+    use sha2::Digest as _;
+
+    let mut expanded = [0u8; 112];
+    wacore::crypto::hkdf_sha256_into(media_key, None, info, &mut expanded)
+        .map_err(|e| format!("key expansion failed: {e}"))?;
+    let (iv, rest) = expanded.split_at(16);
+    let (cipher_key, rest) = rest.split_at(32);
+    let mac_key = &rest[..32];
+
+    let mut data = Vec::with_capacity(plaintext.len() + 32);
+    wacore::libsignal::crypto::aes_256_cbc_encrypt_into(plaintext, cipher_key, iv, &mut data)
+        .map_err(|e| format!("encryption failed: {e}"))?;
+    let mac = wacore::libsignal::crypto::hmac_sha256_two_part(mac_key, iv, &data);
+    data.extend_from_slice(&mac[..10]);
+    Ok(EncryptedBlob {
+        sha256: sha2::Sha256::digest(plaintext).into(),
+        enc_sha256: sha2::Sha256::digest(&data).into(),
+        data,
+    })
+}
+
+/// Encrypt the preview under the document's key and upload it to the media
+/// hosts, trying each once. The error never includes the upload URL, which
+/// carries the media auth token.
+#[cfg(feature = "whatsapp-web")]
+async fn upload_document_thumbnail(
+    client: &whatsapp_rust::Client,
+    media_key: &[u8; 32],
+    thumbnail: DocumentThumbnail,
+) -> std::result::Result<UploadedThumbnail, String> {
+    use base64::Engine as _;
+
+    let blob = encrypt_media_blob(media_key, DOCUMENT_THUMBNAIL_KEY_INFO, &thumbnail.jpeg)?;
+    let conn = client
+        .refresh_media_conn(false)
+        .await
+        .map_err(|_| "could not get media hosts".to_string())?;
+    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob.enc_sha256);
+    let body = bytes::Bytes::from(blob.data);
+    let requests: Vec<wacore::net::HttpRequest> = conn
+        .hosts
+        .iter()
+        .map(|host| document_thumbnail_upload_request(&host.hostname, &conn.auth, &token))
+        .collect();
+    // Not the client the library uses for media: that one runs a blocking
+    // request under `spawn_blocking` with no deadline of its own, so a host
+    // that stops responding leaves the request running after this future is
+    // dropped. This one carries its own deadlines, and dropping it ends the
+    // request.
+    let http = zeroclaw_config::schema::build_channel_proxy_client_with_timeouts(
+        "channel.whatsapp.document_thumbnail",
+        None,
+        DOCUMENT_THUMBNAIL_TIMEOUT_SECS,
+        DOCUMENT_THUMBNAIL_CONNECT_TIMEOUT_SECS,
+    );
+    let direct_path = post_document_thumbnail(&http, &requests, body).await?;
+    Ok(UploadedThumbnail {
+        direct_path,
+        sha256: blob.sha256,
+        enc_sha256: blob.enc_sha256,
+        width: thumbnail.width,
+        height: thumbnail.height,
+    })
+}
+
+/// POST the encrypted thumbnail to each media host in turn, returning the
+/// `direct_path` the first one that accepts it reports.
+///
+/// Takes the composed requests rather than hostnames: the caller owns where
+/// the thumbnail goes, and this owns what happens on the wire, which is what
+/// lets the transport behaviour be exercised against a real socket. Everything
+/// above it needs a paired client, and none of it decides what a host that
+/// goes quiet costs the document.
+#[cfg(feature = "whatsapp-web")]
+async fn post_document_thumbnail(
+    http: &reqwest::Client,
+    requests: &[wacore::net::HttpRequest],
+    body: bytes::Bytes,
+) -> std::result::Result<String, String> {
+    let mut last_error = "no media hosts".to_string();
+    for request in requests {
+        let mut post = http.post(&request.url).body(body.clone());
+        for (key, value) in &request.headers {
+            post = post.header(key, value);
+        }
+        match post.send().await {
+            Ok(response) if response.status() == reqwest::StatusCode::OK => {
+                match response.bytes().await {
+                    Ok(payload) => match upload_response_direct_path(&payload) {
+                        Some(direct_path) => return Ok(direct_path),
+                        None => last_error = "upload response had no direct_path".to_string(),
+                    },
+                    Err(_) => last_error = "upload response body could not be read".to_string(),
+                }
+            }
+            Ok(response) => last_error = format!("upload returned {}", response.status().as_u16()),
+            // The deadline lands here, as an ordinary request failure: the
+            // request is over, and the next host gets its own budget.
+            Err(e) if e.is_timeout() => {
+                last_error = format!("upload timed out after {DOCUMENT_THUMBNAIL_TIMEOUT_SECS}s");
+            }
+            Err(_) => last_error = "upload request failed".to_string(),
+        }
+    }
+    Err(last_error)
+}
+
+#[cfg(feature = "whatsapp-web")]
+fn document_thumbnail_upload_request(
+    hostname: &str,
+    auth: &str,
+    token: &str,
+) -> wacore::net::HttpRequest {
+    wacore::net::HttpRequest::post(format!(
+        "https://{hostname}{DOCUMENT_THUMBNAIL_UPLOAD_PATH}/{token}?auth={auth}&token={token}"
+    ))
+    .with_header("Content-Type", "application/octet-stream")
+    .with_header("Origin", wacore::net::WHATSAPP_WEB_ORIGIN)
+}
+
+#[cfg(feature = "whatsapp-web")]
+fn upload_response_direct_path(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()?
+        .get("direct_path")?
+        .as_str()
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+}
+
+/// Run one preview tool and return its stdout, or why it could not be used.
+/// The reason never includes the document path.
+#[cfg(feature = "whatsapp-web")]
+async fn run_preview_tool(
+    program: &str,
+    args: &[std::ffi::OsString],
+    timeout: std::time::Duration,
+) -> std::result::Result<Vec<u8>, String> {
+    use std::process::Stdio;
+
+    let child = tokio::process::Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("could not start: {}", e.kind()))?;
+    let output = tokio::time::timeout(timeout, child.wait_with_output())
+        .await
+        .map_err(|_| format!("timed out after {timeout:?}"))?
+        .map_err(|e| format!("failed while running: {}", e.kind()))?;
+    if !output.status.success() {
+        return Err(format!("exited with {}", output.status));
+    }
+    Ok(output.stdout)
+}
+
+#[cfg(feature = "whatsapp-web")]
+fn note_preview_skipped(step: &str, reason: &str) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({ "step": step, "reason": reason })),
+        "whatsapp-web: document preview part skipped"
+    );
+}
+
+/// The `Pages:` line of `pdfinfo` output.
+#[cfg(feature = "whatsapp-web")]
+fn pdfinfo_page_count(stdout: &str) -> Option<u32> {
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Pages:"))
+        .and_then(|value| value.trim().parse().ok())
+        .filter(|pages| *pages > 0)
+}
+
+/// Width and height from the first start-of-frame segment of a JPEG.
+#[cfg(feature = "whatsapp-web")]
+fn jpeg_dimensions(jpeg: &[u8]) -> Option<(u32, u32)> {
+    if !jpeg.starts_with(&[0xFF, 0xD8]) {
+        return None;
+    }
+    let mut pos = 2;
+    while pos + 4 <= jpeg.len() {
+        if jpeg[pos] != 0xFF {
+            return None;
+        }
+        let marker = jpeg[pos + 1];
+        // Fill bytes before a marker.
+        if marker == 0xFF {
+            pos += 1;
+            continue;
+        }
+        let length = usize::from(u16::from_be_bytes([jpeg[pos + 2], jpeg[pos + 3]]));
+        // SOF0..SOF15, except DHT (C4), JPG (C8) and DAC (CC).
+        if (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+            let frame = jpeg.get(pos + 4..pos + 9)?;
+            let height = u32::from(u16::from_be_bytes([frame[1], frame[2]]));
+            let width = u32::from(u16::from_be_bytes([frame[3], frame[4]]));
+            return (width > 0 && height > 0).then_some((width, height));
+        }
+        if length < 2 {
+            return None;
+        }
+        pos += 2 + length;
+    }
+    None
 }
 
 #[cfg(feature = "whatsapp-web")]
@@ -3029,7 +3579,8 @@ impl Channel for WhatsAppWebChannel {
             let content = &text_content;
             // Only queue substantive natural-language replies for voice.
             // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
-            let skip_reason = crate::util::voice_reply_skip_reason(content);
+            let skip_reason =
+                self.queue_pending_voice(&message.recipient, content, message.suppress_voice);
             if let Some(reason) = skip_reason {
                 // Stable literal per the logging contract: the classification
                 // and per-event measurements ride solely in `attributes` above.
@@ -3046,13 +3597,6 @@ impl Channel for WhatsAppWebChannel {
             }
 
             if skip_reason.is_none() {
-                if let Ok(mut pv) = self.pending_voice.lock() {
-                    pv.insert(
-                        message.recipient.clone(),
-                        (content.clone(), std::time::Instant::now()),
-                    );
-                }
-
                 let pending = self.pending_voice.clone();
                 let voice_chats = self.voice_chats.clone();
                 let client_clone = client.clone();
@@ -3174,7 +3718,8 @@ impl Channel for WhatsAppWebChannel {
                             continue;
                         }
                     };
-                    Self::send_media_marker(&client, &to, media, &target).await
+                    Self::send_media_marker(&client, &to, media, &target, self.document_thumbnails)
+                        .await
                 }
             };
             match result {
@@ -8265,6 +8810,128 @@ mod tests {
         );
     }
 
+    // ── Automatic voice queue ──
+
+    #[cfg(feature = "whatsapp-web")]
+    fn voice_channel() -> WhatsAppWebChannel {
+        WhatsAppWebChannel::new(
+            &approval_cfg(300),
+            "alias",
+            Arc::new(Vec::new),
+            Arc::new(Vec::new),
+        )
+    }
+
+    /// Long enough and plain enough to pass the content heuristic, so what the
+    /// tests below observe is the suppression flag and nothing else.
+    #[cfg(feature = "whatsapp-web")]
+    const SPOKEN_REPLY: &str = "Sure, the tasting is on Friday at seven and there are still seats.";
+
+    /// A notice that says it must not be spoken is not spoken, however
+    /// conversational it reads. Producers that set this flag include SOP
+    /// approval notices and `send_via` against a text-only peer group.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn a_suppressed_message_never_reaches_the_voice_queue() {
+        let ch = voice_channel();
+
+        assert_eq!(
+            ch.queue_pending_voice("chat", SPOKEN_REPLY, true),
+            Some("suppress_voice")
+        );
+        assert!(
+            ch.pending_voice.lock().expect("lock").is_empty(),
+            "a suppressed message queues nothing to synthesize"
+        );
+
+        // Positive control: the same text, unsuppressed, is queued.
+        assert_eq!(ch.queue_pending_voice("chat", SPOKEN_REPLY, false), None);
+        assert!(ch.pending_voice.lock().expect("lock").contains_key("chat"));
+    }
+
+    /// The reason suppression is answered before the queue is touched: a
+    /// notice arriving mid-conversation used to overwrite the reply waiting to
+    /// be spoken and restart its ten-second timer, so the chat heard the
+    /// notice instead of the answer, later.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn a_suppressed_notice_leaves_a_queued_reply_untouched() {
+        let ch = voice_channel();
+        ch.queue_pending_voice("chat", SPOKEN_REPLY, false);
+        let queued = ch
+            .pending_voice
+            .lock()
+            .expect("lock")
+            .get("chat")
+            .cloned()
+            .expect("queued");
+
+        ch.queue_pending_voice("chat", "Approval request expired.", true);
+
+        let after = ch
+            .pending_voice
+            .lock()
+            .expect("lock")
+            .get("chat")
+            .cloned()
+            .expect("still queued");
+        assert_eq!(after.0, queued.0, "the reply text is the one queued");
+        assert_eq!(after.1, queued.1, "and its timer was not restarted");
+    }
+
+    /// Suppression is a property of one message, not a sign that the
+    /// conversation went back to text: the chat stays marked, so the next
+    /// conversational reply is still spoken.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn suppression_does_not_end_the_voice_conversation() {
+        let ch = voice_channel();
+        ch.voice_chats
+            .lock()
+            .expect("lock")
+            .insert("chat".to_string());
+
+        ch.queue_pending_voice("chat", "Approval request expired.", true);
+
+        assert!(
+            ch.voice_chats.lock().expect("lock").contains("chat"),
+            "the chat is still a voice chat"
+        );
+        assert_eq!(ch.queue_pending_voice("chat", SPOKEN_REPLY, false), None);
+    }
+
+    /// The content heuristic is unchanged, and still applies when nothing is
+    /// suppressed.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn the_content_heuristic_still_decides_when_nothing_is_suppressed() {
+        for (content, reason) in [
+            (
+                "{\"status\": \"ok\", \"count\": 3, \"note\": \"a long json body\"}",
+                "json_object",
+            ),
+            (
+                "https://example.com/a/rather/long/link/to/somewhere/else",
+                "url_prefix",
+            ),
+            (
+                "Error: the upstream request timed out after thirty seconds",
+                "error_prefix",
+            ),
+            ("ok", "too_short"),
+        ] {
+            assert_eq!(
+                WhatsAppWebChannel::voice_queue_skip_reason(false, content),
+                Some(reason),
+                "{content}"
+            );
+        }
+        assert_eq!(
+            WhatsAppWebChannel::voice_queue_skip_reason(false, SPOKEN_REPLY),
+            None
+        );
+    }
+
     /// `approval_timeout_secs` reaches the channel from config, so every
     /// construction path picks it up rather than three call sites each
     /// remembering to.
@@ -8610,6 +9277,327 @@ mod tests {
         }
     }
 
+    // ── PDF document previews ──
+
+    /// A JPEG header carrying only what `jpeg_dimensions` reads: SOI, an
+    /// APP0 segment, optionally a DHT segment, then a start-of-frame marker.
+    #[cfg(feature = "whatsapp-web")]
+    fn jpeg_header(sof_marker: u8, width: u16, height: u16, with_dht: bool) -> Vec<u8> {
+        let mut jpeg = vec![0xFF, 0xD8];
+        jpeg.extend_from_slice(&[0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00]);
+        if with_dht {
+            jpeg.extend_from_slice(&[0xFF, 0xC4, 0x00, 0x04, 0x00, 0x00]);
+        }
+        jpeg.extend_from_slice(&[0xFF, sof_marker, 0x00, 0x11, 0x08]);
+        jpeg.extend_from_slice(&height.to_be_bytes());
+        jpeg.extend_from_slice(&width.to_be_bytes());
+        jpeg.extend_from_slice(&[0x03; 12]);
+        jpeg
+    }
+
+    /// A minimal three-page PDF, so the preview can be exercised end to end
+    /// without a fixture file.
+    #[cfg(feature = "whatsapp-web")]
+    fn three_page_pdf() -> Vec<u8> {
+        let mut objects = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>".to_string(),
+        ];
+        for _ in 0..3 {
+            objects.push(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R >>"
+                    .to_string(),
+            );
+        }
+        let stream = "0.2 0.4 0.8 rg 72 420 468 200 re f";
+        objects.push(format!(
+            "<< /Length {} >>\nstream\n{stream}\nendstream",
+            stream.len()
+        ));
+
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+        );
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn tool_on_path(program: &str) -> bool {
+        std::env::var_os("PATH").is_some_and(|paths| {
+            std::env::split_paths(&paths).any(|dir| dir.join(program).is_file())
+        })
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn document_thumbnails_are_off_by_default() {
+        assert!(!zeroclaw_config::schema::WhatsAppConfig::default().document_thumbnails);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn jpeg_dimensions_reads_the_start_of_frame() {
+        assert_eq!(
+            jpeg_dimensions(&jpeg_header(0xC0, 464, 600, false)),
+            Some((464, 600))
+        );
+        assert_eq!(
+            jpeg_dimensions(&jpeg_header(0xC2, 600, 338, false)),
+            Some((600, 338)),
+            "progressive JPEGs carry the size in SOF2"
+        );
+        assert_eq!(
+            jpeg_dimensions(&jpeg_header(0xC0, 464, 600, true)),
+            Some((464, 600)),
+            "a DHT segment (0xC4) is not a frame header and must be skipped"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn jpeg_dimensions_rejects_malformed_input() {
+        let full = jpeg_header(0xC0, 464, 600, false);
+        for bytes in [
+            &b""[..],
+            &b"%PDF-1.4"[..],
+            &full[..full.len() - 14],
+            &jpeg_header(0xC0, 0, 600, false)[..],
+        ] {
+            assert_eq!(jpeg_dimensions(bytes), None);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn pdfinfo_page_count_reads_the_pages_line() {
+        let stdout =
+            "Producer:        example\nPages:           12\nPage size:       612 x 792 pts\n";
+        assert_eq!(pdfinfo_page_count(stdout), Some(12));
+        assert_eq!(pdfinfo_page_count("Producer: example\n"), None);
+        assert_eq!(pdfinfo_page_count("Pages:           0\n"), None);
+        assert_eq!(pdfinfo_page_count("Pages:           many\n"), None);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn thumbnail_is_dropped_when_empty_oversized_or_unreadable() {
+        let jpeg = jpeg_header(0xC0, 75, 96, false);
+        let thumbnail =
+            DocumentThumbnail::from_jpeg(jpeg.clone(), DOCUMENT_PREVIEW_INLINE_MAX_BYTES)
+                .expect("valid JPEG");
+        assert_eq!((thumbnail.width, thumbnail.height), (75, 96));
+
+        assert!(
+            DocumentThumbnail::from_jpeg(Vec::new(), DOCUMENT_PREVIEW_INLINE_MAX_BYTES).is_none()
+        );
+        assert!(
+            DocumentThumbnail::from_jpeg(b"not a jpeg".to_vec(), DOCUMENT_PREVIEW_INLINE_MAX_BYTES)
+                .is_none()
+        );
+        let mut oversized = jpeg;
+        oversized.resize(DOCUMENT_PREVIEW_INLINE_MAX_BYTES + 1, 0);
+        assert!(
+            DocumentThumbnail::from_jpeg(oversized, DOCUMENT_PREVIEW_INLINE_MAX_BYTES).is_none()
+        );
+    }
+
+    /// The failure this guards is the one that does not look like a failure:
+    /// a media host that accepts the connection and then says nothing. An
+    /// `await` deadline around a request cannot end it, so the deadline has to
+    /// belong to the transport. What the caller must see is an error, soon,
+    /// after which the document goes out with the inline preview it already
+    /// has — the fallback `inline_only_preview_fills_the_card_with_its_own_size`
+    /// covers.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn a_silent_thumbnail_host_ends_the_request_rather_than_hanging() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let host = listener.local_addr().expect("addr").to_string();
+        // Take the request in full and then say nothing: the connection is
+        // open, the upload was accepted, and no status line ever comes. That is
+        // the shape the report names, and the one an `await` deadline around a
+        // blocking client cannot end.
+        let silent = ::zeroclaw_spawn::spawn!(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut scratch = [0u8; 1024];
+            let _read = tokio::io::AsyncReadExt::read(&mut socket, &mut scratch).await;
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(500))
+            .connect_timeout(std::time::Duration::from_millis(500))
+            .build()
+            .expect("client");
+
+        let started = std::time::Instant::now();
+        let result = post_document_thumbnail(
+            &http,
+            &[wacore::net::HttpRequest::post(format!(
+                "http://{host}/upload"
+            ))],
+            bytes::Bytes::from_static(b"encrypted thumbnail"),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        silent.abort();
+
+        assert!(
+            result.is_err(),
+            "a host that never answers cannot report a direct_path"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the request ended on its own deadline rather than outliving the send, in {elapsed:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn inline_only_preview_fills_the_card_with_its_own_size() {
+        let jpeg = jpeg_header(0xC2, 75, 96, false);
+        let mut document = waproto::whatsapp::message::DocumentMessage::default();
+        DocumentPreview {
+            inline: DocumentThumbnail::from_jpeg(jpeg.clone(), DOCUMENT_PREVIEW_INLINE_MAX_BYTES),
+            uploaded: None,
+            page_count: Some(3),
+        }
+        .apply_to(&mut document);
+        assert_eq!(document.jpeg_thumbnail.as_deref(), Some(&jpeg[..]));
+        assert_eq!(document.thumbnail_width, Some(75));
+        assert_eq!(document.thumbnail_height, Some(96));
+        assert_eq!(document.page_count, Some(3));
+        assert_eq!(document.thumbnail_direct_path, None);
+
+        let mut untouched = waproto::whatsapp::message::DocumentMessage::default();
+        DocumentPreview::default().apply_to(&mut untouched);
+        assert_eq!(
+            untouched,
+            waproto::whatsapp::message::DocumentMessage::default(),
+            "no preview must leave the card exactly as it was"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn uploaded_preview_is_referenced_and_sets_the_card_size() {
+        let jpeg = jpeg_header(0xC2, 75, 96, false);
+        let mut document = waproto::whatsapp::message::DocumentMessage::default();
+        DocumentPreview {
+            inline: DocumentThumbnail::from_jpeg(jpeg.clone(), DOCUMENT_PREVIEW_INLINE_MAX_BYTES),
+            uploaded: Some(UploadedThumbnail {
+                direct_path: "/v/t62.example/thumbnail.enc".into(),
+                sha256: [1; 32],
+                enc_sha256: [2; 32],
+                width: 371,
+                height: 480,
+            }),
+            page_count: Some(3),
+        }
+        .apply_to(&mut document);
+        assert_eq!(document.jpeg_thumbnail.as_deref(), Some(&jpeg[..]));
+        assert_eq!(
+            document.thumbnail_direct_path.as_deref(),
+            Some("/v/t62.example/thumbnail.enc")
+        );
+        assert_eq!(document.thumbnail_sha256, Some(vec![1; 32]));
+        assert_eq!(document.thumbnail_enc_sha256, Some(vec![2; 32]));
+        assert_eq!(
+            (document.thumbnail_width, document.thumbnail_height),
+            (Some(371), Some(480)),
+            "the card size is that of the uploaded preview"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn media_blob_encryption_matches_the_library_scheme() {
+        // Link thumbnails are a type the library encrypts itself, so the two
+        // outputs must agree byte for byte under the same key and info.
+        let key = [7u8; 32];
+        let plaintext = jpeg_header(0xC0, 371, 480, false);
+        let ours = encrypt_media_blob(&key, b"WhatsApp Link Thumbnail Keys", &plaintext)
+            .expect("encrypts");
+        let library = wacore::upload::encrypt_media_with_key(
+            &plaintext,
+            wacore::download::MediaType::LinkThumbnail,
+            Some(&key),
+        )
+        .expect("library encrypts");
+        assert_eq!(ours.data, library.data_to_upload);
+        assert_eq!(ours.sha256, library.file_sha256);
+        assert_eq!(ours.enc_sha256, library.file_enc_sha256);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn document_thumbnail_is_not_encrypted_with_the_document_keys() {
+        let key = [7u8; 32];
+        let plaintext = jpeg_header(0xC0, 371, 480, false);
+        let blob =
+            encrypt_media_blob(&key, DOCUMENT_THUMBNAIL_KEY_INFO, &plaintext).expect("encrypts");
+        assert!(
+            wacore::download::DownloadUtils::verify_and_decrypt(
+                &blob.data,
+                &key,
+                wacore::download::MediaType::Document
+            )
+            .is_err(),
+            "phones reject a preview encrypted with the document's own keys"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn document_thumbnail_upload_goes_to_the_thumbnail_path() {
+        let request = document_thumbnail_upload_request("media.example.net", "auth-1", "tok");
+        assert_eq!(request.method, "POST");
+        assert_eq!(
+            request.url,
+            "https://media.example.net/mms/thumbnail-document/tok?auth=auth-1&token=tok"
+        );
+        assert_eq!(
+            request.headers.get("Content-Type").map(String::as_str),
+            Some("application/octet-stream")
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn upload_response_yields_the_direct_path() {
+        assert_eq!(
+            upload_response_direct_path(
+                br#"{"url":"https://media.example.net/v/t62/x.enc","direct_path":"/v/t62/x.enc"}"#
+            )
+            .as_deref(),
+            Some("/v/t62/x.enc")
+        );
+        assert_eq!(upload_response_direct_path(br#"{"url":"x"}"#), None);
+        assert_eq!(upload_response_direct_path(br#"{"direct_path":""}"#), None);
+        assert_eq!(upload_response_direct_path(b"<html>"), None);
+    }
+
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn markdown_inline_markers_collapse_to_whatsapp_syntax() {
@@ -8755,6 +9743,89 @@ mod tests {
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
+    fn pdftoppm_renders_page_one_at_the_requested_size() {
+        let path = Path::new("/tmp/example.pdf");
+        let inline = pdftoppm_args(path, DOCUMENT_PREVIEW_INLINE_SIDE, true);
+        let upload = pdftoppm_args(path, DOCUMENT_PREVIEW_UPLOAD_SIDE, false);
+        let as_strs = |args: &[std::ffi::OsString]| {
+            args.iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        let inline = as_strs(&inline);
+        let upload = as_strs(&upload);
+        for args in [&inline, &upload] {
+            assert_eq!(&args[..4], ["-f", "1", "-l", "1"]);
+            assert_eq!(args.last().map(String::as_str), Some("/tmp/example.pdf"));
+        }
+        assert!(inline.contains(&"96".to_string()));
+        assert!(inline.contains(&"quality=70,progressive=y".to_string()));
+        assert!(upload.contains(&"480".to_string()));
+        assert!(upload.contains(&"quality=75".to_string()));
+    }
+
+    #[tokio::test]
+    #[cfg(all(feature = "whatsapp-web", unix))]
+    async fn preview_tool_failures_are_reported_not_raised() {
+        let short = std::time::Duration::from_millis(200);
+
+        let missing = run_preview_tool("zeroclaw-no-such-preview-tool", &[], short)
+            .await
+            .expect_err("a missing tool is an error value");
+        assert!(missing.contains("could not start"), "{missing}");
+
+        let failed = run_preview_tool("false", &[], short)
+            .await
+            .expect_err("a non-zero exit is an error value");
+        assert!(failed.contains("exited"), "{failed}");
+
+        let started = std::time::Instant::now();
+        let slow = run_preview_tool("sleep", &["5".into()], short)
+            .await
+            .expect_err("a slow tool is cut off");
+        assert!(slow.contains("timed out"), "{slow}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn preview_of_an_unreadable_pdf_is_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("broken.pdf");
+        std::fs::write(&path, b"not a pdf").expect("write");
+        assert_eq!(render_pdf_preview(&path).await, RenderedPreview::default());
+    }
+
+    /// Runs only where poppler-utils is installed; elsewhere there is nothing
+    /// to render with and the other tests cover the fallback.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn preview_renders_the_first_page_when_poppler_is_installed() {
+        if !(tool_on_path("pdftoppm") && tool_on_path("pdfinfo")) {
+            eprintln!("skipping: pdftoppm/pdfinfo not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("example-spec-sheet.pdf");
+        std::fs::write(&path, three_page_pdf()).expect("write");
+
+        let preview = render_pdf_preview(&path).await;
+        assert_eq!(preview.page_count, Some(3));
+        for (thumbnail, side) in [
+            (preview.inline, DOCUMENT_PREVIEW_INLINE_SIDE),
+            (preview.upload, DOCUMENT_PREVIEW_UPLOAD_SIDE),
+        ] {
+            let thumbnail = thumbnail.expect("page 1 is rendered");
+            assert_eq!(thumbnail.width.max(thumbnail.height), side);
+            assert!(
+                thumbnail.width < thumbnail.height,
+                "letter pages are portrait"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
     fn bare_url_bytes_survive_unchanged() {
         let url = "https://example.test/a__b__c";
         assert_eq!(markdown_to_whatsapp(url), url);
@@ -8776,6 +9847,31 @@ mod tests {
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
+    fn only_enabled_pdf_documents_get_a_preview() {
+        assert!(wants_document_preview(
+            true,
+            WhatsAppMediaKind::Document,
+            "application/pdf"
+        ));
+        assert!(!wants_document_preview(
+            false,
+            WhatsAppMediaKind::Document,
+            "application/pdf"
+        ));
+        assert!(!wants_document_preview(
+            true,
+            WhatsAppMediaKind::Document,
+            "application/msword"
+        ));
+        assert!(!wants_document_preview(
+            true,
+            WhatsAppMediaKind::Image,
+            "application/pdf"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
     fn link_destination_keeps_balanced_parentheses() {
         assert_eq!(
             markdown_to_whatsapp("[docs](https://example.test/a_(b)/c)"),
@@ -8790,6 +9886,21 @@ mod tests {
             markdown_to_whatsapp("[docs](https://example.test/a_(b"),
             "[docs](https://example.test/a_(b"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn channel_takes_document_thumbnails_from_config() {
+        for enabled in [false, true] {
+            let cfg = zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                session_path: Some("/tmp/test-whatsapp.db".into()),
+                document_thumbnails: enabled,
+                ..Default::default()
+            };
+            let ch = WhatsAppWebChannel::new(&cfg, "alias", Arc::new(Vec::new), Arc::new(Vec::new));
+            assert_eq!(ch.document_thumbnails, enabled);
+        }
     }
 
     #[test]
