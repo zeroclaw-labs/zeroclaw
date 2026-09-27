@@ -2896,7 +2896,7 @@ async fn safety_net_narration_reaches_both_draft_and_event_channels_once() {
 #[tokio::test]
 async fn safety_net_terminal_malformed_fallback_reaches_event_consumer_after_tool() {
     // A narrated valid tool round, then the malformed-protocol retry budget
-    // exhausts. The terminal fallback is the turn's last word on the event
+    // exhausts. The terminal diagnostic is the turn's last word on the event
     // channel: it must be emitted as a Chunk after the ToolResult, because a
     // client that already flushed streamed narration hides the TurnComplete
     // payload and would otherwise settle the turn with no explanation.
@@ -2924,13 +2924,19 @@ async fn safety_net_terminal_malformed_fallback_reaches_event_consumer_after_too
     while let Some(ev) = rx.recv().await {
         events.push(ev);
     }
-    handle
+    let error = handle
         .await
         .expect("task join")
-        .expect("turn should end with the safe fallback");
+        .expect_err("malformed tool protocol exhaustion must fail the turn");
+    assert!(
+        error
+            .error
+            .is::<crate::agent::turn::MalformedToolProtocolExhausted>()
+    );
 
     let fallback_text =
         crate::i18n::get_english_cli_string_with_args("channel-runtime-malformed-tool-output", &[]);
+    assert_eq!(error.committed_response, fallback_text);
     let pos_narration = events
         .iter()
         .position(|e| {
