@@ -16330,6 +16330,7 @@ model_provider = "custom.only"
 
         let switch_config = ProviderSwitchConfig {
             config: Some(Arc::new(config)),
+            live_config: None,
             live: None,
         };
         let mut agent = build_test_agent("openai.primary", "current-model", Some(switch_config));

@@ -6382,7 +6382,10 @@ mod sop_step_reassembly_tests {
     async fn same_agent_step_excludes_existing_breadcrumb_from_trim_turn_count() {
         let (engine, _run_id, action) = start_single_cross_agent_step("outer");
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let parent_provider = TextProvider;
         let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
