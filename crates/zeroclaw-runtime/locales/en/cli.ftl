@@ -165,6 +165,15 @@ cli-auth-login-about = Login with OAuth (OpenAI Codex, Gemini, or xAI)
 cli-auth-refresh-about = Refresh OAuth access token using refresh token
 cli-auth-logout-about = Remove auth profile
 cli-auth-use-about = Set active profile for a provider
+cli-oidc-unknown-alias = No [oidc.{ $alias }] entry in the config. Configured entries: { $known }
+cli-oidc-device-visit = To sign in, visit { $uri } and enter code { $code }
+cli-oidc-device-waiting = Waiting for identity-provider approval (the code expires in { $seconds } seconds)...
+cli-oidc-device-expired = The device code expired before approval; run the command again.
+cli-oidc-enrolled = Enrolled with [oidc.{ $alias }]. The access token is on stdout; present it as auth_token in the RPC handshake or export it as ZEROCLAW_AUTH_TOKEN.
+cli-oidc-token-expiry = The token expires in { $seconds } seconds.
+cli-oidc-browser-open = Opening your browser to sign in. If nothing opens, visit:
+    { $uri }
+cli-oidc-browser-waiting = Waiting for the browser sign-in to complete...
 cli-auth-list-about = List auth profiles
 cli-auth-status-about = Show auth status with active profile and token expiry info
 
@@ -485,6 +494,16 @@ cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" —
 cli-doctor-codex-auth-profile-no-slot = OpenAI Codex credentials are signed in but no model provider slot uses them. Set `requires_openai_auth = true` on an OpenAI provider slot and point an agent's `model_provider` at it, or run `zeroclaw quickstart`.
 cli-doctor-codex-auth-slot-no-profile = OpenAI slot(s) {$slots} set `requires_openai_auth = true` but no OpenAI Codex credentials are signed in. Run `zeroclaw auth login --provider openai-codex`.
 cli-doctor-codex-auth-ok = OpenAI Codex credentials are signed in and referenced by a model provider slot.
+# Bootstrap files over the per-file cap the agent-loop and channel prompt
+# paths apply while the agent's effective `compact_context` setting is on.
+# Prospective wording: ACP sessions load these files through a separate
+# 20000-char loader and AIEOS identities load none of them (see the
+# exclusions in `crates/zeroclaw-runtime/src/doctor/mod.rs`); the counts are
+# the per-file stage, before the whole-prompt budget, and the same counts
+# are logged under `agent.bootstrap_file_truncated` when a file is cut.
+cli-doctor-bootstrap-file-truncated-compact = [{$alias}] {$file}: on agent-loop and channel turns that inject it, the per-file cap retains {$retained} of {$total} chars ({$discarded} discarded, before the whole-prompt budget). compact_context is on for this agent and caps each bootstrap file at {$limit} chars. Set `compact_context = false` in `[runtime_profiles.{$profile}]`, or shorten the file.
+cli-doctor-bootstrap-file-truncated-compact-no-profile = [{$alias}] {$file}: on agent-loop and channel turns that inject it, the per-file cap retains {$retained} of {$total} chars ({$discarded} discarded, before the whole-prompt budget). compact_context is on for this agent (the default, no runtime profile assigned) and caps each bootstrap file at {$limit} chars. Add a `[runtime_profiles.<name>]` with `compact_context = false` and set `runtime_profile = "<name>"` on the agent, or shorten the file.
+cli-doctor-bootstrap-file-truncated = [{$alias}] {$file}: on agent-loop and channel turns that inject it, the per-file cap retains {$retained} of {$total} chars ({$discarded} discarded, before the whole-prompt budget). Each bootstrap file is capped at {$limit} chars; shorten the file.
 cli-doctor-systemd-linger-enabled = systemd user lingering enabled
 cli-doctor-systemd-linger-disabled = systemd user lingering disabled; user service may stop after logout. Enable with: loginctl enable-linger {$user}
 cli-doctor-systemd-linger-unknown = systemd user lingering could not be checked with loginctl
@@ -1033,6 +1052,7 @@ turn-model-fallback-notice = ⚡ { $requested_model } ({ $requested_provider }) 
 # Shown at the end of agent output when the tool call loop exhausted its
 # iteration budget and the agent cannot continue without exceeding limits.
 turn-max-iterations-reached = *Turn stopped: reached maximum tool iterations ({ $max_iterations }).*
+turn-execution-tree-budget-reached = *Turn stopped: exhausted the execution-tree iteration budget.*
 turn-context-window-exceeded-error = This request exceeds the selected model's context window. Reduce the request or enabled tools, or choose a model with a larger context window.
 # Breadcrumb injected into history where older turns were dropped to fit the
 # context budget; user-visible across channels, WS, RPC, ACP.

@@ -154,6 +154,15 @@ cli-auth-login-about = Iniciar sesión con OAuth (OpenAI Codex, Gemini o xAI)
 cli-auth-refresh-about = Actualizar el token de acceso OAuth usando el token de actualización
 cli-auth-logout-about = Eliminar perfil de autenticación
 cli-auth-use-about = Establecer el perfil activo para un proveedor
+cli-oidc-unknown-alias = No hay una entrada [oidc.{ $alias }] en la configuración. Entradas configuradas: { $known }
+cli-oidc-device-visit = Para iniciar sesión, abre { $uri } e introduce el código { $code }
+cli-oidc-device-waiting = Esperando la aprobación del proveedor de identidad (el código caduca en { $seconds } segundos)...
+cli-oidc-device-expired = El código de dispositivo caducó antes de la aprobación; ejecuta el comando de nuevo.
+cli-oidc-enrolled = Inscrito con [oidc.{ $alias }]. El token de acceso está en stdout; preséntalo como auth_token en el handshake RPC o expórtalo como ZEROCLAW_AUTH_TOKEN.
+cli-oidc-token-expiry = El token caduca en { $seconds } segundos.
+cli-oidc-browser-open = Abriendo tu navegador para iniciar sesión. Si no se abre nada, visita:
+    { $uri }
+cli-oidc-browser-waiting = Esperando a que termine el inicio de sesión en el navegador...
 cli-auth-list-about = Listar perfiles de autenticación
 cli-auth-status-about = Mostrar el estado de autenticación con el perfil activo e información de caducidad del token
 cli-memory-list-about = Lista entradas de memoria con filtros opcionales
@@ -430,6 +439,9 @@ cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" —
 cli-doctor-codex-auth-profile-no-slot = Las credenciales de OpenAI Codex tienen sesión iniciada, pero ningún slot de proveedor de modelo las usa. Establece `requires_openai_auth = true` en un slot de proveedor OpenAI y apunta el `model_provider` de un agente a él, o ejecuta `zeroclaw quickstart`.
 cli-doctor-codex-auth-slot-no-profile = Los slots OpenAI {$slots} tienen `requires_openai_auth = true`, pero no hay credenciales de OpenAI Codex con sesión iniciada. Ejecuta `zeroclaw auth login --provider openai-codex`.
 cli-doctor-codex-auth-ok = Las credenciales de OpenAI Codex tienen sesión iniciada y están referenciadas por un slot de proveedor de modelo.
+cli-doctor-bootstrap-file-truncated-compact = [{$alias}] {$file}: en los turnos del bucle de agente y de canales que lo inyectan, el límite por archivo retiene {$retained} de {$total} caracteres ({$discarded} descartados, antes del presupuesto de todo el prompt). compact_context está activado para este agente y limita cada archivo de arranque a {$limit} caracteres. Establece `compact_context = false` en `[runtime_profiles.{$profile}]` o acorta el archivo.
+cli-doctor-bootstrap-file-truncated-compact-no-profile = [{$alias}] {$file}: en los turnos del bucle de agente y de canales que lo inyectan, el límite por archivo retiene {$retained} de {$total} caracteres ({$discarded} descartados, antes del presupuesto de todo el prompt). compact_context está activado para este agente (el valor predeterminado, sin perfil de ejecución asignado) y limita cada archivo de arranque a {$limit} caracteres. Añade un `[runtime_profiles.<name>]` con `compact_context = false` y asigna `runtime_profile = "<name>"` al agente, o acorta el archivo.
+cli-doctor-bootstrap-file-truncated = [{$alias}] {$file}: en los turnos del bucle de agente y de canales que lo inyectan, el límite por archivo retiene {$retained} de {$total} caracteres ({$discarded} descartados, antes del presupuesto de todo el prompt). Cada archivo de arranque está limitado a {$limit} caracteres; acorta el archivo.
 cli-doctor-systemd-linger-enabled = la permanencia de usuario de systemd está habilitada
 cli-doctor-systemd-linger-disabled = la permanencia de usuario de systemd está deshabilitada; el servicio de usuario puede detenerse tras cerrar sesión. Habilítala con: loginctl enable-linger {$user}
 cli-doctor-systemd-linger-unknown = no se pudo comprobar la permanencia de usuario de systemd con loginctl

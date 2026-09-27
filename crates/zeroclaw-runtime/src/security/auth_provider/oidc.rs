@@ -54,8 +54,10 @@ const JWKS_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
 const JWKS_CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// Bound all untrusted OIDC metadata and introspection payloads, even when a
-/// peer omits Content-Length or uses chunked transfer encoding.
-const MAX_OIDC_RESPONSE_BYTES: usize = 1024 * 1024;
+/// peer omits Content-Length or uses chunked transfer encoding. Shared with
+/// the enrollment sibling, which reads the same untrusted IdP documents and
+/// bounds them to the same ceiling.
+pub(super) const MAX_OIDC_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// A JWKS is an untrusted network document; cap its key cardinality before
 /// materializing the selection map.
@@ -302,7 +304,12 @@ fn is_loopback_host(host: &str) -> bool {
 /// OIDC discovery endpoints are token-verification roots of trust. Apply the
 /// same HTTPS/exact-loopback transport rule as the configured issuer before
 /// a request can carry a bearer token or client credentials.
-fn validate_discovered_endpoint(endpoint: &str, field: &str) -> anyhow::Result<()> {
+/// The canonical URL policy for an endpoint a discovery document advertises:
+/// `https`, or `http` for an exact loopback host only, never with userinfo.
+/// Shared with the enrollment client, which must hold the endpoints it sends
+/// credentials to to the same rule the daemon holds its verification
+/// endpoints to.
+pub(super) fn validate_discovered_endpoint(endpoint: &str, field: &str) -> anyhow::Result<()> {
     let url = reqwest::Url::parse(endpoint)
         .map_err(|e| anyhow::Error::msg(format!("invalid discovery {field}: {e}")))?;
     if !url.username().is_empty() || url.password().is_some() {
@@ -318,7 +325,12 @@ fn validate_discovered_endpoint(endpoint: &str, field: &str) -> anyhow::Result<(
     }
 }
 
-async fn read_response_limited(mut response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
+/// Read a response body whole, refusing anything past
+/// [`MAX_OIDC_RESPONSE_BYTES`] whether or not the peer declares a
+/// Content-Length. Shared with the enrollment sibling.
+pub(super) async fn read_response_limited(
+    mut response: reqwest::Response,
+) -> anyhow::Result<Vec<u8>> {
     if response
         .content_length()
         .is_some_and(|len| len > MAX_OIDC_RESPONSE_BYTES as u64)
@@ -913,7 +925,10 @@ mod tests {
     }
 
     async fn start_idp() -> TestIdp {
-        let server = MockServer::start().await;
+        // Keep this authority's port owned until the test ends. A pooled server
+        // can hand the same port to another parallel test while a client still
+        // holds its issuer URL.
+        let server = MockServer::builder().start().await;
         let issuer = server.uri();
         let rng = SystemRandom::new();
         let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
@@ -1211,7 +1226,7 @@ mod tests {
         for surface in ["discovery", "jwks", "introspection"] {
             for status in [302, 307, 308] {
                 let idp = start_idp().await;
-                let sink = MockServer::start().await;
+                let sink = MockServer::builder().start().await;
                 Mock::given(path("/capture"))
                     .respond_with(ResponseTemplate::new(200))
                     .expect(0)
@@ -1261,22 +1276,24 @@ mod tests {
                         b"token=opaque-token&token_type_hint=access_token"
                     );
                 }
-                // `MockServer::start` hands out servers from wiremock's
-                // process-wide pool, and a pooled listener outlives the test
-                // that last used it. Under an in-process parallel run another
-                // test's late request can therefore land on this sink, so only
-                // a request to the redirect target itself counts as a followed
-                // redirect.
-                let followed = sink
+                let unexpected: Vec<_> = sink
                     .received_requests()
                     .await
                     .unwrap()
-                    .into_iter()
-                    .filter(|request| request.url.path() == "/capture")
-                    .count();
-                assert_eq!(
-                    followed, 0,
-                    "{surface} status {status} must not deliver any request to the redirect target"
+                    .iter()
+                    .map(|request| {
+                        format!(
+                            "{} {} authorization={} body_present={}",
+                            request.method,
+                            request.url.path(),
+                            request.headers.contains_key("authorization"),
+                            !request.body.is_empty()
+                        )
+                    })
+                    .collect();
+                assert!(
+                    unexpected.is_empty(),
+                    "{surface} status {status} must not deliver any request to the redirect target; observed {unexpected:?}"
                 );
             }
         }
@@ -2225,7 +2242,7 @@ mod tests {
 
     #[tokio::test]
     async fn discovery_issuer_mismatch_fails_closed() {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let issuer = server.uri();
         Mock::given(method("GET"))
             .and(path("/.well-known/openid-configuration"))
@@ -2432,12 +2449,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unreachable_idp_fails_closed() {
+    async fn introspection_transport_failure_fails_closed() {
         let idp = start_idp().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/introspect", listener.local_addr().unwrap());
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": idp.issuer,
+                "introspection_endpoint": endpoint,
+            })))
+            .with_priority(1)
+            .mount(&idp.server)
+            .await;
+        let refusing_endpoint = ::zeroclaw_spawn::spawn!(async move {
+            while let Ok((connection, _)) = listener.accept().await {
+                drop(connection);
+            }
+        });
         let provider = idp.provider(OidcValidation::Introspection);
         assert!(provider.discovery().await.is_ok(), "warm discovery first");
-        drop(idp.server);
         let out = provider.verify(&bearer("opaque-token")).await;
+        refusing_endpoint.abort();
+        let _ = refusing_endpoint.await;
         assert!(matches!(
             out,
             AuthOutcome::Denied {

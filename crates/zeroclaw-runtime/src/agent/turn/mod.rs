@@ -73,6 +73,7 @@ pub(crate) use stream_consume::consume_provider_streaming_response;
 pub(crate) use tool_specs::{IterationToolSpecs, build_iteration_tool_specs};
 pub(crate) use vision_route::{prepare_messages_for_iteration, resolve_vision_provider};
 
+use crate::agent::execution_tree_budget::{ExecutionTreeBudget, ExecutionTreeReservation};
 use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
 use crate::agent::tool_execution::{
     ToolDispatchContext, execute_tools_parallel, execute_tools_sequential,
@@ -223,16 +224,6 @@ fn replace_tool_protocol_section(
     }
 }
 
-fn try_reserve_shared_iteration(budget: &std::sync::atomic::AtomicUsize) -> bool {
-    budget
-        .fetch_update(
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-            |remaining| remaining.checked_sub(1),
-        )
-        .is_ok()
-}
-
 pub struct ToolLoop<'a> {
     /// The resolved per-agent execution context: model binding, gated tool
     /// registry, approval, observability, and resolved runtime knobs. Stable
@@ -264,7 +255,7 @@ pub struct ToolLoop<'a> {
     pub channel_reply_target: Option<&'a str>,
     pub cancellation_token: Option<CancellationToken>,
     pub on_delta: Option<tokio::sync::mpsc::Sender<DraftEvent>>,
-    pub shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    pub shared_budget: Option<ExecutionTreeBudget>,
     pub channel: Option<&'a dyn Channel>,
     pub collected_receipts: Option<&'a std::sync::Mutex<Vec<String>>>,
     pub event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
@@ -340,7 +331,7 @@ async fn projected_provider_facing_tokens(
         .round() as usize
 }
 
-struct ReportedRequestUsage {
+pub(crate) struct ReportedRequestUsage {
     provider_name: String,
     model: String,
     reported_tokens: usize,
@@ -536,6 +527,8 @@ async fn enforce_reported_budget(
     context_token_budget: usize,
     event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
     observer: &dyn crate::observability::Observer,
+    agent_alias: Option<&str>,
+    turn_id: &str,
     // The multimodal boundary the NEXT request will re-normalize retained
     // history through. A short `[IMAGE:...]` marker in raw history can become a
     // large base64 provider payload, so selection and the recount must describe
@@ -760,8 +753,8 @@ async fn enforce_reported_budget(
                 kept_turns: result.kept_turns,
                 reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
                 channel: None,
-                agent_alias: None,
-                turn_id: None,
+                agent_alias: agent_alias.map(str::to_string),
+                turn_id: Some(turn_id.to_string()),
                 token_budget: Some(context_token_budget as u64),
                 tokens_before: Some(tokens_before as u64),
                 tokens_after: Some(result.tokens_after as u64),
@@ -1194,19 +1187,52 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             return Err(ToolLoopCancelled.into());
         }
 
-        // Shared iteration budget: parent + subagents share a global counter
-        if let Some(ref budget) = shared_budget
-            && !try_reserve_shared_iteration(budget)
-        {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_category(::zeroclaw_log::EventCategory::Agent)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"iteration": iteration})),
-                "Shared iteration budget exhausted at iteration"
-            );
-            break;
+        if let Some(budget) = shared_budget.as_ref() {
+            match budget.reserve() {
+                Ok(ExecutionTreeReservation::Iteration) => {}
+                Ok(ExecutionTreeReservation::FinalCompletion) => {
+                    let mut final_knobs = knobs.clone();
+                    final_knobs.max_iteration_behavior = MaxIterationBehavior::GracefulSummary;
+                    let summary_result = finish_after_max_iterations(
+                        model_provider,
+                        turn_state.history,
+                        provider_name,
+                        model,
+                        dispatch_model,
+                        temperature,
+                        pacing,
+                        cancellation_token.as_ref(),
+                        max_iter::CompletionLimit::ExecutionTree,
+                        accumulated_display_text,
+                        turn_id,
+                        &final_knobs,
+                        event_tx.as_ref(),
+                        on_delta.as_ref(),
+                        turn_state.canonical.as_deref_mut(),
+                        config,
+                        multimodal_config,
+                        hooks,
+                        image_cache.as_deref_mut(),
+                        |provider, selected_model| {
+                            resolve_context_limits_for_call(
+                                context_limits_resolver.as_ref(),
+                                config,
+                                agent_alias,
+                                provider,
+                                selected_model,
+                                context_limits,
+                            )
+                        },
+                        &mut turn_state.crumb_present,
+                        pending_reported_usage,
+                        observer,
+                    )
+                    .await;
+                    *history_has_trim_breadcrumb = turn_state.crumb_present;
+                    return summary_result;
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
 
         preflight_history_maintenance(turn_state.history);
@@ -1630,8 +1656,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     kept_turns: trim_result.kept_turns,
                     reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
                     channel: None,
-                    agent_alias: None,
-                    turn_id: None,
+                    agent_alias: agent_alias.map(str::to_string),
+                    turn_id: Some(turn_id.to_string()),
                     token_budget: Some(event_budget as u64),
                     tokens_before: Some(tokens_before_dispatch),
                     tokens_after: Some(tokens_after_dispatch),
@@ -1668,8 +1694,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     kept_turns: trim_result.kept_turns,
                     reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
                     channel: None,
-                    agent_alias: None,
-                    turn_id: None,
+                    agent_alias: agent_alias.map(str::to_string),
+                    turn_id: Some(turn_id.to_string()),
                     token_budget: Some(model_context_window as u64),
                     tokens_before: Some(tokens_before_dispatch),
                     tokens_after: Some(tokens_before_dispatch),
@@ -1915,6 +1941,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     on_delta.as_ref(),
                     observer,
                     ctx.context_limits,
+                    agent_alias,
+                    turn_id,
                     &mut turn_state.crumb_present,
                 )
                 .await;
@@ -2130,6 +2158,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     ctx.context_limits.context_token_budget,
                     event_tx.as_ref(),
                     observer,
+                    agent_alias,
+                    turn_id,
                     multimodal_config,
                     degrade_strip_images,
                     image_cache.as_deref_mut(),
@@ -2217,7 +2247,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         .await?;
 
         let live_sop_queue = crate::sop::executor::new_live_action_queue();
-        let execution_result =
+        let execution =
             crate::sop::executor::scope_live_action_queue(live_sop_queue.clone(), async {
                 if allow_parallel_execution && executable_calls.len() > 1 {
                     let meta = ctx.meta();
@@ -2256,8 +2286,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     )
                     .await
                 }
-            })
-            .await;
+            });
+        let execution_result = match shared_budget.clone() {
+            Some(budget) => ExecutionTreeBudget::scope(budget, Box::pin(execution)).await,
+            None => execution.await,
+        };
         let executed_slots = match execution_result {
             Ok(slots) => slots,
             Err(e) if is_tool_loop_cancelled(&e) => {
@@ -2446,7 +2479,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 channel_reply_target,
                 cancellation_token.clone(),
                 on_delta.clone(),
-                shared_budget.clone(),
+                shared_budget.as_ref().map(ExecutionTreeBudget::child),
                 channel,
                 collected_receipts,
                 event_tx.clone(),
@@ -2469,14 +2502,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         });
     }
 
-    let summary_limits = resolve_context_limits_for_call(
-        context_limits_resolver.as_ref(),
-        config,
-        agent_alias,
-        provider_name,
-        model,
-        context_limits,
-    );
+    if let Some(budget) = shared_budget.as_ref() {
+        budget.reserve()?;
+    }
+
     let summary_result = finish_after_max_iterations(
         model_provider,
         turn_state.history,
@@ -2484,19 +2513,31 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         model,
         dispatch_model,
         temperature,
-        multimodal_config,
         pacing,
         cancellation_token.as_ref(),
-        max_iterations,
+        max_iter::CompletionLimit::LocalIterations(max_iterations),
         accumulated_display_text,
         turn_id,
         knobs,
         event_tx.as_ref(),
         on_delta.as_ref(),
         turn_state.canonical.as_deref_mut(),
-        summary_limits,
+        config,
+        multimodal_config,
+        hooks,
+        image_cache,
+        |provider, selected_model| {
+            resolve_context_limits_for_call(
+                context_limits_resolver.as_ref(),
+                config,
+                agent_alias,
+                provider,
+                selected_model,
+                context_limits,
+            )
+        },
         &mut turn_state.crumb_present,
-        DispatchTokenCounter::for_route(pending_reported_usage, provider_name, model),
+        pending_reported_usage,
         observer,
     )
     .await;
@@ -2852,7 +2893,7 @@ fn build_owned_step_system_prompt(
         .map(|t| (t.name(), t.description()))
         .collect();
     let bootstrap_max_chars = if owned.agent.resolved.compact_context {
-        Some(6000)
+        Some(crate::agent::system_prompt::COMPACT_BOOTSTRAP_MAX_CHARS)
     } else {
         None
     };
@@ -2927,7 +2968,7 @@ async fn drive_live_sop_actions(
     channel_reply_target: Option<&str>,
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<StreamDelta>>,
-    shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    shared_budget: Option<ExecutionTreeBudget>,
     channel: Option<&dyn Channel>,
     collected_receipts: Option<&std::sync::Mutex<Vec<String>>>,
     event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
@@ -3606,6 +3647,65 @@ mod reported_budget_tests {
     use super::*;
     use crate::observability::NoopObserver;
 
+    // Keep existing budget tests focused on trim behavior; the identity test
+    // below calls the production function with an explicit turn identity.
+    #[allow(clippy::too_many_arguments)]
+    async fn enforce_reported_budget(
+        history: &mut Vec<ChatMessage>,
+        reported_input_tokens: usize,
+        reported_population_estimated: usize,
+        tool_schema_tokens: usize,
+        context_token_budget: usize,
+        event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
+        observer: &dyn crate::observability::Observer,
+        multimodal_config: &zeroclaw_config::schema::MultimodalConfig,
+        degrade_strip_images: bool,
+        image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
+        next_use_native_tools: bool,
+        hook_reserve_tokens: usize,
+        crumb_present: &mut bool,
+    ) {
+        super::enforce_reported_budget(
+            history,
+            reported_input_tokens,
+            reported_population_estimated,
+            tool_schema_tokens,
+            context_token_budget,
+            event_tx,
+            observer,
+            None,
+            "test",
+            multimodal_config,
+            degrade_strip_images,
+            image_cache,
+            next_use_native_tools,
+            hook_reserve_tokens,
+            crumb_present,
+        )
+        .await;
+    }
+
+    #[derive(Default)]
+    struct TrimObserver(std::sync::Mutex<Vec<zeroclaw_api::observability_traits::ObserverEvent>>);
+
+    impl crate::observability::Observer for TrimObserver {
+        fn record_event(&self, event: &zeroclaw_api::observability_traits::ObserverEvent) {
+            self.0.lock().expect("trim events lock").push(event.clone());
+        }
+
+        fn record_metric(&self, _metric: &zeroclaw_api::observability_traits::ObserverMetric) {}
+
+        fn name(&self) -> &str {
+            "trim-test"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn flush(&self) {}
+    }
+
     fn big_history() -> Vec<ChatMessage> {
         let big = "x".repeat(2000);
         vec![
@@ -3617,6 +3717,41 @@ mod reported_budget_tests {
             ChatMessage::user("turn3 short".to_string()),
             ChatMessage::assistant("final answer".to_string()),
         ]
+    }
+
+    #[tokio::test]
+    async fn reported_budget_observer_identifies_the_effective_turn() {
+        let mut history = big_history();
+        let estimated = crate::agent::history::estimate_history_tokens(&history);
+        let observer = TrimObserver::default();
+        super::enforce_reported_budget(
+            &mut history,
+            estimated * 4,
+            estimated,
+            0,
+            estimated * 2,
+            None,
+            &observer,
+            Some("effective-agent"),
+            "turn-2",
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            false,
+            None,
+            false,
+            0,
+            &mut false,
+        )
+        .await;
+        let events = observer.0.lock().expect("trim events lock");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
+                agent_alias,
+                turn_id,
+                ..
+            } if agent_alias.as_deref() == Some("effective-agent")
+                && turn_id.as_deref() == Some("turn-2")
+        )));
     }
 
     #[tokio::test]
@@ -5201,17 +5336,21 @@ vision_model_provider = "custom.vision"
 
 #[cfg(test)]
 mod shared_iteration_budget_tests {
-    use super::try_reserve_shared_iteration;
+    use super::{ExecutionTreeBudget, ExecutionTreeReservation};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
 
     #[test]
     fn exhausted_budget_never_wraps() {
-        let budget = AtomicUsize::new(1);
+        let budget = ExecutionTreeBudget::root(2);
 
-        assert!(try_reserve_shared_iteration(&budget));
-        assert!(!try_reserve_shared_iteration(&budget));
-        assert_eq!(budget.load(Ordering::Acquire), 0);
+        assert_eq!(budget.reserve(), Ok(ExecutionTreeReservation::Iteration));
+        assert_eq!(
+            budget.reserve(),
+            Ok(ExecutionTreeReservation::FinalCompletion)
+        );
+        assert!(budget.reserve().is_err());
+        assert_eq!(budget.remaining(), 0);
     }
 
     #[test]
@@ -5219,18 +5358,18 @@ mod shared_iteration_budget_tests {
         const AVAILABLE: usize = 8;
         const WORKERS: usize = 64;
 
-        let budget = Arc::new(AtomicUsize::new(AVAILABLE));
+        let budget = Arc::new(ExecutionTreeBudget::root(AVAILABLE + 1));
         let granted = Arc::new(AtomicUsize::new(0));
         let start = Arc::new(Barrier::new(WORKERS + 1));
 
         std::thread::scope(|scope| {
             for _ in 0..WORKERS {
-                let budget = Arc::clone(&budget);
+                let budget = budget.child();
                 let granted = Arc::clone(&granted);
                 let start = Arc::clone(&start);
                 scope.spawn(move || {
                     start.wait();
-                    if try_reserve_shared_iteration(&budget) {
+                    if budget.reserve() == Ok(ExecutionTreeReservation::Iteration) {
                         granted.fetch_add(1, Ordering::Relaxed);
                     }
                 });
@@ -5239,7 +5378,7 @@ mod shared_iteration_budget_tests {
         });
 
         assert_eq!(granted.load(Ordering::Relaxed), AVAILABLE);
-        assert_eq!(budget.load(Ordering::Acquire), 0);
+        assert_eq!(budget.remaining(), 1);
     }
 }
 
@@ -5740,6 +5879,468 @@ mod sop_step_reassembly_tests {
                 error: None,
             })
         }
+    }
+
+    struct BudgetToolCallingProvider;
+
+    impl ::zeroclaw_api::attribution::Attributable for BudgetToolCallingProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "BudgetToolCallingProvider"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for BudgetToolCallingProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            if request.tools.is_none_or(<[_]>::is_empty) {
+                return Ok(ChatResponse {
+                    text: Some("local-cap-summary".into()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                });
+            }
+
+            Ok(ChatResponse {
+                text: Some(String::new()),
+                tool_calls: vec![ToolCall {
+                    id: "budget-call".into(),
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    async fn run_budgeted_test_loop(
+        provider: &dyn ModelProvider,
+        history: &mut Vec<ChatMessage>,
+        tools: &crate::tools::scoped::ScopedToolRegistry,
+        budget: ExecutionTreeBudget,
+        cancellation_token: CancellationToken,
+        max_tool_iterations: usize,
+    ) -> Result<String> {
+        run_budgeted_test_loop_with_hooks(
+            provider,
+            history,
+            tools,
+            budget,
+            cancellation_token,
+            max_tool_iterations,
+            None,
+        )
+        .await
+    }
+
+    async fn run_budgeted_test_loop_with_hooks(
+        provider: &dyn ModelProvider,
+        history: &mut Vec<ChatMessage>,
+        tools: &crate::tools::scoped::ScopedToolRegistry,
+        budget: ExecutionTreeBudget,
+        cancellation_token: CancellationToken,
+        max_tool_iterations: usize,
+        hooks: Option<&crate::hooks::HookRunner>,
+    ) -> Result<String> {
+        let observer = crate::observability::NoopObserver {};
+        let multimodal = zeroclaw_config::schema::MultimodalConfig::default();
+        let pacing = zeroclaw_config::schema::PacingConfig {
+            loop_detection_enabled: false,
+            ..zeroclaw_config::schema::PacingConfig::default()
+        };
+        let knobs = LoopKnobs {
+            dedup_enabled: false,
+            ..LoopKnobs::default()
+        };
+        let turn_id = uuid::Uuid::new_v4().to_string();
+
+        run_tool_call_loop(ToolLoop {
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution::resolve(
+                ResolvedModelAccess {
+                    model_provider: provider,
+                    provider_name: "budget-test",
+                    model: "budget-test-model",
+                    dispatch_model: "hint:budget-test",
+                    temperature: None,
+                },
+                ResolvedIo {
+                    tools_registry: tools,
+                    observer: &observer,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &multimodal,
+                    config: None,
+                    hooks,
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    receipt_generator: None,
+                },
+                ResolvedRuntimeKnobs {
+                    max_tool_iterations,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    pacing: &pacing,
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 30_000,
+                    context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(
+                        100_000,
+                    ),
+                    context_limits_resolver: None,
+                    knobs: &knobs,
+                },
+            ),
+            history,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: Some(cancellation_token),
+            on_delta: None,
+            shared_budget: Some(budget),
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: Some("budget-test"),
+            parent_agent_alias: None,
+            served_route_sink: None,
+            turn_id: &turn_id,
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn tree_budget_final_completion_prepares_images_and_honors_hooks() {
+        struct SummaryProbe(Arc<AtomicUsize>, &'static str);
+        impl zeroclaw_api::attribution::Attributable for SummaryProbe {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Attributable::role(&TextProvider)
+            }
+            fn alias(&self) -> &str {
+                "summary-probe"
+            }
+        }
+        #[async_trait::async_trait]
+        impl ModelProvider for SummaryProbe {
+            fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
+                zeroclaw_api::model_provider::ProviderCapabilities {
+                    vision: true,
+                    ..Default::default()
+                }
+            }
+            async fn chat_with_system(
+                &self,
+                _: Option<&str>,
+                _: &str,
+                _: &str,
+                _: Option<f64>,
+            ) -> Result<String> {
+                anyhow::bail!("summary must use chat")
+            }
+            async fn chat(
+                &self,
+                request: zeroclaw_providers::ChatRequest<'_>,
+                model: &str,
+                _: Option<f64>,
+            ) -> Result<ChatResponse> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(model, self.1);
+                assert!(request.tools.is_none());
+                assert!(
+                    request
+                        .messages
+                        .iter()
+                        .any(|m| m.content.contains("data:image/png;base64,"))
+                );
+                assert!(request.messages.iter().any(|m| m.content == "hook-rewrite"));
+                Ok(ChatResponse {
+                    text: Some("prepared summary".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+        struct SummaryHook {
+            cancel: bool,
+            change_model: bool,
+        }
+        #[async_trait::async_trait]
+        impl crate::hooks::HookHandler for SummaryHook {
+            fn name(&self) -> &str {
+                "summary-hook"
+            }
+            async fn before_llm_call(
+                &self,
+                messages: &mut Vec<ChatMessage>,
+                model: &mut String,
+            ) -> crate::hooks::HookResult<()> {
+                assert!(
+                    messages
+                        .iter()
+                        .any(|m| m.content.contains("data:image/png;base64,")),
+                    "hooks must see prepared images"
+                );
+                if self.cancel {
+                    return crate::hooks::HookResult::Cancel("summary denied".into());
+                }
+                if self.change_model {
+                    *model = "hook-selected-model".into();
+                }
+                messages.push(ChatMessage::user("hook-rewrite"));
+                crate::hooks::HookResult::Continue(())
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let image = tmp.path().join("summary.png");
+        // Image validation rejects a PNG signature without decodable pixels.
+        std::fs::write(
+            &image,
+            [
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+                0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+                0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x78,
+                0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92,
+                0xEF, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+            ],
+        )
+        .unwrap();
+        let prompt = format!("describe [IMAGE:{}]", image.display());
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]);
+        for (cancel, change_model) in [(false, false), (false, true), (true, true)] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = SummaryProbe(
+                calls.clone(),
+                if change_model {
+                    "hook-selected-model"
+                } else {
+                    "hint:budget-test"
+                },
+            );
+            let mut hooks = crate::hooks::HookRunner::new();
+            hooks.register(Box::new(SummaryHook {
+                cancel,
+                change_model,
+            }));
+            let budget = ExecutionTreeBudget::root(1);
+            let mut history = vec![ChatMessage::user(prompt.clone())];
+            let result = run_budgeted_test_loop_with_hooks(
+                &provider,
+                &mut history,
+                &tools,
+                budget.clone(),
+                CancellationToken::new(),
+                10,
+                Some(&hooks),
+            )
+            .await;
+            assert_eq!(budget.remaining(), 0);
+            if cancel {
+                assert!(format!("{:#}", result.unwrap_err()).contains("summary denied"));
+                assert_eq!(
+                    history.len(),
+                    1,
+                    "cancelled preparation must remove the synthetic summary prompt"
+                );
+            } else {
+                let response = result.unwrap();
+                assert!(response.contains("execution-tree iteration budget"));
+                assert!(!response.contains("maximum tool iterations"));
+            }
+            assert_eq!(
+                history[0].content, prompt,
+                "preparation must not rewrite durable user history"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                usize::from(!cancel),
+                "hook cancellation must prevent dispatch"
+            );
+        }
+        let mut history = vec![ChatMessage::user(prompt)];
+        let result = run_budgeted_test_loop(
+            &TextProvider,
+            &mut history,
+            &tools,
+            ExecutionTreeBudget::root(1),
+            CancellationToken::new(),
+            10,
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<zeroclaw_providers::ProviderCapabilityError>()
+                .is_some(),
+            "synthetic prompt must not hide a fresh image from a text-only provider"
+        );
+        assert_eq!(history.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn root_local_iteration_cap_consumes_tree_budget_for_summary() {
+        let root_budget = ExecutionTreeBudget::root(2);
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+            ShellProbe {
+                calls: Arc::clone(&tool_calls),
+            },
+        )]);
+        let mut history = vec![ChatMessage::user("run one tool")];
+
+        let response = run_budgeted_test_loop(
+            &BudgetToolCallingProvider,
+            &mut history,
+            &tools,
+            root_budget.clone(),
+            CancellationToken::new(),
+            1,
+        )
+        .await
+        .expect("root should use its final reservation for the local-cap summary");
+
+        assert!(response.contains("local-cap-summary"));
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(root_budget.remaining(), 0);
+    }
+
+    #[tokio::test]
+    async fn child_local_iteration_cap_preserves_root_final_reservation() {
+        use crate::agent::execution_tree_budget::ExecutionTreeBudgetExhausted;
+
+        let root_budget = ExecutionTreeBudget::root(2);
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+            ShellProbe {
+                calls: Arc::clone(&tool_calls),
+            },
+        )]);
+        let mut history = vec![ChatMessage::user("run one child tool")];
+
+        let error = run_budgeted_test_loop(
+            &BudgetToolCallingProvider,
+            &mut history,
+            &tools,
+            root_budget.child(),
+            CancellationToken::new(),
+            1,
+        )
+        .await
+        .expect_err("child must not spend the root-only final reservation on a summary");
+
+        assert!(
+            error
+                .downcast_ref::<ExecutionTreeBudgetExhausted>()
+                .is_some(),
+            "child local-cap exhaustion must preserve the typed budget error: {error:#}"
+        );
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(root_budget.remaining(), 1);
+    }
+
+    #[tokio::test]
+    async fn child_exhaustion_preserves_root_final_completion_slot() {
+        use crate::agent::execution_tree_budget::ExecutionTreeBudgetExhausted;
+
+        let root_budget = ExecutionTreeBudget::root(3);
+        let cancellation_token = CancellationToken::new();
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+            ShellProbe {
+                calls: Arc::clone(&tool_calls),
+            },
+        )]);
+        let mut child_history = vec![ChatMessage::user("run tools")];
+
+        let child_error = run_budgeted_test_loop(
+            &BudgetToolCallingProvider,
+            &mut child_history,
+            &tools,
+            root_budget.child(),
+            cancellation_token.clone(),
+            10,
+        )
+        .await
+        .expect_err("child must stop at the shared tree allowance");
+
+        assert!(
+            child_error
+                .downcast_ref::<ExecutionTreeBudgetExhausted>()
+                .is_some(),
+            "child exhaustion must preserve the typed budget error: {child_error:#}"
+        );
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 2);
+        assert!(!cancellation_token.is_cancelled());
+        assert_eq!(root_budget.remaining(), 1);
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let root_provider = CaptureProvider {
+            requests: Arc::clone(&requests),
+        };
+        let mut root_history = vec![ChatMessage::user("finish coherently")];
+        let response = run_budgeted_test_loop(
+            &root_provider,
+            &mut root_history,
+            &tools,
+            root_budget.clone(),
+            cancellation_token.clone(),
+            10,
+        )
+        .await
+        .expect("root must consume the retained final slot");
+
+        assert!(
+            response.starts_with("child-done"),
+            "root final completion must return the provider response: {response:?}"
+        );
+        assert_eq!(root_budget.remaining(), 0);
+        assert!(!cancellation_token.is_cancelled());
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 2);
+        let captured = requests.lock().expect("capture lock");
+        assert_eq!(captured.len(), 1);
+        assert!(
+            captured[0].1.is_empty(),
+            "final completion must offer no tools"
+        );
+        assert_eq!(
+            root_history.last().map(|message| message.content.as_str()),
+            Some("child-done")
+        );
     }
 
     /// Seed a step agent's owned execution context directly (the memo cache is

@@ -1,5 +1,6 @@
 use crate::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher, XmlToolDispatcher};
 use crate::agent::eval::AutoClassifyExt;
+use crate::agent::execution_tree_budget::ExecutionTreeBudget;
 use crate::agent::prompt::{
     InteractionContext, PromptContext, SystemPromptBuilder, append_timestamp_orientation,
 };
@@ -352,11 +353,19 @@ async fn forward_history_trim_notice(
 
 pub struct Agent {
     model_provider: Box<dyn ModelProvider>,
+    /// Shared with the shell tool and RPC session admission; this is the
+    /// immutable execution environment, not a cached authorization decision.
+    forwarded_environment: Option<crate::tools::ForwardedEnvironment>,
     /// Sealed per-agent tool set. Stored as a [`crate::tools::scoped::ScopedToolRegistry`]
     /// so it can only be handed to the turn engine after passing through
     /// `assemble()` (the seal).
     tools: crate::tools::scoped::ScopedToolRegistry,
     memory: Arc<dyn Memory>,
+    /// The security policy the memory-backed tools were assembled with. Kept so
+    /// that [`Agent::route_memory_to_principal`] can rebuild those tools over a
+    /// principal-scoped handle without re-deriving policy: session memory must
+    /// follow its owner across the tools too, not only the `memory` field.
+    memory_security: Arc<SecurityPolicy>,
     observer: Arc<dyn Observer>,
     prompt_builder: SystemPromptBuilder,
     tool_dispatcher: Box<dyn ToolDispatcher>,
@@ -424,6 +433,10 @@ pub struct Agent {
     /// and stored here for lookup during tool execution.
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     tool_search: Option<Arc<crate::tools::ToolSearchTool>>,
+    /// The principal whose private memory plane `memory` is pinned to, set by
+    /// `route_memory_to_principal` at session construction. `None` = the
+    /// shared/legacy handle (the shared operator's sessions).
+    memory_principal: Option<String>,
     /// MCP pinned resources, read once at construction from each server's
     /// `pinned_resources` and provenance-wrapped (`trust="untrusted-external"`).
     /// Kept as attributed blocks rather than pre-rendered text so a later
@@ -591,6 +604,7 @@ pub struct AgentBuilder {
     model_provider: Option<Box<dyn ModelProvider>>,
     tools: Option<crate::tools::scoped::ScopedToolRegistry>,
     memory: Option<Arc<dyn Memory>>,
+    memory_security: Option<Arc<SecurityPolicy>>,
     observer: Option<Arc<dyn Observer>>,
     prompt_builder: Option<SystemPromptBuilder>,
     tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
@@ -652,6 +666,7 @@ impl AgentBuilder {
             model_provider: None,
             tools: None,
             memory: None,
+            memory_security: None,
             observer: None,
             prompt_builder: None,
             tool_dispatcher: None,
@@ -716,6 +731,15 @@ impl AgentBuilder {
 
     pub fn memory(mut self, memory: Arc<dyn Memory>) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// The security policy the memory tools were assembled with, retained so a
+    /// later `route_memory_to_principal` can rebind those tools to the routed
+    /// handle. Defaults to a permissive policy if unset (test builders); the
+    /// production constructor always supplies the agent's real policy.
+    pub fn memory_security(mut self, security: Arc<SecurityPolicy>) -> Self {
+        self.memory_security = Some(security);
         self
     }
 
@@ -1072,7 +1096,11 @@ impl AgentBuilder {
                 anyhow::Error::msg("model_provider is required")
             })?,
             tools,
+            forwarded_environment: None,
             memory: memory.clone(),
+            memory_security: self
+                .memory_security
+                .unwrap_or_else(|| Arc::new(SecurityPolicy::default())),
             observer: self.observer.ok_or_else(|| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -1147,6 +1175,7 @@ impl AgentBuilder {
             shell_profile: self.shell_profile,
             activated_tools: self.activated_tools,
             tool_search: None,
+            memory_principal: None,
             mcp_pinned: self.mcp_pinned,
             mcp_deferred_section: self.mcp_deferred_section.unwrap_or_default(),
             hook_runner: self.hook_runner,
@@ -1678,6 +1707,64 @@ impl Agent {
         if let Ok(sys) = self.build_system_prompt() {
             self.history[0] = ConversationMessage::Chat(ChatMessage::system(sys));
         }
+    }
+
+    /// Pin this session's memory to its OWNER's private plane (RFC 7141).
+    ///
+    /// Called once at session construction with the session owner's scope,
+    /// never with a later caller's: an administrator prompting another
+    /// principal's session must not re-route that session's memory. Every
+    /// memory operation the session's tools and loop issue afterwards goes to
+    /// the backend's principal-scoped forms; a backend without private support
+    /// fails them closed. The shared operator (no owner) keeps the legacy
+    /// shared handle. Idempotent: a second call with the same owner is a no-op,
+    /// and a call with a different owner is refused.
+    pub fn route_memory_to_principal(
+        &mut self,
+        scope: zeroclaw_api::memory_traits::PrincipalScope,
+    ) -> anyhow::Result<()> {
+        if let Some(current) = &self.memory_principal {
+            if *current == scope.principal_id {
+                return Ok(());
+            }
+            anyhow::bail!(
+                "session memory is already pinned to principal {current:?}; refusing to re-route it"
+            );
+        }
+        let routed: Arc<dyn Memory> = Arc::new(zeroclaw_memory::PrincipalPlaneMemory::new(
+            Arc::clone(&self.memory),
+            scope.clone(),
+        ));
+        self.memory = Arc::clone(&routed);
+        // The memory-backed tools each captured a clone of the shared handle at
+        // assembly. Swapping only `self.memory` would leave those tools writing
+        // and reading the shared plane while the agent reports its memory as
+        // private — so rebind them to the routed handle here, before any prompt
+        // exercises them. This never adds a tool name: memory tools already
+        // withdrawn by policy narrowing stay withdrawn.
+        self.tools
+            .rebind_memory_tools(routed, Arc::clone(&self.memory_security));
+        self.memory_principal = Some(scope.principal_id);
+        Ok(())
+    }
+
+    /// The principal whose private plane this session's memory is pinned to,
+    /// if any.
+    pub fn memory_principal(&self) -> Option<&str> {
+        self.memory_principal.as_deref()
+    }
+
+    /// Re-derive the forwarded shell environment for a REUSED session. `env`
+    /// is already filtered for the resuming connection's entitlement (empty
+    /// overlays nothing). A canonical live session keeps the shell tool it was
+    /// built with, whose environment was filtered for the ORIGINAL connection;
+    /// reuse under a re-derived entitlement (a principal that has lost `admin`,
+    /// a WSS reconnect describing another host) must re-derive it here, or the
+    /// resumed session would keep overlaying the first connection's forwarded
+    /// environment onto its subprocesses. Preserves the shell tool's sandbox,
+    /// rate limiter and timeout; only the forwarded environment changes.
+    pub fn rebind_shell_env(&self, env: Option<std::collections::HashMap<String, String>>) {
+        self.tools.rebind_shell_env(env);
     }
 
     /// Apply a current principal tool ceiling to an existing session. This is
@@ -2318,6 +2405,7 @@ impl Agent {
 
         let acp_sessions =
             acp_session_store.map(|store| tools::AcpSessionReadView::new(store, agent_alias));
+        let tui_env = tui_env.map(Arc::new);
         let all_tools_result = tools::all_tools_with_runtime_and_acp_sessions(
             Arc::new(config.clone()),
             &security,
@@ -2336,7 +2424,7 @@ impl Agent {
             config,
             canvas_store,
             false,
-            tui_env,
+            tui_env.clone(),
             sop_engine,
             sop_audit,
             // Daemon-backed constructors supply the shared handle; tools that
@@ -2529,6 +2617,7 @@ impl Agent {
             .allowed_tools(principal_allowed_tools)
             .tools(tools)
             .memory(memory.clone())
+            .memory_security(Arc::clone(&security))
             .observer(observer)
             .response_cache(response_cache)
             .tool_dispatcher(tool_dispatcher)
@@ -2594,6 +2683,7 @@ impl Agent {
         }
         let mut agent = builder.build()?;
 
+        agent.forwarded_environment = tui_env;
         agent.tool_search = tool_search_handle;
 
         // Wire per-tool channel-map handles into the agent so callers (e.g.
@@ -2607,6 +2697,10 @@ impl Agent {
         };
 
         Ok(agent)
+    }
+
+    pub(crate) fn forwarded_environment(&self) -> Option<crate::tools::ForwardedEnvironment> {
+        self.forwarded_environment.clone()
     }
 
     fn trim_history(&mut self, turn_id: Option<&str>) -> Option<HistoryTrimNotice> {
@@ -3355,6 +3449,8 @@ impl Agent {
             &self.config.resolved.tool_receipts,
         );
         let agent_alias_for_loop = self.observer_agent_alias();
+        let execution_tree_budget =
+            ExecutionTreeBudget::from_limit(self.config.resolved.max_execution_tree_iterations);
         let turn_loop = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
             Some(cost_context.clone()),
             crate::agent::tool_receipts::scope_receipts(
@@ -3408,7 +3504,7 @@ impl Agent {
                         channel_reply_target: None,
                         cancellation_token: None,
                         on_delta: None,
-                        shared_budget: None,
+                        shared_budget: execution_tree_budget.clone(),
                         channel: None,
                         collected_receipts: receipt_scope
                             .as_ref()
@@ -3855,6 +3951,8 @@ impl Agent {
         let receipt_scope = crate::agent::tool_receipts::ReceiptScope::from_config(
             &self.config.resolved.tool_receipts,
         );
+        let execution_tree_budget =
+            ExecutionTreeBudget::from_limit(self.config.resolved.max_execution_tree_iterations);
 
         // ── Round loop: one tool-call-loop run per steering round ──────────
         // Sink the loop writes the final serving route into each round, so the
@@ -3990,7 +4088,7 @@ impl Agent {
                             channel_reply_target: None,
                             cancellation_token: cancel_token.clone(),
                             on_delta: None,
-                            shared_budget: None,
+                            shared_budget: execution_tree_budget.clone(),
                             channel: approval_bridge.as_deref(),
                             collected_receipts: receipt_scope
                                 .as_ref()
@@ -4139,9 +4237,16 @@ impl Agent {
                     let notice = self.trim_history(Some(&turn_id));
                     forward_history_trim_notice(&event_tx, notice).await;
 
+                    // Spending the root's reserved final slot is terminal for
+                    // the whole turn. Steering that arrives during that
+                    // tools-free completion cannot start another round on the
+                    // already exhausted tree budget.
+                    let tree_budget_finalized = execution_tree_budget
+                        .as_ref()
+                        .is_some_and(|budget| budget.remaining() == 0);
                     let has_more_steering =
                         steering_rx.as_deref_mut().is_some_and(|rx| !rx.is_empty());
-                    if has_more_steering {
+                    if has_more_steering && !tree_budget_finalized {
                         continue;
                     }
 
@@ -4984,6 +5089,108 @@ mod tests {
         let mut agent = blank_input_agent(model_provider);
         let err = agent.turn("").await.expect_err("blank turn must fail");
         assert_eq!(err.to_string(), BLANK_TURN_ERROR);
+    }
+
+    /// Regression for the memory-handle binding order: `route_memory_to_principal`
+    /// must rebind the actual memory TOOLS to the owner's private plane, not only
+    /// the `Agent.memory` field. Exercises the real `memory_store`/`memory_recall`
+    /// tools against owner / other-owner / shared sentinels — asserting tool
+    /// BEHAVIOUR, not merely the `memory_principal()` marker.
+    #[tokio::test]
+    async fn routing_rebinds_the_memory_tools_to_the_owners_private_plane() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        use zeroclaw_tools::memory_recall::MemoryRecallTool;
+        use zeroclaw_tools::memory_store::MemoryStoreTool;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let shared: Arc<dyn Memory> = Arc::new(
+            zeroclaw_memory::SqliteMemory::new("sqlite", tmp.path()).expect("sqlite memory"),
+        );
+
+        // Seed a sentinel on the SHARED plane and one on ANOTHER owner's plane.
+        shared
+            .store("s", "shared-secret", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let mallory = PrincipalScope::new("user:mallory");
+        shared
+            .store_for_principal(&mallory, "m", "mallory-secret", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let security = Arc::new(crate::security::SecurityPolicy::default());
+        let raw_tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(MemoryStoreTool::new(
+                Arc::clone(&shared),
+                Arc::clone(&security),
+            )),
+            Box::new(MemoryRecallTool::new(Arc::clone(&shared))),
+        ];
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(Vec::new()),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                raw_tools,
+            ))
+            .memory(Arc::clone(&shared))
+            .memory_security(Arc::clone(&security))
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .build()
+            .expect("agent builds");
+
+        // Pin the session to alice's private plane; this must rebind the tools.
+        agent
+            .route_memory_to_principal(PrincipalScope::new("user:alice"))
+            .unwrap();
+
+        // The store tool must write to ALICE's private plane, not the shared one.
+        let store = agent
+            .tools
+            .iter()
+            .find(|t| t.name() == "memory_store")
+            .expect("memory_store present");
+        store
+            .execute(serde_json::json!({"key": "note", "content": "alice-note"}))
+            .await
+            .unwrap();
+
+        // Shared plane is untouched by the owned session's store.
+        assert!(
+            shared.get("note").await.unwrap().is_none(),
+            "an owned session's memory_store must not land on the shared plane"
+        );
+        // It DID land on alice's private plane.
+        let on_alice = shared
+            .get_for_principal(&PrincipalScope::new("user:alice"), "note")
+            .await
+            .unwrap()
+            .expect("alice's private plane holds the note");
+        assert_eq!(on_alice.content, "alice-note");
+
+        // The recall tool must read ONLY alice's plane: neither the shared
+        // sentinel nor mallory's sentinel is reachable through the tool.
+        let recall = agent
+            .tools
+            .iter()
+            .find(|t| t.name() == "memory_recall")
+            .expect("memory_recall present");
+        let result = recall
+            .execute(serde_json::json!({"query": "secret"}))
+            .await
+            .unwrap();
+        let text = format!("{result:?}");
+        assert!(
+            !text.contains("shared-secret"),
+            "recall leaked the shared plane: {text}"
+        );
+        assert!(
+            !text.contains("mallory-secret"),
+            "recall leaked another owner's plane: {text}"
+        );
     }
 
     #[tokio::test]
@@ -6715,6 +6922,59 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "StreamingSteeringModelProvider"
+        }
+    }
+
+    struct GatedFinalCompletionProvider {
+        calls: Arc<AtomicUsize>,
+        started: tokio::sync::mpsc::Sender<()>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for GatedFinalCompletionProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("root-final".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started
+                .send(())
+                .await
+                .expect("final-completion test should still be observing the provider");
+            self.release.notified().await;
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("root-final".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for GatedFinalCompletionProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "GatedFinalCompletionProvider"
         }
     }
 
@@ -12491,6 +12751,7 @@ mod tests {
                 _: Option<&str>,
             ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
                 Ok(vec![zeroclaw_memory::MemoryEntry {
+                    principal_id: None,
                     id: "deploy".into(),
                     key: "deploy".into(),
                     content: self.content.clone(),
@@ -12906,6 +13167,68 @@ mod tests {
             provider_steering.content.ends_with("]\n\nsecond"),
             "the provider's steering turn must end with the raw user text, got: {}",
             provider_steering.content
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_budget_final_completion_is_terminal_when_steering_arrives() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(1);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut config = zeroclaw_config::schema::AliasedAgentConfig::default();
+        config.resolved.max_execution_tree_iterations = Some(1);
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(GatedFinalCompletionProvider {
+                calls: Arc::clone(&calls),
+                started: started_tx,
+                release: Arc::clone(&release),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(mem)
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .config(config)
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(4);
+        let handle = zeroclaw_spawn::spawn!(async move {
+            agent
+                .turn_streamed_with_steering_state("first", event_tx, None, Some(&mut steering_rx))
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), started_rx.recv())
+            .await
+            .expect("final-completion provider should start")
+            .expect("final-completion provider signal should remain connected");
+        steering_tx
+            .send("too late for another budgeted round".into())
+            .await
+            .expect("steering message should enqueue during final completion");
+        release.notify_one();
+
+        let outcome = handle
+            .await
+            .expect("turn task should finish")
+            .expect("the reserved final completion must remain successful");
+        assert!(outcome.response.contains("root-final"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "queued steering must not start a second round on the exhausted tree budget"
         );
     }
 

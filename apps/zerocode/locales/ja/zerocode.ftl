@@ -422,8 +422,10 @@ zc-chat-resyncing = 一部のライブ更新を受信できませんでした。
 zc-chat-resynced = ライブ更新を受信できなかったため、永続化された会話を再読み込みしました。進行中の承認や質問はキャンセルされました。
 zc-chat-resync-failed = ライブ更新を受信できず、セッションを再読み込みできませんでした: { $error }
 zc-chat-session-restart-error = 新しいセッションを開始できませんでした: { $error }
-zc-chat-code-cwd-unavailable = zerocode を起動したディレクトリを特定できません: { $error }。ローカルの Code セッションはそのプロジェクトで開始する必要があるため、作成されませんでした。
-zc-chat-code-cwd-not-utf8 = zerocode を起動したディレクトリが有効な UTF-8 ではないため ({ $path })、ローカルの Code セッションを開始できません。UTF-8 のパスから zerocode を起動し直してください。
+zc-chat-code-cwd-not-utf8 = 選択したディレクトリが有効な UTF-8 ではないため ({ $path })、Code セッションは作成されませんでした。パスが有効な UTF-8 のディレクトリを選んでください。
+zc-chat-code-cwd-not-absolute = 選択したディレクトリは絶対パスではないため ({ $path })、新しい Code セッションは作成されませんでした。セッションが動作するファイルシステムのルートからディレクトリを選んでください。
+zc-chat-change-directory-error = 選択したディレクトリでセッションを開始できませんでした: { $error }
+zc-chat-change-directory-chat-only = Chat セッションは選択したエージェントのワークスペースに従うため、ここで選べるディレクトリはありません。別のディレクトリでセッションを開始するには Code ペインを使用してください。
 zc-chat-thinking-visible = 思考出力: 表示
 zc-chat-thinking-hidden = 思考出力: 非表示
 zc-model-picker-hint = /model の後にモデル名を入力するか、Tab で自動補完します。
@@ -465,6 +467,7 @@ zc-chat-help-scroll-conversation = 会話をスクロール
 zc-chat-help-open-link = リンクをクリックして開く。別の場所からドラッグするとテキストを選択
 zc-chat-help-toggle-thoughts = 思考を切り替え
 zc-chat-help-new-session = 新しいセッション
+zc-chat-help-change-directory = ディレクトリを選んで新しい Code セッションを開始
 zc-chat-session-list-resume-title = 保存済みセッション (Enter=再開, Esc=新規)
 zc-chat-session-list-switch-title = セッション (Enter=切替, Esc=閉じる)
 zc-elicit-help-toggle = 選択を切り替え
@@ -579,6 +582,11 @@ zc-config-footer-action-help = ヘルプ
 zc-config-footer-action-new-line = 改行
 zc-config-field-edit-hint = { $keys } → 押して編集
 zc-doctor-log-path = log: { $path }
+
+zc-oidc-enroll-visit = サインインするには { $uri } を開き、コード { $code } を入力してください
+zc-oidc-enroll-waiting = ID プロバイダーの承認を待っています(コードは { $seconds } 秒で失効します)...
+zc-oidc-enroll-missing-url = auth_provider { $provider } が設定されていますが auth_token がありません。対話的にサインインするには [connection.wss] enroll_url にゲートウェイの HTTP オリジンを設定するか、ZEROCLAW_AUTH_TOKEN をエクスポートしてください(参照: zeroclaw oidc login)。
+zc-oidc-enroll-done = サインインしました。トークンはこのセッションのみ保持されます。次回の登録を省略するには ZEROCLAW_AUTH_TOKEN をエクスポートしてください。
 
 ## 設定レジストリのメタデータ。キーは安定した識別子から生成され、RPC が返す英語表示は互換性のためのフォールバックとして残ります。
 zc-config-group-foundation = 基盤

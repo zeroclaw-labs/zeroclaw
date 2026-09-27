@@ -41,6 +41,7 @@ mod jsonrpc;
 mod keymap;
 mod logs;
 mod mouse;
+mod oidc_enroll;
 mod osc_status;
 mod quickstart_pane;
 mod relay_proto;
@@ -1013,7 +1014,69 @@ async fn run() -> anyhow::Result<()> {
                     .or_else(|| opt_path(&cfg_wss.tls.client_key_path))
                     .or_else(|| default_tls_path(&config_dir, "client.key")),
             };
-            let (auth_token, auth_provider) = resolve_auth(cfg_wss);
+            let (mut auth_token, auth_provider) = resolve_auth(cfg_wss);
+            // An OIDC provider with no token means "enroll first": run the
+            // device grant through the gateway enrollment API and hold the
+            // token for this session only.
+            if auth_token.is_none()
+                && let Some(alias) = auth_provider
+                    .as_deref()
+                    .and_then(|p| p.strip_prefix("oidc."))
+            {
+                let Some(enroll_url) = cfg_wss.enroll_url.as_deref() else {
+                    anyhow::bail!(i18n::t_args(
+                        "zc-oidc-enroll-missing-url",
+                        &[("provider", auth_provider.as_deref().unwrap_or(""))],
+                    ));
+                };
+                // `tls` is borrowed here and moved into the WssRoute below: the
+                // enrollment leg runs on exactly the trust material the WSS
+                // connection is about to use.
+                let token = oidc_enroll::run_device_flow(
+                    enroll_url,
+                    &tls,
+                    alias,
+                    |start| {
+                        let uri = start
+                            .verification_uri_complete
+                            .as_deref()
+                            .unwrap_or(&start.verification_uri);
+                        eprintln!(
+                            "{}",
+                            i18n::t_args(
+                                "zc-oidc-enroll-visit",
+                                &[("uri", uri), ("code", &start.user_code)],
+                            )
+                        );
+                        eprintln!(
+                            "{}",
+                            i18n::t_args(
+                                "zc-oidc-enroll-waiting",
+                                &[("seconds", &start.expires_in.to_string())],
+                            )
+                        );
+                    },
+                    // The enrollment origin is its own peer: it may not be the
+                    // daemon this run connects to afterwards, so it is
+                    // acknowledged under its own URL rather than the WSS
+                    // route's. A non-interactive run reads EOF, which the
+                    // prompt maps to abort, so enrollment refuses instead of
+                    // proceeding unverified.
+                    |origin| {
+                        if cfg_wss.tls.route_acked(origin) {
+                            return Ok(());
+                        }
+                        apply_insecure_tls_choice(
+                            confirm_insecure_tls(origin)?,
+                            &config_dir,
+                            origin,
+                        )
+                    },
+                )
+                .await?;
+                eprintln!("{}", i18n::t("zc-oidc-enroll-done"));
+                auth_token = Some(token);
+            }
             ConnectTarget::Wss(Box::new(WssRoute {
                 direct_url,
                 relay_inner_url: DEFAULT_RELAY_INNER_URL.to_string(),

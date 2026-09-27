@@ -421,6 +421,7 @@ mod tests {
             kind: None,
             pinned: false,
             tenant_id: None,
+            principal_id: None,
             agent_alias: None,
             agent_id: None,
         }

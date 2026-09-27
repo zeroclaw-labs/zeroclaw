@@ -445,6 +445,11 @@ rpc_type! {
         pub session_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub agent: Option<String>,
+        /// Memory plane: `"private"` (the caller's own; the default for every
+        /// authenticated principal) or `"shared"` (honoured only for callers
+        /// with the admin bypass, audited).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plane: Option<String>,
     }
 }
 
@@ -469,6 +474,9 @@ rpc_type! {
         pub until: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub agent: Option<String>,
+        /// Memory plane; see `MemoryListParams::plane`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plane: Option<String>,
     }
 }
 
@@ -487,6 +495,11 @@ rpc_type! {
     /// `memory/get` params — fetch one entry's full content by key.
     pub struct MemoryGetParams {
         pub key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub agent: Option<String>,
+        /// Memory plane; see `MemoryListParams::plane`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plane: Option<String>,
     }
 }
 
@@ -510,6 +523,9 @@ rpc_type! {
         pub session_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub agent: Option<String>,
+        /// Memory plane; see `MemoryListParams::plane`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plane: Option<String>,
     }
 }
 
@@ -526,6 +542,9 @@ rpc_type! {
         pub key: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub agent: Option<String>,
+        /// Memory plane; see `MemoryListParams::plane`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plane: Option<String>,
     }
 }
 

@@ -2105,7 +2105,10 @@ impl RpcClient {
     /// Build a rustls `ClientConfig` from a [`ClientTls`]: server verification via
     /// the configured CA (or `NoVerify` when `skip_verify`), presenting the client
     /// certificate for mutual TLS when one is configured.
-    fn wss_tls_config(tls: &ClientTls) -> Result<std::sync::Arc<rustls::ClientConfig>> {
+    ///
+    /// Crate-visible because the gateway enrollment leg that precedes the WSS
+    /// connection must be given exactly the same trust material.
+    pub(crate) fn wss_tls_config(tls: &ClientTls) -> Result<std::sync::Arc<rustls::ClientConfig>> {
         use std::sync::Arc;
 
         let builder = rustls::ClientConfig::builder_with_provider(Arc::new(

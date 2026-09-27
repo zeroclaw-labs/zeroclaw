@@ -153,6 +153,15 @@ cli-auth-login-about = 使用 OAuth 登录（OpenAI Codex、Gemini 或 xAI）
 cli-auth-refresh-about = 使用刷新令牌刷新 OAuth 访问令牌
 cli-auth-logout-about = 移除认证配置文件
 cli-auth-use-about = 为提供商设置活动配置文件
+cli-oidc-unknown-alias = 配置中没有 [oidc.{ $alias }] 条目。已配置的条目:{ $known }
+cli-oidc-device-visit = 要登录,请打开 { $uri } 并输入代码 { $code }
+cli-oidc-device-waiting = 正在等待身份提供方批准(代码将在 { $seconds } 秒后过期)...
+cli-oidc-device-expired = 设备代码在获得批准前已过期;请重新运行该命令。
+cli-oidc-enrolled = 已向 [oidc.{ $alias }] 注册。访问令牌已输出到 stdout;请在 RPC 握手中作为 auth_token 提供,或导出为 ZEROCLAW_AUTH_TOKEN。
+cli-oidc-token-expiry = 令牌将在 { $seconds } 秒后过期。
+cli-oidc-browser-open = 正在打开浏览器进行登录。如果没有打开,请访问:
+    { $uri }
+cli-oidc-browser-waiting = 正在等待浏览器登录完成...
 cli-auth-list-about = 列出认证配置文件
 cli-auth-status-about = 显示认证状态，包括活动配置文件和令牌过期信息
 cli-memory-list-about = 列出内存条目，可使用可选过滤器
@@ -429,6 +438,9 @@ cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" —
 cli-doctor-codex-auth-profile-no-slot = OpenAI Codex 凭据已登录，但没有模型提供方槽位使用它们。请在 OpenAI 提供方槽位上设置 `requires_openai_auth = true`，并将 agent 的 `model_provider` 指向它，或运行 `zeroclaw quickstart`。
 cli-doctor-codex-auth-slot-no-profile = OpenAI 槽位 {$slots} 已设置 `requires_openai_auth = true`，但没有 OpenAI Codex 凭据登录。请运行 `zeroclaw auth login --provider openai-codex`。
 cli-doctor-codex-auth-ok = OpenAI Codex 凭据已登录，并由模型提供方槽位引用。
+cli-doctor-bootstrap-file-truncated-compact = [{$alias}] {$file}：在注入该文件的智能体循环与通道轮次中，每文件上限保留 {$total} 个字符中的 {$retained} 个（丢弃 {$discarded} 个，先于整个提示词预算）。该智能体的 compact_context 为开启状态，每个引导文件的上限为 {$limit} 个字符。请在 `[runtime_profiles.{$profile}]` 中设置 `compact_context = false`，或缩短该文件。
+cli-doctor-bootstrap-file-truncated-compact-no-profile = [{$alias}] {$file}：在注入该文件的智能体循环与通道轮次中，每文件上限保留 {$total} 个字符中的 {$retained} 个（丢弃 {$discarded} 个，先于整个提示词预算）。该智能体的 compact_context 为开启状态（默认值，未分配 runtime profile），每个引导文件的上限为 {$limit} 个字符。请添加一个带 `compact_context = false` 的 `[runtime_profiles.<name>]`，并在该智能体上设置 `runtime_profile = "<name>"`，或缩短该文件。
+cli-doctor-bootstrap-file-truncated = [{$alias}] {$file}：在注入该文件的智能体循环与通道轮次中，每文件上限保留 {$total} 个字符中的 {$retained} 个（丢弃 {$discarded} 个，先于整个提示词预算）。每个引导文件的上限为 {$limit} 个字符；请缩短该文件。
 cli-doctor-systemd-linger-enabled = systemd 用户 linger 已启用
 cli-doctor-systemd-linger-disabled = systemd 用户 linger 已禁用；用户服务可能会在注销后停止。启用命令：loginctl enable-linger {$user}
 cli-doctor-systemd-linger-unknown = 无法使用 loginctl 检查 systemd 用户 linger

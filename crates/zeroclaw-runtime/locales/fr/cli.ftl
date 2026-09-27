@@ -154,6 +154,15 @@ cli-auth-login-about = Se connecter avec OAuth (OpenAI Codex, Gemini ou xAI)
 cli-auth-refresh-about = Actualiser le jeton d'accès OAuth avec le jeton d'actualisation
 cli-auth-logout-about = Supprimer le profil d'authentification
 cli-auth-use-about = Définir le profil actif pour un fournisseur
+cli-oidc-unknown-alias = Aucune entrée [oidc.{ $alias }] dans la configuration. Entrées configurées : { $known }
+cli-oidc-device-visit = Pour vous connecter, ouvrez { $uri } et saisissez le code { $code }
+cli-oidc-device-waiting = En attente de l'approbation du fournisseur d'identité (le code expire dans { $seconds } secondes)...
+cli-oidc-device-expired = Le code d'appareil a expiré avant l'approbation ; relancez la commande.
+cli-oidc-enrolled = Enrôlé auprès de [oidc.{ $alias }]. Le jeton d'accès est sur stdout ; présentez-le comme auth_token dans la négociation RPC ou exportez-le comme ZEROCLAW_AUTH_TOKEN.
+cli-oidc-token-expiry = Le jeton expire dans { $seconds } secondes.
+cli-oidc-browser-open = Ouverture de votre navigateur pour vous connecter. Si rien ne s'ouvre, visitez :
+    { $uri }
+cli-oidc-browser-waiting = En attente de la fin de la connexion dans le navigateur...
 cli-auth-list-about = Lister les profils d'authentification
 cli-auth-status-about = Afficher le statut d'authentification avec le profil actif et les informations d'expiration du jeton
 cli-memory-list-about = Lister les entrées de mémoire avec des filtres optionnels
@@ -433,6 +442,9 @@ cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" —
 cli-doctor-codex-auth-profile-no-slot = Des identifiants OpenAI Codex sont connectés, mais aucun slot de fournisseur de modèle ne les utilise. Définissez `requires_openai_auth = true` sur un slot de fournisseur OpenAI et pointez le `model_provider` d'un agent vers celui-ci, ou exécutez `zeroclaw quickstart`.
 cli-doctor-codex-auth-slot-no-profile = Les slots OpenAI {$slots} définissent `requires_openai_auth = true`, mais aucun identifiant OpenAI Codex n'est connecté. Exécutez `zeroclaw auth login --provider openai-codex`.
 cli-doctor-codex-auth-ok = Les identifiants OpenAI Codex sont connectés et référencés par un slot de fournisseur de modèle.
+cli-doctor-bootstrap-file-truncated-compact = [{$alias}] {$file} : sur les tours de la boucle agent et des canaux qui l'injectent, le plafond par fichier conserve {$retained} caractères sur {$total} ({$discarded} ignorés, avant le budget de tout le prompt). compact_context est activé pour cet agent et limite chaque fichier d'amorçage à {$limit} caractères. Définissez `compact_context = false` dans `[runtime_profiles.{$profile}]` ou raccourcissez le fichier.
+cli-doctor-bootstrap-file-truncated-compact-no-profile = [{$alias}] {$file} : sur les tours de la boucle agent et des canaux qui l'injectent, le plafond par fichier conserve {$retained} caractères sur {$total} ({$discarded} ignorés, avant le budget de tout le prompt). compact_context est activé pour cet agent (le réglage par défaut, aucun profil d'exécution attribué) et limite chaque fichier d'amorçage à {$limit} caractères. Ajoutez un `[runtime_profiles.<name>]` avec `compact_context = false` et attribuez `runtime_profile = "<name>"` à l'agent, ou raccourcissez le fichier.
+cli-doctor-bootstrap-file-truncated = [{$alias}] {$file} : sur les tours de la boucle agent et des canaux qui l'injectent, le plafond par fichier conserve {$retained} caractères sur {$total} ({$discarded} ignorés, avant le budget de tout le prompt). Chaque fichier d'amorçage est limité à {$limit} caractères ; raccourcissez le fichier.
 cli-doctor-systemd-linger-enabled = persistance utilisateur systemd activée
 cli-doctor-systemd-linger-disabled = persistance utilisateur systemd désactivée ; le service utilisateur peut s'arrêter après la déconnexion. Activez-la avec : loginctl enable-linger {$user}
 cli-doctor-systemd-linger-unknown = impossible de vérifier la persistance utilisateur systemd avec loginctl

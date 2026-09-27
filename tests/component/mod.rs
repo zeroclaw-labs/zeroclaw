@@ -21,6 +21,7 @@ mod dockerignore_test;
 mod gateway;
 mod gemini_capabilities;
 mod hardware_probe_feature_graph;
+mod oidc_enrollment_cli;
 mod otel_dependency_feature_regression;
 mod plugin_feature_graph;
 mod provider_resolution;

@@ -64,6 +64,8 @@ pub(crate) async fn try_recover_context_overflow(
     on_delta: Option<&tokio::sync::mpsc::Sender<super::events::DraftEvent>>,
     observer: &dyn Observer,
     context_limits: zeroclaw_config::schema::ResolvedContextLimits,
+    agent_alias: Option<&str>,
+    turn_id: &str,
     // Owner-tracked breadcrumb provenance for `history` (see
     // `history_trim::insert_breadcrumb_deduped`); set when this recovery
     // inserts a fresh crumb so classification never depends on text.
@@ -166,8 +168,8 @@ pub(crate) async fn try_recover_context_overflow(
                 kept_turns,
                 reason,
                 channel: None,
-                agent_alias: None,
-                turn_id: None,
+                agent_alias: agent_alias.map(str::to_string),
+                turn_id: Some(turn_id.to_string()),
                 token_budget: reported_token_budget,
                 tokens_before: Some(tokens_now as u64),
                 tokens_after: Some(tokens_after as u64),
@@ -214,6 +216,55 @@ mod tests {
     use crate::observability::NoopObserver;
     use zeroclaw_providers::ChatMessage;
 
+    // Keep the existing recovery tests focused on sizing; the test below
+    // calls the production seam with an explicit turn identity.
+    #[allow(clippy::too_many_arguments)]
+    async fn try_recover_context_overflow(
+        history: &mut Vec<ChatMessage>,
+        error: &anyhow::Error,
+        iteration: usize,
+        event_tx: Option<&tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
+        on_delta: Option<&tokio::sync::mpsc::Sender<super::super::events::DraftEvent>>,
+        observer: &dyn Observer,
+        context_limits: zeroclaw_config::schema::ResolvedContextLimits,
+        crumb_present: &mut bool,
+    ) -> bool {
+        super::try_recover_context_overflow(
+            history,
+            error,
+            iteration,
+            event_tx,
+            on_delta,
+            observer,
+            context_limits,
+            None,
+            "test",
+            crumb_present,
+        )
+        .await
+    }
+
+    #[derive(Default)]
+    struct TrimObserver(std::sync::Mutex<Vec<ObserverEvent>>);
+
+    impl Observer for TrimObserver {
+        fn record_event(&self, event: &ObserverEvent) {
+            self.0.lock().expect("trim events lock").push(event.clone());
+        }
+
+        fn record_metric(&self, _metric: &zeroclaw_api::observability_traits::ObserverMetric) {}
+
+        fn name(&self) -> &str {
+            "trim-test"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn flush(&self) {}
+    }
+
     fn overflowing_history() -> Vec<ChatMessage> {
         let big = "x".repeat(4000);
         let mut h = vec![ChatMessage::system("system")];
@@ -222,6 +273,33 @@ mod tests {
             h.push(ChatMessage::assistant(format!("reply {i} {big}").as_str()));
         }
         h
+    }
+
+    #[tokio::test]
+    async fn recovery_observer_identifies_the_effective_turn() {
+        let mut history = overflowing_history();
+        let observer = TrimObserver::default();
+        let recovered = super::try_recover_context_overflow(
+            &mut history,
+            &anyhow::Error::msg("maximum context length exceeded"),
+            1,
+            None,
+            None,
+            &observer,
+            limits(32_000),
+            Some("effective-agent"),
+            "turn-1",
+            &mut false,
+        )
+        .await;
+        assert!(recovered);
+        let events = observer.0.lock().expect("trim events lock");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ObserverEvent::HistoryTrimmed { agent_alias, turn_id, .. }
+                if agent_alias.as_deref() == Some("effective-agent")
+                    && turn_id.as_deref() == Some("turn-1")
+        )));
     }
 
     fn limits(context_token_budget: usize) -> zeroclaw_config::schema::ResolvedContextLimits {
