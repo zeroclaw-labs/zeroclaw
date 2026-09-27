@@ -2,11 +2,25 @@
 
 Skills are reusable instructions and optional tool definitions that ZeroClaw can load into an agent session. Use them for repeatable workflows such as code review checklists, deployment runbooks, support playbooks, or domain-specific tool wrappers.
 
-Skills live in one of three locations:
+Skills can come from four sources:
 
+- Built-in skills embedded in the current ZeroClaw binary. These are
+  read-only, loaded for every agent, and updated with the binary.
 - Per-agent workspace skills under `<install>/agents/<alias>/workspace/skills/<name>/`.
 - Shared skill bundles under `<install>/shared/skills/<bundle>/<name>/`. Agents load these when their config lists the bundle in `agents.<alias>.skill_bundles`.
 - The global skill directory under `<install>/data/skills/<name>/`. The CLI can install there as a fallback, but agents do not load global skills automatically.
+
+Built-in skills have the lowest precedence. A workspace, community, plugin, or
+assigned-bundle skill with the same name intentionally overrides the built-in
+skill for that agent. Built-ins are served directly from the running binary;
+ZeroClaw does not copy them into agent workspaces.
+
+The built-in `zeroclaw-docs` skill uses progressive disclosure: every agent
+receives its name and description, while `read_skill` loads the full
+instructions only when they are relevant. This applies even when the effective
+prompt-injection mode is `full`; other skills keep the configured behavior. An
+operator-provided skill named `zeroclaw-docs` overrides the built-in and follows
+the configured mode like any other operator skill.
 
 Use bundles for skills an agent should load during runtime. A bundle is configured under `[skill_bundles.<alias>]`; when its `directory` is omitted, ZeroClaw resolves it to `<install>/shared/skills/<alias>/`.
 

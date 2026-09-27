@@ -4,7 +4,7 @@ use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
 
-/// Compact-mode helper for loading a skill's source file on demand.
+/// Helper for loading an available skill's source file on demand.
 /// Supports workspace skills, open-skills, agent-bound skill bundles, and plugin skills.
 pub struct ReadSkillTool {
     config: Arc<Config>,
@@ -27,7 +27,7 @@ impl Tool for ReadSkillTool {
     }
 
     fn description(&self) -> &str {
-        "Read the full source file for an available skill by name. Use this in compact skills mode when you need the complete skill instructions without remembering file paths."
+        "Read the full source file for an available skill by name. Use this when its prompt entry says the instructions load on demand."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -86,6 +86,14 @@ impl Tool for ReadSkillTool {
                 )),
             });
         };
+
+        if let Some(source) = crate::skills::builtin_skill_source(skill) {
+            return Ok(ToolResult {
+                success: true,
+                output: source.into(),
+                error: None,
+            });
+        }
 
         let Some(location) = skill.location.as_ref() else {
             return Ok(ToolResult {
@@ -206,8 +214,29 @@ description = "Ship safely"
         assert!(!result.success);
         assert_eq!(
             result.error.as_deref(),
-            Some("Unknown skill 'calendar'. Available skills: weather")
+            Some("Unknown skill 'calendar'. Available skills: weather, zeroclaw-docs")
         );
+    }
+
+    #[tokio::test]
+    async fn reads_builtin_skill_without_a_filesystem_copy() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_for_tmp(&tmp);
+        let copied_path = agent_workspace(&config, "default").join("skills/zeroclaw-docs/SKILL.md");
+
+        let result = make_tool(config)
+            .execute(json!({ "name": "zeroclaw-docs" }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("name: zeroclaw-docs"));
+        assert!(
+            result
+                .output
+                .contains("# ZeroClaw self-knowledge and operation")
+        );
+        assert!(!copied_path.exists());
     }
 
     #[tokio::test]
