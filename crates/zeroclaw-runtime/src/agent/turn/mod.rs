@@ -42,6 +42,8 @@ pub use execution::{
 pub(crate) use history_window::preflight_history_maintenance;
 pub use knobs::{LoopKnobs, MaxIterationBehavior};
 pub(crate) use max_iter::finish_after_max_iterations;
+#[cfg(test)]
+pub(crate) use outcome::MalformedToolProtocolExhausted;
 pub(crate) use outcome::StreamCancelledAfterOutput;
 pub use outcome::{
     ContextWindowExceeded, append_safeguard_fallback_notice, context_window_exceeded_from_error,
@@ -2024,7 +2026,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             }
             let msg = ChatMessage::assistant(fallback.to_string());
             turn_state.push_dual(msg);
-            return Ok(accumulated_display_text);
+            return Err(outcome::MalformedToolProtocolExhausted.into());
         }
 
         // Earlier physical leaves are rejected routing/retry work. The final
