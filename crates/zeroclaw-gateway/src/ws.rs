@@ -23,6 +23,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::ChannelApprovalResponse;
+use zeroclaw_api::ingress::{IngressContext, SourceClass, Transport, TrustClass, TurnOrigin};
+use zeroclaw_runtime::agent::agent::SteeringMessage;
 use zeroclaw_runtime::sop::approval::{
     ApprovalDecision as SopApprovalDecision, ApprovalPrincipal as SopApprovalPrincipal,
 };
@@ -44,6 +46,20 @@ const WS_APPROVAL_TIMEOUT_SECS: u64 = 120;
 /// names in observability while interactive tools still route correctly —
 /// or, worse, tools route to an arbitrary seeded channel.
 const WS_CHANNEL_KEY: &str = "wss";
+
+fn gateway_steering_message(content: String) -> SteeringMessage {
+    SteeringMessage::known(
+        content,
+        IngressContext {
+            message_id: None,
+            source_class: SourceClass::External,
+            sender: None,
+            transport: Transport::Gateway,
+            trust: TrustClass::Untrusted,
+            origin: TurnOrigin::Interactive,
+        },
+    )
+}
 
 #[derive(Debug, Deserialize)]
 struct ConnectParams {
@@ -1725,7 +1741,7 @@ async fn process_chat_message(
 
     // Channel for streaming turn events from the agent.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
-    let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(32);
+    let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<SteeringMessage>(32);
 
     let content_owned = content.to_string();
     let session_key_owned = session_key.to_string();
@@ -1750,7 +1766,7 @@ async fn process_chat_message(
                 zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                     cost_tracking_context.clone(),
                     agent
-                        .turn_streamed_with_steering_state(
+                        .turn_streamed_with_steering_provenance_state(
                             &content_owned,
                             event_tx,
                             Some(cancel_token.as_ref().clone()),
@@ -1870,7 +1886,7 @@ async fn process_chat_message(
                                             let _ = sender.send(Message::Text(err.to_string().into())).await;
                                             continue;
                                         }
-                                        match steering_tx.try_send(content) {
+                                        match steering_tx.try_send(gateway_steering_message(content)) {
                                             Ok(()) => {}
                                             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                                                 let err = serde_json::json!({

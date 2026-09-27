@@ -78,7 +78,7 @@ use crate::agent::tool_execution::{
     ToolDispatchContext, execute_tools_parallel, execute_tools_sequential,
     should_execute_tools_in_parallel,
 };
-use crate::security::ingress::{IngressPolicy, ingress_policy};
+use crate::security::ingress::{IngressPolicy, ingress_policy, steering_policy};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::collections::HashSet;
@@ -302,6 +302,30 @@ pub struct ToolLoop<'a> {
     /// FAILS CLOSED (the step errors rather than running with the parent
     /// agent's broader context).
     pub sop_reassembly: Option<SopStepReassembly<'a>>,
+}
+
+/// Admission subject for the outer Agent wrapper. Steering injections are
+/// admitted before they enter the loop; the loop must either admit the
+/// original user message or skip the already-admitted round entirely.
+pub(crate) enum InitialIngressSubject {
+    Original {
+        text: String,
+        ingress: IngressContext,
+    },
+    AlreadyAdmitted,
+}
+
+pub(crate) fn run_tool_call_loop_with_initial_ingress<'a>(
+    p: ToolLoop<'a>,
+    subject: InitialIngressSubject,
+) -> impl std::future::Future<Output = Result<String>> + 'a {
+    run_tool_call_loop_impl(p, Some(subject))
+}
+
+pub fn run_tool_call_loop(
+    p: ToolLoop<'_>,
+) -> impl std::future::Future<Output = Result<String>> + '_ {
+    run_tool_call_loop_impl(p, None)
 }
 
 /// Project the token population of the NEXT provider request that would be
@@ -928,7 +952,10 @@ async fn emit_rejected_attempt_usage(
     }
 }
 
-pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
+async fn run_tool_call_loop_impl(
+    mut p: ToolLoop<'_>,
+    initial_ingress: Option<InitialIngressSubject>,
+) -> Result<String> {
     let model_switch_state = p
         .exec
         .model_switch_callback
@@ -1002,30 +1029,36 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     turn_state.sync_pending();
 
     let ingress_policy_cfg = IngressPolicy::default();
-    let p1_text = turn_state
-        .history
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map_or("", |m| m.content.as_str());
-    match ingress_policy(p1_text, &ingress, &ingress_policy_cfg) {
-        // DEFAULT — the only arm reachable under the default policy. Proceed
-        // into the loop exactly as today.
-        IngressDecision::Loop => {}
-        // Phase 3: wrap the message as untrusted data before it enters history.
-        // Until framing exists, proceed as Loop (behavior-identical).
-        IngressDecision::Annotate { .. } => {}
-        // Phase 2: divert the turn into a managed SOP run instead of the loop.
-        // Not reachable under the default policy; proceed-as-loop for now.
-        IngressDecision::Gate { .. } => {
-            // TODO(PR C): hand this turn to the SOP run the gate names.
-        }
-        // Not reachable under the default policy; refuse the turn when it is.
-        IngressDecision::Drop { ref reason } => {
-            return Ok(crate::i18n::get_required_cli_string_with_args(
-                "turn-ingress-dropped",
-                &[("reason", reason.as_str())],
-            ));
+    let p1_subject = match initial_ingress {
+        Some(InitialIngressSubject::Original { text, ingress }) => Some((text, ingress)),
+        Some(InitialIngressSubject::AlreadyAdmitted) => None,
+        None => turn_state
+            .history
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|message| (message.content.clone(), ingress.clone())),
+    };
+    if let Some((p1_text, p1_ingress)) = p1_subject {
+        match ingress_policy(&p1_text, &p1_ingress, &ingress_policy_cfg) {
+            // DEFAULT — the only arm reachable under the default policy. Proceed
+            // into the loop exactly as today.
+            IngressDecision::Loop => {}
+            // Phase 3: wrap the message as untrusted data before it enters history.
+            // Until framing exists, proceed as Loop (behavior-identical).
+            IngressDecision::Annotate { .. } => {}
+            // Phase 2: divert the turn into a managed SOP run instead of the loop.
+            // Not reachable under the default policy; proceed-as-loop for now.
+            IngressDecision::Gate { .. } => {
+                // TODO(PR C): hand this turn to the SOP run the gate names.
+            }
+            // Not reachable under the default policy; refuse the turn when it is.
+            IngressDecision::Drop { ref reason } => {
+                return Ok(crate::i18n::get_required_cli_string_with_args(
+                    "turn-ingress-dropped",
+                    &[("reason", reason.as_str())],
+                ));
+            }
         }
     }
 
@@ -1165,7 +1198,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         let excluded_tools: &[String] = step_scoped_excluded.as_deref().unwrap_or(excluded_tools);
 
         for steering_message in drain_steering_messages(&mut steering) {
-            match ingress_policy(&steering_message, &ingress, &ingress_policy_cfg) {
+            // Direct ToolLoop string callers have no stamped per-injection
+            // provenance. Keep them explicitly unknown/untrusted instead of
+            // borrowing the enclosing turn's ingress.
+            match steering_policy(&steering_message, None, &ingress_policy_cfg) {
                 // DEFAULT — append the injection to history exactly as today.
                 IngressDecision::Loop => {}
                 // Phase 3: frame as untrusted data; proceed as Loop until
