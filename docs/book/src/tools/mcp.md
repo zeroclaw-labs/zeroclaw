@@ -98,7 +98,7 @@ the standard HTTP MCP setup shown in the Parallel example above, using
 `https://api.you.com/mcp` (authenticated) or
 `https://api.you.com/mcp?profile=free` (keyless) as the URL. See the
 [You.com setup docs](https://you.com/docs) and the
-[ZeroClaw MCP server fields guide](https://zeroclaw.dev/docs/tools/mcp#server-fields)
+[ZeroClaw MCP server fields guide](#server-fields)
 for configuration details.
 
 ## Editing servers
