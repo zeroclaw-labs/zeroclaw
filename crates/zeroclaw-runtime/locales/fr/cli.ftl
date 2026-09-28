@@ -377,6 +377,8 @@ channel-wecom-ws-stop-ack = Message en cours arrêté.
 channel-wecom-ws-voice-unavailable = Je ne peux pas traiter les messages vocaux pour le moment {$emoji}
 channel-wecom-ws-unsupported-message = Ce type de message n'est pas encore pris en charge.
 channel-wecom-ws-welcome = Bonjour, bienvenue dans cette discussion avec moi {$emoji}
+channel-wecom-ws-media-failed =
+    {"["}Média non envoyé] {$detail}
 channel-wecom-ws-supplemental-message =
     {"["}Message complémentaire]
     {$extra}

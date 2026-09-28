@@ -45,6 +45,31 @@ const WECOM_EMOJIS: &[&str] = &[
     "\u{1F44C}",
 ];
 const WECOM_FILE_CLEANUP_INTERVAL_SECS: u64 = 1800;
+
+// ── outbound media (temporary-material upload) ───────────────────────
+//
+// The long-connection API has no single "send this file" call: a `media_id`
+// must first be minted with a three-step chunked upload
+// (`aibot_upload_media_init` → `aibot_upload_media_chunk` ×N →
+// `aibot_upload_media_finish`) over the *same* socket, and only then may it be
+// referenced by an `image`/`file` message. The numbers below are the
+// service-side ceilings documented for that flow.
+
+/// WeCom caps one chunk at 512 KiB measured *before* base64 encoding.
+const WECOM_UPLOAD_CHUNK_BYTES: usize = 512 * 1024;
+/// WeCom accepts at most 100 chunks per upload session.
+const WECOM_UPLOAD_MAX_CHUNKS: usize = 100;
+/// `type: "image"` ceiling.
+const WECOM_UPLOAD_MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+/// `type: "file"` ceiling. WeCom documents 50 MiB, which its
+/// 100 x 512 KiB chunk allowance covers exactly.
+const WECOM_UPLOAD_MAX_FILE_BYTES: usize = 50 * 1024 * 1024;
+/// A media upload is several round-trips; each gets a longer ack budget than
+/// a single fire-and-forget command.
+const WECOM_UPLOAD_ACK_TIMEOUT_SECS: u64 = 30;
+/// The only image containers WeCom renders inline. Anything else must travel
+/// as `type: "file"`, which arrives as a downloadable attachment instead.
+const WECOM_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif"];
 macro_rules! wecom_log_debug {
     ($($arg:tt)*) => {
         ::zeroclaw_log::record!(
@@ -167,6 +192,47 @@ impl AttachmentKind {
         match self {
             Self::Image => "image",
             Self::File => "file",
+        }
+    }
+
+    /// Upload ceiling for this material type (`type` in
+    /// `aibot_upload_media_init`).
+    fn max_upload_bytes(self) -> usize {
+        match self {
+            Self::Image => WECOM_UPLOAD_MAX_IMAGE_BYTES,
+            Self::File => WECOM_UPLOAD_MAX_FILE_BYTES,
+        }
+    }
+
+    /// Map an outbound `[KIND:target]` marker kind onto a transportable
+    /// type.
+    ///
+    /// Video/audio/voice markers ride as `file`: WeCom's dedicated
+    /// `video`/`voice` types demand specific containers (mp4, amr) that a
+    /// marker target gives us no way to guarantee, whereas `file` accepts any
+    /// bytes and still delivers the media. `location` has no WeCom
+    /// equivalent and is refused so the caller can report it.
+    fn from_marker_kind(kind: &str) -> Option<Self> {
+        match kind.trim().to_ascii_uppercase().as_str() {
+            "IMAGE" | "PHOTO" => Some(Self::Image),
+            "DOCUMENT" | "FILE" | "VIDEO" | "AUDIO" | "VOICE" => Some(Self::File),
+            _ => None,
+        }
+    }
+
+    /// Pick the type from the file extension, so a marker that names a
+    /// renderable image goes out inline and everything else goes out as a
+    /// document.
+    fn for_path(path: &Path) -> Self {
+        let ext = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if WECOM_IMAGE_EXTENSIONS.contains(&ext.as_str()) {
+            Self::Image
+        } else {
+            Self::File
         }
     }
 }
@@ -293,6 +359,12 @@ pub struct WeComWsChannel {
     ws_tx: Arc<tokio::sync::Mutex<Option<mpsc::Sender<WsOutbound>>>>,
     pending_responses:
         Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<()>>>>>,
+    /// Waiters for commands whose ack carries a payload the caller needs
+    /// (`upload_id` from `aibot_upload_media_init`, `media_id` from
+    /// `aibot_upload_media_finish`). Kept apart from `pending_responses`,
+    /// which only ever reports success or failure and would drop the body.
+    pending_value_responses:
+        Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<Value>>>>>,
     respond_msg_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     last_cleanup: Arc<Mutex<Instant>>,
     idempotency: Arc<SimpleIdempotencyStore>,
@@ -350,6 +422,7 @@ impl WeComWsChannel {
             client,
             ws_tx: Arc::new(tokio::sync::Mutex::new(None)),
             pending_responses: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            pending_value_responses: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             respond_msg_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             last_cleanup: Arc::new(Mutex::new(Instant::now())),
             idempotency: Arc::new(SimpleIdempotencyStore::new()),
@@ -420,6 +493,44 @@ impl WeComWsChannel {
         }
     }
 
+    /// Like [`Self::ws_send_frame_and_wait_for_response`], but hands back the
+    /// whole ack frame so the caller can read a payload out of `body`
+    /// (`upload_id`, `media_id`).
+    ///
+    /// Takes its own timeout because media commands carry base64 payloads and
+    /// are thereby slower than a text ack.
+    async fn ws_send_frame_and_wait_for_value(
+        &self,
+        frame: Value,
+        req_id: &str,
+        command: &str,
+        timeout_secs: u64,
+    ) -> Result<Value> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending_value_responses
+            .lock()
+            .await
+            .insert(req_id.to_string(), tx);
+
+        if let Err(err) = self.ws_send_frame(frame).await {
+            self.pending_value_responses.lock().await.remove(req_id);
+            return Err(err);
+        }
+
+        match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => anyhow::bail!(
+                "WeCom WS {command} response channel closed before ack (req_id={req_id})"
+            ),
+            Err(_) => {
+                self.pending_value_responses.lock().await.remove(req_id);
+                anyhow::bail!(
+                    "WeCom WS {command} ack timeout after {timeout_secs}s (req_id={req_id})"
+                );
+            }
+        }
+    }
+
     async fn maybe_handle_command_response(&self, frame: &Value) -> bool {
         let Some(req_id) = frame
             .get("headers")
@@ -437,6 +548,20 @@ impl WeComWsChannel {
             .get("errmsg")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
+
+        // Payload-bearing commands first: their waiter needs the whole ack
+        // body, not just the verdict.
+        if let Some(waiter) = self.pending_value_responses.lock().await.remove(req_id) {
+            let result = if errcode == 0 {
+                Ok(frame.clone())
+            } else {
+                Err(anyhow::Error::msg(format!(
+                    "WeCom command failed: req_id={req_id} errcode={errcode} errmsg={errmsg}"
+                )))
+            };
+            let _ = waiter.send(result);
+            return true;
+        }
 
         if let Some(waiter) = self.pending_responses.lock().await.remove(req_id) {
             let result = if errcode == 0 {
@@ -483,6 +608,17 @@ impl WeComWsChannel {
         };
 
         for (req_id, waiter) in pending {
+            let _ = waiter.send(Err(anyhow::Error::msg(format!(
+                "WeCom WebSocket disconnected before response: req_id={req_id} reason={reason}"
+            ))));
+        }
+
+        let pending_values = {
+            let mut guard = self.pending_value_responses.lock().await;
+            std::mem::take(&mut *guard)
+        };
+
+        for (req_id, waiter) in pending_values {
             let _ = waiter.send(Err(anyhow::Error::msg(format!(
                 "WeCom WebSocket disconnected before response: req_id={req_id} reason={reason}"
             ))));
@@ -1481,6 +1617,367 @@ impl WeComWsChannel {
 
         Ok(())
     }
+
+    // ── outbound media ───────────────────────────────────────────────
+
+    /// Mint a temporary `media_id` for `bytes` via the three-step chunked
+    /// upload, so a later `image`/`file` message can reference it.
+    ///
+    /// Temporary material lives for three days, which is longer than any reply
+    /// window this channel needs.
+    async fn upload_media(
+        &self,
+        kind: AttachmentKind,
+        filename: &str,
+        bytes: &[u8],
+    ) -> Result<String> {
+        let type_str = kind.as_str();
+        let max_bytes = kind.max_upload_bytes();
+
+        if bytes.is_empty() {
+            anyhow::bail!("WeCom {type_str} upload refused: file is empty");
+        }
+        if bytes.len() > max_bytes {
+            anyhow::bail!(
+                "WeCom {type_str} upload refused: {} bytes exceeds the {max_bytes}-byte limit",
+                bytes.len()
+            );
+        }
+
+        let chunk_count = bytes.len().div_ceil(WECOM_UPLOAD_CHUNK_BYTES);
+        if chunk_count > WECOM_UPLOAD_MAX_CHUNKS {
+            anyhow::bail!(
+                "WeCom {type_str} upload refused: {chunk_count} chunks exceeds the \
+                 {WECOM_UPLOAD_MAX_CHUNKS}-chunk limit"
+            );
+        }
+
+        // 1/3 — open the session
+        let init_req_id = random_ascii_token(16);
+        let init_frame = serde_json::json!({
+            "cmd": "aibot_upload_media_init",
+            "headers": { "req_id": init_req_id },
+            "body": {
+                "type": type_str,
+                "filename": filename,
+                "total_size": bytes.len(),
+                "total_chunks": chunk_count,
+                "md5": format!("{:x}", md5::compute(bytes)),
+            }
+        });
+        let init_ack = self
+            .ws_send_frame_and_wait_for_value(
+                init_frame,
+                &init_req_id,
+                "aibot_upload_media_init",
+                WECOM_UPLOAD_ACK_TIMEOUT_SECS,
+            )
+            .await?;
+        let upload_id = ack_field(&init_ack, "upload_id").ok_or_else(|| {
+            anyhow::Error::msg("WeCom aibot_upload_media_init ack carried no upload_id")
+        })?;
+
+        // 2/3 — one frame per chunk
+        for (index, chunk) in bytes.chunks(WECOM_UPLOAD_CHUNK_BYTES).enumerate() {
+            let chunk_req_id = random_ascii_token(16);
+            let frame = serde_json::json!({
+                "cmd": "aibot_upload_media_chunk",
+                "headers": { "req_id": chunk_req_id },
+                "body": {
+                    "upload_id": upload_id,
+                    "chunk_index": index,
+                    "base64_data": base64::engine::general_purpose::STANDARD.encode(chunk),
+                }
+            });
+            self.ws_send_frame_and_wait_for_value(
+                frame,
+                &chunk_req_id,
+                "aibot_upload_media_chunk",
+                WECOM_UPLOAD_ACK_TIMEOUT_SECS,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "WeCom media upload chunk {}/{chunk_count} failed",
+                    index + 1
+                )
+            })?;
+        }
+
+        // 3/3 — merge and mint the media id
+        let finish_req_id = random_ascii_token(16);
+        let finish_frame = serde_json::json!({
+            "cmd": "aibot_upload_media_finish",
+            "headers": { "req_id": finish_req_id },
+            "body": { "upload_id": upload_id }
+        });
+        let finish_ack = self
+            .ws_send_frame_and_wait_for_value(
+                finish_frame,
+                &finish_req_id,
+                "aibot_upload_media_finish",
+                WECOM_UPLOAD_ACK_TIMEOUT_SECS,
+            )
+            .await?;
+        let media_id = ack_field(&finish_ack, "media_id").ok_or_else(|| {
+            anyhow::Error::msg("WeCom aibot_upload_media_finish ack carried no media_id")
+        })?;
+
+        wecom_log_info!(
+            "WeCom media uploaded type={type_str} filename={filename} bytes={} chunks={chunk_count}",
+            bytes.len()
+        );
+
+        Ok(media_id)
+    }
+
+    /// Deliver an uploaded `media_id` to a scope over `aibot_send_msg`.
+    async fn send_media_to_scope(
+        &self,
+        scope: &str,
+        media_id: &str,
+        kind: AttachmentKind,
+    ) -> Result<()> {
+        let (chat_type, chatid) = parse_scope(scope)?;
+        let mut body = media_message_body(kind, media_id);
+        if let Value::Object(ref mut fields) = body {
+            fields.insert("chatid".to_string(), Value::String(chatid.to_string()));
+            fields.insert("chat_type".to_string(), Value::from(chat_type));
+        }
+
+        let req_id = random_ascii_token(16);
+        let frame = serde_json::json!({
+            "cmd": "aibot_send_msg",
+            "headers": { "req_id": req_id },
+            "body": body,
+        });
+
+        self.ws_send_frame_and_wait_for_response(frame, &req_id, "aibot_send_msg")
+            .await
+    }
+
+    /// Deliver an uploaded `media_id` as a reply on a live callback.
+    async fn send_media_via_respond(
+        &self,
+        req_id: &str,
+        media_id: &str,
+        kind: AttachmentKind,
+    ) -> Result<()> {
+        let frame = serde_json::json!({
+            "cmd": "aibot_respond_msg",
+            "headers": { "req_id": req_id },
+            "body": media_message_body(kind, media_id),
+        });
+
+        self.ws_send_frame_and_wait_for_response(frame, req_id, "aibot_respond_msg")
+            .await
+    }
+
+    /// Turn parsed `[KIND:target]` markers into uploadable `(kind, path)`
+    /// pairs, reporting — rather than silently dropping — what it refuses.
+    fn resolve_outbound_markers(
+        &self,
+        markers: Vec<(String, String)>,
+    ) -> Vec<(AttachmentKind, PathBuf)> {
+        let mut resolved = Vec::with_capacity(markers.len());
+
+        for (kind, target) in markers {
+            if AttachmentKind::from_marker_kind(&kind).is_none() {
+                wecom_log_warn!(
+                    "[wecom_ws] dropping outbound marker with unsupported kind kind={kind} target={target}"
+                );
+                continue;
+            }
+
+            match resolve_outbound_media_path(&target, &self.cfg.workspace_dir) {
+                // The bytes decide the transport type, not the marker label: a
+                // path WeCom cannot render inline goes out as a document.
+                Ok(path) => resolved.push((AttachmentKind::for_path(&path), path)),
+                Err(err) => {
+                    wecom_log_warn!(
+                        "[wecom_ws] dropping unresolved outbound marker target={target} error={err:#}"
+                    );
+                }
+            }
+        }
+
+        resolved
+    }
+
+    /// Split a reply into the text to show and the media it names.
+    ///
+    /// Two delivery routes need this and neither is optional. A reply with
+    /// `stream_mode` off arrives through `send()`; a streamed reply arrives
+    /// through `finalize_draft()`, which is the route a WeCom workspace group
+    /// actually takes. Parsing in only one of them leaves the marker sitting on
+    /// screen as literal `[image: …]` text in the other.
+    fn split_reply_and_media(&self, content: &str) -> (String, Vec<(AttachmentKind, PathBuf)>) {
+        let (text, markers) = super::util::parse_attachment_markers(content);
+        let media = self.resolve_outbound_markers(markers);
+        (text, media)
+    }
+
+    /// Upload each resolved marker and deliver it.
+    ///
+    /// The marker that named these files has already been stripped from the
+    /// reply text, so a failure cannot be left silent — the caller gets an
+    /// error and the user gets a notice naming what did not make it.
+    async fn send_outbound_media(
+        &self,
+        scope: &str,
+        req_id: Option<&str>,
+        media: Vec<(AttachmentKind, PathBuf)>,
+    ) -> Result<()> {
+        let mut failures: Vec<String> = Vec::new();
+
+        for (kind, path) in media {
+            let filename = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("attachment")
+                .to_string();
+
+            let bytes = match tokio::fs::read(&path).await {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    failures.push(format!("{filename}: read failed: {err}"));
+                    continue;
+                }
+            };
+
+            let media_id = match self.upload_media(kind, &filename, &bytes).await {
+                Ok(media_id) => media_id,
+                Err(err) => {
+                    failures.push(format!("{filename}: upload failed: {err:#}"));
+                    continue;
+                }
+            };
+
+            // Prefer the push path: it addresses the scope directly, whereas
+            // the reply slot belongs to `req_id` and the text above has
+            // already finished that stream.
+            let delivered = match self.send_media_to_scope(scope, &media_id, kind).await {
+                Ok(()) => Ok(()),
+                Err(scope_err) => match req_id {
+                    Some(req_id) => self
+                        .send_media_via_respond(req_id, &media_id, kind)
+                        .await
+                        .map_err(|respond_err| {
+                            anyhow::Error::msg(format!(
+                                "push failed ({scope_err:#}); reply failed ({respond_err:#})"
+                            ))
+                        }),
+                    None => Err(scope_err),
+                },
+            };
+
+            if let Err(err) = delivered {
+                failures.push(format!("{filename}: send failed: {err:#}"));
+            }
+        }
+
+        if failures.is_empty() {
+            return Ok(());
+        }
+
+        let detail = failures.join("; ");
+        wecom_log_warn!("[wecom_ws] outbound media delivery failed: {detail}");
+
+        let notice =
+            wecom_ws_cli_string_with_args("channel-wecom-ws-media-failed", &[("detail", &detail)]);
+        if let Err(err) = self.send_markdown_chunks_to_scope(scope, &notice).await {
+            wecom_log_warn!(
+                "[wecom_ws] failed to report outbound media failure to scope={scope} error={err:#}"
+            );
+        }
+
+        anyhow::bail!("WeCom outbound media delivery failed: {detail}")
+    }
+}
+
+/// The `body` fragment naming an uploaded media item.
+///
+/// `aibot_send_msg` and `aibot_respond_msg` share this shape; the former only
+/// adds `chatid`/`chat_type` addressing on top.
+fn media_message_body(kind: AttachmentKind, media_id: &str) -> Value {
+    match kind {
+        AttachmentKind::Image => serde_json::json!({
+            "msgtype": "image",
+            "image": { "media_id": media_id },
+        }),
+        AttachmentKind::File => serde_json::json!({
+            "msgtype": "file",
+            "file": { "media_id": media_id },
+        }),
+    }
+}
+
+/// Pull a non-empty string field out of an ack `body`.
+fn ack_field(ack: &Value, field: &str) -> Option<String> {
+    ack.get("body")
+        .and_then(|body| body.get(field))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+/// Bound an outbound `[KIND:target]` marker target to a readable file inside
+/// the workspace.
+///
+/// Marker text is model-authored, so the target is untrusted input. Unlike the
+/// front-end channels, there is nothing here for a URL to buy us: WeCom's
+/// upload path takes bytes, so fetching a remote target would turn a marker
+/// into an outbound request the operator never approved. Schemes are therefore
+/// refused outright rather than fetched.
+fn resolve_outbound_media_path(target: &str, workspace_dir: &Path) -> Result<PathBuf> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("WeCom media marker target is empty");
+    }
+    if trimmed.contains('\0') {
+        anyhow::bail!("WeCom media marker target contains a null byte");
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("data:") || lower.starts_with("file:") || lower.contains("://") {
+        anyhow::bail!(
+            "WeCom media marker target must be a local file path, not a URL or data: target"
+        );
+    }
+
+    let raw = Path::new(trimmed);
+    let candidate = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        workspace_dir.join(raw)
+    };
+
+    // Canonicalize before the containment check, so `..` segments and symlinks
+    // cannot smuggle the target out of the workspace.
+    let resolved = candidate.canonicalize().map_err(|err| {
+        anyhow::Error::msg(format!(
+            "WeCom media marker target could not be resolved: {err}"
+        ))
+    })?;
+    let root = workspace_dir.canonicalize().map_err(|err| {
+        anyhow::Error::msg(format!("WeCom workspace root could not be resolved: {err}"))
+    })?;
+    if !resolved.starts_with(&root) {
+        anyhow::bail!("WeCom media marker target escapes the workspace");
+    }
+
+    let metadata = std::fs::metadata(&resolved).map_err(|err| {
+        anyhow::Error::msg(format!("WeCom media marker target metadata failed: {err}"))
+    })?;
+    if !metadata.is_file() {
+        anyhow::bail!("WeCom media marker target is not a file");
+    }
+    if metadata.len() == 0 {
+        anyhow::bail!("WeCom media marker target is empty");
+    }
+
+    Ok(resolved)
 }
 
 // ── Channel trait impl ───────────────────────────────────────────────
@@ -1518,13 +2015,18 @@ impl Channel for WeComWsChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
-        if let Some(req_id) = message
+        let (text, media) = self.split_reply_and_media(&message.content);
+
+        let req_id = message
             .thread_ts
             .as_deref()
-            .filter(|req_id| !req_id.is_empty())
-        {
+            .filter(|req_id| !req_id.is_empty());
+
+        if let Some(req_id) = req_id {
+            // Finish the stream even when the reply was nothing but a marker:
+            // otherwise the draft keeps spinning with no text left to show.
             let stream_id = next_stream_id();
-            let (stream_content, overflow) = split_stream_content_and_overflow(&message.content);
+            let (stream_content, overflow) = split_stream_content_and_overflow(&text);
 
             self.ws_send_respond_msg(req_id, &stream_id, &stream_content, true)
                 .await?;
@@ -1537,11 +2039,17 @@ impl Channel for WeComWsChannel {
                 self.send_markdown_chunks_to_scope(&message.recipient, &extra_msg)
                     .await?;
             }
+        } else if !text.is_empty() {
+            self.send_markdown_chunks_to_scope(&message.recipient, &text)
+                .await?;
+        }
 
+        // Media follows the caption that introduced it.
+        if media.is_empty() {
             return Ok(());
         }
 
-        self.send_markdown_chunks_to_scope(&message.recipient, &message.content)
+        self.send_outbound_media(&message.recipient, req_id, media)
             .await
     }
 
@@ -1797,7 +2305,10 @@ impl Channel for WeComWsChannel {
         if req_id.is_empty() {
             return Ok(());
         }
-        self.ws_send_respond_msg(&req_id, message_id, content, false)
+        // Media markers are resolved once, on finalize. Rendering them here
+        // would flash `[image: …]` in the draft before the upload even starts.
+        let (text, _media) = super::util::parse_attachment_markers(content);
+        self.ws_send_respond_msg(&req_id, message_id, &text, false)
             .await?;
         Ok(())
     }
@@ -1815,13 +2326,15 @@ impl Channel for WeComWsChannel {
             .remove(message_id)
             .unwrap_or_default();
 
-        let (stream_content, overflow) = split_stream_content_and_overflow(content);
+        // Resolve media before any text leaves. The marker is stripped from the
+        // reply either way, so skipping this would lose the file without a word.
+        let (text, media) = self.split_reply_and_media(content);
+        let (stream_content, overflow) = split_stream_content_and_overflow(&text);
 
         if !req_id.is_empty() {
             self.ws_send_respond_msg(&req_id, message_id, &stream_content, true)
                 .await?;
         }
-
         // Send overflow via aibot_send_msg
         if let Some(extra) = overflow {
             let extra_msg = format!("[\u{8865}\u{5145}\u{6d88}\u{606f}]\n{extra}");
@@ -1840,6 +2353,14 @@ impl Channel for WeComWsChannel {
                     let _ = self.ws_send_frame(frame).await;
                 }
             }
+        }
+
+        // The stream above is already finished, so the push path carries the
+        // media; `req_id` is kept only as its reply-slot fallback.
+        if !media.is_empty() {
+            let respond_to = (!req_id.is_empty()).then_some(req_id.as_str());
+            self.send_outbound_media(recipient, respond_to, media)
+                .await?;
         }
 
         Ok(())
@@ -3952,5 +4473,310 @@ mod tests {
             }))
             .await;
         second.await.unwrap().unwrap();
+    }
+
+    // ── outbound media ───────────────────────────────────────────────
+
+    #[test]
+    fn outbound_marker_kinds_map_to_transport_types() {
+        assert_eq!(
+            AttachmentKind::from_marker_kind("image"),
+            Some(AttachmentKind::Image)
+        );
+        assert_eq!(
+            AttachmentKind::from_marker_kind(" PHOTO "),
+            Some(AttachmentKind::Image)
+        );
+        assert_eq!(
+            AttachmentKind::from_marker_kind("document"),
+            Some(AttachmentKind::File)
+        );
+        // Containers WeCom's dedicated video/voice types cannot guarantee ride
+        // as plain files rather than being dropped on the floor.
+        assert_eq!(
+            AttachmentKind::from_marker_kind("video"),
+            Some(AttachmentKind::File)
+        );
+        assert_eq!(AttachmentKind::from_marker_kind("location"), None);
+        assert_eq!(AttachmentKind::from_marker_kind(""), None);
+    }
+
+    #[test]
+    fn outbound_transport_type_follows_the_file_extension() {
+        for inline in ["/w/poster.png", "/w/SHOT.JPEG", "/w/clip.gif", "/w/a.jpg"] {
+            assert_eq!(
+                AttachmentKind::for_path(Path::new(inline)),
+                AttachmentKind::Image,
+                "{inline} should render inline"
+            );
+        }
+        for document in ["/w/report.pdf", "/w/notes.txt", "/w/noext"] {
+            assert_eq!(
+                AttachmentKind::for_path(Path::new(document)),
+                AttachmentKind::File,
+                "{document} should travel as a document"
+            );
+        }
+    }
+
+    #[test]
+    fn media_body_names_the_id_under_its_own_msgtype_key() {
+        assert_eq!(
+            media_message_body(AttachmentKind::Image, "MID"),
+            serde_json::json!({ "msgtype": "image", "image": { "media_id": "MID" } })
+        );
+        assert_eq!(
+            media_message_body(AttachmentKind::File, "MID"),
+            serde_json::json!({ "msgtype": "file", "file": { "media_id": "MID" } })
+        );
+    }
+
+    #[test]
+    fn ack_field_reads_only_non_empty_body_strings() {
+        let ack = serde_json::json!({
+            "headers": { "req_id": "r1" },
+            "body": { "upload_id": "UP1", "blank": "   " },
+            "errcode": 0,
+        });
+        assert_eq!(ack_field(&ack, "upload_id").as_deref(), Some("UP1"));
+        // Whitespace-only must not pass as a usable id.
+        assert_eq!(ack_field(&ack, "blank"), None);
+        assert_eq!(ack_field(&ack, "missing"), None);
+        assert_eq!(
+            ack_field(&serde_json::json!({ "errcode": 0 }), "upload_id"),
+            None
+        );
+    }
+
+    #[test]
+    fn marker_targets_must_be_files_inside_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nest the workspace so a sibling file gives us a real escape target
+        // without touching anything outside the temporary directory.
+        let root = dir.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("poster.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+        std::fs::write(root.join("empty.png"), b"").unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        let outside = dir.path().join("outside.png");
+        std::fs::write(&outside, b"x").unwrap();
+
+        // Relative and absolute paths inside the workspace both resolve.
+        assert_eq!(
+            resolve_outbound_media_path("poster.png", &root).unwrap(),
+            root.join("poster.png").canonicalize().unwrap()
+        );
+        assert!(resolve_outbound_media_path(outside.to_str().unwrap(), &root).is_err());
+        assert!(
+            resolve_outbound_media_path(root.join("poster.png").to_str().unwrap(), &root).is_ok()
+        );
+
+        // An existing file outside the workspace is refused on containment,
+        // not merely because it is missing.
+        assert!(outside.exists());
+        assert!(
+            resolve_outbound_media_path(outside.to_str().unwrap(), &root)
+                .unwrap_err()
+                .to_string()
+                .contains("escapes the workspace")
+        );
+
+        // Remote and pseudo schemes are never fetched.
+        for target in [
+            "https://example.com/a.png",
+            "http://example.com/a.png",
+            "data:image/png;base64,AAAA",
+            "file:///etc/passwd",
+        ] {
+            assert!(
+                resolve_outbound_media_path(target, &root).is_err(),
+                "{target} must be refused"
+            );
+        }
+
+        // Non-files, empty files, and blank targets are refused.
+        assert!(resolve_outbound_media_path("missing.png", &root).is_err());
+        assert!(resolve_outbound_media_path("empty.png", &root).is_err());
+        assert!(resolve_outbound_media_path("sub", &root).is_err());
+        assert!(resolve_outbound_media_path("   ", &root).is_err());
+    }
+
+    #[test]
+    fn media_markers_leave_the_reply_text_clean() {
+        let (text, markers) = crate::util::parse_attachment_markers(
+            "海报好了\n[image: poster.png]\n还想换个配色吗？",
+        );
+        assert_eq!(text, "海报好了\n\n还想换个配色吗？");
+        assert_eq!(
+            markers,
+            vec![("IMAGE".to_string(), "poster.png".to_string())]
+        );
+        // A non-media bracket is left alone rather than eaten.
+        let (untouched, none) = crate::util::parse_attachment_markers("看 [1] 这条");
+        assert_eq!(untouched, "看 [1] 这条");
+        assert!(none.is_empty());
+    }
+
+    /// Ack every outbound frame until the sender is dropped, then hand back
+    /// what was sent. The three upload commands wait on a body field; the
+    /// delivery commands only need the verdict.
+    async fn acknowledge_frames(
+        channel: WeComWsChannel,
+        mut ws_rx: mpsc::Receiver<WsOutbound>,
+    ) -> Vec<(String, Value)> {
+        let mut frames = Vec::new();
+        while let Some(WsOutbound::Frame(frame)) = ws_rx.recv().await {
+            let command = frame
+                .get("cmd")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let req_id = frame
+                .get("headers")
+                .and_then(|headers| headers.get("req_id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let body = match command.as_str() {
+                "aibot_upload_media_init" => serde_json::json!({ "upload_id": "UP1" }),
+                "aibot_upload_media_finish" => serde_json::json!({ "media_id": "MD1" }),
+                _ => serde_json::json!({}),
+            };
+
+            channel
+                .maybe_handle_command_response(&serde_json::json!({
+                    "headers": { "req_id": req_id },
+                    "body": body,
+                    "errcode": 0,
+                    "errmsg": "ok"
+                }))
+                .await;
+            frames.push((command, frame));
+        }
+        frames
+    }
+
+    /// A workspace group reply is streamed, so it lands on `finalize_draft` and
+    /// never touches `send()`. Parsing markers in only one of those routes puts
+    /// `[image: …]` on screen as literal text — which is exactly what happened
+    /// the first time this was wired up.
+    #[tokio::test]
+    async fn finalize_draft_delivers_marked_media_and_cleans_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("poster.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+
+        let channel = WeComWsChannel::new(&test_wecom_ws_config(), &root).unwrap();
+        channel
+            .req_id_map
+            .lock()
+            .insert("stream-1".to_string(), "req-finalize".to_string());
+
+        let (ws_tx, ws_rx) = mpsc::channel::<WsOutbound>(16);
+        *channel.ws_tx.lock().await = Some(ws_tx);
+        let ack_channel = channel.clone();
+        let responder = zeroclaw_spawn::spawn!(acknowledge_frames(ack_channel, ws_rx));
+
+        channel
+            .finalize_draft(
+                "group--wr6_group_chatid",
+                "stream-1",
+                "海报好了\n[image: poster.png]",
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Closing the sender is what ends the responder loop.
+        *channel.ws_tx.lock().await = None;
+        let frames = responder.await.unwrap();
+        let commands: Vec<&str> = frames.iter().map(|(c, _)| c.as_str()).collect();
+
+        assert_eq!(
+            commands,
+            vec![
+                "aibot_respond_msg",
+                "aibot_upload_media_init",
+                "aibot_upload_media_chunk",
+                "aibot_upload_media_finish",
+                "aibot_send_msg",
+            ]
+        );
+
+        // The marker never reaches the rendered reply.
+        let (_, finalize_frame) = &frames[0];
+        assert_eq!(
+            finalize_frame
+                .pointer("/body/stream/content")
+                .and_then(Value::as_str),
+            Some("海报好了")
+        );
+        assert_eq!(
+            finalize_frame
+                .pointer("/body/stream/finish")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        // The bytes arrive under the image msgtype, addressed to the group.
+        let (_, media_frame) = frames.last().unwrap();
+        assert_eq!(
+            media_frame.pointer("/body/msgtype").and_then(Value::as_str),
+            Some("image")
+        );
+        assert_eq!(
+            media_frame
+                .pointer("/body/image/media_id")
+                .and_then(Value::as_str),
+            Some("MD1")
+        );
+        assert_eq!(
+            media_frame.pointer("/body/chatid").and_then(Value::as_str),
+            Some("wr6_group_chatid")
+        );
+        assert_eq!(
+            media_frame
+                .pointer("/body/chat_type")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+    }
+
+    /// Half-finished replies are streamed before the upload even starts, so the
+    /// draft must not advertise a file it has not sent yet.
+    #[tokio::test]
+    async fn update_draft_hides_media_markers() {
+        let channel = WeComWsChannel::new(&test_wecom_ws_config(), Path::new("/tmp")).unwrap();
+        channel
+            .req_id_map
+            .lock()
+            .insert("stream-1".to_string(), "req-1".to_string());
+
+        let (ws_tx, ws_rx) = mpsc::channel::<WsOutbound>(4);
+        *channel.ws_tx.lock().await = Some(ws_tx);
+        let ack_channel = channel.clone();
+        let responder = zeroclaw_spawn::spawn!(acknowledge_frames(ack_channel, ws_rx));
+
+        channel
+            .update_draft(
+                "group--wr6_group_chatid",
+                "stream-1",
+                "海报好了\n[image: poster.png]",
+            )
+            .await
+            .unwrap();
+
+        *channel.ws_tx.lock().await = None;
+        let frames = responder.await.unwrap();
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0]
+                .1
+                .pointer("/body/stream/content")
+                .and_then(Value::as_str),
+            Some("海报好了")
+        );
     }
 }
