@@ -420,6 +420,9 @@ fn starts_with_tool_protocol_tag_or_fence(text: &str) -> bool {
         || lower.starts_with("<function_call")
         || starts_with_tool_protocol_fence_lower(&lower)
         || lower.starts_with("[tool_call]")
+        // DeepSeek DSML markers (U+FF5C FULLWIDTH VERTICAL LINE or ASCII pipe)
+        || lower.starts_with("<｜dsml｜")
+        || lower.starts_with("<|dsml|")
 }
 
 fn starts_with_tool_protocol_fence(text: &str) -> bool {
@@ -457,6 +460,11 @@ fn contains_tool_protocol_tag_marker(text: &str) -> bool {
         || lower.contains("```invoke")
         || lower.contains("```tool ")
         || lower.contains("[tool_call]")
+        // DeepSeek DSML markers (U+FF5C FULLWIDTH VERTICAL LINE or ASCII pipe)
+        || lower.contains("<｜dsml｜")
+        || lower.contains("<|dsml|")
+        || lower.contains("</｜dsml｜")
+        || lower.contains("</|dsml|")
 }
 
 pub fn looks_like_tool_protocol_example(text: &str) -> bool {
@@ -816,7 +824,7 @@ static MINIMAX_INVOKE_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 static MINIMAX_PARAMETER_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?is)<parameter\b[^>]*\bname\s*=\s*(?:"([^"]+)"|'([^']+)')[^>]*>(.*?)</parameter>"#,
+        r#"(?is)<parameter\b([^>]*)\bname\s*=\s*(?:"([^"]+)"|'([^']+)')([^>]*)>(.*?)</parameter>"#,
     )
     .expect("MINIMAX_PARAMETER_RE regex must compile")
 });
@@ -941,27 +949,47 @@ fn parse_minimax_invoke_calls(response: &str) -> Option<(String, Vec<ParsedToolC
 
         let mut args = serde_json::Map::new();
         for param_cap in MINIMAX_PARAMETER_RE.captures_iter(body) {
+            // Capture groups: 1=pre-name attrs, 2=name (double-quoted), 3=name (single-quoted),
+            // 4=post-name attrs, 5=value
             let key = param_cap
-                .get(1)
-                .or_else(|| param_cap.get(2))
+                .get(2)
+                .or_else(|| param_cap.get(3))
                 .map(|m| m.as_str().trim())
                 .unwrap_or_default();
             if key.is_empty() {
                 continue;
             }
-            let value = param_cap
-                .get(3)
-                .map(|m| m.as_str().trim())
-                .unwrap_or_default();
-            if value.is_empty() {
+
+            // Check for string="true" attribute in pre-name or post-name attrs
+            let pre_attrs = param_cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            let post_attrs = param_cap.get(4).map(|m| m.as_str()).unwrap_or("");
+            let is_string_true = pre_attrs.contains("string=\"true\"")
+                || pre_attrs.contains("string='true'")
+                || post_attrs.contains("string=\"true\"")
+                || post_attrs.contains("string='true'");
+
+            let raw_value = param_cap.get(5).map(|m| m.as_str()).unwrap_or_default();
+
+            if raw_value.is_empty() {
                 continue;
             }
 
-            let parsed = extract_json_values(value).into_iter().next();
-            args.insert(
-                key.to_string(),
-                parsed.unwrap_or_else(|| serde_json::Value::String(value.to_string())),
-            );
+            // When string="true" is set, preserve raw value exactly (no trim, no JSON decode).
+            // This prevents alteration of literal quotes, whitespace, etc.
+            if is_string_true {
+                args.insert(
+                    key.to_string(),
+                    serde_json::Value::String(raw_value.to_string()),
+                );
+            } else {
+                // Normal path: trim and try JSON extraction
+                let value = raw_value.trim();
+                let parsed = extract_json_values(value).into_iter().next();
+                args.insert(
+                    key.to_string(),
+                    parsed.unwrap_or_else(|| serde_json::Value::String(value.to_string())),
+                );
+            }
         }
 
         if args.is_empty() {
@@ -2073,9 +2101,41 @@ static DSML_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("DSML_TAG_RE regex must compile")
 });
 
+/// Pre-scan for `<tools>` spans to identify inert regions before DSML extraction.
+/// Returns byte ranges of complete `<tools>...</tools>` blocks.
+fn find_tools_spans(input: &str) -> Vec<std::ops::Range<usize>> {
+    let mut spans = Vec::new();
+    let mut search_start = 0;
+
+    while let Some(open_pos) = input[search_start..].find("<tools>") {
+        let open_abs = search_start + open_pos;
+        let after_open = open_abs + "<tools>".len();
+
+        // Find matching close
+        if let Some(close_rel) = input[after_open..].find("</tools>") {
+            let close_abs = after_open + close_rel;
+            let span_end = close_abs + "</tools>".len();
+            spans.push(open_abs..span_end);
+            search_start = span_end;
+        } else {
+            // Unclosed <tools> — treat remainder as inert
+            spans.push(open_abs..input.len());
+            break;
+        }
+    }
+
+    spans
+}
+
 /// Extract DeepSeek DSML-wrapped tool-call blocks, normalize inner tags, parse them.
 /// DSML blocks are removed from text whether they parse or not (malformed protocol must not leak).
-fn extract_dsml_blocks(input: &str) -> (String, Vec<ParsedToolCall>) {
+///
+/// `inert_spans` are byte ranges (e.g., `<tools>` blocks) where DSML extraction must not execute.
+/// DSML blocks overlapping any inert span are preserved as-is in the cleaned text.
+fn extract_dsml_blocks(
+    input: &str,
+    inert_spans: &[std::ops::Range<usize>],
+) -> (String, Vec<ParsedToolCall>) {
     if !input.contains("DSML") {
         return (input.to_string(), Vec::new());
     }
@@ -2088,15 +2148,34 @@ fn extract_dsml_blocks(input: &str) -> (String, Vec<ParsedToolCall>) {
         let full_match = caps.get(0).unwrap();
         let inner_content = caps.get(1).unwrap();
 
+        // Check if this DSML block overlaps any inert span
+        let in_inert_span =
+            range_hits_rejected_span(inert_spans, full_match.start(), full_match.end());
+
+        // Check if this DSML block is in an example context.
+        // Look at the visible text before this block for example markers.
+        let text_before = &input[last_end..full_match.start()];
+        let in_example_context = has_example_context(text_before);
+
         // Add text before this DSML block
-        cleaned.push_str(&input[last_end..full_match.start()]);
+        cleaned.push_str(text_before);
 
-        // Normalize DSML markers in inner tags: <｜DSML｜ invoke> → <invoke>
-        let normalized = DSML_TAG_RE.replace_all(inner_content.as_str(), "<$1");
-
-        // Parse normalized content (recursive call safe: no DSML markers remain)
-        let (_, parsed_calls) = parse_tool_calls(&normalized);
-        calls.extend(parsed_calls);
+        if in_example_context {
+            // Example context — don't extract, don't normalize, just remove the block.
+            // The DSML block is not added to cleaned text, so it won't leak or execute.
+            // (Do nothing here — the block is skipped)
+        } else if in_inert_span {
+            // Inside <tools> or other inert span — normalize markers to prevent leaking,
+            // but don't parse/execute. The normalized tags will be rejected by the <tools>
+            // handler downstream.
+            let normalized = DSML_TAG_RE.replace_all(inner_content.as_str(), "<$1");
+            cleaned.push_str(&normalized);
+        } else {
+            // Normal path: normalize and parse
+            let normalized = DSML_TAG_RE.replace_all(inner_content.as_str(), "<$1");
+            let (_, parsed_calls) = parse_tool_calls(&normalized);
+            calls.extend(parsed_calls);
+        }
 
         last_end = full_match.end();
     }
@@ -2125,7 +2204,11 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     // This MUST run before `remaining` is bound, so both `response` and
     // `remaining` point at the DSML-cleaned text and the marker cannot leak
     // into the returned text via the tag-walk accumulator.
-    let (dsml_cleaned, dsml_calls) = extract_dsml_blocks(response);
+    //
+    // Pre-scan for `<tools>` spans to identify inert regions. DSML blocks inside
+    // `<tools>` must not execute before the `<tools>` handler can reject them.
+    let tools_spans = find_tools_spans(response);
+    let (dsml_cleaned, dsml_calls) = extract_dsml_blocks(response, &tools_spans);
     let dsml_cleaned_owned;
     let response = if !dsml_calls.is_empty() || dsml_cleaned != response {
         dsml_cleaned_owned = dsml_cleaned;
@@ -2143,8 +2226,11 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     // First, try to parse as OpenAI-style JSON response with tool_calls array
     // This handles model_providers like Minimax that return tool_calls in native JSON format
     if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(response.trim()) {
-        calls = parse_tool_calls_from_json_value(&json_value);
-        if !calls.is_empty() {
+        let json_calls = parse_tool_calls_from_json_value(&json_value);
+        if !json_calls.is_empty() {
+            // EXTEND accumulated calls (e.g., from DSML) rather than replace.
+            // This preserves source order: DSML calls came first in the text.
+            calls.extend(json_calls);
             // If we found tool_calls, extract any content field as text
             if let Some(content) = json_value.get("content").and_then(|v| v.as_str())
                 && !content.trim().is_empty()
@@ -2155,7 +2241,9 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         }
     }
     if let Some(call) = parse_malformed_file_write_call(response.trim()) {
-        return (String::new(), vec![call]);
+        // EXTEND accumulated calls rather than replace.
+        calls.push(call);
+        return (String::new(), calls);
     }
 
     // This scan searches the WHOLE response for executable `<invoke>` syntax, so
@@ -5628,5 +5716,154 @@ Let me check the result."#;
             text.contains("After text"),
             "Text after DSML block preserved"
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // DSML hardening tests (PR review blockers)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// BLOCKER 1a: DSML in example context must not execute.
+    /// "Here is an example:" + DSML fence should produce 0 calls.
+    #[test]
+    fn dsml_in_example_context_does_not_execute() {
+        let input = r#"Here is an example of how to use the tool:
+<｜DSML｜ calls>
+<｜DSML｜ invoke name="shell">
+<｜DSML｜ parameter name="command" string="true">ls -la</｜DSML｜ parameter>
+</｜DSML｜ invoke>
+</｜DSML｜ calls>
+That's how you call it."#;
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(
+            calls.len(),
+            0,
+            "DSML in example context must not execute, got {calls:?}"
+        );
+        assert!(text.contains("example"), "Example text preserved");
+    }
+
+    /// BLOCKER 1b: DSML inside rejected <tools> block must not execute.
+    #[test]
+    fn dsml_inside_rejected_tools_block_does_not_execute() {
+        let input = r#"<tools>
+<｜DSML｜ calls>
+<｜DSML｜ invoke name="shell">
+<｜DSML｜ parameter name="command" string="true">rm -rf /tmp/x</｜DSML｜ parameter>
+</｜DSML｜ invoke>
+</｜DSML｜ calls>
+</tools>"#;
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(
+            calls.len(),
+            0,
+            "DSML inside rejected <tools> must not execute, got {calls:?}"
+        );
+        // The <tools> block is rejected, so DSML markers should not leak
+        assert!(!text.contains("DSML"), "DSML marker must not leak");
+    }
+
+    /// BLOCKER 2: DSML string="true" parameters must preserve raw value.
+    /// A file_write with content containing literal quotes must arrive exactly.
+    #[test]
+    fn dsml_string_true_preserves_literal_quotes() {
+        let input = r#"<｜DSML｜ calls>
+<｜DSML｜ invoke name="file_write">
+<｜DSML｜ parameter name="path" string="true">/tmp/test.txt</｜DSML｜ parameter>
+<｜DSML｜ parameter name="content" string="true">"hello" with "quotes"</｜DSML｜ parameter>
+</｜DSML｜ invoke>
+</｜DSML｜ calls>"#;
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1, "Should parse one file_write call");
+        assert_eq!(calls[0].name, "file_write");
+        assert_eq!(
+            calls[0].arguments.get("path").and_then(|v| v.as_str()),
+            Some("/tmp/test.txt"),
+            "path parameter preserved"
+        );
+        assert_eq!(
+            calls[0].arguments.get("content").and_then(|v| v.as_str()),
+            Some(r#""hello" with "quotes""#),
+            "content with literal quotes must be preserved exactly, got {:?}",
+            calls[0].arguments.get("content")
+        );
+        assert!(!text.contains("DSML"), "DSML marker must not leak");
+    }
+
+    /// BLOCKER 2b: DSML string="true" must not trim whitespace.
+    #[test]
+    fn dsml_string_true_preserves_whitespace() {
+        let input = r#"<｜DSML｜ calls>
+<｜DSML｜ invoke name="file_write">
+<｜DSML｜ parameter name="content" string="true">  leading and trailing  
+</｜DSML｜ parameter>
+</｜DSML｜ invoke>
+</｜DSML｜ calls>"#;
+        let (_, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments.get("content").and_then(|v| v.as_str()),
+            Some("  leading and trailing  \n"),
+            "whitespace must be preserved exactly"
+        );
+    }
+
+    /// BLOCKER 3: DSML call + JSON response must retain the DSML call.
+    #[test]
+    fn dsml_call_plus_json_response_retains_dsml_call() {
+        let input = r#"<｜DSML｜ calls>
+<｜DSML｜ invoke name="shell">
+<｜DSML｜ parameter name="command" string="true">ls</｜DSML｜ parameter>
+</｜DSML｜ invoke>
+</｜DSML｜ calls>
+{"status":"done"}"#;
+        let (_text, calls) = parse_tool_calls(input);
+        assert_eq!(
+            calls.len(),
+            1,
+            "DSML call must be retained even when followed by JSON, got {calls:?}"
+        );
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").and_then(|v| v.as_str()),
+            Some("ls")
+        );
+    }
+
+    /// BLOCKER 3b: Multiple DSML calls + JSON must preserve order and all calls.
+    #[test]
+    fn multiple_dsml_calls_plus_json_preserve_order() {
+        let input = r#"<｜DSML｜ calls>
+<｜DSML｜ invoke name="shell">
+<｜DSML｜ parameter name="command" string="true">first</｜DSML｜ parameter>
+</｜DSML｜ invoke>
+<｜DSML｜ invoke name="shell">
+<｜DSML｜ parameter name="command" string="true">second</｜DSML｜ parameter>
+</｜DSML｜ invoke>
+</｜DSML｜ calls>
+{"status":"done"}"#;
+        let (_, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 2, "Both DSML calls must be retained");
+        assert_eq!(
+            calls[0].arguments.get("command").and_then(|v| v.as_str()),
+            Some("first")
+        );
+        assert_eq!(
+            calls[1].arguments.get("command").and_then(|v| v.as_str()),
+            Some("second")
+        );
+    }
+
+    /// Positive control: DSML without example context still works.
+    #[test]
+    fn dsml_without_example_context_still_parses() {
+        let input = r#"<｜DSML｜ calls>
+<｜DSML｜ invoke name="shell">
+<｜DSML｜ parameter name="command" string="true">pwd</｜DSML｜ parameter>
+</｜DSML｜ invoke>
+</｜DSML｜ calls>"#;
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1, "DSML without example context must parse");
+        assert_eq!(calls[0].name, "shell");
+        assert!(!text.contains("DSML"), "DSML marker must not leak");
     }
 }
