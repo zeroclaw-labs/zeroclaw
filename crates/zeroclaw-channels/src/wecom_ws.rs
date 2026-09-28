@@ -70,6 +70,19 @@ const WECOM_UPLOAD_ACK_TIMEOUT_SECS: u64 = 30;
 /// The only image containers WeCom renders inline. Anything else must travel
 /// as `type: "file"`, which arrives as a downloadable attachment instead.
 const WECOM_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif"];
+
+/// A reply split into the text to show and the media it names.
+///
+/// `refusals` holds one line per marker that never became media — an
+/// unsupported kind, a target outside the workspace, a file that is missing.
+/// They travel alongside the media because the marker has already been stripped
+/// from the visible text: a refusal nobody reports reads as a file that
+/// silently vanished.
+struct OutboundReply {
+    text: String,
+    media: Vec<(AttachmentKind, PathBuf)>,
+    refusals: Vec<String>,
+}
 macro_rules! wecom_log_debug {
     ($($arg:tt)*) => {
         ::zeroclaw_log::record!(
@@ -1774,34 +1787,41 @@ impl WeComWsChannel {
     }
 
     /// Turn parsed `[KIND:target]` markers into uploadable `(kind, path)`
-    /// pairs, reporting — rather than silently dropping — what it refuses.
-    fn resolve_outbound_markers(
+    /// pairs, handing back one line per marker it refused.
+    ///
+    /// A refusal is not cosmetic. The marker is stripped from the reply either
+    /// way, so a target that never resolves would lose the file without a word
+    /// unless the caller reports it.
+    async fn resolve_outbound_markers(
         &self,
         markers: Vec<(String, String)>,
-    ) -> Vec<(AttachmentKind, PathBuf)> {
+    ) -> (Vec<(AttachmentKind, PathBuf)>, Vec<String>) {
         let mut resolved = Vec::with_capacity(markers.len());
+        let mut refusals = Vec::new();
 
         for (kind, target) in markers {
             if AttachmentKind::from_marker_kind(&kind).is_none() {
                 wecom_log_warn!(
-                    "[wecom_ws] dropping outbound marker with unsupported kind kind={kind} target={target}"
+                    "[wecom_ws] refusing outbound marker with unsupported kind kind={kind} target={target}"
                 );
+                refusals.push(format!("{target}: unsupported marker kind `{kind}`"));
                 continue;
             }
 
-            match resolve_outbound_media_path(&target, &self.cfg.workspace_dir) {
+            match resolve_outbound_media_path(&target, &self.cfg.workspace_dir).await {
                 // The bytes decide the transport type, not the marker label: a
                 // path WeCom cannot render inline goes out as a document.
                 Ok(path) => resolved.push((AttachmentKind::for_path(&path), path)),
                 Err(err) => {
                     wecom_log_warn!(
-                        "[wecom_ws] dropping unresolved outbound marker target={target} error={err:#}"
+                        "[wecom_ws] refusing unresolved outbound marker target={target} error={err:#}"
                     );
+                    refusals.push(format!("{target}: {err:#}"));
                 }
             }
         }
 
-        resolved
+        (resolved, refusals)
     }
 
     /// Split a reply into the text to show and the media it names.
@@ -1811,24 +1831,30 @@ impl WeComWsChannel {
     /// through `finalize_draft()`, which is the route a WeCom workspace group
     /// actually takes. Parsing in only one of them leaves the marker sitting on
     /// screen as literal `[image: …]` text in the other.
-    fn split_reply_and_media(&self, content: &str) -> (String, Vec<(AttachmentKind, PathBuf)>) {
+    async fn split_reply_and_media(&self, content: &str) -> OutboundReply {
         let (text, markers) = super::util::parse_attachment_markers(content);
-        let media = self.resolve_outbound_markers(markers);
-        (text, media)
+        let (media, refusals) = self.resolve_outbound_markers(markers).await;
+        OutboundReply {
+            text,
+            media,
+            refusals,
+        }
     }
 
     /// Upload each resolved marker and deliver it.
     ///
     /// The marker that named these files has already been stripped from the
     /// reply text, so a failure cannot be left silent — the caller gets an
-    /// error and the user gets a notice naming what did not make it.
+    /// error and the user gets a notice naming what did not make it. Markers
+    /// that never resolved start out in that same list.
     async fn send_outbound_media(
         &self,
         scope: &str,
         req_id: Option<&str>,
         media: Vec<(AttachmentKind, PathBuf)>,
+        refusals: Vec<String>,
     ) -> Result<()> {
-        let mut failures: Vec<String> = Vec::new();
+        let mut failures: Vec<String> = refusals;
 
         for (kind, path) in media {
             let filename = path
@@ -1836,6 +1862,25 @@ impl WeComWsChannel {
                 .and_then(|name| name.to_str())
                 .unwrap_or("attachment")
                 .to_string();
+
+            // Measure before reading. `upload_media` would refuse a file that
+            // breaks the ceiling anyway, and pulling it into memory first is
+            // how a single oversized attachment takes the process down.
+            let limit = kind.max_upload_bytes();
+            match tokio::fs::metadata(&path).await {
+                Ok(metadata) if metadata.len() > limit as u64 => {
+                    failures.push(format!(
+                        "{filename}: {} bytes exceeds the {limit}-byte limit",
+                        metadata.len()
+                    ));
+                    continue;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    failures.push(format!("{filename}: stat failed: {err}"));
+                    continue;
+                }
+            }
 
             let bytes = match tokio::fs::read(&path).await {
                 Ok(bytes) => bytes,
@@ -1930,7 +1975,7 @@ fn ack_field(ack: &Value, field: &str) -> Option<String> {
 /// upload path takes bytes, so fetching a remote target would turn a marker
 /// into an outbound request the operator never approved. Schemes are therefore
 /// refused outright rather than fetched.
-fn resolve_outbound_media_path(target: &str, workspace_dir: &Path) -> Result<PathBuf> {
+async fn resolve_outbound_media_path(target: &str, workspace_dir: &Path) -> Result<PathBuf> {
     let trimmed = target.trim();
     if trimmed.is_empty() {
         anyhow::bail!("WeCom media marker target is empty");
@@ -1954,21 +1999,25 @@ fn resolve_outbound_media_path(target: &str, workspace_dir: &Path) -> Result<Pat
     };
 
     // Canonicalize before the containment check, so `..` segments and symlinks
-    // cannot smuggle the target out of the workspace.
-    let resolved = candidate.canonicalize().map_err(|err| {
+    // cannot smuggle the target out of the workspace. This runs on the channel
+    // task, so it goes through `tokio::fs`: a slow or network-mounted workspace
+    // must not park a runtime worker thread.
+    let resolved = tokio::fs::canonicalize(&candidate).await.map_err(|err| {
         anyhow::Error::msg(format!(
             "WeCom media marker target could not be resolved: {err}"
         ))
     })?;
-    let root = workspace_dir.canonicalize().map_err(|err| {
-        anyhow::Error::msg(format!("WeCom workspace root could not be resolved: {err}"))
-    })?;
+    let root = tokio::fs::canonicalize(workspace_dir)
+        .await
+        .map_err(|err| {
+            anyhow::Error::msg(format!("WeCom workspace root could not be resolved: {err}"))
+        })?;
     if !resolved.starts_with(&root) {
         anyhow::bail!("WeCom media marker target escapes the workspace");
     }
 
-    let metadata = std::fs::metadata(&resolved).map_err(|err| {
-        anyhow::Error::msg(format!("WeCom media marker target metadata failed: {err}"))
+    let metadata = tokio::fs::metadata(&resolved).await.map_err(|err| {
+        anyhow::Error::msg(format!("WeCom media marker target failed to stat: {err}"))
     })?;
     if !metadata.is_file() {
         anyhow::bail!("WeCom media marker target is not a file");
@@ -2015,7 +2064,11 @@ impl Channel for WeComWsChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
-        let (text, media) = self.split_reply_and_media(&message.content);
+        let OutboundReply {
+            text,
+            media,
+            refusals,
+        } = self.split_reply_and_media(&message.content).await;
 
         let req_id = message
             .thread_ts
@@ -2044,12 +2097,14 @@ impl Channel for WeComWsChannel {
                 .await?;
         }
 
-        // Media follows the caption that introduced it.
-        if media.is_empty() {
+        // Media follows the caption that introduced it. A refusal goes down
+        // the same path: it is the only thing that keeps it from looking like
+        // a file that was never named.
+        if media.is_empty() && refusals.is_empty() {
             return Ok(());
         }
 
-        self.send_outbound_media(&message.recipient, req_id, media)
+        self.send_outbound_media(&message.recipient, req_id, media, refusals)
             .await
     }
 
@@ -2328,7 +2383,11 @@ impl Channel for WeComWsChannel {
 
         // Resolve media before any text leaves. The marker is stripped from the
         // reply either way, so skipping this would lose the file without a word.
-        let (text, media) = self.split_reply_and_media(content);
+        let OutboundReply {
+            text,
+            media,
+            refusals,
+        } = self.split_reply_and_media(content).await;
         let (stream_content, overflow) = split_stream_content_and_overflow(&text);
 
         if !req_id.is_empty() {
@@ -2357,9 +2416,9 @@ impl Channel for WeComWsChannel {
 
         // The stream above is already finished, so the push path carries the
         // media; `req_id` is kept only as its reply-slot fallback.
-        if !media.is_empty() {
+        if !media.is_empty() || !refusals.is_empty() {
             let respond_to = (!req_id.is_empty()).then_some(req_id.as_str());
-            self.send_outbound_media(recipient, respond_to, media)
+            self.send_outbound_media(recipient, respond_to, media, refusals)
                 .await?;
         }
 
@@ -4548,8 +4607,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn marker_targets_must_be_files_inside_the_workspace() {
+    #[tokio::test]
+    async fn marker_targets_must_be_files_inside_the_workspace() {
         let dir = tempfile::tempdir().unwrap();
         // Nest the workspace so a sibling file gives us a real escape target
         // without touching anything outside the temporary directory.
@@ -4563,12 +4622,20 @@ mod tests {
 
         // Relative and absolute paths inside the workspace both resolve.
         assert_eq!(
-            resolve_outbound_media_path("poster.png", &root).unwrap(),
+            resolve_outbound_media_path("poster.png", &root)
+                .await
+                .unwrap(),
             root.join("poster.png").canonicalize().unwrap()
         );
-        assert!(resolve_outbound_media_path(outside.to_str().unwrap(), &root).is_err());
         assert!(
-            resolve_outbound_media_path(root.join("poster.png").to_str().unwrap(), &root).is_ok()
+            resolve_outbound_media_path(outside.to_str().unwrap(), &root)
+                .await
+                .is_err()
+        );
+        assert!(
+            resolve_outbound_media_path(root.join("poster.png").to_str().unwrap(), &root)
+                .await
+                .is_ok()
         );
 
         // An existing file outside the workspace is refused on containment,
@@ -4576,6 +4643,7 @@ mod tests {
         assert!(outside.exists());
         assert!(
             resolve_outbound_media_path(outside.to_str().unwrap(), &root)
+                .await
                 .unwrap_err()
                 .to_string()
                 .contains("escapes the workspace")
@@ -4589,16 +4657,24 @@ mod tests {
             "file:///etc/passwd",
         ] {
             assert!(
-                resolve_outbound_media_path(target, &root).is_err(),
+                resolve_outbound_media_path(target, &root).await.is_err(),
                 "{target} must be refused"
             );
         }
 
         // Non-files, empty files, and blank targets are refused.
-        assert!(resolve_outbound_media_path("missing.png", &root).is_err());
-        assert!(resolve_outbound_media_path("empty.png", &root).is_err());
-        assert!(resolve_outbound_media_path("sub", &root).is_err());
-        assert!(resolve_outbound_media_path("   ", &root).is_err());
+        assert!(
+            resolve_outbound_media_path("missing.png", &root)
+                .await
+                .is_err()
+        );
+        assert!(
+            resolve_outbound_media_path("empty.png", &root)
+                .await
+                .is_err()
+        );
+        assert!(resolve_outbound_media_path("sub", &root).await.is_err());
+        assert!(resolve_outbound_media_path("   ", &root).await.is_err());
     }
 
     #[test]
@@ -4778,5 +4854,113 @@ mod tests {
                 .and_then(Value::as_str),
             Some("海报好了")
         );
+    }
+
+    /// A marker that never resolves still has to say so. The visible text loses
+    /// the marker either way, so silence here is indistinguishable from a file
+    /// that was never attached.
+    #[tokio::test]
+    async fn refused_markers_are_reported_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+
+        let channel = WeComWsChannel::new(&test_wecom_ws_config(), &root).unwrap();
+        channel
+            .req_id_map
+            .lock()
+            .insert("stream-1".to_string(), "req-refused".to_string());
+
+        let (ws_tx, ws_rx) = mpsc::channel::<WsOutbound>(16);
+        *channel.ws_tx.lock().await = Some(ws_tx);
+        let ack_channel = channel.clone();
+        let responder = zeroclaw_spawn::spawn!(acknowledge_frames(ack_channel, ws_rx));
+
+        // The first marker parses and has a transport, but names no file. The
+        // second parses into a kind WeCom has no transport for at all, and used
+        // to be dropped without a trace.
+        let result = channel
+            .finalize_draft(
+                "group--wr6_group_chatid",
+                "stream-1",
+                "海报好了\n[image: missing.png]\n[location: 31.23,121.47]",
+                false,
+            )
+            .await;
+
+        *channel.ws_tx.lock().await = None;
+        let frames = responder.await.unwrap();
+
+        assert!(result.is_err(), "a refusal must not report success");
+
+        // Neither marker got as far as an upload.
+        let commands: Vec<&str> = frames.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(
+            commands,
+            vec!["aibot_respond_msg", "aibot_send_msg"],
+            "frames: {commands:?}"
+        );
+
+        let notice = frames
+            .last()
+            .and_then(|(_, frame)| frame.pointer("/body/markdown/content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(notice.contains("missing.png"), "notice: {notice}");
+        assert!(notice.contains("LOCATION"), "notice: {notice}");
+    }
+
+    /// The ceiling is checked on metadata, before the bytes are read: an
+    /// oversized file in the workspace must not be pulled into memory just to
+    /// be refused a moment later.
+    #[tokio::test]
+    async fn oversized_files_are_refused_before_they_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        // Sparse, so the test costs no real disk worth mentioning.
+        let big = std::fs::File::create(root.join("big.png")).unwrap();
+        big.set_len(WECOM_UPLOAD_MAX_IMAGE_BYTES as u64 + 1)
+            .unwrap();
+        drop(big);
+
+        let channel = WeComWsChannel::new(&test_wecom_ws_config(), &root).unwrap();
+        channel
+            .req_id_map
+            .lock()
+            .insert("stream-1".to_string(), "req-oversized".to_string());
+
+        let (ws_tx, ws_rx) = mpsc::channel::<WsOutbound>(16);
+        *channel.ws_tx.lock().await = Some(ws_tx);
+        let ack_channel = channel.clone();
+        let responder = zeroclaw_spawn::spawn!(acknowledge_frames(ack_channel, ws_rx));
+
+        let result = channel
+            .finalize_draft(
+                "group--wr6_group_chatid",
+                "stream-1",
+                "[image: big.png]",
+                false,
+            )
+            .await;
+
+        *channel.ws_tx.lock().await = None;
+        let frames = responder.await.unwrap();
+        let commands: Vec<&str> = frames.iter().map(|(c, _)| c.as_str()).collect();
+
+        assert!(result.is_err());
+        // No `aibot_upload_media_init` means the upload never started.
+        assert!(
+            !commands.contains(&"aibot_upload_media_init"),
+            "frames: {commands:?}"
+        );
+
+        let notice = frames
+            .last()
+            .and_then(|(_, frame)| frame.pointer("/body/markdown/content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(notice.contains("big.png"), "notice: {notice}");
+        assert!(notice.contains("exceeds"), "notice: {notice}");
     }
 }
