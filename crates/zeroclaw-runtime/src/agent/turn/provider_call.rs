@@ -352,8 +352,8 @@ pub(crate) async fn call_provider(
                             }
                             if request_tools.is_some()
                                 && custom_provider_alias(active_model_provider_name).is_some()
-                                && zeroclaw_providers::rejects_native_tool_calling_message(
-                                    &stream_err.to_string(),
+                                && zeroclaw_providers::rejects_native_tool_calling(
+                                    stream_err.as_ref(),
                                 )
                             {
                                 scope.record_stream_recovery_failure(&stream_err);

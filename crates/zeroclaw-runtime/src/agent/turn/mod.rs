@@ -1309,6 +1309,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     // hook-selected model, schemas, or prepared messages.
     let mut pending_reported_usage: Option<ReportedRequestUsage> = None;
 
+    // Provider that rejected native tool calling earlier in this turn. The
+    // capability refresh below re-derives `use_native_tools` from the provider
+    // each iteration, so without this the turn would repeat the rejected
+    // native request (and the fallback) on every following iteration.
+    let mut native_tools_rejected_by: Option<String> = None;
+
     for iteration in 0..max_iterations {
         // Re-resolved every iteration, against the tools callable *right now*.
         //
@@ -1604,6 +1610,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             });
         }
         iteration_tool_specs.refresh_native_tool_mode(active_model_provider, protocol_model);
+        if native_tools_rejected_by.as_deref() == Some(active_model_provider_name) {
+            iteration_tool_specs.use_native_tools = false;
+        }
         let use_native_tools = iteration_tool_specs.use_native_tools;
 
         // Tool protocol selection follows the provider-facing selector. Direct
@@ -2053,6 +2062,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             provider_call_outcome.streamed_visible_text = fallback_outcome.streamed_visible_text;
             provider_request_messages = fallback_messages;
             iteration_tool_specs.use_native_tools = false;
+            native_tools_rejected_by = Some(active_model_provider_name.to_string());
             refresh_prompt_anchor(turn_state.history, false);
             refresh_scoped_history_tool_protocol_prompt(turn_state.history, false);
         }
@@ -4018,7 +4028,8 @@ mod native_tool_fallback_tests {
                             .into_response();
                     }
 
-                    prompt_guided_attempts.fetch_add(1, Ordering::Relaxed);
+                    let prompt_guided_call =
+                        prompt_guided_attempts.fetch_add(1, Ordering::Relaxed);
                     let saw_tools = body
                         .get("messages")
                         .and_then(serde_json::Value::as_array)
@@ -4029,6 +4040,20 @@ mod native_tool_fallback_tests {
                             content.contains("## Tools") && content.contains("lookup_status")
                         });
                     saw_prompt_guided_tools.store(saw_tools, Ordering::Relaxed);
+                    if prompt_guided_call == 0 {
+                        return (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "choices": [{
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": "<tool_call>{\"name\": \"lookup_status\", \"arguments\": {}}</tool_call>"
+                                    }
+                                }]
+                            })),
+                        )
+                            .into_response();
+                    }
 
                     (
                         StatusCode::OK,
@@ -4110,7 +4135,7 @@ mod native_tool_fallback_tests {
             ChatMessage::system(native_prompt),
             ChatMessage::user("check status"),
         ];
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(256);
         let exec = ResolvedAgentExecution {
             model_access: ResolvedModelAccess {
                 model_provider: &provider,
@@ -4126,7 +4151,7 @@ mod native_tool_fallback_tests {
             security: None,
             multimodal_config: &multimodal,
             config: None,
-            max_tool_iterations: 2,
+            max_tool_iterations: 3,
             hooks: None,
             excluded_tools: &[],
             dedup_exempt_tools: &[],
@@ -4173,8 +4198,13 @@ mod native_tool_fallback_tests {
         .expect("turn should complete on the prompt-guided fallback");
 
         assert_eq!(result, "completed on prompt-guided tools");
+        // The rejected native request is sent once; the second iteration of the
+        // same turn stays on prompt-guided tools instead of retrying native.
         assert_eq!(native_attempts.load(Ordering::Relaxed), 1);
-        assert_eq!(prompt_guided_attempts.load(Ordering::Relaxed), 1);
+        // At least the fallback request and the follow-up iteration; the mock
+        // does not speak SSE, so the streamed follow-up may be re-sent once as
+        // a non-streaming chat.
+        assert!(prompt_guided_attempts.load(Ordering::Relaxed) >= 2);
         assert!(saw_prompt_guided_tools.load(Ordering::Relaxed));
 
         let mut warning_text = String::new();
