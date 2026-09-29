@@ -510,8 +510,6 @@ zc-chat-thinking-visible = Thinking output: visible
 zc-chat-thinking-hidden = Thinking output: hidden
 
 # Model picker slash commands
-zc-model-picker-hint = Type a model name after /model, or Tab to autocomplete.
-zc-model-provider-picker-hint = Type a model_provider after /model-provider, then pick a model with /model.
 zc-model-picker-title = Select model
 zc-model-provider-picker-title = Select model_provider
 zc-model-switch-applying = Applying model change…
@@ -523,6 +521,23 @@ zc-model-catalog-empty = No models available for the active model_provider.
 zc-model-catalog-failed = Could not load models for the active model_provider: { $error }
 zc-model-catalog-loading = Loading models…
 zc-model-provider-catalog-failed = Could not load model_providers: { $error }
+
+# Session thinking controls: effort level and thinking display pickers
+zc-effort-picker-title = Select effort
+zc-display-picker-title = Select thinking display
+zc-thinking-switch-applying = Applying thinking change…
+zc-effort-ok = Effort set to { $level }.
+zc-effort-reset = Effort override cleared; now { $level }.
+zc-display-ok = Thinking display set to { $display }.
+zc-display-reset = Thinking display override cleared; now { $display }.
+zc-thinking-switch-failed = Thinking change failed: { $error }
+zc-effort-none-for-model = This model offers no effort levels.
+zc-display-none-for-model = This model offers no thinking display choices.
+zc-thinking-options-failed = Could not load thinking options: { $error }
+zc-thinking-remembered-skipped = Remembered thinking setting { $value } is not offered by this model; skipped.
+
+# Picker modals: dim suffix on the row whose value is currently in force
+zc-picker-current = current
 
 zc-chat-label-you = You:
 zc-chat-label-agent = Agent:
@@ -766,3 +781,5 @@ zc-config-section-peer-groups-help = Named groups that bind a channel, member ag
 zc-config-section-cron-help = Scheduled tasks that bind a schedule to a prompt, channel, and target.
 zc-config-section-tunnel-help = Optionally expose the gateway through Cloudflare or ngrok, or keep it local only.
 zc-config-section-onboard-state-help = Quickstart lifecycle state and its legacy per-section completion ledger.
+
+zc-thinking-not-acknowledged = The daemon did not confirm this thinking change. Update or restart the daemon, then try again. Your saved preference is unchanged.

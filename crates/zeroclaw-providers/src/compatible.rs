@@ -6490,6 +6490,7 @@ mod tests {
                 budget_tokens: Some(8192),
                 effort: None,
                 display: None,
+                profile_display: None,
             };
             let wire = serde_json::to_value(p.build_native_tool_chat_request(
                 &messages,
@@ -6547,11 +6548,13 @@ mod tests {
                             budget_tokens: None,
                             effort: Some(ThinkingEffort::High),
                             display: None,
+                            profile_display: None,
                         },
                         NativeThinkingParams {
                             budget_tokens: None,
                             effort: None,
                             display: Some(ThinkingDisplay::Summarized),
+                            profile_display: None,
                         },
                         NativeThinkingParams::default(),
                     ] {
@@ -6584,6 +6587,7 @@ mod tests {
             budget_tokens: Some(8_192),
             effort: None,
             display: None,
+            profile_display: None,
         };
         let messages = vec![ChatMessage::user("hello")];
 
@@ -6638,6 +6642,7 @@ mod tests {
             budget_tokens: Some(8_192),
             effort: None,
             display: None,
+            profile_display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
             .display_name("gateway")
@@ -6701,6 +6706,7 @@ mod tests {
             budget_tokens: Some(8_192),
             effort: None,
             display: Some(zeroclaw_api::model_provider::ThinkingDisplay::Summarized),
+            profile_display: None,
         };
 
         let with_tools = serde_json::to_value(p.build_streaming_native_tool_request(
@@ -6742,6 +6748,7 @@ mod tests {
             budget_tokens: Some(8_192),
             effort: None,
             display: None,
+            profile_display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
             .display_name("gateway")
@@ -6773,6 +6780,7 @@ mod tests {
             budget_tokens: Some(8_192),
             effort: None,
             display: None,
+            profile_display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
             .display_name("gateway")
@@ -6806,6 +6814,7 @@ mod tests {
             budget_tokens: Some(8_192),
             effort: None,
             display: Some(zeroclaw_api::model_provider::ThinkingDisplay::Updates),
+            profile_display: None,
         };
         let budget = p.request_extra_body("test-model", Some(updates)).unwrap();
         assert_eq!(
@@ -6831,6 +6840,7 @@ mod tests {
             budget_tokens: Some(8_192),
             effort: None,
             display: Some(zeroclaw_api::model_provider::ThinkingDisplay::Omitted),
+            profile_display: None,
         };
         let omitted_body = p.request_extra_body("test-model", Some(omitted)).unwrap();
         assert_eq!(
@@ -6850,6 +6860,7 @@ mod tests {
             budget_tokens: Some(8_192),
             effort: None,
             display: None,
+            profile_display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
             .display_name("gateway")
@@ -6880,6 +6891,7 @@ mod tests {
             budget_tokens: Some(8_192),
             effort: None,
             display: Some(zeroclaw_api::model_provider::ThinkingDisplay::Summarized),
+            profile_display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
             .display_name("gateway")
@@ -6945,6 +6957,7 @@ mod tests {
             budget_tokens: Some(8_192),
             effort: None,
             display: None,
+            profile_display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
             .display_name("gateway")
@@ -7005,6 +7018,7 @@ mod tests {
             budget_tokens: Some(8_192),
             effort: None,
             display: None,
+            profile_display: None,
         };
 
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -7080,6 +7094,7 @@ mod tests {
             budget_tokens: Some(8_192),
             effort: None,
             display: None,
+            profile_display: None,
         };
 
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -7126,6 +7141,7 @@ mod tests {
             budget_tokens: Some(8_192),
             effort: None,
             display: None,
+            profile_display: None,
         };
         let messages = vec![ChatMessage::user("hello")];
 
@@ -7272,6 +7288,7 @@ mod tests {
             budget_tokens: Some(8_192),
             effort: None,
             display: None,
+            profile_display: None,
         };
 
         let plain = OpenAiCompatibleModelProvider::builder("test")
@@ -7376,6 +7393,7 @@ mod tests {
             budget_tokens: Some(4_096),
             effort: None,
             display: None,
+            profile_display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
             .display_name("gateway")
@@ -7405,6 +7423,7 @@ mod tests {
             budget_tokens: Some(8_192),
             effort: None,
             display: None,
+            profile_display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
             .display_name("gateway")
@@ -7433,6 +7452,7 @@ mod tests {
             budget_tokens: Some(8_192),
             effort: None,
             display: None,
+            profile_display: None,
         };
         let messages = vec![ChatMessage::user("hello")];
 
@@ -7509,6 +7529,7 @@ mod tests {
             budget_tokens: Some(8_192),
             effort: None,
             display: None,
+            profile_display: None,
         };
         let messages = vec![ChatMessage::user("hello")];
 
@@ -7581,6 +7602,7 @@ mod tests {
             budget_tokens: Some(8_192),
             effort: None,
             display: None,
+            profile_display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
             .display_name("gateway")
@@ -7625,6 +7647,7 @@ mod tests {
             budget_tokens: Some(8_192),
             effort: None,
             display: None,
+            profile_display: None,
         };
         let messages = vec![ChatMessage::user("hello")];
 
@@ -7714,6 +7737,7 @@ mod tests {
             budget_tokens: Some(8_192),
             effort: None,
             display: None,
+            profile_display: None,
         };
 
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -7777,6 +7801,7 @@ mod tests {
             budget_tokens: Some(8_192),
             effort: None,
             display: None,
+            profile_display: None,
         };
         let messages = vec![ChatMessage::user("hello")];
 
@@ -7860,6 +7885,7 @@ mod tests {
             budget_tokens: Some(8_192),
             effort: None,
             display: None,
+            profile_display: None,
         };
         let messages = vec![ChatMessage::user("hello")];
 
@@ -7939,6 +7965,7 @@ mod tests {
             budget_tokens: Some(8_192),
             effort: None,
             display: None,
+            profile_display: None,
         };
         let messages = vec![ChatMessage::user("hello")];
 
@@ -8000,6 +8027,7 @@ mod tests {
             budget_tokens: Some(8_192),
             effort: None,
             display: None,
+            profile_display: None,
         };
         let p = OpenAiCompatibleModelProvider::builder("test")
             .display_name("gateway")
@@ -8045,6 +8073,7 @@ mod tests {
             budget_tokens: Some(8_192),
             effort: None,
             display: None,
+            profile_display: None,
         };
         let messages = vec![ChatMessage::user("hello")];
 
@@ -8141,6 +8170,7 @@ mod tests {
             budget_tokens: Some(8_192),
             effort: None,
             display: None,
+            profile_display: None,
         };
 
         let p = OpenAiCompatibleModelProvider::builder("test")
@@ -8814,6 +8844,7 @@ mod tests {
             budget_tokens: Some(8_192),
             effort: None,
             display: None,
+            profile_display: None,
         };
 
         // Turn 1: schema rejected, prompt-guided fallback succeeds and its
@@ -8973,6 +9004,7 @@ mod tests {
             budget_tokens: Some(8_192),
             effort: None,
             display: None,
+            profile_display: None,
         };
 
         let response = provider
@@ -9076,6 +9108,7 @@ mod tests {
             budget_tokens: Some(8_192),
             effort: None,
             display: None,
+            profile_display: None,
         };
         let messages = vec![ChatMessage::user("What is the weather in SF?")];
 
@@ -13716,6 +13749,7 @@ mod tests {
                         budget_tokens: Some(2048),
                         effort: None,
                         display: None,
+                        profile_display: None,
                     }),
                 },
                 "test-model",

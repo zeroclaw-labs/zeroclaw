@@ -725,6 +725,7 @@ async fn native_hailo_rejects_call_level_thinking_before_http() {
                     budget_tokens: Some(1024),
                     effort: None,
                     display: None,
+                    profile_display: None,
                 }),
             },
             "qwen3:1.7b",

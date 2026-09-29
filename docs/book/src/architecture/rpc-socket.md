@@ -80,7 +80,9 @@ the operating system:
 | `session/close` | client -> daemon | Remove the live session owner; ACP durable history remains resumable |
 | `session/kill` | client -> daemon | Remove the live session and tombstone its ACP durable history |
 | `session/delete` | client -> daemon | Remove the live session and its selected durable history |
-| `session/prompt` | client -> daemon | Run a turn (streamed via `session/update` notifications) |
+| `session/prompt` | client -> daemon | Run a turn (streamed via `session/update` notifications); a leading `/effort:<level>` names the depth for that turn only |
+| `session/configure` | client -> daemon | Set session overrides (`model`, `model_provider`, `temperature`, `thinking_level`, `thinking_display`); `reset` names thinking fields to clear first; the result echoes the merged overrides and the session's `thinking_options` |
+| `session/thinking-options` | client -> daemon | The depths and displays the session's model accepts, what the session currently has, and where each value comes from |
 | `session/cancel` | client -> daemon | Cancel an in-flight turn |
 | `session/state` | client -> daemon | Read live session lifecycle state, active turn identity, and the optional current plan; active or queued work is represented by `state: "running"` so recovery clients can confirm terminal status before releasing retained work |
 | `status` | client -> daemon | Server version, protocol version, active session list |
@@ -157,6 +159,52 @@ events:
 
 Event types: `agent_message_chunk`, `agent_thought_chunk`, `tool_call`,
 `tool_result`, `approval_request`.
+
+### Session thinking controls
+
+`session/configure` sets a reasoning depth and a display for one session next
+to the model overrides, and `reset` clears either by name before the patch
+applies. A model or provider switch in the same patch clears both first, so
+one call can switch models and choose a depth for the new model:
+
+```json
+{"jsonrpc":"2.0","method":"session/configure","params":{"session_id":"sess-1","overrides":{"model":"claude-fable-5-1","thinking_level":"high","thinking_display":"summarized"},"reset":["thinking_display"]},"id":3}
+```
+
+A choice the merged model does not take is rejected with `-32602` (invalid
+params) and nothing is committed; the message names the accepted values, for
+example ``thinking_level `xhigh` is not supported by `claude-opus-4-6`
+(anthropic.default); accepted: low, medium, high, max``.
+
+The result, and the result of `session/thinking-options`, carry the same
+block:
+
+```json
+{"session_id":"sess-1","overrides":{"model":"claude-fable-5-1","thinking_level":"high","thinking_display":"summarized"},
+ "thinking_options":{"model_provider":"anthropic.default","model":"claude-fable-5-1",
+   "levels":["low","medium","high","xhigh","max"],"displays":["omitted","summarized"],
+   "current_level":"high","level_source":"session","current_display":"summarized","display_source":"session"}}
+```
+
+`levels` and `displays` are what the session may name on its current model;
+either list is empty where nothing is adjustable (a non-Claude provider, an
+older Claude model without `native_thinking`, a display on Claude 4.6 or on
+Bedrock). `current_level` and `current_display` are present exactly when the
+matching list is non-empty. `level_source` is `session`, `profile` (the
+runtime profile's `default_level`) or `model_default` (the profile names no
+depth); `display_source` is `session`, `alias` (the provider slot's
+`thinking_display`), `profile` (the runtime profile's
+`agent.thinking.display`) or `model_default`, in that order of precedence. Session overrides are read at turn
+time and rebuild no provider; the daemon resolves the turn's depth as the
+inline prefix, then the session override, then the profile default, and
+applies native request parameters only.
+
+Zerocode reports an explicit thinking set/reset as successful, and updates its
+saved preference, only when the configure response confirms both the resulting
+override and effective thinking options. An older daemon that ignores these
+fields, or a response that does not match the request, leaves the saved
+preference unchanged and asks the operator to update or restart the daemon.
+Ordinary model/provider changes retain compatibility with older daemons.
 
 ### ACP durable lifecycle
 

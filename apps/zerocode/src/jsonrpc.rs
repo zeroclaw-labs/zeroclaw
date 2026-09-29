@@ -75,6 +75,8 @@ pub struct JsonRpcError {
 pub mod error_codes {
     pub const METHOD_NOT_FOUND: i32 = -32601;
     pub const INTERNAL_ERROR: i32 = -32603;
+    #[cfg(test)]
+    pub const INVALID_PARAMS: i32 = -32602;
 
     pub const SESSION_NOT_FOUND: i32 = -32000;
     #[cfg(test)]

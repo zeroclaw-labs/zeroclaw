@@ -10099,7 +10099,8 @@ mod tests {
         ) -> anyhow::Result<ChatResponse> {
             let thinking = request.thinking.as_ref();
             let thinking_budget = thinking.and_then(|params| params.budget_tokens);
-            let thinking_display = thinking.and_then(|params| params.display);
+            let thinking_display =
+                thinking.and_then(|params| params.display.or(params.profile_display));
             let system_prompt = request
                 .messages
                 .iter()
@@ -10212,6 +10213,7 @@ mod tests {
             budget_tokens: Some(10_000),
             effort: None,
             display: None,
+            profile_display: None,
         });
 
         zeroclaw_api::NATIVE_THINKING_OVERRIDE
@@ -10266,6 +10268,7 @@ mod tests {
             budget_tokens: Some(10_000),
             effort: None,
             display: None,
+            profile_display: None,
         });
 
         zeroclaw_api::NATIVE_THINKING_OVERRIDE
@@ -10308,6 +10311,7 @@ mod tests {
             budget_tokens: Some(10_000),
             effort: None,
             display: None,
+            profile_display: None,
         });
 
         zeroclaw_api::NATIVE_THINKING_OVERRIDE
@@ -10365,6 +10369,7 @@ mod tests {
             budget_tokens: Some(10_000),
             effort: None,
             display: None,
+            profile_display: None,
         });
 
         zeroclaw_api::NATIVE_THINKING_OVERRIDE
