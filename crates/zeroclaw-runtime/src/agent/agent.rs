@@ -8793,6 +8793,7 @@ native_tools = false
             );
             agent.provider_switch_config = Some(ProviderSwitchConfig {
                 config: Some(std::sync::Arc::new(vision_alias_config)),
+                live_config: None,
                 live: None,
             });
 

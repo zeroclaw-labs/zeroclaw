@@ -4123,6 +4123,7 @@ mod native_tool_fallback_tests {
             observer: &observer,
             silent: true,
             approval: None,
+            security: None,
             multimodal_config: &multimodal,
             config: None,
             max_tool_iterations: 2,
