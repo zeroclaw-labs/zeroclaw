@@ -348,9 +348,11 @@ fn ensure_prompt_guided_tool_instructions(
     tools: &[crate::tools::ToolSpec],
 ) {
     if tools.is_empty()
-        || request_messages
-            .iter()
-            .any(|message| message.role == "system" && message.content.contains("## Tools"))
+        || request_messages.iter().any(|message| {
+            message.role == "system"
+                && (message.content.contains("## Tools")
+                    || message.content.contains("## Tool Use Protocol"))
+        })
     {
         return;
     }
@@ -3958,6 +3960,23 @@ mod native_tool_fallback_tests {
         MultimodalConfig, PacingConfig, RiskProfileConfig, SkillsPromptInjectionMode,
     };
     use zeroclaw_providers::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
+
+    #[test]
+    fn prompt_guided_instructions_are_inserted_when_no_system_message_exists() {
+        let tools = vec![crate::tools::Tool::spec(&LookupStatusTool)];
+        let mut messages = vec![ChatMessage::user("check status")];
+
+        ensure_prompt_guided_tool_instructions(&mut messages, &tools);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "system");
+        assert!(messages[0].content.contains("## Tool Use Protocol"));
+        assert!(messages[0].content.contains("lookup_status"));
+        assert_eq!(messages[1].role, "user");
+
+        ensure_prompt_guided_tool_instructions(&mut messages, &tools);
+        assert_eq!(messages.len(), 2, "instructions are only added once");
+    }
 
     struct LookupStatusTool;
 
