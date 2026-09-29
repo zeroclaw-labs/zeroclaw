@@ -1452,6 +1452,16 @@ pub struct OpenRouterModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
+    /// OpenRouter Management API key used only for account-level credit
+    /// reporting. This credential is never used for model inference and is
+    /// never returned by the gateway. When unset, the dashboard omits the
+    /// OpenRouter credit balance card.
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub management_api_key: Option<String>,
 }
 
 // ── Ollama (local-default endpoint) ──
@@ -32040,6 +32050,7 @@ auto_save = true
                             timeout_secs: Some(120),
                             ..Default::default()
                         },
+                        management_api_key: None,
                     },
                 );
                 p
@@ -33333,6 +33344,7 @@ default_temperature = 0.7
                     timeout_secs: Some(120),
                     ..Default::default()
                 },
+                management_api_key: None,
             },
         );
         let config = Config {
@@ -33560,6 +33572,7 @@ default_temperature = 0.7
                     model: Some("model-test".into()),
                     ..Default::default()
                 },
+                management_api_key: None,
             },
         );
         config.agents.insert(
@@ -33867,6 +33880,7 @@ default_temperature = 0.7
                     model: Some("model-a".into()),
                     ..Default::default()
                 },
+                management_api_key: None,
             },
         );
         config.save().await.unwrap();
@@ -35626,6 +35640,7 @@ model = "primary-model"
                     model: Some("primary-model".to_string()),
                     ..Default::default()
                 },
+                management_api_key: None,
             },
         );
         // resolve_default_model returns the first non-empty model across all model_providers.
@@ -35640,6 +35655,7 @@ model = "primary-model"
                     model: Some("beta-model".to_string()),
                     ..Default::default()
                 },
+                management_api_key: None,
             },
         );
         config.providers.models.openrouter.insert(
@@ -35649,6 +35665,7 @@ model = "primary-model"
                     model: Some("aaa-model".to_string()),
                     ..Default::default()
                 },
+                management_api_key: None,
             },
         );
         assert_eq!(config.resolve_default_model().as_deref(), Some("aaa-model"),);
@@ -36945,6 +36962,7 @@ runtime_profile = "default"
                     temperature: Some(99.0),
                     ..Default::default()
                 },
+                management_api_key: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -36965,6 +36983,7 @@ runtime_profile = "default"
                     temperature: Some(-0.5),
                     ..Default::default()
                 },
+                management_api_key: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -36984,6 +37003,7 @@ runtime_profile = "default"
                     temperature: Some(0.7),
                     ..Default::default()
                 },
+                management_api_key: None,
             },
         );
         assert!(config.validate().is_ok());
@@ -43869,6 +43889,7 @@ allowed_users = []
                     api_key: Some("secret-key".into()),
                     ..Default::default()
                 },
+                management_api_key: None,
             },
         );
 
@@ -43882,7 +43903,6 @@ allowed_users = []
             .as_ref()
             .unwrap();
         assert!(crate::secrets::SecretStore::is_encrypted(encrypted_key));
-
         config.decrypt_secrets(&store).unwrap();
         assert_eq!(
             config
@@ -43893,6 +43913,45 @@ allowed_users = []
                 .api_key
                 .as_deref(),
             Some("secret-key")
+        );
+    }
+
+    #[test]
+    async fn openrouter_management_key_encrypts_and_decrypts() {
+        let dir = TempDir::new().unwrap();
+        let store = crate::secrets::SecretStore::new(dir.path(), true);
+        let mut config = Config::default();
+        config.providers.models.openrouter.insert(
+            "test".into(),
+            crate::schema::OpenRouterModelProviderConfig {
+                base: ModelProviderConfig::default(),
+                management_api_key: Some("management-secret-key".into()),
+            },
+        );
+
+        config.encrypt_secrets(&store).unwrap();
+        let encrypted = config
+            .providers
+            .models
+            .openrouter
+            .get("test")
+            .expect("entry exists")
+            .management_api_key
+            .as_ref()
+            .unwrap();
+        assert!(crate::secrets::SecretStore::is_encrypted(encrypted));
+
+        config.decrypt_secrets(&store).unwrap();
+        assert_eq!(
+            config
+                .providers
+                .models
+                .openrouter
+                .get("test")
+                .expect("entry exists")
+                .management_api_key
+                .as_deref(),
+            Some("management-secret-key")
         );
     }
 
