@@ -177,6 +177,33 @@ cli-oidc-token-expiry = The token expires in { $seconds } seconds.
 cli-oidc-browser-open = Opening your browser to sign in. If nothing opens, visit:
     { $uri }
 cli-oidc-browser-waiting = Waiting for the browser sign-in to complete...
+cli-user-password-prompt = New password
+cli-user-password-confirm = Repeat the password
+cli-user-password-mismatch = The two passwords do not match.
+cli-user-password-stdin-empty = No password was read from standard input.
+cli-user-password-too-short = The password must be at least { $min } characters long.
+cli-user-password-too-long = The password must be at most { $max } bytes long.
+cli-user-exists = users.{ $name } already exists. Use `zeroclaw user passwd { $name }` to change its password.
+cli-user-not-found = There is no [users.{ $name }] entry.
+cli-user-roster-degraded = Part of { $path } failed to load ({ $sections }), so the roster cannot be read or edited safely. Repair it by hand, then run the command again.
+cli-user-added = Added users.{ $name }.
+cli-user-password-set = Set the password for users.{ $name }.
+cli-user-password-removed = Removed the password from users.{ $name }.
+cli-user-no-password = users.{ $name } has no password.
+cli-user-password-only-credential = users.{ $name } has no uid, so its password is its only credential. Remove the entry with `zeroclaw user remove { $name }` instead.
+cli-user-removed = Removed users.{ $name }.
+cli-user-apply-hint = The running daemon applies this change at its next reload or restart.
+cli-user-password-auth-off = Password sign-in is off. Set security.password_auth.enabled = true to turn it on.
+cli-user-list-empty = No [users] entries are configured.
+cli-user-list-row = { $name }: principal { $principal }, uid { $uid }, password { $password }, profiles { $profiles }
+cli-user-list-password-set = set
+cli-user-list-no-uid = none
+cli-user-list-no-password = none
+cli-user-add-needs-credential = users.{ $name } needs a credential: pass --uid, --password, or --password-stdin.
+cli-user-config-changed = { $path } changed while this command ran, so nothing was written. Run the command again.
+cli-user-env-overrides = Environment overrides change { $paths }, so the roster check would not match { $path }. Unset them and run the command again.
+cli-user-password-stdin-terminal = --password-stdin reads a pipe or a file; typing into a terminal here would show the password. To type it at a hidden prompt, pass --password to add, or leave --password-stdin out of passwd and hash-password.
+cli-user-password-not-utf8 = The password is not valid UTF-8.
 cli-auth-list-about = List auth profiles
 cli-auth-status-about = Show auth status with active profile and token expiry info
 

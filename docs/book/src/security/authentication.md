@@ -171,6 +171,10 @@ Edit `config.toml` directly as its owner, then restart the daemon so the
 repaired sections are compiled and published. The daemon ignores `SIGHUP`,
 so a restart is the step that reloads it.
 
+A forgotten roster password is repaired on the daemon host the same way:
+`zeroclaw user passwd <name>` writes a new hash to `config.toml` whether or
+not the daemon is running, and a restart applies it.
+
 If `security.trust_daemon_uid` is set to `false`, the trusted-uid route is
 gone. A policy that compiles can still be repaired live by a client that
 presents a paired gateway token, or by a roster principal with admin
@@ -233,9 +237,88 @@ takes as long as checking one of them. A hash with other parameters takes a
 different time to check, which can reveal that its user exists; keep every
 hash at the same parameters.
 
-No command writes these hashes yet, and no client surface presents a
-password to the provider. In particular an RPC `auth_token` sent with
-`auth_provider = "password"` is refused, never checked as a password.
+`zeroclaw user`, described next, writes these hashes. No client surface
+presents a password to the provider yet. In particular an RPC `auth_token`
+sent with `auth_provider = "password"` is refused, never checked as a
+password.
+
+#### Managing users from the command line
+
+`zeroclaw user` edits the roster in `config.toml` directly, so it works while
+the daemon is stopped. Each command checks the edited roster, permission
+profiles, and OIDC entries as one authorization policy before it asks for a
+password and again before it writes, and it writes nothing when a check
+fails or when `config.toml` changed since the edit began, such as while a
+password was being typed. It also refuses while an environment override sets
+a roster or permission-profile value, a non-secret OIDC value, or an OIDC
+entry or agent the file does not define, since the check would then pass
+against values the file does not hold. Overrides elsewhere, and a secret
+such as the `client_secret` of an OIDC entry the file defines, whose
+presence is all the check reads, do not block it. A running daemon applies
+the change at its next reload or restart, like any other edit made outside
+the daemon. Run the commands as the account that owns `config.toml`: the
+file is rewritten owner-only, so running them through `sudo` would leave it
+owned by root.
+
+To prepare the first administrator, give a profile administrator rights,
+turn the provider on, and add a user holding that profile:
+
+```toml
+[permission_profiles.admins]
+admin = true
+
+[security.password_auth]
+enabled = true
+```
+
+```sh
+# Prompts twice for the password; the input is masked.
+zeroclaw user add zeroclaw_operator --profile admins --password
+```
+
+Until a client surface can present a password, as noted above, this user
+cannot sign in with it. Adding the entry still creates a roster, which
+closes the local no-credential path described under
+[Local connections](#local-connections). On Windows that means a local
+client must then present a token, so zerocode, which sends none over the
+named pipe, can no longer connect. To undo, run
+`zeroclaw user remove zeroclaw_operator` and restart the daemon.
+
+The other commands:
+
+```sh
+# Replace a password. --password-stdin reads one line instead of prompting,
+# for scripts and secret managers.
+zeroclaw user passwd zeroclaw_operator
+
+# Stop accepting a user's password while keeping their uid. Refused when the
+# password is the entry's only credential.
+zeroclaw user disable-password zeroclaw_operator
+
+# Remove the entry and every credential it carries.
+zeroclaw user remove zeroclaw_operator
+
+# List entries and which credentials each carries, never a hash.
+zeroclaw user list
+
+# Print a hash for config written by other tools; stdout carries only it.
+zeroclaw user hash-password --password-stdin
+```
+
+A new password must be at least 15 characters long, the minimum NIST SP
+800-63B-4 sets for a password that is the only authentication factor, and at
+most 1024 bytes. There are no composition rules. The rule applies when a
+password is set, so raising it later never locks out a password already in
+use. `--password-stdin` reads the first line of a pipe or file and refuses a
+terminal, where the typed password would be shown. At a terminal, pass
+`--password` to `add`, and leave the flag out of `passwd` and
+`hash-password`, which prompt by default.
+
+`add` accepts the same names as other config map keys: lowercase ASCII
+letters, digits, and single underscores, starting and ending with a letter or
+digit, at most 63 characters. Entries written by hand under other names,
+such as ones with hyphens, still work with `passwd`, `disable-password`, and
+`remove`.
 
 ### OIDC
 

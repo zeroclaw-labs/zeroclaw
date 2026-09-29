@@ -23,6 +23,49 @@ use scrypt::{Params, Scrypt};
 /// Longest password accepted, in bytes. Longer input is never hashed.
 pub const MAX_PASSWORD_BYTES: usize = 1024;
 
+/// Shortest new password accepted, in characters. NIST SP 800-63B-4 asks for
+/// at least 15 when a password is the only authentication factor, which a
+/// roster password is.
+pub const MIN_NEW_PASSWORD_CHARS: usize = 15;
+
+/// Why [`check_new_password`] refused a password. Only length is checked:
+/// composition rules make a password harder to remember without making it
+/// harder to guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewPasswordError {
+    /// Shorter than [`MIN_NEW_PASSWORD_CHARS`] characters.
+    TooShort,
+    /// Longer than [`MAX_PASSWORD_BYTES`] bytes.
+    TooLong,
+}
+
+impl std::fmt::Display for NewPasswordError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooShort => write!(
+                f,
+                "the password is shorter than {MIN_NEW_PASSWORD_CHARS} characters"
+            ),
+            Self::TooLong => write!(f, "the password is longer than {MAX_PASSWORD_BYTES} bytes"),
+        }
+    }
+}
+
+impl std::error::Error for NewPasswordError {}
+
+/// Check a password that is about to be set. Stored hashes are not held to
+/// this rule, so raising the minimum never locks out a password already in
+/// use.
+pub fn check_new_password(password: &str) -> Result<(), NewPasswordError> {
+    if password.len() > MAX_PASSWORD_BYTES {
+        return Err(NewPasswordError::TooLong);
+    }
+    if password.chars().count() < MIN_NEW_PASSWORD_CHARS {
+        return Err(NewPasswordError::TooShort);
+    }
+    Ok(())
+}
+
 /// `log2(N)` for new hashes. With [`DEFAULT_R`] and [`DEFAULT_P`] this is
 /// 32 MiB of memory and three passes, one of the scrypt configurations OWASP
 /// lists.
@@ -95,6 +138,14 @@ impl Decoy {
             "$scrypt$ln={log_n},r={r},p={p}${DECOY_SALT}${DECOY_OUTPUT}"
         ))
     }
+
+    /// The decoy as a PHC string. It satisfies the policy and no password
+    /// produces it, so it can also stand in for a hash that does not exist
+    /// yet, such as when a config is checked before a password is typed.
+    #[must_use]
+    pub fn as_phc(&self) -> &str {
+        &self.0
+    }
 }
 
 impl Default for Decoy {
@@ -153,15 +204,10 @@ fn parse(phc: &str) -> Result<PasswordHash<'_>> {
     Ok(hash)
 }
 
-/// Hash `password` for storage, at the default parameters with a fresh
-/// random salt.
+/// Hash a new `password` for storage, at the default parameters with a fresh
+/// random salt. The password must pass [`check_new_password`].
 pub fn hash_password(password: &str) -> Result<String> {
-    if password.is_empty() {
-        bail!("the password is empty");
-    }
-    if password.len() > MAX_PASSWORD_BYTES {
-        bail!("the password is longer than {MAX_PASSWORD_BYTES} bytes");
-    }
+    check_new_password(password)?;
     let salt: [u8; MIN_SALT_LEN] = rand::random();
     let salt = SaltString::encode_b64(&salt)
         .map_err(|e| anyhow::Error::msg(format!("encoding the salt failed: {e}")))?;
@@ -306,14 +352,36 @@ mod tests {
     }
 
     #[test]
-    fn hashing_refuses_empty_and_over_long_passwords() {
+    fn hashing_refuses_passwords_outside_the_new_password_rule() {
         assert!(hash_password("").is_err());
+        assert!(hash_password(&"a".repeat(MIN_NEW_PASSWORD_CHARS - 1)).is_err());
         assert!(hash_password(&"a".repeat(MAX_PASSWORD_BYTES + 1)).is_err());
     }
 
     fn decoy_params(decoy: &Decoy) -> ParamSet {
         let hash = parse(&decoy.0).expect("a decoy satisfies the policy");
         param_set(&hash).expect("params")
+    }
+
+    #[test]
+    fn the_new_password_rule_counts_characters_and_bounds_bytes() {
+        assert_eq!(
+            check_new_password(&"a".repeat(MIN_NEW_PASSWORD_CHARS - 1)),
+            Err(NewPasswordError::TooShort)
+        );
+        assert_eq!(
+            check_new_password(&"a".repeat(MIN_NEW_PASSWORD_CHARS)),
+            Ok(())
+        );
+        // Fifteen three-byte characters: long enough by characters.
+        assert_eq!(
+            check_new_password(&"\u{3042}".repeat(MIN_NEW_PASSWORD_CHARS)),
+            Ok(())
+        );
+        assert_eq!(
+            check_new_password(&"a".repeat(MAX_PASSWORD_BYTES + 1)),
+            Err(NewPasswordError::TooLong)
+        );
     }
 
     #[test]

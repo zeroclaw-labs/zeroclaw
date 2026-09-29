@@ -14365,10 +14365,10 @@ pub struct UserConfig {
     pub uid: Option<u32>,
     /// Hash of this user's password, as a scrypt PHC string
     /// (`$scrypt$ln=<log2 N>,r=8,p=<p>$<salt>$<hash>`); never the password
-    /// itself. A value that is not such a hash, or whose cost falls outside
-    /// the accepted bounds, fails validation. The `password` auth provider
-    /// checks it only while `security.password_auth.enabled` is on.
-    /// Encrypted at rest.
+    /// itself. Set it with `zeroclaw user passwd <name>`. A value that is
+    /// not such a hash, or whose cost falls outside the accepted bounds,
+    /// fails validation. The `password` auth provider checks it only while
+    /// `security.password_auth.enabled` is on. Encrypted at rest.
     #[secret]
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
