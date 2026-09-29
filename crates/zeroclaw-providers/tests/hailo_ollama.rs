@@ -722,7 +722,8 @@ async fn native_hailo_rejects_call_level_thinking_before_http() {
                 messages: &messages,
                 tools: None,
                 thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
-                    budget_tokens: 1024,
+                    budget_tokens: Some(1024),
+                    effort: None,
                     display: None,
                 }),
             },
