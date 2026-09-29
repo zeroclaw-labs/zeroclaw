@@ -780,12 +780,14 @@ jobs:
       # runs rather than a name filter: the ceremony tests in `main.rs` share no
       # common name, and a filter silently skipped most of them. The component
       # tests drive the real binary through `plugin info` and `plugin list
-      # --verify` against an installed component that does not load.
+      # --verify` against an installed component that does not load, and
+      # through `plugin update` against a local registry serving the in-tree
+      # tool fixture, built for the fixture target installed above.
       - name: Run root CLI plugin tests
         if: steps.changed.outputs.run == 'true' && matrix.suite == 'runtime'
         run: |
           cargo test --locked --features plugins-wasm-cranelift --bin zeroclaw
-          cargo test --locked --features plugins-wasm-cranelift --test component -- plugin_info_cli
+          cargo test --locked --features plugins-wasm-cranelift --test component -- plugin_info_cli plugin_update_cli
 
   msrv:
     name: MSRV (declared floor)

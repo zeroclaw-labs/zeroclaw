@@ -55,6 +55,15 @@ expect "mixed unrelated then activation e2e" "true" \
     "web/src/pages/AgentChat.tsx" \
     "tests/plugin_channel_runtime_e2e.rs"
 
+# The plugin CLI component tests drive the real binary with plugin support, so
+# only this job runs them; a change to them alone must still run it.
+expect "plugin info CLI component test" "true" \
+    "tests/component/plugin_info_cli.rs"
+expect "plugin update CLI component test" "true" \
+    "tests/component/plugin_update_cli.rs"
+expect "unrelated component test" "false" \
+    "tests/component/skills_bundle_cli.rs"
+
 expect "wit contracts" "true" "wit/v0/tool-plugin.wit"
 expect "workspace manifest" "true" "Cargo.toml"
 expect "workspace lockfile" "true" "Cargo.lock"

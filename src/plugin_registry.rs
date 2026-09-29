@@ -84,7 +84,15 @@ pub(crate) async fn download_registry_plugin(
         write_cached_registry_index(data_dir, registry_url, &index)?;
     }
     let spec = parse_plugin_spec(source)?;
-    let entry = resolve_entry(&index, &spec)?.clone();
+    let entry = resolve_entry(&index, &spec)?;
+    download_registry_entry(entry).await
+}
+
+/// Download the archive one registry entry names, check its digest, and
+/// extract it: the entry's manifest must carry the entry's name and version.
+pub(crate) async fn download_registry_entry(
+    entry: &PluginRegistryEntry,
+) -> Result<DownloadedPlugin> {
     let bytes = download_archive_bytes(&entry.url).await?;
     verify_sha256_if_present(&bytes, entry.sha256.as_deref())?;
 
@@ -93,7 +101,7 @@ pub(crate) async fn download_registry_plugin(
     extract_zip_safe(std::io::Cursor::new(bytes), &extract_dir)?;
     let plugin_dir = find_manifest_dir(&extract_dir)?;
     let manifest = load_plugin_manifest(&plugin_dir)?;
-    verify_manifest_matches_registry(&entry, &manifest)?;
+    verify_manifest_matches_registry(entry, &manifest)?;
 
     Ok(DownloadedPlugin {
         _temp_dir: temp_dir,

@@ -218,6 +218,22 @@ zeroclaw plugin install ./my-plugin
 zeroclaw plugin install ./my-plugin/manifest.toml
 ```
 
+`zeroclaw plugin update` replaces an installed package through the same
+admission (`PluginHost::admit_update`) with the identity decided the other way
+round: the named package must be installed, and the source must carry its
+name. The CLI refuses authority the new manifest adds unless `--allow` accepts
+it, runs the same load check with no way to skip it, and
+`PluginHost::update_admitted` builds the replacement in a staging directory
+before renaming it into the installed package's place. The operator-facing
+contract is in [Updating a plugin](../plugins/index.md#updating-a-plugin).
+
+```bash
+zeroclaw plugin update team-calendar
+zeroclaw plugin update team-calendar@0.2.0 --registry https://example.invalid/registry.json
+zeroclaw plugin update --all
+zeroclaw plugin update my-plugin --from ./my-plugin
+```
+
 The default registry URL is:
 
 ```text
@@ -766,9 +782,11 @@ plugin that declares its destinations works without the operator transcribing
 hosts, and the seeded values are printed. It never extends a row that already
 exists: an upgrade whose declaration grew prints the difference plus the exact
 `zeroclaw config set` command, and the operator applies it. `zeroclaw plugin
-list` reports the same gap as a standing diagnostic. Declare the destinations
-your code actually contacts, and treat a growing declaration as something every
-operator has to approve on every upgrade.
+update` seeds nothing at all, not even into a row it creates, and prints the
+same difference. `zeroclaw plugin list` reports the same gap as a standing
+diagnostic. Declare the destinations your code actually contacts, and treat a
+growing declaration as something every operator has to approve on every
+upgrade.
 
 If reinstall finds an unsupported pre-typed-config row keyed by the package
 name, install refuses before creating the derived `zpi1_…` row and prints the
