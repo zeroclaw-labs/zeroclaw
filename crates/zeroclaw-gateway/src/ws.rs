@@ -1726,7 +1726,8 @@ async fn process_chat_message(
 
     // Channel for streaming turn events from the agent.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
-    let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(32);
+    let (steering_tx, mut steering_rx) =
+        tokio::sync::mpsc::channel::<zeroclaw_runtime::agent::SteeringInput>(32);
 
     let content_owned = content.to_string();
     let session_key_owned = session_key.to_string();
@@ -1871,7 +1872,7 @@ async fn process_chat_message(
                                             let _ = sender.send(Message::Text(err.to_string().into())).await;
                                             continue;
                                         }
-                                        match steering_tx.try_send(content) {
+                                        match steering_tx.try_send(content.into()) {
                                             Ok(()) => {}
                                             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                                                 let err = serde_json::json!({
