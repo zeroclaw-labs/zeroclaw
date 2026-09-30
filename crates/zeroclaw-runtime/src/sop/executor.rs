@@ -404,6 +404,34 @@ impl SopDriverSink {
     }
 }
 
+/// Where a headless driver reads the daemon configuration that a step runs
+/// under: whether its agent is configured and enabled, the step's tool policy,
+/// and the turn itself. The driver reads it once per step, at the step's
+/// execution boundary, after every wait that step makes.
+#[derive(Clone)]
+pub enum SopDriverConfig {
+    /// A copy fixed when the driver was requested.
+    Snapshot(Arc<zeroclaw_config::schema::Config>),
+    /// The daemon's live configuration, so an agent disabled or re-profiled
+    /// while the driver waited is seen before the step runs as it.
+    Live(Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>),
+}
+
+impl SopDriverConfig {
+    fn current(&self) -> zeroclaw_config::schema::Config {
+        match self {
+            Self::Snapshot(config) => config.as_ref().clone(),
+            Self::Live(config) => config.read().clone(),
+        }
+    }
+}
+
+impl From<zeroclaw_config::schema::Config> for SopDriverConfig {
+    fn from(config: zeroclaw_config::schema::Config) -> Self {
+        Self::Snapshot(Arc::new(config))
+    }
+}
+
 /// Start a headless run driver **without** registering it with a generation.
 ///
 /// Only for a caller that has no generation to register with, where the
@@ -411,14 +439,14 @@ impl SopDriverSink {
 /// [`spawn_and_register_sop_driver`], which cannot create a driver that the
 /// generation has not already accepted.
 pub fn spawn_headless_run_driver(
-    config: zeroclaw_config::schema::Config,
+    config: impl Into<SopDriverConfig>,
     engine: Arc<Mutex<SopEngine>>,
     audit: Option<Arc<SopAuditLogger>>,
     first_action: SopRunAction,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let lease = lease_for_first_action(&engine, &first_action).ok()?;
     Some(spawn_leased_driver(
-        config,
+        config.into(),
         engine,
         audit,
         first_action,
@@ -455,7 +483,7 @@ fn lease_for_first_action(
 }
 
 fn spawn_leased_driver(
-    config: zeroclaw_config::schema::Config,
+    config: SopDriverConfig,
     engine: Arc<Mutex<SopEngine>>,
     audit: Option<Arc<SopAuditLogger>>,
     first_action: SopRunAction,
@@ -553,11 +581,12 @@ where
 /// [`spawn_headless_run_driver`] directly instead.
 pub fn spawn_and_register_sop_driver(
     handles: &SopDriverHandles,
-    config: zeroclaw_config::schema::Config,
+    config: impl Into<SopDriverConfig>,
     engine: Arc<Mutex<SopEngine>>,
     audit: Option<Arc<SopAuditLogger>>,
     first_action: SopRunAction,
 ) -> bool {
+    let config = config.into();
     // Captured before the closure consumes the action, because a refusal has to
     // name the run it is abandoning.
     let run_id = crate::sop::dispatch::extract_run_id_from_action(&first_action).to_string();
@@ -792,7 +821,7 @@ fn headless_step_scope(
 }
 
 async fn drive_headless_run(
-    config: zeroclaw_config::schema::Config,
+    config_source: SopDriverConfig,
     engine: Arc<Mutex<SopEngine>>,
     audit: Option<Arc<SopAuditLogger>>,
     first_action: SopRunAction,
@@ -851,6 +880,18 @@ async fn drive_headless_run(
                         .get_run(&run_id)
                         .and_then(|run| run.initiating_agent.clone())
                 };
+                // Also taken under the engine lock, so it comes before the
+                // configuration is read below rather than after it.
+                let scope = headless_step_scope(&engine, &run_id, &step);
+                #[cfg(test)]
+                step_boundary_pause::reached(&engine, &run_id).await;
+                // The step's execution boundary. Every wait this step makes
+                // (the driver lease, generation admission, the engine lock) is
+                // behind it, and nothing from here to the turn waits, so the
+                // owner check, the tool policy and the turn all use the
+                // configuration as it is now rather than as it was when the
+                // driver was requested.
+                let config = config_source.current();
                 let resolved_agent = headless_step_agent(&config, &step, run_initiator.as_deref());
                 // Attribution follows execution: a step that never ran — no
                 // owner, or an owner naming an unconfigured agent — is recorded
@@ -882,7 +923,6 @@ async fn drive_headless_run(
                                 "sop-{run_id}-step-{}",
                                 step.number
                             ));
-                            let scope = headless_step_scope(&engine, &run_id, &step);
                             // The scope is both handed to this run and published
                             // on the task: a tool that starts a child run
                             // (child-agent spawning) inherits the same boundary,
@@ -1273,6 +1313,58 @@ async fn audit_sop_step_emit(
                 .with_attrs(::serde_json::json!({"error": e.to_string()})),
             "SOP executor: audit log_run_complete failed"
         );
+    }
+}
+
+/// A test-only pause at a headless step's execution boundary: after the last
+/// wait the step makes and immediately before it reads the configuration it
+/// runs under. A test parks a driver here to change the configuration at the
+/// latest moment it can still take effect.
+#[cfg(test)]
+pub(crate) mod step_boundary_pause {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use tokio::sync::Notify;
+
+    use super::SopEngine;
+
+    type Pause = (Arc<Notify>, Arc<Notify>);
+
+    fn armed() -> &'static Mutex<HashMap<String, Pause>> {
+        static ARMED: OnceLock<Mutex<HashMap<String, Pause>>> = OnceLock::new();
+        ARMED.get_or_init(Mutex::default)
+    }
+
+    /// Park the next step any driver runs for `sop_name` at its execution
+    /// boundary. Returns `(reached, release)`: `reached` is notified once the
+    /// driver is parked there, and the driver waits for `release`. Tests
+    /// sharing a process must use distinct procedure names.
+    pub(crate) fn arm(sop_name: &str) -> (Arc<Notify>, Arc<Notify>) {
+        let pause: Pause = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        armed()
+            .lock()
+            .unwrap()
+            .insert(sop_name.to_string(), pause.clone());
+        pause
+    }
+
+    pub(super) async fn reached(engine: &Arc<Mutex<SopEngine>>, run_id: &str) {
+        let sop_name = {
+            let guard = match engine.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.get_run(run_id).map(|run| run.sop_name.clone())
+        };
+        let Some(sop_name) = sop_name else {
+            return;
+        };
+        let pause = armed().lock().unwrap().remove(&sop_name);
+        if let Some((reached, release)) = pause {
+            reached.notify_one();
+            release.notified().await;
+        }
     }
 }
 
@@ -1678,7 +1770,7 @@ mod tests {
                 ..zeroclaw_config::schema::AliasedAgentConfig::default()
             },
         );
-        drive_headless_run(config, Arc::clone(&engine), None, action, None).await;
+        drive_headless_run(config.into(), Arc::clone(&engine), None, action, None).await;
 
         let guard = engine.lock().unwrap();
         let run = guard.get_run(&run_id).expect("run is still known");

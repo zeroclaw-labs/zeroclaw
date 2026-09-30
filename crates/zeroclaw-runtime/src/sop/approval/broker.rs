@@ -624,6 +624,7 @@ fn vote_principal(source: Option<&str>, identity: Option<String>) -> Option<Appr
         "ws" => ApprovalSource::Ws,
         "http" => ApprovalSource::Http,
         "system" => ApprovalSource::System,
+        "principal" => ApprovalSource::Principal,
         _ => return None,
     };
     Some(ApprovalPrincipal {

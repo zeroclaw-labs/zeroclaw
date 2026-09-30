@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 use super::audit::SopAuditLogger;
 use super::engine::{SopEngine, now_iso8601};
 use super::types::{
-    SopAdmission, SopEvent, SopExecutionMode, SopRun, SopRunAction, SopRunStatus, SopTriggerSource,
+    Sop, SopAdmission, SopEvent, SopExecutionMode, SopRun, SopRunAction, SopRunStatus,
+    SopTriggerSource,
 };
 use crate::security::{ContentSafety, ScanOutcome, ScreenVerdict};
 
@@ -83,6 +84,13 @@ pub enum SopIngressOutcome {
     Dispatched(Vec<DispatchResult>),
 }
 
+/// A caller's authority over one matched procedure, evaluated at run
+/// admission: after trigger matching on the normalized event and after any
+/// decision-model wait, under the engine lock, immediately before the run
+/// starts. `Err` carries the refusal reason and the procedure is reported as
+/// skipped instead of started. The check must not take the engine lock.
+pub type SopAdmissionCheck<'a> = &'a (dyn Fn(&Sop) -> Result<(), String> + Sync);
+
 /// Borrowed, per-call adapter from transport deliveries into canonical SOP events.
 ///
 /// This is the ingress boundary for untrusted fan-in sources. Transport adapters
@@ -97,6 +105,9 @@ pub struct SopIngress<'a> {
     /// into the shared driver supervisor instead of being logged and dropped
     /// by `process_headless_results` (the channel half of the headless-driver gap).
     driver_sink: Option<&'a crate::sop::executor::SopDriverSink>,
+    /// When attached, every matched procedure must pass this check at run
+    /// admission (see [`SopAdmissionCheck`]).
+    admission_check: Option<SopAdmissionCheck<'a>>,
 }
 
 impl<'a> SopIngress<'a> {
@@ -109,7 +120,19 @@ impl<'a> SopIngress<'a> {
             engine,
             audit,
             driver_sink: None,
+            admission_check: None,
         }
+    }
+
+    /// Hold every procedure this delivery would start to the caller's
+    /// authority at the moment the run is admitted, rather than only when the
+    /// delivery arrived. A caller whose authority is revoked while a decision
+    /// model deliberates starts nothing, and a procedure the caller could not
+    /// see because it matched only on the normalized topic is refused.
+    #[must_use]
+    pub fn with_admission_check(mut self, check: SopAdmissionCheck<'a>) -> Self {
+        self.admission_check = Some(check);
+        self
     }
 
     /// Attach the shared driver supervisor. Callers that omit this keep the
@@ -205,6 +228,7 @@ impl<'a> SopIngress<'a> {
                 delivery_dedup,
                 active_dedup,
                 max_bytes,
+                admission_check: self.admission_check,
             },
         )
         .await;
@@ -617,7 +641,7 @@ pub async fn dispatch_sop_event(
     audit: &SopAuditLogger,
     event: SopEvent,
 ) -> Vec<DispatchResult> {
-    dispatch_sop_event_filtered(engine, audit, event, None, None, None).await
+    dispatch_sop_event_filtered(engine, audit, event, None, None, None, None).await
 }
 
 /// Dispatch an incoming event to one named SOP, after normal trigger matching.
@@ -629,7 +653,7 @@ pub async fn dispatch_sop_event_to(
     event: SopEvent,
     target_sop: &str,
 ) -> Vec<DispatchResult> {
-    dispatch_sop_event_filtered(engine, audit, event, Some(target_sop), None, None).await
+    dispatch_sop_event_filtered(engine, audit, event, Some(target_sop), None, None, None).await
 }
 
 /// Dispatch to one named SOP with an active-run key shared by independent
@@ -648,6 +672,7 @@ pub async fn dispatch_sop_event_to_deduplicated(
         Some(target_sop),
         None,
         Some(dedup_key),
+        None,
     )
     .await
 }
@@ -668,6 +693,8 @@ async fn dispatch_sop_event_filtered(
     // Semantic key shared by fresh producers. Coalesces only while its run is
     // active; terminal retries remain possible.
     active_dedup: Option<&str>,
+    // The caller's authority, re-evaluated per procedure at run admission.
+    admission_check: Option<SopAdmissionCheck<'_>>,
 ) -> Vec<DispatchResult> {
     let safety = match engine.lock() {
         Ok(eng) => ContentSafety::from_sop_config(eng.config()),
@@ -795,6 +822,47 @@ async fn dispatch_sop_event_filtered(
                 return vec![];
             }
         };
+
+        // Re-establish the caller's authority over each procedure now, on the
+        // normalized match set and after the decision wait, with the lock that
+        // starts the runs held so nothing can change between check and start.
+        let matched_names = match admission_check {
+            None => matched_names,
+            Some(check) => {
+                let mut admitted = Vec::with_capacity(matched_names.len());
+                for sop_name in matched_names {
+                    let verdict = eng.get_sop(&sop_name).map(check);
+                    match verdict {
+                        Some(Err(reason)) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "sop_name": sop_name, "reason": reason
+                                })),
+                                &format!(
+                                    "SOP dispatch: '{sop_name}' refused at admission: {reason}"
+                                )
+                            );
+                            results.push(DispatchResult::Skipped {
+                                sop_name,
+                                reason: format!("{NOT_AUTHORIZED_PREFIX}{reason}"),
+                            });
+                        }
+                        // A procedure that is no longer loaded fails its own start below.
+                        Some(Ok(())) | None => admitted.push(sop_name),
+                    }
+                }
+                admitted
+            }
+        };
+        if matched_names.is_empty() {
+            return results;
+        }
 
         // Keep producer/delivery idempotency orthogonal to admission. This pre-pass
         // removes SOPs already active for a shared producer key, or already known to
@@ -1506,6 +1574,7 @@ struct PreparedSopIngress<'a> {
     delivery_dedup: Option<(String, bool)>,
     active_dedup: Option<String>,
     max_bytes: usize,
+    admission_check: Option<SopAdmissionCheck<'a>>,
 }
 
 async fn dispatch_untrusted_fan_in_inner(
@@ -1521,6 +1590,7 @@ async fn dispatch_untrusted_fan_in_inner(
         delivery_dedup,
         active_dedup,
         max_bytes,
+        admission_check,
     } = ingress;
     let (topic, topic_truncated) = match topic {
         Some(t) => {
@@ -1565,10 +1635,39 @@ async fn dispatch_untrusted_fan_in_inner(
             .as_ref()
             .map(|(key, redelivered)| (key.as_str(), *redelivered)),
         active_dedup.as_deref(),
+        admission_check,
     )
     .await;
     process_headless_results(&results);
     results
+}
+
+/// Prefix on the reason of a procedure the admission check refused, so a
+/// caller can tell a refusal apart from an ordinary skip.
+pub const NOT_AUTHORIZED_PREFIX: &str = "not authorized: ";
+
+/// The procedures an untrusted delivery on `topic` would match, computed on
+/// the topic exactly as the dispatch path normalizes it (capped to the
+/// engine's byte limit, then screened). An authorization preflight must use
+/// this rather than the raw topic, or a topic that differs only in characters
+/// the normalization removes matches nothing at the preflight and a real
+/// procedure at dispatch. `None` when the engine lock is poisoned.
+pub fn untrusted_topic_matches(
+    engine: &Arc<Mutex<SopEngine>>,
+    source: SopTriggerSource,
+    topic: &str,
+) -> Option<Vec<Sop>> {
+    let eng = engine.lock().ok()?;
+    let max_bytes = eng.config().untrusted_payload_max_bytes;
+    let (capped, _) = crate::security::cap_untrusted(topic, max_bytes);
+    let normalized = ContentSafety::from_sop_config(eng.config()).normalize_topic(&capped);
+    let event = SopEvent {
+        source,
+        topic: Some(normalized),
+        payload: None,
+        timestamp: now_iso8601(),
+    };
+    Some(eng.match_trigger(&event).into_iter().cloned().collect())
 }
 
 // ── Peripheral signal helper ────────────────────────────────────
@@ -3715,6 +3814,38 @@ mod tests {
             SopIngressKind::NotYetLive,
             "the exhaustive registry must not contradict the shipped HTTP routes"
         );
+    }
+
+    /// An authorization preflight must see the procedures dispatch will
+    /// start. A zero-width character inside the topic is folded out before
+    /// matching, so the raw topic matches nothing while the delivery starts
+    /// the `/sop/deploy` procedure; `untrusted_topic_matches` reports that
+    /// procedure.
+    #[test]
+    fn untrusted_topic_matches_uses_the_normalized_topic() {
+        let mut engine = SopEngine::new(SopConfig::default());
+        engine.set_sops_for_test(vec![test_sop(
+            "deploy",
+            vec![SopTrigger::Webhook {
+                path: "/sop/deploy".into(),
+            }],
+        )]);
+        let raw = SopEvent {
+            source: SopTriggerSource::Webhook,
+            topic: Some("/sop/de\u{200b}ploy".into()),
+            payload: None,
+            timestamp: now_iso8601(),
+        };
+        assert!(
+            engine.match_trigger(&raw).is_empty(),
+            "the raw topic must not match, or this test proves nothing"
+        );
+        let engine = Arc::new(Mutex::new(engine));
+        let matched =
+            untrusted_topic_matches(&engine, SopTriggerSource::Webhook, "/sop/de\u{200b}ploy")
+                .expect("engine lock");
+        let names: Vec<_> = matched.iter().map(|sop| sop.name.as_str()).collect();
+        assert_eq!(names, ["deploy"]);
     }
 
     mod decision_gating {

@@ -77,12 +77,22 @@ impl ContentSafety {
         )
     }
 
+    /// An untrusted event topic exactly as [`Self::screen_event`] rewrites it
+    /// before trigger matching: capped to the byte limit, folded (zero-width
+    /// and look-alike characters removed) and stripped of control whitespace.
+    /// Anything that authorizes against the procedures a topic will match
+    /// must match on this form, not on the raw topic.
+    pub fn normalize_topic(&self, topic: &str) -> String {
+        let (capped, _) = cap_untrusted(topic, self.scan.max_bytes);
+        sanitize_untrusted_topic(&capped)
+    }
+
     pub fn screen_event(&self, event: &SopEvent) -> ScreenVerdict {
         let mut normalized = event.clone();
-        normalized.topic = event.topic.as_deref().map(|topic| {
-            let (capped, _) = cap_untrusted(topic, self.scan.max_bytes);
-            sanitize_untrusted_topic(&capped)
-        });
+        normalized.topic = event
+            .topic
+            .as_deref()
+            .map(|topic| self.normalize_topic(topic));
         normalized.payload = event.payload.as_deref().map(|payload| {
             let (capped, _) = cap_untrusted(payload, self.scan.max_bytes);
             sanitize_untrusted(&capped)

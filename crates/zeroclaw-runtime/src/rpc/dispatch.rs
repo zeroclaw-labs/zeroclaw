@@ -24,9 +24,9 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
     JSONRPC_VERSION, JsonRpcError, JsonRpcFrame, JsonRpcFrameErrorKind, JsonRpcNotification,
-    JsonRpcResponse, RpcOutbound, SopDecideRequest, SopRenameRequest, SopRunDetailRequest,
-    SopRunOverlayRequest, SopRunRequest, SopRunResponse, SopRunsRequest, SopSaveRequest,
-    SopSelectRequest,
+    JsonRpcResponse, RpcOutbound, SopCancelRequest, SopDecideRequest, SopDispatchEventRequest,
+    SopRenameRequest, SopRunDetailRequest, SopRunOverlayRequest, SopRunRequest, SopRunResponse,
+    SopRunsRequest, SopSaveRequest, SopSelectRequest,
 };
 use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall, ToolResultMessage};
 use zeroclaw_api::runtime_status::{RuntimeConfigKind, RuntimeShellProfile};
@@ -213,6 +213,10 @@ pub enum Method {
     SopsWireDraft,
     SopsGraphDraft,
     SopsTriggerSources,
+    SopsCancel,
+    SopsDispatchEvent,
+    SopsDecisionModels,
+    SopsGraphLegend,
     ToolsParamOptions,
 }
 
@@ -332,6 +336,10 @@ impl Method {
         (Method::SopsWireDraft, "sops/wire-draft"),
         (Method::SopsGraphDraft, "sops/graph-draft"),
         (Method::SopsTriggerSources, "sops/trigger-sources"),
+        (Method::SopsCancel, "sops/cancel"),
+        (Method::SopsDispatchEvent, "sops/dispatch-event"),
+        (Method::SopsDecisionModels, "sops/decision-models"),
+        (Method::SopsGraphLegend, "sops/graph-legend"),
         (Method::ToolsParamOptions, "tools/param-options"),
     ];
 
@@ -461,13 +469,19 @@ impl Method {
             | M::SopsRuns
             | M::SopsRunDetail
             | M::SopsRunOverlay
-            | M::SopsTriggerSources => (Resource::Sops, Verb::Read),
+            | M::SopsTriggerSources
+            | M::SopsDecisionModels
+            | M::SopsGraphLegend => (Resource::Sops, Verb::Read),
             M::SopsCreate => (Resource::Sops, Verb::Create),
             M::SopsSave | M::SopsRename => (Resource::Sops, Verb::Update),
             M::SopsDelete => (Resource::Sops, Verb::Delete),
-            M::SopsRun | M::SopsDecide | M::SopsValidate | M::SopsWireDraft | M::SopsGraphDraft => {
-                (Resource::Sops, Verb::Execute)
-            }
+            M::SopsRun
+            | M::SopsDecide
+            | M::SopsCancel
+            | M::SopsDispatchEvent
+            | M::SopsValidate
+            | M::SopsWireDraft
+            | M::SopsGraphDraft => (Resource::Sops, Verb::Execute),
 
             M::ToolsParamOptions => (Resource::Tools, Verb::Read),
         };
@@ -3108,6 +3122,12 @@ impl RpcDispatcher {
             Method::SopsWireDraft => self.handle_sops_wire_draft(&req.params),
             Method::SopsGraphDraft => self.handle_sops_graph_draft(&req.params),
             Method::SopsTriggerSources => self.handle_sops_trigger_sources(),
+            Method::SopsCancel => self.handle_sops_cancel(&req.params),
+            Method::SopsDispatchEvent => {
+                Box::pin(self.handle_sops_dispatch_event(&req.params)).await
+            }
+            Method::SopsDecisionModels => self.handle_sops_decision_models(),
+            Method::SopsGraphLegend => to_result(crate::sop::GraphLegend::canonical()),
             Method::ToolsParamOptions => self.handle_tools_param_options(&req.params),
         };
 
@@ -9892,19 +9912,49 @@ impl RpcDispatcher {
         let Some(grants) = self.stamped_grants() else {
             return Ok(());
         };
+        self.authorize_sop_agents_with_grants(method, sop, executes, grants)
+    }
+
+    /// [`Self::authorize_sop_agents`] evaluated against `grants`: the stamped
+    /// grants at admission, freshly resolved ones at a recheck after a wait.
+    fn authorize_sop_agents_with_grants(
+        &self,
+        method: Method,
+        sop: &crate::sop::Sop,
+        executes: bool,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
+    ) -> Result<(), JsonRpcError> {
         if executes {
-            self.refuse_constrained_tool_selector_for_sop(method)?;
+            return self.authorize_sop_execution_with_grants(method, sop, grants);
         }
         let agents = {
             let config = self.ctx.config.read();
             Self::sop_executing_agents(sop, &config)
         };
         for alias in &agents {
-            if executes {
-                self.selector_session_agent_with_grants(method, grants, alias)?;
-            } else {
-                self.selector_agent(method, alias)?;
-            }
+            self.check_agent_selector_with_grants(method, grants, alias, true)?;
+        }
+        Ok(())
+    }
+
+    /// The one predicate for running a procedure: the constrained-tool-selector
+    /// refusal and the agent selector for every agent the procedure runs as,
+    /// evaluated against `grants`. Admission passes the grants stamped on the
+    /// connection; a recheck after a wait passes freshly resolved grants.
+    /// Both sides call this function so they cannot test different things.
+    fn authorize_sop_execution_with_grants(
+        &self,
+        method: Method,
+        sop: &crate::sop::Sop,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
+    ) -> Result<(), JsonRpcError> {
+        self.refuse_constrained_tool_selector_for_sop(method, grants)?;
+        let agents = {
+            let config = self.ctx.config.read();
+            Self::sop_executing_agents(sop, &config)
+        };
+        for alias in &agents {
+            self.selector_session_agent_with_grants(method, grants, alias)?;
         }
         Ok(())
     }
@@ -9923,13 +9973,13 @@ impl RpcDispatcher {
     ///
     /// A wildcard selector passes: the principal may already name any tool, so
     /// the engine assembling the agent's own set is not an escalation past it.
-    fn refuse_constrained_tool_selector_for_sop(&self, method: Method) -> Result<(), JsonRpcError> {
-        let Some(auth) = self.auth.as_ref() else {
-            return Ok(());
-        };
-        if auth.grants.admin
-            || auth
-                .grants
+    fn refuse_constrained_tool_selector_for_sop(
+        &self,
+        method: Method,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
+    ) -> Result<(), JsonRpcError> {
+        if grants.admin
+            || grants
                 .allowed_tools
                 .iter()
                 .any(|tool| tool == zeroclaw_api::grants::WILDCARD)
@@ -10275,15 +10325,18 @@ impl RpcDispatcher {
                 )
             })?;
 
-        let (dir, mode) = self.sops_dir_and_mode();
-        let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
-            .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
         let engine = self
             .ctx
             .sop_engine
             .as_ref()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?
             .clone();
+        // The run id alone selects the run; a caller that also names the SOP
+        // gets that checked against the run rather than trusted.
+        let sop_name = self.sop_name_for_run(&engine, &req.run_id, req.name.as_deref())?;
+        let (dir, mode) = self.sops_dir_and_mode();
+        let sop = crate::sop::load_sop_by_name(&dir, &sop_name, mode)
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{sop_name}': {e}")))?;
 
         let agent_alias = sop.agent.clone().unwrap_or_default();
         let span = ::zeroclaw_log::info_span!(
@@ -10299,19 +10352,11 @@ impl RpcDispatcher {
         // the principal must be entitled to every one of them before its
         // decision reaches the broker. The loaded run's procedure is what
         // executes, whatever is on disk.
-        if self.stamped_grants().is_some() {
-            let run_sop = {
-                let guard = engine
-                    .lock()
-                    .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?;
-                guard
-                    .get_run(&req.run_id)
-                    .and_then(|run| guard.get_sop(&run.sop_name))
-                    .cloned()
-            };
-            if let Some(run_sop) = run_sop {
-                self.authorize_sop_agents(Method::SopsDecide, &run_sop, true)?;
-            }
+        if let Some(grants) = self.stamped_grants() {
+            let guard = engine
+                .lock()
+                .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?;
+            self.authorize_decision_agents_with_grants(&guard, &req.run_id, grants)?;
         }
 
         let mut resolved_outcome = None;
@@ -10325,17 +10370,24 @@ impl RpcDispatcher {
                 .ok_or_else(|| {
                     rpc_err(INVALID_PARAMS, format!("run '{}' not found", req.run_id))
                 })?;
-            if run_sop_name != req.name {
+            if run_sop_name != sop_name {
                 return Err(rpc_err(
                     INVALID_PARAMS,
                     format!(
                         "run '{}' belongs to SOP '{}', not '{}'",
-                        req.run_id, run_sop_name, req.name
+                        req.run_id, run_sop_name, sop_name
                     ),
                 ));
             }
+            // The entitlement check above used the grants stamped at the gate,
+            // before this lock was taken. Re-resolve the caller with the lock
+            // that resolves the decision held, so a grant or agent entitlement
+            // withdrawn while this request waited cannot resume the run.
+            if let Some(grants) = self.recheck_authority_after_admission(Method::SopsDecide)? {
+                self.authorize_decision_agents_with_grants(&guard, &req.run_id, &grants)?;
+            }
             use crate::sop::approval::{BrokerOutcome, ResolveOutcome};
-            let principal = crate::sop::approval::ApprovalPrincipal::cli(self.tui_id.clone());
+            let principal = self.approval_principal();
             match guard
                 .resolve_via_broker_deferred(&req.run_id, decision, principal)
                 .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?
@@ -10569,6 +10621,298 @@ impl RpcDispatcher {
             crate::sop::registry_from_config(&config)
         };
         to_result(registry)
+    }
+
+    /// The approval principal this connection decides and cancels as,
+    /// derived from its bound authentication and never from a client-claimed
+    /// label such as the TUI id. A native pairing bearer is the same
+    /// paired-token subject the gateway's HTTP and WebSocket surfaces derive
+    /// from that token; any other authenticated principal is its canonical
+    /// principal id; the unauthenticated shared operator is anonymous, so it
+    /// satisfies no required group.
+    fn approval_principal(&self) -> crate::sop::approval::ApprovalPrincipal {
+        use crate::sop::approval::ApprovalPrincipal;
+        let Some(auth) = self.auth.as_ref() else {
+            return ApprovalPrincipal::rpc_local_operator();
+        };
+        if let Some(subject) = auth.native_token_hash.as_deref() {
+            return ApprovalPrincipal::rpc_paired(subject.to_owned());
+        }
+        if auth.principal.is_authenticated() {
+            return ApprovalPrincipal::rpc_principal(auth.principal.id.as_str().to_owned());
+        }
+        ApprovalPrincipal::rpc_local_operator()
+    }
+
+    /// The SOP a run belongs to. When the caller also named a SOP, the run
+    /// must belong to it.
+    fn sop_name_for_run(
+        &self,
+        engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        run_id: &str,
+        expected: Option<&str>,
+    ) -> Result<String, JsonRpcError> {
+        let run_sop_name = engine
+            .lock()
+            .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?
+            .get_run(run_id)
+            .map(|run| run.sop_name.clone())
+            .ok_or_else(|| rpc_err(INVALID_PARAMS, format!("run '{run_id}' not found")))?;
+        if let Some(expected) = expected.filter(|name| !name.is_empty())
+            && expected != run_sop_name
+        {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!("run '{run_id}' belongs to SOP '{run_sop_name}', not '{expected}'"),
+            ));
+        }
+        Ok(run_sop_name)
+    }
+
+    /// Hold a scoped principal to the agents of the procedure a run executes
+    /// before acting on the run. A run whose procedure is no longer loaded
+    /// cannot be checked, so it is refused for a scoped principal rather than
+    /// passed.
+    fn authorize_run_agents(
+        &self,
+        method: Method,
+        engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        run_id: &str,
+    ) -> Result<(), JsonRpcError> {
+        let Some(grants) = self.stamped_grants() else {
+            return Ok(());
+        };
+        let guard = engine
+            .lock()
+            .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?;
+        self.authorize_run_agents_with_grants(method, &guard, run_id, grants)
+    }
+
+    /// [`Self::authorize_run_agents`] evaluated against `grants`, reading the
+    /// run from `engine`, whose lock the caller holds. Admission passes the
+    /// stamped grants; the recheck under the lock that acts on the run passes
+    /// freshly resolved ones, so both sides test the same thing.
+    fn authorize_run_agents_with_grants(
+        &self,
+        method: Method,
+        engine: &crate::sop::SopEngine,
+        run_id: &str,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
+    ) -> Result<(), JsonRpcError> {
+        let run_sop = engine
+            .get_run(run_id)
+            .and_then(|run| engine.get_sop(&run.sop_name));
+        match run_sop {
+            Some(run_sop) => self.authorize_sop_agents_with_grants(method, run_sop, false, grants),
+            None if grants.admin => Ok(()),
+            None => Err(rpc_err(
+                AUTH_REQUIRED,
+                format!(
+                    "{}: the run's procedure is not loaded, so its agents cannot be authorized",
+                    method.wire_name()
+                ),
+            )),
+        }
+    }
+
+    /// The entitlement a checkpoint decision needs: approving resumes the run
+    /// headlessly as its loaded procedure's agents, so `grants` must allow
+    /// running every one of them. Reads the run from `engine`, whose lock the
+    /// caller holds. Admission passes the stamped grants and the recheck under
+    /// the lock that resolves the decision passes freshly resolved ones. A run
+    /// whose procedure is not loaded has no agents to check here.
+    fn authorize_decision_agents_with_grants(
+        &self,
+        engine: &crate::sop::SopEngine,
+        run_id: &str,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
+    ) -> Result<(), JsonRpcError> {
+        match engine
+            .get_run(run_id)
+            .and_then(|run| engine.get_sop(&run.sop_name))
+        {
+            Some(run_sop) => {
+                self.authorize_sop_execution_with_grants(Method::SopsDecide, run_sop, grants)
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Request a safe cancellation of a run. Params: `{ run_id, name?,
+    /// reason? }`. The in-flight step finishes and the run stops at the next
+    /// step boundary. Idempotent: a run that is already terminal is reported
+    /// as-is with `already_terminal: true`. The cancellation is attributed to
+    /// this connection's approval principal.
+    fn handle_sops_cancel(&self, params: &Value) -> RpcResult {
+        use crate::sop::{CancelOutcome, err_is_cancellation_persistence_retained};
+
+        let req: SopCancelRequest = parse_params(params)?;
+        let engine = self
+            .ctx
+            .sop_engine
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
+        let sop_name = self.sop_name_for_run(engine, &req.run_id, req.name.as_deref())?;
+        self.authorize_run_agents(Method::SopsCancel, engine, &req.run_id)?;
+        let actor = self.approval_principal().voter_key();
+
+        // Classify and act under one lock hold so a normal completion racing
+        // this request cannot land between a check and the cancellation.
+        let mut guard = engine
+            .lock()
+            .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?;
+        // The checks above ran on the grants stamped at the gate, and each
+        // lock acquisition since could have waited behind other engine work
+        // while a policy change was published. Re-resolve the caller now, with
+        // the lock that cancels held, and hold the run's procedure to it.
+        if let Some(grants) = self.recheck_authority_after_admission(Method::SopsCancel)? {
+            self.authorize_run_agents_with_grants(
+                Method::SopsCancel,
+                &guard,
+                &req.run_id,
+                &grants,
+            )?;
+        }
+        let outcome = match guard.cancel_run_idempotent(&req.run_id, req.reason, Some(actor)) {
+            Ok(Some(outcome)) => outcome,
+            Ok(None) => {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    format!("run '{}' not found", req.run_id),
+                ));
+            }
+            Err(e) if err_is_cancellation_persistence_retained(&e) => {
+                return Err(rpc_err(
+                    INTERNAL_ERROR,
+                    "cancellation could not be durably persisted; the run remains active - retry",
+                ));
+            }
+            Err(e) => return Err(rpc_err(INTERNAL_ERROR, e.to_string())),
+        };
+        let (label, already_terminal) = match outcome {
+            CancelOutcome::Requested => ("requested", false),
+            CancelOutcome::AlreadyRequested => ("already_requested", false),
+            CancelOutcome::Cancelled => ("cancelled", false),
+            CancelOutcome::AlreadyTerminal(_) => ("already_terminal", true),
+        };
+        let run = guard
+            .get_run(&req.run_id)
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "run disappeared after cancellation"))?;
+        let summary = crate::sop::types::SopRunSummary::from_run(
+            run,
+            guard.active_runs().contains_key(&req.run_id),
+        );
+        to_result(serde_json::json!({
+            "run_id": req.run_id,
+            "sop_name": sop_name,
+            "outcome": label,
+            "status": summary.status,
+            "already_terminal": already_terminal,
+            "run": summary,
+        }))
+    }
+
+    /// Deliver a webhook event to every SOP whose webhook trigger matches
+    /// `path`. Params: `{ path, payload? }`. The same fan-in as the gateway's
+    /// `POST /sop/{*rest}` route; the caller authenticates the delivery and
+    /// applies idempotency. A path no SOP matches returns `status:
+    /// "no_match"`; a delivery every match refused as unsafe returns `status:
+    /// "blocked"`.
+    async fn handle_sops_dispatch_event(&self, params: &Value) -> RpcResult {
+        let req: SopDispatchEventRequest = parse_params(params)?;
+        let path = req.path.trim();
+        if path.is_empty() {
+            return Err(rpc_err(INVALID_PARAMS, "path must not be empty"));
+        }
+        let (Some(engine), Some(audit)) =
+            (self.ctx.sop_engine.as_ref(), self.ctx.sop_audit.as_ref())
+        else {
+            return Err(rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"));
+        };
+        // Every procedure the event starts runs as its own agents, so the
+        // principal must be entitled to all of them. This preflight refuses
+        // early, and it matches on the topic as dispatch normalizes it: the
+        // raw path can differ from the matched one in characters the
+        // normalization removes. It is not the enforcement point, because a
+        // decision model can deliberate between here and the start; the
+        // admission check below is.
+        if self.stamped_grants().is_some() {
+            let matched = crate::sop::dispatch::untrusted_topic_matches(
+                engine,
+                crate::sop::SopTriggerSource::Webhook,
+                path,
+            )
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?;
+            for sop in &matched {
+                self.authorize_sop_agents(Method::SopsDispatchEvent, sop, true)?;
+            }
+        }
+        // Re-resolve the caller's authority for each procedure at the moment
+        // its run is admitted, after any decision-model wait, so a grant or
+        // agent entitlement revoked in the meantime starts nothing.
+        let admission_check = |sop: &crate::sop::Sop| -> Result<(), String> {
+            let grants = self
+                .recheck_authority_after_admission(Method::SopsDispatchEvent)
+                .map_err(|denied| denied.message)?;
+            match grants {
+                Some(grants) => self
+                    .authorize_sop_execution_with_grants(Method::SopsDispatchEvent, sop, &grants)
+                    .map_err(|denied| denied.message),
+                // Only the direct unit-test handlers run unbound.
+                None => Ok(()),
+            }
+        };
+        let payload = req
+            .payload
+            .filter(|value| !value.is_null())
+            .map(|value| value.to_string());
+        let dispatched = crate::sop::dispatch_webhook_event(
+            engine,
+            audit,
+            self.ctx.sop_driver_handles.as_ref(),
+            &self.ctx.config,
+            path,
+            payload.as_deref(),
+            Some(&admission_check),
+        )
+        .await;
+        let (status, results) = match dispatched {
+            crate::sop::WebhookDispatch::Unavailable => {
+                return Err(rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"));
+            }
+            crate::sop::WebhookDispatch::NoMatch => ("no_match", Vec::new()),
+            crate::sop::WebhookDispatch::Dispatched { blocked, results } => {
+                (if blocked { "blocked" } else { "accepted" }, results)
+            }
+        };
+        // Every match refused at admission: the caller lost the authority the
+        // preflight saw. Report that as the refusal it is.
+        let refused = |result: &Value| {
+            result["status"] == "skipped"
+                && result["reason"].as_str().is_some_and(|reason| {
+                    reason.starts_with(crate::sop::dispatch::NOT_AUTHORIZED_PREFIX)
+                })
+        };
+        if !results.is_empty() && results.iter().all(refused) {
+            let reason = results[0]["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            return Err(rpc_err(FORBIDDEN, reason));
+        }
+        to_result(serde_json::json!({
+            "status": status,
+            "source": "webhook",
+            "path": path,
+            "results": results,
+        }))
+    }
+
+    /// The `[decision_models]` aliases an SOP's `[decision] model` can select,
+    /// sorted by alias. Never includes an API key.
+    fn handle_sops_decision_models(&self) -> RpcResult {
+        let models = crate::sop::decision_model_options(&self.ctx.config.read());
+        to_result(serde_json::json!({ "models": models }))
     }
 
     /// Resolve selectable values for a domain-typed tool parameter.
@@ -22348,12 +22692,16 @@ mod tests {
         );
     }
 
-    fn make_checkpoint_rpc_dispatcher(
+    /// A context whose SOP engine holds one run parked at a checkpoint that
+    /// the `prod` policy gates: `members` form its required group and
+    /// `quorum` distinct approvers clear it. `configure` adds the pairing
+    /// tokens or roster the test authenticates with.
+    fn make_checkpoint_rpc_fixture(
         quorum: u32,
         members: &[&str],
-        tui_id: &str,
+        configure: impl FnOnce(&mut zeroclaw_config::schema::Config),
     ) -> (
-        RpcDispatcher,
+        Arc<RpcContext>,
         Arc<std::sync::Mutex<crate::sop::SopEngine>>,
         String,
         tempfile::TempDir,
@@ -22422,6 +22770,7 @@ mod tests {
         let mut config = Config::default();
         config.sop.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
         config.sop.approval = SopApprovalConfig { groups, policies };
+        configure(&mut config);
 
         let mut engine = crate::sop::SopEngine::new(config.sop.clone())
             .with_approval_broker(Arc::new(crate::sop::approval::ApprovalBroker::disabled()));
@@ -22447,10 +22796,33 @@ mod tests {
             Arc::new(SessionActorQueue::new(4, 10, 60)),
         ));
         let ctx = RpcContext::minimal_with_sop_engine(config, sessions, Arc::clone(&engine));
+        (ctx, engine, run_id, temp)
+    }
+
+    /// A remote connection authenticated with a native pairing bearer.
+    async fn paired_sop_dispatcher(ctx: &Arc<RpcContext>, token: &str) -> RpcDispatcher {
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
-        let mut dispatcher = RpcDispatcher::new(ctx, tx, "local:test".into());
-        dispatcher.set_tui_id_for_test(Some(tui_id.to_string()));
-        (dispatcher, engine, run_id, temp)
+        let mut dispatcher = RpcDispatcher::new(Arc::clone(ctx), tx, "wss:test".into())
+            .with_transport(
+                crate::rpc::transport::TransportKind::Wss,
+                crate::security::auth_provider::Credential::None,
+            );
+        dispatcher
+            .handle_initialize(&json!({ "auth_token": token }))
+            .await
+            .expect("the paired token authenticates");
+        dispatcher
+    }
+
+    fn paired_subject(token: &str) -> String {
+        zeroclaw_config::pairing::PairingGuard::token_hash(token)
+    }
+
+    fn run_status(
+        engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        run_id: &str,
+    ) -> Option<crate::sop::types::SopRunStatus> {
+        engine.lock().unwrap().get_run(run_id).map(|run| run.status)
     }
 
     /// An RPC dispatcher over one SOP, with the driver handles under test.
@@ -22627,50 +22999,1281 @@ mod tests {
         );
     }
 
+    /// The group-approval policy sees the principal the connection
+    /// authenticated as. A native pairing bearer is the same paired-token
+    /// subject the gateway's HTTP and WebSocket surfaces derive, so an
+    /// `http:<subject>` member decides over RPC and a different paired device
+    /// does not. The run is addressed by its id alone.
     #[tokio::test]
-    async fn sops_decide_rpc_enforces_checkpoint_membership_and_quorum() {
+    async fn sops_decide_sees_the_paired_subject_the_gateway_sees() {
         use crate::sop::types::SopRunStatus;
 
-        let (unauthorized, engine, run_id, _temp) =
-            make_checkpoint_rpc_dispatcher(1, &["cli:ZeroClawOperator"], "ZeroClawAgent");
-        let error = unauthorized
-            .handle_sops_decide(&json!({
-                "name": "rpc-checkpoint",
-                "run_id": run_id.clone(),
-                "decision": "approve",
-            }))
+        let member = format!("http:{}", paired_subject("zc_member"));
+        let (ctx, engine, run_id, _temp) = make_checkpoint_rpc_fixture(1, &[&member], |config| {
+            config.gateway.paired_tokens = vec!["zc_member".into(), "zc_other".into()];
+        });
+
+        let outsider = paired_sop_dispatcher(&ctx, "zc_other").await;
+        let error = outsider
+            .handle_sops_decide(&json!({ "run_id": run_id.clone(), "decision": "approve" }))
             .await
-            .expect_err("unauthorized RPC principal must be rejected");
+            .expect_err("a paired device outside the group must be refused");
         assert_eq!(error.code, AUTH_REQUIRED);
         assert_eq!(
-            engine
-                .lock()
-                .unwrap()
-                .get_run(&run_id)
-                .map(|run| run.status),
+            run_status(&engine, &run_id),
             Some(SopRunStatus::PausedCheckpoint)
         );
 
-        let (pending, engine, run_id, _temp) = make_checkpoint_rpc_dispatcher(
-            2,
-            &["cli:ZeroClawOperator", "cli:ZeroClawMaintainer"],
-            "ZeroClawOperator",
+        let member = paired_sop_dispatcher(&ctx, "zc_member").await;
+        member
+            .handle_sops_decide(&json!({ "run_id": run_id.clone(), "decision": "approve" }))
+            .await
+            .expect("the group member's paired device clears the gate");
+        assert_ne!(
+            run_status(&engine, &run_id),
+            Some(SopRunStatus::PausedCheckpoint),
+            "an approved checkpoint resumes the run"
         );
-        pending
+    }
+
+    /// One paired credential is one quorum voter however often it votes, and
+    /// a second member's device completes the quorum.
+    #[tokio::test]
+    async fn sops_decide_counts_one_paired_credential_as_one_voter() {
+        use crate::sop::types::SopRunStatus;
+
+        let first = format!("http:{}", paired_subject("zc_first"));
+        let second = format!("http:{}", paired_subject("zc_second"));
+        let (ctx, engine, run_id, _temp) =
+            make_checkpoint_rpc_fixture(2, &[&first, &second], |config| {
+                config.gateway.paired_tokens = vec!["zc_first".into(), "zc_second".into()];
+            });
+
+        let first = paired_sop_dispatcher(&ctx, "zc_first").await;
+        for _ in 0..2 {
+            first
+                .handle_sops_decide(&json!({ "run_id": run_id.clone(), "decision": "approve" }))
+                .await
+                .expect("a member's vote is accepted while quorum is pending");
+            assert_eq!(
+                run_status(&engine, &run_id),
+                Some(SopRunStatus::PausedCheckpoint),
+                "a repeated vote from the same credential must not meet a quorum of two"
+            );
+        }
+
+        let second = paired_sop_dispatcher(&ctx, "zc_second").await;
+        second
+            .handle_sops_decide(&json!({ "run_id": run_id.clone(), "decision": "approve" }))
+            .await
+            .expect("the second member completes the quorum");
+        assert_ne!(
+            run_status(&engine, &run_id),
+            Some(SopRunStatus::PausedCheckpoint)
+        );
+    }
+
+    /// An authenticated principal decides as its canonical principal id, so
+    /// a `principal:<id>` member is honoured and another roster user is not.
+    #[tokio::test]
+    async fn sops_decide_sees_the_authenticated_roster_principal() {
+        use crate::sop::types::SopRunStatus;
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+
+        let roster = |config: &mut zeroclaw_config::schema::Config| {
+            config.permission_profiles.insert(
+                "operator".into(),
+                PermissionProfileConfig {
+                    allowed_agents: vec!["*".into()],
+                    allowed_tools: vec!["*".into()],
+                    grants: std::collections::HashMap::from([(
+                        zeroclaw_api::grants::Resource::Sops,
+                        vec![
+                            zeroclaw_api::grants::Verb::Read,
+                            zeroclaw_api::grants::Verb::Execute,
+                        ],
+                    )]),
+                    ..PermissionProfileConfig::default()
+                },
+            );
+            for (name, uid) in [("alice", 4242u32), ("bob", 4343u32)] {
+                config.users.insert(
+                    name.into(),
+                    UserConfig {
+                        principal_id: None,
+                        uid: Some(uid),
+                        permission_profiles: vec!["operator".into()],
+                    },
+                );
+            }
+        };
+        // Resolve alice's canonical id the way the daemon does, then gate the
+        // policy on it.
+        let (probe_ctx, _probe_engine, _probe_run, _probe_temp) =
+            make_checkpoint_rpc_fixture(1, &[], roster);
+        let alice_id = scoped_dispatcher(&probe_ctx, 4242)
+            .await
+            .owner_principal_id()
+            .expect("a roster user has a canonical id");
+        let member = format!("principal:{alice_id}");
+        let (ctx, engine, run_id, _temp) = make_checkpoint_rpc_fixture(1, &[&member], roster);
+
+        let bob = scoped_dispatcher(&ctx, 4343).await;
+        let error = bob
+            .handle_sops_decide(&json!({ "run_id": run_id.clone(), "decision": "approve" }))
+            .await
+            .expect_err("a roster user outside the group must be refused");
+        assert_eq!(error.code, AUTH_REQUIRED);
+        assert_eq!(
+            run_status(&engine, &run_id),
+            Some(SopRunStatus::PausedCheckpoint)
+        );
+
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        alice
+            .handle_sops_decide(&json!({ "run_id": run_id.clone(), "decision": "approve" }))
+            .await
+            .expect("the group member clears the gate");
+        assert_ne!(
+            run_status(&engine, &run_id),
+            Some(SopRunStatus::PausedCheckpoint)
+        );
+    }
+
+    /// A client-claimed TUI id is not an approval identity: the unauthenticated
+    /// shared operator is anonymous even when it claims a label a group lists,
+    /// so a policy with a required group fails closed for it.
+    #[tokio::test]
+    async fn sops_decide_ignores_a_claimed_tui_id() {
+        use crate::sop::types::SopRunStatus;
+
+        let (ctx, engine, run_id, _temp) =
+            make_checkpoint_rpc_fixture(1, &["ZeroClawOperator", "cli:ZeroClawOperator"], |_| {});
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut operator = RpcDispatcher::new(Arc::clone(&ctx), tx, "local:test".into());
+        operator.set_authenticated_for_test();
+        operator.set_tui_id_for_test(Some("ZeroClawOperator".into()));
+        let error = operator
             .handle_sops_decide(&json!({
                 "name": "rpc-checkpoint",
                 "run_id": run_id.clone(),
                 "decision": "approve",
             }))
             .await
-            .expect("an authorized first vote returns the still-parked overlay");
+            .expect_err("a claimed TUI id must not satisfy group membership");
+        assert_eq!(error.code, AUTH_REQUIRED);
         assert_eq!(
-            engine
-                .lock()
-                .unwrap()
-                .get_run(&run_id)
-                .map(|run| run.status),
+            run_status(&engine, &run_id),
             Some(SopRunStatus::PausedCheckpoint)
+        );
+    }
+
+    /// `name` is optional, but when given it must be the run's SOP.
+    #[tokio::test]
+    async fn sops_decide_checks_a_named_sop_against_the_run() {
+        let (ctx, _engine, run_id, _temp) = make_checkpoint_rpc_fixture(1, &[], |_| {});
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut operator = RpcDispatcher::new(Arc::clone(&ctx), tx, "local:test".into());
+        operator.set_authenticated_for_test();
+        let error = operator
+            .handle_sops_decide(&json!({
+                "name": "some-other-sop",
+                "run_id": run_id,
+                "decision": "approve",
+            }))
+            .await
+            .expect_err("a run named under the wrong SOP is refused");
+        assert_eq!(error.code, INVALID_PARAMS);
+        assert!(error.message.contains("belongs to SOP 'rpc-checkpoint'"));
+    }
+
+    /// `sops/cancel` addresses a run by id, is idempotent, and records the
+    /// connection's principal as the actor.
+    #[tokio::test]
+    async fn sops_cancel_is_idempotent_by_run_id() {
+        use crate::sop::types::SopRunStatus;
+
+        let (ctx, engine, run_id, _temp) = make_checkpoint_rpc_fixture(1, &[], |config| {
+            config.gateway.paired_tokens = vec!["zc_op".into()];
+        });
+        let operator = paired_sop_dispatcher(&ctx, "zc_op").await;
+
+        let wrong = operator
+            .handle_sops_cancel(&json!({ "run_id": run_id.clone(), "name": "other" }))
+            .expect_err("a run named under the wrong SOP is refused");
+        assert_eq!(wrong.code, INVALID_PARAMS);
+        assert_eq!(
+            run_status(&engine, &run_id),
+            Some(SopRunStatus::PausedCheckpoint)
+        );
+
+        let first = operator
+            .handle_sops_cancel(&json!({ "run_id": run_id.clone(), "reason": "not needed" }))
+            .expect("a parked run cancels");
+        assert_eq!(first["outcome"], "cancelled");
+        assert_eq!(first["sop_name"], "rpc-checkpoint");
+        assert_eq!(first["already_terminal"], false);
+        assert_eq!(run_status(&engine, &run_id), Some(SopRunStatus::Cancelled));
+
+        let again = operator
+            .handle_sops_cancel(&json!({ "run_id": run_id.clone() }))
+            .expect("a repeat cancel reports the terminal run");
+        assert_eq!(again["outcome"], "already_terminal");
+        assert_eq!(again["already_terminal"], true);
+
+        let missing = operator
+            .handle_sops_cancel(&json!({ "run_id": "no-such-run" }))
+            .expect_err("an unknown run is refused");
+        assert_eq!(missing.code, INVALID_PARAMS);
+    }
+
+    /// `sops/dispatch-event` is the webhook fan-in the gateway's `/sop/*`
+    /// route performs: a matching path starts the SOP, and an unmatched path
+    /// reports `no_match` without starting anything.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sops_dispatch_event_starts_webhook_sops() {
+        let mut sop = manual_sop(
+            "deploy-hook",
+            true,
+            crate::sop::types::SopStep {
+                number: 1,
+                title: "No-op".to_string(),
+                kind: crate::sop::types::SopStepKind::Capability,
+                capability: Some("noop".to_string()),
+                ..crate::sop::types::SopStep::default()
+            },
+        );
+        sop.triggers = vec![crate::sop::types::SopTrigger::Webhook {
+            path: "/sop/deploy".into(),
+        }];
+        let (mut dispatcher, engine, _temp) =
+            sops_run_dispatcher(sop, Some(crate::sop::SopDriverHandles::default()));
+        dispatcher.set_authenticated_for_test();
+
+        let accepted = dispatcher
+            .handle_sops_dispatch_event(&json!({
+                "path": "/sop/deploy",
+                "payload": { "ref": "main" },
+            }))
+            .await
+            .expect("a matching webhook path dispatches");
+        assert_eq!(accepted["status"], "accepted");
+        assert_eq!(accepted["source"], "webhook");
+        assert_eq!(accepted["results"][0]["status"], "started");
+        assert_eq!(accepted["results"][0]["sop"], "deploy-hook");
+        let run_id = accepted["results"][0]["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(engine.lock().unwrap().get_run(&run_id).is_some());
+
+        let unmatched = dispatcher
+            .handle_sops_dispatch_event(&json!({ "path": "/sop/nothing" }))
+            .await
+            .expect("an unmatched path is an answer, not an error");
+        assert_eq!(unmatched["status"], "no_match");
+        assert_eq!(unmatched["results"], json!([]));
+
+        let empty = dispatcher
+            .handle_sops_dispatch_event(&json!({ "path": "  " }))
+            .await
+            .expect_err("an empty path is refused");
+        assert_eq!(empty.code, INVALID_PARAMS);
+    }
+
+    /// A roster config for the dispatch-event authority tests: alice (uid
+    /// 4242) holds `sops:read`/`execute` with a wildcard tool selector and the
+    /// agents in `agents`.
+    fn dispatch_event_roster(agents: &[&str]) -> zeroclaw_config::schema::Config {
+        dispatch_event_roster_with(
+            agents,
+            &[
+                zeroclaw_api::grants::Verb::Read,
+                zeroclaw_api::grants::Verb::Execute,
+            ],
+        )
+    }
+
+    /// [`dispatch_event_roster`] with an explicit `sops` verb set.
+    fn dispatch_event_roster_with(
+        agents: &[&str],
+        verbs: &[zeroclaw_api::grants::Verb],
+    ) -> zeroclaw_config::schema::Config {
+        use zeroclaw_config::schema::{AliasedAgentConfig, PermissionProfileConfig, UserConfig};
+        let mut config = zeroclaw_config::schema::Config::default();
+        // Agent selectors resolve against configured agents only.
+        for alias in ["alpha", "beta"] {
+            config.agents.insert(
+                alias.into(),
+                AliasedAgentConfig {
+                    enabled: true,
+                    ..AliasedAgentConfig::default()
+                },
+            );
+        }
+        config.permission_profiles.insert(
+            "dispatcher".into(),
+            PermissionProfileConfig {
+                allowed_agents: agents.iter().map(|agent| (*agent).to_string()).collect(),
+                allowed_tools: vec!["*".into()],
+                grants: std::collections::HashMap::from([(
+                    zeroclaw_api::grants::Resource::Sops,
+                    verbs.to_vec(),
+                )]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "alice".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4242),
+                permission_profiles: vec!["dispatcher".into()],
+            },
+        );
+        config
+    }
+
+    /// A deterministic no-op procedure run as `agent`, triggered by a
+    /// webhook on `/sop/deploy`.
+    fn deploy_hook_sop(name: &str, agent: &str) -> crate::sop::types::Sop {
+        let mut sop = manual_sop(
+            name,
+            true,
+            crate::sop::types::SopStep {
+                number: 1,
+                title: "No-op".to_string(),
+                kind: crate::sop::types::SopStepKind::Capability,
+                capability: Some("noop".to_string()),
+                ..crate::sop::types::SopStep::default()
+            },
+        );
+        sop.agent = Some(agent.to_string());
+        sop.triggers = vec![crate::sop::types::SopTrigger::Webhook {
+            path: "/sop/deploy".into(),
+        }];
+        sop
+    }
+
+    /// A context over `engine` with an audit logger and the roster `config`.
+    fn dispatch_event_ctx(
+        config: zeroclaw_config::schema::Config,
+        engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        temp: &tempfile::TempDir,
+    ) -> Arc<RpcContext> {
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            16,
+            Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+                4, 10, 60,
+            )),
+        ));
+        let mem_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "sqlite".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let memory: Arc<dyn zeroclaw_api::memory_traits::Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, temp.path(), None).unwrap());
+        RpcContext::minimal_with_sop_engine_and_audit(
+            config,
+            sessions,
+            Arc::clone(engine),
+            Arc::new(crate::sop::SopAuditLogger::new(memory)),
+            Some(crate::sop::SopDriverHandles::default()),
+        )
+    }
+
+    fn started_run_count(engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>) -> usize {
+        let engine = engine.lock().unwrap();
+        engine.active_runs().len() + engine.finished_runs(None).len()
+    }
+
+    /// The dispatch path folds zero-width characters out of an untrusted
+    /// topic before it matches triggers. A principal entitled only to agent
+    /// `alpha` sending `/sop/de<U+200B>ploy` must not start the `beta`
+    /// procedure that the normalized `/sop/deploy` matches: the preflight
+    /// matches on the normalized topic and refuses, and nothing starts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sops_dispatch_event_authorizes_the_normalized_topic() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
+        engine.set_sops_for_test(vec![deploy_hook_sop("beta-deploy", "beta")]);
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+        let ctx = dispatch_event_ctx(dispatch_event_roster(&["alpha"]), &engine, &temp);
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+
+        let error = alice
+            .handle_sops_dispatch_event(&json!({ "path": "/sop/de\u{200b}ploy" }))
+            .await
+            .expect_err("a topic that normalizes onto a forbidden procedure is refused");
+        assert_eq!(error.code, FORBIDDEN, "{}", error.message);
+        assert_eq!(started_run_count(&engine), 0, "no procedure may start");
+    }
+
+    /// A decision model that signals when it is consulted and answers "start"
+    /// only once released, so a test can change policy mid-deliberation.
+    struct HeldDecision {
+        consulted: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::sop::decision::DecisionModel for HeldDecision {
+        fn id(&self) -> &str {
+            "held"
+        }
+        async fn ask(
+            &self,
+            _state: Value,
+            _questions: std::collections::BTreeMap<String, crate::sop::decision::Question>,
+        ) -> anyhow::Result<crate::sop::decision::Answers> {
+            use crate::sop::decision::{Answer, Answers};
+            self.consulted.notify_one();
+            self.release.notified().await;
+            let probabilities = ["auto", "supervised", "step_by_step"]
+                .iter()
+                .map(|mode| {
+                    (
+                        (*mode).to_string(),
+                        if *mode == "auto" { 0.9 } else { 0.05 },
+                    )
+                })
+                .collect();
+            Ok(Answers {
+                model: None,
+                answers: std::collections::BTreeMap::from([
+                    ("start_sop".to_string(), Answer::Noul { noul: 0.95 }),
+                    (
+                        "execution_mode".to_string(),
+                        Answer::Choice {
+                            choice: "auto".into(),
+                            probabilities,
+                            confidence: 0.95,
+                        },
+                    ),
+                ]),
+                usage: None,
+            })
+        }
+    }
+
+    /// What changes while a `sops/dispatch-event` call is parked at the
+    /// decision wait: after admission was won, before the run starts.
+    enum WhileParked {
+        Nothing,
+        /// Publish this policy (a roster config) as the new generation.
+        Publish(Box<zeroclaw_config::schema::Config>),
+        /// Replace the loaded procedure with this definition.
+        ReplaceSop(Box<crate::sop::types::Sop>),
+        /// Edit the daemon's live configuration, as `config/set` does,
+        /// leaving the caller's grants as they are.
+        EditLiveConfig(fn(&mut zeroclaw_config::schema::Config)),
+    }
+
+    /// The gated procedure: `gated-deploy`, run as `agent`, on `/sop/deploy`,
+    /// asking the held decision model before it starts.
+    fn gated_deploy_sop(agent: &str) -> crate::sop::types::Sop {
+        use crate::sop::decision::{GateOnError, SopDecisionSpec};
+        use crate::sop::types::SopExecutionMode;
+        let mut sop = deploy_hook_sop("gated-deploy", agent);
+        sop.decision = Some(SopDecisionSpec {
+            model: "held".into(),
+            gate: Some("Should this deploy start?".into()),
+            gate_threshold: 0.7,
+            gate_on_error: GateOnError::RunStrict,
+            modes: vec![
+                SopExecutionMode::Auto,
+                SopExecutionMode::Supervised,
+                SopExecutionMode::StepByStep,
+            ],
+            mode_instructions: None,
+            min_confidence: 0.7,
+            part_threshold: 0.5,
+        });
+        sop
+    }
+
+    /// Admit a `sops/dispatch-event` as alice (entitled to `alpha`), park it
+    /// at the decision wait, apply `change`, release it, and return the
+    /// call's result and the engine for side-effect probes.
+    ///
+    /// The decision model is consulted only after the preflight has admitted
+    /// the call, so reaching the park proves the change lands after admission
+    /// was won; the returned result is asserted to have parked, and a stalled
+    /// park fails the test instead of hanging it.
+    async fn dispatch_parked_at_the_decision(
+        change: WhileParked,
+    ) -> (
+        RpcResult,
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        tempfile::TempDir,
+    ) {
+        dispatch_parked_at_the_decision_with(
+            gated_deploy_sop("alpha"),
+            dispatch_event_roster(&["alpha"]),
+            change,
+        )
+        .await
+    }
+
+    /// [`dispatch_parked_at_the_decision`] for a given procedure and roster.
+    async fn dispatch_parked_at_the_decision_with(
+        sop: crate::sop::types::Sop,
+        config: zeroclaw_config::schema::Config,
+        change: WhileParked,
+    ) -> (
+        RpcResult,
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        tempfile::TempDir,
+    ) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let consulted = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let model: Arc<dyn crate::sop::decision::DecisionModel> = Arc::new(HeldDecision {
+            consulted: Arc::clone(&consulted),
+            release: Arc::clone(&release),
+        });
+        let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default())
+            .with_decision_models(std::collections::HashMap::from([(
+                "held".to_string(),
+                model,
+            )]));
+        engine.set_sops_for_test(vec![sop]);
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+        let ctx = dispatch_event_ctx(config, &engine, &temp);
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+
+        let parked = std::sync::atomic::AtomicBool::new(false);
+        let change_while_parked = async {
+            consulted.notified().await;
+            parked.store(true, std::sync::atomic::Ordering::SeqCst);
+            match change {
+                WhileParked::Nothing => {}
+                WhileParked::Publish(config) => {
+                    ctx.auth
+                        .refresh_from_config(&config)
+                        .expect("the new policy publishes");
+                }
+                WhileParked::ReplaceSop(sop) => {
+                    engine.lock().unwrap().set_sops_for_test(vec![*sop]);
+                }
+                WhileParked::EditLiveConfig(edit) => edit(&mut ctx.config.write()),
+            }
+            release.notify_one();
+        };
+        let params = json!({
+            "path": "/sop/deploy",
+            "payload": { "ref": "main" },
+        });
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            tokio::join!(
+                alice.handle_sops_dispatch_event(&params),
+                change_while_parked
+            )
+        })
+        .await
+        .expect("the call reaches the decision wait and completes");
+        assert!(
+            parked.load(std::sync::atomic::Ordering::SeqCst),
+            "the change must land while parked after admission, or the test is vacuous"
+        );
+        (result, engine, temp)
+    }
+
+    fn assert_refused_with_no_run(
+        result: RpcResult,
+        engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+    ) {
+        let error = result.expect_err("the call must be refused at run admission");
+        assert_eq!(error.code, FORBIDDEN, "{}", error.message);
+        assert!(
+            error
+                .message
+                .starts_with(crate::sop::dispatch::NOT_AUTHORIZED_PREFIX),
+            "{}",
+            error.message
+        );
+        assert_eq!(started_run_count(engine), 0, "no run may be admitted");
+    }
+
+    /// Control: with nothing changed while parked, the gated procedure starts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sop_run_start_unchanged_after_admission_starts() {
+        let (result, engine, _temp) = dispatch_parked_at_the_decision(WhileParked::Nothing).await;
+        let result = result.expect("an entitled caller's gated dispatch starts");
+        assert_eq!(result["status"], "accepted");
+        assert_eq!(result["results"][0]["status"], "started");
+        assert_eq!(started_run_count(&engine), 1);
+    }
+
+    /// The coarse `sops:execute` grant is removed while the decision model
+    /// deliberates: nothing starts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sop_run_start_revoked_after_admission_has_no_effect() {
+        let revoked = dispatch_event_roster_with(&["alpha"], &[zeroclaw_api::grants::Verb::Read]);
+        let (result, engine, _temp) =
+            dispatch_parked_at_the_decision(WhileParked::Publish(Box::new(revoked))).await;
+        assert_refused_with_no_run(result, &engine);
+    }
+
+    /// Alice's agent selector is narrowed away from the procedure's agent
+    /// while the decision model deliberates: nothing starts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sop_run_start_narrowed_after_admission_has_no_effect() {
+        let (result, engine, _temp) = dispatch_parked_at_the_decision(WhileParked::Publish(
+            Box::new(dispatch_event_roster(&["beta"])),
+        ))
+        .await;
+        assert_refused_with_no_run(result, &engine);
+    }
+
+    /// A new policy generation that keeps what the run needs and adds more
+    /// is honoured: the recheck re-resolves rather than refusing because the
+    /// generation moved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sop_run_start_widened_after_admission_is_honoured() {
+        let widened = dispatch_event_roster_with(
+            &["alpha", "beta"],
+            &[
+                zeroclaw_api::grants::Verb::Read,
+                zeroclaw_api::grants::Verb::Execute,
+                zeroclaw_api::grants::Verb::Update,
+            ],
+        );
+        let (result, engine, _temp) =
+            dispatch_parked_at_the_decision(WhileParked::Publish(Box::new(widened))).await;
+        let result = result.expect("a widened policy still admits the run");
+        assert_eq!(result["results"][0]["status"], "started");
+        assert_eq!(started_run_count(&engine), 1);
+    }
+
+    /// The procedure is redefined to run as an agent alice is not entitled
+    /// to while the decision model deliberates: the recheck reads the live
+    /// definition, not the one admitted, and nothing starts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sop_run_start_resource_reowned_after_admission_is_refused() {
+        let (result, engine, _temp) = dispatch_parked_at_the_decision(WhileParked::ReplaceSop(
+            Box::new(gated_deploy_sop("beta")),
+        ))
+        .await;
+        assert_refused_with_no_run(result, &engine);
+    }
+
+    /// The gated procedure with one agent step owned by `alpha`. Started in
+    /// auto mode it goes to a headless driver rather than running inline, so
+    /// the configuration the driver is handed is what the step runs under.
+    fn gated_agent_step_sop() -> crate::sop::types::Sop {
+        let mut sop = gated_deploy_sop("alpha");
+        sop.execution_mode = crate::sop::types::SopExecutionMode::Auto;
+        sop.deterministic = false;
+        sop.steps = vec![crate::sop::types::SopStep {
+            number: 1,
+            title: "Deploy".to_string(),
+            kind: crate::sop::types::SopStepKind::Execute,
+            agent: Some("alpha".to_string()),
+            ..crate::sop::types::SopStep::default()
+        }];
+        sop
+    }
+
+    /// Alice's roster with `alpha`'s risk profile naming no configured
+    /// profile. The driver refuses a disabled owner before it builds a step
+    /// policy, and fails the step when the policy cannot be built, so either
+    /// outcome is recorded without a model turn ever running.
+    fn roster_with_unbuildable_alpha_policy() -> zeroclaw_config::schema::Config {
+        let mut config = dispatch_event_roster(&["alpha"]);
+        config
+            .agents
+            .get_mut("alpha")
+            .expect("the roster configures alpha")
+            .risk_profile = "no-such-profile".into();
+        config
+    }
+
+    fn started_run_id(result: RpcResult) -> String {
+        let result = result.expect("the caller's grants are unchanged, so the run is admitted");
+        assert_eq!(result["results"][0]["status"], "started", "{result}");
+        result["results"][0]["run_id"]
+            .as_str()
+            .expect("a started run carries its id")
+            .to_string()
+    }
+
+    /// The first step of `run_id` as the headless driver recorded it.
+    async fn driven_first_step(
+        engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        run_id: &str,
+    ) -> crate::sop::types::SopStepResult {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                let recorded = engine.lock().unwrap().get_run(run_id).and_then(|run| {
+                    run.step_results
+                        .iter()
+                        .find(|result| result.step_number == 1)
+                        .cloned()
+                });
+                if let Some(result) = recorded {
+                    return result;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the headless driver records the first step")
+    }
+
+    /// Control: with the configuration unchanged while parked, the driver
+    /// resolves `alpha` as its enabled owner and goes on to build the step's
+    /// policy (which this roster makes unbuildable, so no turn runs).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sop_driver_unchanged_config_runs_as_the_configured_owner() {
+        let (result, engine, _temp) = dispatch_parked_at_the_decision_with(
+            gated_agent_step_sop(),
+            roster_with_unbuildable_alpha_policy(),
+            WhileParked::Nothing,
+        )
+        .await;
+        let run_id = started_run_id(result);
+        let step = driven_first_step(&engine, &run_id).await;
+        assert_eq!(step.effective_agent.as_deref(), Some("alpha"));
+        assert!(
+            step.output
+                .contains(crate::sop::executor::STEP_TURN_SCOPE_UNAVAILABLE),
+            "{}",
+            step.output
+        );
+    }
+
+    /// `alpha` is disabled while the decision model deliberates. The caller's
+    /// grants do not change, so the run is admitted, but the driver reads the
+    /// configuration after the wait and refuses the withdrawn agent: no step
+    /// policy is built and no turn runs as it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sop_driver_owner_disabled_while_parked_does_not_run() {
+        let (result, engine, _temp) = dispatch_parked_at_the_decision_with(
+            gated_agent_step_sop(),
+            roster_with_unbuildable_alpha_policy(),
+            WhileParked::EditLiveConfig(disable_alpha),
+        )
+        .await;
+        let run_id = started_run_id(result);
+        assert_step_refused_disabled_owner(&driven_first_step(&engine, &run_id).await);
+    }
+
+    /// `alpha`'s risk profile is replaced while the decision model
+    /// deliberates. The step's tool policy is built from the configuration
+    /// after the wait: the new profile names nothing configured, so the step
+    /// fails on its policy instead of running under the profile `alpha` had
+    /// when the call arrived.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sop_driver_policy_changed_while_parked_builds_from_the_new_config() {
+        let data = tempfile::TempDir::new().unwrap();
+        let (result, engine, _temp) = dispatch_parked_at_the_decision_with(
+            gated_agent_step_sop(),
+            roster_with_buildable_alpha_policy(&data),
+            WhileParked::EditLiveConfig(make_alpha_policy_unbuildable),
+        )
+        .await;
+        let run_id = started_run_id(result);
+        assert_step_failed_on_its_policy(&driven_first_step(&engine, &run_id).await);
+    }
+
+    /// Alice's roster with `alpha` on a risk profile that builds. Building a
+    /// step policy creates the agent's workspace under `data_dir`, so that
+    /// points into `data`. Asserts the profile builds, or a test that changes
+    /// it could not tell the old configuration from the new one.
+    fn roster_with_buildable_alpha_policy(
+        data: &tempfile::TempDir,
+    ) -> zeroclaw_config::schema::Config {
+        let mut roster = dispatch_event_roster(&["alpha"]);
+        roster.data_dir = data.path().to_path_buf();
+        roster.config_path = data.path().join("config.toml");
+        roster.risk_profiles.insert(
+            "reviewer".into(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        roster
+            .agents
+            .get_mut("alpha")
+            .expect("the roster configures alpha")
+            .risk_profile = "reviewer".into();
+        assert!(
+            crate::sop::executor::step_turn_security(&roster, "alpha").is_ok(),
+            "the profile alpha starts with must build"
+        );
+        roster
+    }
+
+    fn make_alpha_policy_unbuildable(config: &mut zeroclaw_config::schema::Config) {
+        config.agents.get_mut("alpha").unwrap().risk_profile = "no-such-profile".into();
+    }
+
+    fn disable_alpha(config: &mut zeroclaw_config::schema::Config) {
+        config.agents.get_mut("alpha").unwrap().enabled = false;
+    }
+
+    /// The step was refused because its owner is disabled: it failed, is
+    /// attributed to no agent, and no policy or turn was built for it.
+    fn assert_step_refused_disabled_owner(step: &crate::sop::types::SopStepResult) {
+        assert_eq!(step.status, crate::sop::types::SopStepStatus::Failed);
+        assert_eq!(
+            step.effective_agent, None,
+            "a refused step is attributed to no agent"
+        );
+        assert!(
+            step.output.contains("'alpha', which is disabled"),
+            "{}",
+            step.output
+        );
+    }
+
+    /// The step resolved its owner and then failed building its policy from
+    /// an unbuildable profile, so no turn ran.
+    fn assert_step_failed_on_its_policy(step: &crate::sop::types::SopStepResult) {
+        assert_eq!(step.status, crate::sop::types::SopStepStatus::Failed);
+        assert!(
+            step.output
+                .contains(crate::sop::executor::STEP_TURN_SCOPE_UNAVAILABLE),
+            "{}",
+            step.output
+        );
+    }
+
+    /// [`gated_agent_step_sop`] named `name`, with no decision model: these
+    /// tests park the driver, not the dispatch. Each test uses its own name,
+    /// because the step-boundary pause is armed by procedure name.
+    fn agent_step_sop_named(name: &str) -> crate::sop::types::Sop {
+        let mut sop = gated_agent_step_sop();
+        sop.name = name.to_string();
+        sop.decision = None;
+        sop
+    }
+
+    fn agent_step_ctx(
+        sop: crate::sop::types::Sop,
+        config: zeroclaw_config::schema::Config,
+        temp: &tempfile::TempDir,
+    ) -> (
+        Arc<RpcContext>,
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+    ) {
+        let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
+        engine.set_sops_for_test(vec![sop]);
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+        let ctx = dispatch_event_ctx(config, &engine, temp);
+        (ctx, engine)
+    }
+
+    fn deploy_event() -> Value {
+        json!({ "path": "/sop/deploy", "payload": { "ref": "main" } })
+    }
+
+    /// Dispatch the agent-step procedure `name` as alice and park its driver
+    /// at the step's execution boundary: past the decision, the run start,
+    /// the driver lease, generation admission and every engine lock the step
+    /// takes, and immediately before the step reads its configuration. Apply
+    /// `edit` to the live configuration there, release the driver, and return
+    /// the first step as it recorded it. This is the latest point a
+    /// configuration change can land before the step runs, so every earlier
+    /// wait is behind it.
+    async fn driver_step_after_edit_at_the_boundary(
+        name: &str,
+        config: zeroclaw_config::schema::Config,
+        edit: Option<fn(&mut zeroclaw_config::schema::Config)>,
+    ) -> crate::sop::types::SopStepResult {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (ctx, engine) = agent_step_ctx(agent_step_sop_named(name), config, &temp);
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let (reached, release) = crate::sop::executor::step_boundary_pause::arm(name);
+        let run_id = started_run_id(alice.handle_sops_dispatch_event(&deploy_event()).await);
+        tokio::time::timeout(std::time::Duration::from_secs(20), reached.notified())
+            .await
+            .expect("the driver parks at the step's execution boundary");
+        assert!(
+            run_status(&engine, &run_id)
+                .is_some_and(|status| status == crate::sop::types::SopRunStatus::Running),
+            "parked with the run started and nothing recorded for the step yet"
+        );
+        if let Some(edit) = edit {
+            edit(&mut ctx.config.write());
+        }
+        release.notify_one();
+        driven_first_step(&engine, &run_id).await
+    }
+
+    /// Control: parked at the step's execution boundary with nothing
+    /// changed, the step resolves `alpha` and goes on to build its policy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sop_driver_unchanged_at_the_step_boundary_runs_as_the_configured_owner() {
+        let step = driver_step_after_edit_at_the_boundary(
+            "boundary-unchanged",
+            roster_with_unbuildable_alpha_policy(),
+            None,
+        )
+        .await;
+        assert_eq!(step.effective_agent.as_deref(), Some("alpha"));
+        assert_step_failed_on_its_policy(&step);
+    }
+
+    /// `alpha` is disabled at the step's execution boundary, after every wait
+    /// the driver makes: the step is refused and nothing runs as `alpha`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sop_driver_owner_disabled_at_the_step_boundary_does_not_run() {
+        let step = driver_step_after_edit_at_the_boundary(
+            "boundary-disabled",
+            roster_with_unbuildable_alpha_policy(),
+            Some(disable_alpha),
+        )
+        .await;
+        assert_step_refused_disabled_owner(&step);
+    }
+
+    /// `alpha`'s risk profile is replaced at the step's execution boundary:
+    /// the step's policy is built from the replacement.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sop_driver_policy_changed_at_the_step_boundary_builds_from_the_new_config() {
+        let data = tempfile::TempDir::new().unwrap();
+        let step = driver_step_after_edit_at_the_boundary(
+            "boundary-policy",
+            roster_with_buildable_alpha_policy(&data),
+            Some(make_alpha_policy_unbuildable),
+        )
+        .await;
+        assert_step_failed_on_its_policy(&step);
+    }
+
+    /// The window between the dispatch handing its run to a driver and the
+    /// driver running: the run has started and the dispatch is waiting to
+    /// admit the driver into the generation (the test holds the generation's
+    /// driver registry, a production lock) when `alpha` is disabled. The
+    /// driver carries the live configuration through that wait and refuses
+    /// the withdrawn agent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sop_driver_owner_disabled_while_the_driver_awaits_admission_does_not_run() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (ctx, engine) = agent_step_ctx(
+            agent_step_sop_named("admission-wait-deploy"),
+            roster_with_unbuildable_alpha_policy(),
+            &temp,
+        );
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let handles = ctx
+            .sop_driver_handles
+            .clone()
+            .expect("the context has driver handles");
+        // Hold the registry on a thread of its own, so no lock is held across
+        // this test's awaits.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _held = handles.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().expect("the registry is held");
+        let call = zeroclaw_spawn::spawn!(async move {
+            alice.handle_sops_dispatch_event(&deploy_event()).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while started_run_count(&engine) == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the run starts before its driver asks for admission");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !call.is_finished(),
+            "the dispatch must be waiting to admit its driver when the change lands"
+        );
+        disable_alpha(&mut ctx.config.write());
+        release_tx.send(()).unwrap();
+        holder.join().expect("the registry holder does not panic");
+        let run_id = started_run_id(call.await.expect("the dispatch does not panic"));
+        assert_step_refused_disabled_owner(&driven_first_step(&engine, &run_id).await);
+    }
+
+    /// Run `call` on its own thread while this test holds the SOP engine
+    /// lock, so the call waits on that lock after the gate admitted it;
+    /// publish `change` (a roster) while it waits; release the lock; and
+    /// return the call's result. The call must still be waiting when the
+    /// change lands, or the test is vacuous, and a call that never completes
+    /// fails the test instead of hanging it.
+    fn call_parked_on_the_engine_lock<T: Send + 'static>(
+        ctx: &Arc<RpcContext>,
+        engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        change: Option<zeroclaw_config::schema::Config>,
+        call: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let held = engine.lock().unwrap();
+        let caller = std::thread::spawn(call);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !caller.is_finished(),
+            "the call must be waiting on the engine lock when the change lands"
+        );
+        if let Some(config) = change {
+            ctx.auth
+                .refresh_from_config(&config)
+                .expect("the new policy publishes");
+        }
+        drop(held);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !caller.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the call must complete once the engine lock is free"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        caller.join().expect("the call does not panic")
+    }
+
+    /// The context's configuration with alice's permission profile replaced:
+    /// entitled to `agents`, holding `verbs` on SOPs.
+    fn roster_republished(
+        ctx: &Arc<RpcContext>,
+        agents: &[&str],
+        verbs: &[zeroclaw_api::grants::Verb],
+    ) -> zeroclaw_config::schema::Config {
+        let mut config = ctx.config.read().clone();
+        config.permission_profiles = dispatch_event_roster_with(agents, verbs).permission_profiles;
+        config
+    }
+
+    /// Alice's roster (uid 4242, entitled to `alpha`, SOP read and execute)
+    /// applied to a checkpoint fixture's configuration.
+    fn alice_roster(config: &mut zeroclaw_config::schema::Config) {
+        let roster = dispatch_event_roster(&["alpha"]);
+        config.agents = roster.agents;
+        config.permission_profiles = roster.permission_profiles;
+        config.users = roster.users;
+    }
+
+    /// A run parked at a checkpoint in a procedure `alpha` executes.
+    fn alpha_checkpoint_fixture() -> (
+        Arc<RpcContext>,
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        String,
+        tempfile::TempDir,
+    ) {
+        let (ctx, engine, run_id, temp) = make_checkpoint_rpc_fixture(1, &[], alice_roster);
+        {
+            let mut engine = engine.lock().unwrap();
+            let mut sop = engine
+                .get_sop("rpc-checkpoint")
+                .cloned()
+                .expect("the procedure is loaded");
+            sop.agent = Some("alpha".into());
+            engine.set_sops_for_test(vec![sop]);
+        }
+        (ctx, engine, run_id, temp)
+    }
+
+    /// Everything a cancellation or a decision would change about `run_id`:
+    /// the run itself (its status and cancellation record) and whether it is
+    /// still active, which is what keeps its execution claim.
+    fn run_state(
+        engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        run_id: &str,
+    ) -> (Value, bool) {
+        let engine = engine.lock().unwrap();
+        let run = engine.get_run(run_id).expect("the run is known");
+        (
+            serde_json::to_value(run).unwrap(),
+            engine.active_runs().contains_key(run_id),
+        )
+    }
+
+    fn cancel_parked_on_the_engine_lock(
+        ctx: &Arc<RpcContext>,
+        engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        alice: RpcDispatcher,
+        run_id: &str,
+        change: Option<zeroclaw_config::schema::Config>,
+    ) -> RpcResult {
+        let params = json!({ "run_id": run_id });
+        tokio::task::block_in_place(|| {
+            call_parked_on_the_engine_lock(ctx, engine, change, move || {
+                alice.handle_sops_cancel(&params)
+            })
+        })
+    }
+
+    /// Control: with nothing changed while the cancel waits for the engine,
+    /// the entitled caller cancels the run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sops_cancel_unchanged_while_waiting_for_the_engine_cancels() {
+        let (ctx, engine, run_id, _temp) = alpha_checkpoint_fixture();
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let result = cancel_parked_on_the_engine_lock(&ctx, &engine, alice, &run_id, None)
+            .expect("an entitled caller cancels");
+        assert_eq!(result["outcome"], "cancelled");
+        assert_eq!(
+            run_status(&engine, &run_id),
+            Some(crate::sop::types::SopRunStatus::Cancelled)
+        );
+    }
+
+    /// `sops:execute` is withdrawn while the cancel waits for the engine: the
+    /// run, its cancellation record and its claim are untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sops_cancel_revoked_while_waiting_for_the_engine_has_no_effect() {
+        let (ctx, engine, run_id, _temp) = alpha_checkpoint_fixture();
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let before = run_state(&engine, &run_id);
+        let revoked = roster_republished(&ctx, &["alpha"], &[zeroclaw_api::grants::Verb::Read]);
+        let error = cancel_parked_on_the_engine_lock(&ctx, &engine, alice, &run_id, Some(revoked))
+            .expect_err("a caller whose execute grant was withdrawn must not cancel");
+        assert_eq!(error.code, FORBIDDEN, "{}", error.message);
+        assert_eq!(run_state(&engine, &run_id), before);
+    }
+
+    /// Alice's agent selector is narrowed away from `alpha` while the cancel
+    /// waits for the engine: the run is untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sops_cancel_narrowed_while_waiting_for_the_engine_has_no_effect() {
+        let (ctx, engine, run_id, _temp) = alpha_checkpoint_fixture();
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let before = run_state(&engine, &run_id);
+        let narrowed = roster_republished(
+            &ctx,
+            &["beta"],
+            &[
+                zeroclaw_api::grants::Verb::Read,
+                zeroclaw_api::grants::Verb::Execute,
+            ],
+        );
+        let error = cancel_parked_on_the_engine_lock(&ctx, &engine, alice, &run_id, Some(narrowed))
+            .expect_err("a caller no longer entitled to the run's agent must not cancel");
+        assert_eq!(error.code, FORBIDDEN, "{}", error.message);
+        assert_eq!(run_state(&engine, &run_id), before);
+    }
+
+    /// A checkpoint run whose release group alice belongs to, by her
+    /// canonical principal id.
+    async fn alice_approves_checkpoint_fixture() -> (
+        Arc<RpcContext>,
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        String,
+        tempfile::TempDir,
+    ) {
+        let (probe_ctx, _probe_engine, _probe_run, _probe_temp) =
+            make_checkpoint_rpc_fixture(1, &[], alice_roster);
+        let alice_id = scoped_dispatcher(&probe_ctx, 4242)
+            .await
+            .owner_principal_id()
+            .expect("a roster user has a canonical id");
+        make_checkpoint_rpc_fixture(1, &[&format!("principal:{alice_id}")], alice_roster)
+    }
+
+    fn approve_parked_on_the_engine_lock(
+        ctx: &Arc<RpcContext>,
+        engine: &Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        alice: RpcDispatcher,
+        run_id: &str,
+        change: Option<zeroclaw_config::schema::Config>,
+    ) -> RpcResult {
+        let params = json!({ "run_id": run_id, "decision": "approve" });
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::block_in_place(|| {
+            call_parked_on_the_engine_lock(ctx, engine, change, move || {
+                runtime.block_on(async move { alice.handle_sops_decide(&params).await })
+            })
+        })
+    }
+
+    /// Control: with nothing changed while the decision waits for the
+    /// engine, a group member's approval resumes the run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sops_decide_unchanged_while_waiting_for_the_engine_resumes() {
+        let (ctx, engine, run_id, _temp) = alice_approves_checkpoint_fixture().await;
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        approve_parked_on_the_engine_lock(&ctx, &engine, alice, &run_id, None)
+            .expect("a group member's approval is accepted");
+        assert_ne!(
+            run_status(&engine, &run_id),
+            Some(crate::sop::types::SopRunStatus::PausedCheckpoint)
+        );
+    }
+
+    /// `sops:execute` is withdrawn while the decision waits for the engine:
+    /// the approval does not reach the broker and the run stays parked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sops_decide_revoked_while_waiting_for_the_engine_has_no_effect() {
+        let (ctx, engine, run_id, _temp) = alice_approves_checkpoint_fixture().await;
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let before = run_state(&engine, &run_id);
+        let revoked = roster_republished(&ctx, &["alpha"], &[zeroclaw_api::grants::Verb::Read]);
+        let error = approve_parked_on_the_engine_lock(&ctx, &engine, alice, &run_id, Some(revoked))
+            .expect_err("a caller whose execute grant was withdrawn must not approve");
+        assert_eq!(error.code, FORBIDDEN, "{}", error.message);
+        assert_eq!(run_state(&engine, &run_id), before);
+    }
+
+    #[test]
+    fn sops_parity_methods_are_classified() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        for (wire, verb) in [
+            ("sops/cancel", Verb::Execute),
+            ("sops/dispatch-event", Verb::Execute),
+            ("sops/decision-models", Verb::Read),
+            ("sops/graph-legend", Verb::Read),
+        ] {
+            let method = Method::from_wire(wire).expect("wire name resolves");
+            assert_eq!(method.wire_name(), wire);
+            assert_eq!(
+                method.authz(),
+                MethodAuthz::Requires(Resource::Sops, verb),
+                "classification for {wire}"
+            );
+        }
+    }
+
+    /// The two read-only authoring lookups answer through the full request
+    /// path with the gateway routes' shapes, and never list an API key.
+    #[tokio::test]
+    async fn sops_decision_models_and_graph_legend_serve_the_gateway_shapes() {
+        use zeroclaw_config::schema::SopDecisionModelConfig;
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.decision_models.insert(
+            "local".into(),
+            SopDecisionModelConfig {
+                base_url: Some("http://127.0.0.1:9/v1".into()),
+                model: Some("m".into()),
+                api_key: Some("never-returned".into()),
+                ..SopDecisionModelConfig::default()
+            },
+        );
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            16,
+            Arc::new(SessionActorQueue::new(4, 10, 60)),
+        ));
+        let ctx = RpcContext::minimal(config, sessions);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "local:test".into());
+        dispatcher.set_authenticated_for_test();
+
+        let models = rpc(
+            &mut dispatcher,
+            &mut rx,
+            1,
+            "sops/decision-models",
+            json!({}),
+        )
+        .await;
+        assert_eq!(
+            models["result"],
+            json!({ "models": crate::sop::decision_model_options(&dispatcher.ctx.config.read()) })
+        );
+        assert_eq!(models["result"]["models"][0]["alias"], "local");
+        assert!(!models.to_string().contains("never-returned"));
+
+        let legend = rpc(&mut dispatcher, &mut rx, 2, "sops/graph-legend", json!({})).await;
+        assert_eq!(
+            legend["result"],
+            serde_json::to_value(crate::sop::GraphLegend::canonical()).unwrap()
         );
     }
 

@@ -111,11 +111,24 @@ escalation_route = "oncall"
 
 `[sop.approval.groups.*]` members are approval identities, not account names.
 Members may be source-qualified (`http:<subject>`, `ws:<subject>`,
-`agent:<alias>`) to grant approval rights on one transport only, or bare
-(`ZeroClawOperator`) to grant any source carrying that identity. HTTP and WebSocket
-approval surfaces use the paired-token subject; the current CLI approval path
-(`zeroclaw sop approve`) is anonymous and cannot satisfy `cli:<user>`
+`agent:<alias>`, `principal:<id>`) to grant approval rights on one transport only,
+or bare (`ZeroClawOperator`) to grant any source carrying that identity. HTTP and
+WebSocket approval surfaces use the paired-token subject; the current CLI approval
+path (`zeroclaw sop approve`) is anonymous and cannot satisfy `cli:<user>`
 membership yet.
+
+The daemon RPC methods `sops/decide` and `sops/cancel` take their identity from
+the connection's authentication, never from anything the client claims:
+
+- A connection that authenticated with a paired token uses that token's
+  subject, exactly as the HTTP route does, so an `http:<subject>` member can
+  decide over RPC too, and the same token counts as one voter on every surface.
+- A connection that authenticated as a principal (a `[users]` entry or an OIDC
+  subject) uses its canonical principal id, the `principal_id` that
+  `initialize` reports for the connection, qualified as `principal:<id>`
+  (for example `principal:user:alice`).
+- The unauthenticated local operator is anonymous and cannot satisfy a policy
+  with a `required_group`.
 
 The paired-token subject is the lowercase SHA-256 hex digest of the bearer
 token. After pairing, copy the digest from the canonical

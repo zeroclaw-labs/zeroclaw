@@ -17,6 +17,7 @@ pub mod schema;
 pub mod scope;
 pub mod step_contract;
 pub mod store;
+pub mod surface;
 pub mod trigger_registry;
 pub mod trigger_source;
 pub mod types;
@@ -39,9 +40,9 @@ pub use engine::{
     err_is_terminal_persistence_retained,
 };
 pub use executor::{
-    RegisteredSopDriver, SopDriverHandles, SopDriverRegistry, SopDriverSink, admit_sop_driver,
-    admit_sop_driver_for_run, drive_resumed_broker_action, spawn_and_register_sop_driver,
-    spawn_headless_run_driver,
+    RegisteredSopDriver, SopDriverConfig, SopDriverHandles, SopDriverRegistry, SopDriverSink,
+    admit_sop_driver, admit_sop_driver_for_run, drive_resumed_broker_action,
+    spawn_and_register_sop_driver, spawn_headless_run_driver,
 };
 pub use graph::{
     FlowRole, GraphDiagnostic, GraphLayout, GraphLegend, GraphNode, GraphPin, GraphSeverity,
@@ -55,6 +56,9 @@ pub use step_contract::{StepFailure, StepRouting, SwitchRule};
 pub use store::{
     ClaimToken, PersistedRun, ProposalKind, ProposalRecord, ProposalStatus, SopEventRecord,
     SopRunStore, SqliteRunStore, StoreError, build_run_store,
+};
+pub use surface::{
+    DecisionModelOption, WebhookDispatch, decision_model_options, dispatch_webhook_event,
 };
 pub use trigger_registry::{
     BoundTriggerSource, ChannelAlias, ChannelTriggerKind, ConditionField, ConditionValueType,
