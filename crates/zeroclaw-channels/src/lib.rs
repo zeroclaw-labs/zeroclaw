@@ -8,6 +8,7 @@
 #![cfg_attr(feature = "channel-matrix", recursion_limit = "256")]
 
 pub mod allowlist;
+pub mod control;
 // Ungated: the reader-aligned paired-identity writer is now shared by every
 // writer of an `external_peers` grant, including the CLI/API bind core and the
 // Telegram and LINE pairing paths, none of which are wechat/whatsapp-web.

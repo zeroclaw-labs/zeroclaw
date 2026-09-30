@@ -1543,7 +1543,14 @@ mod tests {
             .await
             .expect("the handler polled the body after admission");
 
-        assert!(authority.pairing().revoke_token("zc_second"));
+        assert!(
+            authority.pairing().revoke_token(
+                "zc_second",
+                &std::sync::Arc::new(tokio::sync::Mutex::new(()))
+                    .try_lock_owned()
+                    .expect("a fresh mutex is free"),
+            )
+        );
         release.send(()).unwrap();
 
         assert_eq!(write.await.unwrap(), StatusCode::UNAUTHORIZED);

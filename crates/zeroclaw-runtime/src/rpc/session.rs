@@ -249,6 +249,14 @@ type CancelTokenEntry = (u64, Option<u64>, tokio_util::sync::CancellationToken);
 #[cfg(test)]
 type RehydrateSeedPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 
+/// A workspace operation's blocking worker parks on this: it notifies
+/// `arrived`, then waits on a plain channel, since it runs on no runtime.
+#[cfg(test)]
+struct WorkspaceWorkerPause {
+    arrived: Arc<tokio::sync::Notify>,
+    released: std::sync::mpsc::Receiver<()>,
+}
+
 pub struct SessionStore {
     sessions: Mutex<HashMap<String, RpcSession>>,
     #[cfg(test)]
@@ -296,6 +304,15 @@ pub struct SessionStore {
     /// first commit that reaches it.
     #[cfg(test)]
     test_upload_effect_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Test-only pause on a workspace operation's blocking worker, before it
+    /// takes the authority lease. Taken by the first operation that reaches it.
+    #[cfg(test)]
+    test_workspace_worker_pause: std::sync::Mutex<Option<WorkspaceWorkerPause>>,
+    /// Test-only hook a workspace operation runs between its final authority
+    /// check and its effect, while it holds the authority lease. Taken by the
+    /// first operation that reaches it.
+    #[cfg(test)]
+    test_workspace_effect_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Test-only hook an upload commit runs right after its write and index
     /// insert, while it still holds the authority lease. Taken by the first
     /// commit that reaches it.
@@ -368,6 +385,10 @@ impl SessionStore {
             test_upload_commit_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_upload_effect_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_workspace_worker_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_workspace_effect_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_upload_written_hook: std::sync::Mutex::new(None),
         }
@@ -975,6 +996,56 @@ impl SessionStore {
     #[cfg(not(test))]
     #[inline(always)]
     async fn wait_test_upload_commit_pause(&self) {}
+
+    /// Arm a test-only pause for the next workspace operation's blocking
+    /// worker, before it takes the authority lease. Returns `(arrived,
+    /// release)`: `arrived` is notified once the worker has parked, and the
+    /// worker waits until `release` sends or is dropped.
+    #[cfg(test)]
+    pub fn set_test_workspace_worker_pause(
+        &self,
+    ) -> (Arc<tokio::sync::Notify>, std::sync::mpsc::Sender<()>) {
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let (release, released) = std::sync::mpsc::channel();
+        *self.test_workspace_worker_pause.lock().unwrap() = Some(WorkspaceWorkerPause {
+            arrived: Arc::clone(&arrived),
+            released,
+        });
+        (arrived, release)
+    }
+
+    /// Park a workspace operation's blocking worker at an armed pause.
+    #[cfg(test)]
+    pub(crate) fn wait_test_workspace_worker_pause(&self) {
+        let pause = self.test_workspace_worker_pause.lock().unwrap().take();
+        if let Some(pause) = pause {
+            pause.arrived.notify_one();
+            let _ = pause.released.recv();
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) fn wait_test_workspace_worker_pause(&self) {}
+
+    /// Arm a test-only hook for the next workspace operation, run between its
+    /// final authority check and its effect.
+    #[cfg(test)]
+    pub fn set_test_workspace_effect_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.test_workspace_effect_hook.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_test_workspace_effect_hook(&self) {
+        let hook = self.test_workspace_effect_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) fn run_test_workspace_effect_hook(&self) {}
 
     /// Arm a test-only hook for the next upload commit, run between its final
     /// authority check and its write.

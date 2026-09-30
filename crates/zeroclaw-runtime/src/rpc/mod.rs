@@ -3,6 +3,9 @@
 pub mod approval_channel;
 pub mod attachments;
 pub mod auth;
+pub mod canvas;
+pub mod catalog;
+pub mod channels;
 pub mod context;
 pub mod dispatch;
 pub mod fs;
@@ -16,6 +19,7 @@ pub mod tui_identity;
 pub mod turn;
 pub mod types;
 pub mod upload;
+pub mod workspace;
 pub mod wss;
 
 /// How long a cancelled listener waits for the connections it accepted to

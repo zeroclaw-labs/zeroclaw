@@ -512,134 +512,73 @@ pub async fn handle_api_channel_bind(
     principal: RequestPrincipal,
     Json(body): Json<ChannelBindBody>,
 ) -> Response {
+    use zeroclaw_channels::control::{BindFailureKind, BindPlan};
+    let bind_error = |failure: zeroclaw_channels::control::BindFailure| {
+        let code = match failure.kind {
+            BindFailureKind::ValidationFailed => ConfigApiCode::ValidationFailed,
+            BindFailureKind::PathNotFound => ConfigApiCode::PathNotFound,
+            BindFailureKind::ReloadFailed => ConfigApiCode::ReloadFailed,
+        };
+        error_response(ConfigApiError::new(code, failure.message))
+    };
     // Serialize the whole read-mutate-swap section: acquired before the
-    // read-for-modify below and held through the swap at the end of this
-    // handler, so a concurrent config writer can't land between this
-    // handler's read and its `save()`/swap.
-    let _cfg_guard = Arc::clone(&state.config_write_lock).lock_owned().await;
-    let channel_type = body.channel_type.trim();
-    let alias = body.alias.trim();
-
-    // Closed-set gate: only telegram/wechat/line have an operator-bind surface.
-    if zeroclaw_channels::orchestrator::channel_identity_normalizer(channel_type).is_none() {
-        return error_response(ConfigApiError::new(
-            ConfigApiCode::ValidationFailed,
-            format!(
-                "channel type `{channel_type}` does not support identity binding \
-                 (supported: telegram, wechat, line)"
-            ),
-        ));
-    }
-
-    let mut working = state.config.read().clone();
-
-    // The daemon gives the gateway, the RPC path and the channels separate
-    // `Config` copies of the same file, so `_cfg_guard` alone is not enough:
-    // this handle's `peer_groups` can be older than what another writer has
-    // already saved. Without the refresh, an `ignore` persisted through RPC is
-    // both invisible to the bind check below and overwritten by the save.
-    match zeroclaw_config::schema::persisted_peer_groups(&working.config_path).await {
-        Ok(Some(persisted)) => working.peer_groups = persisted,
-        Ok(None) => {}
-        Err(e) => {
-            return error_response(ConfigApiError::new(
-                ConfigApiCode::ReloadFailed,
-                format!("could not read the persisted peer policy: {e}"),
-            ));
-        }
-    }
-
-    // Reject a phantom alias loudly (404) rather than minting a peer group the
-    // runtime never reads.
-    if !zeroclaw_channels::orchestrator::channel_alias_configured(&working, channel_type, alias) {
-        return error_response(ConfigApiError::new(
-            ConfigApiCode::PathNotFound,
-            format!("channel `{channel_type}.{alias}` is not configured"),
-        ));
-    }
-
-    let target = match zeroclaw_channels::orchestrator::bind_channel_identity_into(
-        &mut working,
-        channel_type,
-        alias,
+    // read-for-modify inside `prepare_bind` and held through the swap in
+    // `commit_bind`, so a concurrent config writer can't land between this
+    // handler's read and its save.
+    let cfg_guard = Arc::clone(&state.config_write_lock).lock_owned().await;
+    let plan = match zeroclaw_channels::control::prepare_bind(
+        &state.config,
+        &cfg_guard,
+        &body.channel_type,
+        &body.alias,
         &body.identity,
-    ) {
-        Ok(target) => target,
-        Err(e) => {
-            return error_response(ConfigApiError::new(
-                ConfigApiCode::ValidationFailed,
-                e.to_string(),
-            ));
-        }
+    )
+    .await
+    {
+        Ok(plan) => plan,
+        Err(failure) => return bind_error(failure),
+    };
+    let (working, group, channel) = match plan {
+        BindPlan::AlreadyBound(already) => return Json(already).into_response(),
+        // The route classifies the write by its effect below.
+        BindPlan::Write {
+            working,
+            group,
+            channel,
+            created: _,
+        } => (*working, group, channel),
     };
 
-    let channel = format!("{channel_type}.{alias}");
-
-    // The writer picks its target by the group's `channel` field, so the
-    // destination may be any key, not the conventional `<type>_<alias>`.
-    // Reporting the conventional name would name a group that need not exist.
-    let Some(group) = target else {
-        // Name the group that actually carries the grant, including a bare
-        // type-wide one. Falling back to the conventional `<type>_<alias>` key
-        // named a block that need not exist and sent operators to edit it.
-        let source = zeroclaw_channels::orchestrator::channel_authorizing_group_key(
-            &working,
-            channel_type,
-            alias,
-            &body.identity,
-        )
-        .or_else(|| {
-            zeroclaw_channels::orchestrator::channel_peer_group_key(&working, channel_type, alias)
-        });
-        return Json(serde_json::json!({
-            "saved": false,
-            "already_bound": true,
-            "group": source,
-            "channel": channel,
-        }))
-        .into_response();
-    };
-
-    // Incremental: only `peer_groups` is applied onto the current on-disk
-    // document, so the rest of this snapshot, which is still whatever this
-    // handle last saw, cannot drop another writer's keys. A full `save` here
-    // wrote the whole stale snapshot back. A direct peer-group mutation is not
-    // dirty-tracked, so the explicit `mark_dirty` is what makes `save_dirty`
-    // write it at all, and it materializes a brand-new table the same way.
-    // Then swap the shared in-memory config so the channel authorizes live.
     // The bind writes exactly one path; a peer group that did not exist
-    // before is the creation it is. Authorized before the save below.
+    // before is the creation it is. Authorized before the save.
     let before = state.config.read().clone();
-    let external_peers = format!("peer_groups.{group}.external_peers");
+    let external_peers = BindPlan::write_path(&group);
     let authorization = match authorize_config_write(
         &principal,
         ConfigWriteSet::by_effect(&before, &working, [external_peers.as_str()]),
-        &_cfg_guard,
+        &cfg_guard,
     ) {
         Ok(authorization) => authorization,
         Err(denied) => return denied.into_response(),
     };
-
-    working.mark_dirty("peer_groups");
-    if let Err(e) = working.save_dirty().await {
-        return error_response(ConfigApiError::new(
-            ConfigApiCode::ReloadFailed,
-            format!("save failed: {e}"),
-        ));
+    match zeroclaw_channels::control::commit_bind(
+        &state.config,
+        &cfg_guard,
+        working,
+        group,
+        channel,
+        |persisted| authorization.publish_persisted(persisted),
+    )
+    .await
+    {
+        Ok(result) => {
+            state
+                .pending_reload
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            Json(result).into_response()
+        }
+        Err(failure) => bind_error(failure),
     }
-    authorization.publish_persisted(&working);
-    *state.config.write() = working;
-    state
-        .pending_reload
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-
-    Json(serde_json::json!({
-        "saved": true,
-        "already_bound": false,
-        "group": group,
-        "channel": channel,
-    }))
-    .into_response()
 }
 
 /// Fields the gateway owns end-to-end (mints, rotates, persists itself).
@@ -4751,6 +4690,45 @@ mod tests {
                 .is_empty(),
             "a rejected bind must not mutate the peer group"
         );
+    }
+
+    /// `prepare_bind` says whether its write creates the peer group, the
+    /// effect the RPC surface holds the `config` verb to, and a saved bind
+    /// says a reload is due while an idempotent one does not.
+    #[tokio::test]
+    async fn a_bind_reports_its_effect_and_the_reload_it_needs() {
+        use zeroclaw_channels::control::{BindPlan, commit_bind, prepare_bind};
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(config_with_telegram_alias(&tmp, "alerts"));
+        let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
+
+        for (identity, creates) in [("111111111", true), ("222222222", false)] {
+            let plan = prepare_bind(&state.config, &guard, "telegram", "alerts", identity)
+                .await
+                .unwrap_or_else(|failure| panic!("{identity}: {}", failure.message));
+            let BindPlan::Write {
+                working,
+                group,
+                channel,
+                created,
+            } = plan
+            else {
+                panic!("{identity} is not bound yet");
+            };
+            assert_eq!(created, creates, "{identity}");
+            let saved = commit_bind(&state.config, &guard, *working, group, channel, |_| {})
+                .await
+                .unwrap_or_else(|failure| panic!("{identity}: {}", failure.message));
+            assert_eq!(saved["restart_required"], true, "{saved}");
+        }
+
+        let again = prepare_bind(&state.config, &guard, "telegram", "alerts", "111111111")
+            .await
+            .unwrap_or_else(|failure| panic!("{}", failure.message));
+        let BindPlan::AlreadyBound(body) = again else {
+            panic!("the identity is already bound");
+        };
+        assert_eq!(body["restart_required"], false, "{body}");
     }
 
     /// Trust-boundary regression: binding into a `[channels.telegram.<alias>]`

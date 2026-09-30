@@ -884,7 +884,14 @@ mod tests {
         let lease = auth.hold_authority();
         let revoker = {
             let auth = Arc::clone(&auth);
-            std::thread::spawn(move || auth.pairing().revoke_token("zc_tok"))
+            std::thread::spawn(move || {
+                // A revocation proves it holds a config write lock; this test
+                // has no context, so it mints its own.
+                let serialized = Arc::new(tokio::sync::Mutex::new(()))
+                    .try_lock_owned()
+                    .expect("a fresh lock is free");
+                auth.pairing().revoke_token("zc_tok", &serialized)
+            })
         };
         wait_until_queued(
             || auth.pairing().token_write_queued_behind_a_hold(),

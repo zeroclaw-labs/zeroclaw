@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::OwnedMutexGuard;
 use zeroclaw_macros::Configurable;
 
 /// Maximum failed pairing attempts before lockout.
@@ -719,19 +720,30 @@ impl PairingGuard {
         tokens.iter().cloned().collect()
     }
 
-    pub fn revoke_token(&self, token: &str) -> bool {
+    /// Revoke a paired token. Returns true if removed.
+    ///
+    /// Every revocation takes the caller's guard on the process-wide config
+    /// write lock ([`crate::write_lock::shared_config_write_lock`]) as proof
+    /// that it holds that lock. An operation that re-establishes its caller's
+    /// authority under the lock and commits under it relies on no credential
+    /// being revoked in between; requiring the guard here makes every
+    /// revocation, on any surface, wait for such an operation to finish.
+    pub fn revoke_token(&self, token: &str, _serialized: &OwnedMutexGuard<()>) -> bool {
         let hashed = hash_token(token);
         let mut tokens = self.paired_tokens.write();
         tokens.remove(&hashed)
     }
 
     /// Revoke a paired token by its SHA-256 hash. Returns true if removed.
-    pub fn revoke_token_hash(&self, token_hash: &str) -> bool {
+    /// The guard is the proof described on [`Self::revoke_token`].
+    pub fn revoke_token_hash(&self, token_hash: &str, _serialized: &OwnedMutexGuard<()>) -> bool {
         let mut tokens = self.paired_tokens.write();
         tokens.remove(token_hash)
     }
 
-    pub fn revoke_all_tokens(&self) -> usize {
+    /// Revoke every paired token. Returns how many were removed. The guard is
+    /// the proof described on [`Self::revoke_token`].
+    pub fn revoke_all_tokens(&self, _serialized: &OwnedMutexGuard<()>) -> usize {
         let mut tokens = self.paired_tokens.write();
         let count = tokens.len();
         tokens.clear();
@@ -917,6 +929,13 @@ mod tests {
     use super::*;
     use tokio::test;
 
+    /// A held config-write guard, the proof the revocation methods take.
+    fn held() -> OwnedMutexGuard<()> {
+        Arc::new(tokio::sync::Mutex::new(()))
+            .try_lock_owned()
+            .expect("a fresh mutex is free")
+    }
+
     /// Serializes the tests that either emit or assert-the-absence-of the
     /// clamp WARN. The log broadcast is process-global, so two overlapping
     /// capture windows would let one test see the other's warning.
@@ -1081,7 +1100,7 @@ mod tests {
         let hash = PairingGuard::token_hash("zc_tok");
         assert!(guard.token_hash_is_paired(&hash));
 
-        assert!(guard.revoke_token("zc_tok"));
+        assert!(guard.revoke_token("zc_tok", &held()));
         assert!(!guard.token_is_paired("zc_tok"), "revocation is live");
         assert!(!guard.token_hash_is_paired(&hash));
     }
@@ -1835,7 +1854,7 @@ mod tests {
         let token = guard.try_pair(&code, "c").await.unwrap().unwrap();
         assert!(guard.is_authenticated(&token));
 
-        assert!(guard.revoke_token(&token));
+        assert!(guard.revoke_token(&token, &held()));
         assert!(!guard.is_authenticated(&token));
         assert!(!guard.is_paired());
     }
@@ -1848,7 +1867,7 @@ mod tests {
         let expected_hash = hash_token(&token);
         assert!(guard.tokens().contains(&expected_hash));
 
-        assert!(guard.revoke_token(&token));
+        assert!(guard.revoke_token(&token, &held()));
         assert!(!guard.tokens().contains(&expected_hash));
     }
 
@@ -1856,7 +1875,7 @@ mod tests {
     async fn revoke_token_hash_matches_revoke_token() {
         let guard = new_guard(true, &["zc_a".into(), "zc_b".into()]);
         let hash_a = hash_token("zc_a");
-        assert!(guard.revoke_token_hash(&hash_a));
+        assert!(guard.revoke_token_hash(&hash_a, &held()));
         assert!(!guard.is_authenticated("zc_a"));
         assert!(guard.is_authenticated("zc_b"));
     }
@@ -1864,14 +1883,14 @@ mod tests {
     #[test]
     async fn revoke_unknown_token_is_noop() {
         let guard = new_guard(true, &["zc_a".into()]);
-        assert!(!guard.revoke_token("zc_never_paired"));
+        assert!(!guard.revoke_token("zc_never_paired", &held()));
         assert!(guard.is_authenticated("zc_a"));
     }
 
     #[test]
     async fn revoke_is_scoped_to_target_token() {
         let guard = new_guard(true, &["zc_keep".into(), "zc_drop".into()]);
-        assert!(guard.revoke_token("zc_drop"));
+        assert!(guard.revoke_token("zc_drop", &held()));
         assert!(guard.is_authenticated("zc_keep"));
         assert!(!guard.is_authenticated("zc_drop"));
     }
@@ -1879,7 +1898,7 @@ mod tests {
     #[test]
     async fn revoke_all_tokens_invalidates_every_token() {
         let guard = new_guard(true, &["zc_a".into(), "zc_b".into(), "zc_c".into()]);
-        assert_eq!(guard.revoke_all_tokens(), 3);
+        assert_eq!(guard.revoke_all_tokens(&held()), 3);
         assert!(!guard.is_authenticated("zc_a"));
         assert!(!guard.is_authenticated("zc_b"));
         assert!(!guard.is_authenticated("zc_c"));
@@ -1890,7 +1909,7 @@ mod tests {
     #[test]
     async fn revoke_all_tokens_on_empty_set_returns_zero() {
         let guard = new_guard(true, &[]);
-        assert_eq!(guard.revoke_all_tokens(), 0);
+        assert_eq!(guard.revoke_all_tokens(&held()), 0);
     }
 
     // ── Atomic pairing-code generation ───────────────────────

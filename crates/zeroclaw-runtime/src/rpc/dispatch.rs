@@ -182,6 +182,12 @@ pub enum Method {
     FileUploadChunk,
     FileUploadCommit,
     FsListDir,
+    WorkspaceList,
+    FsMkdir,
+    FsRmdir,
+    FsRead,
+    FsDelete,
+    FsMove,
 
     // Locales
     LocalesList,
@@ -214,6 +220,27 @@ pub enum Method {
     SopsGraphDraft,
     SopsTriggerSources,
     ToolsParamOptions,
+    ToolsCliDiscover,
+    ToolsList,
+    IntegrationsList,
+    PluginsList,
+    A2aIdentity,
+    CanvasList,
+    CanvasGet,
+    CanvasHistory,
+    CanvasRender,
+    CanvasClear,
+    MetricsScrape,
+    PairingList,
+    PairingRevoke,
+    PairingRevokeAll,
+    PairingNewCode,
+    ChannelsList,
+    ChannelsRelink,
+    ChannelsBind,
+    SystemUpgrade,
+    SystemUpgradeStatus,
+    SystemRestart,
 }
 
 impl Method {
@@ -306,6 +333,12 @@ impl Method {
         (Method::FileUploadChunk, "file/upload/chunk"),
         (Method::FileUploadCommit, "file/upload/commit"),
         (Method::FsListDir, "fs/list_dir"),
+        (Method::WorkspaceList, "workspace/list"),
+        (Method::FsMkdir, "fs/mkdir"),
+        (Method::FsRmdir, "fs/rmdir"),
+        (Method::FsRead, "fs/read"),
+        (Method::FsDelete, "fs/delete"),
+        (Method::FsMove, "fs/move"),
         // Locales
         (Method::LocalesList, "locales/list"),
         (Method::LocalesFetch, "locales/fetch"),
@@ -333,6 +366,27 @@ impl Method {
         (Method::SopsGraphDraft, "sops/graph-draft"),
         (Method::SopsTriggerSources, "sops/trigger-sources"),
         (Method::ToolsParamOptions, "tools/param-options"),
+        (Method::ToolsCliDiscover, "tools/cli-discover"),
+        (Method::ToolsList, "tools/list"),
+        (Method::IntegrationsList, "integrations/list"),
+        (Method::PluginsList, "plugins/list"),
+        (Method::A2aIdentity, "a2a/identity"),
+        (Method::CanvasList, "canvas/list"),
+        (Method::CanvasGet, "canvas/get"),
+        (Method::CanvasHistory, "canvas/history"),
+        (Method::CanvasRender, "canvas/render"),
+        (Method::CanvasClear, "canvas/clear"),
+        (Method::MetricsScrape, "metrics/scrape"),
+        (Method::PairingList, "pairing/list"),
+        (Method::PairingRevoke, "pairing/revoke"),
+        (Method::PairingRevokeAll, "pairing/revoke-all"),
+        (Method::PairingNewCode, "pairing/new-code"),
+        (Method::ChannelsList, "channels/list"),
+        (Method::ChannelsRelink, "channels/relink"),
+        (Method::ChannelsBind, "channels/bind"),
+        (Method::SystemUpgrade, "system/upgrade"),
+        (Method::SystemUpgradeStatus, "system/upgrade-status"),
+        (Method::SystemRestart, "system/restart"),
     ];
 
     /// Resolve a wire method name to a variant. Table scan, no hand-written
@@ -445,7 +499,10 @@ impl Method {
             M::FileAttach | M::FileUploadBegin | M::FileUploadChunk | M::FileUploadCommit => {
                 (Resource::Files, Verb::Create)
             }
-            M::FsListDir => (Resource::Files, Verb::Read),
+            M::FsListDir | M::WorkspaceList | M::FsRead => (Resource::Files, Verb::Read),
+            M::FsMkdir => (Resource::Files, Verb::Create),
+            M::FsMove => (Resource::Files, Verb::Update),
+            M::FsRmdir | M::FsDelete => (Resource::Files, Verb::Delete),
 
             M::LocalesList | M::LocalesFetch => (Resource::Locales, Verb::Read),
 
@@ -469,7 +526,20 @@ impl Method {
                 (Resource::Sops, Verb::Execute)
             }
 
-            M::ToolsParamOptions => (Resource::Tools, Verb::Read),
+            M::ToolsParamOptions | M::ToolsCliDiscover | M::ToolsList | M::IntegrationsList => {
+                (Resource::Tools, Verb::Read)
+            }
+            M::PluginsList => (Resource::Plugins, Verb::Read),
+            M::A2aIdentity | M::MetricsScrape | M::PairingList => (Resource::System, Verb::Read),
+            M::PairingRevoke | M::PairingRevokeAll => (Resource::System, Verb::Delete),
+            M::PairingNewCode => (Resource::System, Verb::Create),
+            M::ChannelsList => (Resource::Channels, Verb::Read),
+            M::ChannelsRelink | M::ChannelsBind => (Resource::Channels, Verb::Update),
+            M::SystemUpgrade | M::SystemRestart => (Resource::System, Verb::Execute),
+            M::SystemUpgradeStatus => (Resource::System, Verb::Read),
+            M::CanvasList | M::CanvasGet | M::CanvasHistory => (Resource::Canvas, Verb::Read),
+            M::CanvasRender => (Resource::Canvas, Verb::Update),
+            M::CanvasClear => (Resource::Canvas, Verb::Delete),
         };
         MethodAuthz::Requires(resource, verb)
     }
@@ -564,6 +634,16 @@ fn principal_tool_ceiling(grants: &zeroclaw_api::grants::ResolvedGrants) -> Opti
         return None;
     }
     Some(grants.allowed_tools.clone())
+}
+
+/// The JSON-RPC code for a paired-device failure the dashboard reports with
+/// HTTP `status`.
+fn pairing_error_code(status: u16) -> i32 {
+    match status {
+        404 => INVALID_PARAMS,
+        400 | 503 => INVALID_REQUEST,
+        _ => INTERNAL_ERROR,
+    }
 }
 
 fn not_yet_implemented(method: Method) -> RpcResult {
@@ -1267,6 +1347,76 @@ fn current_authority_under(
     Ok(grants)
 }
 
+/// Whether `grants` reach a `workspace/list` or `fs/*` operation on `agent`
+/// under `config`; see [`RpcDispatcher::authorize_workspace_scope`] for the
+/// rule.
+fn workspace_scope_permits(
+    grants: &zeroclaw_api::grants::ResolvedGrants,
+    config: &Config,
+    agent: Option<&str>,
+) -> bool {
+    match agent {
+        Some(alias) => {
+            grants.may_use_agent(alias) && (grants.admin || config.agents.contains_key(alias))
+        }
+        None => grants.may_use_agent(zeroclaw_api::grants::WILDCARD),
+    }
+}
+
+fn workspace_scope_refusal(method: Method, agent: Option<&str>) -> crate::rpc::auth::AuthDenied {
+    crate::rpc::auth::AuthDenied::forbidden(match agent {
+        Some(agent) => format!(
+            "{} is not permitted for agent {agent:?}",
+            method.wire_name()
+        ),
+        None => format!(
+            "{} on the shared area requires access to every agent",
+            method.wire_name()
+        ),
+    })
+}
+
+/// Run a workspace operation where it takes effect, on its blocking worker.
+///
+/// The operation was admitted before it waited for a worker, and a grant,
+/// agent entitlement, configured agent or credential withdrawn during that
+/// wait must stop it. So the authority lease is taken here (see
+/// [`crate::rpc::auth::RpcInboundAuth::hold_authority`]), the caller's
+/// authority is re-resolved from it, including the method's coarse grant,
+/// the agent scope is judged again with those grants against the config in
+/// force now, and the operation runs on that config before the lease is
+/// dropped. A publication or unpairing that arrives after the check waits
+/// for the lease, so it lands after the operation, never between the check
+/// and the effect. The hold lasts one bounded path walk, rename, read or
+/// listing, or one recursive delete. Lock order, as for an upload: the
+/// authority state, the paired-token set, then the config.
+fn run_workspace_operation(
+    ctx: &RpcContext,
+    auth: Option<&crate::rpc::auth::ConnectionAuth>,
+    method: Method,
+    agent: Option<&str>,
+    operation: impl FnOnce(&Config) -> Result<Value, JsonRpcError>,
+) -> Result<Value, JsonRpcError> {
+    ctx.sessions.wait_test_workspace_worker_pause();
+    let Some(auth) = auth else {
+        return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+    };
+    let refuse = |denied: crate::rpc::auth::AuthDenied| {
+        audit_denial(Some(auth), method, &denied);
+        rpc_err(denied.code, denied.message)
+    };
+    let lease = ctx.auth.hold_authority();
+    let grants = current_authority_under(&lease, auth, method).map_err(refuse)?;
+    let config = ctx.config.read().clone();
+    if !workspace_scope_permits(&grants, &config, agent) {
+        return Err(refuse(workspace_scope_refusal(method, agent)));
+    }
+    ctx.sessions.run_test_workspace_effect_hook();
+    let result = operation(&config);
+    drop(lease);
+    result
+}
+
 impl RpcDispatcher {
     /// Fine-grained config-path selector. Composes with the coarse
     /// `Config` grant the gate already enforced: both are required.
@@ -1413,12 +1563,15 @@ impl RpcDispatcher {
     /// `None` on a surface that has no path selector to repeat (Quickstart
     /// applies a whole submission); the liveness, generation and coarse-grant
     /// checks still run there.
+    ///
+    /// Returns the grants it resolved, for a handler whose own selectors must
+    /// run on them before it writes.
     fn recheck_config_write_authority(
         &self,
         method: Method,
         path: Option<&str>,
         _guard: &ConfigWriteGuard,
-    ) -> Result<(), JsonRpcError> {
+    ) -> Result<zeroclaw_api::grants::ResolvedGrants, JsonRpcError> {
         use crate::rpc::auth::AuthDenied;
 
         let refuse = |denied: AuthDenied| -> JsonRpcError {
@@ -1437,7 +1590,7 @@ impl RpcDispatcher {
                 "Principal is not granted config write access to {path:?}"
             ))));
         }
-        Ok(())
+        Ok(grants)
     }
 
     /// Fine-grained agent selector for surfaces that address an agent: cron
@@ -1719,6 +1872,714 @@ impl RpcDispatcher {
         Ok(())
     }
 
+    /// `workspace/list` and `fs/*`: parse, hold to the agent selector, then
+    /// run the shared browse operation. See [`super::workspace`].
+    ///
+    /// The selector check here refuses early, before the operation waits for
+    /// a worker; the worker checks the caller's authority again where the
+    /// operation takes effect ([`run_workspace_operation`]).
+    async fn handle_workspace_method(&self, method: Method, params: &Value) -> RpcResult {
+        use zeroclaw_api::jsonrpc::{
+            FsDeleteRequest, FsMkdirRequest, FsMoveRequest, FsReadRequest, FsRmdirRequest,
+            WorkspaceListRequest,
+        };
+        type Operation = Box<dyn FnOnce(&Config) -> RpcResult + Send>;
+        let (agent, operation): (Option<String>, Operation) = match method {
+            Method::WorkspaceList => {
+                let req: WorkspaceListRequest = parse_params(params)?;
+                (
+                    req.agent.clone(),
+                    Box::new(move |config| super::workspace::handle_workspace_list(config, &req)),
+                )
+            }
+            Method::FsMkdir => {
+                let req: FsMkdirRequest = parse_params(params)?;
+                (
+                    req.agent.clone(),
+                    Box::new(move |config| super::workspace::handle_fs_mkdir(config, &req)),
+                )
+            }
+            Method::FsRmdir => {
+                let req: FsRmdirRequest = parse_params(params)?;
+                (
+                    None,
+                    Box::new(move |config| super::workspace::handle_fs_rmdir(config, &req)),
+                )
+            }
+            Method::FsRead => {
+                let req: FsReadRequest = parse_params(params)?;
+                (
+                    Some(req.agent.clone()),
+                    Box::new(move |config| super::workspace::handle_fs_read(config, &req)),
+                )
+            }
+            Method::FsDelete => {
+                let req: FsDeleteRequest = parse_params(params)?;
+                (
+                    Some(req.agent.clone()),
+                    Box::new(move |config| super::workspace::handle_fs_delete(config, &req)),
+                )
+            }
+            Method::FsMove => {
+                let req: FsMoveRequest = parse_params(params)?;
+                (
+                    Some(req.agent.clone()),
+                    Box::new(move |config| super::workspace::handle_fs_move(config, &req)),
+                )
+            }
+            _ => {
+                return Err(rpc_err(
+                    INTERNAL_ERROR,
+                    format!("{} is not a workspace method", method.wire_name()),
+                ));
+            }
+        };
+        self.authorize_workspace_scope(method, agent.as_deref())?;
+        // The work runs on a blocking worker: creating a directory walks its
+        // path one component at a time, and a recursive delete visits
+        // everything beneath it, so neither belongs on a runtime worker that
+        // other connections share.
+        let ctx = Arc::clone(&self.ctx);
+        let auth = self.auth.clone();
+        tokio::task::spawn_blocking(move || {
+            run_workspace_operation(&ctx, auth.as_ref(), method, agent.as_deref(), operation)
+        })
+        .await
+        .map_err(|join| {
+            rpc_err(
+                INTERNAL_ERROR,
+                format!("{} task failed: {join}", method.wire_name()),
+            )
+        })?
+    }
+
+    /// `integrations/list`, `tools/cli-discover`, `plugins/list` and
+    /// `a2a/identity`: the bodies the matching HTTP routes serve. See
+    /// [`super::catalog`].
+    async fn handle_catalog_method(&self, method: Method, params: &Value) -> RpcResult {
+        match method {
+            Method::IntegrationsList => {
+                let config = self.ctx.config.read().clone();
+                Ok(super::catalog::integrations_body(&config))
+            }
+            Method::ToolsCliDiscover => Ok(super::catalog::cli_tools_body().await),
+            Method::PluginsList => {
+                let config = self.ctx.config.read().clone();
+                let response =
+                    super::catalog::plugins_body(&config)
+                        .await
+                        .map_err(|unavailable| match unavailable {
+                            super::catalog::PluginCatalogUnavailable::Busy => rpc_err(
+                                INTERNAL_ERROR,
+                                "another plugin catalog scan is running; retry",
+                            ),
+                            super::catalog::PluginCatalogUnavailable::Failed => {
+                                rpc_err(INTERNAL_ERROR, "plugin catalog discovery failed")
+                            }
+                        })?;
+                serde_json::to_value(response).map_err(|e| {
+                    rpc_err(
+                        INTERNAL_ERROR,
+                        format!("failed to serialize the plugin catalog: {e}"),
+                    )
+                })
+            }
+            Method::A2aIdentity => {
+                let req: zeroclaw_api::jsonrpc::A2aIdentityRequest = parse_params(params)?;
+                // The catalog card lists only A2A-published agents and is what
+                // the gateway serves unauthenticated, so only a named agent is
+                // held to the agent selector.
+                if let Some(agent) = req.agent.as_deref() {
+                    self.authorize_agent_selector(method, agent)?;
+                }
+                let config = self.ctx.config.read().clone();
+                super::catalog::a2a_identity(&config, req.agent.as_deref())
+            }
+            _ => Err(rpc_err(
+                INTERNAL_ERROR,
+                format!("{} is not a catalog method", method.wire_name()),
+            )),
+        }
+    }
+
+    /// `tools/list`: the tools an agent would see, assembled on request from
+    /// live config rather than from a registry built once at startup.
+    ///
+    /// A named agent is held to the agent selector, and so is the default
+    /// agent a request without one describes. An alias that does not resolve
+    /// is refused; the dashboard route instead falls back to the default
+    /// agent's tools, which would show a principal an agent it may not use.
+    ///
+    /// Assembly is the same deep build a turn does, so it runs on a blocking
+    /// worker, as agent construction does, and the caller's stack pays only
+    /// for dispatch.
+    async fn handle_tools_list(&self, params: &Value) -> RpcResult {
+        let req: zeroclaw_api::jsonrpc::ToolsListRequest = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let alias = match req.agent {
+            Some(agent) => agent,
+            None => match crate::tools::listing::default_listing_alias(&config) {
+                Some(alias) => alias,
+                None => return Ok(super::catalog::tools_body(&[])),
+            },
+        };
+        self.authorize_agent_selector(Method::ToolsList, &alias)?;
+        // The dashboard builds listings for enabled agents only.
+        if !config.agents.get(&alias).is_some_and(|agent| agent.enabled) {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!("agent {alias:?} does not resolve to a configured agent"),
+            ));
+        }
+        let runtime: Arc<dyn crate::platform::RuntimeAdapter> =
+            match crate::platform::create_runtime(&config.runtime) {
+                Ok(runtime) => Arc::from(runtime),
+                Err(_) => Arc::new(crate::platform::NativeRuntime::new()),
+            };
+        let memory: Arc<dyn zeroclaw_memory::Memory> = match self.ctx.memory.as_ref() {
+            Some(memory) => Arc::clone(memory),
+            None => Arc::new(zeroclaw_memory::NoneMemory::new("none")),
+        };
+        let deps = crate::tools::listing::ToolListingDeps {
+            runtime,
+            memory,
+            canvas_store: self.ctx.canvas_store.clone(),
+            sop_engine: self.ctx.sop_engine.clone(),
+            sop_audit: self.ctx.sop_audit.clone(),
+        };
+        // One listing at a time across every connection, held until the
+        // assembly finishes even if the requesting client goes away: each one
+        // builds every tool and starts the agent's MCP servers, so a weak
+        // `tools:read` grant must not be able to run them in parallel.
+        static TOOL_LISTING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let permit = TOOL_LISTING.try_acquire().map_err(|_| {
+            rpc_err(
+                INTERNAL_ERROR,
+                "another tool listing is being assembled; retry",
+            )
+        })?;
+        let handle = tokio::runtime::Handle::current();
+        let listed = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            handle
+                .block_on(crate::tools::listing::agent_tool_specs(
+                    &config, &alias, &deps,
+                ))
+                .map(|specs| (alias, specs))
+        })
+        .await
+        .map_err(|join| rpc_err(INTERNAL_ERROR, format!("tool listing task failed: {join}")))?;
+        match listed {
+            Ok((_, Some(specs))) => Ok(super::catalog::tools_body(&specs)),
+            Ok((alias, None)) => Err(rpc_err(
+                INVALID_PARAMS,
+                format!("agent {alias:?} does not resolve to a configured agent"),
+            )),
+            Err(e) => Err(rpc_err(
+                INTERNAL_ERROR,
+                format!("failed to assemble the tool listing: {e}"),
+            )),
+        }
+    }
+
+    /// `pairing/*`: the core's authority over paired devices (the device
+    /// list, revocation and one-time codes), with the bodies the dashboard's
+    /// device routes and `/admin/paircode/new` serve.
+    ///
+    /// Administrators only. A pairing code yields a bearer credential for the
+    /// dashboard, so minting one or deciding whose credential survives is an
+    /// operator decision, not a grantable one.
+    async fn handle_pairing_method(&self, method: Method, params: &Value) -> RpcResult {
+        self.require_admin(method)?;
+        if matches!(method, Method::PairingNewCode | Method::PairingRevokeAll) {
+            self.require_local_transport(method)?;
+        }
+        let pairing = Arc::clone(self.ctx.auth.pairing());
+        let config = Arc::clone(&self.ctx.config);
+        let device_error = |failure: crate::devices::DeviceFailure| {
+            rpc_err(pairing_error_code(failure.http_status), failure.message)
+        };
+        let registry = {
+            let current = config.read();
+            crate::devices::registry_for(&current, &pairing)
+        }
+        .map_err(device_error)?;
+        let code_result = |(status, body): (u16, Value)| {
+            if status == 200 {
+                Ok(body)
+            } else {
+                let message = body["message"]
+                    .as_str()
+                    .unwrap_or("pairing failed")
+                    .to_string();
+                Err(rpc_err(pairing_error_code(status), message))
+            }
+        };
+        if matches!(method, Method::PairingList) {
+            return crate::devices::list_devices_body(registry.as_deref()).map_err(device_error);
+        }
+        // Revoking a device and issuing a code decide who holds a credential.
+        // Take the config write lock first and establish the caller's
+        // authority again under it, on fresh grants: every accepted policy
+        // change and every revocation takes this same lock, so the caller
+        // cannot lose `admin`, or its own credential, between this check and
+        // the effect.
+        let guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        let grants = self.recheck_config_write_authority(method, None, &guard)?;
+        self.require_admin_grants(method, &grants)?;
+        match method {
+            Method::PairingRevoke => {
+                let req: zeroclaw_api::jsonrpc::PairingRevokeRequest = parse_params(params)?;
+                crate::devices::revoke_device(
+                    registry.as_deref(),
+                    &pairing,
+                    config,
+                    &guard,
+                    &req.device_id,
+                )
+                .await
+                .map_err(device_error)
+            }
+            Method::PairingRevokeAll => code_result(
+                crate::devices::new_pairing_code(
+                    registry.as_deref(),
+                    &pairing,
+                    config,
+                    &guard,
+                    Some("all"),
+                )
+                .await,
+            ),
+            Method::PairingNewCode => {
+                let req: zeroclaw_api::jsonrpc::PairingNewCodeRequest = parse_params(params)?;
+                code_result(
+                    crate::devices::new_pairing_code(
+                        registry.as_deref(),
+                        &pairing,
+                        config,
+                        &guard,
+                        req.rotate.as_deref(),
+                    )
+                    .await,
+                )
+            }
+            _ => Err(rpc_err(
+                INTERNAL_ERROR,
+                format!("{} is not a pairing method", method.wire_name()),
+            )),
+        }
+    }
+
+    /// `channels/*`: through the registered [`super::channels::ChannelControl`],
+    /// with the bodies the dashboard's channel routes serve.
+    ///
+    /// `channels/bind` also writes `peer_groups`, granting an outside identity
+    /// access to the agents, so it is held to the config-write selector for
+    /// `peer_groups` as well as `channels:update`. The binding reaches
+    /// channels running on another config copy at the next reload, as it does
+    /// from the dashboard.
+    async fn handle_channels_method(&self, method: Method, params: &Value) -> RpcResult {
+        let Some(control) = self.ctx.channel_control.clone() else {
+            return Err(rpc_err(
+                INVALID_REQUEST,
+                format!(
+                    "{} is not available: this process runs no channels",
+                    method.wire_name()
+                ),
+            ));
+        };
+        match method {
+            Method::ChannelsList => {
+                let config = self.ctx.config.read().clone();
+                Ok(control.list(&config, self.ctx.auth.pairing()))
+            }
+            Method::ChannelsRelink => {
+                let req: zeroclaw_api::jsonrpc::ChannelsRelinkRequest = parse_params(params)?;
+                self.authorize_channel_owner(method, |info| {
+                    format!("{}.{}", info.channel_type, info.alias) == req.channel
+                })?;
+                let config = self.ctx.config.read().clone();
+                control.relink(&config, &req.channel)
+            }
+            Method::ChannelsBind => {
+                let req: zeroclaw_api::jsonrpc::ChannelsBindRequest = parse_params(params)?;
+                let is_channel = |info: &zeroclaw_config::schema::ChannelAliasInfo| {
+                    info.channel_type == req.channel_type.trim() && info.alias == req.alias.trim()
+                };
+                // Refuse early on the stamped grants, before waiting. The
+                // peer group the bind writes is not known yet: it is chosen
+                // from the persisted policy, read under the lock.
+                let Some(stamped) = self.stamped_grants().cloned() else {
+                    return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+                };
+                self.check_channel_bind(method, &stamped, &is_channel, None)?;
+                // The bind waits for the config write lock, and a policy change
+                // committed while it waited must be seen: re-resolve authority
+                // under the lock and run the same predicate on the fresh grants,
+                // the config in force now, and the path the write will touch.
+                // The lock is held through the write, so nothing publishes in
+                // between.
+                let guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+                let grants = self.recheck_config_write_authority(method, None, &guard)?;
+                self.check_channel_bind(method, &grants, &is_channel, None)?;
+                let authorize_write = |path: &str, verb: zeroclaw_api::grants::Verb| {
+                    self.check_channel_bind(method, &grants, &is_channel, Some((path, verb)))
+                };
+                let bound = control
+                    .bind(
+                        &self.ctx.config,
+                        &guard,
+                        &req.channel_type,
+                        &req.alias,
+                        &req.identity,
+                        &authorize_write,
+                    )
+                    .await?;
+                // One accepted persistence, one revision, as every config
+                // writer publishes: the policy compiled from what was just
+                // saved, still under the write lock.
+                if bound["saved"] == Value::Bool(true) {
+                    let persisted = self.ctx.config.read().clone();
+                    let revision = self.ctx.auth.accepted_revision().saturating_add(1);
+                    if let Err(error) = self.ctx.auth.publish_accepted(&persisted, revision) {
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({ "error": format!("{error}") })),
+                            "channels/bind: persisted configuration did not publish as an accepted policy"
+                        );
+                    }
+                }
+                Ok(bound)
+            }
+            _ => Err(rpc_err(
+                INTERNAL_ERROR,
+                format!("{} is not a channels method", method.wire_name()),
+            )),
+        }
+    }
+
+    /// `system/{upgrade,upgrade-status,restart}`: the in-app upgrade the
+    /// dashboard's `/api/version/upgrade` routes drive, and restarting a core
+    /// component.
+    ///
+    /// Upgrading replaces the running binary and restarting interrupts every
+    /// session, so both are administrator-only; reading upgrade progress is
+    /// not. Only the daemon restarts today: a gateway is restarted with the
+    /// daemon until the core supervises a separate gateway process.
+    fn handle_system_method(&self, method: Method, params: &Value) -> RpcResult {
+        let refusal = |refusal: crate::self_upgrade::UpgradeRefusal| {
+            let code = match refusal.http_status {
+                400 | 404 => INVALID_PARAMS,
+                _ => INVALID_REQUEST,
+            };
+            rpc_err(code, refusal.message)
+        };
+        match method {
+            Method::SystemUpgrade => {
+                self.require_admin(method)?;
+                let req: zeroclaw_api::jsonrpc::SystemUpgradeRequest = parse_params(params)?;
+                let allow_self_upgrade = self.ctx.config.read().gateway.allow_self_upgrade;
+                // Inside the daemon a self-respawn goes through the daemon's
+                // own shutdown path, so there is no standalone watch to pass.
+                let accepted = crate::self_upgrade::start_upgrade(
+                    allow_self_upgrade,
+                    crate::self_upgrade::UpgradeRequest {
+                        version: req.version,
+                        auto_restart: req.auto_restart,
+                    },
+                    None,
+                )
+                .map_err(refusal)?;
+                Ok(serde_json::to_value(accepted).unwrap_or(Value::Null))
+            }
+            Method::SystemUpgradeStatus => {
+                let req: zeroclaw_api::jsonrpc::SystemUpgradeStatusRequest = parse_params(params)?;
+                let status = crate::self_upgrade::upgrade_status(req.handoff_id.as_deref())
+                    .map_err(refusal)?;
+                Ok(serde_json::to_value(status).unwrap_or(Value::Null))
+            }
+            Method::SystemRestart => {
+                self.require_admin(method)?;
+                let req: zeroclaw_api::jsonrpc::SystemRestartRequest = parse_params(params)?;
+                if req.component != "daemon" {
+                    return Err(rpc_err(
+                        INVALID_PARAMS,
+                        format!(
+                            "cannot restart {:?}; the supported component is \"daemon\"",
+                            req.component
+                        ),
+                    ));
+                }
+                if !self.schedule_daemon_reload("system/restart") {
+                    return Err(rpc_err(
+                        INVALID_REQUEST,
+                        "no daemon supervisor is attached; restart the process instead",
+                    ));
+                }
+                Ok(serde_json::json!({ "component": "daemon", "restarting": true }))
+            }
+            _ => Err(rpc_err(
+                INTERNAL_ERROR,
+                format!("{} is not a system method", method.wire_name()),
+            )),
+        }
+    }
+
+    /// Refuse `method` unless this connection arrived on the local socket or
+    /// pipe. Minting a pairing code and revoking every paired token are
+    /// loopback-only over HTTP (`/admin/paircode/new`), and stay so here: a
+    /// remote administrator can revoke devices one at a time, but cannot mint
+    /// a credential or clear every other one from afar.
+    fn require_local_transport(&self, method: Method) -> Result<(), JsonRpcError> {
+        if self.transport_kind == crate::rpc::transport::TransportKind::Local {
+            return Ok(());
+        }
+        let denied = rpc_err(
+            FORBIDDEN,
+            format!(
+                "{} is only available on the local socket, as /admin/paircode/new is only \
+                 available from localhost",
+                method.wire_name()
+            ),
+        );
+        self.audit_auth_denial(
+            method,
+            &crate::rpc::auth::AuthDenied {
+                code: denied.code,
+                message: denied.message.clone(),
+            },
+        );
+        Err(denied)
+    }
+
+    /// Refuse `method` unless the bound principal may use every agent: for a
+    /// surface shared by all agents, where a principal scoped to some of them
+    /// must not change what the others see. An unbound dispatcher is refused.
+    fn authorize_every_agent(&self, method: Method, surface: &str) -> Result<(), JsonRpcError> {
+        let Some(grants) = self.stamped_grants() else {
+            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+        };
+        if grants.may_use_agent(zeroclaw_api::grants::WILDCARD) {
+            return Ok(());
+        }
+        let denied = rpc_err(
+            FORBIDDEN,
+            format!(
+                "{} on {surface} requires access to every agent",
+                method.wire_name()
+            ),
+        );
+        self.audit_auth_denial(
+            method,
+            &crate::rpc::auth::AuthDenied {
+                code: denied.code,
+                message: denied.message.clone(),
+            },
+        );
+        Err(denied)
+    }
+
+    /// Hold a channel operation to the agent that owns the channel alias. A
+    /// channel with no owner, or no such channel, needs access to every agent,
+    /// so an unknown channel is refused the same way as a forbidden one.
+    fn authorize_channel_owner(
+        &self,
+        method: Method,
+        matches: impl Fn(&zeroclaw_config::schema::ChannelAliasInfo) -> bool,
+    ) -> Result<(), JsonRpcError> {
+        let Some(grants) = self.stamped_grants() else {
+            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+        };
+        let grants = grants.clone();
+        self.check_channel_owner(method, &grants, matches)
+    }
+
+    /// [`Self::authorize_channel_owner`] against an explicit grant set and
+    /// the config in force now, for a handler that re-resolved its principal
+    /// after waiting.
+    fn check_channel_owner(
+        &self,
+        method: Method,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
+        matches: impl Fn(&zeroclaw_config::schema::ChannelAliasInfo) -> bool,
+    ) -> Result<(), JsonRpcError> {
+        let owner = self
+            .ctx
+            .config
+            .read()
+            .channels_by_alias()
+            .into_iter()
+            .find(|info| matches(info))
+            .and_then(|info| info.owning_agent);
+        let entitled = match owner.as_deref() {
+            Some(agent) => grants.may_use_agent(agent),
+            None => grants.may_use_agent(zeroclaw_api::grants::WILDCARD),
+        };
+        if entitled {
+            return Ok(());
+        }
+        let denied = rpc_err(
+            FORBIDDEN,
+            format!(
+                "{} is not permitted for this channel's owning agent",
+                method.wire_name()
+            ),
+        );
+        self.audit_auth_denial(
+            method,
+            &crate::rpc::auth::AuthDenied {
+                code: denied.code,
+                message: denied.message.clone(),
+            },
+        );
+        Err(denied)
+    }
+
+    /// The whole `channels/bind` predicate: the channel's owning agent and,
+    /// once the bind has chosen it, what the dashboard route requires of a
+    /// config write: the `config` verb its effect needs (`create` for a new
+    /// peer group, `update` otherwise) and write access to the path it
+    /// writes. Admission and the check under the config write lock both call
+    /// this, with different grants.
+    fn check_channel_bind(
+        &self,
+        method: Method,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
+        is_channel: &impl Fn(&zeroclaw_config::schema::ChannelAliasInfo) -> bool,
+        write: Option<(&str, zeroclaw_api::grants::Verb)>,
+    ) -> Result<(), JsonRpcError> {
+        self.check_channel_owner(method, grants, is_channel)?;
+        let Some((path, verb)) = write else {
+            return Ok(());
+        };
+        let denied = if !grants.permits(zeroclaw_api::grants::Resource::Config, verb) {
+            crate::rpc::auth::AuthDenied::forbidden(format!(
+                "Principal is not granted config:{verb} for {path:?}"
+            ))
+        } else if !grants.may_write_config(path) {
+            crate::rpc::auth::AuthDenied::forbidden(format!(
+                "Principal is not granted config write access to {path:?}"
+            ))
+        } else {
+            return Ok(());
+        };
+        self.audit_auth_denial(method, &denied);
+        Err(rpc_err(denied.code, denied.message))
+    }
+
+    /// Refuse `method` unless the bound principal is an administrator. An
+    /// unbound dispatcher is refused.
+    fn require_admin(&self, method: Method) -> Result<(), JsonRpcError> {
+        let Some(grants) = self.stamped_grants() else {
+            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+        };
+        self.require_admin_grants(method, grants)
+    }
+
+    /// [`Self::require_admin`] on an explicit grant set, for a handler that
+    /// has resolved its caller's authority again after waiting for the config
+    /// write lock.
+    fn require_admin_grants(
+        &self,
+        method: Method,
+        grants: &zeroclaw_api::grants::ResolvedGrants,
+    ) -> Result<(), JsonRpcError> {
+        if grants.admin {
+            return Ok(());
+        }
+        let denied = rpc_err(
+            FORBIDDEN,
+            format!("{} requires an administrator", method.wire_name()),
+        );
+        self.audit_auth_denial(
+            method,
+            &crate::rpc::auth::AuthDenied {
+                code: denied.code,
+                message: denied.message.clone(),
+            },
+        );
+        Err(denied)
+    }
+
+    /// `canvas/*`: the daemon's one canvas store, with the bodies and failures
+    /// the `/api/canvas` routes use. See [`super::canvas`].
+    fn handle_canvas_method(&self, method: Method, params: &Value) -> RpcResult {
+        use zeroclaw_api::jsonrpc::{CanvasIdRequest, CanvasRenderRequest};
+        // Canvas ids are chosen by agents and not namespaced, and every agent,
+        // the dashboard and every `canvas:*` holder share the one store. A
+        // principal scoped to some agents would otherwise read, overwrite or
+        // clear canvases drawn by agents it may not use.
+        self.authorize_every_agent(method, "the shared canvas store")?;
+        let store = &self.ctx.canvas_store;
+        match method {
+            Method::CanvasList => Ok(super::canvas::list_body(store)),
+            Method::CanvasGet => {
+                let req: CanvasIdRequest = parse_params(params)?;
+                Ok(super::canvas::get_body(store, &req.canvas_id)?)
+            }
+            Method::CanvasHistory => {
+                let req: CanvasIdRequest = parse_params(params)?;
+                Ok(super::canvas::history_body(store, &req.canvas_id))
+            }
+            Method::CanvasRender => {
+                let req: CanvasRenderRequest = parse_params(params)?;
+                Ok(super::canvas::render_body(
+                    store,
+                    &req.canvas_id,
+                    req.content_type.as_deref(),
+                    &req.content,
+                )?)
+            }
+            Method::CanvasClear => {
+                let req: CanvasIdRequest = parse_params(params)?;
+                Ok(super::canvas::clear_body(store, &req.canvas_id))
+            }
+            _ => Err(rpc_err(
+                INTERNAL_ERROR,
+                format!("{} is not a canvas method", method.wire_name()),
+            )),
+        }
+    }
+
+    /// Refuse `method` unless the bound principal may use agent `alias`. An
+    /// unbound dispatcher is refused.
+    fn authorize_agent_selector(&self, method: Method, alias: &str) -> Result<(), JsonRpcError> {
+        self.authorize_workspace_scope(method, Some(alias))
+    }
+
+    /// Hold a `workspace/list` or `fs/*` operation to the principal's agent
+    /// selector, before anything touches the filesystem, so a refusal does
+    /// not reveal whether a path exists. With `agent`, the principal must be
+    /// entitled to that agent, and, as [`Self::selector_agent`] holds, a
+    /// principal without operator grants may name only an agent the current
+    /// configuration defines: the alias becomes a directory under the agents
+    /// tree, so a wildcard selector would otherwise reach a removed agent's
+    /// workspace or create one for any name. Without an agent the operation
+    /// targets the shared area every agent reads, so the principal must be
+    /// entitled to every agent: one scoped to some agents must not change
+    /// what the others see. An unbound dispatcher is refused, as it is for
+    /// `fs/list_dir`.
+    fn authorize_workspace_scope(
+        &self,
+        method: Method,
+        agent: Option<&str>,
+    ) -> Result<(), JsonRpcError> {
+        let Some(grants) = self.stamped_grants() else {
+            return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
+        };
+        if workspace_scope_permits(grants, &self.ctx.config.read(), agent) {
+            return Ok(());
+        }
+        let denied = workspace_scope_refusal(method, agent);
+        self.audit_auth_denial(method, &denied);
+        Err(rpc_err(denied.code, denied.message))
+    }
+
     /// Confine `fs/list_dir` to what the bound principal may read, before the
     /// handler probes the path, so a refusal does not reveal whether the path
     /// exists. The coarse `Files:Read` grant has already passed the gate; see
@@ -1918,6 +2779,25 @@ impl RpcDispatcher {
     ) -> bool {
         self.transport_kind == crate::rpc::transport::TransportKind::Local
             && grants.is_some_and(|grants| grants.admin)
+    }
+
+    /// The canvas store a session on `agent_alias` draws into: the daemon's
+    /// store, addressed only through that agent's namespace.
+    ///
+    /// Canvas ids carry no owner, so an unrestricted handle to the shared
+    /// store reads, overwrites and clears every agent's frames, and deciding
+    /// once at construction would outlive a later change to the principal's
+    /// grants. A namespaced handle cannot name a canvas outside its agent's
+    /// namespace, whatever the principal holds now or later, and a session is
+    /// usable only while its principal may use that agent, which each prompt
+    /// establishes again. The dashboard and `canvas/*` still see every
+    /// namespace through the unrestricted store.
+    ///
+    /// An alias that cannot be a namespace, such as one containing `/` from
+    /// a hand-written `[agents."a/b"]` table, gets `None`: the session draws
+    /// into a private store of its own and reaches no shared canvas.
+    fn session_canvas_store(&self, agent_alias: &str) -> Option<crate::tools::CanvasStore> {
+        self.ctx.canvas_store.namespaced(agent_alias)
     }
 
     fn session_tui_env(
@@ -3075,6 +3955,12 @@ impl RpcDispatcher {
                 Ok(auth) => super::fs::handle_fs_list_dir(&req.params, &auth).await,
                 Err(denied) => Err(denied),
             },
+            Method::WorkspaceList
+            | Method::FsMkdir
+            | Method::FsRmdir
+            | Method::FsRead
+            | Method::FsDelete
+            | Method::FsMove => self.handle_workspace_method(method, &req.params).await,
 
             // Locales
             Method::LocalesList => super::locales::handle_locales_list(self.tui_id()),
@@ -3109,6 +3995,37 @@ impl RpcDispatcher {
             Method::SopsGraphDraft => self.handle_sops_graph_draft(&req.params),
             Method::SopsTriggerSources => self.handle_sops_trigger_sources(),
             Method::ToolsParamOptions => self.handle_tools_param_options(&req.params),
+            Method::ToolsCliDiscover
+            | Method::IntegrationsList
+            | Method::PluginsList
+            | Method::A2aIdentity => {
+                Box::pin(self.handle_catalog_method(method, &req.params)).await
+            }
+            Method::ToolsList => Box::pin(self.handle_tools_list(&req.params)).await,
+            Method::PairingList
+            | Method::PairingRevoke
+            | Method::PairingRevokeAll
+            | Method::PairingNewCode => {
+                Box::pin(self.handle_pairing_method(method, &req.params)).await
+            }
+            Method::SystemUpgrade | Method::SystemUpgradeStatus | Method::SystemRestart => {
+                self.handle_system_method(method, &req.params)
+            }
+            Method::ChannelsList | Method::ChannelsRelink | Method::ChannelsBind => {
+                Box::pin(self.handle_channels_method(method, &req.params)).await
+            }
+            Method::MetricsScrape => {
+                let observability = self.ctx.config.read().observability.clone();
+                Ok(serde_json::json!({
+                    "content_type": crate::observability::PROMETHEUS_CONTENT_TYPE,
+                    "text": crate::observability::prometheus_exposition(&observability),
+                }))
+            }
+            Method::CanvasList
+            | Method::CanvasGet
+            | Method::CanvasHistory
+            | Method::CanvasRender
+            | Method::CanvasClear => self.handle_canvas_method(method, &req.params),
         };
 
         if is_notification {
@@ -4095,6 +5012,7 @@ impl RpcDispatcher {
                     tui_env,
                     self.ctx.sop_engine.clone(),
                     self.ctx.sop_audit.clone(),
+                    self.session_canvas_store(&req.agent_alias),
                     store,
                     self.principal_tool_narrowing(),
                 )
@@ -4109,6 +5027,7 @@ impl RpcDispatcher {
                     tui_env,
                     self.ctx.sop_engine.clone(),
                     self.ctx.sop_audit.clone(),
+                    self.session_canvas_store(&req.agent_alias),
                     self.principal_tool_narrowing(),
                 )
                 .await
@@ -5152,6 +6071,7 @@ impl RpcDispatcher {
                 tui_env,
                 self.ctx.sop_engine.clone(),
                 self.ctx.sop_audit.clone(),
+                self.session_canvas_store(&data.agent_alias),
                 Arc::clone(&store),
                 self.principal_tool_narrowing(),
             )
@@ -11813,6 +12733,8 @@ pub(crate) mod connection_test_support {
 
 #[cfg(test)]
 mod tests {
+    mod p6_parity;
+
     use zeroclaw_api::model_provider::ChatMessage;
 
     /// The personality filename allowlist constrains the name, not its target.
@@ -12582,7 +13504,14 @@ mod tests {
 
         // Live revocation on the shared guard denies the ESTABLISHED
         // connection before its next privileged operation.
-        assert!(ctx.auth.pairing().revoke_token("zc_tok"));
+        assert!(
+            ctx.auth.pairing().revoke_token(
+                "zc_tok",
+                &Arc::clone(&ctx.config_write_lock)
+                    .try_lock_owned()
+                    .expect("no writer holds the test lock")
+            )
+        );
         let denied = dispatcher
             .authorize(Method::Status, Resource::System, Verb::Read)
             .expect_err("revoked pairing token invalidates the connection");
@@ -15812,7 +16741,17 @@ mod tests {
         let (revoking_ctx, probing_ctx) = (Arc::clone(&ctx), Arc::clone(&ctx));
         let (timeline, thread) = race_a_revocation_through_the_commit(
             &ctx,
-            move || assert!(revoking_ctx.auth.pairing().revoke_token("zc_tok")),
+            move || {
+                let serialized = Arc::clone(&revoking_ctx.config_write_lock)
+                    .try_lock_owned()
+                    .expect("no writer holds the test lock");
+                assert!(
+                    revoking_ctx
+                        .auth
+                        .pairing()
+                        .revoke_token("zc_tok", &serialized)
+                );
+            },
             move || {
                 probing_ctx
                     .auth
@@ -15877,7 +16816,13 @@ mod tests {
             "file/upload/commit",
             json!({"upload_id": upload_id}),
             async move {
-                assert!(change_ctx.auth.pairing().revoke_token("zc_tok"));
+                let serialized = Arc::clone(&change_ctx.config_write_lock).lock_owned().await;
+                assert!(
+                    change_ctx
+                        .auth
+                        .pairing()
+                        .revoke_token("zc_tok", &serialized)
+                );
             },
         )
         .await;
@@ -34301,154 +35246,164 @@ mod tests {
     /// Every entry is checked against the caller's config-path selector
     /// before the first is staged: one refused path refuses the batch
     /// wholesale, even when the entries before it are individually allowed.
-    #[tokio::test]
-    async fn config_set_many_refuses_wholesale_when_any_path_is_outside_the_selector() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut config = roster_config(4242);
-        {
-            let profile = config.permission_profiles.get_mut("reader").unwrap();
-            profile.config_write_paths = vec!["gateway.*".into()];
-            profile.grants.insert(
-                zeroclaw_api::grants::Resource::Config,
-                vec![zeroclaw_api::grants::Verb::Update],
+    #[test]
+    fn config_set_many_refuses_wholesale_when_any_path_is_outside_the_selector() {
+        // Config-handler frames exceed the default test stack in debug
+        // builds; see `run_on_a_large_stack`.
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = roster_config(4242);
+            {
+                let profile = config.permission_profiles.get_mut("reader").unwrap();
+                profile.config_write_paths = vec!["gateway.*".into()];
+                profile.grants.insert(
+                    zeroclaw_api::grants::Resource::Config,
+                    vec![zeroclaw_api::grants::Verb::Update],
+                );
+            }
+            config
+                .create_map_key("providers.models.anthropic", "default")
+                .expect("create anthropic.default");
+            let port_before = config.gateway.port;
+            let (mut dispatcher, mut rx) =
+                authenticated_roster_dispatcher(&tmp, config, 4242).await;
+            let disk_before = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+
+            let response = rpc_roundtrip(
+                &mut dispatcher,
+                &mut rx,
+                "config/set-many",
+                json!({"sets": [
+                    {"prop": "gateway.port", "value": port_before + 1},
+                    {"prop": "providers.models.anthropic.default.model", "value": "denied-model"},
+                ]}),
+            )
+            .await;
+            assert_eq!(
+                response["error"]["code"],
+                json!(FORBIDDEN),
+                "a path outside the selector must refuse the batch: {response}"
             );
-        }
-        config
-            .create_map_key("providers.models.anthropic", "default")
-            .expect("create anthropic.default");
-        let port_before = config.gateway.port;
-        let (mut dispatcher, mut rx) = authenticated_roster_dispatcher(&tmp, config, 4242).await;
-        let disk_before = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+            let message = response["error"]["message"].as_str().unwrap();
+            assert!(
+                message.contains("entry 1"),
+                "error must name the refused entry: {message}"
+            );
+            assert_eq!(
+                dispatcher.ctx.config.read().gateway.port,
+                port_before,
+                "the allowed entry before the refused one must not have been applied"
+            );
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join("config.toml")).unwrap(),
+                disk_before,
+                "nothing may reach disk"
+            );
 
-        let response = rpc_roundtrip(
-            &mut dispatcher,
-            &mut rx,
-            "config/set-many",
-            json!({"sets": [
-                {"prop": "gateway.port", "value": port_before + 1},
-                {"prop": "providers.models.anthropic.default.model", "value": "denied-model"},
-            ]}),
-        )
-        .await;
-        assert_eq!(
-            response["error"]["code"],
-            json!(FORBIDDEN),
-            "a path outside the selector must refuse the batch: {response}"
-        );
-        let message = response["error"]["message"].as_str().unwrap();
-        assert!(
-            message.contains("entry 1"),
-            "error must name the refused entry: {message}"
-        );
-        assert_eq!(
-            dispatcher.ctx.config.read().gateway.port,
-            port_before,
-            "the allowed entry before the refused one must not have been applied"
-        );
-        assert_eq!(
-            std::fs::read_to_string(tmp.path().join("config.toml")).unwrap(),
-            disk_before,
-            "nothing may reach disk"
-        );
-
-        // Control: the same principal may batch the allowed path alone, so
-        // it was the selector — not the coarse Config:Update gate — that
-        // refused above.
-        let response = rpc_roundtrip(
-            &mut dispatcher,
-            &mut rx,
-            "config/set-many",
-            json!({"sets": [{"prop": "gateway.port", "value": port_before + 1}]}),
-        )
-        .await;
-        assert!(
-            response.get("error").is_none(),
-            "a batch within the selector must commit: {response}"
-        );
-        assert_eq!(dispatcher.ctx.config.read().gateway.port, port_before + 1);
+            // Control: the same principal may batch the allowed path alone, so
+            // it was the selector — not the coarse Config:Update gate — that
+            // refused above.
+            let response = rpc_roundtrip(
+                &mut dispatcher,
+                &mut rx,
+                "config/set-many",
+                json!({"sets": [{"prop": "gateway.port", "value": port_before + 1}]}),
+            )
+            .await;
+            assert!(
+                response.get("error").is_none(),
+                "a batch within the selector must commit: {response}"
+            );
+            assert_eq!(dispatcher.ctx.config.read().gateway.port, port_before + 1);
+        });
     }
 
     /// The motivating case: `save_and_swap_config` validates the auth
     /// sections before persisting, so a `[users.<name>]` entry cannot be
     /// authored one field at a time in either order — each single
     /// `config/set` is refused. The same two writes in one batch commit.
-    #[tokio::test]
-    async fn config_set_many_authors_a_user_whose_fields_are_refused_one_at_a_time() {
-        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut config = zeroclaw_config::schema::Config::default();
-        config.permission_profiles.insert(
-            "admin".into(),
-            PermissionProfileConfig {
-                admin: true,
-                ..PermissionProfileConfig::default()
-            },
-        );
-        config
-            .create_map_key("permission_profiles", "operator")
-            .expect("create permission_profiles.operator");
-        config.users.insert(
-            "root-operator".into(),
-            UserConfig {
-                principal_id: None,
-                uid: Some(4242),
-                permission_profiles: vec!["admin".into()],
-            },
-        );
-        let (mut dispatcher, mut rx) = authenticated_roster_dispatcher(&tmp, config, 4242).await;
-        let disk_before = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+    #[test]
+    fn config_set_many_authors_a_user_whose_fields_are_refused_one_at_a_time() {
+        // Config-handler frames exceed the default test stack in debug
+        // builds; see `run_on_a_large_stack`.
+        run_on_a_large_stack(|| async move {
+            use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = zeroclaw_config::schema::Config::default();
+            config.permission_profiles.insert(
+                "admin".into(),
+                PermissionProfileConfig {
+                    admin: true,
+                    ..PermissionProfileConfig::default()
+                },
+            );
+            config
+                .create_map_key("permission_profiles", "operator")
+                .expect("create permission_profiles.operator");
+            config.users.insert(
+                "root-operator".into(),
+                UserConfig {
+                    principal_id: None,
+                    uid: Some(4242),
+                    permission_profiles: vec!["admin".into()],
+                },
+            );
+            let (mut dispatcher, mut rx) =
+                authenticated_roster_dispatcher(&tmp, config, 4242).await;
+            let disk_before = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
 
-        for (entry, missing) in [
-            (
-                json!({"prop": "users.bob.uid", "value": 1001}),
-                "users.bob.permission_profiles is required",
-            ),
-            (
-                json!({"prop": "users.bob.permission_profiles", "value": ["operator"]}),
-                "users.bob.uid is required",
-            ),
-        ] {
-            let response = rpc_roundtrip(&mut dispatcher, &mut rx, "config/set", entry).await;
-            let message = response["error"]["message"]
-                .as_str()
-                .unwrap_or_else(|| panic!("a lone write must be refused: {response}"));
-            assert!(
-                message.contains(missing),
-                "refusal must name the missing co-required field: {message}"
-            );
-            assert!(
-                !dispatcher.ctx.config.read().users.contains_key("bob"),
-                "a refused single write must not install a half-authored user"
-            );
-            assert_eq!(
-                std::fs::read_to_string(tmp.path().join("config.toml")).unwrap(),
-                disk_before,
-                "a refused single write must not reach disk"
-            );
-        }
+            for (entry, missing) in [
+                (
+                    json!({"prop": "users.bob.uid", "value": 1001}),
+                    "users.bob.permission_profiles is required",
+                ),
+                (
+                    json!({"prop": "users.bob.permission_profiles", "value": ["operator"]}),
+                    "users.bob.uid is required",
+                ),
+            ] {
+                let response = rpc_roundtrip(&mut dispatcher, &mut rx, "config/set", entry).await;
+                let message = response["error"]["message"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("a lone write must be refused: {response}"));
+                assert!(
+                    message.contains(missing),
+                    "refusal must name the missing co-required field: {message}"
+                );
+                assert!(
+                    !dispatcher.ctx.config.read().users.contains_key("bob"),
+                    "a refused single write must not install a half-authored user"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(tmp.path().join("config.toml")).unwrap(),
+                    disk_before,
+                    "a refused single write must not reach disk"
+                );
+            }
 
-        let response = rpc_roundtrip(
-            &mut dispatcher,
-            &mut rx,
-            "config/set-many",
-            json!({"sets": [
-                {"prop": "users.bob.uid", "value": 1001},
-                {"prop": "users.bob.permission_profiles", "value": ["operator"]},
-            ]}),
-        )
-        .await;
-        assert!(
-            response.get("error").is_none(),
-            "the same two writes in one batch must commit: {response}"
-        );
-        let on_disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
-        let reparsed: zeroclaw_config::schema::Config = toml::from_str(&on_disk).unwrap();
-        let bob = reparsed
-            .users
-            .get("bob")
-            .unwrap_or_else(|| panic!("users.bob must reach disk; on-disk file:\n{on_disk}"));
-        assert_eq!(bob.uid, Some(1001));
-        assert_eq!(bob.permission_profiles, vec!["operator".to_string()]);
+            let response = rpc_roundtrip(
+                &mut dispatcher,
+                &mut rx,
+                "config/set-many",
+                json!({"sets": [
+                    {"prop": "users.bob.uid", "value": 1001},
+                    {"prop": "users.bob.permission_profiles", "value": ["operator"]},
+                ]}),
+            )
+            .await;
+            assert!(
+                response.get("error").is_none(),
+                "the same two writes in one batch must commit: {response}"
+            );
+            let on_disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+            let reparsed: zeroclaw_config::schema::Config = toml::from_str(&on_disk).unwrap();
+            let bob = reparsed
+                .users
+                .get("bob")
+                .unwrap_or_else(|| panic!("users.bob must reach disk; on-disk file:\n{on_disk}"));
+            assert_eq!(bob.uid, Some(1001));
+            assert_eq!(bob.permission_profiles, vec!["operator".to_string()]);
+        });
     }
 
     #[tokio::test]
@@ -34826,6 +35781,8 @@ mod tests {
             sop_driver_handles: None,
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
+            canvas_store: crate::tools::CanvasStore::default(),
+            channel_control: None,
             cert_audit: None,
             auth: crate::rpc::auth::RpcInboundAuth::for_tests(
                 &zeroclaw_config::schema::Config::default(),
@@ -34877,6 +35834,8 @@ mod tests {
             sop_driver_handles: None,
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
+            canvas_store: crate::tools::CanvasStore::default(),
+            channel_control: None,
             cert_audit: None,
             auth: crate::rpc::auth::RpcInboundAuth::for_tests(
                 &zeroclaw_config::schema::Config::default(),
@@ -34987,6 +35946,8 @@ mod tests {
             sop_driver_handles: None,
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
+            canvas_store: crate::tools::CanvasStore::default(),
+            channel_control: None,
             cert_audit: None,
             auth: crate::rpc::auth::RpcInboundAuth::for_tests(
                 &zeroclaw_config::schema::Config::default(),

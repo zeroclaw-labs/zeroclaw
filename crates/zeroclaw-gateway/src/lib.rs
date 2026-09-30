@@ -57,7 +57,7 @@ pub mod ws;
 pub mod ws_approval;
 pub mod ws_sop_runs;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 #[cfg(any(
     feature = "channel-email",
     feature = "channel-linq",
@@ -660,12 +660,7 @@ fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
 }
 
 fn default_agent_alias(config: &Config) -> Option<String> {
-    config
-        .agents
-        .iter()
-        .filter(|(_, a)| a.enabled)
-        .map(|(alias, _)| alias.clone())
-        .min()
+    zeroclaw_runtime::tools::listing::default_listing_alias(config)
 }
 
 /// Owned guard for [`AppState::config_write_lock`]. Owned (not borrowed) so
@@ -1318,88 +1313,32 @@ pub async fn run_gateway_with_plugin_webhooks(
         .map(|(alias, _)| alias.clone())
         .collect();
     other_aliases.sort();
+    // The per-agent listings come from the same function `tools/list` uses,
+    // so the dashboard and the RPC method list the same tools for an agent.
+    let listing_deps = zeroclaw_runtime::tools::listing::ToolListingDeps {
+        runtime: Arc::clone(&runtime),
+        memory: Arc::clone(&mem),
+        canvas_store: canvas_store.clone(),
+        sop_engine: sop_engine.clone(),
+        sop_audit: sop_audit.clone(),
+    };
     for alias in other_aliases {
-        let Some(risk_profile) = config.risk_profile_for_agent(&alias) else {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"agent_alias": alias})),
-                "Gateway: agent risk_profile does not resolve; skipping its /api/tools listing."
-            );
-            continue;
-        };
-        let risk_profile = risk_profile.clone();
-        let security = match SecurityPolicy::for_agent(&config, &alias) {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
+        match zeroclaw_runtime::tools::listing::agent_tool_specs(&config, &alias, &listing_deps)
+            .await?
+        {
+            Some(specs) => {
+                tools_registry_by_agent.insert(alias, Arc::new(specs));
+            }
+            None => {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"agent_alias": alias, "error": format!("{e}")})
-                        ),
-                    "Gateway: agent SecurityPolicy failed to build; skipping its /api/tools listing."
+                        .with_attrs(::serde_json::json!({"agent_alias": alias})),
+                    "Gateway: agent risk_profile or SecurityPolicy does not resolve; skipping its /api/tools listing."
                 );
-                continue;
             }
-        };
-        let agent_tools_result = tools::all_tools_with_runtime(
-            Arc::new(config.clone()),
-            &security,
-            &risk_profile,
-            &alias,
-            Arc::clone(&runtime),
-            Arc::clone(&mem),
-            composio_key,
-            composio_entity_id,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &config.data_dir,
-            &config.agents,
-            config
-                .model_provider_for_agent(&alias)
-                .and_then(|e| e.api_key.as_deref()),
-            &config,
-            Some(canvas_store.clone()),
-            false,
-            None,
-            sop_engine.clone(),
-            sop_audit.clone(),
-            None,
-        )?;
-        // Same gated seam as the dashboard seed above, so this listing shows
-        // the agent's policy-filtered set (filter + MCP). The tools are only
-        // enumerated for their specs, never invoked, so the returned channel
-        // handles, deferred section, and activation handle are unused.
-        let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
-            config: &config,
-            agent_alias: &alias,
-            security: &security,
-            built: agent_tools_result,
-            // Same divergence note as the dashboard seed: no skills on the
-            // gateway until Epic F unifies the loaders.
-            skills: &[],
-            runtime: Arc::clone(&runtime),
-            caller_allowed: None,
-            connect_mcp: true,
-            // Gateway tool-listing path: short-lived, no cross-turn reuse
-            // contract, so the per-call connect is correct.
-            mcp_registry: None,
-            // Same as the seed: never open hardware for a listing (and
-            // `config.peripherals` is global - N per-agent opens of the same
-            // boards would fail against the first holder anyway).
-            connect_peripherals: false,
-            emit_assembly_logs: false,
-            exclude_memory: false,
-            acp_delivery: false,
-            list_deferred_mcp_specs: true,
-        })
-        .await;
-        let specs: Vec<ToolSpec> = assembled.registry.iter().map(|t| t.spec()).collect();
-        tools_registry_by_agent.insert(alias, Arc::new(specs));
+        }
     }
     let tools_registry_by_agent: Arc<HashMap<String, Arc<Vec<ToolSpec>>>> =
         Arc::new(tools_registry_by_agent);
@@ -1932,7 +1871,7 @@ pub async fn run_gateway_with_plugin_webhooks(
 
     // Device registry and pairing store (only when pairing is required)
     let device_registry = if config.gateway.require_pairing {
-        let registry = Arc::new(api_pairing::DeviceRegistry::new(&config.data_dir));
+        let registry = api_pairing::DeviceRegistry::shared(&config.data_dir);
         // Reconcile the registry against the canonical paired-token set so that
         // tokens paired via the legacy `/pair` route (and any other historical
         // orphans) become visible and revocable in the management UI. The token
@@ -2635,9 +2574,7 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 fn prometheus_disabled_hint() -> String {
-    String::from(
-        "# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n",
-    )
+    zeroclaw_runtime::observability::PROMETHEUS_DISABLED_HINT.to_string()
 }
 
 #[cfg(feature = "observability-prometheus")]
@@ -2749,7 +2686,8 @@ async fn handle_pair(
                             .with_attrs(::serde_json::json!({"error": format!("{e}")})),
                         "device registry insert failed after successful legacy /pair; rolling back in-process token"
                     );
-                    state.pairing.revoke_token_hash(&token_hash);
+                    let held = state.config_write_lock.clone().lock_owned().await;
+                    state.pairing.revoke_token_hash(&token_hash, &held);
                     let body = serde_json::json!({
                         "paired": false,
                         "persisted": false,
@@ -2773,7 +2711,8 @@ async fn handle_pair(
                         .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
                     "pairing token persistence failed; rolling back in-process token"
                 );
-                state.pairing.revoke_token_hash(&token_hash);
+                let held = state.config_write_lock.clone().lock_owned().await;
+                state.pairing.revoke_token_hash(&token_hash, &held);
                 let body = serde_json::json!({
                     "paired": false,
                     "persisted": false,
@@ -2824,28 +2763,7 @@ pub(crate) async fn persist_pairing_tokens(
     pairing: &PairingGuard,
     config_write_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> Result<()> {
-    // Self-contained: no caller pre-reads config for modify, so this
-    // acquires the witness itself rather than taking it as a param. Held
-    // across the whole read-modify-save-swap below.
-    let _guard = Arc::clone(&config_write_lock).lock_owned().await;
-    debug_assert!(
-        config_write_lock.try_lock().is_err(),
-        "persist_pairing_tokens must hold config_write_lock across its read-modify-save-swap"
-    );
-    let paired_tokens = pairing.tokens();
-    // This is needed because parking_lot's guard is not Send so we clone the inner
-    // this should be removed once async mutexes are used everywhere
-    let mut updated_cfg = { config.read().clone() };
-    updated_cfg.gateway.paired_tokens = paired_tokens;
-    updated_cfg.mark_dirty("gateway.paired_tokens");
-    updated_cfg
-        .save_dirty()
-        .await
-        .context("Failed to persist paired tokens to config.toml")?;
-
-    // Keep shared runtime config in sync with persisted tokens.
-    *config.write() = updated_cfg;
-    Ok(())
+    zeroclaw_runtime::devices::persist_pairing_tokens(config, pairing, config_write_lock).await
 }
 
 /// Result of a gateway chat turn.
@@ -4922,147 +4840,21 @@ async fn handle_admin_paircode_new(
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_localhost(&peer)?;
     require_gateway_admin_token(&state, &headers)?;
-
-    if !state.pairing.require_pairing() {
-        let body = serde_json::json!({
-            "success": false,
-            "pairing_required": false,
-            "pairing_code": null,
-            "message": "Pairing is disabled for this gateway"
-        });
-        return Ok((StatusCode::BAD_REQUEST, Json(body)));
-    }
-
-    let rotate = params
-        .rotate
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-
-    let revocation_message = match rotate {
-        Some("all") => {
-            let revoked = state.pairing.revoke_all_tokens();
-            if let Some(registry) = state.device_registry.as_ref() {
-                if let Err(e) = registry.clear() {
-                    let body = serde_json::json!({
-                        "success": false,
-                        "pairing_required": true,
-                        "pairing_code": null,
-                        "message": format!("Tokens revoked in memory but device registry clear failed: {e}"),
-                    });
-                    return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
-                }
-            }
-            if let Err(e) = persist_pairing_tokens(
-                state.config.clone(),
-                &state.pairing,
-                state.config_write_lock.clone(),
-            )
-            .await
-            {
-                let body = serde_json::json!({
-                    "success": false,
-                    "pairing_required": true,
-                    "pairing_code": null,
-                    "message": format!("Tokens revoked in memory but config persist failed: {e}"),
-                });
-                return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
-            }
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"revoked": revoked})),
-                "all paired tokens revoked via admin endpoint"
-            );
-            Some(format!(
-                "Revoked all {revoked} paired token(s) and cleared the device registry."
-            ))
-        }
-        Some(device_id) => {
-            let Some(registry) = state.device_registry.as_ref() else {
-                let body = serde_json::json!({
-                    "success": false,
-                    "pairing_required": true,
-                    "pairing_code": null,
-                    "message": "Device registry is disabled; cannot rotate a single device.",
-                });
-                return Ok((StatusCode::SERVICE_UNAVAILABLE, Json(body)));
-            };
-            let token_hash = match registry.revoke(device_id) {
-                Ok(Some(hash)) => hash,
-                Ok(None) => {
-                    let body = serde_json::json!({
-                        "success": false,
-                        "pairing_required": true,
-                        "pairing_code": null,
-                        "message": format!("Device '{device_id}' not found; nothing revoked."),
-                    });
-                    return Ok((StatusCode::NOT_FOUND, Json(body)));
-                }
-                Err(e) => {
-                    let body = serde_json::json!({
-                        "success": false,
-                        "pairing_required": true,
-                        "pairing_code": null,
-                        "message": format!("Device registry error: {e}"),
-                    });
-                    return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
-                }
-            };
-            state.pairing.revoke_token_hash(&token_hash);
-            if let Err(e) = persist_pairing_tokens(
-                state.config.clone(),
-                &state.pairing,
-                state.config_write_lock.clone(),
-            )
-            .await
-            {
-                let body = serde_json::json!({
-                    "success": false,
-                    "pairing_required": true,
-                    "pairing_code": null,
-                    "message": format!("Token revoked in memory but config persist failed: {e}"),
-                });
-                return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
-            }
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                "single device token revoked via admin endpoint"
-            );
-            Some(format!(
-                "Revoked the bearer token for device '{device_id}'."
-            ))
-        }
-        None => None,
-    };
-
-    let code = state
-        .pairing
-        .generate_new_pairing_code(live_pairing_code_policy(&state))
-        .expect("require_pairing checked above");
-    if rotate.is_none() {
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "new pairing code generated via admin endpoint"
-        );
-    }
-
-    let message = match revocation_message {
-        Some(revoked) => {
-            format!("{revoked} Use this one-time code to re-pair.")
-        }
-        None => "New pairing code generated — use this one-time code to pair".to_string(),
-    };
-
-    let body = serde_json::json!({
-        "success": true,
-        "pairing_required": true,
-        "pairing_code": code,
-        "message": message,
-    });
-    Ok((StatusCode::OK, Json(body)))
+    // Issuing a code, and any rotation before it, runs under the config
+    // write lock with the admin token checked again under it, so the same
+    // lock that orders policy changes and revocations orders this too.
+    let guard = state.config_write_lock.clone().lock_owned().await;
+    require_gateway_admin_token(&state, &headers)?;
+    let (status, body) = zeroclaw_runtime::devices::new_pairing_code(
+        state.device_registry.as_deref(),
+        &state.pairing,
+        state.config.clone(),
+        &guard,
+        params.rotate.as_deref(),
+    )
+    .await;
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    Ok((status, Json(body)))
 }
 
 /// GET /pair/code — whether pairing is required. It never returns the code.
@@ -13274,6 +13066,9 @@ data: [DONE]\n\n";
         );
     }
 }
+
+#[cfg(test)]
+mod p6_parity_tests;
 
 #[cfg(test)]
 mod accept_error_tests {

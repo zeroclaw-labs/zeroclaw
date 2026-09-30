@@ -136,7 +136,14 @@ mod tests {
                 .await
                 .is_allowed()
         );
-        assert!(guard.revoke_token("zc_tok"));
+        assert!(
+            guard.revoke_token(
+                "zc_tok",
+                &Arc::new(tokio::sync::Mutex::new(()))
+                    .try_lock_owned()
+                    .expect("a fresh mutex is free"),
+            )
+        );
         assert!(
             !provider
                 .verify(&Credential::Bearer("zc_tok".into()))
