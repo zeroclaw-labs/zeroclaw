@@ -986,6 +986,9 @@ fn local_update_rejects_incomplete_materialized_skill_and_preserves_config() {
         )
     };
     let config_dir = config_dir_with_package(&bundle_manifest("1.0.0"), &row);
+    let config_path = config_dir.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    std::fs::write(&config_path, format!("locale = \"en\"\n{config}")).unwrap();
     let installed = config_dir.path().join("plugins").join(PACKAGE);
     let skill =
         "---\nname: alpha\ndescription: Original usable skill\n---\nOriginal instructions.\n";
@@ -1028,6 +1031,10 @@ fn local_update_rejects_incomplete_materialized_skill_and_preserves_config() {
     assert!(
         !out.status.success(),
         "incomplete staging must fail: {text}"
+    );
+    assert!(
+        text.contains("subdirectory 'beta' is missing SKILL.md"),
+        "must reject the incomplete materialized skill, not an earlier boundary: {text}"
     );
     assert_eq!(
         std::fs::read(&config_path).unwrap(),
