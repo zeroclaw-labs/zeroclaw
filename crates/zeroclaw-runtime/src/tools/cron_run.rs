@@ -13,6 +13,10 @@ pub struct CronRunTool {
     /// Owning agent — another agent's job cannot be triggered from here.
     agent_alias: String,
     runtime: Arc<dyn RuntimeAdapter>,
+    /// The capabilities the owning entry point binds. A job run from a bound
+    /// tool executes on them, so a supplied-capability turn's `cron_run` child
+    /// does not fall back to config.
+    capabilities: crate::composition::CapabilitySlot,
 }
 
 struct ManualCronClaim {
@@ -80,7 +84,14 @@ impl CronRunTool {
             security,
             agent_alias: agent_alias.into(),
             runtime,
+            capabilities: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// The slot this tool reads its capabilities from, for the registry that
+    /// builds it to hand to the owning entry point.
+    pub(crate) fn capabilities_slot(&self) -> crate::composition::CapabilitySlot {
+        Arc::clone(&self.capabilities)
     }
 
     #[cfg(test)]
@@ -227,15 +238,31 @@ impl Tool for CronRunTool {
             self.agent_alias.clone(),
             lock_token,
         );
-        let result = cron::scheduler::run_manual_job_with_runtime(
-            &self.config,
-            &job,
-            cron::scheduler::CronDeliveryContext::ToolManual,
-            &None,
-            self.runtime.as_ref(),
-            approved,
-        )
-        .await;
+        let result = match self.capabilities.get() {
+            Some(bound) => {
+                cron::scheduler::run_manual_job_with_capabilities(
+                    &self.config,
+                    &job,
+                    cron::scheduler::CronDeliveryContext::ToolManual,
+                    &None,
+                    self.runtime.as_ref(),
+                    approved,
+                    &bound.capabilities,
+                )
+                .await
+            }
+            None => {
+                cron::scheduler::run_manual_job_with_runtime(
+                    &self.config,
+                    &job,
+                    cron::scheduler::CronDeliveryContext::ToolManual,
+                    &None,
+                    self.runtime.as_ref(),
+                    approved,
+                )
+                .await
+            }
+        };
 
         claim.release();
 

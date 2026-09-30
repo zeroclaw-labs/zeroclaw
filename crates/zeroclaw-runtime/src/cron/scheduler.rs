@@ -252,7 +252,7 @@ pub async fn run_manual_job(
     context: CronDeliveryContext,
     event_tx: &EventBroadcast,
 ) -> ManualCronRunResult {
-    run_manual_job_inner(config, job, context, event_tx, None, false).await
+    run_manual_job_inner(config, job, context, event_tx, None, false, None).await
 }
 
 pub(crate) async fn run_manual_job_with_runtime(
@@ -263,7 +263,40 @@ pub(crate) async fn run_manual_job_with_runtime(
     runtime: &dyn RuntimeAdapter,
     approved: bool,
 ) -> ManualCronRunResult {
-    run_manual_job_inner(config, job, context, event_tx, Some(runtime), approved).await
+    run_manual_job_inner(
+        config,
+        job,
+        context,
+        event_tx,
+        Some(runtime),
+        approved,
+        None,
+    )
+    .await
+}
+
+/// [`run_manual_job_with_runtime`] for a caller that holds capabilities, such
+/// as a `cron_run` tool bound by a supplied-capability turn: an agent job runs
+/// on `capabilities` instead of building a config-backed set.
+pub(crate) async fn run_manual_job_with_capabilities(
+    config: &Config,
+    job: &CronJob,
+    context: CronDeliveryContext,
+    event_tx: &EventBroadcast,
+    runtime: &dyn RuntimeAdapter,
+    approved: bool,
+    capabilities: &crate::composition::RuntimeCapabilities,
+) -> ManualCronRunResult {
+    run_manual_job_inner(
+        config,
+        job,
+        context,
+        event_tx,
+        Some(runtime),
+        approved,
+        Some(capabilities),
+    )
+    .await
 }
 
 async fn run_manual_job_inner(
@@ -273,6 +306,7 @@ async fn run_manual_job_inner(
     event_tx: &EventBroadcast,
     runtime: Option<&dyn RuntimeAdapter>,
     approved: bool,
+    capabilities: Option<&crate::composition::RuntimeCapabilities>,
 ) -> ManualCronRunResult {
     let started_at = Utc::now();
     // Resolve the executing identity exactly as execution will (a migrated
@@ -322,7 +356,8 @@ async fn run_manual_job_inner(
             finished_at,
         };
     }
-    let (success, output) = execute_job_now_with_runtime(config, job, runtime, approved).await;
+    let (success, output) =
+        execute_job_now_with_runtime(config, job, runtime, approved, capabilities).await;
     let finished_at = Utc::now();
     let duration_ms = (finished_at - started_at).num_milliseconds();
     let outcome = deliver_and_classify_run_result(config, job, success, output, context).await;
@@ -385,8 +420,34 @@ async fn run_manual_job_inner(
     }
 }
 
-pub async fn run(
+/// Run the scheduler; agent jobs build their capabilities from config per run.
+///
+/// Both entry points return the inner future rather than adding an `async fn`
+/// layer: the daemon spawns this future, and an agent job inside it already
+/// sits at the auto-trait recursion limit for `Send`.
+pub fn run(
     config: Config,
+    event_tx: EventBroadcast,
+    cancel: CancellationToken,
+) -> impl std::future::Future<Output = Result<()>> {
+    run_inner(config, None, event_tx, cancel)
+}
+
+/// Run the scheduler with the config generation's capabilities: every agent
+/// job it starts obtains its provider, memory and observer from
+/// `capabilities`.
+pub fn run_with_capabilities(
+    config: Config,
+    capabilities: crate::composition::RuntimeCapabilities,
+    event_tx: EventBroadcast,
+    cancel: CancellationToken,
+) -> impl std::future::Future<Output = Result<()>> {
+    run_inner(config, Some(capabilities), event_tx, cancel)
+}
+
+async fn run_inner(
+    config: Config,
+    capabilities: Option<crate::composition::RuntimeCapabilities>,
     event_tx: EventBroadcast,
     cancel: CancellationToken,
 ) -> Result<()> {
@@ -466,7 +527,7 @@ pub async fn run(
     }
 
     if config.scheduler.catch_up_on_startup {
-        catch_up_overdue_jobs(&config, &event_tx).await;
+        catch_up_overdue_jobs(&config, &event_tx, capabilities.as_ref()).await;
     } else {
         ::zeroclaw_log::record!(
             INFO,
@@ -498,7 +559,14 @@ pub async fn run(
                 };
 
                 let jobs = claim_due_jobs(&config, jobs);
-                process_due_jobs(&config, jobs, SCHEDULER_COMPONENT, &event_tx).await;
+                process_due_jobs(
+                    &config,
+                    jobs,
+                    SCHEDULER_COMPONENT,
+                    &event_tx,
+                    capabilities.as_ref(),
+                )
+                .await;
             }
             _ = cancel.cancelled() => {
                 crate::health::mark_component_ok(SCHEDULER_COMPONENT);
@@ -518,7 +586,11 @@ use super::store::{NO_OWNER_MESSAGE, resolve_owning_agent};
 /// Fetch **all** overdue jobs (ignoring `max_tasks`) and execute them.
 /// Called once at scheduler startup so that jobs missed during downtime
 /// (e.g. late boot, daemon restart) are caught up immediately.
-async fn catch_up_overdue_jobs(config: &Config, event_tx: &EventBroadcast) {
+async fn catch_up_overdue_jobs(
+    config: &Config,
+    event_tx: &EventBroadcast,
+    capabilities: Option<&crate::composition::RuntimeCapabilities>,
+) {
     let now = Utc::now();
     let jobs = match all_overdue_jobs(config, now) {
         Ok(jobs) => jobs,
@@ -551,7 +623,7 @@ async fn catch_up_overdue_jobs(config: &Config, event_tx: &EventBroadcast) {
     );
 
     let jobs = claim_due_jobs(config, jobs);
-    process_due_jobs(config, jobs, SCHEDULER_COMPONENT, event_tx).await;
+    process_due_jobs(config, jobs, SCHEDULER_COMPONENT, event_tx, capabilities).await;
 
     ::zeroclaw_log::record!(
         INFO,
@@ -627,7 +699,7 @@ async fn skip_missed_jobs_on_startup(config: &Config) {
 }
 
 pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
-    execute_job_now_with_runtime(config, job, None, false).await
+    execute_job_now_with_runtime(config, job, None, false, None).await
 }
 
 async fn execute_job_now_with_runtime(
@@ -635,6 +707,7 @@ async fn execute_job_now_with_runtime(
     job: &CronJob,
     runtime: Option<&dyn RuntimeAdapter>,
     approved: bool,
+    capabilities: Option<&crate::composition::RuntimeCapabilities>,
 ) -> (bool, String) {
     // Reject orphaned declarative jobs: a declarative row whose canonical
     // config declaration has been removed must not execute through any
@@ -670,6 +743,7 @@ async fn execute_job_now_with_runtime(
         job,
         runtime,
         approved,
+        capabilities,
     ))
     .instrument(span)
     .await
@@ -704,6 +778,7 @@ async fn execute_job_with_retry(
     job: &CronJob,
     runtime: Option<&dyn RuntimeAdapter>,
     approved: bool,
+    capabilities: Option<&crate::composition::RuntimeCapabilities>,
 ) -> (bool, String) {
     let owned_runtime = if matches!(job.job_type, JobType::Shell) && runtime.is_none() {
         match crate::platform::create_runtime(&config.runtime) {
@@ -730,7 +805,9 @@ async fn execute_job_with_retry(
                 };
                 run_job_command_with_runtime(config, runtime, security, job, approved).await
             }
-            JobType::Agent => Box::pin(run_agent_job(config, security, agent_alias, job)).await,
+            JobType::Agent => {
+                agent_job_turn(config, capabilities, security, agent_alias, job).await
+            }
         };
         last_output = output;
 
@@ -751,6 +828,32 @@ async fn execute_job_with_retry(
     }
 
     (false, last_output)
+}
+
+/// An agent job's run, on the supplied capabilities or, without them, through
+/// the config-backed adapter.
+///
+/// Boxed as `dyn Future + Send`: the daemon spawns the scheduler, and proving
+/// the job future `Send` from inside the scheduler's state machine exceeds the
+/// auto-trait recursion limit. Erasing the type here proves it once, at this
+/// shallow boundary.
+fn agent_job_turn<'a>(
+    config: &'a Config,
+    capabilities: Option<&'a crate::composition::RuntimeCapabilities>,
+    security: &'a SecurityPolicy,
+    agent_alias: &'a str,
+    job: &'a CronJob,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = (bool, String)> + Send + 'a>> {
+    match capabilities {
+        Some(capabilities) => Box::pin(run_agent_job_with_capabilities(
+            config,
+            capabilities,
+            security,
+            agent_alias,
+            job,
+        )),
+        None => Box::pin(run_agent_job(config, security, agent_alias, job)),
+    }
 }
 
 fn claim_due_jobs(config: &Config, jobs: Vec<CronJob>) -> Vec<CronJob> {
@@ -787,6 +890,7 @@ async fn process_due_jobs(
     jobs: Vec<CronJob>,
     component: &str,
     event_tx: &EventBroadcast,
+    capabilities: Option<&crate::composition::RuntimeCapabilities>,
 ) {
     // Refresh scheduler health on every successful poll cycle, including idle cycles.
     crate::health::mark_component_ok(component);
@@ -811,6 +915,7 @@ async fn process_due_jobs(
         };
         let config = config.clone();
         let component = component.to_owned();
+        let capabilities = capabilities.cloned();
         Some(async move {
             Box::pin(execute_and_persist_job(
                 &config,
@@ -818,6 +923,7 @@ async fn process_due_jobs(
                 &agent_alias,
                 &job,
                 &component,
+                capabilities.as_ref(),
             ))
             .await
         })
@@ -853,6 +959,7 @@ async fn execute_and_persist_job(
     agent_alias: &str,
     job: &CronJob,
     component: &str,
+    capabilities: Option<&crate::composition::RuntimeCapabilities>,
 ) -> (String, bool, String) {
     crate::health::mark_component_ok(component);
     warn_if_high_frequency_agent_job(job);
@@ -866,6 +973,7 @@ async fn execute_and_persist_job(
         job,
         None,
         false,
+        capabilities,
     ))
     .instrument(span)
     .await;
@@ -903,8 +1011,37 @@ fn agent_job_error_message(error: &anyhow::Error) -> String {
         .unwrap_or_else(|| crate::i18n::get_required_cli_string("cron-agent-job-failed"))
 }
 
-async fn run_agent_job(
+/// Compatibility adapter: the turn runs through [`crate::agent::run`], and the
+/// isolated-session purge opens memory through the config-backed source.
+///
+/// Both entry points return the inner future rather than adding an `async fn`
+/// layer: the job future already sits at the auto-trait recursion limit where
+/// the scheduler spawns it.
+fn run_agent_job<'a>(
+    config: &'a Config,
+    security: &'a SecurityPolicy,
+    agent_alias: &'a str,
+    job: &'a CronJob,
+) -> impl std::future::Future<Output = (bool, String)> + 'a {
+    run_agent_job_inner(config, None, security, agent_alias, job)
+}
+
+/// Run an agent job with supplied capabilities: the turn and the
+/// isolated-session purge both obtain their provider and memory from
+/// `capabilities`.
+pub fn run_agent_job_with_capabilities<'a>(
+    config: &'a Config,
+    capabilities: &'a crate::composition::RuntimeCapabilities,
+    security: &'a SecurityPolicy,
+    agent_alias: &'a str,
+    job: &'a CronJob,
+) -> impl std::future::Future<Output = (bool, String)> + 'a {
+    run_agent_job_inner(config, Some(capabilities), security, agent_alias, job)
+}
+
+async fn run_agent_job_inner(
     config: &Config,
+    capabilities: Option<&crate::composition::RuntimeCapabilities>,
     security: &SecurityPolicy,
     agent_alias: &str,
     job: &CronJob,
@@ -982,29 +1119,54 @@ async fn run_agent_job(
         // are a separate surface driven by the SOP maintenance tick.
         sop_step_scope: None,
     };
+    let temperature = config
+        .model_provider_for_agent(agent_alias)
+        .and_then(|e| e.temperature);
     let run_result = match job.session_target {
-        SessionTarget::Main | SessionTarget::Isolated => {
-            Box::pin(
-                crate::agent::run(
-                    cron_config,
-                    agent_alias,
-                    Some(prefixed_prompt),
-                    None,
-                    model_override,
-                    config
-                        .model_provider_for_agent(agent_alias)
-                        .and_then(|e| e.temperature),
-                    vec![],
-                    false,
-                    Some(session_path.clone()),
-                    job.allowed_tools.clone(),
-                    zeroclaw_api::ingress::TurnOrigin::Cron,
-                    run_overrides,
+        SessionTarget::Main | SessionTarget::Isolated => match capabilities {
+            Some(capabilities) => {
+                Box::pin(
+                    crate::agent::run_with_capabilities(
+                        cron_config,
+                        capabilities.clone(),
+                        None,
+                        agent_alias,
+                        Some(prefixed_prompt),
+                        None,
+                        model_override,
+                        temperature,
+                        vec![],
+                        false,
+                        Some(session_path.clone()),
+                        job.allowed_tools.clone(),
+                        zeroclaw_api::ingress::TurnOrigin::Cron,
+                        run_overrides,
+                    )
+                    .instrument(subagent_span),
                 )
-                .instrument(subagent_span),
-            )
-            .await
-        }
+                .await
+            }
+            None => {
+                Box::pin(
+                    crate::agent::run(
+                        cron_config,
+                        agent_alias,
+                        Some(prefixed_prompt),
+                        None,
+                        model_override,
+                        temperature,
+                        vec![],
+                        false,
+                        Some(session_path.clone()),
+                        job.allowed_tools.clone(),
+                        zeroclaw_api::ingress::TurnOrigin::Cron,
+                        run_overrides,
+                    )
+                    .instrument(subagent_span),
+                )
+                .await
+            }
+        },
     };
 
     match run_result {
@@ -1043,15 +1205,15 @@ async fn run_agent_job(
                     "cli:{}",
                     session_path.display()
                 ));
-                if let Ok(mem) = zeroclaw_memory::create_memory_for_agent(
-                    config,
-                    agent_alias,
-                    config
-                        .model_provider_for_agent(agent_alias)
-                        .and_then(|e| e.api_key.as_deref()),
-                )
-                .await
-                {
+                let memory = match capabilities {
+                    Some(capabilities) => capabilities.agent_memory(config, agent_alias).await,
+                    None => {
+                        crate::composition::RuntimeCapabilities::config_backed_unobserved()
+                            .agent_memory(config, agent_alias)
+                            .await
+                    }
+                };
+                if let Ok(mem) = memory {
                     let _ = mem.purge_session(&mem_session_key).await;
                 }
             }
@@ -2311,6 +2473,7 @@ mod tests {
             &job,
             None,
             false,
+            None,
         ))
         .await;
         assert!(success);
@@ -2335,6 +2498,7 @@ mod tests {
             &job,
             None,
             false,
+            None,
         ))
         .await;
         assert!(!success);
@@ -2600,7 +2764,7 @@ mod tests {
         job.uses_memory = false;
 
         let (success, output) = Box::pin(execute_job_with_retry(
-            &config, &security, TEST_AGENT, &job, None, false,
+            &config, &security, TEST_AGENT, &job, None, false, None,
         ))
         .await;
         assert!(success, "retrying cron agent run failed: {output}");
@@ -2646,6 +2810,115 @@ mod tests {
         }
 
         server.abort();
+    }
+
+    /// The scheduler's polling path hands its capabilities down to the agent
+    /// jobs it runs: an agent job driven through `process_due_jobs` with a
+    /// supplied set is served by that set's provider and memory sources.
+    #[tokio::test]
+    async fn process_due_jobs_runs_agent_jobs_on_supplied_capabilities() {
+        use crate::composition::test_support::{
+            NoTools, RecordingMemory, RecordingProviders, STUB_REPLY, recording_capabilities,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        if let Some(entry) = config.providers.models.openrouter.get_mut(TEST_AGENT) {
+            entry.base.model = Some("test-model".into());
+        }
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Say hello".into());
+        config
+            .agents
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .cron_jobs
+            .push(job.id.clone());
+        let providers = Arc::new(RecordingProviders::default());
+        let memory = Arc::new(RecordingMemory::default());
+        let capabilities = recording_capabilities(
+            Arc::clone(&providers),
+            Arc::clone(&memory),
+            Arc::new(NoTools),
+        );
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<serde_json::Value>(16);
+        let event_tx: EventBroadcast = Some(tx);
+
+        Box::pin(process_due_jobs(
+            &config,
+            vec![job],
+            &unique_component("supplied-capabilities"),
+            &event_tx,
+            Some(&capabilities),
+        ))
+        .await;
+
+        let event = rx.try_recv().expect("the job reports a result");
+        assert_eq!(event["success"], true, "job failed: {event}");
+        assert!(
+            event["output"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(STUB_REPLY),
+            "the reply comes from the supplied provider: {event}"
+        );
+        let seen = providers.seen.lock();
+        assert_eq!(seen.len(), 1, "one provider for the job: {seen:?}");
+        assert_eq!(seen[0].agent_alias, TEST_AGENT);
+        assert_eq!(seen[0].principal, None);
+        drop(seen);
+        let agents = memory.agents.lock();
+        assert!(
+            !agents.is_empty() && agents.iter().all(|alias| alias == TEST_AGENT),
+            "the job's memory comes from the memory source: {agents:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_agent_job_serves_the_job_from_supplied_capabilities() {
+        use crate::composition::test_support::{
+            NoTools, RecordingMemory, RecordingProviders, STUB_REPLY, recording_capabilities,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        if let Some(entry) = config.providers.models.openrouter.get_mut(TEST_AGENT) {
+            entry.base.model = Some("test-model".into());
+        }
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Say hello".into());
+        let security = test_security(&config);
+        let providers = Arc::new(RecordingProviders::default());
+        let memory = Arc::new(RecordingMemory::default());
+        let capabilities = recording_capabilities(
+            Arc::clone(&providers),
+            Arc::clone(&memory),
+            Arc::new(NoTools),
+        );
+
+        let (success, output) = Box::pin(run_agent_job_with_capabilities(
+            &config,
+            &capabilities,
+            &security,
+            TEST_AGENT,
+            &job,
+        ))
+        .await;
+
+        assert!(success, "job failed: {output}");
+        assert!(output.contains(STUB_REPLY), "unexpected output: {output}");
+        let seen = providers.seen.lock();
+        assert_eq!(seen.len(), 1, "one provider for the job: {seen:?}");
+        assert_eq!(seen[0].agent_alias, TEST_AGENT);
+        assert_eq!(seen[0].principal, None);
+        drop(seen);
+        let agents = memory.agents.lock();
+        assert!(
+            !agents.is_empty() && agents.iter().all(|alias| alias == TEST_AGENT),
+            "the job's memory comes from the memory source: {agents:?}"
+        );
     }
 
     #[tokio::test]
@@ -2697,7 +2970,7 @@ mod tests {
         let component = unique_component("scheduler-idle");
 
         crate::health::mark_component_error(&component, "pre-existing error");
-        process_due_jobs(&config, Vec::new(), &component, &None).await;
+        process_due_jobs(&config, Vec::new(), &component, &None, None).await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
@@ -2714,7 +2987,7 @@ mod tests {
         let component = unique_component("scheduler-fail");
 
         crate::health::mark_component_ok(&component);
-        process_due_jobs(&config, vec![job], &component, &None).await;
+        process_due_jobs(&config, vec![job], &component, &None, None).await;
 
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
@@ -3856,7 +4129,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<serde_json::Value>(16);
         let event_tx: EventBroadcast = Some(tx);
 
-        process_due_jobs(&config, vec![job], &component, &event_tx).await;
+        process_due_jobs(&config, vec![job], &component, &event_tx, None).await;
 
         let event = rx.try_recv().expect("should receive a broadcast event");
         assert_eq!(event["type"], "cron_result");
@@ -3882,7 +4155,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<serde_json::Value>(16);
         let event_tx: EventBroadcast = Some(tx);
 
-        process_due_jobs(&config, vec![job], &component, &event_tx).await;
+        process_due_jobs(&config, vec![job], &component, &event_tx, None).await;
 
         let event = rx.try_recv().expect("should receive a broadcast event");
         assert_eq!(event["type"], "cron_result");
@@ -3938,7 +4211,14 @@ mod tests {
             ..job.clone()
         };
 
-        process_due_jobs(&config, vec![orphan], &unique_component("orphan"), &None).await;
+        process_due_jobs(
+            &config,
+            vec![orphan],
+            &unique_component("orphan"),
+            &None,
+            None,
+        )
+        .await;
 
         assert!(
             cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
@@ -4010,6 +4290,7 @@ mod tests {
             vec![contested.clone()],
             &unique_component("contested"),
             &None,
+            None,
         )
         .await;
         assert!(
@@ -4071,7 +4352,14 @@ mod tests {
         assert_eq!(resolve_owning_agent(&config, &legacy), Some(TEST_AGENT));
 
         assert!(cron::claim_job(&config, &job.id, Utc::now()).unwrap());
-        process_due_jobs(&config, vec![legacy], &unique_component("sole"), &None).await;
+        process_due_jobs(
+            &config,
+            vec![legacy],
+            &unique_component("sole"),
+            &None,
+            None,
+        )
+        .await;
 
         let runs = cron::list_runs(&config, &job.id, 10).unwrap();
         assert_eq!(
@@ -4090,7 +4378,7 @@ mod tests {
         let component = unique_component("broadcast-none");
 
         // event_tx = None — should complete without panic.
-        process_due_jobs(&config, vec![job], &component, &None).await;
+        process_due_jobs(&config, vec![job], &component, &None, None).await;
     }
 
     #[tokio::test]
@@ -4105,7 +4393,7 @@ mod tests {
         // process_due_jobs must not panic when there are no subscribers.
         let event_tx: EventBroadcast = Some(tx);
 
-        process_due_jobs(&config, vec![job], &component, &event_tx).await;
+        process_due_jobs(&config, vec![job], &component, &event_tx, None).await;
         // If we got here without panic, the test passes.
     }
 }

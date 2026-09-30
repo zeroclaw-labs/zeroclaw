@@ -25,6 +25,11 @@ pub struct SendMessageToPeerTool {
     live_config: Option<Arc<RwLock<Config>>>,
     sender_alias: String,
     description: String,
+    /// The capabilities and principal the sending turn was built from. When
+    /// bound, the recipient's in-process turn runs through them, so it uses
+    /// the sender's sources and resolves for the same principal. Empty only
+    /// for a registry no capability entry point bound.
+    capabilities: crate::composition::CapabilitySlot,
 }
 
 impl SendMessageToPeerTool {
@@ -44,7 +49,14 @@ impl SendMessageToPeerTool {
             live_config,
             sender_alias,
             description,
+            capabilities: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// The slot this tool reads its capabilities from, for the registry that
+    /// builds it to hand to the owning entry point.
+    pub(crate) fn capabilities_slot(&self) -> crate::composition::CapabilitySlot {
+        Arc::clone(&self.capabilities)
     }
 }
 
@@ -214,13 +226,33 @@ impl Tool for SendMessageToPeerTool {
             let turn_usage = cost_ctx
                 .as_ref()
                 .map(|_| Arc::new(Mutex::new(TurnUsage::default())));
+            let bound = self.capabilities.get().cloned();
             zeroclaw_spawn::spawn!(async move {
                 // Keep the large turn future out of the nested cost-scope wrappers.
                 // The recipient executes under its own alias; the sender's
-                // canonical alias is provenance for the detached turn.
+                // canonical alias is provenance for the detached turn. A bound
+                // sender also hands the recipient its capabilities and
+                // principal, so the peer turn stays on the sender's sources;
+                // the live tool-policy source, when the sender holds one, is
+                // kept either way.
                 let turn: Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> =
-                    if let Some(live_config) = live_config {
-                        Box::pin(
+                    match (bound, live_config) {
+                        (Some(bound), live_config) => Box::pin(
+                            crate::agent::loop_::process_message_shared_with_capabilities(
+                                cfg,
+                                live_config,
+                                bound.capabilities,
+                                bound.principal,
+                                &turn_recipient_alias,
+                                &body,
+                                None,
+                                zeroclaw_api::ingress::TurnOrigin::AgentDirect,
+                                Some(zeroclaw_api::ingress::InternalPrincipal::PeerAgent {
+                                    sender_alias: sender.clone(),
+                                }),
+                            ),
+                        ),
+                        (None, Some(live_config)) => Box::pin(
                             crate::agent::loop_::process_message_shared_with_live_config(
                                 cfg,
                                 live_config,
@@ -232,9 +264,8 @@ impl Tool for SendMessageToPeerTool {
                                     sender_alias: sender.clone(),
                                 }),
                             ),
-                        )
-                    } else {
-                        Box::pin(crate::agent::loop_::process_message_shared(
+                        ),
+                        (None, None) => Box::pin(crate::agent::loop_::process_message_shared(
                             cfg,
                             &turn_recipient_alias,
                             &body,
@@ -243,7 +274,7 @@ impl Tool for SendMessageToPeerTool {
                             Some(zeroclaw_api::ingress::InternalPrincipal::PeerAgent {
                                 sender_alias: sender.clone(),
                             }),
-                        ))
+                        )),
                     };
                 if let Err(e) = deliver_peer_turn_with_cost_scope(cost_ctx, turn_usage, turn).await
                 {
