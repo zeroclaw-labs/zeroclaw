@@ -402,7 +402,10 @@ impl Tool for SkillBuiltinTool {
                 })),
             "skill-scoped elevated tool invoked"
         );
-        let merged = merge_locked_args(&self.locked_args, args);
+        let mut merged = merge_locked_args(&self.locked_args, args);
+        // The runtime approved (or not) this alias's call, not the target's,
+        // so the target runs unapproved whatever the model or manifest says.
+        zeroclaw_api::tool::clear_runtime_approval(self.target_tool.name(), &mut merged);
         self.target_tool.execute(merged).await
     }
 }
@@ -997,6 +1000,52 @@ mod tests {
             .unwrap();
         assert!(result.success);
         assert_eq!(result.output, "mock_result:hello");
+    }
+
+    /// The runtime approves, or not, a skill alias's call under the alias's
+    /// name, never the target's, so an `approved` set on the alias must not
+    /// reach a target that takes runtime approval.
+    #[tokio::test]
+    async fn skill_builtin_tool_never_forwards_approval_to_its_target() {
+        struct ApprovalEcho(&'static str);
+        zeroclaw_api::mock_tool_attribution!(ApprovalEcho);
+        #[async_trait]
+        impl Tool for ApprovalEcho {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn description(&self) -> &str {
+                "echo the approval it received"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                Ok(ToolResult {
+                    success: true,
+                    output: args["approved"].to_string().into(),
+                    error: None,
+                })
+            }
+        }
+
+        for (target, expected) in [
+            ("cron_run", "false"),
+            ("shell", "false"),
+            ("calculator", "true"),
+        ] {
+            let tool = SkillBuiltinTool::new(
+                "my_skill",
+                &sample_builtin_skill_tool(),
+                Arc::new(ApprovalEcho(target)),
+                HashMap::new(),
+            );
+            let result = tool
+                .execute(serde_json::json!({"approved": true}))
+                .await
+                .unwrap();
+            assert_eq!(result.output, expected, "{target}");
+        }
     }
 
     #[test]

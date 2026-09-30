@@ -738,6 +738,47 @@ impl PairingGuard {
         count
     }
 
+    /// Run a credential revocation under `config_write_lock`, taken before
+    /// anything changes, and return its result with the held guard so the
+    /// caller persists the token set under it.
+    ///
+    /// A connection authenticated by a paired token is checked for liveness
+    /// under the process-wide config write lock before a guarded write, and
+    /// the write holds that lock until it commits. A revocation that takes
+    /// the lock first is ordered against every such write: one that checked
+    /// first commits before the token goes, and one that checks after sees
+    /// it gone.
+    ///
+    /// `revoke` is synchronous and runs as soon as the lock is held. It does
+    /// the whole revocation: it removes any durable record that names the
+    /// credential, such as a device row, and removes the token from the live
+    /// set through the guard it is handed. Nothing can be awaited between
+    /// the two, so a caller dropped at any point, a timed-out request for
+    /// one, has either changed nothing (it was still waiting for the lock)
+    /// or changed both. Only the persist that follows can be cut short, and
+    /// that leaves the token revoked in memory.
+    pub async fn revoke_under_config_write_lock<T>(
+        &self,
+        config_write_lock: Arc<tokio::sync::Mutex<()>>,
+        revoke: impl FnOnce(&Self) -> T,
+    ) -> (T, tokio::sync::OwnedMutexGuard<()>) {
+        let guard = config_write_lock.lock_owned().await;
+        (revoke(self), guard)
+    }
+
+    /// [`Self::revoke_under_config_write_lock`] for a bare token hash, with no
+    /// durable record to remove alongside it.
+    pub async fn revoke_token_hash_ordered(
+        &self,
+        config_write_lock: Arc<tokio::sync::Mutex<()>>,
+        token_hash: &str,
+    ) -> (bool, tokio::sync::OwnedMutexGuard<()>) {
+        self.revoke_under_config_write_lock(config_write_lock, |pairing| {
+            pairing.revoke_token_hash(token_hash)
+        })
+        .await
+    }
+
     /// Generate a new pairing code that pairs an additional client.
     /// Does not revoke existing tokens. To rotate a compromised token,
     /// pair with `revoke_token`/`revoke_token_hash` + a config persist pass.

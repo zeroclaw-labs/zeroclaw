@@ -50,6 +50,14 @@ impl SendMessageToPeerTool {
 
 #[async_trait]
 impl Tool for SendMessageToPeerTool {
+    // An agent recipient runs a detached turn as itself, with its own full
+    // tool set (cron_add included) and only `InternalPrincipal::PeerAgent`
+    // for provenance: nothing of the RPC principal reaches that turn or the
+    // work it schedules.
+    fn requires_unrestricted_principal(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "send_message_to_peer"
     }

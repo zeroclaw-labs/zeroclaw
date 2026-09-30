@@ -173,6 +173,14 @@ fn schedule_error_result(error: String) -> ToolResult {
 
 #[async_trait]
 impl Tool for CronAddTool {
+    /// A job it creates runs later under the agent's own policy and the job's
+    /// stored tool list, not under the calling principal's ceiling. A
+    /// constrained RPC session must not reach it until a job can carry and
+    /// re-check that principal's authority.
+    fn requires_unrestricted_principal(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "cron_add"
     }

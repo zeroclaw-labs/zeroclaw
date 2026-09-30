@@ -365,11 +365,37 @@ pub fn invocation_trigger_matches(haystack_lower: &str, trigger_lower: &str) -> 
     false
 }
 
+/// Whether `tool_name` takes an `approved` argument that only the runtime
+/// may set, from the operator's approval decision for that call. A value the
+/// model supplies is never an approval.
+pub fn takes_runtime_approval(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "shell" | "schedule" | "cron_add" | "cron_update" | "cron_run"
+    )
+}
+
+/// Clear the approval on a call a wrapper makes to `tool_name` directly.
+///
+/// The runtime writes `approved` only on the call it dispatched, under the
+/// outer tool's name. A wrapper that invokes a child tool itself, such as a
+/// pipeline step or a skill alias, has no approval decision for the child,
+/// so the child runs unapproved whatever its arguments say.
+pub fn clear_runtime_approval(tool_name: &str, args: &mut serde_json::Value) {
+    if takes_runtime_approval(tool_name)
+        && let Some(args) = args.as_object_mut()
+    {
+        args.insert("approved".to_string(), serde_json::Value::Bool(false));
+    }
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync + crate::attribution::Attributable {
-    /// True when this tool starts nested execution without carrying the RPC
-    /// principal's current tool and agent ceilings. Constrained RPC sessions
-    /// must omit it. Wrappers forward the target's value so a renamed skill
+    /// True when this tool starts execution, nested or stored to run later,
+    /// without carrying the RPC principal's current grants to it. An RPC
+    /// session of any principal but the shared operator must omit it, because
+    /// that principal's grants can be withdrawn while the work it started
+    /// still runs. Wrappers forward the target's value so a renamed skill
     /// cannot bypass that restriction. This describes implementation support,
     /// not a stored authorization decision.
     fn requires_unrestricted_principal(&self) -> bool {
