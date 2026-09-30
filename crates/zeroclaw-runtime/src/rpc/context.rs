@@ -17,6 +17,55 @@ use zeroclaw_infra::session_backend::SessionBackend;
 use super::session::SessionStore;
 use super::tui_identity::TuiRegistry;
 
+/// The generation-level owner of session-lifetime turns.
+///
+/// A connection-lifetime turn is held by its connection: the connection's
+/// liveness token counts it in the daemon's drain, and closing the connection
+/// cancels it. A session-lifetime turn outlives its connection by design, so
+/// it is held here instead: `activity()` counts it in the same drain counter
+/// the daemon waits on before admitting a replacement generation, and
+/// `cancelled()` fires when this generation retires. The default (tests and
+/// standalone contexts) never cancels and counts nothing.
+#[derive(Clone, Default)]
+pub struct SessionTurnOwner {
+    cancel: tokio_util::sync::CancellationToken,
+    activity: Option<Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+impl SessionTurnOwner {
+    /// Owner for a daemon generation: `cancel` fires at retirement and
+    /// `activity` is the drain counter the daemon waits on.
+    #[must_use]
+    pub fn new(
+        cancel: tokio_util::sync::CancellationToken,
+        activity: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        Self {
+            cancel,
+            activity: Some(activity),
+        }
+    }
+
+    /// Count one session-lifetime turn in the generation's drain until every
+    /// clone of the returned token is dropped.
+    #[must_use]
+    pub fn activity(&self) -> Option<crate::rpc::ConnectionActivity> {
+        self.activity
+            .as_ref()
+            .map(|count| crate::rpc::ConnectionActivity::new(Arc::clone(count)))
+    }
+
+    /// Resolves when this generation retires.
+    pub fn cancelled(&self) -> tokio_util::sync::WaitForCancellationFuture<'_> {
+        self.cancel.cancelled()
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+}
+
 #[derive(Default)]
 pub struct ApprovalPendingMap {
     /// `request_id -> (originating session_id, responder)`. The session id
@@ -169,6 +218,11 @@ pub struct RpcContext {
     /// `events/subscribe`). The daemon feeds it from its event bus.
     pub subscriptions: Arc<crate::rpc::subscription::SubscriptionHub>,
 
+    /// Owner of this daemon generation's session-lifetime turns. Such a turn
+    /// outlives the connection that prompted it, so the generation, not the
+    /// connection, cancels it at retirement and counts it until it ends.
+    pub session_turns: SessionTurnOwner,
+
     /// Write `true` to trigger a daemon-level config reload. Mirrors
     /// the gateway's `/admin/reload` mechanism.
     pub reload_tx: Option<tokio::sync::watch::Sender<bool>>,
@@ -272,6 +326,7 @@ impl RpcContext {
             event_tx: None,
             event_history: None,
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
+            session_turns: SessionTurnOwner::default(),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
@@ -301,6 +356,7 @@ impl RpcContext {
             event_tx: None,
             event_history: None,
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
+            session_turns: SessionTurnOwner::default(),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
@@ -339,6 +395,7 @@ impl RpcContext {
             event_tx: None,
             event_history: None,
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
+            session_turns: SessionTurnOwner::default(),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
@@ -418,6 +475,7 @@ impl RpcContext {
             event_tx: Some(event_tx),
             event_history,
             subscriptions,
+            session_turns: SessionTurnOwner::default(),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
@@ -451,6 +509,7 @@ impl RpcContext {
             event_tx: None,
             event_history: None,
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
+            session_turns: SessionTurnOwner::default(),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
@@ -490,6 +549,7 @@ impl RpcContext {
             event_tx: None,
             event_history: None,
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
+            session_turns: SessionTurnOwner::default(),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
@@ -522,6 +582,7 @@ impl RpcContext {
             event_tx: None,
             event_history: None,
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
+            session_turns: SessionTurnOwner::default(),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
@@ -555,6 +616,7 @@ impl RpcContext {
             event_tx: None,
             event_history: None,
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
+            session_turns: SessionTurnOwner::default(),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
@@ -589,6 +651,7 @@ impl RpcContext {
             event_tx: None,
             event_history: None,
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
+            session_turns: SessionTurnOwner::default(),
             reload_tx: None,
             gateway_shutdown_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
@@ -623,6 +686,7 @@ impl RpcContext {
             event_tx: None,
             event_history: None,
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
+            session_turns: SessionTurnOwner::default(),
             reload_tx,
             gateway_shutdown_tx,
             approval_pending: Arc::new(ApprovalPendingMap::default()),

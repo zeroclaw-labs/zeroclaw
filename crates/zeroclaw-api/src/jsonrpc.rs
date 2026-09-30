@@ -329,6 +329,15 @@ impl RpcOutbound {
         self.writer_tx.send(json).await.is_ok()
     }
 
+    /// Wait for room in the writer for one line without committing to send
+    /// it. A caller that must hold a line to a condition at the moment it is
+    /// enqueued (an authorization that can change while the writer is full)
+    /// checks after this returns, then commits with [`mpsc::Permit::send`] or
+    /// drops the permit to send nothing. `None` once the writer is closed.
+    pub async fn reserve(&self) -> Option<mpsc::Permit<'_, String>> {
+        self.writer_tx.reserve().await.ok()
+    }
+
     /// Resolve when the writer end is closed (peer dropped). Useful for
     /// long-lived forwarders that need to exit on disconnect even when
     /// there is no payload to send.

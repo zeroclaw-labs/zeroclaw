@@ -920,6 +920,13 @@ pub async fn run(
                 hub.attach_bus(&event_tx);
                 hub
             },
+            // Session-lifetime turns retire with this generation: the same
+            // token that retires the listeners cancels them, and they count in
+            // the same drain the reload waits on.
+            session_turns: crate::rpc::context::SessionTurnOwner::new(
+                channels_cancel.clone(),
+                socket_client_count.clone(),
+            ),
             reload_tx: Some(reload_tx.clone()),
             gateway_shutdown_tx: Some(gateway_shutdown_tx.clone()),
             approval_pending: std::sync::Arc::new(

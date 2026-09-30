@@ -737,6 +737,28 @@ impl AcpSessionStore {
         }
     }
 
+    /// The owning principal and creation time of a session, read together.
+    /// The creation time tells two rows apart that reuse one session id
+    /// after a delete, which the owner alone cannot. Returns `Ok(None)` when
+    /// the session does not exist.
+    #[allow(clippy::option_option)]
+    pub fn session_principal_and_created_at(
+        &self,
+        session_uuid: &str,
+    ) -> Result<Option<(Option<String>, String)>> {
+        let conn = self.conn.lock();
+        let row = conn.query_row(
+            "SELECT principal_id, created_at FROM acp_sessions WHERE session_uuid = ?1",
+            params![session_uuid],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+        );
+        match row {
+            Ok(found) => Ok(Some(found)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e).context("Failed to query ACP session owner"),
+        }
+    }
+
     /// Read the owner and interaction surface needed before checkpoint
     /// recovery without hydrating a potentially large transcript.
     pub fn session_owner_and_surface(
