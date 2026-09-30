@@ -969,3 +969,95 @@ fn a_local_update_of_a_name_that_is_not_installed_points_at_installing_that_dire
         "the pointer installs the local directory: {text}"
     );
 }
+
+/// Source admission accepts the nested link, but copying deliberately omits
+/// it. The CLI must reject that incomplete staging tree before replacement.
+#[cfg(unix)]
+#[test]
+fn local_update_rejects_incomplete_materialized_skill_and_preserves_config() {
+    let key = tool_instance_key();
+    let row = format!(
+        "\n[[plugins.entries]]\nname = \"{key}\"\negress_hosts = [\"api.example.com\"]\negress_allow_private = [\"api.example.com\"]\n\n[plugins.entries.config]\nlabel = \"kept\"\n"
+    );
+    let bundle_manifest = |version| {
+        manifest(version, CONFIG_SCHEMA).replace(
+            "capabilities = [\"tool\"]",
+            "capabilities = [\"tool\", \"skill\"]",
+        )
+    };
+    let config_dir = config_dir_with_package(&bundle_manifest("1.0.0"), &row);
+    let installed = config_dir.path().join("plugins").join(PACKAGE);
+    let skill =
+        "---\nname: alpha\ndescription: Original usable skill\n---\nOriginal instructions.\n";
+    std::fs::create_dir_all(installed.join("skills/alpha")).unwrap();
+    std::fs::write(installed.join("skills/alpha/SKILL.md"), skill).unwrap();
+    let info = run_plugin(config_dir.path(), &["info", PACKAGE]);
+    assert!(info.status.success(), "{}", combined(&info));
+    let config_path = config_dir.path().join("config.toml");
+    let before_config = std::fs::read(&config_path).unwrap();
+    let before_manifest = std::fs::read(installed.join("manifest.toml")).unwrap();
+    let before_component = std::fs::read(installed.join("plugin.wasm")).unwrap();
+
+    let source = tempfile::tempdir().unwrap();
+    std::fs::write(
+        source.path().join("manifest.toml"),
+        bundle_manifest("2.0.0"),
+    )
+    .unwrap();
+    std::fs::copy(fixture(), source.path().join("plugin.wasm")).unwrap();
+    std::fs::create_dir_all(source.path().join("skills/beta")).unwrap();
+    let target = source.path().join("skill-target.md");
+    std::fs::write(
+        &target,
+        "---\nname: beta\ndescription: Replacement skill\n---\nNew instructions.\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&target, source.path().join("skills/beta/SKILL.md")).unwrap();
+    let source_arg = source.path().to_str().unwrap();
+    let host =
+        zeroclaw_plugins::host::PluginHost::from_plugins_dir(&config_dir.path().join("plugins"))
+            .unwrap();
+    host.admit_update(PACKAGE, source_arg)
+        .expect("valid source admission must reach the materialization boundary");
+
+    let out = run_plugin(
+        config_dir.path(),
+        &["update", PACKAGE, "--from", source_arg],
+    );
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "incomplete staging must fail: {text}"
+    );
+    assert_eq!(
+        std::fs::read(&config_path).unwrap(),
+        before_config,
+        "config and grants stay unchanged"
+    );
+    assert_eq!(
+        std::fs::read(installed.join("manifest.toml")).unwrap(),
+        before_manifest
+    );
+    assert_eq!(
+        std::fs::read(installed.join("plugin.wasm")).unwrap(),
+        before_component
+    );
+    assert_eq!(
+        std::fs::read_to_string(installed.join("skills/alpha/SKILL.md")).unwrap(),
+        skill
+    );
+    assert!(!installed.join("skills/beta").exists());
+    assert_eq!(
+        std::fs::read_dir(config_dir.path().join("plugins"))
+            .unwrap()
+            .count(),
+        1,
+        "no displaced or staging package remains"
+    );
+    let info = run_plugin(config_dir.path(), &["info", PACKAGE]);
+    let text = combined(&info);
+    assert!(
+        info.status.success() && text.contains("1.0.0"),
+        "original package remains usable: {text}"
+    );
+}
