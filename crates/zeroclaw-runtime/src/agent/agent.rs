@@ -5,7 +5,7 @@ use crate::agent::prompt::{
     InteractionContext, PromptContext, SystemPromptBuilder, append_timestamp_orientation,
 };
 use crate::approval::ApprovalManager;
-use crate::observability::{self, Observer, ObserverEvent};
+use crate::observability::{Observer, ObserverEvent};
 use crate::platform;
 use crate::security::SecurityPolicy;
 use crate::sop::{SopAuditLogger, SopEngine};
@@ -41,11 +41,59 @@ type SessionModelProvider = (
     Arc<zeroclaw_providers::router::ModelRouteResolver>,
 );
 
-pub fn build_session_model_provider(
+/// [`build_session_model_provider`] with the provider obtained from
+/// `capabilities`, resolved for `agent_alias` and `principal`. For session
+/// surfaces (RPC) that swap a session's provider for a connection principal.
+///
+/// The reference and model are validated and resolved exactly as there; the
+/// route resolver is derived from the same config routes the routed provider
+/// is built from.
+pub fn build_session_model_provider_with_capabilities(
+    capabilities: &crate::composition::RuntimeCapabilities,
     config: &Config,
+    agent_alias: &str,
     model_provider_ref: &str,
     model_override: Option<&str>,
+    principal: Option<&zeroclaw_api::principal::PrincipalId>,
 ) -> Result<SessionModelProvider> {
+    let SessionModel { model_name, .. } =
+        resolve_session_model(config, model_provider_ref, model_override)?;
+    let model_provider = capabilities.model_provider(&crate::composition::ProviderRequest {
+        config,
+        agent_alias,
+        provider_ref: Some(model_provider_ref),
+        model: Some(&model_name),
+        principal,
+    })?;
+    let model_route_resolver = zeroclaw_providers::model_route_resolver(
+        model_provider_ref,
+        &config.model_routes,
+        &model_name,
+    );
+    Ok((
+        model_provider,
+        model_provider_ref.to_string(),
+        model_name,
+        model_route_resolver,
+    ))
+}
+
+/// A validated `<type>.<alias>` reference, its configured entry if any, and
+/// the model a session on it serves.
+struct SessionModel<'c> {
+    family: String,
+    alias: String,
+    entry: Option<&'c zeroclaw_config::schema::ModelProviderConfig>,
+    model_name: String,
+}
+
+/// Validate a `<type>.<alias>` reference and resolve the model a session on it
+/// serves: the override when one is given, else the entry's configured model.
+fn resolve_session_model<'c>(
+    config: &'c Config,
+    model_provider_ref: &str,
+    model_override: Option<&str>,
+) -> Result<SessionModel<'c>> {
     let (model_provider_name, model_provider_alias) = model_provider_ref
         .split_once('.')
         .map(|(t, a)| (t.to_string(), a.to_string()))
@@ -76,12 +124,28 @@ pub fn build_session_model_provider(
                  override was supplied"
             ))
         })?;
+    Ok(SessionModel {
+        family: model_provider_name,
+        alias: model_provider_alias,
+        entry,
+        model_name,
+    })
+}
 
-    let model_provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
-        config,
-        &model_provider_name,
-        &model_provider_alias,
-    );
+pub fn build_session_model_provider(
+    config: &Config,
+    model_provider_ref: &str,
+    model_override: Option<&str>,
+) -> Result<SessionModelProvider> {
+    let SessionModel {
+        family,
+        alias,
+        entry,
+        model_name,
+    } = resolve_session_model(config, model_provider_ref, model_override)?;
+
+    let model_provider_runtime_options =
+        zeroclaw_providers::provider_runtime_options_for_alias(config, &family, &alias);
 
     let (model_provider, model_route_resolver) =
         zeroclaw_providers::create_routed_model_provider_with_options_and_resolver(
@@ -565,6 +629,12 @@ pub struct Agent {
     /// the full conversation history on every turn and tool iteration.
     image_cache: zeroclaw_providers::multimodal::LocalImageCache,
     provider_switch_config: Option<ProviderSwitchConfig>,
+    /// The capabilities a capability-built agent was constructed from, and
+    /// the principal it resolves for. A model switch asks their provider
+    /// source for the new provider, and a cross-agent SOP step re-assembles
+    /// through them. `None` on an agent built by a compatibility adapter or
+    /// directly through the builder, which keeps the config-snapshot rebuild.
+    supplied_capabilities: Option<crate::composition::BoundCapabilities>,
     /// The generation cell the context-limits resolver reads. Direct ACP/WS
     /// agents retain their construction generation until reconnect; callers
     /// with an acknowledged live-refresh transaction may republish it together
@@ -643,6 +713,41 @@ pub struct StreamedTurnError {
 /// may republish it; direct ACP/WS agents pin it until reconnect.
 pub type ConfigGeneration =
     std::sync::Arc<parking_lot::RwLock<std::sync::Arc<zeroclaw_config::schema::Config>>>;
+
+/// How a snapshot or live-config constructor obtains its capabilities.
+enum CapabilityBinding {
+    /// Build the config-backed set from the construction snapshot: the
+    /// compatibility adapter.
+    ConfigBacked,
+    /// Use the caller's capabilities, resolving for `principal`.
+    Supplied {
+        capabilities: crate::composition::RuntimeCapabilities,
+        principal: Option<zeroclaw_api::principal::PrincipalId>,
+    },
+}
+
+/// Where an agent constructor's capabilities came from.
+#[derive(Clone, Copy)]
+enum CapabilityOrigin<'a> {
+    /// An old entry point built the config-backed set. The agent keeps the
+    /// config-snapshot model-switch rebuild it always had.
+    Adapter,
+    /// The caller supplied the capabilities, and the principal to resolve for.
+    Supplied {
+        principal: Option<&'a zeroclaw_api::principal::PrincipalId>,
+    },
+}
+
+impl<'a> CapabilityOrigin<'a> {
+    /// The principal the constructor resolves for: the supplied one, or
+    /// none on the adapter path.
+    fn principal(self) -> Option<&'a zeroclaw_api::principal::PrincipalId> {
+        match self {
+            CapabilityOrigin::Supplied { principal } => principal,
+            CapabilityOrigin::Adapter => None,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct ProviderSwitchConfig {
@@ -752,6 +857,7 @@ pub struct AgentBuilder {
     channel_name: Option<String>,
     exclude_memory: bool,
     provider_switch_config: Option<ProviderSwitchConfig>,
+    supplied_capabilities: Option<crate::composition::BoundCapabilities>,
     config_generation: Option<ConfigGeneration>,
     #[cfg(any(test, feature = "test-util"))]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
@@ -818,6 +924,7 @@ impl AgentBuilder {
             config_generation: None,
             exclude_memory: false,
             provider_switch_config: None,
+            supplied_capabilities: None,
             #[cfg(any(test, feature = "test-util"))]
             turn_datetime: None,
             #[cfg(test)]
@@ -1156,6 +1263,14 @@ impl AgentBuilder {
         self
     }
 
+    /// Mark the agent as built from supplied capabilities: model switches ask
+    /// their provider source, and cross-agent SOP steps re-assemble through
+    /// them, all for the bound principal.
+    pub fn supplied_capabilities(mut self, bound: crate::composition::BoundCapabilities) -> Self {
+        self.supplied_capabilities = Some(bound);
+        self
+    }
+
     /// Install the generation cell that provider rebuilding and context-limit
     /// resolution both read. Callers that supply one MUST derive the agent's
     /// `context_limits_resolver` from the SAME cell (see
@@ -1323,6 +1438,7 @@ impl AgentBuilder {
             image_cache: zeroclaw_providers::multimodal::LocalImageCache::new(),
             config_generation: self.config_generation,
             provider_switch_config: self.provider_switch_config,
+            supplied_capabilities: self.supplied_capabilities,
             channel_name: self.channel_name.unwrap_or_else(|| "agent".to_string()),
             #[cfg(any(test, feature = "test-util"))]
             turn_datetime: self.turn_datetime,
@@ -2181,6 +2297,7 @@ impl Agent {
             None,
             None,
             None,
+            CapabilityBinding::ConfigBacked,
         )
         .await
     }
@@ -2212,6 +2329,7 @@ impl Agent {
             None,
             None,
             None,
+            CapabilityBinding::ConfigBacked,
         )
         .await
     }
@@ -2244,6 +2362,7 @@ impl Agent {
             None,
             None,
             None,
+            CapabilityBinding::ConfigBacked,
         )
         .await
     }
@@ -2279,6 +2398,7 @@ impl Agent {
             Some(live_config),
             None,
             None,
+            CapabilityBinding::ConfigBacked,
         )
         .await
     }
@@ -2339,6 +2459,7 @@ impl Agent {
             Some(live_config),
             None,
             None,
+            CapabilityBinding::ConfigBacked,
         )
         .await
     }
@@ -2374,6 +2495,7 @@ impl Agent {
             None,
             None,
             None,
+            CapabilityBinding::ConfigBacked,
         )
         .await
     }
@@ -2419,6 +2541,143 @@ impl Agent {
         sop_audit: Option<Arc<SopAuditLogger>>,
         principal_allowed_tools: Option<Vec<String>>,
     ) -> Result<Self> {
+        Self::from_live_config_bound(
+            live_config,
+            agent_alias,
+            session_cwd,
+            initialize_mcp,
+            exclude_memory,
+            tui_env,
+            sop_engine,
+            sop_audit,
+            None,
+            principal_allowed_tools,
+            CapabilityBinding::ConfigBacked,
+        )
+        .await
+    }
+
+    /// [`Agent::from_live_config_with_tui_env_and_principal_tools`] with the
+    /// agent's provider, memory, observer and supplied tools taken from
+    /// `capabilities`, resolving for `principal` (the RPC connection's).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn from_live_config_with_tui_env_and_principal_tools_and_capabilities(
+        live_config: Arc<parking_lot::RwLock<Config>>,
+        agent_alias: &str,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        exclude_memory: bool,
+        tui_env: Option<std::collections::HashMap<String, String>>,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+        principal_allowed_tools: Option<Vec<String>>,
+        capabilities: crate::composition::RuntimeCapabilities,
+        principal: Option<zeroclaw_api::principal::PrincipalId>,
+    ) -> Result<Self> {
+        Self::from_live_config_bound(
+            live_config,
+            agent_alias,
+            session_cwd,
+            initialize_mcp,
+            exclude_memory,
+            tui_env,
+            sop_engine,
+            sop_audit,
+            None,
+            principal_allowed_tools,
+            CapabilityBinding::Supplied {
+                capabilities,
+                principal,
+            },
+        )
+        .await
+    }
+
+    /// Build a daemon-backed ACP TUI Agent with access to the shared durable
+    /// session store. The store is a read view for session tools; TUI turns do
+    /// not gain ACP file-delivery authority.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn from_live_config_with_tui_env_and_acp_sessions(
+        live_config: Arc<parking_lot::RwLock<Config>>,
+        agent_alias: &str,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        exclude_memory: bool,
+        tui_env: Option<std::collections::HashMap<String, String>>,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+        acp_session_store: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+        principal_allowed_tools: Option<Vec<String>>,
+    ) -> Result<Self> {
+        Self::from_live_config_bound(
+            live_config,
+            agent_alias,
+            session_cwd,
+            initialize_mcp,
+            exclude_memory,
+            tui_env,
+            sop_engine,
+            sop_audit,
+            Some(acp_session_store),
+            principal_allowed_tools,
+            CapabilityBinding::ConfigBacked,
+        )
+        .await
+    }
+
+    /// The ACP-session RPC constructor
+    /// (`Agent::from_live_config_with_tui_env_and_acp_sessions`) with the
+    /// agent's capabilities supplied, resolving for `principal`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn from_live_config_with_tui_env_and_acp_sessions_and_capabilities(
+        live_config: Arc<parking_lot::RwLock<Config>>,
+        agent_alias: &str,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        exclude_memory: bool,
+        tui_env: Option<std::collections::HashMap<String, String>>,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+        acp_session_store: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+        principal_allowed_tools: Option<Vec<String>>,
+        capabilities: crate::composition::RuntimeCapabilities,
+        principal: Option<zeroclaw_api::principal::PrincipalId>,
+    ) -> Result<Self> {
+        Self::from_live_config_bound(
+            live_config,
+            agent_alias,
+            session_cwd,
+            initialize_mcp,
+            exclude_memory,
+            tui_env,
+            sop_engine,
+            sop_audit,
+            Some(acp_session_store),
+            principal_allowed_tools,
+            CapabilityBinding::Supplied {
+                capabilities,
+                principal,
+            },
+        )
+        .await
+    }
+
+    /// The daemon-backed live-config construction both RPC constructor
+    /// families share.
+    #[allow(clippy::too_many_arguments)]
+    async fn from_live_config_bound(
+        live_config: Arc<parking_lot::RwLock<Config>>,
+        agent_alias: &str,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        exclude_memory: bool,
+        tui_env: Option<std::collections::HashMap<String, String>>,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+        acp_session_store: Option<Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
+        principal_allowed_tools: Option<Vec<String>>,
+        binding: CapabilityBinding,
+    ) -> Result<Self> {
         // Stack-budget boundary for the daemon-backed construction paths
         // (`session/new`, rehydration, plugin agents). The whole incarnation
         // build — config snapshot, security policy, provider + route
@@ -2450,62 +2709,122 @@ impl Agent {
                 sop_engine,
                 sop_audit,
                 None,
-                None,
+                acp_session_store,
                 Some(Arc::clone(&live_config)),
                 Some(live_config),
                 principal_allowed_tools,
+                binding,
             ))
         })
         .await
         .map_err(|join| anyhow::Error::msg(format!("agent construction task failed: {join}")))?
     }
 
-    /// Build a daemon-backed ACP TUI Agent with access to the shared durable
-    /// session store. The store is a read view for session tools; TUI turns do
-    /// not gain ACP file-delivery authority.
-    pub(crate) async fn from_live_config_with_tui_env_and_acp_sessions(
-        live_config: Arc<parking_lot::RwLock<Config>>,
+    /// Build an agent whose provider, memory, observer and supplied tools come
+    /// from `capabilities` rather than from config factories.
+    ///
+    /// Otherwise the same construction as [`Agent::from_config`]: the runtime
+    /// still resolves the agent's security policy, runtime adapter, model and
+    /// tool policy from `config`, and still builds its own tools. `principal`
+    /// reaches the provider source with every provider request this agent
+    /// makes, including a later model switch.
+    pub async fn from_config_with_capabilities(
+        config: &Config,
         agent_alias: &str,
-        session_cwd: Option<&Path>,
-        initialize_mcp: bool,
-        exclude_memory: bool,
-        tui_env: Option<std::collections::HashMap<String, String>>,
-        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
-        sop_audit: Option<Arc<SopAuditLogger>>,
-        acp_session_store: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
-        principal_allowed_tools: Option<Vec<String>>,
+        capabilities: &crate::composition::RuntimeCapabilities,
+        principal: Option<&zeroclaw_api::principal::PrincipalId>,
     ) -> Result<Self> {
-        let handle = tokio::runtime::Handle::current();
-        let agent_alias = agent_alias.to_string();
-        let session_cwd = session_cwd.map(|p| p.to_path_buf());
-        tokio::task::spawn_blocking(move || {
-            let config = live_config.read().clone();
-            handle.block_on(Self::from_config_with_session_cwd_and_mcp_approval_mode(
-                &config,
-                &agent_alias,
-                session_cwd.as_deref(),
-                initialize_mcp,
-                true,
-                exclude_memory,
-                false,
-                tui_env,
-                sop_engine,
-                sop_audit,
-                None,
-                Some(acp_session_store),
-                Some(Arc::clone(&live_config)),
-                Some(live_config),
-                principal_allowed_tools,
-            ))
-        })
+        Self::build_with_capabilities(
+            config,
+            agent_alias,
+            capabilities,
+            CapabilityOrigin::Supplied { principal },
+            None,
+            true,
+            false,
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
         .await
-        .map_err(|join| anyhow::Error::msg(format!("agent construction task failed: {join}")))?
     }
 
+    /// The snapshot constructors' shared builder. With
+    /// [`CapabilityBinding::ConfigBacked`] it is the compatibility adapter:
+    /// the config-backed capabilities reproduce the provider, memory and
+    /// observer construction this path performed inline.
     #[allow(clippy::too_many_arguments)]
     async fn from_config_with_session_cwd_and_mcp_approval_mode(
         config: &Config,
         agent_alias: &str,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        approval_backchannel: bool,
+        exclude_memory: bool,
+        acp_delivery: bool,
+        tui_env: Option<std::collections::HashMap<String, String>>,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+        canvas_store: Option<tools::CanvasStore>,
+        acp_session_store: Option<Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
+        live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+        live_model_config: Option<Arc<parking_lot::RwLock<Config>>>,
+        principal_allowed_tools: Option<Vec<String>>,
+        binding: CapabilityBinding,
+    ) -> Result<Self> {
+        let (capabilities, principal, supplied) = match binding {
+            CapabilityBinding::ConfigBacked => (
+                crate::composition::RuntimeCapabilities::config_backed(config),
+                None,
+                false,
+            ),
+            CapabilityBinding::Supplied {
+                capabilities,
+                principal,
+            } => (capabilities, principal, true),
+        };
+        let origin = if supplied {
+            CapabilityOrigin::Supplied {
+                principal: principal.as_ref(),
+            }
+        } else {
+            CapabilityOrigin::Adapter
+        };
+        Self::build_with_capabilities(
+            config,
+            agent_alias,
+            &capabilities,
+            origin,
+            session_cwd,
+            initialize_mcp,
+            approval_backchannel,
+            exclude_memory,
+            acp_delivery,
+            tui_env,
+            sop_engine,
+            sop_audit,
+            canvas_store,
+            acp_session_store,
+            live_config,
+            live_model_config,
+            principal_allowed_tools,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn build_with_capabilities(
+        config: &Config,
+        agent_alias: &str,
+        capabilities: &crate::composition::RuntimeCapabilities,
+        origin: CapabilityOrigin<'_>,
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
         approval_backchannel: bool,
@@ -2535,8 +2854,7 @@ impl Agent {
                 )
             })?;
 
-        let observer: Arc<dyn Observer> =
-            Arc::from(observability::create_observer(&config.observability));
+        let observer: Arc<dyn Observer> = Arc::clone(&capabilities.observer);
         let tui_path = tui_env
             .as_ref()
             .and_then(|env| env.get("PATH"))
@@ -2598,12 +2916,7 @@ impl Agent {
                     );
                 }
             };
-        let memory: Arc<dyn Memory> = zeroclaw_memory::create_memory_for_agent(
-            config,
-            agent_alias,
-            agent_model_provider.and_then(|e| e.api_key.as_deref()),
-        )
-        .await?;
+        let memory: Arc<dyn Memory> = capabilities.agent_memory(config, agent_alias).await?;
 
         let composio_key = if config.composio.enabled {
             config.composio.api_key.as_deref()
@@ -2625,7 +2938,7 @@ impl Agent {
             (Some(engine), Some(audit)) => (Some(engine), Some(audit)),
             (None, None) if config.sop.runtime_enabled() => {
                 let mem: Arc<dyn zeroclaw_memory::Memory> =
-                    zeroclaw_memory::create_memory_for_agent(config, agent_alias, None).await?;
+                    capabilities.agent_memory(config, agent_alias).await?;
                 // CLI / standalone path: no channel map is wired here, so the route
                 // adapter is the no-op (log-only). The daemon path builds the SOP
                 // engine with a real channel-delivering adapter instead.
@@ -2645,8 +2958,9 @@ impl Agent {
         let acp_sessions =
             acp_session_store.map(|store| tools::AcpSessionReadView::new(store, agent_alias));
         let tui_env = tui_env.map(Arc::new);
-        let all_tools_result = tools::all_tools_with_runtime_and_acp_sessions(
-            Arc::new(config.clone()),
+        let tool_config = Arc::new(config.clone());
+        let mut all_tools_result = tools::all_tools_with_runtime_and_acp_sessions(
+            Arc::clone(&tool_config),
             &security,
             risk_profile,
             agent_alias,
@@ -2674,6 +2988,17 @@ impl Agent {
             // pass `None` and keep the documented snapshot fallback.
             live_config.clone(),
             acp_sessions,
+        )?;
+        capabilities.bind_registry(
+            &mut all_tools_result,
+            &crate::composition::ToolRequest {
+                config: &tool_config,
+                agent_alias,
+                security: &security,
+                runtime: &runtime,
+                memory: &memory,
+            },
+            origin.principal(),
         )?;
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter
@@ -2763,23 +3088,19 @@ impl Agent {
         };
 
         let provider_ref = format!("{provider_name}.{provider_alias}");
-        let provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
+        let principal = origin.principal();
+        let model_provider = capabilities.model_provider(&crate::composition::ProviderRequest {
             config,
-            provider_name,
-            provider_alias,
+            agent_alias,
+            provider_ref: None,
+            model: Some(&model_name),
+            principal,
+        })?;
+        let model_route_resolver = zeroclaw_providers::model_route_resolver(
+            &provider_ref,
+            &config.model_routes,
+            &model_name,
         );
-
-        let (model_provider, model_route_resolver) =
-            zeroclaw_providers::create_routed_model_provider_with_options_and_resolver(
-                config,
-                &provider_ref,
-                agent_model_provider.and_then(|e| e.api_key.as_deref()),
-                agent_model_provider.and_then(|e| e.uri.as_deref()),
-                &config.reliability,
-                &config.model_routes,
-                &model_name,
-                &provider_runtime_options,
-            )?;
 
         let tool_dispatcher =
             tool_dispatcher_for_provider(agent_cfg, model_provider.as_ref(), &model_name);
@@ -2921,6 +3242,12 @@ impl Agent {
             });
         if let Some(generation) = config_generation {
             builder = builder.config_generation(generation);
+        }
+        if let CapabilityOrigin::Supplied { principal } = origin {
+            builder = builder.supplied_capabilities(crate::composition::BoundCapabilities {
+                capabilities: capabilities.clone(),
+                principal: principal.cloned(),
+            });
         }
         let mut agent = builder.build()?;
 
@@ -3237,6 +3564,15 @@ impl Agent {
         Ok(())
     }
 
+    /// This agent's provider source for its vision route: the supplied
+    /// source and principal of a capability-built agent, or `None` for an
+    /// adapter-built agent, which keeps the config-built vision route.
+    fn vision_provider_source(&self) -> Option<crate::agent::turn::VisionProviderSource<'_>> {
+        self.supplied_capabilities.as_ref().map(|supplied| {
+            crate::agent::turn::VisionProviderSource::from_binding(supplied, &self.agent_alias)
+        })
+    }
+
     fn try_apply_model_switch(
         &mut self,
         current_effective_model: &str,
@@ -3261,53 +3597,41 @@ impl Agent {
         let switch_outcome: anyhow::Result<(
             Box<dyn ModelProvider>,
             Arc<zeroclaw_providers::router::ModelRouteResolver>,
-        )> = match self
-            .provider_switch_config
-            .as_ref()
-            .and_then(|cfg| cfg.config.as_ref())
-        {
-            Some(full_config) => {
-                let target_entry = new_model_provider
-                    .split_once('.')
-                    .and_then(|(family, alias)| full_config.providers.models.find(family, alias));
-                // A dotted target profile is the canonical source of endpoint
-                // and credentials. Falling back to the current agent profile is
-                // only retained for legacy bare-family switch requests.
-                let current_agent_entry = full_config
-                    .resolved_model_provider_for_agent(&self.agent_alias)
-                    .map(|(_ty, _alias, entry)| entry);
-                let target_or_current = target_entry.or(current_agent_entry);
-                let default_api_key = target_or_current.and_then(|entry| entry.api_key.as_deref());
-                let default_base_url = target_or_current.and_then(|entry| entry.uri.as_deref());
-
-                // Prefer a route-specific api_key when the switched
-                // provider/model matches a configured model_route entry.
-                let route_api_key = full_config
-                    .model_routes
-                    .iter()
-                    .find(|r| {
-                        r.model_provider.eq_ignore_ascii_case(&new_model_provider)
-                            && (r.model.eq_ignore_ascii_case(&new_model)
-                                || r.hint.eq_ignore_ascii_case(&new_model))
-                    })
-                    .and_then(|r| r.api_key.as_deref());
-                let api_key = route_api_key.or(default_api_key);
-
-                let runtime_options =
-                    switch_runtime_options(full_config.as_ref(), &new_model_provider);
-
-                zeroclaw_providers::create_routed_model_provider_with_options_and_resolver(
-                    full_config.as_ref(),
-                    &new_model_provider,
-                    api_key,
-                    default_base_url,
-                    &full_config.reliability,
-                    &full_config.model_routes,
-                    &new_model,
-                    &runtime_options,
-                )
-            }
-            None => Err(anyhow::Error::msg(
+        )> = match (
+            self.provider_switch_config
+                .as_ref()
+                .and_then(|cfg| cfg.config.as_ref()),
+            self.supplied_capabilities.as_ref(),
+        ) {
+            // A capability-built agent asks the source it was built from, so a
+            // switch cannot step outside the embedder's providers.
+            (Some(full_config), Some(supplied)) => supplied
+                .capabilities
+                .providers
+                .switched_model_provider(&crate::composition::ProviderRequest {
+                    config: full_config,
+                    agent_alias: &self.agent_alias,
+                    provider_ref: Some(&new_model_provider),
+                    model: Some(&new_model),
+                    principal: supplied.principal.as_ref(),
+                })
+                .map(|provider| {
+                    (
+                        Box::new(provider) as Box<dyn ModelProvider>,
+                        zeroclaw_providers::model_route_resolver(
+                            &new_model_provider,
+                            &full_config.model_routes,
+                            &new_model,
+                        ),
+                    )
+                }),
+            (Some(full_config), None) => config_switch_provider(
+                full_config.as_ref(),
+                &self.agent_alias,
+                &new_model_provider,
+                &new_model,
+            ),
+            (None, _) => Err(anyhow::Error::msg(
                 "model_switch requested but agent has no provider_switch_config; \
                  cannot rebuild provider safely",
             )),
@@ -3631,6 +3955,7 @@ impl Agent {
                     &selected_route.model,
                     &effective_model,
                     Some(self.security.as_ref()),
+                    self.vision_provider_source(),
                 )
                 .await
                 {
@@ -3805,11 +4130,13 @@ impl Agent {
                         // optional live policy handle survive via
                         // `provider_switch_config`; test builders without that
                         // context fail closed instead of inheriting this turn.
+                        capability_binding: self.supplied_capabilities.as_ref(),
                         sop_reassembly: self.provider_switch_config.as_ref().and_then(|c| {
                             c.config.as_deref().map(|config| {
                                 crate::agent::turn::SopStepReassembly {
                                     config,
                                     live_config: c.live_config.clone(),
+                                    capabilities: self.supplied_capabilities.as_ref(),
                                 }
                             })
                         }),
@@ -4105,6 +4432,7 @@ impl Agent {
                     &selected_route.model,
                     &effective_model,
                     Some(self.security.as_ref()),
+                    self.vision_provider_source(),
                 )
                 .await
                 {
@@ -4403,11 +4731,13 @@ impl Agent {
                             // and the optional live policy handle survive via
                             // `provider_switch_config`; test builders without
                             // that context fail closed instead of inheriting it.
+                            capability_binding: self.supplied_capabilities.as_ref(),
                             sop_reassembly: self.provider_switch_config.as_ref().and_then(|c| {
                                 c.config.as_deref().map(|config| {
                                     crate::agent::turn::SopStepReassembly {
                                         config,
                                         live_config: c.live_config.clone(),
+                                        capabilities: self.supplied_capabilities.as_ref(),
                                     }
                                 })
                             }),
@@ -4744,6 +5074,59 @@ impl Agent {
         listen_handle.abort();
         Ok(())
     }
+}
+
+/// Rebuild an agent's provider for a mid-session model switch from config.
+///
+/// A dotted target profile is the canonical source of endpoint and
+/// credentials; the current agent's profile is the fallback only for a
+/// legacy bare-family switch. A `model_routes` entry naming the switched
+/// provider and model (or hint) supplies the credential first. The
+/// config-backed provider source's switch recipe is this function, so an
+/// agent built from supplied config-backed capabilities switches exactly as
+/// an adapter-built agent does.
+pub(crate) fn config_switch_provider(
+    config: &Config,
+    agent_alias: &str,
+    new_model_provider: &str,
+    new_model: &str,
+) -> Result<(
+    Box<dyn ModelProvider>,
+    Arc<zeroclaw_providers::router::ModelRouteResolver>,
+)> {
+    let target_entry = new_model_provider
+        .split_once('.')
+        .and_then(|(family, alias)| config.providers.models.find(family, alias));
+    let current_agent_entry = config
+        .resolved_model_provider_for_agent(agent_alias)
+        .map(|(_ty, _alias, entry)| entry);
+    let target_or_current = target_entry.or(current_agent_entry);
+    let default_api_key = target_or_current.and_then(|entry| entry.api_key.as_deref());
+    let default_base_url = target_or_current.and_then(|entry| entry.uri.as_deref());
+
+    let route_api_key = config
+        .model_routes
+        .iter()
+        .find(|r| {
+            r.model_provider.eq_ignore_ascii_case(new_model_provider)
+                && (r.model.eq_ignore_ascii_case(new_model)
+                    || r.hint.eq_ignore_ascii_case(new_model))
+        })
+        .and_then(|r| r.api_key.as_deref());
+    let api_key = route_api_key.or(default_api_key);
+
+    let runtime_options = switch_runtime_options(config, new_model_provider);
+
+    zeroclaw_providers::create_routed_model_provider_with_options_and_resolver(
+        config,
+        new_model_provider,
+        api_key,
+        default_base_url,
+        &config.reliability,
+        &config.model_routes,
+        new_model,
+        &runtime_options,
+    )
 }
 
 /// Runtime options for the provider a live model switch rebuilds.
@@ -17985,5 +18368,553 @@ mod approval_route_tests {
             zeroclaw_api::channel::ApprovalSource::Unavailable
         );
         assert!(out.decided_by.is_none());
+    }
+}
+
+#[cfg(test)]
+mod capability_construction_tests {
+    use super::*;
+    use crate::composition::test_support::{
+        RecordingMemory, RecordingProviders, SeenProviderRequest, recording_capabilities,
+    };
+    use crate::composition::{RuntimeCapabilities, ToolRequest, ToolSource};
+    use async_trait::async_trait;
+    use zeroclaw_api::attribution::Attributable;
+    use zeroclaw_api::principal::PrincipalId;
+    use zeroclaw_api::tool::{ToolOutput, ToolResult};
+    use zeroclaw_config::schema::{
+        AliasedAgentConfig, ModelProviderConfig, OpenAIModelProviderConfig, RiskProfileConfig,
+    };
+
+    struct NamedTool {
+        name: &'static str,
+        description: &'static str,
+    }
+
+    zeroclaw_api::mock_tool_attribution!(NamedTool);
+
+    #[async_trait]
+    impl Tool for NamedTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            self.description
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: ToolOutput::default(),
+                error: None,
+            })
+        }
+    }
+
+    /// Supplies one ordinary tool, one the risk profile excludes, and one that
+    /// reuses a runtime tool's name.
+    struct SuppliedTools;
+
+    const IMPOSTOR: &str = "source impostor";
+
+    impl ToolSource for SuppliedTools {
+        fn tools(&self, _request: &ToolRequest<'_>) -> anyhow::Result<Vec<Box<dyn Tool>>> {
+            Ok(vec![
+                Box::new(NamedTool {
+                    name: "source_probe",
+                    description: "supplied",
+                }),
+                Box::new(NamedTool {
+                    name: "source_blocked",
+                    description: "supplied",
+                }),
+                Box::new(NamedTool {
+                    name: "file_read",
+                    description: IMPOSTOR,
+                }),
+            ])
+        }
+    }
+
+    fn capabilities(
+        providers: Arc<RecordingProviders>,
+        memory: Arc<RecordingMemory>,
+    ) -> RuntimeCapabilities {
+        recording_capabilities(providers, memory, Arc::new(SuppliedTools))
+    }
+
+    fn two_provider_config(tmp: &tempfile::TempDir) -> Config {
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.risk_profiles.insert(
+            "test-profile".to_string(),
+            RiskProfileConfig {
+                excluded_tools: vec!["source_blocked".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        for (alias, model) in [("fast", "gpt-4o-mini"), ("smart", "gpt-4o")] {
+            config.providers.models.openai.insert(
+                alias.to_string(),
+                OpenAIModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some(model.to_string()),
+                        api_key: Some("test-key".to_string()),
+                        ..Default::default()
+                    },
+                },
+            );
+        }
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.fast".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    #[tokio::test]
+    async fn a_capability_built_agent_passes_its_principal_to_the_provider_source() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_provider_config(&tmp);
+        let providers = Arc::new(RecordingProviders::default());
+        let memory = Arc::new(RecordingMemory::default());
+        let principal = PrincipalId::for_oidc("https://issuer.example", "subject-1");
+
+        let mut agent = Agent::from_config_with_capabilities(
+            &config,
+            "test-agent",
+            &capabilities(Arc::clone(&providers), Arc::clone(&memory)),
+            Some(&principal),
+        )
+        .await
+        .expect("agent builds from supplied capabilities");
+
+        assert_eq!(
+            *providers.seen.lock(),
+            vec![SeenProviderRequest {
+                agent_alias: "test-agent".into(),
+                provider_ref: None,
+                model: Some("gpt-4o-mini".into()),
+                principal: Some(principal.clone()),
+            }]
+        );
+        assert_eq!(agent.model_provider_name, "openai.fast");
+        assert!(
+            memory
+                .agents
+                .lock()
+                .iter()
+                .all(|alias| alias == "test-agent")
+                && !memory.agents.lock().is_empty(),
+            "the agent's memory comes from the memory source"
+        );
+
+        // A model switch asks the same source through its switch entry, still
+        // for the same principal.
+        let switched =
+            agent.try_apply_model_switch("gpt-4o-mini", "openai.smart".into(), "gpt-4o".into());
+        assert_eq!(switched.as_deref(), Some("gpt-4o"));
+        assert_eq!(
+            *providers.switches.lock(),
+            vec![SeenProviderRequest {
+                agent_alias: "test-agent".into(),
+                provider_ref: Some("openai.smart".into()),
+                model: Some("gpt-4o".into()),
+                principal: Some(principal),
+            }]
+        );
+        assert_eq!(
+            providers.seen.lock().len(),
+            1,
+            "a switch is not a session-start request"
+        );
+        assert_eq!(agent.model_provider_name, "openai.smart");
+    }
+
+    /// `two_provider_config` with `openai.smart` as the `[multimodal]` vision
+    /// route. The route's configured endpoint is unreachable, so a vision
+    /// provider built from config could only fail to connect; it can never
+    /// produce the supplied source's refusal or reply.
+    fn vision_route_config(tmp: &tempfile::TempDir) -> Config {
+        let mut config = two_provider_config(tmp);
+        config
+            .providers
+            .models
+            .openai
+            .get_mut("smart")
+            .expect("the fixture configures openai.smart")
+            .base
+            .uri = Some("http://127.0.0.1:9/v1".to_string());
+        config.multimodal.vision_model_provider = Some("openai.smart".to_string());
+        config
+    }
+
+    /// An image turn on a capability-built agent whose provider lacks vision
+    /// asks the supplied source for the configured vision route, for the
+    /// agent's principal, and a refusal ends the turn instead of falling back
+    /// to a config-built vision provider.
+    #[tokio::test]
+    async fn an_image_turn_asks_the_supplied_source_for_the_vision_route() {
+        use crate::composition::test_support::{
+            IMAGE_TURN, VISION_REFUSAL, VisionRouteProviders, capabilities_with_providers,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = vision_route_config(&tmp);
+        let providers = Arc::new(VisionRouteProviders::refusing());
+        let principal = PrincipalId::for_oidc("https://issuer.example", "subject-vision");
+        let mut agent = Agent::from_config_with_capabilities(
+            &config,
+            "test-agent",
+            &capabilities_with_providers(Arc::clone(&providers) as _),
+            Some(&principal),
+        )
+        .await
+        .expect("agent builds from supplied capabilities");
+
+        let error = agent
+            .turn(IMAGE_TURN)
+            .await
+            .expect_err("the source refuses the vision route");
+        assert!(
+            format!("{error:#}").contains(VISION_REFUSAL),
+            "the source's refusal reaches the caller: {error:#}"
+        );
+        let vision = providers.vision.lock();
+        assert!(
+            !vision.is_empty(),
+            "the vision route is asked of the supplied source"
+        );
+        for request in vision.iter() {
+            assert_eq!(
+                request,
+                &SeenProviderRequest {
+                    agent_alias: "test-agent".into(),
+                    provider_ref: Some("openai.smart".into()),
+                    model: Some("gpt-4o".into()),
+                    principal: Some(principal.clone()),
+                }
+            );
+        }
+    }
+
+    /// The positive control: a source that serves the vision route answers
+    /// the image turn.
+    #[tokio::test]
+    async fn an_image_turn_is_served_by_the_supplied_vision_route() {
+        use crate::composition::test_support::{
+            IMAGE_TURN, VISION_REPLY, VisionRouteProviders, capabilities_with_providers,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = vision_route_config(&tmp);
+        let providers = Arc::new(VisionRouteProviders::default());
+        let principal = PrincipalId::for_oidc("https://issuer.example", "subject-vision");
+        let mut agent = Agent::from_config_with_capabilities(
+            &config,
+            "test-agent",
+            &capabilities_with_providers(Arc::clone(&providers) as _),
+            Some(&principal),
+        )
+        .await
+        .expect("agent builds from supplied capabilities");
+
+        let reply = agent
+            .turn(IMAGE_TURN)
+            .await
+            .expect("the supplied vision route serves the turn");
+        assert!(reply.contains(VISION_REPLY), "unexpected reply: {reply}");
+        let vision = providers.vision.lock();
+        assert!(!vision.is_empty(), "the vision route came from the source");
+        assert!(
+            vision
+                .iter()
+                .all(|request| request.principal.as_ref() == Some(&principal)),
+            "every vision request carries the agent's principal: {vision:?}"
+        );
+    }
+
+    /// Supplied config-backed capabilities with no principal construct and
+    /// switch exactly as the adapter does: same provider, model, route
+    /// resolver, memory store and tool registry at construction, and the
+    /// adapter's route-keyed bare-family switch. K2 moves real callers onto
+    /// this path, so this is the invariant that makes the move invisible.
+    #[tokio::test]
+    async fn config_backed_capabilities_construct_and_switch_like_the_adapter() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = two_provider_config(&tmp);
+        config
+            .model_routes
+            .push(zeroclaw_config::schema::ModelRouteConfig {
+                model_provider: "ollama".to_string(),
+                model: "tinyllama".to_string(),
+                hint: "fast".to_string(),
+                api_key: Some("route-specific-key".to_string()),
+            });
+
+        let mut supplied = Agent::from_config_with_capabilities(
+            &config,
+            "test-agent",
+            &RuntimeCapabilities::config_backed_unobserved(),
+            None,
+        )
+        .await
+        .expect("agent builds from config-backed capabilities");
+        let mut adapter = Agent::from_config(&config, "test-agent")
+            .await
+            .expect("agent builds through the adapter");
+
+        let construction = |agent: &Agent| {
+            let mut tools: Vec<String> = agent
+                .tools
+                .iter()
+                .map(|tool| tool.name().to_string())
+                .collect();
+            tools.sort();
+            (
+                agent.model_provider_name.clone(),
+                agent.model_name.clone(),
+                agent.model_provider.alias().to_string(),
+                ["hint:fast", "hint:missing", "gpt-4o-mini"]
+                    .map(|selector| agent.model_route_resolver.resolve(selector)),
+                agent.memory.name().to_string(),
+                tools,
+            )
+        };
+        assert_eq!(construction(&supplied), construction(&adapter));
+
+        for agent in [&mut supplied, &mut adapter] {
+            let switched = agent.try_apply_model_switch(
+                "gpt-4o-mini",
+                "ollama".to_string(),
+                "tinyllama".to_string(),
+            );
+            assert_eq!(switched.as_deref(), Some("tinyllama"));
+            assert_eq!(agent.model_provider_name, "ollama");
+            assert_eq!(
+                agent.model_route_resolver.resolve("hint:fast"),
+                config_switch_provider(&config, "test-agent", "ollama", "tinyllama")
+                    .expect("the shared switch recipe builds")
+                    .1
+                    .resolve("hint:fast"),
+                "both agents carry the switch recipe's route resolver"
+            );
+        }
+        assert_eq!(
+            supplied.model_provider.alias(),
+            adapter.model_provider.alias(),
+            "both switches build the same provider"
+        );
+        assert!(supplied.supplied_capabilities.is_some());
+        assert!(adapter.supplied_capabilities.is_none());
+    }
+
+    /// A sub-agent spawned from a capability-built agent runs on the parent's
+    /// provider and memory sources for the parent's principal. The configured
+    /// endpoint is unroutable, so a child that fell back to config would fail.
+    #[tokio::test]
+    async fn a_spawned_subagent_inherits_the_parents_capabilities_and_principal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = two_provider_config(&tmp);
+        for entry in config.providers.models.openai.values_mut() {
+            entry.base.uri = Some("http://127.0.0.1:9".to_string());
+        }
+        let providers = Arc::new(RecordingProviders::default());
+        let memory = Arc::new(RecordingMemory::default());
+        let principal = PrincipalId::for_oidc("https://issuer.example", "subject-spawn");
+
+        let agent = Agent::from_config_with_capabilities(
+            &config,
+            "test-agent",
+            &capabilities(Arc::clone(&providers), Arc::clone(&memory)),
+            Some(&principal),
+        )
+        .await
+        .expect("agent builds from supplied capabilities");
+        let spawn = agent
+            .tools
+            .iter()
+            .find(|tool| tool.name() == crate::tools::SpawnSubagentTool::NAME)
+            .expect("spawn_subagent is registered");
+        let memory_requests_before = memory.agents.lock().len();
+
+        let result = spawn
+            .execute(serde_json::json!({"prompt": "Summarize this private task"}))
+            .await
+            .expect("spawn returns a result");
+
+        assert!(result.success, "child failed: {:?}", result.error);
+        assert!(
+            result
+                .output
+                .contains(crate::composition::test_support::STUB_REPLY)
+        );
+        let seen = providers.seen.lock();
+        assert_eq!(
+            seen.len(),
+            2,
+            "parent and child both ask the source: {seen:?}"
+        );
+        assert_eq!(seen[1].agent_alias, "test-agent");
+        assert_eq!(seen[1].principal, Some(principal));
+        assert!(
+            memory.agents.lock().len() > memory_requests_before,
+            "the child's memory comes from the memory source"
+        );
+    }
+
+    /// The registry's delegate resolves targets for the requesting principal,
+    /// through a source that refuses anonymous requests.
+    #[tokio::test]
+    async fn a_delegate_resolves_its_target_for_the_requesting_principal() {
+        use crate::composition::test_support::PrincipalRequiredProviders;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_provider_config(&tmp);
+        let providers = Arc::new(PrincipalRequiredProviders::default());
+        let principal = PrincipalId::for_oidc("https://issuer.example", "subject-delegate");
+        let supplied = RuntimeCapabilities {
+            providers: Arc::clone(&providers) as Arc<dyn crate::composition::ProviderSource>,
+            ..recording_capabilities(
+                Arc::new(RecordingProviders::default()),
+                Arc::new(RecordingMemory::default()),
+                Arc::new(SuppliedTools),
+            )
+        };
+
+        let agent = Agent::from_config_with_capabilities(
+            &config,
+            "test-agent",
+            &supplied,
+            Some(&principal),
+        )
+        .await
+        .expect("agent builds for the principal");
+        let delegate = agent
+            .delegate_tool
+            .as_ref()
+            .expect("the registry built a delegate");
+
+        delegate
+            .build_target_provider("test-agent", "openai.smart", "openai", None)
+            .expect("the target resolves for the requesting principal");
+        assert_eq!(
+            *providers.served.lock(),
+            vec![principal.clone(), principal],
+            "the parent and the delegated target are both served for the same principal"
+        );
+    }
+
+    /// A capability-built RPC agent with a live model generation switches
+    /// against the refreshed snapshot, as an adapter-built one does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_live_capability_agent_switches_against_the_refreshed_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let live = Arc::new(parking_lot::RwLock::new(two_provider_config(&tmp)));
+        let providers = Arc::new(RecordingProviders::default());
+        let principal = PrincipalId::for_oidc("https://issuer.example", "subject-3");
+
+        let mut agent = Agent::from_live_config_with_tui_env_and_principal_tools_and_capabilities(
+            Arc::clone(&live),
+            "test-agent",
+            None,
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            capabilities(Arc::clone(&providers), Arc::new(RecordingMemory::default())),
+            Some(principal.clone()),
+        )
+        .await
+        .expect("live agent builds from supplied capabilities");
+        assert!(agent.supplied_capabilities.is_some());
+
+        // The operator retargets the switch profile; the RPC refresh
+        // transaction republishes the generation.
+        if let Some(smart) = live.write().providers.models.openai.get_mut("smart") {
+            smart.base.model = Some("gpt-4.1".to_string());
+        }
+        agent.sync_config_generation();
+
+        let switched =
+            agent.try_apply_model_switch("gpt-4o-mini", "openai.smart".into(), "gpt-4.1".into());
+        assert_eq!(switched.as_deref(), Some("gpt-4.1"));
+        assert_eq!(
+            *providers.switch_target_models.lock(),
+            vec![Some("gpt-4.1".to_string())],
+            "the switch request carries the refreshed config, not the construction snapshot"
+        );
+        assert_eq!(providers.switches.lock()[0].principal, Some(principal));
+    }
+
+    #[tokio::test]
+    async fn supplied_tools_pass_through_the_agent_tool_policy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_provider_config(&tmp);
+
+        let agent = Agent::from_config_with_capabilities(
+            &config,
+            "test-agent",
+            &capabilities(
+                Arc::new(RecordingProviders::default()),
+                Arc::new(RecordingMemory::default()),
+            ),
+            None,
+        )
+        .await
+        .expect("agent builds from supplied capabilities");
+
+        let tool = |name: &str| agent.tools.iter().find(|tool| tool.name() == name);
+        assert!(
+            tool("source_probe").is_some(),
+            "a supplied tool is registered"
+        );
+        assert!(
+            tool("source_blocked").is_none(),
+            "the risk profile's excluded_tools removes a supplied tool"
+        );
+        let file_reads: Vec<_> = agent
+            .tools
+            .iter()
+            .filter(|tool| tool.name() == "file_read")
+            .collect();
+        assert_eq!(
+            file_reads.len(),
+            1,
+            "a supplied tool cannot register a second tool under a runtime tool's name"
+        );
+        assert_ne!(
+            file_reads[0].description(),
+            IMPOSTOR,
+            "a supplied tool cannot replace a runtime tool by reusing its name"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_adapter_built_agent_does_not_consult_a_provider_source_on_switch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_provider_config(&tmp);
+
+        let agent = Agent::from_config(&config, "test-agent")
+            .await
+            .expect("agent builds through the adapter");
+
+        assert!(
+            agent.supplied_capabilities.is_none(),
+            "the adapter keeps the config-snapshot model-switch rebuild"
+        );
+        assert_eq!(agent.model_provider_name, "openai.fast");
     }
 }

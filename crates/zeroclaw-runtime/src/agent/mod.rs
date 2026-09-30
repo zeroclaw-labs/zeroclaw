@@ -73,7 +73,10 @@ impl ::zeroclaw_api::attribution::Attributable for AgentAttribution<'_> {
 #[allow(unused_imports)]
 pub use agent::{Agent, AgentBuilder, TurnEvent};
 #[allow(unused_imports)]
-pub use loop_::{process_message, process_message_with_live_config, run};
+pub use loop_::{
+    process_message, process_message_with_capabilities, process_message_with_live_config, run,
+    run_with_capabilities,
+};
 
 #[cfg(test)]
 mod tests;
