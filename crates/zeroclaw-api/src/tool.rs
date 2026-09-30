@@ -376,6 +376,16 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
         false
     }
 
+    /// The tool this one runs, for a wrapper that exposes another tool under
+    /// a different name (a skill's builtin wrapper). A caller that restricts
+    /// tools by name applies the restriction along this chain as well, so a
+    /// renamed wrapper cannot reach a tool the caller excluded or skip an
+    /// approval the caller requires for it. Transparent wrappers that keep
+    /// their inner tool's name forward the inner tool's value.
+    fn wrapped_tool(&self) -> Option<&dyn Tool> {
+        None
+    }
+
     /// Tool name (used in LLM function calling)
     fn name(&self) -> &str;
 

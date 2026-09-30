@@ -70,7 +70,11 @@ pub(crate) struct ToolDispatchContext<'a> {
     pub model_switch_callback: Option<&'a ModelSwitchCallback>,
 }
 
-fn is_excluded_tool(name: &str, excluded_tools: &[String]) -> bool {
+/// Whether `name` is in `excluded_tools`: both sides trimmed, ASCII case
+/// ignored. The one matcher every exclusion check uses, including a caller
+/// that excludes a wrapper because of the tool it runs, so an entry that
+/// blocks a direct call blocks the same tool behind a wrapper.
+pub fn is_excluded_tool(name: &str, excluded_tools: &[String]) -> bool {
     let name = name.trim();
     excluded_tools
         .iter()

@@ -362,6 +362,10 @@ impl Tool for SkillBuiltinTool {
         self.target_tool.requires_unrestricted_principal()
     }
 
+    fn wrapped_tool(&self) -> Option<&dyn zeroclaw_api::tool::Tool> {
+        Some(self.target_tool.as_ref())
+    }
+
     fn name(&self) -> &str {
         &self.tool_name
     }

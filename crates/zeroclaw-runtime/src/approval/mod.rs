@@ -232,6 +232,14 @@ impl ApprovalManager {
 
     /// Check whether a tool call requires interactive approval.
     /// Returns `true` if the call needs a prompt, `false` if it can proceed.
+    /// Whether this manager's `always_ask` list names `tool_name` (or holds
+    /// `"*"`), matched as [`Self::approval_requirement`] matches it: entries
+    /// trimmed, names compared exactly. A caller propagating the list to a
+    /// wrapper uses this, so a wrapper asks whenever its target would.
+    pub fn always_asks(&self, tool_name: &str) -> bool {
+        self.always_ask.contains("*") || self.always_ask.contains(tool_name)
+    }
+
     pub fn needs_approval(&self, tool_name: &str) -> bool {
         self.approval_requirement(tool_name) == ApprovalRequirement::Prompt
     }
@@ -244,7 +252,7 @@ impl ApprovalManager {
 
         // always_ask overrides everything, including Full autonomy — an operator
         // who explicitly lists a tool here wants a prompt regardless of level.
-        if self.always_ask.contains("*") || self.always_ask.contains(tool_name) {
+        if self.always_asks(tool_name) {
             return ApprovalRequirement::Prompt;
         }
 

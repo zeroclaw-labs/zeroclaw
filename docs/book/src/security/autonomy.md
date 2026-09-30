@@ -68,6 +68,8 @@ When `approval_route` is absent (the default), approvals behave exactly as descr
 
 > **Scope.** `approval_route` is honored on both turn paths: the interactive, channel-driven path (a turn that carries a live channel handle, e.g. a streamed agent chat) and the non-interactive path that runs without an originating channel (gateway chat/webhook dispatch and agent-to-agent peer messages). On the non-interactive path the approver must be a **live, registered channel** in the running daemon (it is resolved through the daemon's channel registry); if that registry is unavailable (for example a one-shot CLI run with no channels started) or the named approver is not live, the gate falls back to the profile's non-interactive default, which fails closed (denies) under the default `on_no_approver = "deny"`.
 
+**Sender roles.** A messaging-channel turn narrowed by a [sender role](../channels/peer-groups.md#sender-roles) uses the role's `approval_route`, or the agent's when the role sets none, and never falls back to the room the message came from: an approver that is missing, silent, or unavailable denies, even under `inherit-originator`.
+
 ## Command allow list
 
 For the shell tool specifically: if `allowed_commands` is non-empty, it's strict: any command not listed is blocked. The shell-policy validator handles destructive-pattern detection on top of the allowlist.
