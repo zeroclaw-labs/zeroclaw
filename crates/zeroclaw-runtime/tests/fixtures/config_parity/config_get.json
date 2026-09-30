@@ -1,0 +1,9 @@
+{
+  "agents": {
+    "bot": "anthropic.default",
+    "helper": false
+  },
+  "heartbeat": "bot",
+  "provider": "***MASKED***",
+  "provider_model": "claude-sonnet-5"
+}

@@ -516,6 +516,8 @@ async fn agent_delete_owned_state(
         session_backend.as_ref(),
         alias,
         &archive_dir,
+        // The CLI is the local operator: not scoped to one principal's sessions.
+        None,
     )
     .await;
     let memory = report.memory_purged.to_string();

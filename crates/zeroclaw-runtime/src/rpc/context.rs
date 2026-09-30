@@ -177,6 +177,11 @@ pub struct RpcContext {
     /// daemon reload rebinds the same address.
     pub gateway_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
 
+    /// Set when an accepted config write needs a daemon reload to take full
+    /// effect. The daemon generation owns it and hands the same flag to the
+    /// gateway, so both surfaces report one answer.
+    pub pending_reload: Arc<std::sync::atomic::AtomicBool>,
+
     /// In-flight approval requests waiting for session/approve RPC calls.
     pub approval_pending: Arc<ApprovalPendingMap>,
 
@@ -227,6 +232,49 @@ pub struct RpcContext {
     /// `commit_config_with_live_session_refresh`. See `ConfigCommitPause`.
     #[cfg(test)]
     pub config_commit_pause: Option<Arc<ConfigCommitPause>>,
+
+    /// Test-only pause inside a config write's commit. See
+    /// `ConfigReplacePause`.
+    #[cfg(test)]
+    pub config_replace_pause: Option<Arc<ConfigReplacePause>>,
+}
+
+/// Where a config write's commit parks under [`ConfigReplacePause`].
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigReplacePoint {
+    /// Every wait of the write is done (the temporary file and backup are
+    /// written and synced); authority has not yet been rechecked.
+    BeforeAuthority,
+    /// Authority passed and the credential's revocation is held off; the
+    /// canonical file has not yet been replaced.
+    InsideLiveCredential,
+    /// The canonical file was replaced; the write has not yet returned.
+    AfterReplace,
+}
+
+/// Test-only pause inside the commit of a config write. The commit runs
+/// synchronously, so it parks on std channels: `arrived` is sent once the
+/// write reaches `at`, and the commit blocks on `release` until the test
+/// sends it. Tests that use it drive the write on a multi-threaded runtime.
+#[cfg(test)]
+pub struct ConfigReplacePause {
+    pub at: ConfigReplacePoint,
+    pub arrived: std::sync::mpsc::SyncSender<()>,
+    pub release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+#[cfg(test)]
+impl RpcContext {
+    /// Park a config write's commit if a test armed a pause at `point`.
+    pub(crate) fn pause_config_replace(&self, point: ConfigReplacePoint) {
+        if let Some(pause) = self.config_replace_pause.as_ref()
+            && pause.at == point
+        {
+            let _ = pause.arrived.send(());
+            let _ = pause.release.lock().unwrap().recv();
+        }
+    }
 }
 
 /// Test-only pause point inside `commit_config_with_live_session_refresh`:
@@ -274,6 +322,7 @@ impl RpcContext {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new(&tui_dir)),
             acp_session_store: AcpSessionStore::new(data_dir.as_path()).ok().map(Arc::new),
@@ -283,6 +332,8 @@ impl RpcContext {
             hooks: None,
             #[cfg(test)]
             config_commit_pause: None,
+            #[cfg(test)]
+            config_replace_pause: None,
             cert_audit,
             auth,
         })
@@ -303,6 +354,7 @@ impl RpcContext {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -312,6 +364,8 @@ impl RpcContext {
             hooks: None,
             #[cfg(test)]
             config_commit_pause: None,
+            #[cfg(test)]
+            config_replace_pause: None,
             cert_audit: None,
             auth,
         })
@@ -341,6 +395,7 @@ impl RpcContext {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -350,6 +405,8 @@ impl RpcContext {
             hooks: None,
             #[cfg(test)]
             config_commit_pause: None,
+            #[cfg(test)]
+            config_replace_pause: None,
             cert_audit,
             auth,
         })
@@ -420,6 +477,7 @@ impl RpcContext {
             subscriptions,
             reload_tx: None,
             gateway_shutdown_tx: None,
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -429,6 +487,8 @@ impl RpcContext {
             hooks: None,
             #[cfg(test)]
             config_commit_pause: None,
+            #[cfg(test)]
+            config_replace_pause: None,
             cert_audit: None,
             auth,
         })
@@ -453,6 +513,7 @@ impl RpcContext {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -462,6 +523,8 @@ impl RpcContext {
             hooks: None,
             #[cfg(test)]
             config_commit_pause: None,
+            #[cfg(test)]
+            config_replace_pause: None,
             cert_audit: None,
             auth,
         })
@@ -492,6 +555,7 @@ impl RpcContext {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -500,6 +564,8 @@ impl RpcContext {
             sop_audit: Some(sop_audit),
             hooks: None,
             config_commit_pause: None,
+            #[cfg(test)]
+            config_replace_pause: None,
             cert_audit: None,
             auth,
         })
@@ -524,6 +590,7 @@ impl RpcContext {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -533,6 +600,8 @@ impl RpcContext {
             hooks: None,
             #[cfg(test)]
             config_commit_pause: None,
+            #[cfg(test)]
+            config_replace_pause: None,
             cert_audit: None,
             auth,
         })
@@ -557,6 +626,7 @@ impl RpcContext {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -566,6 +636,8 @@ impl RpcContext {
             hooks: None,
             #[cfg(test)]
             config_commit_pause: None,
+            #[cfg(test)]
+            config_replace_pause: None,
             cert_audit: None,
             auth,
         })
@@ -591,6 +663,7 @@ impl RpcContext {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx: None,
             gateway_shutdown_tx: None,
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store,
@@ -600,6 +673,8 @@ impl RpcContext {
             hooks: None,
             #[cfg(test)]
             config_commit_pause: None,
+            #[cfg(test)]
+            config_replace_pause: None,
             cert_audit: None,
             auth,
         })
@@ -625,6 +700,7 @@ impl RpcContext {
             subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
             reload_tx,
             gateway_shutdown_tx,
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
@@ -634,6 +710,8 @@ impl RpcContext {
             hooks: None,
             #[cfg(test)]
             config_commit_pause: None,
+            #[cfg(test)]
+            config_replace_pause: None,
             cert_audit: None,
             auth,
         })

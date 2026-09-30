@@ -25768,6 +25768,12 @@ impl Config {
     }
 
     pub async fn save(&self) -> Result<()> {
+        self.save_gated(&crate::commit_gate::UngatedCommit).await
+    }
+
+    /// [`Self::save`], with `gate` deciding at the canonical replacement
+    /// whether the write takes effect.
+    pub async fn save_gated(&self, gate: &dyn crate::commit_gate::ConfigCommitGate) -> Result<()> {
         // Encrypt secrets before serialization
         let mut config_to_save = self.clone();
         // Stamp the current schema version on every write. The in-memory
@@ -25841,7 +25847,7 @@ impl Config {
             new_toml
         };
 
-        write_config_atomically(&config_path, &toml_str).await
+        write_config_atomically(&config_path, &toml_str, gate).await
     }
 
     /// Incremental save: only the paths in `self.dirty_paths` are written
@@ -25851,13 +25857,25 @@ impl Config {
     /// written. Falls back to a full `save()` when the file doesn't
     /// exist yet. Clears the dirty set on success.
     pub async fn save_dirty(&mut self) -> Result<()> {
+        self.save_dirty_gated(&crate::commit_gate::UngatedCommit)
+            .await
+    }
+
+    /// [`Self::save_dirty`], with `gate` deciding at the canonical replacement
+    /// whether the write takes effect. Everything that waits (reading the
+    /// current file, writing, syncing and backing up) happens first; the gate
+    /// is consulted only for the synchronous replacement.
+    pub async fn save_dirty_gated(
+        &mut self,
+        gate: &dyn crate::commit_gate::ConfigCommitGate,
+    ) -> Result<()> {
         if self.dirty_paths.is_empty() {
             return Ok(());
         }
 
         let config_path = self.resolve_config_path_for_save().await?;
         if !config_path.exists() {
-            let result = self.save().await;
+            let result = self.save_gated(gate).await;
             if result.is_ok() {
                 self.clear_dirty();
             }
@@ -25930,7 +25948,7 @@ impl Config {
 
         let toml_str = ensure_blank_line_before_sections(&doc.to_string());
 
-        write_config_atomically(&config_path, &toml_str).await?;
+        write_config_atomically(&config_path, &toml_str, gate).await?;
         if retired_nevis {
             ::zeroclaw_log::record!(
                 INFO,
@@ -26039,23 +26057,29 @@ fn take_post_replace_sync_failure(config_path: &Path) -> bool {
 }
 
 /// Atomic write shared by `save()` and `save_dirty()`.
-async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<()> {
+async fn write_config_atomically(
+    config_path: &Path,
+    toml_str: &str,
+    gate: &dyn crate::commit_gate::ConfigCommitGate,
+) -> Result<()> {
     #[cfg(any(test, feature = "test-helpers"))]
     if take_post_replace_sync_failure(config_path) {
         return write_config_atomically_with_sync(
             config_path,
             toml_str,
             PostReplaceSync::FailForTest,
+            gate,
         )
         .await;
     }
-    write_config_atomically_with_sync(config_path, toml_str, PostReplaceSync::Real).await
+    write_config_atomically_with_sync(config_path, toml_str, PostReplaceSync::Real, gate).await
 }
 
 async fn write_config_atomically_with_sync(
     config_path: &Path,
     toml_str: &str,
     post_replace_sync: PostReplaceSync,
+    gate: &dyn crate::commit_gate::ConfigCommitGate,
 ) -> Result<()> {
     let parent_dir = config_path
         .parent()
@@ -26141,8 +26165,28 @@ async fn write_config_atomically_with_sync(
             .context("Failed to fsync config backup directory entry before atomic replace")?;
     }
 
-    if let Err(e) = fs::rename(&temp_path, config_path).await {
+    // The replacement is the write's single point of effect. Everything
+    // above only prepared it; `gate` decides now, and a gate that allows it
+    // performs the synchronous rename itself, with nothing awaited between
+    // its decision and the replacement.
+    let replace_attempted = std::sync::atomic::AtomicBool::new(false);
+    let committed = {
+        let mut replace = || {
+            replace_attempted.store(true, std::sync::atomic::Ordering::Relaxed);
+            std::fs::rename(&temp_path, config_path)
+        };
+        gate.commit(&mut replace)
+    };
+    if let Err(e) = committed {
         let _ = fs::remove_file(&temp_path).await;
+        if !replace_attempted.load(std::sync::atomic::Ordering::Relaxed) {
+            // Refused before replacement: `config.toml` is untouched, and
+            // the backup copy of it is not needed.
+            if had_existing_config {
+                let _ = fs::remove_file(&backup_path).await;
+            }
+            return Err(e.context("Config replacement was refused at commit"));
+        }
         if had_existing_config && backup_path.exists() {
             fs::copy(&backup_path, config_path)
                 .await
@@ -33606,6 +33650,7 @@ default_temperature = 0.7
             &config_path,
             "schema_version = 2\n",
             PostReplaceSync::FailForTest,
+            &crate::commit_gate::UngatedCommit,
         )
         .await;
 
@@ -33653,6 +33698,7 @@ default_temperature = 0.7
             &config_path,
             "schema_version = 2\n",
             PostReplaceSync::Real,
+            &crate::commit_gate::UngatedCommit,
         )
         .await;
 

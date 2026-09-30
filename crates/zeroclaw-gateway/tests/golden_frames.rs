@@ -188,6 +188,7 @@ impl Gateway {
         let reload_controls = zeroclaw_runtime::daemon::GatewayReloadControls {
             shutdown_tx: shutdown_tx.clone(),
             reload_tx,
+            pending_reload: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(None);
         let readiness = zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {

@@ -2974,6 +2974,40 @@ impl AcpSessionStore {
     /// Delete every ACP session (live or killed) for `agent_alias`, returning the
     /// row count. Child tables (`acp_messages`/`acp_tool_calls`/`acp_session_events`)
     /// cascade via their `ON DELETE CASCADE` FKs (`foreign_keys = ON`).
+    /// Delete the ended (`killed_at` set) sessions of `agent_alias` owned by
+    /// `owner_principal_id`, returning the row count. The owner rides the
+    /// statement, so another principal's session, or one created after the
+    /// caller's ownership check, keeps its row and transcript.
+    pub fn delete_killed_sessions_by_agent_owned(
+        &self,
+        agent_alias: &str,
+        owner_principal_id: &str,
+    ) -> Result<usize> {
+        let conn = self.conn.lock();
+        let rows = conn
+            .execute(
+                "DELETE FROM acp_sessions \
+                 WHERE agent_alias = ?1 AND killed_at IS NOT NULL AND principal_id = ?2",
+                params![agent_alias, owner_principal_id],
+            )
+            .context("Failed to delete owned ended ACP sessions for agent")?;
+        Ok(rows)
+    }
+
+    /// Delete only the ended (`killed_at` set) sessions of `agent_alias`,
+    /// returning the row count. A session that started after the caller's
+    /// live-session check keeps its row.
+    pub fn delete_killed_sessions_by_agent(&self, agent_alias: &str) -> Result<usize> {
+        let conn = self.conn.lock();
+        let rows = conn
+            .execute(
+                "DELETE FROM acp_sessions WHERE agent_alias = ?1 AND killed_at IS NOT NULL",
+                params![agent_alias],
+            )
+            .context("Failed to delete ended ACP sessions for agent")?;
+        Ok(rows)
+    }
+
     pub fn delete_sessions_by_agent(&self, agent_alias: &str) -> Result<usize> {
         let conn = self.conn.lock();
         let rows = conn
@@ -6898,6 +6932,45 @@ mod tests {
         );
         assert!(store.is_live_session_for_agent("owned", "alpha").unwrap());
         assert_eq!(store.list_session_ids().unwrap(), vec!["owned"]);
+    }
+
+    #[test]
+    fn owned_ended_session_delete_keeps_other_principals_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        store
+            .create_session("mine", "alpha", "/tmp/w", Some("alice"))
+            .unwrap();
+        store
+            .create_session("theirs", "alpha", "/tmp/w", Some("bob"))
+            .unwrap();
+        store
+            .create_session("legacy", "alpha", "/tmp/w", None)
+            .unwrap();
+        store
+            .append_turn(
+                "theirs",
+                &[ConversationMessage::Chat(ChatMessage::user("hello"))],
+            )
+            .unwrap();
+        for id in ["mine", "theirs", "legacy"] {
+            assert!(store.mark_session_killed(id).unwrap());
+        }
+
+        assert_eq!(
+            store
+                .delete_killed_sessions_by_agent_owned("alpha", "alice")
+                .unwrap(),
+            1
+        );
+
+        assert!(store.load_session("mine").unwrap().is_none());
+        let theirs = store
+            .load_session("theirs")
+            .unwrap()
+            .expect("bob keeps his");
+        assert_eq!(theirs.messages.len(), 1, "and his transcript");
+        assert!(store.load_session("legacy").unwrap().is_some());
     }
 
     #[test]

@@ -11,6 +11,7 @@ pub mod alias_refs;
 pub mod api_error;
 pub mod autonomy;
 pub mod comment_writer;
+pub mod commit_gate;
 pub mod cost;
 pub mod domain_matcher;
 pub mod env_overrides;

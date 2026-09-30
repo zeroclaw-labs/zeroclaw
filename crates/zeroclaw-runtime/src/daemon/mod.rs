@@ -614,6 +614,10 @@ pub async fn run(
     // gateway serves /pair, rotation, and revocation from THIS instance
     // and the RPC native auth provider verifies against it, so a pairing
     // change reaches both surfaces immediately (no boot-time snapshot).
+    // One pending-reload flag per daemon generation, shared by every surface
+    // that writes config. A reload starts a new generation, so it starts clear.
+    let pending_reload = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     let pairing_guard = std::sync::Arc::new(zeroclaw_config::pairing::PairingGuard::new(
         config.gateway.require_pairing,
         &config.gateway.paired_tokens,
@@ -652,6 +656,7 @@ pub async fn run(
         let gateway_reload_controls = GatewayReloadControls {
             shutdown_tx: gateway_shutdown_tx.clone(),
             reload_tx: reload_tx.clone(),
+            pending_reload: pending_reload.clone(),
         };
         let gateway_tui_registry = tui_registry.clone();
         let gateway_start = std::sync::Arc::new(gateway_start);
@@ -901,6 +906,8 @@ pub async fn run(
         Some(std::sync::Arc::new(RpcContext {
             #[cfg(test)]
             config_commit_pause: None,
+            #[cfg(test)]
+            config_replace_pause: None,
             config: std::sync::Arc::clone(&live_config),
             config_write_lock: zeroclaw_config::write_lock::shared_config_write_lock(),
             sessions,
@@ -922,6 +929,7 @@ pub async fn run(
             },
             reload_tx: Some(reload_tx.clone()),
             gateway_shutdown_tx: Some(gateway_shutdown_tx.clone()),
+            pending_reload: pending_reload.clone(),
             approval_pending: std::sync::Arc::new(
                 crate::rpc::context::ApprovalPendingMap::default(),
             ),

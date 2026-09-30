@@ -556,6 +556,34 @@ impl RpcInboundAuth {
         Ok(())
     }
 
+    /// Run `effect` only while the credential behind `auth` is live, ordered
+    /// against its revocation: for a native pairing token the paired set is
+    /// held from the membership check through `effect`, so an unpairing lands
+    /// entirely before (and `effect` does not run) or entirely after it.
+    /// Expiry and revalidation deadlines are read immediately before `effect`
+    /// with nothing awaited between. Policy publication is ordered by the
+    /// caller's config write lock, not here.
+    pub fn commit_while_live<R>(
+        &self,
+        auth: &ConnectionAuth,
+        effect: impl FnOnce() -> R,
+    ) -> Result<R, AuthDenied> {
+        match auth.native_token_hash.as_deref() {
+            Some(hash) => self
+                .pairing
+                .while_paired(hash, || credential_unexpired(auth).map(|()| effect()))
+                .unwrap_or_else(|| {
+                    Err(AuthDenied::auth_required(
+                        crate::i18n::get_required_cli_string("rpc-auth-pairing-revoked"),
+                    ))
+                }),
+            None => {
+                credential_unexpired(auth)?;
+                Ok(effect())
+            }
+        }
+    }
+
     /// Hold the accepted authorization state and the paired-token set still
     /// until the returned lease is dropped: no policy publication can install
     /// a new state and no pairing can be revoked meanwhile.

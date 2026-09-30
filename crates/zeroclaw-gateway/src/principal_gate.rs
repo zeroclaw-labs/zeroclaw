@@ -37,7 +37,6 @@
 //! concurrent persist can never reinstall the older policy over the
 //! newer one.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::{
@@ -203,6 +202,13 @@ impl WriteDenied {
     }
 }
 
+impl WriteDenied {
+    /// A 403 a handler decides itself, after the write-set check.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self::forbidden(message.into())
+    }
+}
+
 impl IntoResponse for WriteDenied {
     fn into_response(self) -> Response {
         (
@@ -268,20 +274,12 @@ impl ConfigWriteSet {
         after: &Config,
         paths: impl IntoIterator<Item = &'a str>,
     ) -> Self {
-        let before = declared_paths(before);
-        let after = declared_paths(after);
-        let writes = paths
-            .into_iter()
-            .map(|path| {
-                let verb = match (contains_path(&before, path), contains_path(&after, path)) {
-                    (false, true) => Verb::Create,
-                    (true, false) => Verb::Delete,
-                    _ => Verb::Update,
-                };
-                (path.to_owned(), verb)
-            })
-            .collect();
-        Self { writes }
+        // The same classification the RPC persistence boundary applies.
+        Self {
+            writes: zeroclaw_runtime::config_ops::write_set::classify_by_effect(
+                before, after, paths,
+            ),
+        }
     }
 
     /// Pin the verb for a path whose route semantics the effect diff does
@@ -302,22 +300,6 @@ impl ConfigWriteSet {
                     .is_some_and(|rest| rest.starts_with('.'))
         })
     }
-}
-
-fn declared_paths(config: &Config) -> HashSet<String> {
-    config
-        .prop_fields()
-        .into_iter()
-        .map(|info| info.name)
-        .collect()
-}
-
-fn contains_path(declared: &HashSet<String>, path: &str) -> bool {
-    declared.contains(path)
-        || declared.iter().any(|name| {
-            name.strip_prefix(path)
-                .is_some_and(|rest| rest.starts_with('.'))
-        })
 }
 
 fn verb_name(verb: Verb) -> &'static str {
@@ -452,6 +434,28 @@ pub fn authorize_config_write(
         enforced: Some(writes),
         authority,
     })
+}
+
+/// The principal a scoped request acts as, decided under the config write
+/// lock on the grants it holds now: an authenticated principal that is not
+/// admin. `Ok(None)` when nothing limits the request (the open posture, an
+/// admin, or no principal), the same exemptions [`authorize_config_write`]
+/// grants.
+pub fn scoped_principal_id(
+    request: &RequestPrincipal,
+    guard: &ConfigWriteGuard,
+) -> Result<Option<String>, WriteDenied> {
+    let Some(axum::Extension(request)) = request else {
+        return Ok(None);
+    };
+    let Some(conn) = &request.principal else {
+        return Ok(None);
+    };
+    let grants = current_grants(request, conn, guard)?;
+    if grants.admin || !conn.principal.is_authenticated() {
+        return Ok(None);
+    }
+    Ok(Some(conn.principal.id.as_str().to_owned()))
 }
 
 /// A rewrite whose write set cannot be enumerated before it runs (a schema
@@ -1124,6 +1128,50 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(agent_model(&router, "beta").await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn scoped_agent_delete_is_refused_while_other_principals_own_its_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idp = introspection_idp(&["ops"]).await;
+        let config = editor_config(
+            &tmp,
+            &idp.uri(),
+            &[Verb::Create, Verb::Update, Verb::Delete],
+            &["agents.*"],
+        );
+        let data_dir = config.data_dir.clone();
+        let router = router_for(config);
+        create_agent(&router, "beta").await;
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let store = zeroclaw_infra::acp_session_store::AcpSessionStore::new(&data_dir).unwrap();
+        store
+            .create_session("theirs", "beta", "/tmp/beta", Some("someone-else"))
+            .unwrap();
+        assert!(store.mark_session_killed("theirs").unwrap());
+
+        let (status, body) = send(
+            &router,
+            "DELETE",
+            "/api/config/map-key?path=agents&key=beta",
+            SCOPED.0,
+            SCOPED.1,
+            None,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("owned by other principals")),
+            "{body}"
+        );
+        assert_eq!(agent_model(&router, "beta").await.0, StatusCode::OK);
+        assert!(
+            store.load_session("theirs").unwrap().is_some(),
+            "the other principal's session survives"
+        );
     }
 
     #[tokio::test]

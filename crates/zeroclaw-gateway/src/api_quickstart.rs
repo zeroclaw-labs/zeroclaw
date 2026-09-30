@@ -114,10 +114,17 @@ pub async fn handle_apply(
     let mut working = state.config.read().clone();
     // The staged policy is compiled BEFORE Quickstart's first write, so a
     // rejected one cannot reach disk and then be reported as not saved.
-    let result = apply_with_surface_checked(submission, &mut working, Surface::Web, &|staged| {
-        zeroclaw_runtime::rpc::auth::validate_accepted_auth_config(staged)
-            .map_err(|e| e.to_string())
-    })
+    // Authorized in full above, under the config write lock.
+    let result = apply_with_surface_checked(
+        submission,
+        &mut working,
+        Surface::Web,
+        &|staged| {
+            zeroclaw_runtime::rpc::auth::validate_accepted_auth_config(staged)
+                .map_err(|e| e.to_string())
+        },
+        &zeroclaw_config::commit_gate::UngatedCommit,
+    )
     .await;
     let body = match result {
         Ok(agent) => {

@@ -237,7 +237,14 @@ pub async fn apply_with_surface(
     config: &mut Config,
     surface: Surface,
 ) -> Result<AppliedAgent, Vec<QuickstartError>> {
-    apply_with_surface_checked(submission, config, surface, &|_| Ok(())).await
+    apply_with_surface_checked(
+        submission,
+        config,
+        surface,
+        &|_| Ok(()),
+        &zeroclaw_config::commit_gate::UngatedCommit,
+    )
+    .await
 }
 
 /// Apply a submission, with `staged_check` given the fully staged
@@ -253,6 +260,7 @@ pub async fn apply_with_surface_checked(
     config: &mut Config,
     surface: Surface,
     staged_check: &(dyn Fn(&Config) -> Result<(), String> + Sync),
+    commit_gate: &dyn zeroclaw_config::commit_gate::ConfigCommitGate,
 ) -> Result<AppliedAgent, Vec<QuickstartError>> {
     let ctx = RunCtx::new(surface);
     let started = std::time::Instant::now();
@@ -361,7 +369,9 @@ pub async fn apply_with_surface_checked(
         ),
         "quickstart: persist start"
     );
-    let write_result = config.save_dirty().await;
+    // `commit_gate` decides at the canonical replacement, after the save's
+    // own waits, whether the write takes effect.
+    let write_result = config.save_dirty_gated(commit_gate).await;
     let write_ms = write_started.elapsed().as_millis() as u64;
     match &write_result {
         Ok(_) => ::zeroclaw_log::record!(
@@ -2970,6 +2980,7 @@ mod tests {
             &mut config,
             Surface::Tui,
             &|_staged| Err("authorization policy does not compile".to_string()),
+            &zeroclaw_config::commit_gate::UngatedCommit,
         )
         .await
         .expect_err("a rejected staged policy must refuse the apply");
@@ -3002,6 +3013,7 @@ mod tests {
             &mut config,
             Surface::Tui,
             &|_staged| Ok(()),
+            &zeroclaw_config::commit_gate::UngatedCommit,
         )
         .await
         .expect("an accepted staged policy still applies");

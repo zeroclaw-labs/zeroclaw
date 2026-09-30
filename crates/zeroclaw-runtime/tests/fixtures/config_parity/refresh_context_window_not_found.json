@@ -1,0 +1,5 @@
+{
+  "code": "path_not_found",
+  "message": "model provider 'anthropic.missing' not found",
+  "path": "providers.models.anthropic.missing"
+}

@@ -1,0 +1,23 @@
+# Shared input for the config parity goldens. The runtime tests drive the RPC
+# methods against it and the gateway tests drive the HTTP routes against it;
+# both must produce the JSON files beside it.
+schema_version = 3
+
+[providers.models.anthropic.default]
+model = "claude-sonnet-5"
+api_key = "sk-parity-fixture-not-a-real-key"
+
+[agents.bot]
+enabled = true
+model_provider = "anthropic.default"
+
+[agents.helper]
+enabled = false
+model_provider = "anthropic.default"
+
+[heartbeat]
+enabled = false
+agent = "bot"
+
+[memory]
+backend = "none"

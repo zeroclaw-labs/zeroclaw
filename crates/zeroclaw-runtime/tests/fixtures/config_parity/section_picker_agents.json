@@ -1,0 +1,16 @@
+{
+  "help": "An agent binds a model provider, profiles, bundles, and channels into one dispatchable unit. Add one per persona; reuse the same alias across channels to share state.",
+  "items": [
+    {
+      "badge": "active",
+      "key": "bot",
+      "label": "bot"
+    },
+    {
+      "badge": "configured",
+      "key": "helper",
+      "label": "helper"
+    }
+  ],
+  "section": "agents"
+}

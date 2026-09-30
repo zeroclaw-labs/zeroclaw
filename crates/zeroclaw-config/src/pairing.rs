@@ -707,6 +707,22 @@ impl PairingGuard {
             && self.paired_tokens.try_read_recursive().is_some()
     }
 
+    /// Run `f` only while `token_hash` is paired, holding the paired set for
+    /// its duration so a concurrent revocation waits until `f` returns: the
+    /// revocation is ordered entirely before `f` (and `f` does not run) or
+    /// entirely after it. `None` when the hash is not paired. `f` must not
+    /// call back into this guard's token set.
+    pub fn while_paired<R>(&self, token_hash: &str, f: impl FnOnce() -> R) -> Option<R> {
+        // A shared read: revocation takes the write side, so it waits.
+        let tokens = self.paired_tokens.read();
+        if !tokens.contains(token_hash) {
+            return None;
+        }
+        let result = f();
+        drop(tokens);
+        Some(result)
+    }
+
     /// Returns true if the gateway is already paired (has at least one token).
     pub fn is_paired(&self) -> bool {
         let tokens = self.paired_tokens.read();

@@ -1,0 +1,10 @@
+{
+  "drifted": [
+    {
+      "drifted": true,
+      "in_memory_value": "helper",
+      "on_disk_value": "bot",
+      "path": "heartbeat.agent"
+    }
+  ]
+}
