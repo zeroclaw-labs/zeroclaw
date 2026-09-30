@@ -152,8 +152,10 @@ impl PipelineTool {
                 .find_tool(&step.tool)
                 .ok_or_else(|| PipelineError::UnknownTool(step.tool.clone()))?;
 
-            // Interpolate previous step results into args.
-            let interpolated_args = interpolate_args(&step.args, &results);
+            // Interpolate previous step results into args. The step is a
+            // direct call, so it carries no approval whatever its args say.
+            let mut interpolated_args = interpolate_args(&step.args, &results);
+            zeroclaw_api::tool::clear_runtime_approval(tool.name(), &mut interpolated_args);
 
             let tool_result =
                 tool.execute(interpolated_args)
@@ -201,7 +203,8 @@ impl PipelineTool {
 
             // Clone what we need for the spawned task.
             let tool_name = step.tool.clone();
-            let args = step.args.clone();
+            let mut args = step.args.clone();
+            zeroclaw_api::tool::clear_runtime_approval(tool.name(), &mut args);
 
             // We need a reference that lives long enough — use Arc.
             let tool_arc = self.tools.iter().find(|t| t.name() == tool.name()).cloned();
@@ -912,5 +915,100 @@ mod tests {
         assert!(res.success);
         assert!(res.output.contains("FIRST_BIG_BLOB"));
         assert!(res.output.contains("final answer"));
+    }
+
+    // ── Approval ───────────────────────────────────────────
+
+    struct RecordingTool {
+        name: String,
+        seen: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+    }
+
+    zeroclaw_api::mock_tool_attribution!(RecordingTool);
+
+    #[async_trait::async_trait]
+    impl Tool for RecordingTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "record"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, args: serde_json::Value) -> Result<ToolResult> {
+            self.seen.lock().unwrap().push((self.name.clone(), args));
+            Ok(ToolResult {
+                success: true,
+                output: "ok".to_string().into(),
+                error: None,
+            })
+        }
+    }
+
+    /// A step is a call the pipeline makes itself, which the runtime never
+    /// approved, so a step's `approved: true` must not reach a tool that
+    /// takes runtime approval. Other tools' arguments pass through unchanged.
+    #[tokio::test]
+    async fn steps_never_carry_approval_to_tools_that_take_runtime_approval() {
+        for parallel in [false, true] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let names = ["cron_update", "cron_run", "a"];
+            let tools: Vec<Arc<dyn Tool>> = names
+                .iter()
+                .map(|name| {
+                    Arc::new(RecordingTool {
+                        name: (*name).to_string(),
+                        seen: Arc::clone(&seen),
+                    }) as Arc<dyn Tool>
+                })
+                .collect();
+            let config = PipelineConfig {
+                enabled: true,
+                max_steps: 20,
+                allowed_tools: names.iter().map(|name| (*name).to_string()).collect(),
+            };
+            let args = serde_json::json!({
+                "parallel": parallel,
+                "steps": [
+                    {"tool": "cron_update", "args": {
+                        "job_id": "J",
+                        "patch": {"command": "touch pipeline-proof"},
+                        "approved": true
+                    }},
+                    {"tool": "cron_run", "args": {"job_id": "J", "approved": true}},
+                    {"tool": "a", "args": {"approved": true}}
+                ]
+            });
+            let res = PipelineTool::new(config, tools)
+                .execute(args)
+                .await
+                .unwrap();
+            assert!(res.success, "{:?}", res.error);
+
+            let seen = seen.lock().unwrap();
+            let approved = |name: &str| {
+                seen.iter()
+                    .find(|(tool, _)| tool == name)
+                    .map(|(_, args)| args["approved"].clone())
+                    .unwrap_or_else(|| panic!("{name} ran"))
+            };
+            assert_eq!(
+                approved("cron_update"),
+                serde_json::json!(false),
+                "parallel={parallel}"
+            );
+            assert_eq!(
+                approved("cron_run"),
+                serde_json::json!(false),
+                "parallel={parallel}"
+            );
+            assert_eq!(
+                approved("a"),
+                serde_json::json!(true),
+                "parallel={parallel}"
+            );
+        }
     }
 }

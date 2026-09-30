@@ -37,10 +37,7 @@ pub use turn::{
 };
 
 pub(crate) fn is_runtime_approved_arg_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "shell" | "schedule" | "cron_add" | "cron_update" | "cron_run"
-    )
+    zeroclaw_api::tool::takes_runtime_approval(tool_name)
 }
 
 pub(crate) fn set_runtime_approved_arg(

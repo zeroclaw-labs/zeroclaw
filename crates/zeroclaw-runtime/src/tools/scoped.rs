@@ -130,8 +130,10 @@ pub struct ScopedAssembly<'a> {
     pub skills: &'a [Skill],
     pub runtime: Arc<dyn RuntimeAdapter>,
     /// Documented divergence: a per-run caller allowlist. It only NARROWS, and is
-    /// threaded into BOTH the built-in filter and the MCP tool-access policy. `None`
-    /// on every path except `run`.
+    /// threaded into the built-in filter and the MCP tool-access policy, then
+    /// bounds the finished registry so late additions (skills) obey it too.
+    /// `None` except on `run` (a cron job's `allowed_tools`) and on an `Agent`
+    /// built for a principal with a tool selector.
     pub caller_allowed: Option<&'a [String]>,
     /// Documented divergence: ACP `session/new` must return promptly, so it does not
     /// connect MCP servers - they are neither resolved nor connected; nothing is
@@ -684,9 +686,16 @@ impl ScopedToolRegistry {
             }
         }
 
-        if caller_allowed.is_some_and(|allowed| !allowed.iter().any(|name| name == "tool_search")) {
-            tools_registry.retain(|tool| tool.name() != "tool_search");
-            deferred_section.clear();
+        // The per-run caller ceiling bounds the finished registry, not only the
+        // built-ins filtered in step 2: skills are appended after that filter,
+        // so an empty, unrelated or unknown-only `caller_allowed` used to leave
+        // every eligible skill wrapper callable on the `run` path. Exact-match,
+        // as in step 2, the MCP policy, and `AgentBuilder::build`'s allowlist.
+        if let Some(allowed) = caller_allowed {
+            tools_registry.retain(|tool| allowed.iter().any(|name| name == tool.name()));
+            if !allowed.iter().any(|name| name == "tool_search") {
+                deferred_section.clear();
+            }
         }
 
         ScopedAssembled {
@@ -1175,6 +1184,119 @@ mod tests {
     #[tokio::test]
     async fn skill_cannot_recover_delivery_outside_acp_context() {
         assert_skill_context_excludes_tool("deliver_file", false, false).await;
+    }
+
+    /// Assemble with one skill, `ops`, whose builtin tool `write` wraps
+    /// `file_write`, under the caller ceiling a `run` (cron) turn passes.
+    async fn assemble_ops_write_skill(
+        calls: Arc<AtomicUsize>,
+        caller_allowed: Option<&[String]>,
+    ) -> ScopedAssembled {
+        let skill = Skill {
+            name: "ops".to_string(),
+            description: "file-writing builtin wrapper".to_string(),
+            description_localizations: Default::default(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: Vec::new(),
+            tools: vec![SkillTool {
+                name: "write".to_string(),
+                description: "write a file".to_string(),
+                kind: "builtin".to_string(),
+                command: String::new(),
+                args: Default::default(),
+                target: Some("file_write".to_string()),
+                locked_args: Default::default(),
+                timeout_secs: None,
+            }],
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        };
+        let config = Config::default();
+        ScopedToolRegistry::assemble(ScopedAssembly {
+            config: &config,
+            agent_alias: "default",
+            security: &Arc::new(SecurityPolicy::default()),
+            built: built_with_counting_tools(calls, &["file_read", "file_write"]),
+            skills: std::slice::from_ref(&skill),
+            runtime: Arc::new(crate::platform::NativeRuntime::new()),
+            caller_allowed,
+            connect_mcp: false,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery: false,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: None,
+        })
+        .await
+    }
+
+    fn registry_names(assembled: &ScopedAssembled) -> Vec<String> {
+        assembled
+            .registry
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect()
+    }
+
+    /// A caller ceiling bounds skill wrappers as well as built-ins. Skills are
+    /// registered after the built-in filter, so an empty, unknown-only or
+    /// unrelated ceiling used to leave `ops__write` callable on a cron job's
+    /// `run` turn. Naming the wrapper admits it, and it still reaches its target.
+    #[tokio::test]
+    async fn caller_allowed_ceiling_bounds_skill_wrappers() {
+        let ceilings: [(&str, Vec<String>, Vec<String>); 3] = [
+            ("empty", Vec::new(), Vec::new()),
+            (
+                "unknown-only",
+                vec!["missing__tool".to_string()],
+                Vec::new(),
+            ),
+            (
+                "unrelated built-in",
+                vec!["file_read".to_string()],
+                vec!["file_read".to_string()],
+            ),
+        ];
+        for (label, ceiling, expected) in ceilings {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let assembled =
+                assemble_ops_write_skill(Arc::clone(&calls), Some(ceiling.as_slice())).await;
+            assert_eq!(
+                registry_names(&assembled),
+                expected,
+                "{label} ceiling must not expose the skill wrapper"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+
+        // Naming the wrapper admits it, and invoking it runs the target.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let named = vec!["ops__write".to_string()];
+        let assembled = assemble_ops_write_skill(Arc::clone(&calls), Some(&named)).await;
+        assert_eq!(registry_names(&assembled), named);
+        let wrapper = assembled
+            .registry
+            .iter()
+            .find(|tool| tool.name() == "ops__write")
+            .expect("a named skill wrapper is registered");
+        let result = wrapper
+            .execute(serde_json::json!({}))
+            .await
+            .expect("the wrapper runs");
+        assert!(result.success, "{result:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // With no ceiling the skill is registered as before.
+        let unbounded = assemble_ops_write_skill(Arc::new(AtomicUsize::new(0)), None).await;
+        assert!(
+            registry_names(&unbounded).contains(&"ops__write".to_string()),
+            "no ceiling keeps the skill: {:?}",
+            registry_names(&unbounded)
+        );
     }
 
     async fn assemble_names(

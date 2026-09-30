@@ -79,6 +79,14 @@ impl CronUpdateTool {
 
 #[async_trait]
 impl Tool for CronUpdateTool {
+    /// A job it changes keeps its stored tool list and runs later under the
+    /// agent's own policy, not under the calling principal's ceiling. An RPC
+    /// session of any principal but the shared operator must not reach it until
+    /// a job can carry and re-check that principal's authority.
+    fn requires_unrestricted_principal(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "cron_update"
     }
@@ -554,6 +562,59 @@ mod tests {
             .await
             .unwrap();
         assert!(approved.success, "{:?}", approved.error);
+    }
+
+    /// The same medium-risk patch, sent as a pipeline step that claims
+    /// approval. The pipeline's call to `cron_update` was never approved by
+    /// the runtime, so the command is refused and the stored job keeps its
+    /// command.
+    #[tokio::test]
+    async fn pipeline_step_approval_does_not_patch_a_medium_risk_command() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        seed_test_agent(&mut config);
+        let profile = config.risk_profiles.entry(TEST_AGENT.into()).or_default();
+        profile.level = AutonomyLevel::Supervised;
+        profile.allowed_commands = vec!["echo".into(), "touch".into()];
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let cfg = Arc::new(config);
+        let job = cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        let update: Arc<dyn Tool> = Arc::new(CronUpdateTool::new(
+            cfg.clone(),
+            test_security(&cfg),
+            TEST_AGENT,
+        ));
+        let pipeline = crate::tools::PipelineTool::new(
+            zeroclaw_config::schema::PipelineConfig {
+                enabled: true,
+                max_steps: 5,
+                allowed_tools: vec!["cron_update".into()],
+            },
+            vec![update],
+        );
+
+        let result = pipeline
+            .execute(json!({
+                "steps": [{"tool": "cron_update", "args": {
+                    "job_id": job.id,
+                    "patch": {"command": "touch pipeline-proof"},
+                    "approved": true
+                }}]
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success, "{:?}", result.output);
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("explicit approval")
+        );
+        assert_eq!(cron::get_job(&cfg, &job.id).unwrap().command, "echo ok");
     }
 
     #[tokio::test]
