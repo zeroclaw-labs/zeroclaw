@@ -23,6 +23,10 @@ use zeroclaw_config::schema::{CacheTtl, ToolResultImagePolicy};
 
 const TOOL_RESULT_IMAGE_OMITTED_NOTICE: &str = "[tool-result image omitted by provider policy]";
 
+pub(crate) fn minimax_supports_multimodal(model: &str) -> bool {
+    model.eq_ignore_ascii_case("MiniMax-M3")
+}
+
 /// A model_provider that speaks the OpenAI-compatible chat completions API.
 /// Used by: Venice, Vercel AI Gateway, Cloudflare AI Gateway, Moonshot,
 /// Synthetic, `OpenCode` Zen, `OpenCode` Go, `Z.AI`, `GLM`, `MiniMax`, Bedrock, Qianfan, Groq, Mistral, `xAI`, etc.
@@ -1259,7 +1263,123 @@ impl OpenAiCompatibleModelProvider {
     /// Whether system messages should be flattened into the first user message,
     /// either because the model_provider was configured that way or the model requires it.
     fn effective_merge_system(&self, model: &str) -> bool {
+        if self.name.eq_ignore_ascii_case("MiniMax") && minimax_supports_multimodal(model) {
+            // Keep system examples separate from the user media that is expanded.
+            return false;
+        }
         self.merge_system_into_user || Self::model_requires_system_merge(model)
+    }
+
+    fn request_payload(&self, request: impl Serialize) -> serde_json::Result<serde_json::Value> {
+        let mut payload = serde_json::to_value(request)?;
+        if !self.name.eq_ignore_ascii_case("MiniMax")
+            || !payload
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(minimax_supports_multimodal)
+        {
+            return Ok(payload);
+        }
+        if let Some(messages) = payload
+            .get_mut("messages")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for message in messages {
+                if message.get("role").and_then(serde_json::Value::as_str) != Some("user") {
+                    continue;
+                }
+                let Some(content) = message.get_mut("content") else {
+                    continue;
+                };
+                let parts = if let Some(text) = content.as_str() {
+                    let Some(parts) = Self::minimax_video_parts(text) else {
+                        continue;
+                    };
+                    parts
+                } else if let Some(parts) = content.as_array() {
+                    if !parts.iter().any(|part| {
+                        part.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                            && part
+                                .get("text")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|text| text.contains("[VIDEO:"))
+                    }) {
+                        continue;
+                    }
+                    parts
+                        .iter()
+                        .flat_map(|part| {
+                            if part.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                                && let Some(text) =
+                                    part.get("text").and_then(serde_json::Value::as_str)
+                                && let Some(mut expanded) = Self::minimax_video_parts(text)
+                            {
+                                if let Some(cache_control) = part.get("cache_control")
+                                    && let Some(last_text) = expanded
+                                        .iter_mut()
+                                        .rev()
+                                        .find(|part| part["type"] == "text")
+                                {
+                                    last_text["cache_control"] = cache_control.clone();
+                                }
+                                return expanded;
+                            }
+                            vec![part.clone()]
+                        })
+                        .collect()
+                } else {
+                    continue;
+                };
+                *content = serde_json::Value::Array(parts);
+            }
+        }
+        Ok(payload)
+    }
+
+    fn minimax_video_parts(text: &str) -> Option<Vec<serde_json::Value>> {
+        let mut parts = Vec::new();
+        let mut cursor = 0;
+        let mut retained_start = 0;
+        while let Some(start) = text[cursor..].find("[VIDEO:").map(|offset| cursor + offset) {
+            let value_start = start + "[VIDEO:".len();
+            let Some(end) = text[value_start..]
+                .find(']')
+                .map(|offset| value_start + offset)
+            else {
+                break;
+            };
+            cursor = end + 1;
+            let reference = text[value_start..end].trim();
+            // Only forward explicit remote references. Local paths and embedded
+            // payloads need a separate bounded upload contract, never file reads here.
+            let valid = reference.len() <= 8192
+                && (reference.strip_prefix("mm_file://").is_some_and(|id| {
+                    !id.is_empty()
+                        && id
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                }) || reqwest::Url::parse(reference).is_ok_and(|url| {
+                    url.scheme() == "https"
+                        && url.host_str().is_some()
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                }));
+            if !valid {
+                continue;
+            }
+            if retained_start < start {
+                parts.push(serde_json::json!({"type":"text", "text":&text[retained_start..start]}));
+            }
+            parts.push(serde_json::json!({"type":"video_url", "video_url":{"url":reference}}));
+            retained_start = cursor;
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        if retained_start < text.len() {
+            parts.push(serde_json::json!({"type":"text", "text":&text[retained_start..]}));
+        }
+        Some(parts)
     }
 
     fn reasoning_effort_for_model(&self, model: &str) -> Option<String> {
@@ -1512,10 +1632,14 @@ impl OpenAiCompatibleModelProvider {
 
         let url = self.chat_completions_url();
         let response = match self
-            .apply_opencode_session_header(self.apply_auth_header(
-                self.http_client().post(&url).json(&request),
-                credential.as_deref(),
-            )?)
+            .apply_opencode_session_header(
+                self.apply_auth_header(
+                    self.http_client()
+                        .post(&url)
+                        .json(&self.request_payload(&request)?),
+                    credential.as_deref(),
+                )?,
+            )
             .send()
             .await
         {
@@ -4124,10 +4248,14 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let url = self.chat_completions_url();
 
         let response = match self
-            .apply_opencode_session_header(self.apply_auth_header(
-                self.http_client().post(&url).json(&request),
-                credential.as_deref(),
-            )?)
+            .apply_opencode_session_header(
+                self.apply_auth_header(
+                    self.http_client()
+                        .post(&url)
+                        .json(&self.request_payload(&request)?),
+                    credential.as_deref(),
+                )?,
+            )
             .send()
             .await
         {
@@ -4216,7 +4344,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             // thinking params are available to forward.
             None,
         );
-        let mut payload = serde_json::to_value(request)?;
+        let mut payload = self.request_payload(request)?;
         let tools_count = payload
             .get("tools")
             .and_then(serde_json::Value::as_array)
@@ -4334,7 +4462,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             system_merged,
             request.thinking,
         );
-        let mut payload = serde_json::to_value(native_request)?;
+        let mut payload = self.request_payload(native_request)?;
         let tools_count = payload
             .get("tools")
             .and_then(serde_json::Value::as_array)
@@ -4528,7 +4656,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 reasoning_effort_omitted.then_some("model_ineligible");
 
             let payload_result = if has_tools {
-                serde_json::to_value(provider.build_streaming_native_tool_request(
+                provider.request_payload(provider.build_streaming_native_tool_request(
                     &model,
                     &effective_messages,
                     tools,
@@ -4566,7 +4694,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     temperature,
                     provider.max_tokens,
                 );
-                serde_json::to_value(ApiChatRequest {
+                provider.request_payload(ApiChatRequest {
                     model: model.clone(),
                     messages,
                     temperature: shape.temperature,
@@ -4835,7 +4963,16 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             };
 
             // Build request with auth
-            let mut req_builder = client.post(&url).json(&request);
+            let payload = match provider.request_payload(&request) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    let _ = tx
+                        .send(Err(StreamError::ModelProvider(error.to_string())))
+                        .await;
+                    return;
+                }
+            };
+            let mut req_builder = client.post(&url).json(&payload);
 
             // Apply auth header, or refuse locally if the credential cannot be
             // turned into one.
@@ -4988,7 +5125,16 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 }
             };
 
-            let mut req_builder = client.post(&url).json(&request);
+            let payload = match provider.request_payload(&request) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    let _ = tx
+                        .send(Err(StreamError::ModelProvider(error.to_string())))
+                        .await;
+                    return;
+                }
+            };
+            let mut req_builder = client.post(&url).json(&payload);
             req_builder = match apply_auth_to_request(
                 req_builder,
                 &auth_header,
@@ -12052,6 +12198,165 @@ mod tests {
         let caps = <OpenAiCompatibleModelProvider as ModelProvider>::capabilities(&p);
         assert!(caps.native_tool_calling);
         assert!(caps.vision);
+    }
+
+    #[tokio::test]
+    async fn minimax_multimodal_reaches_every_chat_entry_point() {
+        use axum::response::IntoResponse;
+        use axum::{Json, Router, routing::post};
+        use base64::Engine as _;
+        use std::sync::{Arc, Mutex};
+        let captured = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured_route = captured.clone();
+        let app = Router::new().route("/chat/completions", post(move |Json(body): Json<serde_json::Value>| {
+            let captured = captured_route.clone();
+            async move {
+                let streaming = body["stream"] == true;
+                captured.lock().unwrap().push(body);
+                if streaming {
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                     "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n").into_response()
+                } else {
+                    Json(serde_json::json!({"choices":[{"message":{"role":"assistant","content":"ok"}}]})).into_response()
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server =
+            ::zeroclaw_spawn::spawn!(async move { axum::serve(listener, app).await.unwrap() });
+        let provider = OpenAiCompatibleModelProvider::builder("minimax.test")
+            .auth_style(AuthStyle::Bearer)
+            .display_name("MiniMax")
+            .base_url(&format!("http://{address}"))
+            .credential(Some("test-key"))
+            .merge_system_into_user_preserving_native()
+            .build();
+        let image = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(boundary_test_png())
+        );
+        let user = format!(
+            "Describe [IMAGE:{image}] [VIDEO:mm_file://test_video] and [VIDEO:https://example.com/clip.mp4]"
+        );
+        let system = "Literal examples: [IMAGE:<path-or-url>] [VIDEO:mm_file://example]";
+        let messages = vec![ChatMessage::system(system), ChatMessage::user(&user)];
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "inspect",
+            "Inspect input",
+            serde_json::json!({"type":"object","properties":{}}),
+        )];
+        let model = "MiniMax-M3";
+        provider
+            .chat_with_system(Some(system), &user, model, None)
+            .await
+            .unwrap();
+        provider
+            .chat_with_history(&messages, model, None)
+            .await
+            .unwrap();
+        provider
+            .chat_with_tools(&messages, &[], model, None)
+            .await
+            .unwrap();
+        provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: None,
+                },
+                model,
+                None,
+            )
+            .await
+            .unwrap();
+        for with_tools in [false, true] {
+            let events = provider
+                .stream_chat(
+                    ProviderChatRequest {
+                        messages: &messages,
+                        tools: with_tools.then_some(tools.as_slice()),
+                        thinking: None,
+                    },
+                    model,
+                    None,
+                    StreamOptions {
+                        enabled: true,
+                        count_tokens: false,
+                    },
+                )
+                .collect::<Vec<_>>()
+                .await;
+            assert!(events.iter().all(Result::is_ok), "{events:?}");
+        }
+        let options = || StreamOptions {
+            enabled: true,
+            count_tokens: false,
+        };
+        let chunks = provider
+            .stream_chat_with_system(Some(system), &user, model, None, options())
+            .collect::<Vec<_>>()
+            .await;
+        assert!(chunks.iter().all(Result::is_ok), "{chunks:?}");
+        let chunks = provider
+            .stream_chat_with_history(&messages, model, None, options())
+            .collect::<Vec<_>>()
+            .await;
+        assert!(chunks.iter().all(Result::is_ok), "{chunks:?}");
+        server.abort();
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 8);
+        for body in requests.iter() {
+            assert_eq!(body["messages"][0]["role"], "system");
+            assert_eq!(body["messages"][0]["content"], system);
+            let parts = body["messages"][1]["content"].as_array().unwrap();
+            assert_eq!(parts.iter().filter(|p| p["type"] == "image_url").count(), 1);
+            let videos: Vec<_> = parts
+                .iter()
+                .filter(|p| p["type"] == "video_url")
+                .map(|p| p["video_url"]["url"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                videos,
+                ["mm_file://test_video", "https://example.com/clip.mp4"]
+            );
+            assert!(
+                parts
+                    .iter()
+                    .filter(|p| p["type"] == "text")
+                    .all(|p| !p["text"].as_str().unwrap().contains("[VIDEO:"))
+            );
+        }
+    }
+
+    #[test]
+    fn minimax_video_conversion_preserves_unsupported_markers_and_roles() {
+        let provider = make_model_provider("MiniMax", "https://example.com", None);
+        let text = "[VIDEO:/tmp/local.mp4] [VIDEO:file:///tmp/local.mp4] [VIDEO:https://user:pass@example.com/clip.mp4] [VIDEO:mm_file://] [VIDEO:unterminated";
+        assert!(OpenAiCompatibleModelProvider::minimax_video_parts(text).is_none());
+        let input = serde_json::json!({"model":"MiniMax-M3", "messages":[
+            {"role":"system","content":"[VIDEO:mm_file://example]"},
+            {"role":"assistant","content":"[VIDEO:mm_file://example]"},
+            {"role":"tool","content":"[VIDEO:mm_file://example]"},
+            {"role":"user","content":text}
+        ]});
+        assert_eq!(provider.request_payload(&input).unwrap(), input);
+        let older = serde_json::json!({"model":"MiniMax-M2.7", "messages":[{"role":"user","content":"[VIDEO:mm_file://example]"}]});
+        assert_eq!(provider.request_payload(&older).unwrap(), older);
+        let cached = serde_json::json!({"model":"MiniMax-M3", "messages":[{"role":"user", "content":[{"type":"text", "text":"before [VIDEO:mm_file://example] after", "cache_control":{"type":"ephemeral"}}]}]});
+        let payload = provider.request_payload(cached).unwrap();
+        let parts = payload["messages"][0]["content"].as_array().unwrap();
+        assert!(parts[0].get("cache_control").is_none());
+        assert_eq!(parts[2]["cache_control"]["type"], "ephemeral");
+        let merging = OpenAiCompatibleModelProvider::builder("minimax.test")
+            .auth_style(AuthStyle::Bearer)
+            .display_name("MiniMax")
+            .base_url("https://example.com")
+            .merge_system_into_user_preserving_native()
+            .build();
+        assert!(merging.effective_merge_system("MiniMax-M2.7"));
+        assert!(!merging.effective_merge_system("MiniMax-M3"));
     }
 
     #[test]

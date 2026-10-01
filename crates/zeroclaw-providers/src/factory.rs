@@ -1071,6 +1071,12 @@ impl FamilyProviderFactory for MinimaxModelProviderConfig {
             .base_url(api_url.unwrap_or(crate::MINIMAX_INTL_BASE_URL))
             .credential(resolved_key)
             .auth_style(AuthStyle::Bearer)
+            .vision(
+                self.base
+                    .model
+                    .as_deref()
+                    .is_some_and(crate::compatible::minimax_supports_multimodal),
+            )
             .merge_system_into_user_preserving_native();
         Ok(apply_compat_options(b, opts))
     }
@@ -2031,6 +2037,33 @@ impl FamilyProviderFactory for zeroclaw_config::schema::ModelProviderConfig {
 mod tests {
     use super::*;
     use zeroclaw_config::schema::{ModelProviderConfig, WireApi};
+
+    #[test]
+    fn minimax_factory_vision_follows_the_configured_model() {
+        for (model, expected) in [
+            (Some("MiniMax-M3"), true),
+            (Some("MiniMax-M2.7"), false),
+            (None, false),
+        ] {
+            let config = MinimaxModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: model.map(str::to_owned),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let provider = config
+                .create_provider(
+                    "test",
+                    Some("test-key"),
+                    None,
+                    &ModelProviderRuntimeOptions::default(),
+                )
+                .unwrap();
+            assert_eq!(provider.capabilities().vision, expected);
+            assert!(provider.supports_native_tools());
+        }
+    }
 
     #[test]
     fn cache_passthrough_runtime_option_reaches_provider_capability() {
