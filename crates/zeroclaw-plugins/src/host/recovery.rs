@@ -11,6 +11,10 @@ use std::path::{Path, PathBuf};
 const LOCK: &str = ".zeroclaw-package-lock-v1";
 const LEASE: &str = "lease";
 pub(super) const PACKAGE: &str = "package";
+/// What a claimed generation is renamed to inside its transaction once a
+/// replacement is published in its place. `publish` only ever moves
+/// [`PACKAGE`], so a superseded generation can be deleted but never put back.
+pub(super) const SUPERSEDED: &str = "superseded";
 
 pub(super) struct Root {
     pub dir: Dir,
@@ -182,6 +186,13 @@ impl Transaction {
         Ok(())
     }
 
+    /// Mark the claimed generation superseded, inside this transaction.
+    pub fn retire(&self, root: &Root) -> Result<(), PluginError> {
+        root.check()?;
+        rename_new(&self.dir, PACKAGE, &self.dir, SUPERSEDED)?;
+        Ok(())
+    }
+
     pub fn finish(self, root: &Root) -> Result<(), PluginError> {
         // Never recursively remove the transaction name: only empty-directory
         // removal is allowed after its owned payload has gone.
@@ -278,6 +289,16 @@ pub(super) fn is_transaction(entry: &str, name: &str, kind: &str) -> bool {
         })
 }
 
+/// The package a `kind` transaction entry belongs to, when `entry` is one.
+pub(super) fn transaction_package<'a>(entry: &'a str, kind: &str) -> Option<&'a str> {
+    let (package, _) = entry
+        .strip_prefix('.')?
+        .rsplit_once(&format!(".{kind}-v1-"))?;
+    (crate::instance::validate_package_name(package).is_ok()
+        && is_transaction(entry, package, kind))
+    .then_some(package)
+}
+
 #[cfg(test)]
 pub(super) fn pause(step: &str) {
     use std::io::Write;
@@ -287,7 +308,14 @@ pub(super) fn pause(step: &str) {
         println!("BARRIER:{step}");
         std::io::stdout().flush().unwrap();
         let mut line = String::new();
-        std::io::stdin().read_line(&mut line).unwrap();
+        // Only an explicit "continue" moves on. A closed pipe means the test is
+        // killing this process, and a thread woken by that must not run past
+        // the barrier while the kill completes.
+        if std::io::stdin().read_line(&mut line).is_err() || line.trim() != "continue" {
+            loop {
+                std::thread::park();
+            }
+        }
     }
 }
 

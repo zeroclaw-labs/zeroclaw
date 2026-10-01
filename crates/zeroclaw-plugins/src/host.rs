@@ -28,6 +28,9 @@ pub struct PluginHost {
 
 struct LoadedPlugin {
     manifest: PluginManifest,
+    /// The exact manifest text admitted with this generation, so an update
+    /// can tell whether the package it claims is still the one loaded here.
+    manifest_toml: String,
     plugin_dir: PathBuf,
     /// Exact executable bytes accepted with this manifest. `None` for
     /// skill-only plugins.
@@ -100,6 +103,60 @@ impl AdmittedSource {
     pub fn component(&self) -> Option<&AdmittedComponent> {
         self.component.as_ref()
     }
+}
+
+/// What a source is admitted as.
+#[derive(Clone, Copy)]
+enum AdmissionTarget<'a> {
+    /// A new package, whose name must not be loaded.
+    NewPackage,
+    /// The replacement for the loaded package of this name.
+    Replacement(&'a str),
+}
+
+/// What [`PluginHost::update_admitted`] replaced.
+#[derive(Debug)]
+pub struct ReplacedPackage {
+    /// The version of the package that was replaced.
+    pub previous_version: String,
+    /// Set when the replaced generation could not be deleted afterwards:
+    /// where it was left, and why. It stays in its hidden transaction, which
+    /// discovery ignores, marked superseded, so recovery only ever deletes it.
+    /// If even that marking failed, it is still a claimed generation, which
+    /// recovery deletes while the package is installed but would put back once
+    /// the package is removed, so it is best deleted by hand.
+    pub leftover: Option<(PathBuf, String)>,
+}
+
+/// What [`PluginHost::recover_interrupted_update`] found for one package.
+#[derive(Debug, PartialEq, Eq)]
+pub enum UpdateRecovery {
+    /// There was nothing to put back or delete. Abandoned stages and empty
+    /// transactions may have been cleared.
+    Nothing,
+    /// Out-of-date or superseded generations earlier updates claimed were
+    /// found. `removed` were deleted. `kept` could not be, each with where it
+    /// was left and why: a generation marked superseded is never loaded or put
+    /// back, while one whose marking failed is still a claim.
+    Swept {
+        removed: usize,
+        kept: Vec<(PathBuf, String)>,
+    },
+    /// The package was missing, and the one generation an interrupted update
+    /// claimed was put back and discovery ran again. The configured policy
+    /// decides whether it is admitted; [`PluginHost::get_plugin`] says whether
+    /// it was.
+    Restored,
+    /// The package is missing and more than one interrupted update claimed a
+    /// generation of it, so which was installed last is not known. Nothing
+    /// was moved.
+    Ambiguous { displaced: Vec<PathBuf> },
+    /// The package is not loaded, but something already occupies its name, so
+    /// the claimed generation was not moved onto it.
+    Occupied {
+        displaced: PathBuf,
+        occupant: PathBuf,
+    },
 }
 
 impl PluginHost {
@@ -191,8 +248,15 @@ impl PluginHost {
 
     /// Discover plugins in the plugins directory.
     fn discover(&mut self) -> Result<(), PluginError> {
+        self.loaded = self.discovered()?;
+        Ok(())
+    }
+
+    /// The packages discovery admits from the plugins directory as it is now.
+    fn discovered(&self) -> Result<HashMap<String, LoadedPlugin>, PluginError> {
+        let mut loaded = HashMap::new();
         if !self.plugins_dir.exists() {
-            return Ok(());
+            return Ok(loaded);
         }
 
         let mut ambiguous_packages = HashSet::new();
@@ -227,7 +291,7 @@ impl PluginHost {
                             if ambiguous_packages.contains(&manifest.name) {
                                 continue;
                             }
-                            if self.loaded.remove(&manifest.name).is_some() {
+                            if loaded.remove(&manifest.name).is_some() {
                                 ambiguous_packages.insert(manifest.name.clone());
                                 ::zeroclaw_log::record!(
                                     WARN,
@@ -252,10 +316,11 @@ impl PluginHost {
                                     continue;
                                 }
                             };
-                            self.loaded.insert(
+                            loaded.insert(
                                 manifest.name.clone(),
                                 LoadedPlugin {
                                     manifest,
+                                    manifest_toml,
                                     plugin_dir: path.clone(),
                                     component,
                                 },
@@ -269,7 +334,7 @@ impl PluginHost {
             }
         }
 
-        Ok(())
+        Ok(loaded)
     }
 
     fn load_manifest(&self, path: &Path) -> Result<(PluginManifest, String), PluginError> {
@@ -361,6 +426,29 @@ impl PluginHost {
     /// The duplicate-name check runs before the component is read, so a
     /// package the host would refuse anyway never reaches the loader.
     pub fn admit_source(&self, source: &str) -> Result<AdmittedSource, PluginError> {
+        self.admit(source, AdmissionTarget::NewPackage)
+    }
+
+    /// Admit a source as the replacement for the installed package `name`.
+    ///
+    /// This is [`Self::admit_source`] with the identity decided the other way
+    /// round: `name` must be loaded, which is checked before the source is
+    /// opened, and the source's manifest must name it, which is checked before
+    /// the signature and before the component is read. Everything else, from
+    /// signature policy to the one confined read of the component, is the same
+    /// admission a new package gets.
+    pub fn admit_update(&self, name: &str, source: &str) -> Result<AdmittedSource, PluginError> {
+        if !self.loaded.contains_key(name) {
+            return Err(PluginError::NotFound(name.to_string()));
+        }
+        self.admit(source, AdmissionTarget::Replacement(name))
+    }
+
+    fn admit(
+        &self,
+        source: &str,
+        target: AdmissionTarget<'_>,
+    ) -> Result<AdmittedSource, PluginError> {
         let source_path = PathBuf::from(source);
         let manifest_path = if source_path.is_dir() {
             source_path.join("manifest.toml")
@@ -384,7 +472,7 @@ impl PluginHost {
             .file_name()
             .ok_or_else(|| PluginError::InvalidManifest("no manifest filename".into()))?;
         let (manifest, manifest_toml, component) =
-            self.admit_open_directory(&dir, &source_dir, filename)?;
+            self.admit_open_directory(&dir, &source_dir, filename, target)?;
 
         Ok(AdmittedSource {
             manifest,
@@ -399,12 +487,25 @@ impl PluginHost {
         dir: &Dir,
         display: &Path,
         filename: &std::ffi::OsStr,
+        target: AdmissionTarget<'_>,
     ) -> Result<(PluginManifest, String, Option<AdmittedComponent>), PluginError> {
         let manifest_toml = dir.read_to_string(filename)?;
         let manifest: PluginManifest = toml::from_str(&manifest_toml)?;
         validate_manifest_shape_in(&manifest, dir, display)?;
-        if self.loaded.contains_key(&manifest.name) {
-            return Err(PluginError::AlreadyLoaded(manifest.name));
+        // Decide the package identity before the signature check and before
+        // the component is read: nothing downstream runs for a package the
+        // host has already decided not to accept.
+        match target {
+            AdmissionTarget::NewPackage if self.loaded.contains_key(&manifest.name) => {
+                return Err(PluginError::AlreadyLoaded(manifest.name));
+            }
+            AdmissionTarget::Replacement(name) if manifest.name != name => {
+                return Err(PluginError::InvalidManifest(format!(
+                    "the update source for '{name}' is the package '{}'",
+                    manifest.name
+                )));
+            }
+            AdmissionTarget::NewPackage | AdmissionTarget::Replacement(_) => {}
         }
         self.verify_plugin_signature(&manifest.name, &manifest_toml, &manifest)?;
         validate_manifest_config(&manifest)?;
@@ -465,7 +566,8 @@ impl PluginHost {
             &manifest_toml,
             &source_dir,
             component.as_ref(),
-        );
+        )
+        .and_then(|()| check_staged_skills(&manifest, &package));
         if let Err(error) = staged {
             recovery::clear_owned(&package)?;
             drop(package);
@@ -488,6 +590,7 @@ impl PluginHost {
             manifest.name.clone(),
             LoadedPlugin {
                 manifest,
+                manifest_toml,
                 plugin_dir: dest_dir,
                 component,
             },
@@ -654,6 +757,7 @@ impl PluginHost {
             dir,
             Path::new("claimed package"),
             std::ffi::OsStr::new("manifest.toml"),
+            AdmissionTarget::NewPackage,
         ) {
             Ok(_) => Err(PluginError::InvalidConfig(
                 "admission accepts this package".into(),
@@ -873,6 +977,531 @@ impl PluginHost {
     /// Returns the plugins directory path.
     pub fn plugins_dir(&self) -> &Path {
         &self.plugins_dir
+    }
+}
+
+/// Updates: replacing an installed package with an admitted source, and
+/// recovering what an interrupted replacement left.
+///
+/// Every step runs under the package lock that serializes install, remove and
+/// recovery across hosts. The replacement is built in a leased stage, as
+/// install builds a package, and the installed generation is claimed into a
+/// leased transaction of its own before the replacement is published in its
+/// place. Both moves are renames that never overwrite, and a claimed generation
+/// is deleted only through its own handle. Discovery ignores the hidden
+/// transaction directories, so neither a half-built replacement nor a claimed
+/// generation is ever loaded, and a lease that outlived its process is how
+/// recovery tells an interrupted update from one still running.
+impl PluginHost {
+    /// Replace the installed package that `admitted` names.
+    ///
+    /// `admitted` comes from [`Self::admit_update`]. The replacement is staged
+    /// as [`Self::install_admitted`] stages a new package, and the staged skill
+    /// bundle of a skill-capable package is validated as discovery will
+    /// validate it: staging copies no symbolic links, so a bundle admission
+    /// accepted can stage incomplete. Only then is the installed generation
+    /// claimed. If its manifest text or admitted component differs from the
+    /// generation this host loaded, it is published back and the update
+    /// refused, because the caller compared authority against the generation
+    /// it loaded. The
+    /// replacement is then published in the directory the installed package
+    /// was discovered in, and if that fails the claimed generation is
+    /// published back. So on every error except
+    /// [`PluginError::ReplacementInterrupted`] the installed package is exactly
+    /// as it was.
+    ///
+    /// Configuration and durable state are not touched: they belong to the
+    /// instance identity, which does not include the version.
+    pub fn update_admitted(
+        &mut self,
+        admitted: AdmittedSource,
+    ) -> Result<ReplacedPackage, PluginError> {
+        let AdmittedSource {
+            manifest,
+            manifest_toml,
+            source_dir,
+            component,
+        } = admitted;
+
+        // Re-checked here as well: the package may have been removed between
+        // admission and replacement.
+        let Some(installed) = self.loaded.get(&manifest.name) else {
+            return Err(PluginError::NotFound(manifest.name));
+        };
+        let package_dir = installed.plugin_dir.clone();
+        let previous_version = installed.manifest.version.clone();
+        let entry = package_entry(&self.plugins_dir, &package_dir)?;
+
+        let _guard = self.recovery_root.lock()?;
+        let stage = self
+            .recovery_root
+            .transaction(&manifest.name, "installing")?;
+        if let Err(error) = stage_replacement(
+            &stage,
+            &manifest,
+            &manifest_toml,
+            &source_dir,
+            component.as_ref(),
+        ) {
+            self.discard(stage);
+            return Err(error);
+        }
+        #[cfg(test)]
+        recovery::pause("update-staged");
+
+        let held = match self.recovery_root.transaction(&manifest.name, "replacing") {
+            Ok(held) => held,
+            Err(error) => {
+                self.discard(stage);
+                return Err(error);
+            }
+        };
+        #[cfg(test)]
+        recovery::pause("update-before-claim");
+        if let Err(error) = held.claim(&self.recovery_root, &entry) {
+            let _ = held.finish(&self.recovery_root);
+            self.discard(stage);
+            return Err(error);
+        }
+        #[cfg(test)]
+        recovery::pause("update-claimed");
+        if let Err(error) = self.claimed_is_loaded(&held, &manifest.name) {
+            self.discard(stage);
+            let refused = self.put_back(&manifest.name, &entry, held, error);
+            if matches!(refused, PluginError::ReplacementInterrupted { .. }) {
+                self.loaded.remove(&manifest.name);
+            }
+            return Err(refused);
+        }
+
+        #[cfg(test)]
+        replace_hook::run(&self.plugins_dir, &stage.entry, &held.entry);
+        if let Err(error) = stage.publish(&self.recovery_root, &entry) {
+            self.discard(stage);
+            let refused = self.put_back(&manifest.name, &entry, held, error);
+            if matches!(refused, PluginError::ReplacementInterrupted { .. }) {
+                self.loaded.remove(&manifest.name);
+            }
+            return Err(refused);
+        }
+        #[cfg(test)]
+        recovery::pause("update-published");
+        // The stage holds nothing but its lease now. One left behind is swept
+        // with the other abandoned stages.
+        let _ = stage.finish(&self.recovery_root);
+        // The replacement is in place, whatever then happens to the replaced
+        // generation, so even a namespace change is reported with it.
+        let held_at = self.plugins_dir.join(&held.entry);
+        let leftover = self
+            .supersede(held)
+            .unwrap_or_else(|error| Some((held_at, error.to_string())));
+
+        self.loaded.insert(
+            manifest.name.clone(),
+            LoadedPlugin {
+                manifest,
+                manifest_toml,
+                plugin_dir: package_dir,
+                component,
+            },
+        );
+        Ok(ReplacedPackage {
+            previous_version,
+            leftover,
+        })
+    }
+
+    /// Put back a package an interrupted update left claimed, or delete the
+    /// generations finished updates left behind.
+    ///
+    /// Runs under the package lock and judges only `replacing` transactions
+    /// whose lease it can take: a lease still held belongs to a process that
+    /// has not finished, and its claimed generation is never touched. Whether
+    /// the package is installed is judged from the plugins directory as it is
+    /// under the lock, not from this host's earlier view, which can predate
+    /// the update that left the claims. When it is installed, every claimed
+    /// generation of it is out of date, so each is marked superseded and
+    /// deleted through its handle; one that cannot be is reported and left.
+    /// When it is not, the one generation an interrupted update claimed is
+    /// published back to `<plugins_dir>/<name>`, so the restored package is
+    /// admitted only if the configured policy accepts it, like any other. An
+    /// installed package of the name takes precedence over any claimed
+    /// generation. Several claimed generations, or anything already at the
+    /// name, are reported and left as found; a superseded generation is never
+    /// put back; and a claim that holds neither is finished. Stages that
+    /// interrupted updates of `name` left are swept as `remove` sweeps them.
+    pub fn recover_interrupted_update(
+        &mut self,
+        name: &str,
+    ) -> Result<UpdateRecovery, PluginError> {
+        if crate::instance::validate_package_name(name).is_err() {
+            return Ok(UpdateRecovery::Nothing);
+        }
+        #[cfg(test)]
+        recovery::pause("recovery-before-lock");
+        let _guard = self.recovery_root.lock()?;
+        let claims = self.abandoned_claims(name)?;
+        // A stage that cannot be swept is hidden and inert, so it never stands
+        // in the way of recovering the package itself; a changed namespace
+        // still refuses.
+        if let Err(error @ PluginError::NamespaceChanged(_)) = self.remove_stale_staging(name) {
+            return Err(error);
+        }
+        if claims.is_empty() {
+            // An update another process finished while this one waited for the
+            // lock has changed what is installed.
+            if !self.loaded.contains_key(name) {
+                self.loaded = self.discovered()?;
+            }
+            return Ok(UpdateRecovery::Nothing);
+        }
+        self.loaded = self.discovered()?;
+        let installed = self.loaded.contains_key(name);
+
+        let mut restorable = Vec::new();
+        let mut outdated = Vec::new();
+        for tx in claims {
+            match claim_contents(&tx)? {
+                ClaimContents::Package if !installed => restorable.push(tx),
+                ClaimContents::Package | ClaimContents::Superseded => outdated.push(tx),
+                ClaimContents::Empty => {
+                    let _ = tx.finish(&self.recovery_root);
+                }
+            }
+        }
+        let mut removed = 0;
+        let mut kept = Vec::new();
+        for tx in outdated {
+            match self.supersede(tx)? {
+                None => removed += 1,
+                Some(left) => kept.push(left),
+            }
+        }
+        let swept = if removed == 0 && kept.is_empty() {
+            UpdateRecovery::Nothing
+        } else {
+            UpdateRecovery::Swept { removed, kept }
+        };
+
+        let held = match restorable.len() {
+            0 => return Ok(swept),
+            1 => restorable.remove(0),
+            _ => {
+                return Ok(UpdateRecovery::Ambiguous {
+                    displaced: restorable
+                        .iter()
+                        .map(|tx| PathBuf::from(self.recovery_root.retained_path(tx)))
+                        .collect(),
+                });
+            }
+        };
+        match self.recovery_root.dir.symlink_metadata(name) {
+            Ok(_) => {
+                return Ok(UpdateRecovery::Occupied {
+                    displaced: PathBuf::from(self.recovery_root.retained_path(&held)),
+                    occupant: self.plugins_dir.join(name),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        held.publish(&self.recovery_root, name)?;
+        let _ = held.finish(&self.recovery_root);
+        self.loaded = self.discovered()?;
+        Ok(UpdateRecovery::Restored)
+    }
+
+    /// Packages an interrupted update left claimed: sorted names that are not
+    /// loaded and have an abandoned claim that holds a package.
+    /// [`Self::recover_interrupted_update`] puts such a package back, or, with
+    /// several claims or an occupied name, reports why it cannot. Runs under
+    /// the package lock, so it never holds a claim's lease while a recovery
+    /// judges it.
+    pub fn displaced_packages(&self) -> Result<Vec<String>, PluginError> {
+        let _guard = self.recovery_root.lock()?;
+        let mut current: Option<HashMap<String, LoadedPlugin>> = None;
+        let mut names = Vec::new();
+        for entry in self.recovery_root.dir.entries()? {
+            let entry = entry?;
+            let Some(entry_name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(package) = recovery::transaction_package(&entry_name, "replacing") else {
+                continue;
+            };
+            // Judged from the plugins directory under the lock, not from this
+            // host's earlier view, as recovery judges it.
+            if current.is_none() {
+                current = Some(self.discovered()?);
+            }
+            if current
+                .as_ref()
+                .is_some_and(|loaded| loaded.contains_key(package))
+            {
+                continue;
+            }
+            let package = package.to_string();
+            // Taking the lease, briefly, skips a claim an update still holds;
+            // one that cannot be inspected is left to recovery to report.
+            if let Ok(Some(tx)) = self.recovery_root.reopen_transaction(entry_name)
+                && matches!(claim_contents(&tx), Ok(ClaimContents::Package))
+            {
+                names.push(package);
+            }
+        }
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
+    /// The `replacing` transactions of `name` whose lease this host can take:
+    /// those an update left when it stopped. Under the package lock a
+    /// cooperating update holds none, so a lease still held is reported
+    /// rather than judged.
+    fn abandoned_claims(&self, name: &str) -> Result<Vec<recovery::Transaction>, PluginError> {
+        let mut claims = Vec::new();
+        for entry in self.recovery_root.dir.entries()? {
+            let entry = entry?;
+            let Some(entry_name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !recovery::is_transaction(&entry_name, name, "replacing") {
+                continue;
+            }
+            let Some(tx) = self.recovery_root.reopen_transaction(entry_name.clone())? else {
+                // An empty directory is what a process stopped while creating
+                // or finishing a transaction leaves. Removing it cannot touch
+                // anything else, and a held lease keeps a directory non-empty.
+                self.recovery_root.check()?;
+                if self.recovery_root.dir.remove_dir(&entry_name).is_ok() {
+                    continue;
+                }
+                return Err(PluginError::RecoveryRetained {
+                    path: self.plugins_dir.join(entry_name).display().to_string(),
+                    reason: "update transaction ownership is unavailable".into(),
+                });
+            };
+            claims.push(tx);
+        }
+        claims.sort_by(|a, b| a.entry.cmp(&b.entry));
+        Ok(claims)
+    }
+
+    /// Whether the generation `held` claimed is the one this host loaded as
+    /// `name`: the same manifest text, which carries all the authority the
+    /// caller compared, and the same admitted component. Skill content is not
+    /// compared; it was never admitted bytes.
+    fn claimed_is_loaded(
+        &self,
+        held: &recovery::Transaction,
+        name: &str,
+    ) -> Result<(), PluginError> {
+        let changed = || {
+            PluginError::NamespaceChanged(format!(
+                "the installed package '{name}' changed after this host loaded it"
+            ))
+        };
+        let loaded = self.loaded.get(name).ok_or_else(changed)?;
+        let claimed = held.dir.open_dir(recovery::PACKAGE)?;
+        let same_manifest = claimed
+            .read_to_string("manifest.toml")
+            .is_ok_and(|text| text == loaded.manifest_toml);
+        if !same_manifest {
+            return Err(changed());
+        }
+        let component = admit_component_in(&claimed, &loaded.manifest).map_err(|_| changed())?;
+        if component.as_ref().map(AdmittedComponent::bytes)
+            != loaded.component.as_ref().map(AdmittedComponent::bytes)
+        {
+            return Err(changed());
+        }
+        Ok(())
+    }
+
+    /// Publish a generation `held` claimed back to `entry`, and return the
+    /// error to report: `error` itself, or, when even that fails,
+    /// [`PluginError::ReplacementInterrupted`]. The generation then stays in
+    /// its transaction, whose lease is released on return, for recovery to
+    /// put back, and the caller no longer holds the package as loaded.
+    fn put_back(
+        &self,
+        name: &str,
+        entry: &str,
+        held: recovery::Transaction,
+        error: PluginError,
+    ) -> PluginError {
+        match held.publish(&self.recovery_root, entry) {
+            Ok(()) => {
+                let _ = held.finish(&self.recovery_root);
+                error
+            }
+            Err(restore) => PluginError::ReplacementInterrupted {
+                name: name.to_string(),
+                preserved: PathBuf::from(self.recovery_root.retained_path(&held)),
+                cause: format!("{error}; moving it back: {restore}"),
+            },
+        }
+    }
+
+    /// Mark a claimed generation superseded, then delete it through its
+    /// handle. Returns where it was left, and why, when it could not be, and
+    /// refuses when the plugins directory itself changed.
+    fn supersede(
+        &self,
+        held: recovery::Transaction,
+    ) -> Result<Option<(PathBuf, String)>, PluginError> {
+        let base = self.plugins_dir.join(&held.entry);
+        if holds(&held.dir, recovery::PACKAGE)? {
+            match held.retire(&self.recovery_root) {
+                Ok(()) => {}
+                Err(error @ PluginError::NamespaceChanged(_)) => return Err(error),
+                Err(error) => {
+                    return Ok(Some((base.join(recovery::PACKAGE), error.to_string())));
+                }
+            }
+        }
+        let deleted = held
+            .dir
+            .open_dir(recovery::SUPERSEDED)
+            .map_err(PluginError::from)
+            .and_then(|generation| {
+                recovery::clear_owned(&generation)?;
+                drop(generation);
+                held.dir.remove_dir(recovery::SUPERSEDED)?;
+                Ok(())
+            });
+        match deleted {
+            Ok(()) => {
+                let _ = held.finish(&self.recovery_root);
+                Ok(None)
+            }
+            Err(error) => Ok(Some((base.join(recovery::SUPERSEDED), error.to_string()))),
+        }
+    }
+
+    /// Delete a stage's package through its handle and release the stage. A
+    /// stage that cannot be cleared is left for the sweep of abandoned stages.
+    fn discard(&self, stage: recovery::Transaction) {
+        let cleared = match stage.dir.open_dir(recovery::PACKAGE) {
+            Ok(package) => recovery::clear_owned(&package).and_then(|()| {
+                drop(package);
+                stage.dir.remove_dir(recovery::PACKAGE)?;
+                Ok(())
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        };
+        if cleared.is_ok() {
+            let _ = stage.finish(&self.recovery_root);
+        }
+    }
+}
+
+/// Build the admitted package in `stage`, as install does.
+fn stage_replacement(
+    stage: &recovery::Transaction,
+    manifest: &PluginManifest,
+    manifest_toml: &str,
+    source_dir: &Path,
+    component: Option<&AdmittedComponent>,
+) -> Result<(), PluginError> {
+    stage.dir.create_dir(recovery::PACKAGE)?;
+    let package = stage.dir.open_dir(recovery::PACKAGE)?;
+    write_package(&package, manifest, manifest_toml, source_dir, component)?;
+    check_staged_skills(manifest, &package)
+}
+
+/// Check the skill bundle a skill-capable package actually staged, as
+/// discovery will check it: staging copies no symbolic links, while admission
+/// follows them within the package, so a bundle admission accepted can stage
+/// incomplete.
+fn check_staged_skills(manifest: &PluginManifest, package: &Dir) -> Result<(), PluginError> {
+    if !manifest.capabilities.contains(&PluginCapability::Skill) {
+        return Ok(());
+    }
+    validate_skill_bundle(&manifest.name, package, Path::new("staged package")).map_err(
+        |error| match error {
+            PluginError::InvalidManifest(cause) => PluginError::InvalidManifest(format!(
+                "the staged copy of '{}' is incomplete: {cause}. Staging does not copy symbolic links; replace any under skills/ with the files they point to",
+                manifest.name
+            )),
+            other => other,
+        },
+    )
+}
+
+/// What a `replacing` transaction holds.
+enum ClaimContents {
+    /// A claimed generation, which recovery may put back.
+    Package,
+    /// A generation marked superseded, which recovery only ever deletes.
+    Superseded,
+    /// Neither: the claim was never made or has been undone.
+    Empty,
+}
+
+/// What `tx` holds. A lookup that fails for any reason but absence says
+/// nothing about the claim, so it is an error, never a verdict.
+fn claim_contents(tx: &recovery::Transaction) -> Result<ClaimContents, PluginError> {
+    if holds(&tx.dir, recovery::PACKAGE)? {
+        Ok(ClaimContents::Package)
+    } else if holds(&tx.dir, recovery::SUPERSEDED)? {
+        Ok(ClaimContents::Superseded)
+    } else {
+        Ok(ClaimContents::Empty)
+    }
+}
+
+/// Whether `dir` holds `entry`, of any type.
+fn holds(dir: &Dir, entry: &str) -> Result<bool, PluginError> {
+    match dir.symlink_metadata(entry) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The name of a loaded package's directory in the plugins directory: the one
+/// entry an update claims and publishes to.
+fn package_entry(plugins_dir: &Path, package_dir: &Path) -> Result<String, PluginError> {
+    package_dir
+        .parent()
+        .filter(|parent| *parent == plugins_dir)
+        .and(package_dir.file_name())
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            PluginError::NamespaceChanged(format!(
+                "{} is not a package directory in {}",
+                package_dir.display(),
+                plugins_dir.display()
+            ))
+        })
+}
+
+/// Test-only seam: runs once between claiming the installed generation and
+/// publishing its replacement, with the plugins directory and the entries of
+/// the stage and of the claim, so a test can make the publication, the
+/// publication back, or the deletion of the claimed generation fail.
+#[cfg(test)]
+mod replace_hook {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    type Hook = Box<dyn FnOnce(&Path, &str, &str)>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn set(hook: impl FnOnce(&Path, &str, &str) + 'static) {
+        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn run(plugins_dir: &Path, stage: &str, claim: &str) {
+        if let Some(hook) = HOOK.with(|slot| slot.borrow_mut().take()) {
+            hook(plugins_dir, stage, claim);
+        }
     }
 }
 
@@ -1409,6 +2038,7 @@ fn is_structural_admission_failure(error: &PluginError) -> bool {
         | PluginError::UnadmittedPackage { .. }
         | PluginError::NamespaceChanged(_)
         | PluginError::RecoveryRetained { .. }
+        | PluginError::ReplacementInterrupted { .. }
         | PluginError::InvalidConfig(_)
         | PluginError::InvalidInstanceId(_)
         | PluginError::InvalidEndpoint(_)
@@ -1437,6 +2067,17 @@ fn write_package(
         manifest_toml.as_bytes(),
     )?;
     dir.write("manifest.toml", manifest_toml.as_bytes())?;
+
+    // Copy skills/ subtree for skill-capable plugins.
+    if manifest.capabilities.contains(&PluginCapability::Skill) {
+        let src_skills = source_dir.join(SKILLS_SUBDIR);
+        if src_skills.is_dir() {
+            copy_skills_into(&src_skills, dir, Path::new(SKILLS_SUBDIR))?;
+        }
+    }
+
+    // The component goes last: a `wasm_path` under `skills/` must hold the
+    // admitted bytes, not whatever the source holds by the time it is copied.
     if let (Some(rel), Some(component)) = (manifest.wasm_path.as_deref(), component) {
         let dest = Path::new(rel);
         if let Some(parent) = dest.parent() {
@@ -1445,14 +2086,6 @@ fn write_package(
         #[cfg(test)]
         write_fault::inject(write_fault::Step::Payload, dir, dest, component.bytes())?;
         dir.write(dest, component.bytes())?;
-    }
-
-    // Copy skills/ subtree for skill-capable plugins.
-    if manifest.capabilities.contains(&PluginCapability::Skill) {
-        let src_skills = source_dir.join(SKILLS_SUBDIR);
-        if src_skills.is_dir() {
-            copy_skills_into(&src_skills, dir, Path::new(SKILLS_SUBDIR))?;
-        }
     }
     Ok(())
 }
@@ -3496,5 +4129,994 @@ capabilities = ["tool"]
         // silently degrading to the weakest posture on a config typo.
         assert_eq!(PluginHost::parse_signature_mode("nonsense"), None);
         assert_eq!(PluginHost::parse_signature_mode("sttict"), None);
+    }
+
+    fn write_tool_version(dir: &Path, name: &str, version: &str, wasm: &[u8]) {
+        std::fs::write(
+            dir.join("manifest.toml"),
+            format!(
+                "name = \"{name}\"\nversion = \"{version}\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("plugin.wasm"), wasm).unwrap();
+    }
+
+    fn install_tool_version(host: &mut PluginHost, name: &str, version: &str, wasm: &[u8]) {
+        let source = tempdir().unwrap();
+        write_tool_version(source.path(), name, version, wasm);
+        host.install(source.path().to_str().unwrap()).unwrap();
+    }
+
+    /// Admit a tool source for `name` at `version` and replace it.
+    fn update_tool(
+        host: &mut PluginHost,
+        name: &str,
+        version: &str,
+        wasm: &[u8],
+    ) -> Result<ReplacedPackage, PluginError> {
+        let source = tempdir().unwrap();
+        write_tool_version(source.path(), name, version, wasm);
+        let admitted = host.admit_update(name, source.path().to_str().unwrap())?;
+        host.update_admitted(admitted)
+    }
+
+    /// Write a tool source whose signed manifest binds the component digest:
+    /// the shape strict signature policy admits.
+    fn write_signed_tool_version(
+        dir: &Path,
+        name: &str,
+        version: &str,
+        wasm: &[u8],
+        private_key: &[u8],
+        publisher_key: &str,
+    ) {
+        let unsigned = format!(
+            "name = \"{name}\"\nversion = \"{version}\"\nwasm_path = \"plugin.wasm\"\nwasm_sha256 = \"{}\"\ncapabilities = [\"tool\"]\n",
+            signature::sha256_hex(wasm)
+        );
+        let signed_value = signature::sign_manifest(&unsigned, private_key).unwrap();
+        let signed = unsigned.replacen(
+            "wasm_path = \"plugin.wasm\"",
+            &format!(
+                "signature = \"{signed_value}\"\npublisher_key = \"{publisher_key}\"\nwasm_path = \"plugin.wasm\""
+            ),
+            1,
+        );
+        std::fs::write(dir.join("manifest.toml"), signed).unwrap();
+        std::fs::write(dir.join("plugin.wasm"), wasm).unwrap();
+    }
+
+    /// Hidden entries of `dir` other than the package lock: stages and claims.
+    fn hidden_entries(dir: &Path) -> Vec<String> {
+        dir_entries(dir)
+            .into_iter()
+            .filter(|name| name.starts_with('.') && name != ".zeroclaw-package-lock-v1")
+            .collect()
+    }
+
+    /// Leave `name` claimed by an update that stopped before publishing: its
+    /// installed directory moved into a `replacing` transaction whose lease is
+    /// released on return. With `retired`, the claim is already marked
+    /// superseded, as a finished update leaves one it could not delete.
+    /// Returns the transaction's entry.
+    fn abandon_claim(host: &PluginHost, name: &str, retired: bool) -> String {
+        let tx = host.recovery_root.transaction(name, "replacing").unwrap();
+        tx.claim(&host.recovery_root, name).unwrap();
+        if retired {
+            tx.retire(&host.recovery_root).unwrap();
+        }
+        tx.entry.clone()
+    }
+
+    /// An update replaces the package where it is installed: the new manifest
+    /// and component are on disk, the host reports the new version, a fresh
+    /// discovery admits it, and nothing but the package lock is left hidden.
+    #[test]
+    fn update_replaces_the_package_in_place_and_reports_the_previous_version() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "1.0.0", b"\0asm v1");
+
+        let replaced = update_tool(&mut host, "weather", "2.0.0", b"\0asm v2").unwrap();
+
+        assert_eq!(replaced.previous_version, "1.0.0");
+        assert!(replaced.leftover.is_none());
+        assert_eq!(host.get_plugin("weather").unwrap().version, "2.0.0");
+        assert_eq!(
+            std::fs::read(plugins.path().join("weather/plugin.wasm")).unwrap(),
+            b"\0asm v2"
+        );
+        assert!(hidden_entries(plugins.path()).is_empty());
+        let rediscovered = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        assert_eq!(rediscovered.get_plugin("weather").unwrap().version, "2.0.0");
+        assert_eq!(
+            rediscovered.admitted_component("weather").unwrap().bytes(),
+            b"\0asm v2"
+        );
+    }
+
+    /// Updating a package that is not installed is refused before the source
+    /// is opened: the error names the plugin, not a missing manifest.
+    #[test]
+    fn admit_update_refuses_a_package_that_is_not_installed_before_opening_the_source() {
+        let plugins = tempdir().unwrap();
+        let host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+
+        let err = host
+            .admit_update("absent", "/nonexistent/update/source")
+            .expect_err("a package that is not installed cannot be updated");
+        assert!(
+            matches!(err, PluginError::NotFound(ref name) if name == "absent"),
+            "{err}"
+        );
+    }
+
+    /// A source for a different package is refused before its component is
+    /// read. As in the duplicate-name test, the candidate's component is a
+    /// sparse file past the admission limit, so reading it would have produced
+    /// the size-limit error instead.
+    #[test]
+    fn admit_update_refuses_a_source_for_another_package_before_reading_its_component() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "1.0.0", b"\0asm v1");
+
+        let source = tempdir().unwrap();
+        write_tool_version(source.path(), "calendar", "2.0.0", b"");
+        std::fs::File::options()
+            .write(true)
+            .open(source.path().join("plugin.wasm"))
+            .unwrap()
+            .set_len(MAX_COMPONENT_BYTES + 1)
+            .unwrap();
+
+        let err = host
+            .admit_update("weather", source.path().to_str().unwrap())
+            .expect_err("a source for another package must be refused");
+        let message = err.to_string();
+        assert!(matches!(err, PluginError::InvalidManifest(_)), "{message}");
+        assert!(
+            message.contains("'weather'") && message.contains("'calendar'"),
+            "{message}"
+        );
+        assert!(!message.contains("admission limit"), "{message}");
+    }
+
+    /// Strict signature policy applies to a replacement exactly as to a new
+    /// package: an unsigned candidate and one signed by an untrusted key are
+    /// both refused and leave the installed package as it was, while one
+    /// signed by a trusted key replaces it.
+    #[test]
+    fn admit_update_applies_signature_policy_and_keeps_the_installed_package() {
+        let (trusted_key, trusted_public) = signature::generate_signing_key().unwrap();
+        let (untrusted_key, untrusted_public) = signature::generate_signing_key().unwrap();
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir_with_security(
+            plugins.path(),
+            SignatureMode::Strict,
+            vec![trusted_public.clone()],
+        )
+        .unwrap();
+        let v1 = tempdir().unwrap();
+        write_signed_tool_version(
+            v1.path(),
+            "signed-tool",
+            "1.0.0",
+            b"\0asm v1",
+            &trusted_key,
+            &trusted_public,
+        );
+        host.install(v1.path().to_str().unwrap()).unwrap();
+
+        let unsigned = tempdir().unwrap();
+        write_tool_version(unsigned.path(), "signed-tool", "2.0.0", b"\0asm v2");
+        let err = host
+            .admit_update("signed-tool", unsigned.path().to_str().unwrap())
+            .expect_err("strict policy refuses an unsigned replacement");
+        assert!(matches!(err, PluginError::UnsignedPlugin(_)), "{err}");
+
+        let untrusted = tempdir().unwrap();
+        write_signed_tool_version(
+            untrusted.path(),
+            "signed-tool",
+            "2.0.0",
+            b"\0asm v2",
+            &untrusted_key,
+            &untrusted_public,
+        );
+        let err = host
+            .admit_update("signed-tool", untrusted.path().to_str().unwrap())
+            .expect_err("strict policy refuses an untrusted publisher");
+        assert!(
+            matches!(err, PluginError::UntrustedPublisher { .. }),
+            "{err}"
+        );
+        assert_eq!(host.get_plugin("signed-tool").unwrap().version, "1.0.0");
+        assert_eq!(
+            std::fs::read(plugins.path().join("signed-tool/plugin.wasm")).unwrap(),
+            b"\0asm v1"
+        );
+
+        let trusted = tempdir().unwrap();
+        write_signed_tool_version(
+            trusted.path(),
+            "signed-tool",
+            "2.0.0",
+            b"\0asm v2",
+            &trusted_key,
+            &trusted_public,
+        );
+        let admitted = host
+            .admit_update("signed-tool", trusted.path().to_str().unwrap())
+            .unwrap();
+        host.update_admitted(admitted).unwrap();
+        assert_eq!(host.get_plugin("signed-tool").unwrap().version, "2.0.0");
+    }
+
+    /// A replacement whose component does not match its declared digest is
+    /// refused at admission.
+    #[test]
+    fn admit_update_rejects_a_component_that_does_not_match_its_digest() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "1.0.0", b"\0asm v1");
+
+        let source = tempdir().unwrap();
+        std::fs::write(
+            source.path().join("manifest.toml"),
+            format!(
+                "name = \"weather\"\nversion = \"2.0.0\"\nwasm_path = \"plugin.wasm\"\nwasm_sha256 = \"{}\"\ncapabilities = [\"tool\"]\n",
+                signature::sha256_hex(b"\0asm expected")
+            ),
+        )
+        .unwrap();
+        std::fs::write(source.path().join("plugin.wasm"), b"\0asm tampered").unwrap();
+
+        let err = host
+            .admit_update("weather", source.path().to_str().unwrap())
+            .expect_err("a digest mismatch must be refused");
+        assert!(
+            matches!(err, PluginError::PayloadDigestMismatch { .. }),
+            "{err}"
+        );
+        assert_eq!(host.get_plugin("weather").unwrap().version, "1.0.0");
+    }
+
+    /// What was admitted is what replaces the package: a source changed after
+    /// admission, the window in which the CLI runs its load check, does not
+    /// change the installed bytes.
+    #[test]
+    fn update_installs_the_admitted_bytes_not_the_source_after_a_swap() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "1.0.0", b"\0asm v1");
+
+        let source = tempdir().unwrap();
+        write_tool_version(source.path(), "weather", "2.0.0", b"\0asm admitted");
+        let admitted = host
+            .admit_update("weather", source.path().to_str().unwrap())
+            .unwrap();
+        std::fs::write(source.path().join("plugin.wasm"), b"\0asm swapped in").unwrap();
+        host.update_admitted(admitted).unwrap();
+
+        assert_eq!(
+            std::fs::read(plugins.path().join("weather/plugin.wasm")).unwrap(),
+            b"\0asm admitted"
+        );
+    }
+
+    /// A component under `skills/` holds the admitted bytes as well: the copy
+    /// of `skills/`, which reads the source as it is by then, never overwrites
+    /// it.
+    #[test]
+    fn a_component_under_skills_keeps_the_admitted_bytes_after_a_source_swap() {
+        fn write_skill_tool(dir: &Path, version: &str, wasm: &[u8]) {
+            std::fs::write(
+                dir.join("manifest.toml"),
+                format!(
+                    "name = \"kit\"\nversion = \"{version}\"\nwasm_path = \"skills/tool.wasm\"\ncapabilities = [\"tool\", \"skill\"]\n"
+                ),
+            )
+            .unwrap();
+            std::fs::create_dir_all(dir.join("skills/alpha")).unwrap();
+            write_skill_md(&dir.join("skills/alpha/SKILL.md"), "alpha", "A skill");
+            std::fs::write(dir.join("skills/tool.wasm"), wasm).unwrap();
+        }
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        let v1 = tempdir().unwrap();
+        write_skill_tool(v1.path(), "1.0.0", b"\0asm v1");
+        host.install(v1.path().to_str().unwrap()).unwrap();
+
+        let v2 = tempdir().unwrap();
+        write_skill_tool(v2.path(), "2.0.0", b"\0asm admitted");
+        let admitted = host
+            .admit_update("kit", v2.path().to_str().unwrap())
+            .unwrap();
+        std::fs::write(v2.path().join("skills/tool.wasm"), b"\0asm swapped in").unwrap();
+        host.update_admitted(admitted).unwrap();
+
+        assert_eq!(
+            std::fs::read(plugins.path().join("kit/skills/tool.wasm")).unwrap(),
+            b"\0asm admitted"
+        );
+        let rediscovered = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        assert_eq!(
+            rediscovered.admitted_component("kit").unwrap().bytes(),
+            b"\0asm admitted"
+        );
+    }
+
+    /// When the replacement cannot be published, the claimed generation is
+    /// published back: the error is the publication's, the installed bytes and
+    /// the host's view are unchanged, and nothing hidden is left behind.
+    #[test]
+    fn a_failed_publication_puts_the_claimed_generation_back() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "1.0.0", b"\0asm v1");
+
+        // Take the staged replacement away, so there is nothing to publish.
+        replace_hook::set(|plugins, stage, _| {
+            std::fs::remove_dir_all(plugins.join(stage).join(recovery::PACKAGE)).unwrap();
+        });
+        let err = update_tool(&mut host, "weather", "2.0.0", b"\0asm v2")
+            .expect_err("the publication must fail");
+
+        assert!(matches!(err, PluginError::Io(_)), "{err}");
+        assert_eq!(host.get_plugin("weather").unwrap().version, "1.0.0");
+        assert_eq!(
+            std::fs::read(plugins.path().join("weather/plugin.wasm")).unwrap(),
+            b"\0asm v1"
+        );
+        assert!(hidden_entries(plugins.path()).is_empty());
+    }
+
+    /// When the claimed generation cannot be published back either, because
+    /// something took its name, the update reports where it is preserved and
+    /// overwrites nothing. Once the name is free, recovery puts it back.
+    #[test]
+    fn a_failed_put_back_reports_the_preserved_generation_and_recovery_restores_it() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "1.0.0", b"\0asm v1");
+        let v1 = package_bytes(&plugins.path().join("weather"));
+
+        replace_hook::set(|plugins, _, _| std::fs::create_dir(plugins.join("weather")).unwrap());
+        let err = update_tool(&mut host, "weather", "2.0.0", b"\0asm v2")
+            .expect_err("both publications must fail");
+
+        let PluginError::ReplacementInterrupted { preserved, .. } = &err else {
+            panic!("expected ReplacementInterrupted, got {err}");
+        };
+        assert_eq!(package_bytes(preserved), v1);
+        assert!(host.get_plugin("weather").is_none());
+        assert!(dir_entries(&plugins.path().join("weather")).is_empty());
+
+        std::fs::remove_dir(plugins.path().join("weather")).unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        assert_eq!(host.displaced_packages().unwrap(), ["weather"]);
+        assert_eq!(
+            host.recover_interrupted_update("weather").unwrap(),
+            UpdateRecovery::Restored
+        );
+        assert_eq!(package_bytes(&plugins.path().join("weather")), v1);
+        assert_eq!(host.get_plugin("weather").unwrap().version, "1.0.0");
+        assert!(hidden_entries(plugins.path()).is_empty());
+    }
+
+    /// The generation an update claims must be the one the host loaded, whose
+    /// authority the caller compared. A package replaced on disk since is
+    /// published back untouched and the update refused.
+    #[test]
+    fn an_update_refuses_a_package_that_changed_since_this_host_loaded_it() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "1.0.0", b"\0asm v1");
+        let source = tempdir().unwrap();
+        write_tool_version(source.path(), "weather", "2.0.0", b"\0asm v2");
+        let admitted = host
+            .admit_update("weather", source.path().to_str().unwrap())
+            .unwrap();
+
+        // Another host removes the package and installs a different one.
+        std::fs::remove_dir_all(plugins.path().join("weather")).unwrap();
+        std::fs::create_dir(plugins.path().join("weather")).unwrap();
+        write_tool_version(
+            &plugins.path().join("weather"),
+            "weather",
+            "1.5.0",
+            b"\0asm reinstalled",
+        );
+        let reinstalled = package_bytes(&plugins.path().join("weather"));
+
+        let err = host
+            .update_admitted(admitted)
+            .expect_err("a changed package is not this update's to replace");
+        assert!(matches!(err, PluginError::NamespaceChanged(_)), "{err}");
+        assert_eq!(package_bytes(&plugins.path().join("weather")), reinstalled);
+        assert!(hidden_entries(plugins.path()).is_empty());
+    }
+
+    /// Recovery puts back the generation an update claimed when it stopped
+    /// before publishing its replacement, and lists it until then.
+    #[test]
+    fn recovery_restores_the_generation_an_interrupted_update_claimed() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "1.0.0", b"\0asm v1");
+        let v1 = package_bytes(&plugins.path().join("weather"));
+        abandon_claim(&host, "weather", false);
+
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        assert!(host.get_plugin("weather").is_none());
+        assert_eq!(host.displaced_packages().unwrap(), ["weather"]);
+        assert_eq!(
+            host.recover_interrupted_update("weather").unwrap(),
+            UpdateRecovery::Restored
+        );
+        assert_eq!(package_bytes(&plugins.path().join("weather")), v1);
+        assert_eq!(host.get_plugin("weather").unwrap().version, "1.0.0");
+        assert!(host.displaced_packages().unwrap().is_empty());
+        assert!(hidden_entries(plugins.path()).is_empty());
+    }
+
+    /// Once the package is installed again, a generation an earlier update
+    /// claimed is out of date, and recovery deletes it.
+    #[test]
+    fn recovery_deletes_claimed_generations_of_an_installed_package() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "1.0.0", b"\0asm v1");
+        abandon_claim(&host, "weather", false);
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "2.0.0", b"\0asm v2");
+
+        assert_eq!(
+            host.recover_interrupted_update("weather").unwrap(),
+            UpdateRecovery::Swept {
+                removed: 1,
+                kept: Vec::new()
+            }
+        );
+        assert_eq!(host.get_plugin("weather").unwrap().version, "2.0.0");
+        assert!(hidden_entries(plugins.path()).is_empty());
+    }
+
+    /// A superseded generation is never put back, even once the package is
+    /// gone: recovery only deletes it, and it is never listed as displaced.
+    #[test]
+    fn recovery_never_puts_back_a_superseded_generation() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "1.0.0", b"\0asm v1");
+        abandon_claim(&host, "weather", true);
+
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        assert!(host.displaced_packages().unwrap().is_empty());
+        assert_eq!(
+            host.recover_interrupted_update("weather").unwrap(),
+            UpdateRecovery::Swept {
+                removed: 1,
+                kept: Vec::new()
+            }
+        );
+        assert!(!plugins.path().join("weather").exists());
+        assert!(host.get_plugin("weather").is_none());
+        assert!(hidden_entries(plugins.path()).is_empty());
+    }
+
+    /// With several claimed generations of a missing package, which was
+    /// installed last is not known, so recovery moves none of them.
+    #[test]
+    fn recovery_refuses_to_choose_between_several_claimed_generations() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "1.0.0", b"\0asm v1");
+        let first = abandon_claim(&host, "weather", false);
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "1.5.0", b"\0asm v1.5");
+        let second = abandon_claim(&host, "weather", false);
+
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        let mut expected = [first, second].map(|entry| {
+            PathBuf::from(
+                plugins
+                    .path()
+                    .join(entry)
+                    .join(recovery::PACKAGE)
+                    .display()
+                    .to_string(),
+            )
+        });
+        expected.sort();
+        assert_eq!(
+            host.recover_interrupted_update("weather").unwrap(),
+            UpdateRecovery::Ambiguous {
+                displaced: expected.to_vec()
+            }
+        );
+        assert!(
+            expected
+                .iter()
+                .all(|claim| claim.join("plugin.wasm").is_file())
+        );
+        assert!(!plugins.path().join("weather").exists());
+    }
+
+    /// A claimed generation is never published onto a name something else
+    /// occupies, even an occupant this host cannot load.
+    #[test]
+    fn recovery_never_puts_a_claim_onto_an_occupied_name() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "1.0.0", b"\0asm v1");
+        let claim = abandon_claim(&host, "weather", false);
+        std::fs::create_dir(plugins.path().join("weather")).unwrap();
+        std::fs::write(plugins.path().join("weather/manifest.toml"), "name =").unwrap();
+
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        assert_eq!(
+            host.recover_interrupted_update("weather").unwrap(),
+            UpdateRecovery::Occupied {
+                displaced: PathBuf::from(
+                    plugins
+                        .path()
+                        .join(&claim)
+                        .join(recovery::PACKAGE)
+                        .display()
+                        .to_string()
+                ),
+                occupant: plugins.path().join("weather"),
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(plugins.path().join("weather/manifest.toml")).unwrap(),
+            "name ="
+        );
+        assert!(
+            plugins
+                .path()
+                .join(&claim)
+                .join(recovery::PACKAGE)
+                .join("plugin.wasm")
+                .is_file()
+        );
+    }
+
+    /// Whether the package is installed is judged from the plugins directory
+    /// under the lock, not from the view a host took when it was built. Here
+    /// the host loaded the package, then another host's update claimed it and
+    /// stopped: the claim is the only copy, and recovery puts it back.
+    #[test]
+    fn recovery_judges_installation_from_the_directory_not_a_stale_view() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "1.0.0", b"\0asm v1");
+        let v1 = package_bytes(&plugins.path().join("weather"));
+        let other = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        abandon_claim(&other, "weather", false);
+        assert!(
+            host.get_plugin("weather").is_some(),
+            "premise: a stale view"
+        );
+
+        assert_eq!(
+            host.recover_interrupted_update("weather").unwrap(),
+            UpdateRecovery::Restored
+        );
+        assert_eq!(package_bytes(&plugins.path().join("weather")), v1);
+        assert!(hidden_entries(plugins.path()).is_empty());
+    }
+
+    /// Following the advice for several claims, renaming the one to keep back
+    /// to the package name, leaves the other claim out of date and the moved
+    /// one empty: recovery deletes the first and finishes the second.
+    #[test]
+    fn recovery_finishes_a_claim_the_ambiguous_remedy_emptied() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "1.0.0", b"\0asm v1");
+        let kept = abandon_claim(&host, "weather", false);
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "1.5.0", b"\0asm v1.5");
+        abandon_claim(&host, "weather", false);
+        std::fs::rename(
+            plugins.path().join(&kept).join(recovery::PACKAGE),
+            plugins.path().join("weather"),
+        )
+        .unwrap();
+
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        assert_eq!(
+            host.recover_interrupted_update("weather").unwrap(),
+            UpdateRecovery::Swept {
+                removed: 1,
+                kept: Vec::new()
+            }
+        );
+        assert_eq!(host.get_plugin("weather").unwrap().version, "1.0.0");
+        assert!(hidden_entries(plugins.path()).is_empty());
+    }
+
+    /// A process stopped while creating or finishing a transaction leaves an
+    /// empty directory without a lease, which recovery removes. One that is
+    /// not empty is never judged by its name alone: it is reported.
+    #[test]
+    fn recovery_removes_an_empty_transaction_and_reports_one_that_is_not() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "1.0.0", b"\0asm v1");
+        let suffix = "0".repeat(32);
+        std::fs::create_dir(
+            plugins
+                .path()
+                .join(format!(".weather.replacing-v1-{suffix}")),
+        )
+        .unwrap();
+
+        assert_eq!(
+            host.recover_interrupted_update("weather").unwrap(),
+            UpdateRecovery::Nothing
+        );
+        assert!(hidden_entries(plugins.path()).is_empty());
+
+        let unleased = plugins
+            .path()
+            .join(format!(".weather.replacing-v1-{suffix}"));
+        std::fs::create_dir_all(unleased.join(recovery::PACKAGE)).unwrap();
+        let err = host
+            .recover_interrupted_update("weather")
+            .expect_err("a non-empty transaction without a lease is not judged");
+        assert!(matches!(err, PluginError::RecoveryRetained { .. }), "{err}");
+        assert!(unleased.join(recovery::PACKAGE).is_dir());
+    }
+
+    /// A claim whose lease is still held belongs to an update that has not
+    /// finished. Recovery reports it and touches nothing, and it is not listed
+    /// as displaced.
+    #[test]
+    fn recovery_leaves_a_claim_whose_lease_is_held() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "1.0.0", b"\0asm v1");
+        let v1 = package_bytes(&plugins.path().join("weather"));
+        let running = host
+            .recovery_root
+            .transaction("weather", "replacing")
+            .unwrap();
+        running.claim(&host.recovery_root, "weather").unwrap();
+
+        let mut other = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        assert!(other.displaced_packages().unwrap().is_empty());
+        let err = other
+            .recover_interrupted_update("weather")
+            .expect_err("a held lease is never judged");
+        assert!(matches!(err, PluginError::RecoveryRetained { .. }), "{err}");
+        assert_eq!(
+            package_bytes(&plugins.path().join(&running.entry).join(recovery::PACKAGE)),
+            v1
+        );
+        assert!(!plugins.path().join("weather").exists());
+        drop(running);
+    }
+
+    /// Only `replacing` transactions of the package itself are claims: a
+    /// hidden directory with a near-miss name, or another package's claim, is
+    /// left alone.
+    #[test]
+    fn only_replacing_transactions_of_the_package_are_claims() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "calendar", "1.0.0", b"\0asm calendar");
+        let other = abandon_claim(&host, "calendar", false);
+        for decoy in [
+            ".weather.replacing-v1-not-hex",
+            ".weather.replaced-4242",
+            ".weather.replacing-v2-00000000000000000000000000000000",
+        ] {
+            std::fs::create_dir_all(plugins.path().join(decoy).join(recovery::PACKAGE)).unwrap();
+        }
+
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        assert_eq!(host.displaced_packages().unwrap(), ["calendar"]);
+        assert_eq!(
+            host.recover_interrupted_update("weather").unwrap(),
+            UpdateRecovery::Nothing
+        );
+        assert_eq!(hidden_entries(plugins.path()).len(), 4);
+        assert!(plugins.path().join(&other).join(recovery::PACKAGE).is_dir());
+    }
+
+    /// A skill bundle is replaced as a whole: the new bundle's skills are
+    /// installed and a skill only the old bundle had is gone.
+    #[test]
+    fn update_replaces_a_skill_bundle_as_a_whole() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        let v1 = tempdir().unwrap();
+        write_skill_bundle_plugin(v1.path(), "toolkit", &["alpha"]);
+        host.install(v1.path().join("toolkit").to_str().unwrap())
+            .unwrap();
+
+        let v2 = tempdir().unwrap();
+        write_skill_bundle_plugin(v2.path(), "toolkit", &["beta"]);
+        let manifest = v2.path().join("toolkit/manifest.toml");
+        let text = std::fs::read_to_string(&manifest)
+            .unwrap()
+            .replace("0.1.0", "0.2.0");
+        std::fs::write(&manifest, text).unwrap();
+        let admitted = host
+            .admit_update("toolkit", v2.path().join("toolkit").to_str().unwrap())
+            .unwrap();
+        host.update_admitted(admitted).unwrap();
+
+        assert!(
+            plugins
+                .path()
+                .join("toolkit/skills/beta/SKILL.md")
+                .is_file()
+        );
+        assert!(!plugins.path().join("toolkit/skills/alpha").exists());
+        assert_eq!(host.get_plugin("toolkit").unwrap().version, "0.2.0");
+    }
+
+    /// A skill bundle at 0.2.0 whose one skill `beta` replaces `alpha`, with
+    /// the skill's `SKILL.md` or the whole skill directory a symbolic link.
+    #[cfg(unix)]
+    fn linked_skill_bundle(link_directory: bool) -> tempfile::TempDir {
+        use std::os::unix::fs::symlink;
+
+        let v2 = tempdir().unwrap();
+        write_skill_bundle_plugin(v2.path(), "toolkit", &["beta"]);
+        let source = v2.path().join("toolkit");
+        let manifest = source.join("manifest.toml");
+        let text = std::fs::read_to_string(&manifest)
+            .unwrap()
+            .replace("0.1.0", "0.2.0");
+        std::fs::write(&manifest, text).unwrap();
+        // Relative targets inside the package: admission reads through a
+        // handle on the package and never follows a link out of it.
+        let (link, target, relative) = if link_directory {
+            (
+                source.join("skills/beta"),
+                source.join("skill-target"),
+                "../skill-target",
+            )
+        } else {
+            (
+                source.join("skills/beta/SKILL.md"),
+                source.join("skill-target.md"),
+                "../../skill-target.md",
+            )
+        };
+        std::fs::rename(&link, &target).unwrap();
+        symlink(relative, &link).unwrap();
+        v2
+    }
+
+    /// Admission follows a linked `SKILL.md` inside the package, but staging
+    /// copies no links, so the staged bundle lacks it. The update is refused
+    /// after staging, before the installed bundle is touched, saying why.
+    #[cfg(unix)]
+    #[test]
+    fn update_refuses_a_staged_bundle_that_lost_a_linked_skill_md() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        let v1 = tempdir().unwrap();
+        write_skill_bundle_plugin(v1.path(), "toolkit", &["alpha"]);
+        host.install(v1.path().join("toolkit").to_str().unwrap())
+            .unwrap();
+        let installed = plugins.path().join("toolkit");
+        let skill = std::fs::read(installed.join("skills/alpha/SKILL.md")).unwrap();
+
+        let v2 = linked_skill_bundle(false);
+        let admitted = host
+            .admit_update("toolkit", v2.path().join("toolkit").to_str().unwrap())
+            .expect("admission follows a link inside the package");
+        let err = host
+            .update_admitted(admitted)
+            .expect_err("the staged bundle lacks the linked SKILL.md");
+
+        let message = err.to_string();
+        assert!(matches!(err, PluginError::InvalidManifest(_)), "{message}");
+        assert!(
+            message.contains("staged copy of 'toolkit' is incomplete")
+                && message.contains("subdirectory 'beta' is missing SKILL.md")
+                && message.contains("symbolic links"),
+            "{message}"
+        );
+        assert_eq!(
+            std::fs::read(installed.join("skills/alpha/SKILL.md")).unwrap(),
+            skill
+        );
+        assert!(!installed.join("skills/beta").exists());
+        assert_eq!(host.get_plugin("toolkit").unwrap().version, "0.1.0");
+        assert!(hidden_entries(plugins.path()).is_empty());
+        let fresh = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        assert_eq!(fresh.get_plugin("toolkit").unwrap().version, "0.1.0");
+    }
+
+    /// Install refuses the same incomplete staged bundle an update refuses,
+    /// instead of publishing a package discovery would then skip.
+    #[cfg(unix)]
+    #[test]
+    fn install_refuses_a_staged_bundle_that_lost_a_linked_skill_md() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+
+        let v2 = linked_skill_bundle(false);
+        let err = host
+            .install(v2.path().join("toolkit").to_str().unwrap())
+            .expect_err("the staged bundle lacks the linked SKILL.md");
+
+        assert!(
+            err.to_string()
+                .contains("staged copy of 'toolkit' is incomplete"),
+            "{err}"
+        );
+        assert!(!plugins.path().join("toolkit").exists());
+        assert!(host.get_plugin("toolkit").is_none());
+        assert!(hidden_entries(plugins.path()).is_empty());
+    }
+
+    /// A skill directory that is itself a link is not a skill to admission, so
+    /// a bundle whose only skill is one is refused before anything is staged.
+    #[cfg(unix)]
+    #[test]
+    fn admit_update_refuses_a_bundle_whose_only_skill_is_a_linked_directory() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        let v1 = tempdir().unwrap();
+        write_skill_bundle_plugin(v1.path(), "toolkit", &["alpha"]);
+        host.install(v1.path().join("toolkit").to_str().unwrap())
+            .unwrap();
+
+        let v2 = linked_skill_bundle(true);
+        let err = host
+            .admit_update("toolkit", v2.path().join("toolkit").to_str().unwrap())
+            .expect_err("a linked skill directory is not a skill");
+        assert!(
+            err.to_string().contains("empty `skills/` directory"),
+            "{err}"
+        );
+        assert_eq!(host.get_plugin("toolkit").unwrap().version, "0.1.0");
+        assert!(hidden_entries(plugins.path()).is_empty());
+    }
+
+    /// A package discovered in a directory named differently from its manifest
+    /// is replaced in that directory, so discovery never sees two packages of
+    /// one name afterwards.
+    #[test]
+    fn update_keeps_the_directory_the_package_was_discovered_in() {
+        let plugins = tempdir().unwrap();
+        let discovered_in = plugins.path().join("legacy-dir");
+        std::fs::create_dir(&discovered_in).unwrap();
+        write_tool_version(&discovered_in, "weather", "1.0.0", b"\0asm v1");
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+
+        update_tool(&mut host, "weather", "2.0.0", b"\0asm v2").unwrap();
+
+        assert_eq!(
+            std::fs::read(discovered_in.join("plugin.wasm")).unwrap(),
+            b"\0asm v2"
+        );
+        assert!(!plugins.path().join("weather").exists());
+        let rediscovered = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        assert_eq!(rediscovered.get_plugin("weather").unwrap().version, "2.0.0");
+    }
+
+    /// A replacement that cannot be staged never touches the installed
+    /// package, and its partial stage is deleted.
+    #[test]
+    fn a_failed_staging_write_leaves_the_installed_package_untouched() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "1.0.0", b"\0asm v1");
+        let v1 = package_bytes(&plugins.path().join("weather"));
+
+        let armed = write_fault::arm(write_fault::Step::Payload);
+        let err = update_tool(&mut host, "weather", "2.0.0", b"\0asm v2")
+            .expect_err("the staged payload write fails");
+        drop(armed);
+
+        assert!(err.to_string().contains("injected"), "{err}");
+        assert_eq!(package_bytes(&plugins.path().join("weather")), v1);
+        assert_eq!(host.get_plugin("weather").unwrap().version, "1.0.0");
+        assert!(hidden_entries(plugins.path()).is_empty());
+    }
+
+    /// Whether this process can be kept from deleting a file by permissions:
+    /// not when it runs as root.
+    #[cfg(unix)]
+    fn permissions_can_block_a_delete() -> bool {
+        use std::os::unix::fs::PermissionsExt;
+
+        let probe = tempdir().unwrap();
+        std::fs::write(probe.path().join("file"), b"x").unwrap();
+        std::fs::set_permissions(probe.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let deletable = std::fs::remove_file(probe.path().join("file")).is_ok();
+        std::fs::set_permissions(probe.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        !deletable
+    }
+
+    /// Put a file `dir` cannot lose inside `dir/locked`, so deleting `dir`
+    /// fails. [`unlock`] undoes it so the temp dir can be cleaned up.
+    #[cfg(unix)]
+    fn lock_a_file_inside(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let locked = dir.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("file"), b"x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn unlock(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+
+    /// A replaced generation that cannot be deleted stays in its transaction,
+    /// marked superseded, and is reported there. After the package is
+    /// removed, recovery still never puts it back.
+    #[cfg(unix)]
+    #[test]
+    fn a_replaced_generation_that_cannot_be_deleted_is_kept_superseded() {
+        if !permissions_can_block_a_delete() {
+            return;
+        }
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "1.0.0", b"\0asm v1");
+
+        replace_hook::set(|plugins, _, claim| {
+            lock_a_file_inside(&plugins.join(claim).join(recovery::PACKAGE));
+        });
+        let replaced = update_tool(&mut host, "weather", "2.0.0", b"\0asm v2").unwrap();
+        let (left, _) = replaced.leftover.expect("the replaced generation stays");
+        assert!(left.ends_with(recovery::SUPERSEDED), "{}", left.display());
+        assert_eq!(host.get_plugin("weather").unwrap().version, "2.0.0");
+
+        host.remove("weather").unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        assert!(host.displaced_packages().unwrap().is_empty());
+        let recovered = host.recover_interrupted_update("weather").unwrap();
+        assert!(
+            matches!(&recovered, UpdateRecovery::Swept { removed: 0, kept } if kept.len() == 1),
+            "{recovered:?}"
+        );
+        assert!(!plugins.path().join("weather").exists());
+        unlock(&left);
+    }
+
+    /// A claimed generation recovery cannot delete is marked superseded first,
+    /// so it is reported, and left, where it can never be put back.
+    #[cfg(unix)]
+    #[test]
+    fn recovery_reports_a_claimed_generation_it_cannot_delete() {
+        if !permissions_can_block_a_delete() {
+            return;
+        }
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "1.0.0", b"\0asm v1");
+        let claim = abandon_claim(&host, "weather", false);
+        lock_a_file_inside(&plugins.path().join(&claim).join(recovery::PACKAGE));
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "2.0.0", b"\0asm v2");
+
+        let recovered = host.recover_interrupted_update("weather").unwrap();
+        let superseded = plugins.path().join(&claim).join(recovery::SUPERSEDED);
+        assert!(
+            matches!(&recovered, UpdateRecovery::Swept { removed: 0, kept } if kept.len() == 1 && kept[0].0 == superseded),
+            "{recovered:?}"
+        );
+        assert_eq!(host.get_plugin("weather").unwrap().version, "2.0.0");
+        unlock(&superseded);
     }
 }
