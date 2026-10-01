@@ -294,3 +294,94 @@ jobs:
           path: target/${{ matrix.target }}/release/${{ runner.os == 'Windows' && 'zerorelay.exe' || 'zerorelay' }}
           if-no-files-found: error
           retention-days: 1
+
+  # Rehearsal of the release's plugin smoke: the same packages and the same
+  # script run against the binary each build leg uploaded, on a runner that
+  # executes that target natively, so a distribution change is measured and
+  # proven from one dispatch.
+  plugin-smoke-packages:
+    name: Build Plugin Smoke Packages
+    if: ${{ !inputs.release_tools_only }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.98.0
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: plugin-smoke-packages
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Build plugin smoke packages
+        run: bash scripts/ci/build_plugin_smoke_packages.sh "$RUNNER_TEMP/plugin-smoke-packages"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: plugin-smoke-packages
+          path: ${{ runner.temp }}/plugin-smoke-packages
+          if-no-files-found: error
+          retention-days: 7
+
+  # The build matrix has legs without a smoke leg (ARM32, Android), so the
+  # rehearsal does not depend on every build leg succeeding: a leg whose
+  # binary is missing fails on its own download instead.
+  plugin-smoke:
+    name: Plugin Smoke ${{ inputs.distribution }} / ${{ matrix.target }}
+    needs: [build, plugin-smoke-packages]
+    if: ${{ !cancelled() && !inputs.release_tools_only && needs.plugin-smoke-packages.result == 'success' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # The same legs as the stable release; an xtask test keeps both lists
+        # equal to the registry's per-target plugin policy.
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: zeroclaw-manual-${{ inputs.distribution }}-${{ matrix.target }}
+          path: binary
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: plugin-smoke-packages
+          path: plugin-smoke-packages
+      - name: Run the plugin smoke against the built binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="binary/${{ runner.os == 'Windows' && 'zeroclaw.exe' || 'zeroclaw' }}"
+          chmod +x "$binary"
+          bash scripts/ci/plugin_artifact_smoke.sh \
+            --binary "$binary" \
+            --expect host \
+            --packages plugin-smoke-packages \
+            --label "${{ inputs.distribution }} / ${{ matrix.target }}" \
+            --evidence "plugin-smoke-${{ matrix.target }}.md"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: plugin-smoke-${{ inputs.distribution }}-${{ matrix.target }}
+          path: plugin-smoke-${{ matrix.target }}.md
+          if-no-files-found: ignore
+          retention-days: 7

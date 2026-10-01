@@ -419,8 +419,11 @@ pending you will see a **"Waiting for review"** banner in the workflow run.
 
 Approve all three when they appear. The `github-releases` gate appears only
 after the tokenless crates.io preflight, `Preflight crates.io Workspace`, has
-packaged and compiled every crate. It runs beside the binary builds, so a
-release whose crates cannot publish stops before anything becomes public. The
+packaged and compiled every crate, and after every `Plugin Smoke <target>` leg
+has installed and executed a plugin from the archive built for that target.
+The preflight runs beside the binary builds and the smoke legs right after
+them, so a release whose crates cannot publish, or whose archives cannot run a
+plugin, stops before the GitHub Release becomes public. The
 later `crates-io` job uploads what that preflight verified without repeating it:
 
 | Environment | Job | What it does |
@@ -446,6 +449,7 @@ Once `publish` completes, confirm:
 [ ] Exactly one zeroclaw-vX.Y.Z-verification.tar.gz asset is present
 [ ] No loose *.bundle, *.attestation.jsonl, or *.intoto.jsonl assets are present
 [ ] At least one binary archive is downloadable (spot-check linux x86_64)
+[ ] Every Plugin Smoke leg is green; each step summary carries its check table
 [ ] Prebuilt Docker and generated Docker matrix jobs are green
 ```
 
@@ -594,6 +598,26 @@ release the tag does not exist yet either. Fix the packaging problem on
 `master`, then dispatch Release Stable again for the same version. Run
 `scripts/release/publish-crates.sh` locally first to confirm the fix; without
 `--execute` it only packages and verifies.
+
+**A Plugin Smoke leg failed:** On a dispatched release nothing was published:
+the GitHub Release and the release workflow's own image pushes wait for every
+leg. A release started by a tag push also triggers Docker Publish on its own,
+and that run does not wait for the smoke, so check it as well. Open the leg's
+step summary: the
+report names the check that failed and quotes the command output, and the
+`plugin-smoke-<target>` artifact holds the same report. A failure at `plugin
+install` or at the tool result means the archive built for that target cannot
+run a plugin; fix it on `master` and dispatch Release Stable again. Rehearse
+the fix first with the Cross-Platform Build workflow, which runs the same legs
+against the binaries it builds. A failure that names the provider or the
+scratch directory is a runner problem: re-run only the failed leg. Re-run a
+timeout once as well; a repeat timeout is a defect, since a binary that hangs
+on plugin load times out the same way.
+
+**A build leg failed the binary size check:** The cap is 80 MiB, set as
+`BINARY_SIZE_HARD_LIMIT` on the `Check binary size` step of the build job.
+Measure the binary sizes with the Cross-Platform Build workflow before
+raising it, and record the per-target sizes in the pull request that does.
 
 **An environment gate timed out:** Re-run only the timed-out job. No need to
 restart the workflow.

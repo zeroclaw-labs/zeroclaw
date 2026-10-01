@@ -1,10 +1,16 @@
 <!-- Canonical plugin install/verify steps. Edit here; reuse via {{#include}}. -->
 > **These commands need a binary with the plugin host compiled in.** The
-> prebuilt release binaries the installer ships are built without the
-> `plugins-wasm` feature, so `zeroclaw plugin ...` is an unrecognized
-> subcommand there and installed plugins are never discovered. Build from
-> source with a plugin execution backend, e.g.
-> `cargo build --release --features plugins-wasm-cranelift`.
+> release archives for the 64-bit desktop and server targets (x86_64 and
+> aarch64 Linux with glibc or musl, macOS on Apple silicon and Intel, Windows
+> x86_64) carry it, and every release executes a plugin from each of those
+> archives before it publishes. The two 32-bit ARM archives and the
+> experimental Android archive do not carry it, and neither does a source
+> build with Cargo defaults (`cargo install zeroclaw`, `install.sh --source`,
+> or `cargo build` without features): there `zeroclaw plugin ...` is an
+> unrecognized subcommand and installed plugins are never discovered. For
+> those, build from source with a plugin execution backend, e.g.
+> `cargo build --release --features plugins-wasm-cranelift`. The protocol page
+> lists plugin support for every artifact.
 
 Each plugin lives in its own subdirectory of the plugins directory (default
 `~/.zeroclaw/plugins/`, resolved through `plugins.plugins_dir`), holding the

@@ -209,6 +209,22 @@ bundles and trusted-root material ship inside one verification archive, and
 both SBOM formats are checksummed and attested before the release is created.
 Cosign remains limited to GHCR image signing.
 
+Every 64-bit archive except the experimental Android one carries the WASM
+plugin host, and a dispatched release proves it before the GitHub Release and
+its own image pushes: `plugin-smoke-packages` builds the fixture plugin
+packages once on Linux, and `plugin-smoke` downloads each archive on a runner
+of its own platform and runs `scripts/ci/plugin_artifact_smoke.sh` against the
+packaged binary (the same script the `check-plugin-backends` smoke leg runs on
+pull requests). `publish` and `docker` wait for every leg. An xtask test keeps
+the leg list equal to the registry's per-target plugin policy, so a target
+cannot carry the host without a leg or lose its leg while it still carries the
+host. The build legs fail any binary over the 80 MiB cap set on the size
+check step. The manual Cross-Platform Build workflow rehearses the same legs
+against the binaries it builds, so a distribution change is measured and proven
+from one dispatch before a release runs. A release started by a tag push also
+triggers Docker Publish on its own `v*` tag trigger, and that run does not wait
+for the smoke.
+
 See the [Release Runbook](./release-runbook.md) for the full procedure.
 
 Release-only build tools do not compile from source on every run. The workflow

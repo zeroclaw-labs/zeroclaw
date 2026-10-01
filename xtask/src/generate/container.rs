@@ -97,7 +97,10 @@ mod tests {
             assert!(b.contains(&feature), "dist feature {feature} not rendered");
         }
         for feature in crate::generate::spec::features_outside_dist(&root()).unwrap() {
-            assert!(!b.contains(&feature), "{feature} leaked into lean dist");
+            assert!(
+                !crate::generate::spec::mentions_feature(&b, &feature),
+                "{feature} leaked into lean dist"
+            );
         }
     }
 

@@ -408,8 +408,17 @@ let
         ProtectHostname = true;
         ProtectProc = "invisible";
         ProcSubset = "pid";
-        # MemoryDenyWriteExecute=yes blocks W+X mappings; safe for a
-        # Rust binary with no JIT. ZeroClaw 0.7.x has no JIT path.
+        # MemoryDenyWriteExecute=yes forbids memory that becomes executable
+        # after it is written. The package built from the distribution
+        # feature list carries the WASM plugin host, whose compiler writes
+        # code into memory and then marks it executable, so under this unit
+        # every plugin load fails with a memory-protection error while the
+        # rest of the daemon, which needs no such transition, runs normally.
+        # That is the intended default:
+        # plugins are off unless the operator enables them. An instance that
+        # runs plugins must override this setting on its own unit:
+        #   systemd.services."zeroclaw-<name>".serviceConfig.MemoryDenyWriteExecute =
+        #     lib.mkForce false;
         MemoryDenyWriteExecute = true;
         # PrivateUsers=yes runs the unit in its own user namespace. The
         # StateDirectory= bind-mount happens in the host namespace

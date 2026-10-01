@@ -386,6 +386,179 @@ fn package_publishers_use_canonical_sources_and_scoped_credentials() {
     );
 }
 
+/// The `target:` entries of one job's matrix, in order, whether an entry
+/// starts with the target or lists it after another field.
+fn matrix_targets(job: &str) -> Vec<String> {
+    job.lines()
+        .map(|line| line.trim())
+        .map(|line| line.strip_prefix("- ").unwrap_or(line))
+        .filter_map(|line| line.strip_prefix("target: "))
+        .map(|target| target.trim().to_owned())
+        .collect()
+}
+
+/// The release proves plugin support from the archives it publishes: one
+/// Linux job builds the smoke packages, every archive that carries the plugin
+/// host is executed on a runner of its own platform, and neither the GitHub
+/// Release nor the container images wait on anything less. The leg set itself
+/// is pinned to the registry's per-target policy by an xtask test; this gate
+/// pins the wiring around it.
+#[test]
+fn plugin_execution_smoke_gates_the_release() {
+    let release = workflow("release-stable-manual.yml");
+
+    // Neither job publishes anything, so each holds exactly a read-only token
+    // and its checkout leaves none behind in the tree.
+    let packages = yaml_block(&release, "  plugin-smoke-packages:\n");
+    let smoke = yaml_block(&release, "  plugin-smoke:\n");
+    for job in [packages, smoke] {
+        assert_eq!(
+            yaml_block(job, "    permissions:\n").trim_end(),
+            "      contents: read",
+            "a plugin smoke job must hold exactly a read-only contents token"
+        );
+        assert!(
+            job.contains("persist-credentials: false"),
+            "a plugin smoke job must not persist the checkout token"
+        );
+    }
+    for required in [
+        "needs: [validate]\n",
+        "targets: wasm32-wasip2",
+        "run: bash scripts/ci/build_plugin_smoke_packages.sh \"$RUNNER_TEMP/plugin-smoke-packages\"",
+        "name: plugin-smoke-packages",
+        "retention-days: 14",
+    ] {
+        assert!(
+            packages.contains(required),
+            "the smoke package build is missing invariant: {required}"
+        );
+    }
+
+    // The whole invocation is pinned so nothing can be appended to it that
+    // would swallow its exit status.
+    let release_invocation = "bash scripts/ci/plugin_artifact_smoke.sh \\\n            \
+--binary \"$binary\" \\\n            \
+--expect host \\\n            \
+--packages plugin-smoke-packages \\\n            \
+--label \"${{ matrix.target }}\" \\\n            \
+--archive \"$archive\" \\\n            \
+--evidence \"plugin-smoke-${{ matrix.target }}.md\"\n";
+    for required in [
+        "needs: [build, plugin-smoke-packages]",
+        "fail-fast: false",
+        "name: zeroclaw-${{ matrix.target }}",
+        "name: plugin-smoke-packages",
+        release_invocation,
+    ] {
+        assert!(
+            smoke.contains(required),
+            "the plugin smoke job is missing invariant: {required}"
+        );
+    }
+    assert!(
+        !smoke.contains("continue-on-error"),
+        "every plugin smoke leg must block the release"
+    );
+    assert!(
+        !smoke.contains("rust-toolchain"),
+        "the smoke legs run the packaged binary and need no toolchain"
+    );
+    // The smoke step itself carries no condition. The only step-level `if` in
+    // either smoke job is the evidence upload's, which runs after a failed
+    // check too. A step key can be written indented under the step or as the
+    // step's first key behind `- `, so both forms count.
+    let step_conditions = |job: &str| -> Vec<String> {
+        job.lines()
+            .filter_map(|line| {
+                let indent = line.len() - line.trim_start().len();
+                let trimmed = line.trim_start();
+                let key = match (indent, trimmed.strip_prefix("- ")) {
+                    (6, Some(first_key)) => first_key,
+                    (8, None) => trimmed,
+                    _ => return None,
+                };
+                key.starts_with("if:").then(|| key.to_owned())
+            })
+            .collect()
+    };
+    assert_eq!(
+        step_conditions(smoke),
+        ["if: ${{ !cancelled() }}"],
+        "the release smoke step must run unconditionally"
+    );
+
+    // Each leg executes an archive the build matrix produces, and the manual
+    // cross-platform workflow rehearses exactly the same legs from the binary
+    // it built, so a distribution change is proven before a release runs.
+    let build = yaml_block(&release, "  build:\n");
+    let smoke_targets = matrix_targets(smoke);
+    assert!(!smoke_targets.is_empty(), "the plugin smoke has no legs");
+    for target in &smoke_targets {
+        assert!(
+            build.contains(&format!("target: {target}\n")),
+            "plugin smoke leg {target} has no build leg"
+        );
+    }
+    let manual = workflow("cross-platform-build-manual.yml");
+    let rehearsal = yaml_block(&manual, "  plugin-smoke:\n");
+    assert_eq!(
+        matrix_targets(rehearsal),
+        smoke_targets,
+        "the manual workflow must rehearse exactly the release smoke legs"
+    );
+    // Build legs without a smoke leg (ARM32, Android) must not take the
+    // rehearsal down with them: it requires the packages to succeed, not every
+    // build leg, and skips only for a cancelled run, a release-tools-only run,
+    // or failed packages. The invocation is pinned whole, as in the release.
+    let rehearsal_invocation = "bash scripts/ci/plugin_artifact_smoke.sh \\\n            \
+--binary \"$binary\" \\\n            \
+--expect host \\\n            \
+--packages plugin-smoke-packages \\\n            \
+--label \"${{ inputs.distribution }} / ${{ matrix.target }}\" \\\n            \
+--evidence \"plugin-smoke-${{ matrix.target }}.md\"\n";
+    for required in [
+        "needs: [build, plugin-smoke-packages]",
+        "if: ${{ !cancelled() && !inputs.release_tools_only && needs.plugin-smoke-packages.result == 'success' }}",
+        "name: zeroclaw-manual-${{ inputs.distribution }}-${{ matrix.target }}",
+        rehearsal_invocation,
+    ] {
+        assert!(
+            rehearsal.contains(required),
+            "the manual plugin smoke is missing invariant: {required}"
+        );
+    }
+    assert_eq!(
+        step_conditions(rehearsal),
+        ["if: ${{ !cancelled() }}"],
+        "the rehearsal smoke step must run unconditionally"
+    );
+    assert!(
+        yaml_block(&manual, "  plugin-smoke-packages:\n")
+            .contains("run: bash scripts/ci/build_plugin_smoke_packages.sh"),
+        "the manual workflow must build the smoke packages the same way"
+    );
+
+    let github_release = yaml_block(&release, "  publish:\n");
+    let needs = github_release
+        .lines()
+        .find(|line| line.trim_start().starts_with("needs: ["))
+        .expect("the GitHub Release must declare needs");
+    assert!(
+        needs.contains(" plugin-smoke,") || needs.contains(" plugin-smoke]"),
+        "the GitHub Release must wait for the plugin smoke"
+    );
+    let docker = yaml_block(&release, "  docker:\n");
+    assert!(
+        docker.contains("needs: [validate, build, plugin-smoke]"),
+        "the container images repackage smoke-gated archives and must wait for the smoke"
+    );
+    assert!(
+        !docker.lines().any(|line| line.starts_with("    if:")),
+        "the container images must keep the implicit success() gate over the smoke"
+    );
+}
+
 #[test]
 fn crates_io_publisher_is_preflighted_gated_and_resumable() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -440,9 +613,9 @@ fn crates_io_publisher_is_preflighted_gated_and_resumable() {
     let github_release = yaml_block(&release, "  publish:\n");
     assert!(
         github_release.contains(
-            "needs: [validate, release-notes, build, build-desktop, build-desktop-linux, build-desktop-windows, sbom, crates-preflight]"
+            "needs: [validate, release-notes, build, build-desktop, build-desktop-linux, build-desktop-windows, sbom, crates-preflight, plugin-smoke]"
         ),
-        "the GitHub Release must wait for the crates.io preflight"
+        "the GitHub Release must wait for the crates.io preflight and the plugin smoke"
     );
     assert!(
         !github_release

@@ -132,7 +132,12 @@ The install path is the local plugin directory; a registry is only a JSON
 index consulted at command time (`zeroclaw plugin search` / `install`).
 Both commands exist only in binaries with the plugin host compiled in (see
 [build features](../developing/plugin-protocol.md#build-features)); the
-prebuilt release binaries ship without it. Fetching an index through either
+release archives for the 64-bit desktop and server targets carry it, and
+every release executes a plugin from each of them before it publishes; the
+32-bit ARM archives, the experimental Android archive, and default source
+builds do not carry it (the
+[per-artifact table](../developing/plugin-protocol.md#plugin-support-per-release-artifact)
+lists every artifact). Fetching an index through either
 command caches it locally. `zeroclaw plugin list` then combines installed
 packages with the cache without making a network request; it keeps installed
 and registry versions separate rather than guessing whether an arbitrary

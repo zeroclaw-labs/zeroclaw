@@ -223,11 +223,21 @@ non_row_features = [
 # Features intentionally added to the lean Cargo defaults for standard
 # distribution artifacts. This list is the complete positive policy beyond
 # `default`; target-specific exclusions are resolved from the table below.
+#
+# `plugins-wasm-cranelift` ships the WASM plugin host together with the
+# compiler that loads `.wasm` components, the only form the plugin registry
+# publishes. Runtime defaults stay closed: the agent loads no installed
+# plugin until the operator enables the plugin system (and turns discovery
+# on for tools and skills); the CLI's install check, `plugin info` and
+# `plugin list --verify` still instantiate a package in a sandboxed store.
+# The release workflow executes a plugin from every archive that carries the
+# host before it publishes anything of its own.
 dist_extra_features = [
     "channel-matrix",
     "channel-lark",
     "channel-git",
     "whatsapp-web",
+    "plugins-wasm-cranelift",
 ]
 
 # Features whose build needs system C libraries or tooling the minimal static
@@ -241,10 +251,17 @@ container_excluded_features = [
 
 # Compatibility exclusions for standard distribution artifacts. Release
 # workflows pass only their target triple; feature policy stays here.
+#
+# Cranelift has no native 32-bit ARM backend. wasmtime would select its Pulley
+# interpreter as the compilation target there, and no native ARM32 runner can
+# execute an ARM32 archive to prove that, so the two ARM32 archives carry no
+# plugin host at all rather than one nobody has run. The experimental Android
+# archive stays out until it is a required release asset with a smoke leg of
+# its own.
 [package.metadata.zeroclaw.dist_target_exclusions]
-aarch64-linux-android = ["whatsapp-web"]
-arm-unknown-linux-gnueabihf = ["observability-prometheus"]
-armv7-unknown-linux-gnueabihf = ["observability-prometheus"]
+aarch64-linux-android = ["whatsapp-web", "plugins-wasm-cranelift"]
+arm-unknown-linux-gnueabihf = ["observability-prometheus", "plugins-wasm-cranelift"]
+armv7-unknown-linux-gnueabihf = ["observability-prometheus", "plugins-wasm-cranelift"]
 
 [features]
 default = [
@@ -385,17 +402,27 @@ metrics = ["observability-prometheus"]
 # always carries the plugin host and its CLI surface; a backend-only build
 # cannot silently produce a binary without the `plugin` subcommand.
 #
+# Only `plugins-wasm-cranelift` includes a compiler. A build without it loads
+# precompiled `.cwasm` components only, pinned to this exact wasmtime version,
+# and refuses the `.wasm` components the plugin registry publishes.
+#
 # - `plugins-wasm-runtime-only`: Fastest startup for plugins and smallest binary size,
 #   but requires plugin authors to compile a specific version for each target
-#   architecture (`.cwasm` files instead of `.wasm`) unless one of the two JIT
-#   compilation feature flags is also used.
-# - `plugins-wasm-cranelift`: Add the Cranelift JIT compilation engine on top of
-#   the runtime which enables compiling WASM plugins on the host machine, but
-#   results in larger binary size due to the Cranelift dependency. NOTE: Not
-#   supported on all platforms (e.g., ARM32).
-# - `plugins-wasm-pulley`: Most flexible, supports JIT compilation on targets
-#   where Cranelift isn't available (e.g., ARM32), but has the slowest runtime
-#   performance.
+#   architecture (`.cwasm` files instead of `.wasm`) unless `plugins-wasm-cranelift`
+#   is also enabled.
+# - `plugins-wasm-cranelift`: Add the Cranelift compiler on top of the runtime,
+#   which compiles `.wasm` plugins on the host machine at the cost of a larger
+#   binary. Standard distribution artifacts carry it on the 64-bit desktop and
+#   server targets (see `dist_extra_features` and `dist_target_exclusions`
+#   above). Cranelift has no native 32-bit ARM backend; on such hosts wasmtime
+#   selects its Pulley interpreter as the compilation target by itself.
+# - `plugins-wasm-pulley`: Compiles in wasmtime's Pulley interpreter. ZeroClaw
+#   never selects Pulley as a compilation target, so on hosts with a native
+#   Cranelift backend (every 64-bit release target) the feature changes
+#   nothing: alone it behaves like `plugins-wasm-runtime-only` and loads
+#   host-native `.cwasm` files, and with `plugins-wasm-cranelift` it compiles
+#   native code. On hosts without a native backend, wasmtime targets Pulley
+#   whether or not this feature is set. Pulley runs slower than native code.
 plugins-wasm-runtime-only = ["plugins-wasm", "zeroclaw-plugins/plugins-wasmtime"]
 plugins-wasm-cranelift    = ["plugins-wasm", "zeroclaw-plugins/plugins-wasm-cranelift", "zeroclaw-runtime/plugins-wasm-cranelift"]
 plugins-wasm-pulley       = ["plugins-wasm", "zeroclaw-plugins/plugins-wasm-pulley"]

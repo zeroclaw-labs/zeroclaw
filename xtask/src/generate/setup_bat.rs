@@ -276,7 +276,10 @@ mod tests {
             );
         }
         for feature in spec::features_outside_dist(&root()).unwrap() {
-            assert!(!dist.contains(&feature), "{feature} leaked into lean dist");
+            assert!(
+                !spec::mentions_feature(dist, &feature),
+                "{feature} leaked into lean dist"
+            );
         }
     }
 

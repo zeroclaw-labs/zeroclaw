@@ -986,13 +986,68 @@ execution backend ships:
   only precompiled `.cwasm` components load.
 - `plugins-wasm-runtime-only` is the smallest and fastest to start: no JIT, so
   components are deserialized from a precompiled `.cwasm`.
-- `plugins-wasm-cranelift` adds the Cranelift JIT, so a `.wasm` component is
-  compiled on load.
-- `plugins-wasm-pulley` is the most portable, supporting compilation on targets
-  Cranelift does not cover.
+- `plugins-wasm-cranelift` adds the Cranelift compiler, so a `.wasm` component
+  is compiled on load. It is the only feature that includes a compiler, and
+  the only one that can load the `.wasm` components the plugin registry
+  publishes.
+- `plugins-wasm-pulley` compiles in wasmtime's Pulley interpreter. ZeroClaw
+  never selects Pulley as a compilation target, so on hosts with a native
+  Cranelift backend the feature changes nothing: alone it behaves like
+  `plugins-wasm-runtime-only`, and with `plugins-wasm-cranelift` it compiles
+  native code. On hosts without a native backend, such as 32-bit ARM,
+  wasmtime targets Pulley by itself.
 
 These delegate to the `zeroclaw-plugins` crate features
 (`plugins-wasmtime`, `plugins-wasm-cranelift`, `plugins-wasm-pulley`) that wire
 up `wasmtime`. The load path keys off whether the Cranelift compiler is in the
 build, as described under WASI Component Host. Read the feature comments in the
 workspace `Cargo.toml` for the authoritative descriptions.
+
+### Plugin support per release artifact
+
+The standard distribution feature set (`cargo generate features --selection
+dist`, resolved per target from the registry in the workspace `Cargo.toml`)
+carries `plugins-wasm-cranelift` on the seven 64-bit desktop and server targets
+and excludes it on 32-bit ARM and the experimental Android target. Which
+artifact carries the host, and what proves it:
+
+| Artifact | Plugin host | Accepted package | Proof |
+|---|---|---|---|
+| CLI archives for x86_64 and aarch64 Linux (glibc and musl), aarch64 and x86_64 macOS, x86_64 Windows | Cranelift compiler, `.wasm` compiled on load | `.wasm` component built against the release's `wit/v0` | the release executes a plugin from each archive on its own platform (the `plugin-smoke` job) before `publish` and `docker` run |
+| CLI archives for armv7 and arm (ARMv6) Linux | none: `plugin` is not a command | none | the registry's per-target policy, pinned by an xtask test |
+| CLI archive for aarch64-linux-android (experimental) | none | none | the same policy |
+| GHCR `latest`, versioned, and `debian` images | Cranelift: they repackage the x86_64 and aarch64 Linux glibc archives | `.wasm` | inherits the archive smoke; nothing runs inside the image |
+| GHCR `dist` variant, AUR package, Nix flake package, `setup.bat` source build | Cranelift: source builds from the generated distribution list | `.wasm` | none |
+| GHCR `all-features` image | Cranelift, Pulley, and runtime-only all compiled in | `.wasm` | none |
+| GHCR `minimal` and `default-features` images | none | none | |
+| Desktop bundles (dmg, deb, AppImage, msi, setup exe) | none: the sidecar builds with Cargo `default` (plus `embedded-web` on macOS) | none | |
+| `cargo install zeroclaw` and the `install.sh` source build | none by default; opt in with `--features plugins-wasm-cranelift` | `.wasm` with the opt-in | |
+| Homebrew core | formula-owned, outside this repository | | |
+
+Limits that hold for every artifact with the host:
+
+- `wit/v0` is unstable. A plugin must be built against the WIT shipped with
+  the release that runs it (`wit/VERSIONING.md`); the manifest carries no host
+  or WIT version, so a mismatch surfaces at the install-time load check.
+- Compiling a component needs memory that becomes executable after it is
+  written. Environments that forbid that, such as systemd units with
+  `MemoryDenyWriteExecute=yes` or SELinux `execmem` denials, refuse every
+  plugin load while the rest of the binary runs normally.
+- Official registry packages are unsigned today, so under
+  `signature_mode = "strict"` none of them install.
+- Every tool call compiles the component again; there is no compilation cache.
+- The runtime defaults stay closed. An installed tool or skill package
+  contributes nothing until the operator sets `plugins.enabled` and
+  `plugins.auto_discover`. Once both are set, every build of the tool
+  registry compiles and instantiates each admitted tool component and
+  queries its name, description, and parameter schema under the package's
+  declared permissions and egress policy; approval gates `execute` only. A
+  channel package runs once `plugins.enabled` is set, the operator declares
+  it under `[channels.plugin.<alias>]`, and an enabled agent lists
+  `plugin.<alias>` among its channels; for a package that mirrors a native
+  channel through `provides`, activation under `[channels.<provides>.<alias>]`
+  is recorded but not constructed yet. Each plugin tool call still needs
+  operator approval unless the agent's risk profile pre-approves it
+  (`auto_approve`, including the `*` wildcard, or `level = "full"`) or the
+  operator answered Always for that tool earlier in the same CLI session or
+  channel turn; tools in `always_ask` prompt every time.
