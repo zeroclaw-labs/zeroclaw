@@ -5470,7 +5470,7 @@ fn plugin_update_outcome_text(name: &str, outcome: &PluginUpdateOutcome) -> Vec<
                     ("command", command),
                 ],
                 format!(
-                    "Could not update '{name}': {error}. Its previous version was not moved back and is preserved at {preserved}. Run `{command}` to put it back and try the update again."
+                    "Could not update '{name}': {error}. Its previous version was not moved back and is preserved at {preserved}. Run `{command}` to put it back and try the update again, unless a package named '{name}' is installed by then."
                 ),
             )]
         }
@@ -10917,7 +10917,9 @@ Add pricing to the active provider profile or supply a catalog entry."
                         )
                     );
                 }
-                for name in host.displaced_packages()? {
+                // The note is advisory. A plugins directory this process cannot
+                // lock, such as a read-only one, has nothing it could recover.
+                for name in host.displaced_packages().unwrap_or_default() {
                     eprintln!("{}", plugin_displaced_note(&config, &name, None));
                 }
                 Ok(())
@@ -21284,6 +21286,18 @@ hosts = ["api.example.com", "api2.example.com"]
         );
     }
 
+    /// The transaction an update that stopped between claiming the installed
+    /// `name` and publishing its replacement leaves in `plugins`: a hidden
+    /// `replacing` directory whose lease no process holds. Returns where its
+    /// claimed package goes.
+    #[cfg(feature = "plugins-wasm")]
+    fn abandoned_claim(plugins: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let claim = plugins.join(format!(".{name}.replacing-v1-{}", "0".repeat(32)));
+        std::fs::create_dir(&claim).expect("claim directory");
+        std::fs::write(claim.join("lease"), b"").expect("lease");
+        claim.join("package")
+    }
+
     /// A package an interrupted update left displaced is put back before the
     /// update is decided, so the operator's retry recovers it and the update
     /// then proceeds against the restored version.
@@ -21292,11 +21306,9 @@ hosts = ["api.example.com", "api2.example.com"]
     async fn update_puts_back_a_package_an_interrupted_update_displaced() {
         let plugins = tempfile::tempdir().expect("plugins dir");
         drop(host_with_installed_tool(plugins.path(), "weather"));
-        std::fs::rename(
-            plugins.path().join("weather"),
-            plugins.path().join(".weather.replaced-4242"),
-        )
-        .expect("displace the package the way a stopped update leaves it");
+        let claimed = abandoned_claim(plugins.path(), "weather");
+        std::fs::rename(plugins.path().join("weather"), &claimed)
+            .expect("claim the package the way a stopped update leaves it");
         let mut host =
             zeroclaw::plugins::host::PluginHost::from_plugins_dir(plugins.path()).expect("host");
         assert!(host.get_plugin("weather").is_none());
@@ -21306,7 +21318,7 @@ hosts = ["api.example.com", "api2.example.com"]
             "a restored package goes on to its update"
         );
         assert!(plugins.path().join("weather/manifest.toml").is_file());
-        assert!(!plugins.path().join(".weather.replaced-4242").exists());
+        assert!(!claimed.exists());
 
         let config_dir = tempfile::tempdir().expect("config dir");
         let mut config = config_in_dir(config_dir.path());
@@ -21342,8 +21354,8 @@ hosts = ["api.example.com", "api2.example.com"]
     #[cfg(feature = "plugins-wasm")]
     fn a_restored_copy_the_policy_rejects_is_reported_where_it_is() {
         let plugins = tempfile::tempdir().expect("plugins dir");
-        let displaced = plugins.path().join(".weather.replaced-4242");
-        std::fs::create_dir(&displaced).expect("displaced copy");
+        let displaced = abandoned_claim(plugins.path(), "weather");
+        std::fs::create_dir(&displaced).expect("claimed package");
         write_tool_update_source(&displaced, "weather", "1.0.0", "");
         let mut host = zeroclaw::plugins::host::PluginHost::from_plugins_dir_with_security(
             plugins.path(),
@@ -21621,14 +21633,18 @@ type = "integer"
             "weather",
             &PluginUpdateOutcome::Interrupted {
                 error: "rename failed".to_string(),
-                preserved: std::path::PathBuf::from("/plugins/.weather.replaced-42"),
+                preserved: std::path::PathBuf::from(
+                    "/plugins/.weather.replacing-v1-0123456789abcdef0123456789abcdef/package",
+                ),
                 command: command.clone(),
             },
         );
 
         assert_eq!(lines.len(), 1, "{lines:#?}");
         assert!(
-            lines[0].contains("/plugins/.weather.replaced-42") && lines[0].contains(&command),
+            lines[0].contains(
+                "/plugins/.weather.replacing-v1-0123456789abcdef0123456789abcdef/package"
+            ) && lines[0].contains(&command),
             "{lines:#?}"
         );
         assert!(

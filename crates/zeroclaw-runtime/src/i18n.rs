@@ -1486,7 +1486,8 @@ mod tests {
         const ERROR: &str = "failed to instantiate: type mismatch";
         const COMMAND: &str = "zeroclaw --config-dir '/cfg' plugin update 'tool-fixture@2.0.0' --allow 'permission:http_client'";
         const KEY: &str = "zpi1_WyJ0b29sLWZpeHR1cmUiXQ";
-        const DISPLACED: &str = "/plugins/.tool-fixture.replaced-42";
+        const DISPLACED: &str =
+            "/plugins/.tool-fixture.replacing-v1-0123456789abcdef0123456789abcdef/package";
         const UPDATE: &str = "zeroclaw --config-dir '/cfg' plugin update 'tool-fixture'";
         const LOCAL: &str =
             "zeroclaw --config-dir '/cfg' plugin update 'tool-fixture' --from '<dir>'";

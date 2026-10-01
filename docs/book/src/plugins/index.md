@@ -601,24 +601,36 @@ with the reason and the version that stays installed. One plugin failing does
 not stop the others. The command exits non-zero when any plugin was not updated
 or needs approval, so a script can branch on it.
 
-**Replacement and recovery.** The new package is verified first, then written in
-full to a hidden staging directory. Only then is the installed directory renamed aside
-and the new one renamed into its place, and if that second rename fails the
-previous package is renamed back. A failure before the first rename leaves the
-installed package exactly as it was. If the process is stopped between the two
-renames, the previous package survives in a hidden `.<name>.replaced-<pid>`
-directory that discovery ignores: `plugin list` notes it, and the next
-`zeroclaw plugin update <name>` renames it back before doing anything else,
-including before it reaches the registry, so recovery works offline. The update
-then goes on as usual, so for a package you installed from a directory, add
-`--from` with that directory, or the registry's package of that name may
-replace it. `--all` only points at that command, so a displaced package is
-never put back unless you name it. A replaced version that cannot be deleted afterwards is set aside
-as `.<name>.superseded-<pid>`, which is never put back and is deleted by the
-next update. If even that rename fails, the warning names the directory where
-the copy stayed under its displaced name: delete it by hand, because once the
-plugin is removed, `zeroclaw plugin update <name>` would put that copy back.
-Run one update of a plugin at a time.
+**Replacement and recovery.** An update changes the plugins directory only
+while it holds the same hidden lock as `plugin install` and `plugin remove`, so
+those changes never overlap, even across processes. The new package is verified
+first, then written in full to a hidden staging transaction, as install writes
+one. Only then does the update claim the installed directory into a hidden
+transaction of its own and check that it is still the package the update was
+prepared against, with the same manifest and component. It then moves the new package into place without
+overwriting anything, and if that move fails, it moves the previous package
+back. A failure before the claim leaves the installed package as it was, and a
+package that changed on disk since the update started is moved back and the
+update refused. If the process is stopped after the claim and before the new
+package is in place, the previous package survives in that hidden transaction,
+which discovery ignores, and the operating-system lease on it ends with the
+process. `plugin list` then notes
+the package as displaced, after waiting for any install, update or recovery in
+progress, and the next `zeroclaw plugin update <name>` moves it
+back before doing anything else, including before it reaches the registry, so
+recovery works offline. The update then goes on as usual, so for a package you
+installed from a directory, add `--from` with that directory, or the
+registry's package of that name may replace it. `--all` only points at that
+command, so a displaced package is never put back unless you name it. A
+replaced version is marked superseded inside its transaction before it is
+deleted, so one that cannot be deleted is never put back: the warning names
+where it is, and the next update of the plugin deletes it. If even the marking
+fails, delete the directory the warning names by hand, because once the plugin
+is removed, `zeroclaw plugin update <name>` would put that copy back. A process
+stopped after the new package is in place but before the replaced version is
+marked leaves it the same way: the next update of the plugin deletes it, but
+after a `plugin remove`, `plugin list` notes it as displaced and a named update
+puts it back.
 
 The files are not flushed to disk before the renames, as with `plugin install`,
 so a power loss right after an update can leave the new package incomplete.

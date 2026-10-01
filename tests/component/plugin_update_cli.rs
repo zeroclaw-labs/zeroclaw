@@ -250,11 +250,11 @@ async fn update_replaces_the_installed_package_with_the_registry_version() {
                 .to_string_lossy()
                 .into_owned()
         })
-        .filter(|name| name.starts_with('.'))
+        .filter(|name| name.starts_with('.') && name != ".zeroclaw-package-lock-v1")
         .collect();
     assert!(
         hidden.is_empty(),
-        "nothing hidden is left behind: {hidden:?}"
+        "no stage or claim is left behind: {hidden:?}"
     );
 
     // The daemon's own check agrees: the replacement loads here.
@@ -448,6 +448,17 @@ async fn one_plugin_failing_does_not_stop_the_update_of_the_next() {
     );
 }
 
+/// Move the installed package into the transaction an update that stopped
+/// between claiming it and publishing its replacement leaves: a hidden
+/// `replacing` directory whose lease no process holds. Returns the claim.
+fn claim_the_way_a_stopped_update_leaves_it(plugins: &Path) -> PathBuf {
+    let claim = plugins.join(format!(".{PACKAGE}.replacing-v1-{}", "0".repeat(32)));
+    std::fs::create_dir(&claim).expect("claim directory");
+    std::fs::write(claim.join("lease"), b"").expect("lease");
+    std::fs::rename(plugins.join(PACKAGE), claim.join("package")).expect("claim the package");
+    claim
+}
+
 /// The recovery the operator is pointed at works without the registry: a
 /// package an interrupted update displaced is put back even when the registry
 /// cannot be reached, and only then does the unreachable registry fail the
@@ -456,9 +467,7 @@ async fn one_plugin_failing_does_not_stop_the_update_of_the_next() {
 fn a_displaced_package_is_put_back_without_reaching_the_registry() {
     let config_dir = config_dir_with_installed_fixture();
     let plugins = config_dir.path().join("plugins");
-    let displaced = plugins.join(format!(".{PACKAGE}.replaced-4242"));
-    std::fs::rename(plugins.join(PACKAGE), &displaced)
-        .expect("displace the package the way a stopped update leaves it");
+    let displaced = claim_the_way_a_stopped_update_leaves_it(&plugins);
     let registry = format!("http://127.0.0.1:{}/registry.json", closed_port());
 
     let out = run_plugin(
@@ -476,6 +485,31 @@ fn a_displaced_package_is_put_back_without_reaching_the_registry() {
         "the displaced package is back in place: {text}"
     );
     assert!(!displaced.exists(), "{text}");
+}
+
+/// `plugin list` takes the package lock only for its note on displaced
+/// packages, so a plugins directory it cannot lock, such as a read-only one,
+/// still lists and exits 0.
+#[cfg(unix)]
+#[test]
+fn plugin_list_still_lists_when_the_plugins_directory_is_read_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let config_dir = config_dir_with_installed_fixture();
+    let plugins = config_dir.path().join("plugins");
+    std::fs::set_permissions(&plugins, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::write(plugins.join("probe"), b"x").is_ok() {
+        // Running as root: permissions cannot make the directory read-only.
+        std::fs::remove_file(plugins.join("probe")).unwrap();
+        std::fs::set_permissions(&plugins, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    let out = run_plugin(config_dir.path(), &["list"]);
+    std::fs::set_permissions(&plugins, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let text = combined(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains(PACKAGE), "{text}");
 }
 
 /// Installing a package that is already installed from a local directory
@@ -519,9 +553,7 @@ fn installing_an_installed_local_package_points_at_updating_it_from_that_directo
 fn all_points_at_a_displaced_package_instead_of_putting_it_back() {
     let config_dir = config_dir_with_installed_fixture();
     let plugins = config_dir.path().join("plugins");
-    let displaced = plugins.join(format!(".{PACKAGE}.replaced-4242"));
-    std::fs::rename(plugins.join(PACKAGE), &displaced)
-        .expect("displace the package the way a stopped update leaves it");
+    let displaced = claim_the_way_a_stopped_update_leaves_it(&plugins);
     let registry = format!("http://127.0.0.1:{}/registry.json", closed_port());
     let config_dir_name = config_dir
         .path()
@@ -1015,7 +1047,13 @@ fn local_update_rejects_incomplete_materialized_skill_and_preserves_config() {
         "---\nname: beta\ndescription: Replacement skill\n---\nNew instructions.\n",
     )
     .unwrap();
-    std::os::unix::fs::symlink(&target, source.path().join("skills/beta/SKILL.md")).unwrap();
+    // A relative link inside the package: admission reads through a handle on
+    // the package and never follows a link out of it.
+    std::os::unix::fs::symlink(
+        "../../skill-target.md",
+        source.path().join("skills/beta/SKILL.md"),
+    )
+    .unwrap();
     let source_arg = source.path().to_str().unwrap();
     let host =
         zeroclaw_plugins::host::PluginHost::from_plugins_dir(&config_dir.path().join("plugins"))
@@ -1054,13 +1092,12 @@ fn local_update_rejects_incomplete_materialized_skill_and_preserves_config() {
         skill
     );
     assert!(!installed.join("skills/beta").exists());
-    assert_eq!(
-        std::fs::read_dir(config_dir.path().join("plugins"))
-            .unwrap()
-            .count(),
-        1,
-        "no displaced or staging package remains"
-    );
+    let entries: Vec<String> = std::fs::read_dir(config_dir.path().join("plugins"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name != ".zeroclaw-package-lock-v1")
+        .collect();
+    assert_eq!(entries, [PACKAGE], "no claimed or staged package remains");
     let info = run_plugin(config_dir.path(), &["info", PACKAGE]);
     let text = combined(&info);
     assert!(
