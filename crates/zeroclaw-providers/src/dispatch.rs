@@ -706,10 +706,10 @@ impl ProviderDispatch {
         policy: zeroclaw_api::model_provider::ToolRoundPolicy,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         let attribution = zeroclaw_log::attribution_span!(&*self.inner);
-        // Enter the attribution span synchronously so the model_scope
-        // info_span! constructs with attribution as its parent. Drop
-        // the guard before returning; the attribution span lives on
-        // via model_scope's parent pointer.
+        // Enter attribution synchronously so model_scope uses it as parent.
+        // Enter model_scope while constructing the inner stream as well as while
+        // polling it: providers may eagerly spawn parser tasks here, and those
+        // tasks must inherit the effective model attribution.
         let _attribution_enter = attribution.enter();
         let model_scope = zeroclaw_log::info_span!(
             target: "zeroclaw_log_internal_scope",
@@ -718,13 +718,16 @@ impl ProviderDispatch {
         );
         let provider_ref = provider_reference(&*self.inner);
         let model_name = model.to_string();
-        let inner_stream = self.inner.stream_chat_with_tool_round_policy(
-            request,
-            model,
-            temperature,
-            options,
-            policy,
-        );
+        let inner_stream = {
+            let _model_enter = model_scope.enter();
+            self.inner.stream_chat_with_tool_round_policy(
+                request,
+                model,
+                temperature,
+                options,
+                policy,
+            )
+        };
         drop(_attribution_enter);
         let mut inner_stream = inner_stream;
         let mut attempt = accounting::AttemptState::unstarted(provider_ref, model_name);
@@ -1098,13 +1101,16 @@ impl<'a> ProviderDispatchRef<'a> {
         );
         let provider_ref = provider_reference(self.inner);
         let model_name = model.to_string();
-        let inner_stream = self.inner.stream_chat_with_tool_round_policy(
-            request,
-            model,
-            temperature,
-            options,
-            policy,
-        );
+        let inner_stream = {
+            let _model_enter = model_scope.enter();
+            self.inner.stream_chat_with_tool_round_policy(
+                request,
+                model,
+                temperature,
+                options,
+                policy,
+            )
+        };
         drop(_attribution_enter);
         let mut inner_stream = inner_stream;
         let mut attempt = accounting::AttemptState::unstarted(provider_ref, model_name);
@@ -1342,7 +1348,7 @@ mod tests {
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use zeroclaw_api::model_provider::{
         ChatRequest, ChatResponse, ModelProvider, StreamChunk, StreamEvent, StreamOptions,
-        StreamResult,
+        StreamResult, ToolRoundPolicy,
     };
 
     struct FakeAnthropic {
@@ -1738,6 +1744,7 @@ mod tests {
 
     struct StreamingFake {
         alias: String,
+        expected_policy: ToolRoundPolicy,
     }
 
     impl Attributable for StreamingFake {
@@ -1761,6 +1768,18 @@ mod tests {
             anyhow::bail!("not used in stream test")
         }
 
+        fn stream_chat_with_tool_round_policy(
+            &self,
+            request: ChatRequest<'_>,
+            model: &str,
+            temperature: Option<f64>,
+            options: StreamOptions,
+            policy: ToolRoundPolicy,
+        ) -> futures_util::stream::BoxStream<'static, StreamResult<StreamEvent>> {
+            assert_eq!(policy, self.expected_policy);
+            self.stream_chat(request, model, temperature, options)
+        }
+
         fn stream_chat(
             &self,
             _request: ChatRequest<'_>,
@@ -1768,6 +1787,11 @@ mod tests {
             _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> futures_util::stream::BoxStream<'static, StreamResult<StreamEvent>> {
+            zeroclaw_log::record!(
+                INFO,
+                zeroclaw_log::Event::new(module_path!(), zeroclaw_log::Action::Note),
+                "streaming-fake stream created"
+            );
             futures_util::stream::unfold(0u8, |state| async move {
                 match state {
                     0 => {
@@ -1924,7 +1948,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_stream_chunk_records_carry_attribution() {
+    async fn dispatch_stream_creation_and_chunk_records_carry_attribution() {
+        for policy in [ToolRoundPolicy::Batch, ToolRoundPolicy::Single] {
+            assert_stream_creation_and_chunk_records_carry_attribution(false, policy).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_ref_stream_creation_and_chunk_records_carry_attribution() {
+        for policy in [ToolRoundPolicy::Batch, ToolRoundPolicy::Single] {
+            assert_stream_creation_and_chunk_records_carry_attribution(true, policy).await;
+        }
+    }
+
+    async fn assert_stream_creation_and_chunk_records_carry_attribution(
+        borrowed: bool,
+        policy: ToolRoundPolicy,
+    ) {
         let _writer_guard = zeroclaw_log::__private_test_writer_lock();
         let _hook_guard = zeroclaw_log::__private_test_hook_lock();
         zeroclaw_log::try_install_capture_subscriber();
@@ -1933,35 +1973,50 @@ mod tests {
 
         let fake: Arc<dyn ModelProvider> = Arc::new(StreamingFake {
             alias: "stream-alias".into(),
+            expected_policy: policy,
         });
-        let dispatch = ProviderDispatch::new(fake);
         let request = ChatRequest {
             messages: &[],
             tools: None,
             thinking: None,
         };
-        let mut stream =
-            dispatch.stream_chat(request, "claude-sonnet-4-6", None, StreamOptions::default());
+        let mut stream = if borrowed {
+            ProviderDispatch::from_ref(fake.as_ref()).stream_chat_with_tool_round_policy(
+                request,
+                "claude-sonnet-4-6",
+                None,
+                StreamOptions::default(),
+                policy,
+            )
+        } else {
+            ProviderDispatch::new(fake).stream_chat_with_tool_round_policy(
+                request,
+                "claude-sonnet-4-6",
+                None,
+                StreamOptions::default(),
+                policy,
+            )
+        };
         while stream.next().await.is_some() {}
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        let mut found = false;
-        while !found && std::time::Instant::now() < deadline {
+        let mut found_creation = false;
+        let mut found_chunk = false;
+        while !(found_creation && found_chunk) && std::time::Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let step = remaining.min(std::time::Duration::from_millis(50));
             match tokio::time::timeout(step, rx.recv()).await {
                 Ok(Ok(value)) => {
-                    if value
-                        .get("message")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.contains("streaming-fake chunk"))
-                        .unwrap_or(false)
-                    {
+                    let message = value.get("message").and_then(|value| value.as_str());
+                    if matches!(
+                        message,
+                        Some("streaming-fake stream created" | "streaming-fake chunk")
+                    ) {
                         let zc = value.get("zeroclaw").expect("zeroclaw block present");
                         assert_eq!(
                             zc.get("model_provider_alias").and_then(|v| v.as_str()),
                             Some("stream-alias"),
-                            "stream chunk record not attributed; zc: {zc:?}",
+                            "stream record not attributed; zc: {zc:?}",
                         );
                         assert_eq!(
                             zc.get("model_provider_type").and_then(|v| v.as_str()),
@@ -1971,7 +2026,8 @@ mod tests {
                             zc.get("model").and_then(|v| v.as_str()),
                             Some("claude-sonnet-4-6"),
                         );
-                        found = true;
+                        found_creation |= message == Some("streaming-fake stream created");
+                        found_chunk |= message == Some("streaming-fake chunk");
                     }
                 }
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
@@ -1979,7 +2035,11 @@ mod tests {
                 Err(_elapsed) => {}
             }
         }
-        assert!(found, "stream chunk record was not attributed");
+        assert!(
+            found_creation,
+            "stream creation record was not attributed with provider/model"
+        );
+        assert!(found_chunk, "stream chunk record was not attributed");
         zeroclaw_log::clear_broadcast_hook();
     }
 
