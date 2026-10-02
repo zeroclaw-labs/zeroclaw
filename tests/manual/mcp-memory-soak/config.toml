@@ -1,0 +1,62 @@
+schema_version = 3
+
+[providers.models.custom.mock]
+uri = "http://mock:9100/v1"
+api_key = "synthetic-soak-placeholder"
+model = "soak-mock"
+native_tools = true
+
+[agents.soak]
+enabled = true
+model_provider = "custom.mock"
+risk_profile = "soak"
+runtime_profile = "soak"
+mcp_bundles = ["soak"]
+
+[agents.soak.workspace]
+path = "/soak/workspace"
+
+[agents.soak.memory]
+backend = "none"
+
+[risk_profiles.soak]
+level = "full"
+
+[runtime_profiles.soak]
+agentic = true
+max_tool_iterations = 26
+max_actions_per_hour = 1000000000
+max_history_messages = 16
+max_context_tokens = 200000
+
+[gateway]
+port = 42617
+host = "0.0.0.0"
+allow_public_bind = true
+require_pairing = false
+session_persistence = false
+
+[mcp]
+enabled = true
+deferred_loading = false
+
+[[mcp.servers]]
+name = "soak0"
+transport = "http"
+url = "http://mock:9100/mcp/0"
+
+[[mcp.servers]]
+name = "soak1"
+transport = "http"
+url = "http://mock:9100/mcp/1"
+
+[[mcp.servers]]
+name = "soak2"
+transport = "http"
+url = "http://mock:9100/mcp/2"
+
+[mcp_bundles.soak]
+servers = ["soak0", "soak1", "soak2"]
+
+[cost]
+enabled = false

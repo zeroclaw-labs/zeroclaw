@@ -25,10 +25,10 @@ Use a fresh mock and runtime data directory for each run. Configure:
 
 - An explicit agent named `soak`, gateway WebSocket enabled, and pairing disabled
   **only in this isolated, unpublished test environment**.
-- A custom OpenAI-compatible provider pointing at `http://mock:8080/v1`, model
-  `soak`; any required API-key placeholder must be synthetic.
+- A custom OpenAI-compatible provider pointing at `http://mock:9100/v1`, model
+  `soak-mock`; any required API-key placeholder must be synthetic.
 - Three eagerly discovered HTTP MCP servers named `soak0`, `soak1`, `soak2`, URLs
-  `http://mock:8080/mcp/0`, `/mcp/1`, `/mcp/2`. Each advertises 12 harmless tools.
+  `http://mock:9100/mcp/0`, `/mcp/1`, `/mcp/2`. Each advertises 12 harmless tools.
 - Set `max_history_messages = 16`, tool-iteration cap **26**, sufficiently high
   synthetic action budget, memory backend `none`, session persistence disabled,
   and sufficient context capacity to avoid unrelated compaction. The historical
@@ -52,18 +52,50 @@ or conversation history is recorded in mock memory. HTTP connections time out in
 The stdlib mock uses HTTP/1.0 with connection closure, identically for both runs;
 this does not reproduce every original server's keep-alive behavior.
 
+## Diagnostic container builds
+
+`Dockerfile.runtime` uses the historical repository's `ci` profile, native
+Linux arm64, and only the `agent-runtime,gateway` features. This uses thin LTO
+instead of the default release profile's fat LTO, which exceeded an 8 GiB build
+environment during setup. Both comparison images must use the same profile and
+features; results do not establish behavior of every distributed release build.
+Compiler and Debian base images are pinned by digest. Target caches are separate
+for each source revision.
+
+From the repository root, with the two historical commits available:
+
+```sh
+SOAK_HARNESS="$PWD/tests/manual/mcp-memory-soak"
+git worktree add --detach ../zeroclaw-soak-before c7f4435b95103b645a5e80585b3b2af412b0cd33
+git worktree add --detach ../zeroclaw-soak-after 5bf683defcd0fd9237eb640b6425e9b978c8dd20
+docker build --platform linux/arm64 -f "$SOAK_HARNESS/Dockerfile.runtime" \
+  --build-arg SOAK_REVISION=c7f4435b95103b645a5e80585b3b2af412b0cd33 \
+  -t zeroclaw-soak:before ../zeroclaw-soak-before
+docker build --platform linux/arm64 -f "$SOAK_HARNESS/Dockerfile.runtime" \
+  --build-arg SOAK_REVISION=5bf683defcd0fd9237eb640b6425e9b978c8dd20 \
+  -t zeroclaw-soak:after ../zeroclaw-soak-after
+docker build -f "$SOAK_HARNESS/Dockerfile.fixtures" \
+  -t zeroclaw-soak:fixtures "$SOAK_HARNESS"
+```
+
+The example `config.toml` is synthetic and only suitable for the isolated network
+described above. Copy it into a fresh runtime container at `/soak/config/config.toml`
+and start `zeroclaw --config-dir /soak/config gateway`. Do not mount a real config
+or expose its unauthenticated gateway. The runtime image sets `MALLOC_ARENA_MAX=2`
+as requested by the issue's published recipe; report that allocator cap explicitly.
+
 ## Commands
 
 Paths below are relative to this directory inside the isolated fixture container.
-Container creation, historical compilation and configuration are deliberately
-outside these scripts; record those exact commands alongside the resulting data.
+Container lifecycle is deliberately outside these scripts; record the exact
+isolation, resource-limit and mount commands alongside the resulting data.
 
 ```sh
-python3 mock.py --host 0.0.0.0 --port 8080
+python3 mock.py --host 0.0.0.0 --port 9100
 
 # Separate driver container, --pid=container:<runtime>; runtime executable is PID 1.
 python3 soak.py --ws-url 'ws://runtime:42617/ws/chat?agent=soak' \
-  --mock-url http://mock:8080 --pid 1 --revision FULL_COMMIT_SHA \
+  --mock-url http://mock:9100 --pid 1 --revision FULL_COMMIT_SHA \
   --output /artifacts/before.jsonl \
   --duration-seconds 2100 --warmup-seconds 300 \
   --sample-seconds 5 --turn-timeout 120
