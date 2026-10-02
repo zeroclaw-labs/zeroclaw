@@ -1341,6 +1341,70 @@ pub struct AgentRunOverrides {
     /// inherits the step's boundary rather than rebuilding the agent's full
     /// surface. `None` for every ordinary agent run.
     pub sop_step_scope: Option<crate::sop::active_scope::HeadlessStepScope>,
+    /// Prior messages of the conversation this internally initiated turn is
+    /// bound to, loaded by the caller through that conversation's owner and
+    /// already bounded by the owner's own history limit. A single-shot run
+    /// places them between the system prompt and its own message. The caller
+    /// records the completed exchange; the run itself never writes them back.
+    /// `None` for unbound runs.
+    pub bound_history: Option<Vec<ChatMessage>>,
+}
+
+/// The opening transcript of a single-shot run: the system prompt, any bound
+/// conversation history, then the run's own message. The history's owner has
+/// already applied its limit, so nothing is trimmed here; the turn's token
+/// budget still applies once the loop runs.
+///
+/// A bound history can end with a message nobody has answered yet: context a
+/// surface recorded without replying, or a turn still in progress. The run's
+/// message is then joined to it, as the surface itself joins consecutive user
+/// messages, so the request never carries two user messages in a row.
+fn single_shot_history(
+    system_prompt: &str,
+    bound_history: Option<Vec<ChatMessage>>,
+    message: &str,
+) -> Vec<ChatMessage> {
+    let mut history = vec![ChatMessage::system(system_prompt)];
+    let Some(bound_history) = bound_history else {
+        history.push(ChatMessage::user(message));
+        return history;
+    };
+    history.extend(bound_history.into_iter().filter(|m| m.role != "system"));
+    crate::agent::history_pruner::remove_orphaned_tool_messages(&mut history);
+    match history.last_mut() {
+        Some(unanswered) if unanswered.role == "user" => {
+            unanswered.content.push_str("\n\n");
+            unanswered.content.push_str(message);
+        }
+        _ => history.push(ChatMessage::user(message)),
+    }
+    history
+}
+
+/// The part of a single-shot transcript that the run itself produced: the
+/// system prompt, then everything from the run's own message on. An unbound
+/// run's transcript is all its own. When the run's message can no longer be
+/// found, nothing but the system prompt is attributed to it.
+fn own_turn_history<'a>(
+    history: &'a [ChatMessage],
+    bound: bool,
+    message: &str,
+) -> std::borrow::Cow<'a, [ChatMessage]> {
+    if !bound {
+        return std::borrow::Cow::Borrowed(history);
+    }
+    let mut own: Vec<ChatMessage> = history
+        .iter()
+        .take_while(|m| m.role == "system")
+        .cloned()
+        .collect();
+    if let Some(start) = history
+        .iter()
+        .rposition(|m| m.role == "user" && m.content.contains(message))
+    {
+        own.extend_from_slice(&history[start..]);
+    }
+    std::borrow::Cow::Owned(own)
 }
 
 fn agent_provider_composite(
@@ -1539,6 +1603,7 @@ pub async fn run(
         let memory_free = overrides.memory_free;
         let internal_principal = overrides.internal_principal.clone();
         let sop_step_scope = overrides.sop_step_scope.clone();
+        let bound_history = overrides.bound_history;
         let security = match overrides.security {
             Some(sec) => sec,
             None => Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?),
@@ -2181,10 +2246,8 @@ pub async fn run(
                 format!("{context}[{now}] {effective_msg}")
             };
 
-            let mut history = vec![
-                ChatMessage::system(&system_prompt),
-                ChatMessage::user(&enriched),
-            ];
+            let bound_run = bound_history.is_some();
+            let mut history = single_shot_history(&system_prompt, bound_history, &enriched);
             let execution_tree_budget = ExecutionTreeBudget::current()
                 .map(|budget| budget.child())
                 .or_else(|| {
@@ -2389,9 +2452,15 @@ pub async fn run(
                 }
             }
 
+            // Post-run skill work looks at what this run did. In a bound run
+            // the conversation ahead of the run's own message belongs to
+            // other turns and must not be attributed to this one.
+            let own_history = own_turn_history(&history, bound_run, &enriched);
+
             // After successful multi-step execution, attempt autonomous skill creation.
             if config.skills.skill_creation.enabled {
-                let tool_calls = crate::skills::creator::extract_tool_calls_from_history(&history);
+                let tool_calls =
+                    crate::skills::creator::extract_tool_calls_from_history(&own_history);
                 if tool_calls.len() >= 2 {
                     let creator = crate::skills::creator::SkillCreator::new(
                         config.data_dir.clone(),
@@ -2469,7 +2538,7 @@ pub async fn run(
                 let review_workspace = config.agent_workspace_dir(agent_alias);
                 let review_config = config.skills.skill_improvement.clone();
                 let failed_slugs: Vec<String> =
-                    crate::skills::improver::extract_skill_executions_from_history(&history)
+                    crate::skills::improver::extract_skill_executions_from_history(&own_history)
                         .into_iter()
                         .filter_map(|(slug, ok)| if ok { None } else { Some(slug) })
                         .collect();
@@ -2481,7 +2550,7 @@ pub async fn run(
                             review_workspace,
                             review_config,
                             config.skills.allow_scripts,
-                            history.clone(),
+                            own_history.to_vec(),
                             failed_slugs,
                             model_provider.as_ref(),
                             &provider_name,
@@ -4036,9 +4105,121 @@ async fn process_message_inner(
 mod tests {
     use super::{
         apply_text_tool_prompt_policy, estimate_history_tokens, load_interactive_session_history,
-        make_query_summary, maybe_inject_channel_delivery_defaults,
-        save_interactive_session_history, seed_channel_handles, truncate_tool_result,
+        make_query_summary, maybe_inject_channel_delivery_defaults, own_turn_history,
+        save_interactive_session_history, seed_channel_handles, single_shot_history,
+        truncate_tool_result,
     };
+
+    fn roles_and_contents(history: &[ChatMessage]) -> Vec<(String, String)> {
+        history
+            .iter()
+            .map(|m| (m.role.clone(), m.content.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn unbound_single_shot_history_is_system_then_message() {
+        let history = single_shot_history("sys", None, "run");
+        assert_eq!(
+            roles_and_contents(&history),
+            vec![
+                ("system".to_string(), "sys".to_string()),
+                ("user".to_string(), "run".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn bound_history_sits_between_system_prompt_and_the_runs_message() {
+        let bound = vec![
+            ChatMessage::system("a stale system message from the bound store"),
+            ChatMessage::user("remind me at five"),
+            ChatMessage::assistant("Scheduled."),
+        ];
+        let history = single_shot_history("sys", Some(bound), "run");
+        assert_eq!(
+            roles_and_contents(&history),
+            vec![
+                ("system".to_string(), "sys".to_string()),
+                ("user".to_string(), "remind me at five".to_string()),
+                ("assistant".to_string(), "Scheduled.".to_string()),
+                ("user".to_string(), "run".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn run_message_joins_an_unanswered_message_instead_of_following_it() {
+        let bound = vec![
+            ChatMessage::user("remind me at five"),
+            ChatMessage::assistant("Scheduled."),
+            ChatMessage::user("someone said something nobody answered"),
+        ];
+        let history = single_shot_history("sys", Some(bound), "run");
+        assert_eq!(
+            roles_and_contents(&history),
+            vec![
+                ("system".to_string(), "sys".to_string()),
+                ("user".to_string(), "remind me at five".to_string()),
+                ("assistant".to_string(), "Scheduled.".to_string()),
+                (
+                    "user".to_string(),
+                    "someone said something nobody answered\n\nrun".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn bound_history_is_kept_whole_whatever_the_agents_turn_limit() {
+        // The owner of the conversation already bounded it. A turn limit of
+        // zero means "use the default" to that owner, and must not be read
+        // here as "keep nothing".
+        let mut bound = Vec::new();
+        for i in 0..10 {
+            bound.push(ChatMessage::user(format!("q{i}")));
+            bound.push(ChatMessage::assistant(format!("a{i}")));
+        }
+        let history = single_shot_history("sys", Some(bound), "run");
+        assert_eq!(history.len(), 22);
+        assert_eq!(history[1].content, "q0");
+        assert_eq!(history.last().map(|m| m.content.as_str()), Some("run"));
+    }
+
+    #[test]
+    fn own_turn_history_excludes_the_bound_conversation() {
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("an earlier question"),
+            ChatMessage::assistant("an earlier answer that used tools"),
+            ChatMessage::user("[memory context]\n[cron:job-1 reminder] Remind me"),
+            ChatMessage::assistant("Reminder: call Sam."),
+        ];
+
+        let own = own_turn_history(&history, true, "[cron:job-1 reminder] Remind me");
+        assert_eq!(
+            roles_and_contents(&own),
+            vec![
+                ("system".to_string(), "sys".to_string()),
+                (
+                    "user".to_string(),
+                    "[memory context]\n[cron:job-1 reminder] Remind me".to_string()
+                ),
+                ("assistant".to_string(), "Reminder: call Sam.".to_string()),
+            ]
+        );
+
+        // An unbound run's transcript is all its own.
+        let unbound = own_turn_history(&history, false, "[cron:job-1 reminder] Remind me");
+        assert_eq!(unbound.len(), history.len());
+
+        // The run's message is gone: nothing is attributed to the run.
+        let lost = own_turn_history(&history, true, "a message that is not there");
+        assert_eq!(
+            roles_and_contents(&lost),
+            vec![("system".to_string(), "sys".to_string())]
+        );
+    }
 
     /// One decision, four gates. The origin gate is the load-bearing one:
     /// the heartbeat session-context shape defeats the content filter (it no

@@ -18,6 +18,8 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::time::{self, Duration};
 use tokio_util::sync::CancellationToken;
+use zeroclaw_api::conversation_binding::{ConversationBinding, ConversationBindingOwner};
+use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
 use zeroclaw_config::schema::Config;
 use zeroclaw_config::schema::{CronJobDecl, CronScheduleDecl, CronShellOutputFormat};
@@ -26,6 +28,8 @@ use zeroclaw_log::Instrument;
 const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
 const SCHEDULER_COMPONENT: &str = "scheduler";
+/// What a successful agent run reports when the model returned no text.
+const EMPTY_AGENT_REPLY_PLACEHOLDER: &str = "agent job executed";
 const CRON_AGENT_DEFAULT_EXCLUDED_TOOLS: &[&str] = &[
     "cron_add",
     "cron_update",
@@ -367,17 +371,24 @@ async fn run_manual_job_inner(
                 };
             }
         };
-    let executing_agent = Some(agent_alias);
+    let conversation =
+        resolve_run_conversation(&effective_config, job, &agent_alias, RunTrigger::Manual).await;
     let (success, output) = execute_job_now_with_runtime(
         &effective_config,
         job,
         runtime,
         approved,
         execution_admission.clone(),
+        conversation.history(),
     )
     .await;
     let finished_at = Utc::now();
     let duration_ms = (finished_at - started_at).num_milliseconds();
+    // The conversation records what the turn produced, before delivery can
+    // annotate the output with its own failure.
+    let persistence =
+        record_run_in_conversation(&conversation, job, &agent_alias, success, &output);
+    let executing_agent = Some(agent_alias);
     let outcome =
         deliver_and_classify_run_result(&effective_config, job, success, output, context).await;
 
@@ -394,9 +405,7 @@ async fn run_manual_job_inner(
         crate::cron::store::RunOutcomes {
             execution: outcome.execution,
             delivery: outcome.delivery.as_str(),
-            // No conversation binding exists yet; every run records the
-            // explicit absence rather than an empty guess.
-            persistence: "not_bound",
+            persistence,
         },
         // Immutable provenance from the same job snapshot the run was
         // dispatched with: what a later rename can no longer rewrite.
@@ -453,6 +462,9 @@ pub async fn run_with_capability(
     cancel: CancellationToken,
     execution_capability: Option<AgentExecutionCapability>,
 ) -> Result<()> {
+    *SCHEDULER_STARTED_AT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
     let mut interval = time::interval(Duration::from_secs(poll_secs));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -750,7 +762,7 @@ async fn skip_missed_jobs_on_startup(config: &Config) {
 }
 
 pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
-    execute_job_now_with_runtime(config, job, None, false, None).await
+    execute_job_now_with_runtime(config, job, None, false, None, None).await
 }
 
 async fn execute_job_now_with_runtime(
@@ -759,6 +771,7 @@ async fn execute_job_now_with_runtime(
     runtime: Option<&dyn RuntimeAdapter>,
     approved: bool,
     execution_admission: Option<AgentExecutionAdmission>,
+    bound_history: Option<&[ChatMessage]>,
 ) -> (bool, String) {
     // Reject orphaned declarative jobs: a declarative row whose canonical
     // config declaration has been removed must not execute through any
@@ -795,6 +808,7 @@ async fn execute_job_now_with_runtime(
         runtime,
         approved,
         execution_admission,
+        bound_history,
     ))
     .instrument(span)
     .await
@@ -822,6 +836,7 @@ fn cron_agent_session_path(target: &SessionTarget, run_session_id: &str) -> std:
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_job_with_retry(
     config: &Config,
     security: &SecurityPolicy,
@@ -830,6 +845,7 @@ async fn execute_job_with_retry(
     runtime: Option<&dyn RuntimeAdapter>,
     approved: bool,
     execution_admission: Option<AgentExecutionAdmission>,
+    bound_history: Option<&[ChatMessage]>,
 ) -> (bool, String) {
     if let Some(admission) = execution_admission.as_ref()
         && let Err(error) = admission.revalidate()
@@ -873,6 +889,7 @@ async fn execute_job_with_retry(
                     agent_alias,
                     job,
                     execution_admission.clone(),
+                    bound_history,
                 ))
                 .await
             }
@@ -1037,6 +1054,8 @@ async fn execute_and_persist_job(
 
     let started_at = Utc::now();
     let span = zeroclaw_log::attribution_span!(job);
+    let conversation =
+        resolve_run_conversation(&effective_config, job, agent_alias, RunTrigger::Schedule).await;
     let (success, output) = Box::pin(execute_job_with_retry(
         &effective_config,
         security,
@@ -1045,10 +1064,14 @@ async fn execute_and_persist_job(
         None,
         false,
         execution_admission.clone(),
+        conversation.history(),
     ))
     .instrument(span)
     .await;
     let finished_at = Utc::now();
+    // The conversation records what the turn produced, before delivery can
+    // annotate the output with its own failure.
+    let persistence = record_run_in_conversation(&conversation, job, agent_alias, success, &output);
     let success = Box::pin(persist_job_result(
         &effective_config,
         job,
@@ -1057,6 +1080,7 @@ async fn execute_and_persist_job(
         &output,
         started_at,
         finished_at,
+        persistence,
     ))
     .await;
 
@@ -1077,6 +1101,244 @@ async fn execute_and_persist_job(
     (job.id.clone(), success, output)
 }
 
+/// The message an agent job runs, attributed to the job. The same text is
+/// what a bound run records in its conversation as the turn's prompt.
+fn cron_prompt_message(job: &CronJob) -> String {
+    let name = job.name.as_deref().unwrap_or("cron-job");
+    let prompt = job.prompt.as_deref().unwrap_or_default();
+    format!("[cron:{} {name}] {prompt}", job.id)
+}
+
+/// What a run does about the conversation its job was created from, decided
+/// once before the run executes so that what the run saw and what it records
+/// can never disagree.
+enum RunConversation {
+    /// No conversation applies to this run.
+    Unbound,
+    /// A conversation is recorded for the job but this run cannot use it. The
+    /// run executes without it and records nothing in it.
+    Unreachable,
+    /// The run executes with `history` as context, and its exchange is
+    /// appended to `binding`. The owner is looked up again for that write:
+    /// the surface may have restarted while the run was executing, and only
+    /// its current instance may write.
+    Bound {
+        binding: ConversationBinding,
+        history: Vec<ChatMessage>,
+    },
+}
+
+impl RunConversation {
+    fn history(&self) -> Option<&[ChatMessage]> {
+        match self {
+            Self::Bound { history, .. } => Some(history),
+            Self::Unbound | Self::Unreachable => None,
+        }
+    }
+}
+
+/// Whether a run was started by the schedule or by a manual trigger.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunTrigger {
+    Schedule,
+    Manual,
+}
+
+/// How long after the scheduler starts a scheduled run will wait for the
+/// surface that owns its conversation to start serving. The scheduler and the
+/// surfaces come up independently, so a job that is overdue when the daemon
+/// starts would otherwise always run before its conversation can be reached.
+/// A surface only starts serving once every agent's provider, memory and
+/// tools are up, which can take a good part of a minute on a small machine.
+/// Once this window has passed, a missing surface is not waited for.
+const CONVERSATION_OWNER_GRACE: Duration = Duration::from_secs(60);
+const CONVERSATION_OWNER_POLL: Duration = Duration::from_millis(250);
+
+/// When the scheduler loop last started in this process.
+static SCHEDULER_STARTED_AT: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+/// What is left of the start-up window in which a scheduled run waits for
+/// its conversation's surface.
+fn conversation_owner_grace_left() -> Duration {
+    SCHEDULER_STARTED_AT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .map_or(Duration::ZERO, |started| {
+            CONVERSATION_OWNER_GRACE.saturating_sub(started.elapsed())
+        })
+}
+
+/// The owner serving `agent_alias` on the binding's surface, waiting up to
+/// `grace` for one to appear.
+async fn conversation_owner_for(
+    binding: &ConversationBinding,
+    agent_alias: &str,
+    grace: Duration,
+) -> Option<Arc<dyn ConversationBindingOwner>> {
+    let deadline = time::Instant::now() + grace;
+    loop {
+        if let Some(owner) =
+            zeroclaw_infra::conversation_owners::conversation_owner(binding.surface, agent_alias)
+        {
+            return Some(owner);
+        }
+        if time::Instant::now() >= deadline {
+            return None;
+        }
+        time::sleep(CONVERSATION_OWNER_POLL).await;
+    }
+}
+
+/// Decide, once, what a run of `job` under `agent_alias` does about the
+/// conversation the job was created from, and load that conversation when
+/// the run may use it.
+///
+/// Only a `main` agent job can be bound. A scheduled run uses the recorded
+/// conversation. A manual run uses it only when the trigger comes from that
+/// same conversation, because the trigger receives the run's output: a manual
+/// run started anywhere else executes unbound. Nothing is ever substituted
+/// for a conversation that is missing or cannot be reached.
+async fn resolve_run_conversation(
+    config: &Config,
+    job: &CronJob,
+    agent_alias: &str,
+    trigger: RunTrigger,
+) -> RunConversation {
+    if !matches!(job.job_type, JobType::Agent) || !matches!(job.session_target, SessionTarget::Main)
+    {
+        return RunConversation::Unbound;
+    }
+    let note_unbound = |message: &str| {
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Cron)
+                .with_attrs(::serde_json::json!({
+                    "job_id": job.id,
+                    "agent_alias": agent_alias,
+                    "job_source": job.source,
+                })),
+            message
+        );
+        RunConversation::Unbound
+    };
+    let warn_unreachable = |reason: String| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Cron)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "job_id": job.id,
+                    "agent_alias": agent_alias,
+                    "reason": reason,
+                })),
+            "cron main job cannot reach its conversation; running without it"
+        );
+        RunConversation::Unreachable
+    };
+
+    let binding = match crate::cron::job_conversation_binding(config, &job.id) {
+        Ok(Some(binding)) => binding,
+        Ok(None) => {
+            return note_unbound(
+                "cron main job has no recorded conversation; running without conversation context",
+            );
+        }
+        Err(error) => return warn_unreachable(error.to_string()),
+    };
+    if trigger == RunTrigger::Manual
+        && ConversationBinding::of_current_turn(agent_alias).as_ref() != Some(&binding)
+    {
+        return note_unbound(
+            "manual cron run was not started from the job's conversation; running without it",
+        );
+    }
+    // The conversation belongs to the agent the job is stored under. A run
+    // executes under another agent only when that owner is gone and
+    // configuration claims the job for someone else; such a run must not
+    // reach for a conversation under the same key in the claimant's store.
+    if job.agent_alias != agent_alias {
+        return warn_unreachable(
+            "the conversation belongs to the agent the job is stored under".to_string(),
+        );
+    }
+    // A manual run that reaches this point was triggered from the
+    // conversation itself, so its surface is already serving.
+    let grace = match trigger {
+        RunTrigger::Schedule => conversation_owner_grace_left(),
+        RunTrigger::Manual => Duration::ZERO,
+    };
+    let Some(owner) = conversation_owner_for(&binding, agent_alias, grace).await else {
+        return warn_unreachable(format!(
+            "no {} surface is serving this agent's conversations",
+            binding.surface.as_str()
+        ));
+    };
+    match owner.load(&binding) {
+        Ok(history) => RunConversation::Bound { binding, history },
+        Err(error) => warn_unreachable(error.to_string()),
+    }
+}
+
+/// Record a finished run in the conversation it ran with and report the
+/// persistence axis of the run-outcome triple.
+///
+/// - `not_bound`: no conversation applies to this run. A `main` agent job in
+///   that state still executed; it ran without conversation context.
+/// - `persisted`: the run's prompt and reply were appended, contiguously, to
+///   the conversation it ran with.
+/// - `skipped`: the run had its conversation but left nothing to record,
+///   because the turn did not complete or it deliberately said nothing.
+/// - `failed`: a conversation is recorded for the job, but it could not be
+///   reached before the run or written after it.
+fn record_run_in_conversation(
+    conversation: &RunConversation,
+    job: &CronJob,
+    agent_alias: &str,
+    execution_ok: bool,
+    output: &str,
+) -> &'static str {
+    let binding = match conversation {
+        RunConversation::Unbound => return "not_bound",
+        RunConversation::Unreachable => return "failed",
+        RunConversation::Bound { binding, .. } => binding,
+    };
+    if !execution_ok || is_no_reply_sentinel(output) || output == EMPTY_AGENT_REPLY_PLACEHOLDER {
+        return "skipped";
+    }
+    let exchange = [
+        ChatMessage::user(cron_prompt_message(job)),
+        ChatMessage::assistant(output),
+    ];
+    // Whoever serves the conversation now writes it. An instance that was
+    // serving when the run started and has since been retired would write
+    // behind its successor's back.
+    let written =
+        zeroclaw_infra::conversation_owners::conversation_owner(binding.surface, agent_alias)
+            .ok_or_else(|| anyhow::Error::msg("the conversation's surface stopped serving"))
+            .and_then(|owner| owner.append(binding, &exchange));
+    match written {
+        Ok(()) => "persisted",
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Cron)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "job_id": job.id,
+                        "agent_alias": agent_alias,
+                        "error": error.to_string(),
+                    })),
+                "cron main job: failed to record the run in its conversation"
+            );
+            "failed"
+        }
+    }
+}
+
 fn agent_job_error_message(error: &anyhow::Error) -> String {
     crate::agent::terminal_completion_error_message(error, None)
         .unwrap_or_else(|| crate::i18n::get_required_cli_string("cron-agent-job-failed"))
@@ -1088,6 +1350,7 @@ async fn run_agent_job(
     agent_alias: &str,
     job: &CronJob,
     execution_admission: Option<AgentExecutionAdmission>,
+    bound_history: Option<&[ChatMessage]>,
 ) -> (bool, String) {
     if !security.can_act() {
         return (
@@ -1109,10 +1372,7 @@ async fn run_agent_job(
             "blocked by security policy: action budget exhausted".to_string(),
         );
     }
-    let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
-    let prompt = job.prompt.clone().unwrap_or_default();
-
-    let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
+    let prefixed_prompt = cron_prompt_message(job);
     let model_override = job.model.clone();
 
     // Assign a unique run ID for tracing. Isolated jobs also use it in the
@@ -1160,6 +1420,7 @@ async fn run_agent_job(
         // A `[[cron]]` job runs a prompt, not a SOP step. SOP cron triggers
         // are a separate surface driven by the SOP maintenance tick.
         sop_step_scope: None,
+        bound_history: bound_history.map(<[ChatMessage]>::to_vec),
         ..crate::agent::loop_::AgentRunOverrides::default()
     };
     let run_result = match job.session_target {
@@ -1191,7 +1452,7 @@ async fn run_agent_job(
         Ok(response) => (
             true,
             if response.trim().is_empty() {
-                "agent job executed".to_string()
+                EMPTY_AGENT_REPLY_PLACEHOLDER.to_string()
             } else {
                 response
             },
@@ -1240,6 +1501,7 @@ async fn run_agent_job(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn persist_job_result(
     config: &Config,
     job: &CronJob,
@@ -1248,6 +1510,7 @@ async fn persist_job_result(
     output: &str,
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
+    persistence: &'static str,
 ) -> bool {
     let duration_ms = (finished_at - started_at).num_milliseconds();
     let outcome = deliver_and_classify_run_result(
@@ -1282,9 +1545,7 @@ async fn persist_job_result(
         crate::cron::store::RunOutcomes {
             execution: outcome.execution,
             delivery: outcome.delivery.as_str(),
-            // No conversation binding exists yet; every run records the
-            // explicit absence rather than an empty guess.
-            persistence: "not_bound",
+            persistence,
         },
         // Immutable provenance from the same job snapshot the run was
         // dispatched with: what a later rename can no longer rewrite.
@@ -2492,6 +2753,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         ))
         .await;
         assert!(success);
@@ -2516,6 +2778,7 @@ mod tests {
             &job,
             None,
             false,
+            None,
             None,
         ))
         .await;
@@ -2562,8 +2825,15 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = test_security(&config);
 
-        let (success, output) =
-            Box::pin(run_agent_job(&config, &security, "test-agent", &job, None)).await;
+        let (success, output) = Box::pin(run_agent_job(
+            &config,
+            &security,
+            "test-agent",
+            &job,
+            None,
+            None,
+        ))
+        .await;
         assert!(!success);
         assert!(!output.trim().is_empty());
         assert!(!output.contains("agent job failed:"));
@@ -2650,8 +2920,10 @@ mod tests {
             ..Default::default()
         };
 
-        let (success, output) =
-            Box::pin(run_agent_job(&config, &security, TEST_AGENT, &job, None)).await;
+        let (success, output) = Box::pin(run_agent_job(
+            &config, &security, TEST_AGENT, &job, None, None,
+        ))
+        .await;
         assert!(!success);
         let expected = crate::i18n::get_required_cli_string("turn-context-window-exceeded-error");
         assert_eq!(output, expected);
@@ -2792,6 +3064,7 @@ mod tests {
             None,
             false,
             admission.clone(),
+            None,
         ))
         .await;
         assert!(success, "retrying cron agent run failed: {output}");
@@ -2803,6 +3076,7 @@ mod tests {
             TEST_AGENT,
             &job,
             admission.clone(),
+            None,
         ))
         .await;
         assert!(
@@ -2812,9 +3086,30 @@ mod tests {
         );
 
         let (concurrent_a, concurrent_b, concurrent_c) = tokio::join!(
-            run_agent_job(&config, &security, TEST_AGENT, &job, admission.clone()),
-            run_agent_job(&config, &security, TEST_AGENT, &job, admission.clone()),
-            run_agent_job(&config, &security, TEST_AGENT, &job, admission.clone()),
+            run_agent_job(
+                &config,
+                &security,
+                TEST_AGENT,
+                &job,
+                admission.clone(),
+                None
+            ),
+            run_agent_job(
+                &config,
+                &security,
+                TEST_AGENT,
+                &job,
+                admission.clone(),
+                None
+            ),
+            run_agent_job(
+                &config,
+                &security,
+                TEST_AGENT,
+                &job,
+                admission.clone(),
+                None
+            ),
         );
         for result in [concurrent_a, concurrent_b, concurrent_c] {
             assert!(result.0, "concurrent cron agent run failed: {:?}", result.1);
@@ -2860,8 +3155,15 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = test_security(&config);
 
-        let (success, output) =
-            Box::pin(run_agent_job(&config, &security, "test-agent", &job, None)).await;
+        let (success, output) = Box::pin(run_agent_job(
+            &config,
+            &security,
+            "test-agent",
+            &job,
+            None,
+            None,
+        ))
+        .await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("read-only"));
@@ -2881,8 +3183,15 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = test_security(&config);
 
-        let (success, output) =
-            Box::pin(run_agent_job(&config, &security, "test-agent", &job, None)).await;
+        let (success, output) = Box::pin(run_agent_job(
+            &config,
+            &security,
+            "test-agent",
+            &job,
+            None,
+            None,
+        ))
+        .await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("rate limit exceeded"));
@@ -3074,6 +3383,7 @@ mod tests {
             "ok",
             started,
             finished,
+            "not_bound",
         )
         .await;
         assert!(success);
@@ -3101,6 +3411,7 @@ mod tests {
             "ok",
             started,
             finished,
+            "not_bound",
         )
         .await;
 
@@ -3132,6 +3443,7 @@ mod tests {
                 &output,
                 started,
                 finished,
+                "not_bound",
             )
             .await;
             assert!(success);
@@ -3177,6 +3489,7 @@ mod tests {
             "ok",
             started,
             finished,
+            "not_bound",
         )
         .await;
 
@@ -3220,6 +3533,7 @@ mod tests {
             "ok",
             started,
             finished,
+            "not_bound",
         )
         .await;
         assert!(success);
@@ -3268,6 +3582,7 @@ mod tests {
             "ok",
             started,
             finished,
+            "not_bound",
         )
         .await;
         assert!(success);
@@ -3307,6 +3622,7 @@ mod tests {
             "boom",
             started,
             finished,
+            "not_bound",
         )
         .await;
         assert!(!success);
@@ -3346,6 +3662,7 @@ mod tests {
             "boom",
             started,
             finished,
+            "not_bound",
         )
         .await;
 
@@ -3401,6 +3718,7 @@ mod tests {
             "ok",
             started,
             finished,
+            "not_bound",
         )
         .await;
         assert!(success);
@@ -3447,6 +3765,7 @@ mod tests {
             "ok",
             started,
             finished,
+            "not_bound",
         )
         .await;
         assert!(success);
@@ -3477,6 +3796,7 @@ mod tests {
             "ok",
             started,
             finished,
+            "not_bound",
         )
         .await;
         assert!(success);
@@ -3503,6 +3823,7 @@ mod tests {
             "boom",
             started,
             finished,
+            "not_bound",
         )
         .await;
         assert!(!success);
@@ -3551,6 +3872,7 @@ mod tests {
             "ok",
             started,
             finished,
+            "not_bound",
         )
         .await;
         assert!(success);
@@ -3588,6 +3910,7 @@ mod tests {
             "ok",
             started,
             finished,
+            "not_bound",
         )
         .await;
         assert!(success);
@@ -3667,6 +3990,7 @@ mod tests {
             "ok",
             started,
             finished,
+            "not_bound",
         )
         .await;
         assert!(success);
@@ -3692,6 +4016,599 @@ mod tests {
             deliver_if_configured(&config, &job, "x").await.unwrap(),
             DeliveryDisposition::NotRequired
         );
+    }
+
+    /// A conversation owner over an in-memory history, standing in for the
+    /// surface that serves an agent's conversations.
+    #[derive(Default)]
+    struct RecordingOwner {
+        history: std::sync::Mutex<Vec<ChatMessage>>,
+        fail_load: bool,
+        fail_append: bool,
+    }
+
+    impl RecordingOwner {
+        fn with_history(history: Vec<ChatMessage>) -> Arc<Self> {
+            Arc::new(Self {
+                history: std::sync::Mutex::new(history),
+                ..Self::default()
+            })
+        }
+
+        fn snapshot(&self) -> Vec<(String, String)> {
+            self.history
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|m| (m.role.clone(), m.content.clone()))
+                .collect()
+        }
+    }
+
+    impl ConversationBindingOwner for RecordingOwner {
+        fn load(&self, _binding: &ConversationBinding) -> anyhow::Result<Vec<ChatMessage>> {
+            if self.fail_load {
+                anyhow::bail!("simulated unverifiable conversation history");
+            }
+            Ok(self.history.lock().unwrap().clone())
+        }
+
+        fn append(
+            &self,
+            _binding: &ConversationBinding,
+            messages: &[ChatMessage],
+        ) -> anyhow::Result<()> {
+            if self.fail_append {
+                anyhow::bail!("simulated conversation write failure");
+            }
+            self.history.lock().unwrap().extend_from_slice(messages);
+            Ok(())
+        }
+    }
+
+    /// `test_config` with one more agent. The owner registry is process-wide
+    /// and keyed by agent, so each binding test runs under its own alias.
+    async fn bound_test_config(tmp: &TempDir, alias: &str) -> Config {
+        let mut config = test_config(tmp).await;
+        config.risk_profiles.insert(
+            alias.to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        config.runtime_profiles.insert(
+            alias.to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig::default(),
+        );
+        config.agents.insert(
+            alias.to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: format!("openrouter.{TEST_AGENT}").into(),
+                risk_profile: alias.into(),
+                runtime_profile: alias.into(),
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    const BOUND_KEY: &str = "telegram_42_42";
+
+    const BOUND_ROUTE: &str = "telegram";
+
+    fn channel_binding(key: &str) -> ConversationBinding {
+        ConversationBinding {
+            surface: zeroclaw_api::conversation_binding::ConversationSurface::Channel,
+            route: BOUND_ROUTE.to_string(),
+            key: key.to_string(),
+        }
+    }
+
+    fn serving(
+        alias: &str,
+        key: &str,
+    ) -> Option<zeroclaw_api::conversation_binding::ActiveConversation> {
+        Some(zeroclaw_api::conversation_binding::ActiveConversation {
+            surface: zeroclaw_api::conversation_binding::ConversationSurface::Channel,
+            route: BOUND_ROUTE.to_string(),
+            key: key.to_string(),
+            agent_alias: alias.to_string(),
+        })
+    }
+
+    fn add_main_job(
+        config: &Config,
+        alias: &str,
+        binding: Option<&ConversationBinding>,
+    ) -> CronJob {
+        cron::add_agent_job_bound(
+            config,
+            alias,
+            Some("reminder".to_string()),
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "Remind me to call Sam",
+            SessionTarget::Main,
+            None,
+            None,
+            false,
+            None,
+            false,
+            binding,
+        )
+        .unwrap()
+    }
+
+    fn publish_owner(
+        alias: &str,
+        owner: Arc<RecordingOwner>,
+    ) -> zeroclaw_infra::conversation_owners::ConversationOwnerLease {
+        zeroclaw_infra::conversation_owners::publish_conversation_owner(
+            zeroclaw_api::conversation_binding::ConversationSurface::Channel,
+            alias,
+            owner,
+        )
+    }
+
+    /// Resolve a scheduled run's conversation and record a finished run in
+    /// it, as the scheduler does around an execution.
+    async fn scheduled_run_outcome(
+        config: &Config,
+        job: &CronJob,
+        alias: &str,
+        execution_ok: bool,
+        output: &str,
+    ) -> &'static str {
+        let conversation = resolve_run_conversation(config, job, alias, RunTrigger::Schedule).await;
+        record_run_in_conversation(&conversation, job, alias, execution_ok, output)
+    }
+
+    #[tokio::test]
+    async fn completed_bound_run_is_appended_as_one_attributed_exchange() {
+        let alias = "binding-append-agent";
+        let tmp = TempDir::new().unwrap();
+        let config = bound_test_config(&tmp, alias).await;
+        let job = add_main_job(&config, alias, Some(&channel_binding(BOUND_KEY)));
+        let owner = RecordingOwner::with_history(vec![ChatMessage::user("remind me at five")]);
+        let _lease = publish_owner(alias, Arc::clone(&owner));
+
+        assert_eq!(
+            scheduled_run_outcome(&config, &job, alias, true, "Reminder: call Sam.").await,
+            "persisted"
+        );
+        assert_eq!(
+            owner.snapshot(),
+            vec![
+                ("user".to_string(), "remind me at five".to_string()),
+                (
+                    "user".to_string(),
+                    format!("[cron:{} reminder] Remind me to call Sam", job.id)
+                ),
+                ("assistant".to_string(), "Reminder: call Sam.".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn main_job_without_a_recorded_conversation_is_not_bound() {
+        let alias = "binding-unbound-agent";
+        let tmp = TempDir::new().unwrap();
+        let config = bound_test_config(&tmp, alias).await;
+        let job = add_main_job(&config, alias, None);
+        // A surface is serving the agent, but the job names no conversation:
+        // nothing may be chosen on its behalf.
+        let owner = RecordingOwner::with_history(vec![ChatMessage::user("some other chat")]);
+        let _lease = publish_owner(alias, Arc::clone(&owner));
+
+        let conversation =
+            resolve_run_conversation(&config, &job, alias, RunTrigger::Schedule).await;
+        assert!(matches!(conversation, RunConversation::Unbound));
+        assert!(conversation.history().is_none());
+        assert_eq!(
+            record_run_in_conversation(&conversation, &job, alias, true, "done"),
+            "not_bound"
+        );
+        assert_eq!(owner.snapshot().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn binding_is_ignored_unless_the_job_targets_main() {
+        let alias = "binding-isolated-agent";
+        let tmp = TempDir::new().unwrap();
+        let config = bound_test_config(&tmp, alias).await;
+        let mut job = add_main_job(&config, alias, Some(&channel_binding(BOUND_KEY)));
+        job.session_target = SessionTarget::Isolated;
+        let owner = RecordingOwner::with_history(Vec::new());
+        let _lease = publish_owner(alias, Arc::clone(&owner));
+
+        assert_eq!(
+            scheduled_run_outcome(&config, &job, alias, true, "done").await,
+            "not_bound"
+        );
+        assert!(owner.snapshot().is_empty());
+    }
+
+    /// What a run recorded must match what it ran with: a conversation that
+    /// could not be reached when the run started is not written to when the
+    /// run ends, even if it has become reachable by then.
+    // Paused clock: if another test started the scheduler moments ago,
+    // the start-up window is open and this run would wait it out for real.
+    #[tokio::test(start_paused = true)]
+    async fn run_that_started_without_its_conversation_never_writes_to_it() {
+        let alias = "binding-late-owner-agent";
+        let tmp = TempDir::new().unwrap();
+        let config = bound_test_config(&tmp, alias).await;
+        let job = add_main_job(&config, alias, Some(&channel_binding(BOUND_KEY)));
+
+        // No surface is serving the agent when the run starts.
+        let conversation =
+            resolve_run_conversation(&config, &job, alias, RunTrigger::Schedule).await;
+        assert!(matches!(conversation, RunConversation::Unreachable));
+        assert!(conversation.history().is_none());
+
+        // It comes up later, while the run is executing.
+        let owner = RecordingOwner::with_history(Vec::new());
+        let _lease = publish_owner(alias, Arc::clone(&owner));
+        assert_eq!(
+            record_run_in_conversation(&conversation, &job, alias, true, "done"),
+            "failed"
+        );
+        assert!(owner.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unreadable_or_unwritable_conversation_reports_failed_persistence() {
+        let alias = "binding-failed-agent";
+        let tmp = TempDir::new().unwrap();
+        let config = bound_test_config(&tmp, alias).await;
+        let job = add_main_job(&config, alias, Some(&channel_binding(BOUND_KEY)));
+
+        // The history exists but cannot be read: the run goes ahead without
+        // it and writes nothing.
+        let unreadable = Arc::new(RecordingOwner {
+            fail_load: true,
+            ..RecordingOwner::default()
+        });
+        let lease = publish_owner(alias, Arc::clone(&unreadable));
+        assert_eq!(
+            scheduled_run_outcome(&config, &job, alias, true, "done").await,
+            "failed"
+        );
+        assert!(unreadable.snapshot().is_empty());
+        drop(lease);
+
+        // The history loads, but the owner refuses the write.
+        let unwritable = Arc::new(RecordingOwner {
+            fail_append: true,
+            ..RecordingOwner::default()
+        });
+        let _lease = publish_owner(alias, Arc::clone(&unwritable));
+        assert_eq!(
+            scheduled_run_outcome(&config, &job, alias, true, "done").await,
+            "failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_or_quiet_runs_leave_the_conversation_untouched() {
+        let alias = "binding-skipped-agent";
+        let tmp = TempDir::new().unwrap();
+        let config = bound_test_config(&tmp, alias).await;
+        let job = add_main_job(&config, alias, Some(&channel_binding(BOUND_KEY)));
+        let owner = RecordingOwner::with_history(Vec::new());
+        let _lease = publish_owner(alias, Arc::clone(&owner));
+
+        // The turn did not complete.
+        assert_eq!(
+            scheduled_run_outcome(&config, &job, alias, false, "agent job failed").await,
+            "skipped"
+        );
+        // The turn completed and deliberately said nothing.
+        assert_eq!(
+            scheduled_run_outcome(&config, &job, alias, true, "NO_REPLY").await,
+            "skipped"
+        );
+        // The model returned no text.
+        assert_eq!(
+            scheduled_run_outcome(&config, &job, alias, true, EMPTY_AGENT_REPLY_PLACEHOLDER).await,
+            "skipped"
+        );
+        assert!(owner.snapshot().is_empty());
+    }
+
+    /// The scheduler and the surfaces start independently. Inside the
+    /// start-up window a scheduled run waits for its surface; with no window
+    /// left it does not wait at all.
+    #[tokio::test(start_paused = true)]
+    async fn surface_that_starts_within_the_grace_is_waited_for() {
+        let alias = "binding-grace-agent";
+        let binding = channel_binding(BOUND_KEY);
+        let owner = RecordingOwner::with_history(Vec::new());
+
+        assert!(
+            conversation_owner_for(&binding, alias, Duration::ZERO)
+                .await
+                .is_none()
+        );
+        let waited = time::Instant::now();
+        assert!(
+            conversation_owner_for(&binding, alias, Duration::from_secs(2))
+                .await
+                .is_none()
+        );
+        assert!(waited.elapsed() >= Duration::from_secs(2));
+
+        let publisher = zeroclaw_spawn::spawn!({
+            let owner = Arc::clone(&owner);
+            async move {
+                time::sleep(Duration::from_secs(3)).await;
+                publish_owner(alias, owner)
+            }
+        });
+        let found = conversation_owner_for(&binding, alias, CONVERSATION_OWNER_GRACE).await;
+        let _lease = publisher.await.unwrap();
+        assert!(found.is_some());
+    }
+
+    /// The surface restarted while the run was executing: the write goes
+    /// through the instance serving now, and nowhere when none is.
+    #[tokio::test]
+    async fn finished_run_is_written_by_the_surface_serving_at_that_moment() {
+        let alias = "binding-restart-agent";
+        let tmp = TempDir::new().unwrap();
+        let config = bound_test_config(&tmp, alias).await;
+        let job = add_main_job(&config, alias, Some(&channel_binding(BOUND_KEY)));
+        let retired = RecordingOwner::with_history(Vec::new());
+        let lease = publish_owner(alias, Arc::clone(&retired));
+        let conversation =
+            resolve_run_conversation(&config, &job, alias, RunTrigger::Schedule).await;
+        assert!(conversation.history().is_some());
+
+        let successor = RecordingOwner::with_history(Vec::new());
+        let successor_lease = publish_owner(alias, Arc::clone(&successor));
+        drop(lease);
+        assert_eq!(
+            record_run_in_conversation(&conversation, &job, alias, true, "done"),
+            "persisted"
+        );
+        assert!(retired.snapshot().is_empty());
+        assert_eq!(successor.snapshot().len(), 2);
+
+        drop(successor_lease);
+        assert_eq!(
+            record_run_in_conversation(&conversation, &job, alias, true, "done"),
+            "failed"
+        );
+        assert_eq!(successor.snapshot().len(), 2);
+    }
+
+    // Paused clock: if another test started the scheduler moments ago,
+    // the start-up window is open and this run would wait it out for real.
+    #[tokio::test(start_paused = true)]
+    async fn conversation_owner_is_resolved_for_the_executing_agent_only() {
+        let alias = "binding-owner-scope-agent";
+        let tmp = TempDir::new().unwrap();
+        let config = bound_test_config(&tmp, alias).await;
+        let job = add_main_job(&config, alias, Some(&channel_binding(BOUND_KEY)));
+        // Another agent's surface holds a conversation under the same key.
+        let other = RecordingOwner::with_history(vec![ChatMessage::user("another agent's chat")]);
+        let _lease = publish_owner("binding-owner-scope-other", Arc::clone(&other));
+
+        let conversation =
+            resolve_run_conversation(&config, &job, alias, RunTrigger::Schedule).await;
+        assert!(matches!(conversation, RunConversation::Unreachable));
+        assert_eq!(
+            record_run_in_conversation(&conversation, &job, alias, true, "done"),
+            "failed"
+        );
+        assert_eq!(other.snapshot().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn binding_is_not_honoured_for_an_agent_that_only_claims_the_job() {
+        let creator = "binding-claim-creator";
+        let claimant = "binding-claim-claimant";
+        let tmp = TempDir::new().unwrap();
+        let config = bound_test_config(&tmp, creator).await;
+        let job = add_main_job(&config, creator, Some(&channel_binding(BOUND_KEY)));
+        // The claimant serves a conversation under the same key.
+        let claimants_chat =
+            RecordingOwner::with_history(vec![ChatMessage::user("the claimant's own chat")]);
+        let _lease = publish_owner(claimant, Arc::clone(&claimants_chat));
+
+        let conversation =
+            resolve_run_conversation(&config, &job, claimant, RunTrigger::Schedule).await;
+        assert!(matches!(conversation, RunConversation::Unreachable));
+        assert_eq!(
+            record_run_in_conversation(&conversation, &job, claimant, true, "done"),
+            "failed"
+        );
+        assert_eq!(claimants_chat.snapshot().len(), 1);
+    }
+
+    /// A manual trigger receives the run's output, so it may only bring the
+    /// job's conversation into the run when it is itself part of that
+    /// conversation.
+    #[tokio::test]
+    async fn manual_run_uses_the_conversation_only_when_triggered_from_it() {
+        let alias = "binding-manual-agent";
+        let tmp = TempDir::new().unwrap();
+        let config = bound_test_config(&tmp, alias).await;
+        let job = add_main_job(&config, alias, Some(&channel_binding(BOUND_KEY)));
+        let owner = RecordingOwner::with_history(vec![ChatMessage::user("remind me at five")]);
+        let _lease = publish_owner(alias, Arc::clone(&owner));
+        let resolve_from = |serving| {
+            zeroclaw_api::TOOL_LOOP_ACTIVE_CONVERSATION.scope(
+                serving,
+                resolve_run_conversation(&config, &job, alias, RunTrigger::Manual),
+            )
+        };
+
+        // Triggered outside any conversation: the gateway, RPC, the CLI.
+        let outside = resolve_run_conversation(&config, &job, alias, RunTrigger::Manual).await;
+        assert!(matches!(outside, RunConversation::Unbound));
+        assert!(matches!(resolve_from(None).await, RunConversation::Unbound));
+        // Triggered from another conversation of the same agent.
+        assert!(matches!(
+            resolve_from(serving(alias, "telegram_99_99")).await,
+            RunConversation::Unbound
+        ));
+        // Triggered from the same key while serving a different agent.
+        assert!(matches!(
+            resolve_from(serving("another-agent", BOUND_KEY)).await,
+            RunConversation::Unbound
+        ));
+        // Triggered from the job's own conversation.
+        let from_within = resolve_from(serving(alias, BOUND_KEY)).await;
+        assert_eq!(from_within.history().map(<[ChatMessage]>::len), Some(1));
+    }
+
+    /// The reported sequence end to end on the cron side: a job bound to a
+    /// conversation runs with that conversation as context, and its exchange
+    /// is in the conversation afterwards.
+    #[tokio::test]
+    async fn bound_main_job_runs_with_its_conversation_and_records_the_run() {
+        use axum::{Json, Router, routing::post};
+        use zeroclaw_config::schema::{ModelProviderConfig, OllamaModelProviderConfig};
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let requests_for_handler = Arc::clone(&requests);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                requests_for_handler.lock().unwrap().push(body);
+                async {
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "Reminder: call Sam."}}]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let alias = "binding-run-agent";
+        let tmp = TempDir::new().unwrap();
+        let mut config = bound_test_config(&tmp, alias).await;
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.reliability.scheduler_retries = 0;
+        config.providers.models.ollama.insert(
+            "binding".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("binding-test-model".to_string()),
+                    timeout_secs: Some(5),
+                    uri: Some(format!("http://{address}")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.get_mut(alias).unwrap().model_provider = "ollama.binding".into();
+        let security = SecurityPolicy::for_agent(&config, alias).unwrap();
+
+        let mut job = add_main_job(&config, alias, Some(&channel_binding(BOUND_KEY)));
+        job.allowed_tools = Some(vec![]);
+        let cron_prompt = format!("[cron:{} reminder] Remind me to call Sam", job.id);
+        let owner = RecordingOwner::with_history(vec![
+            ChatMessage::user("remind me at five to call Sam"),
+            ChatMessage::assistant("Scheduled."),
+        ]);
+        let _lease = publish_owner(alias, Arc::clone(&owner));
+        let sent_messages = |request: usize| -> Vec<(String, String)> {
+            requests.lock().unwrap()[request]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| {
+                    (
+                        m["role"].as_str().unwrap_or_default().to_string(),
+                        m["content"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect()
+        };
+
+        let (_, success, output) = Box::pin(execute_and_persist_job(
+            &config,
+            &security,
+            alias,
+            &job,
+            "binding-test",
+            None,
+        ))
+        .await;
+        assert!(success, "bound cron run failed: {output}");
+
+        // The provider saw the conversation, then the job's own message.
+        let sent = sent_messages(0);
+        let position = |role: &str, needle: &str| {
+            sent.iter()
+                .position(|(r, c)| r == role && c.contains(needle))
+                .unwrap_or_else(|| panic!("{role} message containing {needle:?} in {sent:?}"))
+        };
+        let asked = position("user", "remind me at five to call Sam");
+        let scheduled = position("assistant", "Scheduled.");
+        let ran = position("user", &cron_prompt);
+        assert!(asked < scheduled && scheduled < ran, "order: {sent:?}");
+        assert_eq!(
+            ran,
+            sent.len() - 1,
+            "the job's message comes last: {sent:?}"
+        );
+
+        // The conversation holds the run as the bare attributed prompt and
+        // the reply, without the per-run context the provider was sent.
+        let recorded = owner.snapshot();
+        assert_eq!(recorded.len(), 4, "{recorded:?}");
+        assert_eq!(recorded[2], ("user".to_string(), cron_prompt.clone()));
+        assert_eq!(
+            recorded[3],
+            ("assistant".to_string(), "Reminder: call Sam.".to_string())
+        );
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].execution.as_deref(), Some("ok"));
+        assert_eq!(runs[0].persistence.as_deref(), Some("persisted"));
+
+        // A manual run started outside the conversation gets none of it and
+        // leaves it alone.
+        let manual = run_manual_job(&config, &job, CronDeliveryContext::GatewayManual, &None).await;
+        assert!(manual.success, "manual run failed: {}", manual.output);
+        let sent = sent_messages(1);
+        assert!(
+            !sent.iter().any(|(_, c)| c.contains("remind me at five")),
+            "a manual run from elsewhere must not carry the conversation: {sent:?}"
+        );
+        assert_eq!(owner.snapshot().len(), 4);
+
+        // A manual run started from the conversation itself is part of it.
+        let manual = zeroclaw_api::TOOL_LOOP_ACTIVE_CONVERSATION
+            .scope(
+                serving(alias, BOUND_KEY),
+                run_manual_job(&config, &job, CronDeliveryContext::ToolManual, &None),
+            )
+            .await;
+        assert!(manual.success, "manual run failed: {}", manual.output);
+        let sent = sent_messages(2);
+        assert!(
+            sent.iter().any(|(_, c)| c.contains("Reminder: call Sam.")),
+            "a run from within the conversation sees the earlier run: {sent:?}"
+        );
+        assert_eq!(owner.snapshot().len(), 6);
+
+        // Newest first.
+        let persistence: Vec<_> = cron::list_runs(&config, &job.id, 10)
+            .unwrap()
+            .into_iter()
+            .map(|run| run.persistence.unwrap_or_default())
+            .collect();
+        assert_eq!(persistence, ["persisted", "not_bound", "persisted"]);
+        server.abort();
     }
 
     #[tokio::test]
@@ -3808,6 +4725,7 @@ mod tests {
             "ok",
             started,
             finished,
+            "not_bound",
         )
         .await;
         assert!(success);
