@@ -28,6 +28,53 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 
 Family-specific entries add their own typed fields on top of these shared fields.
 
+## Thinking controls for Ollama and llama.cpp
+
+Set `think` on the provider alias to request thinking on or off:
+
+```toml
+[providers.models.ollama.local]
+uri = "http://localhost:11434/v1"
+model = "qwen3:8b"
+think = false
+
+[providers.models.llamacpp.local]
+uri = "http://localhost:8080/v1"
+model = "local-model"
+think = false
+```
+
+When `think` is unset, these providers inherit
+`[runtime] reasoning_enabled`. If both are unset, ZeroClaw sends no on/off
+override and the backend keeps its default. An alias's explicit `think` value
+takes precedence over the global switch and conflicting manual reasoning
+fields in `provider_extra` or `chat_template_kwargs`. Unrelated request options
+are preserved.
+
+Ollama's compatible chat endpoint receives `reasoning_effort = "none"` for an
+off request. llama.cpp's chat endpoint also receives
+`chat_template_kwargs = { enable_thinking = false }`. llama.cpp's Responses
+wire receives `reasoning.effort = "none"`. On requests that enable thinking,
+ZeroClaw keeps a non-`none` effort from `provider_extra.reasoning_effort` or
+`runtime.reasoning_effort`, using `"medium"` when neither provides one.
+
+These are backend requests, not a guarantee that every model stops generating
+reasoning. The model and its chat template must support an off mode. A backend
+can stop returning a separate reasoning field while the model still generates
+reasoning in ordinary answer text. Check the response itself when verifying
+suppression. See [Ollama thinking controls](https://docs.ollama.com/capabilities/thinking)
+and [llama.cpp's chat endpoint](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md#post-v1chatcompletions-openai-compatible-chat-completions-api).
+
+`agent.thinking.native_thinking = false` only stops ZeroClaw adding native
+thinking budgets; it leaves the model's own defaults unchanged.
+`agent.thinking.display = "off"` leaves Anthropic's display option unset and
+does not control Ollama or llama.cpp output. llama.cpp's
+`reasoning_format = "none"` changes output parsing rather than disabling
+generation.
+
+After changing provider settings, restart the daemon and start a fresh chat
+so the request uses a newly constructed provider.
+
 ## Anthropic thinking passthrough
 
 `thinking_passthrough = true` on an OpenAI-compatible provider entry opts that

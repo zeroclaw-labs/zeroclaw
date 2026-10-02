@@ -103,13 +103,17 @@ impl ThinkingDisplayMode {
 pub struct ThinkingConfig {
     #[serde(default)]
     pub default_level: ThinkingLevel,
-    /// Enables provider-native thinking parameters when the selected level has a budget.
+    /// Requests provider-native thinking parameters when the selected level
+    /// has a budget. False leaves provider/model defaults unchanged; it does
+    /// not send a request to disable the model's own reasoning.
     #[serde(default)]
     pub native_thinking: bool,
     #[serde(default)]
     pub budget_tokens: HashMap<String, u32>,
     /// Anthropic `thinking.display` beta control. Only meaningful when
     /// `native_thinking` is enabled and the provider is Anthropic.
+    /// `off` leaves the display field unset; it does not hide reasoning text
+    /// in other providers or interfaces.
     #[serde(default)]
     pub display: ThinkingDisplayMode,
 }
