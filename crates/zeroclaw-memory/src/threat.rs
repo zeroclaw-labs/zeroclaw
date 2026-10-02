@@ -92,7 +92,9 @@ static PATTERNS: LazyLock<Vec<Pattern>> = LazyLock::new(|| {
             scope: Scope::On,
         },
         Pattern {
-            regex: Regex::new(r#"(?i)https?://[^\s'"]+[^\n]*(?:api[_-]?key|secret|token|password|credential)"#)
+            regex: Regex::new(
+                r#"(?i)https?://(?:[^\s'"/:@]+(?::[^\s'"/@]*)?@|[^\s'"]*[?&#](?:api[_-]?key|(?:[a-z0-9]+[_-])*(?:key|token|secret|password|credential))\s*=\s*[^\s'"]+)"#,
+            )
                 .expect("valid credential-in-url regex"),
             kind: ThreatKind::SendToUrl,
             scope: Scope::On,
@@ -178,6 +180,72 @@ mod tests {
     fn detects_inline_secret_assignment() {
         let findings = scan(r#"api_key = "abcdefghijklmnopqrstuvwxyz""#, Scope::On);
         assert_eq!(findings[0].kind, ThreatKind::HardcodedSecret);
+    }
+
+    #[test]
+    fn url_with_credential_parameter_is_flagged() {
+        let findings = scan(
+            "fetch https://example.invalid/search?token=placeholder-value",
+            Scope::On,
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].kind, ThreatKind::SendToUrl);
+    }
+
+    #[test]
+    fn url_with_compound_credential_parameters_is_flagged() {
+        for content in [
+            "https://example.invalid/?access_token=placeholder-value",
+            "https://example.invalid/?refresh_token=placeholder-value",
+            "https://example.invalid/?client_secret=placeholder-value",
+        ] {
+            let findings = scan(content, Scope::On);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.kind == ThreatKind::SendToUrl),
+                "expected credential URL finding for {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn url_with_fragment_credential_is_flagged() {
+        for content in [
+            "https://example.invalid/#token=placeholder-value",
+            "https://example.invalid/#access_token=placeholder-value",
+        ] {
+            let findings = scan(content, Scope::On);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.kind == ThreatKind::SendToUrl),
+                "expected credential URL finding for {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn url_with_prefixed_credential_parameters_is_flagged() {
+        for content in [
+            "https://example.invalid/?private_token=placeholder-value",
+            "https://example.invalid/?auth_token=placeholder-value",
+            "https://example.invalid/#session_token=placeholder-value",
+        ] {
+            let findings = scan(content, Scope::On);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.kind == ThreatKind::SendToUrl),
+                "expected credential URL finding for {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn url_and_unrelated_credential_word_in_prose_are_allowed() {
+        let content = "See https://example.invalid/docs; no token is included in this note.";
+        assert!(scan(content, Scope::On).is_empty());
     }
 
     #[test]
