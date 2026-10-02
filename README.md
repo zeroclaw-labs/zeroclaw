@@ -177,6 +177,16 @@ Any other repository, organization, domain, or package claiming to be "ZeroClaw"
 
 Dual-licensed: [MIT](LICENSE-MIT) OR [Apache 2.0](LICENSE-APACHE). You may choose either. Contributors automatically grant rights under both — see [CLA](docs/book/src/contributing/cla.md). The **ZeroClaw** name and logo are trademarks of ZeroClaw Labs.
 
+## Sponsors
+
+Thanks to [Blacksmith](https://www.blacksmith.sh/) for sponsoring the CI infrastructure that builds and tests ZeroClaw.
+
+<p align="center">
+  <a href="https://www.blacksmith.sh/">
+    <img src="docs/assets/blacksmith-powered-wob.png" alt="CI powered by Blacksmith" width="368" />
+  </a>
+</p>
+
 ## Credits
 
 Built and maintained by the community — original creator [@theonlyhennygod](https://github.com/theonlyhennygod); project lead [@JordanTheJet](https://github.com/JordanTheJet). Full maintainer list in [Communication](docs/book/src/contributing/communication.md).
