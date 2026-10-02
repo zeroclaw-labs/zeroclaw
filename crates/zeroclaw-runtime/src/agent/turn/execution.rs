@@ -228,6 +228,7 @@ pub struct ResolvedAgentExecution<'a> {
     pub parallel_tools: bool,
     /// Truncation limit for tool outputs.
     pub max_tool_result_chars: usize,
+    pub keep_tool_context_turns: usize,
     /// Capacity and proactive-trim budget resolved together for the selected
     /// route at the turn boundary.
     pub context_limits: ResolvedContextLimits,
@@ -275,6 +276,7 @@ pub struct ResolvedRuntimeKnobs<'a> {
     pub strict_tool_parsing: bool,
     pub parallel_tools: bool,
     pub max_tool_result_chars: usize,
+    pub keep_tool_context_turns: usize,
     pub context_limits: ResolvedContextLimits,
     /// Single live limits authority; see [`ResolvedAgentExecution::context_limits_resolver`].
     pub context_limits_resolver: Option<ContextLimitsResolver>,
@@ -306,6 +308,7 @@ impl<'a> ResolvedAgentExecution<'a> {
             strict_tool_parsing: runtime.strict_tool_parsing,
             parallel_tools: runtime.parallel_tools,
             max_tool_result_chars: runtime.max_tool_result_chars,
+            keep_tool_context_turns: runtime.keep_tool_context_turns,
             context_limits: runtime.context_limits,
             context_limits_resolver: runtime.context_limits_resolver,
             receipt_generator: io.receipt_generator,

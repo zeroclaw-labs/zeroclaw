@@ -525,6 +525,30 @@ struct PreDispatchTrimResult {
     kept_turns: usize,
 }
 
+fn record_tool_context_collapse(
+    collapsed: &crate::agent::history_trim::CollapsedToolContext,
+    keep_prior_turns: usize,
+    turn_id: &str,
+) {
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_category(::zeroclaw_log::EventCategory::Agent)
+            .with_attrs(::serde_json::json!({
+                "dropped_messages": collapsed.dropped_messages,
+                "collapsed_turns": collapsed.collapsed_turns,
+                "keep_tool_context_turns": keep_prior_turns,
+                "turn_id": turn_id,
+            })),
+        format!(
+            "Tool context collapsed for this request: {} older turn(s) sent without {} tool row(s); the newest {} turn(s) sent whole",
+            collapsed.collapsed_turns,
+            collapsed.dropped_messages,
+            keep_prior_turns.saturating_add(1)
+        )
+    );
+}
+
 fn record_dispatch_trim(
     (provider_name, model): (&str, &str),
     trim: &PreDispatchTrimResult,
@@ -1099,6 +1123,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         strict_tool_parsing,
         parallel_tools,
         max_tool_result_chars,
+        keep_tool_context_turns,
         context_limits,
         context_limits_resolver,
         receipt_generator,
@@ -1445,14 +1470,31 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             activated_tools,
         )?;
 
+        // The request is built from a population in which turns older than
+        // the newest `keep_tool_context_turns + 1` have lost their tool rows.
+        // The working history itself is untouched, so owners that persist it
+        // (channel cache, ACP transcript, CLI session file) keep every row.
+        let collapsed = crate::agent::history_trim::collapse_tool_context_older_than(
+            turn_state.history,
+            keep_tool_context_turns,
+            turn_state.crumb_present,
+        );
+        if iteration == 0 && collapsed.dropped_messages > 0 {
+            record_tool_context_collapse(&collapsed, keep_tool_context_turns, turn_id);
+        }
         let (prepared_messages, prepared_source_rows) =
             vision_route::prepare_messages_with_source_rows(
-                turn_state.history,
+                &collapsed.messages,
                 multimodal_config,
                 degrade_strip_images,
                 image_cache.as_deref_mut(),
             )
             .await?;
+        // Source rows must index the working history, not the collapsed copy.
+        let prepared_source_rows: Vec<usize> = prepared_source_rows
+            .iter()
+            .map(|&row| collapsed.source_rows[row])
+            .collect();
         let mut provider_request_messages = prepared_messages.messages;
         let pre_hook_messages = provider_request_messages.clone();
         let mut hook_selected_model = None;
@@ -2177,13 +2219,13 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             if malformed_tool_protocol_retries <= MAX_MALFORMED_TOOL_PROTOCOL_RETRIES {
                 // This is model feedback, not a tool result: malformed protocol
                 // output has no valid tool_call_id to attach a role=tool message to.
-                let msg = ChatMessage::user(
-                    "[Tool call parse error]\n\
+                let msg = ChatMessage::user(format!(
+                    "{}\n\
                      Your previous response looked like an internal tool-call protocol payload, \
                      but ZeroClaw could not parse it into a valid tool call. Use the supported \
-                     tool-call schema, or answer in natural language if no tool is needed."
-                        .to_string(),
-                );
+                     tool-call schema, or answer in natural language if no tool is needed.",
+                    crate::agent::history_trim::RUNTIME_FEEDBACK_PREFIXES[0]
+                ));
                 turn_state.push_dual(msg);
                 continue;
             }
@@ -3583,6 +3625,14 @@ async fn drive_live_sop_actions(
                                             strict_tool_parsing: eff_strict_tool_parsing,
                                             parallel_tools: eff_parallel_tools,
                                             max_tool_result_chars: eff_max_tool_result_chars,
+                                            // A live SOP step runs on the caller's
+                                            // history as part of the caller's turn;
+                                            // the caller's turn is never collapsed,
+                                            // so this nested loop must not collapse
+                                            // it either (each step prompt is a user
+                                            // row, so the outer turn would look
+                                            // "older" from in here).
+                                            keep_tool_context_turns: usize::MAX,
                                             context_limits: eff_context_limits,
                                             context_limits_resolver: None,
                                             knobs,
@@ -5596,6 +5646,7 @@ vision_model_provider = "custom.vision"
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 100_000,
+                    keep_tool_context_turns: 2,
                     context_limits: text_limits,
                     context_limits_resolver: None,
                     knobs: &knobs,
@@ -6484,6 +6535,7 @@ mod sop_step_reassembly_tests {
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 30_000,
+                    keep_tool_context_turns: 2,
                     context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(
                         100_000,
                     ),
@@ -8285,6 +8337,7 @@ mod tool_lifecycle_abandonment_tests {
                 strict_tool_parsing: false,
                 parallel_tools,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: zeroclaw_config::schema::ResolvedContextLimits {
                     context_token_budget,
                     ..zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0)

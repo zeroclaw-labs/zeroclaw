@@ -124,6 +124,44 @@ logs only, without the breadcrumb or `HistoryTrimmed` event. This path serves
 interactive use as well as one-shot and non-interactive daemon, cron, subagent,
 and SOP callers.
 
+## Tool context retention
+
+`keep_tool_context_turns` (runtime profile, default `2`) is the number of
+completed turns before the running one whose tool-call and tool-result rows are
+still sent to the model. Every older turn is sent as its user prompt, one
+`[Tool exchange: N tool call(s) — results collapsed]` summary row in place of the
+assistant row that issued the calls, and the closing assistant reply, so the
+model still sees what was asked and what was answered without the raw tool
+output. The running turn is always sent whole because the model needs its own
+results, so `0` keeps tool context for the running turn only; the local-model
+preset's `1` keeps it for one prior turn as well, and case-style presets use `8`.
+
+This is a request-time bound, not a transcript edit. The tool loop builds each
+provider request from a collapsed copy; the working history and every store an
+owner persists from it (channel sender cache, ACP transcript, CLI session file)
+keep all their rows, so raising the value later shows older tool rows again. The
+summary row is the marker the providers already recognise: those that reject
+consecutive assistant rows skip it before dispatch, so on those routes the older
+turn is sent as prompt and reply only.
+
+A turn collapses as a unit, in both native (`role=tool`) and prompt-mode
+(`[Tool results]` carrier) shapes, so no orphan call or result is created. A
+turn that ended on a call or a result keeps only its prompt and the summary; an
+assistant row that still carries native tool calls is never kept as a closing
+reply. Leading system messages and the trim breadcrumb are copied through. The loop's
+own mid-turn feedback row (`[Tool call parse error]`, user-role because no tool
+call id exists to attach it to) belongs to the turn it interrupts and does not
+open a new one for retention. Two
+loops that run on the caller's own history as part of the caller's turn never
+collapse: live SOP steps and the skill-review fork, since each step or review
+prompt is a user row and the caller's turn would otherwise look older from
+inside them. The first request of a turn that collapses anything logs a `Tool
+context collapsed` record with the row and turn counts; no `HistoryTrimmed`
+event is emitted because no turn is lost.
+
+On channels the same key also decides whether the current turn's tool rows are
+persisted into the sender cache at all (`0` skips them).
+
 ## Pairing safety
 
 Whole-turn retention is the primary tool-pairing guarantee: a tool call and its

@@ -9986,6 +9986,7 @@ async fn process_channel_message_body(
                         strict_tool_parsing: ctx.agent_cfg.resolved.strict_tool_parsing,
                         parallel_tools: ctx.agent_cfg.resolved.parallel_tools,
                         max_tool_result_chars: ctx.max_tool_result_chars,
+                        keep_tool_context_turns: ctx.agent_cfg.resolved.keep_tool_context_turns,
                         context_limits,
                         context_limits_resolver: None,
                         knobs: &loop_knobs,
@@ -10412,7 +10413,10 @@ async fn process_channel_message_body(
 
             // Persist intermediate tool-call/result messages from this turn
             // so the model retains concrete "I used tools" examples in
-            // context, preventing drift toward tool-less responses.
+            // context, preventing drift toward tool-less responses. How many
+            // turns keep those rows on the provider-facing history is decided
+            // per request by the tool loop (`keep_tool_context_turns` counts
+            // turns there); here the key only gates whether they are stored.
             //
             // Skipped when the pre-trim resync above could not confirm the
             // cache matches what's durable: appending onto an evicted cache
