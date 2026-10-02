@@ -29,9 +29,12 @@ Use a fresh mock and runtime data directory for each run. Configure:
   `soak`; any required API-key placeholder must be synthetic.
 - Three eagerly discovered HTTP MCP servers named `soak0`, `soak1`, `soak2`, URLs
   `http://mock:8080/mcp/0`, `/mcp/1`, `/mcp/2`. Each advertises 12 harmless tools.
-- Bounded history of 16 messages, tool-iteration cap **26**, sufficiently high
+- Set `max_history_messages = 16`, tool-iteration cap **26**, sufficiently high
   synthetic action budget, memory backend `none`, session persistence disabled,
-  and sufficient context capacity to avoid unrelated compaction.
+  and sufficient context capacity to avoid unrelated compaction. The historical
+  runtime preserves whole turns, so this is a configured trimming target, not a
+  hard bound of 16 messages: a tool-heavy active turn can exceed it. Keep the
+  same setting and history policy in both runs.
 
 Every tool has a 3,072-byte input schema using Python's default JSON serialization
 (compact wire encoding is slightly smaller). One turn makes **25 sequential real
