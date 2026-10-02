@@ -9,10 +9,57 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::time::Duration;
 use zeroclaw_config::schema::{ChannelAliasInfo, Config};
 use zeroclaw_memory::MemoryEntry;
 
 const MEMORY_API_CONTENT_MAX_CHARS: usize = 4096;
+const OPENROUTER_CREDITS_URL: &str = "https://openrouter.ai/api/v1/credits";
+
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct OpenRouterCreditsResponse {
+    pub total_credits: f64,
+    pub total_usage: f64,
+    pub remaining_credits: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterCreditsEnvelope {
+    data: OpenRouterCreditsData,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterCreditsData {
+    total_credits: f64,
+    total_usage: f64,
+}
+
+fn active_openrouter_management_key(config: &Config) -> Option<String> {
+    let mut agents: Vec<_> = config.agents.iter().collect();
+    agents.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+    agents.into_iter().find_map(|(_, agent)| {
+        if !agent.enabled {
+            return None;
+        }
+        let (family, alias) = agent.model_provider.as_str().split_once('.')?;
+        if family != "openrouter" {
+            return None;
+        }
+        let provider = config.providers.models.openrouter.get(alias)?;
+        provider
+            .base
+            .api_key
+            .as_deref()
+            .filter(|key| !key.is_empty())?;
+        provider
+            .management_api_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+            .map(str::to_owned)
+    })
+}
 
 fn integration_entry_json(
     entry: &zeroclaw_runtime::integrations::IntegrationEntry,
@@ -1271,6 +1318,94 @@ pub async fn handle_api_cost(
     }
 }
 
+/// GET /api/openrouter/credits — account credit totals for an active
+/// OpenRouter-backed agent. The dashboard treats 204 as unavailable and hides
+/// the card. Secrets and upstream response bodies never cross this boundary.
+pub async fn handle_api_openrouter_credits(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let management_key = {
+        let config = state.config.read();
+        active_openrouter_management_key(&config)
+    };
+    let Some(management_key) = management_key else {
+        return StatusCode::NO_CONTENT.into_response();
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                "failed to build OpenRouter credits client"
+            );
+            return StatusCode::NO_CONTENT.into_response();
+        }
+    };
+
+    let response = match client
+        .get(OPENROUTER_CREDITS_URL)
+        .bearer_auth(management_key)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                "OpenRouter credits request failed"
+            );
+            return StatusCode::NO_CONTENT.into_response();
+        }
+    };
+
+    if !response.status().is_success() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"status": response.status().as_u16()})),
+            "OpenRouter credits API rejected the configured management key"
+        );
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
+    let credits = match response.json::<OpenRouterCreditsEnvelope>().await {
+        Ok(credits) => credits.data,
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                "OpenRouter credits API returned an invalid response"
+            );
+            return StatusCode::NO_CONTENT.into_response();
+        }
+    };
+
+    Json(OpenRouterCreditsResponse {
+        total_credits: credits.total_credits,
+        total_usage: credits.total_usage,
+        remaining_credits: credits.total_credits - credits.total_usage,
+    })
+    .into_response()
+}
+
 /// GET /api/cli-tools — discovered CLI tools
 pub async fn handle_api_cli_tools(
     State(state): State<AppState>,
@@ -2266,6 +2401,49 @@ pub(crate) mod tests {
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
     use zeroclaw_providers::ModelProvider;
     use zeroclaw_runtime::security::pairing::PairingGuard;
+
+    #[test]
+    fn openrouter_credits_require_an_enabled_agent_and_both_keys() {
+        let mut config = Config::default();
+        let mut provider = zeroclaw_config::schema::OpenRouterModelProviderConfig::default();
+        provider.base.api_key = Some("inference-key".into());
+        provider.management_api_key = Some("management-key".into());
+        config
+            .providers
+            .models
+            .openrouter
+            .insert("primary".into(), provider);
+
+        let mut agent = zeroclaw_config::schema::AliasedAgentConfig::default();
+        agent.model_provider = "openrouter.primary".into();
+        config.agents.insert("assistant".into(), agent);
+
+        assert_eq!(
+            active_openrouter_management_key(&config).as_deref(),
+            Some("management-key")
+        );
+
+        config.agents.get_mut("assistant").unwrap().enabled = false;
+        assert!(active_openrouter_management_key(&config).is_none());
+    }
+
+    #[test]
+    fn openrouter_credits_ignore_orphaned_or_incomplete_provider_entries() {
+        let mut config = Config::default();
+        let mut provider = zeroclaw_config::schema::OpenRouterModelProviderConfig::default();
+        provider.management_api_key = Some("management-key".into());
+        config
+            .providers
+            .models
+            .openrouter
+            .insert("primary".into(), provider);
+
+        let mut agent = zeroclaw_config::schema::AliasedAgentConfig::default();
+        agent.model_provider = "openrouter.primary".into();
+        config.agents.insert("assistant".into(), agent);
+
+        assert!(active_openrouter_management_key(&config).is_none());
+    }
 
     #[derive(Default)]
     struct MockMemory {
