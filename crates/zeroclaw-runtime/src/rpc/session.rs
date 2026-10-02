@@ -2,7 +2,6 @@
 
 use crate::agent::agent::{Agent, TurnEvent};
 use crate::agent::dispatcher::ToolDispatcher;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -66,15 +65,7 @@ impl CancelCause {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct SessionOverrides {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_provider: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f64>,
-}
+pub use zeroclaw_rpc_proto::types::SessionOverrides;
 
 /// An entry in the per-session upload index (content-addressed by SHA-256).
 #[derive(Clone, Debug)]
@@ -155,10 +146,71 @@ pub struct SessionRecord {
     /// Generation of the live incarnation, when one is present. Operations
     /// re-validate this exact value at their admission boundary.
     pub live_generation: Option<u64>,
+    /// Creation time obtained from the authorized chat row. This request
+    /// identity is derived from the backend, never an independent cache.
+    pub durable_created_at: Option<String>,
+    /// Request-scoped borrow of the canonical JSONL file incarnation.
+    pub durable_file_identity: Option<Arc<zeroclaw_infra::session_backend::SessionFileIdentity>>,
     /// The durable row, when one exists.
     pub durable: Option<DurableSession>,
     /// The owning principal; `None` for legacy / unscoped-creator records.
     pub owner: Option<String>,
+}
+
+/// Prefix of the admission-queue name of a stored chat row that no live
+/// session can cover.
+const STORED_ROW_QUEUE_PREFIX: &str = "\0row:";
+
+/// What a session-targeting call names.
+///
+/// A plain session id names the live session with that id and every chat
+/// key it can be stored under (`rpc_<id>`, `gw_<id>`, the raw id); the
+/// resolver picks among them. A chat key names exactly one chat-store row:
+/// `rpc_<id>` also covers the live chat session `<id>` (its own live
+/// incarnation), and any other key covers no live session at all, whatever
+/// ids the live map holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SessionAddress {
+    Id(String),
+    ChatKey(String),
+}
+
+impl SessionAddress {
+    /// The id the live session map knows this session by, when it can have
+    /// a live incarnation.
+    pub(crate) fn live_id(&self) -> Option<&str> {
+        match self {
+            Self::Id(id) => Some(id),
+            Self::ChatKey(key) => key.strip_prefix("rpc_"),
+        }
+    }
+
+    /// The name admission queues on. A session that can be live queues on
+    /// its live id; a stored row no live session can cover queues under a
+    /// reserved prefix, so it never waits behind, or answers busy for, a live
+    /// session that merely shares its spelling.
+    pub(crate) fn queue_id(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            Self::Id(id) => std::borrow::Cow::Borrowed(id),
+            Self::ChatKey(key) => match key.strip_prefix("rpc_") {
+                Some(id) => std::borrow::Cow::Borrowed(id),
+                None => std::borrow::Cow::Owned(format!("{STORED_ROW_QUEUE_PREFIX}{key}")),
+            },
+        }
+    }
+
+    /// The name logs and errors use: the id or the key as given.
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            Self::Id(id) | Self::ChatKey(id) => id,
+        }
+    }
+
+    /// Whether a live session in `mode` is this address's incarnation. An id
+    /// covers either mode; a chat key covers only a chat-mode session.
+    pub(crate) fn covers(&self, mode: &crate::rpc::types::ChatMode) -> bool {
+        matches!(self, Self::Id(_)) || matches!(mode, crate::rpc::types::ChatMode::Chat)
+    }
 }
 
 /// Canonical live-session data returned when `session/new` reattaches to an
@@ -323,6 +375,10 @@ pub struct SessionStore {
     /// but before it signals an in-flight turn.
     #[cfg(test)]
     test_removal_signal_pause: std::sync::Mutex<Option<RemovalSignalPause>>,
+    /// Test-only pause after `session/state` authorizes its target and
+    /// before it reads the live session.
+    #[cfg(test)]
+    test_state_read_pause: std::sync::Mutex<Option<PromptRehydrationPause>>,
     #[cfg(test)]
     test_prompt_admission_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Test-only pause before a rehydrated candidate is seeded and published.
@@ -409,6 +465,8 @@ impl SessionStore {
             test_prompt_rehydration_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_removal_signal_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_state_read_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_prompt_admission_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -1537,10 +1595,29 @@ impl SessionStore {
     /// caller authorized its predecessor is left untouched, and the caller
     /// learns the removal did not happen.
     pub async fn remove_generation(&self, id: &str, generation: u64) -> bool {
-        let mut sessions = self.sessions.lock().await;
-        if sessions.get(id).is_none_or(|s| s.generation != generation) {
-            return false;
+        match self
+            .remove_generation_authorized(id, generation, |_| Ok::<_, std::convert::Infallible>(()))
+            .await
+        {
+            Ok(removed) => removed.is_some(),
+            Err(never) => match never {},
         }
+    }
+
+    /// Authorize under the live map lock and retain the returned authority
+    /// through removal. The callback must be synchronous and must not acquire
+    /// the session map again.
+    pub(crate) async fn remove_generation_authorized<G, E>(
+        &self,
+        id: &str,
+        generation: u64,
+        authorize: impl FnOnce(&RpcSession) -> Result<G, E>,
+    ) -> Result<Option<Arc<Mutex<Agent>>>, E> {
+        let mut sessions = self.sessions.lock().await;
+        let Some(session) = sessions.get(id).filter(|s| s.generation == generation) else {
+            return Ok(None);
+        };
+        let authority = authorize(session)?;
         let mut tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
         let token = if tokens
             .get(id)
@@ -1555,14 +1632,17 @@ impl SessionStore {
             self.record_cancel_cause(id, CancelCause::SessionRemoved);
             token.cancel();
         }
-        let pending = sessions
-            .remove(id)
-            .and_then(|session| session.pending_generation);
+        let removed = sessions.remove(id);
+        let (agent, pending) = match removed {
+            Some(session) => (Some(session.agent), session.pending_generation),
+            None => (None, None),
+        };
+        drop(authority);
         drop(sessions);
         if let Some(notify) = pending {
             notify.notify_waiters();
         }
-        true
+        Ok(agent)
     }
 
     pub async fn evict_same_mode_sibling(
@@ -1790,6 +1870,30 @@ impl SessionStore {
     }
 
     #[cfg(test)]
+    pub(crate) async fn wait_test_state_read_pause(&self) {
+        let pause = self.test_state_read_pause.lock().unwrap().clone();
+        if let Some((entered, release)) = pause {
+            entered.notify_one();
+            release.notified().await;
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) async fn wait_test_state_read_pause(&self) {}
+
+    /// Arm [`Self::wait_test_state_read_pause`]: returns the notify that
+    /// fires when a state read reaches it and the one that releases it.
+    #[cfg(test)]
+    pub(crate) fn set_test_state_read_pause(&self) -> PromptRehydrationPause {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.test_state_read_pause.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&release)));
+        (entered, release)
+    }
+
+    #[cfg(test)]
     pub(crate) async fn wait_test_removal_signal_pause(&self) {
         let (entered, release) = {
             let guard = self.test_removal_signal_pause.lock().unwrap();
@@ -1896,18 +2000,39 @@ impl SessionStore {
         expected_generation: Option<u64>,
         cause: CancelCause,
     ) -> Option<bool> {
+        match self
+            .signal_cancellation_for_incarnation_authorized(id, expected_generation, cause, |_| {
+                Ok::<_, std::convert::Infallible>(())
+            })
+            .await
+        {
+            Ok(signalled) => signalled,
+            Err(never) => match never {},
+        }
+    }
+
+    /// Retain synchronous authority through the incarnation's cancellation
+    /// signal, under the same session map lock as its generation check.
+    pub(crate) async fn signal_cancellation_for_incarnation_authorized<G, E>(
+        &self,
+        id: &str,
+        expected_generation: Option<u64>,
+        cause: CancelCause,
+        authorize: impl FnOnce(Option<&RpcSession>) -> Result<G, E>,
+    ) -> Result<Option<bool>, E> {
         let sessions = self.sessions.lock().await;
         let current_generation = sessions.get(id).map(|session| session.generation);
         if current_generation != expected_generation {
-            return None;
+            return Ok(None);
         }
-        Some(
-            if cause == CancelCause::ClientRpc && expected_generation.is_none() {
-                self.signal_cancellation(id, cause)
-            } else {
-                self.signal_cancellation_for_generation(id, expected_generation, cause)
-            },
-        )
+        let authority = authorize(sessions.get(id))?;
+        let signalled = if cause == CancelCause::ClientRpc && expected_generation.is_none() {
+            self.signal_cancellation(id, cause)
+        } else {
+            self.signal_cancellation_for_generation(id, expected_generation, cause)
+        };
+        drop(authority);
+        Ok(Some(signalled))
     }
 
     /// Signal an in-flight turn before a close/delete handler waits for the
