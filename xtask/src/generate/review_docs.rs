@@ -179,10 +179,16 @@ fn render_protocol_fetch(policy: &ReviewCiPolicy) -> String {
      --json headRefOid,mergeable,mergeStateStatus)
    printf '%s\n' "$PR_STATE"
    HEAD_SHA=$(printf '%s' "$PR_STATE" | jq -r .headRefOid)
-   gh api "repos/zeroclaw-labs/zeroclaw/compare/{base_branch}...${{HEAD_SHA}}" \
-     --jq '{{status,behind_by,ahead_by}}'
-   gh pr checks <number> --repo zeroclaw-labs/zeroclaw \
-     --required --json name,state,bucket
+   COMPARE_STATUS=0
+   COMPARE_JSON=$(gh api "repos/zeroclaw-labs/zeroclaw/compare/{base_branch}...${{HEAD_SHA}}" \
+     --jq '{{status,behind_by,ahead_by}}') || COMPARE_STATUS=$?
+   printf 'compare_status=%s\n' "$COMPARE_STATUS"
+   printf '%s\n' "$COMPARE_JSON"
+   CHECKS_STATUS=0
+   CHECKS_JSON=$(gh pr checks <number> --repo zeroclaw-labs/zeroclaw \
+     --required --json name,state,bucket) || CHECKS_STATUS=$?
+   printf 'checks_status=%s\n' "$CHECKS_STATUS"
+   printf '%s\n' "$CHECKS_JSON"
    HEAD_AFTER=$(gh pr view <number> --repo zeroclaw-labs/zeroclaw \
      --json headRefOid --jq .headRefOid)
    if [ "$HEAD_AFTER" != "$HEAD_SHA" ]; then
@@ -201,7 +207,11 @@ fn render_protocol_fetch(policy: &ReviewCiPolicy) -> String {
    If the head moved during the capture, discard everything captured in this
    step and repeat it from `PR_STATE`; never classify a comparison from one
    head against checks from another. Treat the check output and `behind_by`
-   comparison as current only for the captured head. `gh pr checks` exits
+   comparison as current only for the captured head. The recipe records the
+   exit status and output of both fetches: a non-zero comparison status means
+   the base comparison is unavailable, not `behind_by: 0`, and a non-zero
+   checks status must be classified from its returned JSON as pending,
+   failing, or absent. `gh pr checks` exits
    non-zero by design when required checks are pending (exit {pending_exit_code}), failing, or
    absent. Treat that exit code as state to classify, not as a failed fetch,
    and inspect any JSON output it returned. Use this state for the CI freshness
@@ -391,6 +401,10 @@ mod tests {
             "[ \"$GH_MINOR\" -lt {} ]",
             POLICY.minimum_gh_minor
         )));
+        assert!(fetch.contains("COMPARE_STATUS=0"));
+        assert!(fetch.contains("printf 'compare_status=%s\\n' \"$COMPARE_STATUS\""));
+        assert!(fetch.contains("CHECKS_STATUS=0"));
+        assert!(fetch.contains("printf 'checks_status=%s\\n' \"$CHECKS_STATUS\""));
     }
 
     #[test]
