@@ -52,6 +52,11 @@ fixture; the analyzer also refuses unmatched before/after hashes. Counters and o
 pending call occupy constant space. Request bodies are limited to 4 MiB; no request
 or conversation history is recorded in mock memory. HTTP connections time out in
 10 seconds and driver HTTP requests in 5 seconds.
+At most eight connection handlers run concurrently, so one accepted idle connection
+does not block metrics or workload requests. The cap is acquired before a thread is
+created; excess connections receive HTTP 503 and increment the error counter, making
+the measurement fail visibly. State transitions and detached metric snapshots are
+locked, but request-body reads and response writes do not hold the state lock.
 The stdlib mock uses HTTP/1.0 with connection closure, identically for both runs;
 this does not reproduce every original server's keep-alive behavior.
 
@@ -161,7 +166,8 @@ python3 -m unittest discover -s tests/manual/mcp-memory-soak -v
 ```
 
 Run this command from the repository root. These tests exercise actual local HTTP
-requests, MCP inventory and calls, deterministic completion, SSE framing, payload
+requests, idle-connection starvation, bounded overload, concurrent duplicate-call
+rejection, MCP inventory and calls, deterministic completion, SSE framing, payload
 fingerprints/drift rejection, driver acceptance checks and matched-turn analysis.
 They do not replace the real-runtime smoke or Linux/glibc measurements. Historical
 protocol references: `crates/zeroclaw-gateway/src/ws.rs`,

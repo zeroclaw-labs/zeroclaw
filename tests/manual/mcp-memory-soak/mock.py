@@ -1,12 +1,16 @@
 """Bounded synthetic MCP/OpenAI fixture. Never connect this to public networks."""
 import argparse
+import copy
 import hashlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import re
+from socketserver import ThreadingMixIn
+import threading
 
 CALLS = 25
 SCHEMA_BYTES = 3072
+MAX_CONNECTIONS = 8
 
 
 def expected_names():
@@ -24,6 +28,7 @@ def schema():
 
 class State:
     def __init__(self):
+        self.lock = threading.Lock()
         self.metrics = {'tool_calls': 0, 'provider_calls': 0, 'errors': 0,
                         'inventory_count': 0, 'lists': [0, 0, 0],
                         'inventory_sha256': None, 'inventory_bytes': 0,
@@ -33,6 +38,18 @@ class State:
         self.finished = True
 
     def dispatch(self, path, body):
+        with self.lock:
+            return self._dispatch(path, body)
+
+    def snapshot(self):
+        with self.lock:
+            return copy.deepcopy(self.metrics)
+
+    def record_error(self):
+        with self.lock:
+            self.metrics['errors'] += 1
+
+    def _dispatch(self, path, body):
         if path == '/turn':
             turn = body['turn']
             if not self.finished or turn != self.metrics['turn'] + 1:
@@ -125,7 +142,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == '/metrics':
-            self.reply(200, self.server.state.metrics)
+            self.reply(200, self.server.state.snapshot())
         else:
             self.reply(404, {'error': 'unknown endpoint'})
 
@@ -150,14 +167,51 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.reply(200, result)
         except (ValueError, KeyError, TypeError) as exc:
-            self.server.state.metrics['errors'] += 1
+            self.server.state.record_error()
             self.reply(400, {'error': str(exc)})
 
 
+class BoundedHTTPServer(ThreadingMixIn, HTTPServer):
+    # Acquire before spawning: ThreadingMixIn alone permits unbounded threads.
+    daemon_threads = False
+    block_on_close = True
+
+    def __init__(self, address, handler):
+        self.slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        self.state = State()
+        super().__init__(address, handler)
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            self.state.record_error()
+            try:
+                # Never let overload handling monopolize the accept loop either.
+                request.settimeout(0.1)
+                body = b'{"error":"fixture connection limit exceeded"}'
+                request.sendall(b'HTTP/1.0 503 Service Unavailable\r\n'
+                                b'Content-Type: application/json\r\n'
+                                b'Connection: close\r\nContent-Length: '
+                                + str(len(body)).encode() + b'\r\n\r\n' + body)
+            except OSError:
+                pass  # The client may already have disconnected; errors stays nonzero.
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+
 def make_server(host, port):
-    server = HTTPServer((host, port), Handler)
-    server.state = State()
-    return server
+    return BoundedHTTPServer((host, port), Handler)
 
 
 if __name__ == '__main__':

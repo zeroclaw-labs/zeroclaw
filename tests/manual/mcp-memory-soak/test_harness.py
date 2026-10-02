@@ -1,6 +1,10 @@
 import importlib.util
 import json
 import hashlib
+import socket
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
+from queue import Queue
 from pathlib import Path
 import threading
 import unittest
@@ -79,6 +83,128 @@ class HarnessTests(unittest.TestCase):
                              {'Content-Type': 'application/json'}), timeout=3) as r:
             body = r.read()
             return json.loads(body) if body else None
+
+    def test_accepted_idle_connection_does_not_starve_metrics(self):
+        accepted = threading.Event()
+        original = self.server.RequestHandlerClass
+
+        class ObservedHandler(original):
+            def setup(self):
+                super().setup()
+                accepted.set()
+
+        self.server.RequestHandlerClass = ObservedHandler
+        # Suppress only the expected closed-client traceback on the unfixed server.
+        server_errors = []
+        self.server.handle_error = lambda *_: server_errors.append('handler error')
+        with socket.create_connection(self.server.server_address, timeout=1) as idle:
+            self.assertTrue(accepted.wait(2), 'idle socket was not accepted')
+            try:
+                with urlopen(self.base + '/metrics', timeout=1) as response:
+                    self.assertEqual(json.load(response)['errors'], 0)
+            except (TimeoutError, socket.timeout):
+                self.fail('accepted idle TCP connection starved the metrics endpoint')
+        self.assertEqual(server_errors, [])
+
+    def test_connection_cap_rejects_overload_without_spawning_more_handlers(self):
+        from urllib.error import HTTPError
+        accepted = Queue(maxsize=self.mock.MAX_CONNECTIONS)
+        finished = threading.Event()
+        counts = {'finished': 0, 'active': 0, 'peak': 0}
+        lock = threading.Lock()
+        original = self.server.RequestHandlerClass
+        original_process = self.server.process_request_thread
+
+        def observed_process(request, client_address):
+            original_process(request, client_address)
+            # BoundedHTTPServer has released its semaphore before returning.
+            with lock:
+                counts['finished'] += 1
+                if counts['finished'] == self.mock.MAX_CONNECTIONS:
+                    finished.set()
+
+        self.server.process_request_thread = observed_process
+
+        class ObservedHandler(original):
+            def setup(self):
+                super().setup()
+                with lock:
+                    counts['active'] += 1
+                    counts['peak'] = max(counts['peak'], counts['active'])
+                accepted.put_nowait(True)
+
+            def finish(self):
+                try:
+                    super().finish()
+                finally:
+                    with lock:
+                        counts['active'] -= 1
+
+        self.server.RequestHandlerClass = ObservedHandler
+        with ExitStack() as stack:
+            for _ in range(self.mock.MAX_CONNECTIONS):
+                stack.enter_context(socket.create_connection(self.server.server_address, timeout=1))
+                self.assertTrue(accepted.get(timeout=2))
+            with self.assertRaises(HTTPError) as raised:
+                urlopen(self.base + '/metrics', timeout=1)
+            self.assertEqual(raised.exception.code, 503)
+            self.assertEqual(json.load(raised.exception),
+                             {'error': 'fixture connection limit exceeded'})
+        self.assertTrue(finished.wait(2), 'idle request threads failed to release slots after close')
+        self.server.RequestHandlerClass = original
+        self.server.process_request_thread = original_process
+        with urlopen(self.base + '/metrics', timeout=2) as response:
+            metrics = json.load(response)
+        self.assertEqual(metrics['errors'], 1)
+        self.assertEqual(metrics['tool_calls'], 0)
+        self.assertEqual(counts['peak'], self.mock.MAX_CONNECTIONS)
+
+    def test_incomplete_body_does_not_hold_state_lock(self):
+        reading_body = threading.Event()
+        original = self.server.RequestHandlerClass
+
+        class ObservedHandler(original):
+            def do_POST(self):
+                reading_body.set()
+                super().do_POST()
+
+        self.server.RequestHandlerClass = ObservedHandler
+        with socket.create_connection(self.server.server_address, timeout=2) as slow:
+            slow.sendall(b'POST /turn HTTP/1.0\r\nContent-Length: 11\r\n\r\n')
+            self.assertTrue(reading_body.wait(2))
+            with urlopen(self.base + '/metrics', timeout=1) as response:
+                self.assertEqual(json.load(response)['errors'], 0)
+            slow.sendall(b'{"turn": 1}')
+            self.assertIn(b'200 OK', slow.recv(4096))
+
+    def test_concurrent_duplicate_calls_execute_once_and_snapshot_is_detached(self):
+        from urllib.error import HTTPError
+        self.post('/turn', {'turn': 1})
+        tools = [{'function': {'name': n}} for n in self.mock.expected_names()]
+        call = self.post('/v1/chat/completions', {'tools': tools})['choices'][0]['message']['tool_calls'][0]
+        request = {'id': 3, 'method': 'tools/call', 'params': {
+            'name': 'echo00', 'arguments': json.loads(call['function']['arguments'])}}
+        barrier = threading.Barrier(2)
+
+        def execute():
+            barrier.wait(timeout=2)
+            try:
+                self.post('/mcp/0', request)
+                return 200
+            except HTTPError as exc:
+                return exc.code
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(lambda _: execute(), range(2)))
+        self.assertEqual(sorted(outcomes), [200, 400])
+        with urlopen(self.base + '/metrics', timeout=2) as response:
+            metrics = json.load(response)
+        self.assertEqual(metrics['tool_calls'], 1)
+        self.assertEqual(metrics['provider_calls'], 1)
+        self.assertEqual(metrics['errors'], 1)
+        snapshot = self.server.state.snapshot()
+        snapshot['per_server_calls'][0] = -1
+        self.assertEqual(self.server.state.snapshot()['per_server_calls'], [1, 0, 0])
 
     def test_real_http_inventory_and_25_call_turn(self):
         tools = []
