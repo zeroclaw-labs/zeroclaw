@@ -235,6 +235,7 @@ pub(crate) async fn call_provider(
     active_dispatch_model: &str,
     prepared_messages: &[ChatMessage],
     request_tools: Option<&[ToolSpec]>,
+    known_tool_names: &std::collections::HashSet<String>,
     should_consume_provider_stream: bool,
     iteration: usize,
 ) -> Result<ProviderCallOutcome> {
@@ -253,14 +254,14 @@ pub(crate) async fn call_provider(
                         active_model_provider,
                         prepared_messages,
                         request_tools,
+                        known_tool_names,
                         active_dispatch_model,
                         ctx.temperature,
                         ctx.cancellation_token,
                         ctx.on_delta,
                         ctx.event_tx,
                         ctx.strict_tool_parsing,
-                        ctx.draft_reasoning,
-                    )
+                        ctx.draft_reasoning)
                     .await
                     {
                         Ok(streamed) => {
@@ -1572,6 +1573,7 @@ mod streaming_fallback_tests {
                         "test-model",
                         &[ChatMessage::user("go")],
                         None,
+                        &std::collections::HashSet::new(),
                         true,
                         0,
                     ),
@@ -1669,6 +1671,7 @@ mod streaming_fallback_tests {
             "test-model",
             &[ChatMessage::user("go")],
             None,
+            &std::collections::HashSet::new(),
             true,
             0,
         )
@@ -1723,6 +1726,7 @@ mod streaming_fallback_tests {
             "test-model",
             &[ChatMessage::user("go")],
             None,
+            &std::collections::HashSet::new(),
             true,
             0,
         )
@@ -1858,6 +1862,7 @@ mod streaming_fallback_tests {
                 "test-model",
                 &[ChatMessage::user("go")],
                 None,
+                &std::collections::HashSet::new(),
                 true,
                 0,
             )
@@ -1944,6 +1949,7 @@ mod streaming_fallback_tests {
                 "requested-model",
                 &[ChatMessage::user("go")],
                 None,
+                &std::collections::HashSet::new(),
                 true,
                 0,
             )
@@ -2047,6 +2053,7 @@ mod streaming_fallback_tests {
             "test-model",
             &[ChatMessage::user("go")],
             None,
+            &std::collections::HashSet::new(),
             true,
             0,
         )
@@ -2117,6 +2124,7 @@ mod streaming_fallback_tests {
             "requested-model",
             &[ChatMessage::user("go")],
             None,
+            &std::collections::HashSet::new(),
             false,
             0,
         )
@@ -2188,6 +2196,7 @@ mod streaming_fallback_tests {
             "requested-model",
             &[ChatMessage::user("go")],
             None,
+            &std::collections::HashSet::new(),
             false,
             0,
         )
@@ -2342,6 +2351,7 @@ mod streaming_fallback_tests {
                         "test-model",
                         &[ChatMessage::user("go")],
                         None,
+                        &std::collections::HashSet::new(),
                         true,
                         0,
                     ),
@@ -2447,6 +2457,7 @@ mod streaming_fallback_tests {
                         "test-model",
                         &[ChatMessage::user("go")],
                         None,
+                        &std::collections::HashSet::new(),
                         true,
                         0,
                     ),
@@ -2701,6 +2712,7 @@ mod streaming_fallback_tests {
                         "test-model",
                         &[ChatMessage::user("go")],
                         None,
+                        &std::collections::HashSet::new(),
                         true,
                         0,
                     ),
@@ -2777,6 +2789,7 @@ mod streaming_fallback_tests {
                         "test-model",
                         &[ChatMessage::user("go")],
                         None,
+                        &std::collections::HashSet::new(),
                         true,
                         0,
                     ),
