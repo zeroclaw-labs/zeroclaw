@@ -21019,7 +21019,7 @@ impl Default for Config {
         });
 
         Self {
-            data_dir: zeroclaw_dir.join("data"),
+            data_dir: install_data_dir(&zeroclaw_dir),
             config_path: zeroclaw_dir.join("config.toml"),
             env_overridden_paths: std::collections::HashSet::new(),
             pre_override_snapshots: std::collections::HashMap::new(),
@@ -21123,11 +21123,23 @@ impl Default for Config {
 
 fn default_config_and_data_dirs() -> Result<(PathBuf, PathBuf)> {
     let config_dir = default_config_dir()?;
-    // The second value is the shared instance data directory
-    // (databases + state files). Per-agent identity + markdown lives
-    // at `<config-dir>/agents/<alias>/workspace/`, resolved separately
-    // via `Config::agent_workspace_dir`.
-    Ok((config_dir.clone(), config_dir.join("data")))
+    let data_dir = install_data_dir(&config_dir);
+    Ok((config_dir, data_dir))
+}
+
+/// The shared instance data directory (databases and state files) of the
+/// install rooted at `config_dir`. Per-agent identity and markdown live at
+/// `<config-dir>/agents/<alias>/workspace/`, resolved separately via
+/// `Config::agent_workspace_dir`.
+///
+/// Every path to the data directory goes through here: the runtime
+/// resolution a daemon uses to lock its state before loading the config,
+/// `Config::load_or_init`, which sets `config.data_dir`, and the V2-to-V3
+/// filesystem migration's targets. A daemon refuses to start when the first
+/// two disagree. Outside this crate, `zerocode` derives the same
+/// `<config-dir>/data` for its daemon socket; keep them in step.
+pub(crate) fn install_data_dir(config_dir: &Path) -> PathBuf {
+    config_dir.join("data")
 }
 
 fn default_config_dir() -> Result<PathBuf> {
@@ -21157,7 +21169,9 @@ fn default_config_dir() -> Result<PathBuf> {
 /// `~/.zeroclaw`. The zerocode binary mirrors this path inline (it carries no
 /// `zeroclaw-*` dependency).
 pub fn ftl_locale_dir(locale: &str) -> Result<PathBuf> {
-    Ok(default_config_dir()?.join("data").join("ftl").join(locale))
+    Ok(install_data_dir(&default_config_dir()?)
+        .join("ftl")
+        .join(locale))
 }
 
 /// The FTL catalogues that `zeroclaw locales fetch` / the daemon's
@@ -21203,16 +21217,29 @@ fn default_path_under_config_dir(relative: &str) -> String {
     }
 }
 
+/// Resolve the install a `ZEROCLAW_DATA_DIR` (or deprecated
+/// `ZEROCLAW_WORKSPACE`) value points at: its config directory and that
+/// install's data directory.
+///
+/// The value locates the install. It is the install itself when it holds a
+/// `config.toml`, or the data directory beside a `.zeroclaw` install (as in
+/// the container images). The data directory returned is always the
+/// install's own `<config-dir>/data`, which is where `Config::load_or_init`
+/// keeps the databases.
 pub fn resolve_config_dir_for_data(data_dir: &Path) -> (PathBuf, PathBuf) {
-    let data_config_dir = data_dir.to_path_buf();
-    if data_config_dir.join("config.toml").exists() {
-        return (data_config_dir.clone(), data_config_dir.join("data"));
+    let config_dir = config_dir_for_data(data_dir);
+    let data_dir = install_data_dir(&config_dir);
+    (config_dir, data_dir)
+}
+
+fn config_dir_for_data(data_dir: &Path) -> PathBuf {
+    if data_dir.join("config.toml").exists() {
+        return data_dir.to_path_buf();
     }
 
-    let legacy_config_dir = data_dir.parent().map(|parent| parent.join(".zeroclaw"));
-    if let Some(legacy_dir) = legacy_config_dir {
+    if let Some(legacy_dir) = data_dir.parent().map(|parent| parent.join(".zeroclaw")) {
         if legacy_dir.join("config.toml").exists() {
-            return (legacy_dir, data_config_dir);
+            return legacy_dir;
         }
 
         // Accept either the new "data" suffix or the legacy "workspace"
@@ -21222,11 +21249,11 @@ pub fn resolve_config_dir_for_data(data_dir: &Path) -> (PathBuf, PathBuf) {
         if data_dir.file_name().is_some_and(|name| {
             name == std::ffi::OsStr::new("data") || name == std::ffi::OsStr::new("workspace")
         }) {
-            return (legacy_dir, data_config_dir);
+            return legacy_dir;
         }
     }
 
-    (data_config_dir.clone(), data_config_dir.join("data"))
+    data_dir.to_path_buf()
 }
 
 pub async fn classify_runtime_config_kind(config_path: &Path) -> RuntimeConfigKind {
@@ -21456,11 +21483,8 @@ async fn resolve_runtime_config_dirs(
                 );
             }
             let zeroclaw_dir = expand_tilde_path(custom_config_dir);
-            return Ok((
-                zeroclaw_dir.clone(),
-                zeroclaw_dir.join("data"),
-                ConfigResolutionSource::EnvConfigDir,
-            ));
+            let data_dir = install_data_dir(&zeroclaw_dir);
+            return Ok((zeroclaw_dir, data_dir, ConfigResolutionSource::EnvConfigDir));
         }
     }
 
@@ -21509,9 +21533,10 @@ async fn resolve_runtime_config_dirs(
         && let Ok(exe) = std::env::current_exe()
         && let Some(homebrew_config_dir) = try_resolve_macos_homebrew_config_dir(&exe).await
     {
+        let data_dir = install_data_dir(&homebrew_config_dir);
         return Ok((
-            homebrew_config_dir.clone(),
-            homebrew_config_dir.join("workspace"),
+            homebrew_config_dir,
+            data_dir,
             ConfigResolutionSource::HomebrewConfigDir,
         ));
     }
@@ -22533,7 +22558,7 @@ impl Config {
         // migration against `default_zeroclaw_dir` would silently skip
         // any install reached via `ZEROCLAW_CONFIG_DIR` or
         // `ZEROCLAW_WORKSPACE`.
-        let (zeroclaw_dir, _legacy_workspace_dir, resolution_source) =
+        let (zeroclaw_dir, _data_dir, resolution_source) =
             resolve_runtime_config_dirs(&default_zeroclaw_dir, &default_workspace_dir).await?;
 
         // One-time, V<3 → V3 ONLY move of `<install>/workspace/` into
@@ -22605,7 +22630,7 @@ impl Config {
         // cost records) and hygiene/state files. Per-agent identity
         // and markdown (MEMORY.md, IDENTITY.md, SOUL.md) lives at
         // `Config::agent_workspace_dir(alias)` instead.
-        let data_dir = zeroclaw_dir.join("data");
+        let data_dir = install_data_dir(&zeroclaw_dir);
         fs::create_dir_all(&data_dir).await.with_context(|| {
             format!(
                 "Failed to create data directory: {}",
@@ -36632,6 +36657,211 @@ wire_api = "ws"
         assert_eq!(resolved_workspace_dir, default_workspace_dir);
 
         let _ = fs::remove_dir_all(default_config_dir).await;
+    }
+
+    /// The daemon locks the data directory `resolve_runtime_dirs` reports
+    /// before it loads the config, then refuses to start if the loaded
+    /// `config.data_dir` differs. Every layout must agree, and the loaded
+    /// data directory must stay where that layout keeps its databases.
+    #[test]
+    #[allow(clippy::large_futures)]
+    async fn runtime_dirs_match_the_loaded_data_dir_in_every_layout() {
+        let _env_guard = env_override_lock().await;
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+        let root =
+            std::env::temp_dir().join(format!("zeroclaw_test_dirs_{}", uuid::Uuid::new_v4()));
+
+        // (layout, HOME, ZEROCLAW_CONFIG_DIR, ZEROCLAW_DATA_DIR, existing
+        // config.toml, expected config dir, expected data dir)
+        let docker = root.join("docker");
+        let default_home = root.join("default");
+        let explicit = root.join("explicit");
+        let inline = root.join("inline");
+        let fresh = root.join("fresh");
+        let cases = [
+            (
+                "container: ZEROCLAW_DATA_DIR beside .zeroclaw/config.toml",
+                docker.clone(),
+                None,
+                Some(docker.join("data")),
+                Some(docker.join(".zeroclaw/config.toml")),
+                docker.join(".zeroclaw"),
+                docker.join(".zeroclaw/data"),
+            ),
+            (
+                "default ~/.zeroclaw",
+                default_home.clone(),
+                None,
+                None,
+                Some(default_home.join(".zeroclaw/config.toml")),
+                default_home.join(".zeroclaw"),
+                default_home.join(".zeroclaw/data"),
+            ),
+            (
+                "explicit --config-dir",
+                root.join("explicit-home"),
+                Some(explicit.clone()),
+                None,
+                Some(explicit.join("config.toml")),
+                explicit.clone(),
+                explicit.join("data"),
+            ),
+            (
+                "ZEROCLAW_DATA_DIR holding config.toml",
+                root.join("inline-home"),
+                None,
+                Some(inline.clone()),
+                Some(inline.join("config.toml")),
+                inline.clone(),
+                inline.join("data"),
+            ),
+            (
+                "fresh ZEROCLAW_DATA_DIR named data",
+                root.join("fresh-home"),
+                None,
+                Some(fresh.join("data")),
+                None,
+                fresh.join(".zeroclaw"),
+                fresh.join(".zeroclaw/data"),
+            ),
+        ];
+
+        let mut mismatches = Vec::new();
+        for (layout, home, config_dir, data_dir, config_file, want_config, want_data) in cases {
+            if let Some(config_file) = &config_file {
+                fs::create_dir_all(config_file.parent().unwrap())
+                    .await
+                    .unwrap();
+                fs::write(config_file, "schema_version = 3\n")
+                    .await
+                    .unwrap();
+            }
+            let _home_guard = EnvValueGuard::set("HOME", &home);
+            let _config_guard = match &config_dir {
+                Some(dir) => EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", dir),
+                None => EnvValueGuard::remove("ZEROCLAW_CONFIG_DIR"),
+            };
+            let _data_guard = match &data_dir {
+                Some(dir) => EnvValueGuard::set("ZEROCLAW_DATA_DIR", dir),
+                None => EnvValueGuard::remove("ZEROCLAW_DATA_DIR"),
+            };
+
+            let (locked_config, locked_data) = resolve_runtime_dirs().await.unwrap();
+            let loaded = Box::pin(Config::load_or_init()).await.unwrap();
+            if locked_data != loaded.data_dir {
+                mismatches.push(format!(
+                    "{layout}: locked {}, loaded {}",
+                    locked_data.display(),
+                    loaded.data_dir.display()
+                ));
+            }
+            assert_eq!(locked_config, want_config, "{layout}: config dir");
+            assert_eq!(
+                loaded.data_dir, want_data,
+                "{layout}: database placement moved"
+            );
+        }
+        let _ = fs::remove_dir_all(&root).await;
+        assert!(
+            mismatches.is_empty(),
+            "pre-lock and loaded data dirs disagree:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    /// Startup creates and locks `config-lifecycle.lock` in the resolved data
+    /// directory before it loads the config. A V2-to-V3 filesystem migration
+    /// interrupted after moving an identity file, with the device database
+    /// still in the legacy workspace, must still resume on that load: the
+    /// database ends up readable in the loaded `data_dir`, and the legacy
+    /// copy is moved out and kept in the migration backup.
+    #[test]
+    #[allow(clippy::large_futures)]
+    async fn an_interrupted_v2_migration_resumes_despite_the_pre_load_lock() {
+        let _env_guard = env_override_lock().await;
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+
+        let mut failures = Vec::new();
+        for layout in ["default ~/.zeroclaw", "container", "explicit --config-dir"] {
+            let temp = TempDir::new().unwrap();
+            let home = temp.path();
+            let (install, config_dir_env, data_dir_env) = match layout {
+                "container" => (home.join(".zeroclaw"), None, Some(home.join("data"))),
+                "explicit --config-dir" => {
+                    (home.join("explicit"), Some(home.join("explicit")), None)
+                }
+                _ => (home.join(".zeroclaw"), None, None),
+            };
+            let legacy = install.join("workspace");
+            std::fs::create_dir_all(&legacy).unwrap();
+            std::fs::write(install.join("config.toml"), "schema_version = 2\n").unwrap();
+            let agent = install.join("agents/default/workspace");
+            std::fs::create_dir_all(&agent).unwrap();
+            std::fs::write(agent.join("IDENTITY.md"), "moved before the interruption").unwrap();
+            {
+                let db = rusqlite::Connection::open(legacy.join("devices.db")).unwrap();
+                db.execute_batch(
+                    "CREATE TABLE marker(value TEXT NOT NULL);
+                     INSERT INTO marker VALUES('existing device');",
+                )
+                .unwrap();
+            }
+
+            let _home_guard = EnvValueGuard::set("HOME", home);
+            let _config_guard = match &config_dir_env {
+                Some(dir) => EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", dir),
+                None => EnvValueGuard::remove("ZEROCLAW_CONFIG_DIR"),
+            };
+            let _data_guard = match &data_dir_env {
+                Some(dir) => EnvValueGuard::set("ZEROCLAW_DATA_DIR", dir),
+                None => EnvValueGuard::remove("ZEROCLAW_DATA_DIR"),
+            };
+
+            // The pre-load lock step: create the lifecycle lock where the
+            // daemon would, and hold an advisory lock on it across the load.
+            let (_, locked_data) = resolve_runtime_dirs().await.unwrap();
+            std::fs::create_dir_all(&locked_data).unwrap();
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(locked_data.join("config-lifecycle.lock"))
+                .unwrap();
+            lock.try_lock().unwrap();
+
+            let loaded = Box::pin(Config::load_or_init()).await.unwrap();
+            drop(lock);
+
+            let moved = loaded.data_dir.join("devices.db");
+            let marker: Option<String> = rusqlite::Connection::open_with_flags(
+                &moved,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .and_then(|db| db.query_row("SELECT value FROM marker", [], |row| row.get(0)))
+            .ok();
+            let backed_up = std::fs::read_dir(&install).unwrap().flatten().any(|entry| {
+                entry.file_name().to_string_lossy().starts_with("backup-")
+                    && entry.path().join("legacy-workspace/devices.db").is_file()
+            });
+            if marker.as_deref() != Some("existing device")
+                || legacy.join("devices.db").exists()
+                || !backed_up
+            {
+                failures.push(format!(
+                    "{layout}: locked {}, loaded {}; row at loaded data dir: {marker:?}; \
+                     still in legacy workspace: {}; in migration backup: {backed_up}",
+                    locked_data.display(),
+                    loaded.data_dir.display(),
+                    legacy.join("devices.db").exists()
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "the device database was not migrated:\n{}",
+            failures.join("\n")
+        );
     }
 
     #[test]
