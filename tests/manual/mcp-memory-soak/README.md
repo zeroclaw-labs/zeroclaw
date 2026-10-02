@@ -5,6 +5,10 @@ with synthetic data. It addresses the Linux/glibc evidence request in issue #864
 it is not a production fix or a claim that the original growth is reproduced.
 No production dependencies or runtime source files are changed.
 
+The [2026-10-02 comparison](results-2026-10-02/README.md) includes all memory
+samples and a bounded negative reproduction result, not proof that the issue is
+fixed.
+
 ## Isolation and requirements
 
 Use Python 3.11+ and `websocket-client` (Debian `python3-websocket`) in a disposable
