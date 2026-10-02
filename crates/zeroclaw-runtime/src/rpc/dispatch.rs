@@ -8026,44 +8026,37 @@ impl RpcDispatcher {
             None
         };
 
+        let update = built_model_provider.map(
+            |(
+                model_provider,
+                model_provider_name,
+                model_name,
+                model_route_resolver,
+                tool_dispatcher,
+                config_generation,
+            )| crate::rpc::session::ModelProviderUpdate {
+                model_provider,
+                model_provider_name,
+                model_name,
+                model_route_resolver,
+                tool_dispatcher,
+                config_generation: Arc::clone(&config_generation),
+                temperature: None,
+                multimodal_config: config_generation.multimodal.clone(),
+            },
+        );
         let merged = self
             .ctx
             .sessions
-            .set_overrides_gated(&req.session_id, session_generation, req.overrides)
-            .await
+            .configure_authorized(
+                &req.session_id,
+                session_generation,
+                merged,
+                update,
+                |session| self.live_effect_lease(Method::SessionConfigure, session),
+            )
+            .await?
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-
-        if let Some((
-            model_provider,
-            model_provider_name,
-            model_name,
-            model_route_resolver,
-            tool_dispatcher,
-            config_generation,
-        )) = built_model_provider
-        {
-            self.ctx
-                .sessions
-                .apply_model_provider(
-                    &req.session_id,
-                    session_generation,
-                    crate::rpc::session::ModelProviderUpdate {
-                        model_provider,
-                        model_provider_name,
-                        model_name,
-                        model_route_resolver,
-                        tool_dispatcher,
-                        config_generation: Arc::clone(&config_generation),
-                        // Temperature is already committed through
-                        // `set_overrides_gated` on this path.
-                        temperature: None,
-                        multimodal_config: config_generation.multimodal.clone(),
-                    },
-                )
-                .await
-                .then_some(())
-                .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-        }
 
         to_result(SessionConfigureResult {
             session_id: req.session_id,
@@ -46675,6 +46668,87 @@ mod tests {
     /// generation, enters the gated method, then the session is removed and
     /// recreation starts while the stale configure is paused. The stale work must be
     /// rejected and the successor must remain untouched.
+    #[tokio::test]
+    async fn session_configure_revoked_at_commit_changes_neither_overrides_nor_agent() {
+        for model_change in [false, true] {
+            for revoke in [false, true] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let mut config = make_model_refresh_test_config(&tmp);
+                config.gateway.paired_tokens = vec!["zc_configure_test".into()];
+                let mut dispatcher = make_config_set_test_dispatcher(config);
+                dispatcher
+                    .handle_initialize(&json!({"auth_token":"zc_configure_test"}))
+                    .await
+                    .unwrap();
+                let sid = create_model_refresh_test_session(&dispatcher, &tmp).await;
+                let sessions = Arc::clone(&dispatcher.ctx.sessions);
+                let before_overrides = sessions
+                    .preview_overrides(&sid, &Default::default())
+                    .await
+                    .unwrap();
+                let before_model = model_name_for_session(&dispatcher, &sid).await;
+                let before_temperature = temperature_for_session(&dispatcher, &sid).await;
+                let (entered, release, _) = sessions.set_test_gated_op_pause();
+                let mut overrides = json!({"temperature":0.99});
+                if model_change {
+                    overrides["model_provider"] = json!("openai.test-provider");
+                    overrides["model"] = json!("configured-model");
+                }
+                let params = json!({"session_id":sid,"overrides":overrides});
+                let request = dispatcher.handle_session_configure(&params);
+                let change = async {
+                    entered.notified().await;
+                    if revoke {
+                        assert!(
+                            dispatcher
+                                .ctx
+                                .auth
+                                .pairing()
+                                .revoke_token("zc_configure_test")
+                        );
+                    }
+                    release.notify_one();
+                };
+                let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::join!(request, change)
+                })
+                .await
+                .expect("configure reaches and leaves its final commit boundary");
+                sessions.clear_test_gated_op_pause();
+                if revoke {
+                    assert_eq!(result.unwrap_err().code, AUTH_REQUIRED);
+                    let after = sessions
+                        .preview_overrides(&sid, &Default::default())
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::to_value(after).unwrap(),
+                        serde_json::to_value(before_overrides).unwrap()
+                    );
+                    assert_eq!(
+                        model_name_for_session(&dispatcher, &sid).await,
+                        before_model
+                    );
+                    assert_eq!(
+                        temperature_for_session(&dispatcher, &sid).await,
+                        before_temperature
+                    );
+                } else {
+                    assert!(result.is_ok(), "{result:?}");
+                    assert_eq!(temperature_for_session(&dispatcher, &sid).await, Some(0.99));
+                    assert_eq!(
+                        model_name_for_session(&dispatcher, &sid).await,
+                        if model_change {
+                            "configured-model"
+                        } else {
+                            before_model.as_str()
+                        }
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn session_configure_stale_gen_replaced_during_provider_build() {
         let tmp = tempfile::TempDir::new().unwrap();
