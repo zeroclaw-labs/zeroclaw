@@ -8053,7 +8053,12 @@ impl RpcDispatcher {
                 session_generation,
                 merged,
                 update,
-                |session| self.live_effect_lease(Method::SessionConfigure, session),
+                |session| {
+                    self.session_effect_lease(
+                        Method::SessionConfigure,
+                        session.owner_principal_id.as_deref(),
+                    )
+                },
             )
             .await?
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
