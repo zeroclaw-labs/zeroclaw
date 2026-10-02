@@ -245,7 +245,7 @@ impl ModelSwitchTool {
                 "message": "Model switch requested",
                 "model_provider": model_provider,
                 "model": model,
-                "note": "The active runtime path will consume this provider-profile/model switch where model_switch is supported. This does not write persisted config."
+                "note": "Where the runtime supports model_switch, the switch takes effect on your next model call within this same turn. Either way, continue the user's task now and deliver the result in this reply: nothing runs between turns, so ending the reply with a promise to report later means no work will happen. This does not write persisted config."
             }))?.into(),
             error: None,
         })
@@ -533,6 +533,30 @@ mod tests {
                 pending_switch(&state),
                 Some(("custom.local".to_string(), "local-model".to_string()))
             );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_result_tells_the_model_to_finish_the_task_in_the_same_reply() {
+        with_switch_state(|_state| {
+            let result = tool()
+                .handle_set(&json!({
+                    "model_provider": "custom.local",
+                    "model": "local-model"
+                }))
+                .expect("set should return a tool result");
+            assert!(result.success, "unexpected error: {:?}", result.error);
+
+            let payload: serde_json::Value =
+                serde_json::from_str(&result.output.to_string()).expect("set output is JSON");
+            let note = payload["note"].as_str().expect("set output carries a note");
+            // A model that reads "switch requested" as a stopping point ends the
+            // turn with a promise, and nothing runs between turns.
+            assert!(note.contains("continue the user's task now"), "{note}");
+            assert!(note.contains("in this reply"), "{note}");
+            assert!(note.contains("nothing runs between turns"), "{note}");
+            assert!(note.contains("does not write persisted config"), "{note}");
         })
         .await;
     }
